@@ -343,23 +343,30 @@ export const TRANSACT_WRITE_ITEMS_LIMIT = 100
 
 /**
  * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
- * (100 items per `TransactWriteItems`). Appends are atomic by design — the
- * batch is never chunked, because chunking would break append atomicity — so
- * an oversized batch is rejected before any request is issued.
+ * (100 items per `TransactWriteItems`). An append is one atomic transaction by
+ * default, so an oversized one is rejected before any request is issued. An
+ * append made with `chunked: true` is split across transactions instead, and
+ * fails with this error only when the items its final transaction must carry
+ * (`additionalItems`, the idempotency sentinel, an inline snapshot) cannot fit
+ * alongside one event.
  *
  * `count` is the total number of transact items the append requires: one Put
- * per event, plus one `ConditionCheck` (the version-contiguity guard) when
- * `expectedVersion > 0`. In practice a single append therefore holds up to
- * 100 events at `expectedVersion === 0` and up to 99 events otherwise.
+ * per event, one `ConditionCheck` (the version-contiguity guard) when
+ * `expectedVersion > 0`, every item the `additionalItems` compile to, and the
+ * idempotency sentinel and inline snapshot when present. In practice a single
+ * append of events alone therefore holds up to 100 events at
+ * `expectedVersion === 0` and up to 99 events otherwise. For a chunked append,
+ * `count` is the size of its smallest possible final transaction: the inline
+ * items, a contiguity check and one event.
  *
- * Note the 4MB aggregate payload cap on `TransactWriteItems` is NOT
- * pre-validated (marshalled size is not practical to pre-compute) — exceeding
- * it surfaces as a `DynamoClientError` from AWS.
+ * DynamoDB's 4 MB aggregate cap on one transaction is checked client-side too,
+ * by DynamoDB's item-size rules: exceeding it fails with `ValidationError`
+ * before anything is sent.
  */
 export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly streamName: string
   readonly streamId: string
-  /** Total transact items required (events + contiguity ConditionCheck). */
+  /** Total transact items required (see the class description). */
   readonly count: number
   /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
   readonly limit: number
@@ -409,6 +416,41 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
   readonly streamName: string
   readonly streamId: string
   readonly commandId: string
+}> {}
+
+/**
+ * A chunked `EventStore.append` (`chunked: true`) failed after its first
+ * transaction committed, so the stream holds a **prefix** of the append's
+ * events: versions `expectedVersion + 1 … committedVersion`.
+ *
+ * A chunked append is not atomic. Concurrency is decided by its first
+ * transaction — a failure there maps exactly as a non-chunked append's does,
+ * and nothing is written. Any failure of a later transaction surfaces as this
+ * error, whatever caused it: another writer appended between two chunks (the
+ * usual case, a `VersionConflict` in `cause`), an `additionalItems` condition
+ * failed on the final chunk, a transport error, or anything else.
+ *
+ * - `expectedVersion` — the version the caller appended after.
+ * - `committedVersion` — the last version known to be durably written by this
+ *   append. When `cause` is a transport error, the failing chunk's own outcome
+ *   is unknown (DynamoDB may have committed it), so the stream may be further
+ *   along; re-read it before acting.
+ * - `intendedVersion` — `expectedVersion + events.length`, the version the
+ *   append would have reached.
+ * - `cause` — the error the failing chunk produced.
+ *
+ * The `additionalItems`, the idempotency sentinel and an inline snapshot all
+ * ride on the final chunk, so none of them is written when this error occurs:
+ * read models never show a partially written command, and the command is not
+ * recorded as applied. `EventStore.commandHandler` never retries it.
+ */
+export class PartialAppend extends Data.TaggedError("PartialAppend")<{
+  readonly streamName: string
+  readonly streamId: string
+  readonly expectedVersion: number
+  readonly committedVersion: number
+  readonly intendedVersion: number
+  readonly cause: unknown
 }> {}
 
 /**

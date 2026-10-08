@@ -4,19 +4,22 @@
  * Provides:
  * - `Decider` type for command-event-state modeling
  * - `makeStream` factory for creating event streams bound to a Table
- * - Core operations: `append`, `read`, `readFrom`, `currentVersion` (reads
+ * - Core operations: `append` (atomic, or opt-in `chunked` across
+ *   transactions), `read`, `readFrom`, `currentVersion`, `readLatest` (reads
  *   optionally strongly consistent)
- * - Snapshot primitives: `writeSnapshot`, `readSnapshot`
+ * - Snapshot primitives: `writeSnapshot`, `readSnapshot`, and inline snapshots
+ *   written in the append transaction (`AppendOptions.snapshot`)
  * - `commandHandler` combinator for the load-decide-fold-append cycle
- *   (snapshot-aware, consistent loads, an optional `VersionConflict` retry
- *   policy, caller-supplied `expectedVersion`, decision-derived
- *   `additionalItems`)
+ *   (snapshot-aware single-request loads, consistent loads, an optional
+ *   `VersionConflict` retry policy, caller-supplied `expectedVersion`,
+ *   decision-derived `additionalItems`, inline snapshots, chunked appends)
  * - `fold` / `foldFrom` helpers for state reconstruction
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
  * DynamoClient, Marshaller).
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
@@ -27,6 +30,7 @@ import {
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   type OptimisticLockError,
+  PartialAppend,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   type UniqueConstraintViolation,
@@ -44,15 +48,20 @@ import {
   Schedule,
   Schema,
 } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import {
+  type BuiltTransactWriteItems,
   buildTransactWriteItems,
+  fitsOneTransaction,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  measureTransaction,
   refuseOversizedTransaction,
   refuseRepeatedItems,
+  type TransactItemTarget,
   type TransactWriteItem,
   type TransactWriteOp,
+  transactEntryBytes,
   transactItemTarget,
 } from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
@@ -165,17 +174,41 @@ export interface Snapshot<State> {
  * - `schema` — the state codec. Snapshot state round-trips through it
  *   (`Schema.encodeUnknownEffect` on write, `Schema.decodeUnknownEffect` on
  *   read), so transforming schemas work.
- * - `every` — optional auto-snapshot cadence for {@link commandHandler}: after a
- *   successful append, write a fresh snapshot once at least this many events
- *   have accumulated since the last one. Must be a positive integer.
+ * - `mode` — how {@link commandHandler} writes snapshots (see
+ *   {@link SnapshotMode}). Default `"after-append"`.
+ * - `every` — optional snapshot cadence for {@link commandHandler}: write a
+ *   fresh snapshot once at least this many events have accumulated since the
+ *   last one. Must be a positive integer. With `mode: "after-append"` and no
+ *   `every`, the handler never snapshots; with `mode: "inline"` and no `every`,
+ *   it snapshots on every append.
+ *
+ * `every` also sizes the first page of {@link EventStream.readLatest}, which
+ * {@link commandHandler} loads state with: a snapshot that lags the head by up
+ * to `every` events still loads in one request.
  */
 export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
   readonly schema: TSchema
+  readonly mode?: SnapshotMode | undefined
   readonly every?: number | undefined
 }
 
+/**
+ * How {@link commandHandler} writes snapshots.
+ *
+ * - `"after-append"` (default) — a best-effort `writeSnapshot` after the append
+ *   succeeds, at the `every` cadence. A failed snapshot write never fails the
+ *   command; the snapshot simply lags until the next threshold crossing.
+ * - `"inline"` — the snapshot `Put` rides in the append's own transaction (see
+ *   {@link AppendOptions.snapshot}), on every append, or at the `every` cadence
+ *   when one is set. The snapshot is then current after every command that
+ *   writes one, so {@link EventStream.readLatest} loads state in one request.
+ *   The snapshot counts towards the transaction's item and size limits.
+ */
+export type SnapshotMode = "after-append" | "inline"
+
 /** The runtime snapshot settings exposed on a stream. */
 export interface SnapshotSettings {
+  readonly mode: SnapshotMode
   readonly every: number | undefined
 }
 
@@ -214,8 +247,13 @@ export interface AppendIdempotency {
   readonly ttl?: Duration.Duration | string
 }
 
-/** Options accepted by {@link EventStream.append}. */
-export interface AppendOptions<TMetadata> {
+/**
+ * Options accepted by {@link EventStream.append}.
+ *
+ * `TState` is the stream's snapshot state type (`never` for a stream without a
+ * `snapshot` config, so `snapshot` cannot be supplied there).
+ */
+export interface AppendOptions<TMetadata, TState = never> {
   /** Per-append metadata, validated against the stream's metadata schema when configured. */
   readonly metadata?: TMetadata
   /**
@@ -239,12 +277,58 @@ export interface AppendOptions<TMetadata> {
   readonly additionalItems?: ReadonlyArray<TransactWriteOp>
   /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
   readonly idempotency?: AppendIdempotency
+  /**
+   * An inline snapshot: the stream's state as of this append's last event.
+   *
+   * The snapshot `Put` (`asOfVersion` = `expectedVersion + events.length`,
+   * encoded through the state schema) joins the **same transaction** as the
+   * events, after the idempotency sentinel, so it commits if and only if the
+   * events do. The `Put` is unconditional: the event puts already prove this
+   * writer owns `asOfVersion`, so it cannot regress the snapshot. It counts
+   * towards the item and size limits, and a cancellation reason at its
+   * position (throttling, for example) reports `TransactionCancelled`.
+   *
+   * `undefined` means no snapshot. Requires at least one event — with none,
+   * nothing proves the writer owns the version, and the append fails with
+   * `ValidationError`. On a stream without a `snapshot` config (where the type
+   * is `never`) it dies with `[EDD-9026]`, as `writeSnapshot` does.
+   */
+  readonly snapshot?: TState
+  /**
+   * Split an append too large for one transaction across several. Default
+   * `false`: an append over DynamoDB's 100-item or 4 MB transaction limits
+   * fails with `AppendTooLarge` (or `ValidationError` for size) before anything
+   * is written.
+   *
+   * With `true`, an append that fits one transaction is written exactly as
+   * without it — atomically, in one request. A larger one is split, in order,
+   * into transactions that each fit both limits, written sequentially at
+   * successive versions:
+   *
+   * - The **first** carries the version-contiguity check on `expectedVersion`
+   *   and, with `idempotency`, a check that the command's sentinel does not
+   *   exist, so a replay still fails with `DuplicateCommand`. Concurrency is
+   *   decided here: its failure maps exactly as a non-chunked append's does,
+   *   and nothing is written.
+   * - Each **later** one checks that the previous chunk's last event exists.
+   * - The **final** one also carries `additionalItems`, the idempotency
+   *   sentinel and the inline `snapshot`, so read models never show a partially
+   *   written command. If they cannot fit alongside one event, the append fails
+   *   with `AppendTooLarge` before anything is written.
+   *
+   * **Not atomic.** Readers can observe a prefix of the events, and another
+   * writer appending between two chunks aborts the rest: any failure after the
+   * first chunk surfaces as `PartialAppend`, carrying the last version
+   * committed. The result's `version` is the final version.
+   */
+  readonly chunked?: boolean | undefined
 }
 
 /** Error channel of {@link EventStream.append}. */
 export type AppendError =
   | VersionConflict
   | DuplicateCommand
+  | PartialAppend
   | AdditionalItemConditionFailed
   | AppendTooLarge
   | DynamoClientError
@@ -271,6 +355,22 @@ export type AppendError =
  */
 export interface ReadOptions {
   readonly consistentRead?: boolean | undefined
+}
+
+/**
+ * A stream's latest state as {@link EventStream.readLatest} loads it.
+ *
+ * - `snapshot` — the stream's snapshot, if one exists (always `None` on a
+ *   stream without a `snapshot` config).
+ * - `events` — the events after the snapshot (every event when there is
+ *   none), ascending by version. Fold them onto the snapshot's state.
+ * - `version` — the stream head: the newest event's version, the snapshot's
+ *   `asOfVersion` when no event follows it, `0` for an empty stream.
+ */
+export interface LatestState<TState, TEvent, M = Record<string, unknown> | undefined> {
+  readonly snapshot: Option.Option<Snapshot<TState>>
+  readonly events: ReadonlyArray<StreamEvent<TEvent, M>>
+  readonly version: number
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +448,9 @@ export interface EventStream<
 
   /**
    * Present iff the stream was created with a `snapshot` config. Its presence
-   * is what switches {@link commandHandler} onto the snapshot-aware read path.
+   * is what switches {@link commandHandler} onto the snapshot-aware read path
+   * ({@link EventStream.readLatest}); its `mode` decides how the handler writes
+   * snapshots.
    */
   readonly snapshotConfig: SnapshotSettings | undefined
 
@@ -390,11 +492,17 @@ export interface EventStream<
     DynamoClient | TableConfig
   >
 
+  /**
+   * Append `events` after `expectedVersion`, atomically (or, with
+   * `chunked: true`, across several transactions) — see {@link AppendOptions}.
+   * A method, like `writeSnapshot`, so a snapshot-less stream (whose
+   * `options.snapshot` is `never`) stays assignable to other streams.
+   */
   append(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<TMetadata> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
 
   /**
@@ -434,11 +542,77 @@ export interface EventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
+  /**
+   * The stream's snapshot (if any), the events after it, and its head — in
+   * **one request** in steady state. This is how {@link commandHandler} loads
+   * state on a snapshot-configured stream.
+   *
+   * Issues a single reverse `Query` over the sort-key range from the first
+   * event to the snapshot (the snapshot sorts after every event, and the
+   * idempotency sentinels before them, so the range holds exactly the events
+   * and the snapshot), with a first page of `(every ?? 1) + 1` items. Further
+   * pages are read only while the snapshot's `asOfVersion` has not been reached
+   * (a snapshot lagging by more than `every` events) — each sized to the events
+   * still missing, so a lagging snapshot costs one more request — or to the
+   * start of the stream when there is no snapshot. Pass
+   * `{ consistentRead: true }` for read-your-writes; it applies to the snapshot
+   * and the events alike.
+   *
+   * A snapshot that fails to decode through the state schema fails with
+   * `ValidationError`, as {@link EventStream.readSnapshot} does. On a stream
+   * without a `snapshot` config it is {@link EventStream.read} plus the head.
+   */
+  readLatest(
+    streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
+  ): Effect.Effect<
+    LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
+    DynamoClientError | ValidationError,
+    DynamoClient | TableConfig
+  >
+
   readonly query: {
     events(
       streamId: StreamIdInput<TStreamIdFields>,
     ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
   }
+}
+
+// ---------------------------------------------------------------------------
+// Append transaction layout (internal)
+// ---------------------------------------------------------------------------
+
+/**
+ * @internal One `TransactWriteItems` request of an append, laid out for
+ * positional cancellation mapping:
+ *
+ * - `[0, guardCount)` — the version-contiguity `ConditionCheck` (0 or 1 items)
+ * - `[guardCount, guardCount + eventCount)` — the event puts
+ * - then the `additional` items (caller op order preserved)
+ * - then, at `sentinelIndex`, the idempotency sentinel (its `Put`, or on the
+ *   first chunk of a chunked append a `ConditionCheck`)
+ * - then the inline snapshot `Put`
+ *
+ * The sentinel and snapshot come last, so adding them never shifts the
+ * additional-item indices the caller sees.
+ */
+interface AppendTransaction {
+  readonly items: Array<TransactWriteItem>
+  /** Parallel to `items`, for `refuseRepeatedItems` / `refuseOversizedTransaction`. */
+  readonly targets: Array<TransactItemTarget>
+  readonly guardCount: number
+  readonly eventCount: number
+  readonly additional: BuiltTransactWriteItems | undefined
+  /** `-1` when the transaction carries no sentinel item. */
+  readonly sentinelIndex: number
+  /** The version this transaction's events are appended after. */
+  readonly baseVersion: number
+}
+
+/** @internal Event indices `[from, to)` of one chunk of a chunked append. */
+interface AppendChunk {
+  readonly from: number
+  readonly to: number
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +659,10 @@ export interface EventStream<
  * })
  * ```
  *
+ * `snapshot.mode: "inline"` writes the snapshot in the append transaction
+ * itself, so it is current after every command and state loads in one
+ * request — see {@link SnapshotMode}.
+ *
  * `casing` overrides the key casing for this stream, as an index's or a vector
  * index's `casing` does: the stream name, stream-id values and command ids in
  * its keys all take it. When omitted, the stream name is lower-cased and the
@@ -496,6 +674,8 @@ export interface EventStream<
  * `casing` will mean the schema's casing, as it does for indexes.
  *
  * @throws `[EDD-9027]` when `snapshot.every` is not a positive integer.
+ * @throws `[EDD-9062]` when `snapshot.mode` is neither `"after-append"` nor
+ *   `"inline"`.
  */
 export const makeStream = <
   const TEvents extends ReadonlyArray<Schema.Top>,
@@ -552,7 +732,7 @@ export const makeStream = <
   const compositeFields = config.streamId.composite
 
   // -------------------------------------------------------------------------
-  // Snapshot config validation (EDD-9027) — fail fast at definition time.
+  // Snapshot config validation (EDD-9027, EDD-9062) — fail fast at definition time.
   // -------------------------------------------------------------------------
 
   const snapshot = config.snapshot as SnapshotConfig | undefined
@@ -564,8 +744,21 @@ export const makeStream = <
       )
     }
   }
+  if (
+    snapshot !== undefined &&
+    snapshot.mode !== undefined &&
+    snapshot.mode !== "after-append" &&
+    snapshot.mode !== "inline"
+  ) {
+    throw new Error(
+      `[EDD-9062] EventStream "${config.streamName}": snapshot.mode must be "after-append" or ` +
+        `"inline"; received ${JSON.stringify(snapshot.mode)}.`,
+    )
+  }
   const snapshotSettings: SnapshotSettings | undefined =
-    snapshot === undefined ? undefined : { every: snapshot.every }
+    snapshot === undefined
+      ? undefined
+      : { mode: snapshot.mode ?? "after-append", every: snapshot.every }
 
   // Build union schema from event schemas for decoding
   const eventUnion: Schema.Top =
@@ -607,6 +800,13 @@ export const makeStream = <
    * The snapshot SK. Distinct entity-type label (`<stream>.snapshot` vs
    * `<stream>.event_1#…`), so it can never collide with an event SK, and it
    * sorts after every event in the partition.
+   *
+   * The three stream-owned SKs share `<prefix>#<label>.` and differ first at
+   * the literal suffix: `.command#<id>` < `.event_1#<version>` < `.snapshot`.
+   * The suffixes are lower-case, and a stream `casing` applies to all three
+   * alike (`"uppercase"` gives `.COMMAND` < `.EVENT_1` < `.SNAPSHOT`), so the
+   * order holds under every casing. `readLatest` relies on it: the range
+   * `[eventSkPrefix, snapshotSk]` holds exactly the events and the snapshot.
    */
   const snapshotSk = DynamoSchema.composeKey(schema, snapshotKeyLabel, [], keyOptions)
 
@@ -703,48 +903,272 @@ export const makeStream = <
   // append
   // ---------------------------------------------------------------------------
 
+  /** Encode snapshot state to wire form through the state schema. */
+  const encodeSnapshotState = (
+    state: unknown,
+    operation: string,
+  ): Effect.Effect<unknown, ValidationError> =>
+    Schema.encodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
+      state,
+    ).pipe(
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
+      ),
+    )
+
+  /**
+   * Map a failed `TransactWriteItems` of an append to its verdict. Resolves to
+   * the race a guarded additional put lost (so the transaction is built and
+   * written again), and fails with every other verdict.
+   */
+  const sendAppendTransaction = (
+    client: DynamoClientService,
+    tx: AppendTransaction,
+    streamIdStr: string,
+    commandId: string | undefined,
+  ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> =>
+    client.transactWriteItems({ TransactItems: tx.items }).pipe(
+      Effect.as(undefined),
+      Effect.catch(
+        (
+          error: DynamoClientError,
+        ): Effect.Effect<OptimisticLockError | ConcurrentModification, AppendError> => {
+          if (!isAwsTransactionCancelled(error.cause)) {
+            return Effect.fail(error)
+          }
+          const rawReasons = error.cause.CancellationReasons ?? []
+          const reasons = rawReasons.map((r) => ({
+            code: r?.Code,
+            message: r?.Message,
+          }))
+          const failedAt = (index: number): boolean =>
+            index >= 0 && reasons[index]?.code === "ConditionalCheckFailed"
+
+          // Precedence is ordered by how terminal the caller's response should
+          // be: a duplicate can never succeed on retry, a version conflict
+          // invites a re-read, and only then are the additional items judged.
+          if (commandId !== undefined && failedAt(tx.sentinelIndex)) {
+            return Effect.fail(
+              new DuplicateCommand({
+                streamName: config.streamName,
+                streamId: streamIdStr,
+                commandId,
+              }),
+            )
+          }
+
+          // The contiguity ConditionCheck and the event puts both mean "the
+          // stream is not where you said it was", so they share one verdict.
+          for (let i = 0; i < tx.guardCount + tx.eventCount; i++) {
+            if (failedAt(i)) {
+              return Effect.fail(
+                new VersionConflict({
+                  streamName: config.streamName,
+                  streamId: streamIdStr,
+                  expectedVersion: tx.baseVersion,
+                }),
+              )
+            }
+          }
+
+          // The additional items, attributed back to the caller OPS that
+          // produced them (several items can belong to one op). Only an op's
+          // own condition is `AdditionalItemConditionFailed`: a guarded put
+          // the caller set no condition on reports what the entity's own put
+          // would — a taken unique value, a history conflict — or, having
+          // lost a race to a concurrent write, is written again (#133).
+          if (tx.additional !== undefined) {
+            const judged = judgeCancellation(
+              tx.additional,
+              rawReasons,
+              tx.guardCount + tx.eventCount,
+            )
+            if (judged?._tag === "fail") return Effect.fail(judged.error)
+            if (judged?._tag === "conditions") {
+              return Effect.fail(
+                new AdditionalItemConditionFailed({
+                  streamName: config.streamName,
+                  streamId: streamIdStr,
+                  indices: judged.opIndices,
+                  reasons,
+                }),
+              )
+            }
+            if (judged?._tag === "retry") return Effect.succeed(judged.error)
+          }
+
+          // No conditional failure we can positionally justify (throttling,
+          // TransactionConflict, a reason at the inline snapshot's position, or
+          // a truncated/absent reason list) — never guess a VersionConflict.
+          return Effect.fail(
+            new TransactionCancelled({
+              operation: "TransactWriteItems",
+              reasons,
+              cause: error.cause,
+            }),
+          )
+        },
+      ),
+    )
+
+  /**
+   * Split a chunked append's events into the chunks written BEFORE its final
+   * one (#141), in order, each within DynamoDB's 100 items and 4 MB. Chunks
+   * are filled by the UPPER bound of the item-size rules
+   * `refuseOversizedTransaction` applies (`transactEntryBytes`), so a planned
+   * chunk never overfills; only the final chunk, when it is down to one event,
+   * is held to the lower bound the refusal uses.
+   *
+   * - The first chunk carries `firstChunkGuards` (the contiguity check on
+   *   `expectedVersion`, the sentinel ConditionCheck); every later one a
+   *   contiguity check on the previous chunk's last event.
+   * - Chunks are filled greedily until the remaining events fit the final
+   *   chunk together with `finalExtras` (additional items, sentinel Put, inline
+   *   snapshot), which always keeps at least one event.
+   *
+   * Fails — before anything is written — when the final chunk's items cannot
+   * fit alongside one event: `AppendTooLarge` for the item count,
+   * `ValidationError` for the size.
+   */
+  const planChunks = (spec: {
+    readonly eventItems: ReadonlyArray<TransactWriteItem>
+    readonly expectedVersion: number
+    readonly firstChunkGuards: ReadonlyArray<TransactWriteItem>
+    readonly contiguityCheck: (version: number) => TransactWriteItem
+    readonly finalExtras: ReadonlyArray<TransactWriteItem>
+    /** The final chunk with only the last event: the smallest it can be. */
+    readonly smallestFinal: () => AppendTransaction
+    readonly tooManyItems: (count: number) => AppendTooLarge
+  }): Effect.Effect<ReadonlyArray<AppendChunk>, AppendTooLarge | ValidationError> =>
+    Effect.gen(function* () {
+      const n = spec.eventItems.length
+      const smallest = spec.smallestFinal()
+      if (smallest.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+        return yield* spec.tooManyItems(smallest.items.length)
+      }
+      yield* refuseOversizedTransaction(smallest.items, smallest.targets, "EventStore.append")
+
+      const bytesOf = (items: ReadonlyArray<TransactWriteItem>) =>
+        items.reduce((sum, item) => sum + transactEntryBytes(item, "upper"), 0)
+      const eventBytes = spec.eventItems.map((item) => transactEntryBytes(item, "upper"))
+      /** `remaining[i]`: the bytes of the events from index `i` on. */
+      const remaining = new Array<number>(n + 1).fill(0)
+      for (let i = n - 1; i >= 0; i--) remaining[i] = remaining[i + 1]! + eventBytes[i]!
+      const extrasBytes = bytesOf(spec.finalExtras)
+      const fitsFinal = (from: number) =>
+        fitsOneTransaction(
+          1 + (n - from) + spec.finalExtras.length,
+          transactEntryBytes(spec.contiguityCheck(spec.expectedVersion + from), "upper") +
+            remaining[from]! +
+            extrasBytes,
+        )
+
+      // Every pass takes at least one event and never the last, so the loop
+      // ends by `n - 1`, where the final chunk is the smallest one — checked
+      // above.
+      const chunks: Array<AppendChunk> = []
+      let from = 0
+      while (from === 0 || (from < n - 1 && !fitsFinal(from))) {
+        const guards =
+          from === 0 ? spec.firstChunkGuards : [spec.contiguityCheck(spec.expectedVersion + from)]
+        let count = guards.length
+        let bytes = bytesOf(guards)
+        let to = from
+        while (to < n - 1 && fitsOneTransaction(count + 1, bytes + eventBytes[to]!)) {
+          count++
+          bytes += eventBytes[to]!
+          to++
+        }
+        if (to === from) {
+          // Unreachable for an event DynamoDB accepts (an item is at most
+          // 400 KB), but never loop on it.
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append",
+            cause:
+              `EventStore.append: the event at version ${spec.expectedVersion + from + 1} does ` +
+              "not fit one transaction. Nothing was written.",
+          })
+        }
+        chunks.push({ from, to })
+        from = to
+      }
+      return chunks
+    })
+
   const append = (
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<unknown> | undefined,
+    options?: AppendOptions<unknown, unknown> | undefined,
   ) =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
+      const snapshotState = options?.snapshot
+      const chunked = options?.chunked === true
+
+      if (snapshotState !== undefined && snapshot === undefined) {
+        return yield* snapshotUnavailable("append({ snapshot })")
+      }
 
       // Nothing at all to write — preserve the historical no-op fast path.
       // With additional items or a dedup sentinel the transaction still runs:
       // a caller who asked for a side write means it, and silently dropping it
       // would lose data.
-      if (events.length === 0 && additionalOps.length === 0 && idempotency === undefined) {
+      if (
+        events.length === 0 &&
+        additionalOps.length === 0 &&
+        idempotency === undefined &&
+        snapshotState === undefined
+      ) {
         return { version: expectedVersion, events: [] }
       }
 
       // Resolve stream ID string for storage (join composites)
       const streamIdStr = composeStreamIdString(streamId as Record<string, unknown>)
 
+      // An inline snapshot is unconditional because the event puts prove this
+      // writer owns its version. Without events nothing proves it, and an
+      // unconditional put could regress the snapshot.
+      if (snapshotState !== undefined && events.length === 0) {
+        return yield* new ValidationError({
+          entityType: snapshotEntityType,
+          operation: "EventStore.append.snapshot",
+          cause:
+            "An inline snapshot requires at least one event: nothing else proves the writer " +
+            `owns version ${expectedVersion}. Nothing was written.`,
+        })
+      }
+
       // Guard: every item the transaction will carry — one Put per event, the
       // items each caller-supplied additional op compiles to, the idempotency
-      // sentinel, and the version-contiguity ConditionCheck when
-      // expectedVersion > 0 — must fit DynamoDB's TransactWriteItems limit.
-      // Never chunk: chunking would break append atomicity.
+      // sentinel, the inline snapshot, and the version-contiguity
+      // ConditionCheck when expectedVersion > 0 — must fit DynamoDB's
+      // TransactWriteItems limit, unless the caller opted into `chunked`.
       //
       // This first check is a LOWER BOUND, counting one item per additional op.
       // Expansion (uniqueness sentinels, version snapshots — #113) only ever
       // adds items, so an append that already fails here can never fit, and
       // failing now keeps an oversized append free. The authoritative check runs
-      // once the ops are compiled, below.
+      // once the ops are compiled, below. A chunked append fails here only when
+      // its final chunk — the inline items, a contiguity check and one event —
+      // cannot fit.
       const needsContiguityCheck = expectedVersion > 0 && events.length > 0
-      const fixedItems =
-        events.length + (idempotency !== undefined ? 1 : 0) + (needsContiguityCheck ? 1 : 0)
+      const inlineItems =
+        (idempotency !== undefined ? 1 : 0) + (snapshotState !== undefined ? 1 : 0)
+      const fixedItems = events.length + inlineItems + (needsContiguityCheck ? 1 : 0)
       if (fixedItems + additionalOps.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-        return yield* new AppendTooLarge({
-          streamName: config.streamName,
-          streamId: streamIdStr,
-          count: fixedItems + additionalOps.length,
-          limit: TRANSACT_WRITE_ITEMS_LIMIT,
-        })
+        const smallestFinalChunk = additionalOps.length + inlineItems + 2
+        if (!chunked || events.length <= 1 || smallestFinalChunk > TRANSACT_WRITE_ITEMS_LIMIT) {
+          return yield* new AppendTooLarge({
+            streamName: config.streamName,
+            streamId: streamIdStr,
+            count:
+              chunked && events.length > 1 ? smallestFinalChunk : fixedItems + additionalOps.length,
+            limit: TRANSACT_WRITE_ITEMS_LIMIT,
+          })
+        }
       }
 
       const client = yield* DynamoClient
@@ -773,259 +1197,350 @@ export const makeStream = <
       // Events are encoded to wire form through their schema (codec symmetry
       // with the read path, which decodes through the same schema), so this is
       // an effectful build rather than a plain `map`.
-      const eventItems = yield* Effect.forEach(events, (event, i) =>
-        Effect.gen(function* () {
-          const version = expectedVersion + i + 1
-          // In Effect v4, Schema.Class instances don't have _tag as an own property.
-          // The identifier is on the constructor (class) itself.
-          const evtType =
-            ((event as Record<string, unknown>)._tag as string | undefined) ??
-            (event as { constructor: { identifier?: string } }).constructor.identifier ??
-            (event as { constructor: { name: string } }).constructor.name
+      const eventItems: ReadonlyArray<TransactWriteItem> = yield* Effect.forEach(
+        events,
+        (event, i) =>
+          Effect.gen(function* () {
+            const version = expectedVersion + i + 1
+            // In Effect v4, Schema.Class instances don't have _tag as an own property.
+            // The identifier is on the constructor (class) itself.
+            const evtType =
+              ((event as Record<string, unknown>)._tag as string | undefined) ??
+              (event as { constructor: { identifier?: string } }).constructor.identifier ??
+              (event as { constructor: { name: string } }).constructor.name
 
-          const wire = yield* encodeToWire(
-            memberSchemaFor(event) as Schema.Codec<any>,
-            event,
-            "EventStore.append",
-          )
+            const wire = yield* encodeToWire(
+              memberSchemaFor(event) as Schema.Codec<any>,
+              event,
+              "EventStore.append",
+            )
 
-          // Inject _tag for plain Schema.Class events; Schema.TaggedClass
-          // events already carry _tag in their encoded form, which wins.
-          const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
+            // Inject _tag for plain Schema.Class events; Schema.TaggedClass
+            // events already carry _tag in their encoded form, which wins.
+            const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
 
-          const item: Record<string, unknown> = {
-            pk,
-            sk: composeEventSk(version),
-            __edd_e__: entityType,
-            streamId: streamIdStr,
-            version,
-            eventType: evtType,
-            data: eventData,
-            timestamp: now,
-          }
-          if (encodedMetadata !== undefined) {
-            item.metadata = encodedMetadata
-          }
+            const item: Record<string, unknown> = {
+              pk,
+              sk: composeEventSk(version),
+              __edd_e__: entityType,
+              streamId: streamIdStr,
+              version,
+              eventType: evtType,
+              data: eventData,
+              timestamp: now,
+            }
+            if (encodedMetadata !== undefined) {
+              item.metadata = encodedMetadata
+            }
 
-          return {
-            Put: {
-              TableName: tableName,
-              Item: toAttributeMap(item),
-              ConditionExpression: "attribute_not_exists(pk)",
-            },
-          }
-        }),
+            return {
+              Put: {
+                TableName: tableName,
+                Item: toAttributeMap(item),
+                ConditionExpression: "attribute_not_exists(pk)",
+              },
+            }
+          }),
       )
+
+      // The idempotency sentinel: a guarded Put, plus — on the first chunk of a
+      // chunked append — a ConditionCheck on the same key, so a replay of a
+      // completed command fails with DuplicateCommand before anything is written.
+      let sentinelPut: TransactWriteItem | undefined
+      let sentinelCheck: TransactWriteItem | undefined
+      if (idempotency !== undefined) {
+        const sentinelSk = composeCommandSk(idempotency.commandId)
+        const sentinel: Record<string, unknown> = {
+          pk,
+          sk: sentinelSk,
+          __edd_e__: commandEntityType,
+          streamId: streamIdStr,
+          commandId: idempotency.commandId,
+          version: expectedVersion + events.length,
+          timestamp: now,
+        }
+        if (idempotency.ttl !== undefined) {
+          const ttlSeconds = yield* Effect.try({
+            try: () => normalizeTtlSeconds(idempotency.ttl as Duration.Duration | string),
+            catch: (cause) =>
+              new ValidationError({
+                entityType: commandEntityType,
+                operation: "EventStore.append.idempotency.ttl",
+                cause,
+              }),
+          })
+          sentinel[resolveTtlAttributeName(tableConfig)] =
+            DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
+        }
+        sentinelPut = {
+          Put: {
+            TableName: tableName,
+            Item: toAttributeMap(sentinel),
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        }
+        sentinelCheck = {
+          ConditionCheck: {
+            TableName: tableName,
+            Key: toAttributeMap({ pk, sk: sentinelSk }),
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        }
+      }
+
+      // The inline snapshot (#138): unconditional — see AppendOptions.snapshot.
+      let snapshotPut: TransactWriteItem | undefined
+      if (snapshotState !== undefined) {
+        const encoded = yield* encodeSnapshotState(snapshotState, "EventStore.append.snapshot")
+        snapshotPut = {
+          Put: {
+            TableName: tableName,
+            Item: toAttributeMap({
+              pk,
+              sk: snapshotSk,
+              __edd_e__: snapshotEntityType,
+              streamId: streamIdStr,
+              asOfVersion: expectedVersion + events.length,
+              state: encoded,
+              timestamp: now,
+            }),
+          },
+        }
+      }
+
+      /**
+       * Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
+       * only rejects STALE expected versions (the target slot already exists).
+       * An AHEAD expectedVersion (e.g. 10 when the stream is at 3) would
+       * silently write from version 11, leaving a permanent gap. Requiring the
+       * event at exactly the version a transaction appends after to exist keeps
+       * the appended range contiguous with the stream head. Its failure
+       * surfaces as a ConditionalCheckFailed cancellation reason, mapping to
+       * VersionConflict just like a stale-version Put failure.
+       */
+      const contiguityCheck = (version: number): TransactWriteItem => ({
+        ConditionCheck: {
+          TableName: tableName,
+          Key: toAttributeMap({ pk, sk: composeEventSk(version) }),
+          ConditionExpression: "attribute_exists(pk)",
+        },
+      })
+
+      /** Lay out one transaction of this append — see {@link AppendTransaction}. */
+      const layout = (spec: {
+        /** Event indices `[from, to)` this transaction writes. */
+        readonly from: number
+        readonly to: number
+        /** Contiguity-check the event at this version, if any. */
+        readonly checkVersion: number | undefined
+        readonly additional?: BuiltTransactWriteItems | undefined
+        readonly sentinel?: TransactWriteItem | undefined
+        readonly snapshot?: TransactWriteItem | undefined
+      }): AppendTransaction => {
+        const items: Array<TransactWriteItem> = []
+        const targets: Array<TransactItemTarget> = []
+        const pushStreamItem = (item: TransactWriteItem, type: string, source: string) => {
+          items.push(item)
+          targets.push(transactItemTarget(item, tableName, ["pk", "sk"], type, source))
+        }
+        if (spec.checkVersion !== undefined) {
+          pushStreamItem(
+            contiguityCheck(spec.checkVersion),
+            entityType,
+            "the version-contiguity check",
+          )
+        }
+        const guardCount = items.length
+        for (let i = spec.from; i < spec.to; i++) {
+          pushStreamItem(
+            eventItems[i]!,
+            entityType,
+            `the event at version ${expectedVersion + i + 1}`,
+          )
+        }
+        if (spec.additional !== undefined) {
+          items.push(...spec.additional.items)
+          targets.push(...spec.additional.targets)
+        }
+        const sentinelIndex = spec.sentinel === undefined ? -1 : items.length
+        if (spec.sentinel !== undefined) {
+          pushStreamItem(spec.sentinel, entityType, "the idempotency sentinel")
+        }
+        if (spec.snapshot !== undefined) {
+          pushStreamItem(spec.snapshot, snapshotEntityType, "the inline snapshot")
+        }
+        return {
+          items,
+          targets,
+          guardCount,
+          eventCount: spec.to - spec.from,
+          additional: spec.additional,
+          sentinelIndex,
+          baseVersion: expectedVersion + spec.from,
+        }
+      }
+
+      /** A transaction carrying more than DynamoDB's item cap. */
+      const tooManyItems = (count: number) =>
+        new AppendTooLarge({
+          streamName: config.streamName,
+          streamId: streamIdStr,
+          count,
+          limit: TRANSACT_WRITE_ITEMS_LIMIT,
+        })
+
+      const commandId = idempotency?.commandId
+      const done = { version: expectedVersion + events.length, events }
+
+      /** Events durably written by the chunks of a chunked append committed so far. */
+      let committed = 0
+      const partial = (cause: unknown) =>
+        new PartialAppend({
+          streamName: config.streamName,
+          streamId: streamIdStr,
+          expectedVersion,
+          committedVersion: expectedVersion + committed,
+          intendedVersion: expectedVersion + events.length,
+          cause,
+        })
+      /** After the first chunk commits, every failure is a PartialAppend. */
+      const afterFirstChunk = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        committed === 0 ? effect : Effect.mapError(effect, partial)
+
       // A guarded put among the additional items reads its item; a race with
-      // that read cancels the append, which is then built and written again.
+      // that read cancels the transaction carrying it, which is then built and
+      // written again. For a chunked append that is the final chunk alone.
       let lost: OptimisticLockError | ConcurrentModification | undefined
       for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
         // Caller-owned items, compiled through the same builder
         // `Transaction.transactWrite` uses, so the two APIs cannot drift.
-        const additional = yield* buildTransactWriteItems(
-          additionalOps,
-          "EventStore.append.additionalItems",
+        const additional = yield* afterFirstChunk(
+          buildTransactWriteItems(additionalOps, "EventStore.append.additionalItems"),
         )
-        const additionalItems = additional.items
 
-        // Authoritative cap check: one additional op can compile to several items
-        // (#113), so the pre-flight lower bound above is not sufficient. Reporting
-        // the EXPANDED count is the point — "you passed 40 items" when the caller
-        // passed 30 ops is baffling without it.
-        if (fixedItems + additionalItems.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-          return yield* new AppendTooLarge({
-            streamName: config.streamName,
-            streamId: streamIdStr,
-            count: fixedItems + additionalItems.length,
-            limit: TRANSACT_WRITE_ITEMS_LIMIT,
+        if (committed === 0) {
+          // The whole append as one transaction:
+          //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
+          //   [C, C + E)            event puts
+          //   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
+          //   then                  idempotency sentinel, then inline snapshot
+          //                         (last, so adding them never shifts the
+          //                         additional-item indices the caller sees)
+          //
+          // `A` is the count of EMITTED items, which is >= the number of caller
+          // ops: a guarded put (#133) expands into its item plus its sentinel
+          // reservations and releases plus a snapshot. The caller-facing
+          // `indices` on `AdditionalItemConditionFailed` are still indices into
+          // the caller's `additionalItems` array — `judgeCancellation` maps them.
+          const whole = layout({
+            from: 0,
+            to: events.length,
+            checkVersion: needsContiguityCheck ? expectedVersion : undefined,
+            additional,
+            sentinel: sentinelPut,
+            snapshot: snapshotPut,
           })
-        }
 
-        // Version-contiguity guard: `attribute_not_exists(pk)` on the event puts
-        // only rejects STALE expected versions (the target slot already exists).
-        // An AHEAD expectedVersion (e.g. 10 when the stream is at 3) would
-        // silently write from version 11, leaving a permanent gap. When
-        // expectedVersion > 0, require the event at exactly `expectedVersion` to
-        // exist so the appended range is contiguous with the stream head. Its
-        // failure surfaces as a ConditionalCheckFailed cancellation reason,
-        // mapping to VersionConflict below just like a stale-version Put failure.
-        //
-        // Only when events are actually being written: the guard exists to stop an
-        // AHEAD expectedVersion opening a permanent gap, and a zero-event append
-        // (pure `additionalItems` / sentinel side-write) writes no version and so
-        // can open no gap.
-        const contiguityCheck: Array<TransactWriteItem> = needsContiguityCheck
-          ? [
-              {
-                ConditionCheck: {
-                  TableName: tableName,
-                  Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
-                  ConditionExpression: "attribute_exists(pk)",
-                },
-              },
-            ]
-          : []
-
-        // Item layout is load-bearing — cancellation reasons are positional:
-        //   [0, C)                version-contiguity ConditionCheck (C is 0 or 1)
-        //   [C, C + E)            event puts
-        //   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
-        //   C + E + A             idempotency sentinel (last, so adding it never
-        //                         shifts the additional-item indices the caller sees)
-        //
-        // `A` is the count of EMITTED items, which is >= the number of caller ops:
-        // a guarded put (#133) expands into its item plus its sentinel
-        // reservations and releases plus a snapshot. The 1:1 "item index == caller
-        // index" assumption is gone, so the reason mapping below goes through
-        // `judgeCancellation` — the caller-facing `indices` on
-        // `AdditionalItemConditionFailed` are still indices into the caller's
-        // `additionalItems` array, unchanged.
-        const transactItems: Array<TransactWriteItem> = [
-          ...contiguityCheck,
-          ...eventItems,
-          ...additionalItems,
-        ]
-        const checkCount = contiguityCheck.length
-        const eventCount = eventItems.length
-        const sentinelIndex = idempotency !== undefined ? transactItems.length : -1
-
-        if (idempotency !== undefined) {
-          const sentinel: Record<string, unknown> = {
-            pk,
-            sk: composeCommandSk(idempotency.commandId),
-            __edd_e__: commandEntityType,
-            streamId: streamIdStr,
-            commandId: idempotency.commandId,
-            version: expectedVersion + events.length,
-            timestamp: now,
+          // Authoritative cap check: one additional op can compile to several
+          // items (#113), so the pre-flight lower bound above is not
+          // sufficient. Reporting the EXPANDED count is the point — "you
+          // passed 40 items" when the caller passed 30 ops is baffling without it.
+          if (!chunked && whole.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+            return yield* tooManyItems(whole.items.length)
           }
-          if (idempotency.ttl !== undefined) {
-            const ttlSeconds = yield* Effect.try({
-              try: () => normalizeTtlSeconds(idempotency.ttl as Duration.Duration | string),
-              catch: (cause) =>
-                new ValidationError({
-                  entityType: commandEntityType,
-                  operation: "EventStore.append.idempotency.ttl",
-                  cause,
-                }),
+
+          // Checked before anything is sent: one op per item — an additional
+          // item repeating an event, the contiguity check, the idempotency
+          // sentinel or the inline snapshot is refused, as additional items
+          // repeating each other are — and the transaction within DynamoDB's
+          // 4 MB (#133). A chunked append is checked as a whole too, so its
+          // chunks never repeat an item either.
+          yield* refuseRepeatedItems(whole.targets, "EventStore.append")
+          if (
+            !chunked ||
+            fitsOneTransaction(whole.items.length, measureTransaction(whole.items).total)
+          ) {
+            // Fits (or not chunked): exactly the atomic, one-request append.
+            yield* refuseOversizedTransaction(whole.items, whole.targets, "EventStore.append")
+            const outcome = yield* sendAppendTransaction(client, whole, streamIdStr, commandId)
+            if (outcome === undefined) return done
+            lost = outcome
+            continue
+          }
+
+          // Chunked, and too large for one transaction (#141): write every
+          // chunk but the final one now. The final chunk is written below, and
+          // alone is rebuilt if a guarded additional put loses a race.
+          const plan = yield* planChunks({
+            eventItems,
+            expectedVersion,
+            firstChunkGuards: [
+              ...(needsContiguityCheck ? [contiguityCheck(expectedVersion)] : []),
+              ...(sentinelCheck === undefined ? [] : [sentinelCheck]),
+            ],
+            contiguityCheck,
+            finalExtras: [
+              ...additional.items,
+              ...(sentinelPut === undefined ? [] : [sentinelPut]),
+              ...(snapshotPut === undefined ? [] : [snapshotPut]),
+            ],
+            smallestFinal: () =>
+              events.length <= 1
+                ? whole
+                : layout({
+                    from: events.length - 1,
+                    to: events.length,
+                    checkVersion: expectedVersion + events.length - 1,
+                    additional,
+                    sentinel: sentinelPut,
+                    snapshot: snapshotPut,
+                  }),
+            tooManyItems,
+          })
+
+          for (const [index, chunk] of plan.entries()) {
+            // The first chunk decides concurrency: its failure maps exactly as
+            // a non-chunked append's does, and nothing has been written.
+            const tx = layout({
+              from: chunk.from,
+              to: chunk.to,
+              checkVersion:
+                index === 0
+                  ? needsContiguityCheck
+                    ? expectedVersion
+                    : undefined
+                  : expectedVersion + chunk.from,
+              sentinel: index === 0 ? sentinelCheck : undefined,
             })
-            sentinel[resolveTtlAttributeName(tableConfig)] =
-              DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
-          }
-          transactItems.push({
-            Put: {
-              TableName: tableName,
-              Item: toAttributeMap(sentinel),
-              ConditionExpression: "attribute_not_exists(pk)",
-            },
-          })
-        }
-
-        // Checked before anything is sent: one op per item — an additional item
-        // repeating an event, the contiguity check or the idempotency sentinel
-        // is refused, as additional items repeating each other are — and the
-        // whole transaction within DynamoDB's 4 MB (#133).
-        const additionalStart = checkCount + eventCount
-        const streamItemSource = (i: number) =>
-          i < checkCount
-            ? "the version-contiguity check"
-            : i < additionalStart
-              ? `the event at version ${expectedVersion + i - checkCount + 1}`
-              : "the idempotency sentinel"
-        const targets = transactItems.map((item, i) =>
-          i >= additionalStart && i < additionalStart + additionalItems.length
-            ? additional.targets[i - additionalStart]!
-            : transactItemTarget(item, tableName, ["pk", "sk"], entityType, streamItemSource(i)),
-        )
-        yield* refuseRepeatedItems(targets, "EventStore.append")
-        yield* refuseOversizedTransaction(transactItems, targets, "EventStore.append")
-
-        const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-          Effect.as(undefined),
-          Effect.catch(
-            (
-              error: DynamoClientError,
-            ): Effect.Effect<OptimisticLockError | ConcurrentModification, AppendError> => {
-              if (!isAwsTransactionCancelled(error.cause)) {
-                return Effect.fail(error)
-              }
-              const rawReasons = error.cause.CancellationReasons ?? []
-              const reasons = rawReasons.map((r) => ({
-                code: r?.Code,
-                message: r?.Message,
-              }))
-              const failedAt = (index: number): boolean =>
-                index >= 0 && reasons[index]?.code === "ConditionalCheckFailed"
-
-              // Precedence is ordered by how terminal the caller's response should
-              // be: a duplicate can never succeed on retry, a version conflict
-              // invites a re-read, and only then are the additional items judged.
-              if (idempotency !== undefined && failedAt(sentinelIndex)) {
-                return Effect.fail(
-                  new DuplicateCommand({
-                    streamName: config.streamName,
-                    streamId: streamIdStr,
-                    commandId: idempotency.commandId,
-                  }),
-                )
-              }
-
-              // The contiguity ConditionCheck and the event puts both mean "the
-              // stream is not where you said it was", so they share one verdict.
-              for (let i = 0; i < checkCount + eventCount; i++) {
-                if (failedAt(i)) {
-                  return Effect.fail(
-                    new VersionConflict({
-                      streamName: config.streamName,
-                      streamId: streamIdStr,
-                      expectedVersion,
-                    }),
-                  )
-                }
-              }
-
-              // The additional items, attributed back to the caller OPS that
-              // produced them (several items can belong to one op). Only an op's
-              // own condition is `AdditionalItemConditionFailed`: a guarded put
-              // the caller set no condition on reports what the entity's own put
-              // would — a taken unique value, a history conflict — or, having
-              // lost a race to a concurrent write, is written again (#133).
-              const judged = judgeCancellation(additional, rawReasons, checkCount + eventCount)
-              if (judged?._tag === "fail") return Effect.fail(judged.error)
-              if (judged?._tag === "conditions") {
-                return Effect.fail(
-                  new AdditionalItemConditionFailed({
-                    streamName: config.streamName,
-                    streamId: streamIdStr,
-                    indices: judged.opIndices,
-                    reasons,
-                  }),
-                )
-              }
-              if (judged?._tag === "retry") return Effect.succeed(judged.error)
-
-              // No conditional failure we can positionally justify (throttling,
-              // TransactionConflict, or a truncated/absent reason list) — never
-              // guess a VersionConflict.
-              return Effect.fail(
-                new TransactionCancelled({
-                  operation: "TransactWriteItems",
-                  reasons,
-                  cause: error.cause,
-                }),
-              )
-            },
-          ),
-        )
-        if (outcome === undefined) {
-          return {
-            version: expectedVersion + events.length,
-            events,
+            yield* afterFirstChunk(sendAppendTransaction(client, tx, streamIdStr, commandId))
+            committed = chunk.to
           }
         }
+
+        // The final chunk of a chunked append: the remaining events, plus the
+        // additional items, the idempotency sentinel and the inline snapshot.
+        const outcome = yield* afterFirstChunk(
+          Effect.gen(function* () {
+            const final = layout({
+              from: committed,
+              to: events.length,
+              checkVersion: expectedVersion + committed,
+              additional,
+              sentinel: sentinelPut,
+              snapshot: snapshotPut,
+            })
+            if (final.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
+              return yield* tooManyItems(final.items.length)
+            }
+            yield* refuseRepeatedItems(final.targets, "EventStore.append")
+            yield* refuseOversizedTransaction(final.items, final.targets, "EventStore.append")
+            return yield* sendAppendTransaction(client, final, streamIdStr, commandId)
+          }),
+        )
+        if (outcome === undefined) return done
         lost = outcome
       }
-      return yield* Effect.fail(lost!)
+      return yield* Effect.fail(committed === 0 ? lost! : partial(lost!))
     })
 
   // ---------------------------------------------------------------------------
@@ -1124,18 +1639,7 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
       const now = DateTime.formatIso(yield* DateTime.now)
 
-      const encoded = yield* Schema.encodeUnknownEffect(snapshot.schema as Schema.Schema<unknown>)(
-        state,
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType: snapshotEntityType,
-              operation: "EventStore.writeSnapshot",
-              cause,
-            }),
-        ),
-      )
+      const encoded = yield* encodeSnapshotState(state, "EventStore.writeSnapshot")
 
       const item: Record<string, unknown> = {
         pk: composeStreamPk(streamId as Record<string, unknown>),
@@ -1165,6 +1669,29 @@ export const makeStream = <
         )
     }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
+  /**
+   * Decode a stored snapshot item. A snapshot that fails to decode through the
+   * state schema is a `ValidationError` — never silently discarded.
+   */
+  const decodeSnapshotItem = (
+    raw: Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<Snapshot<unknown>, ValidationError> =>
+    Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
+      raw.state,
+    ).pipe(
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
+      ),
+      Effect.map(
+        (state): Snapshot<unknown> => ({
+          state,
+          asOfVersion: raw.asOfVersion as number,
+          timestamp: raw.timestamp as string,
+        }),
+      ),
+    )
+
   const readSnapshot = (
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
@@ -1188,28 +1715,113 @@ export const makeStream = <
       })
 
       if (result.Item === undefined) return Option.none<Snapshot<unknown>>()
-
-      const raw = fromAttributeMap(result.Item)
-      const state = yield* Schema.decodeUnknownEffect(snapshot.schema as Schema.Schema<unknown>)(
-        raw.state,
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType: snapshotEntityType,
-              operation: "EventStore.readSnapshot",
-              cause,
-            }),
-        ),
+      return Option.some(
+        yield* decodeSnapshotItem(fromAttributeMap(result.Item), "EventStore.readSnapshot"),
       )
-
-      return Option.some<Snapshot<unknown>>({
-        state,
-        asOfVersion: raw.asOfVersion as number,
-        timestamp: raw.timestamp as string,
-      })
     }) as Effect.Effect<
       Option.Option<Snapshot<unknown>>,
+      DynamoClientError | ValidationError,
+      DynamoClient | TableConfig
+    >
+
+  // ---------------------------------------------------------------------------
+  // readLatest — snapshot + delta + head in one request (#138)
+  // ---------------------------------------------------------------------------
+
+  const readLatest = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
+  ): Effect.Effect<
+    LatestState<unknown, TEvent>,
+    DynamoClientError | ValidationError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      // Without a snapshot config there is nothing to read but the events.
+      if (snapshot === undefined) {
+        const events = yield* read(streamId, options)
+        return {
+          snapshot: Option.none<Snapshot<unknown>>(),
+          events,
+          version: events[events.length - 1]?.version ?? 0,
+        }
+      }
+
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+
+      // One reverse Query over `[first event SK, snapshot SK]`: the snapshot
+      // sorts after every event and the command sentinels before them (see
+      // `snapshotSk`), so the range holds exactly the events and the snapshot,
+      // and the snapshot is the first item evaluated. The `__edd_e__` filter is
+      // belt and braces — `Limit` counts items before it applies.
+      const base = {
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :first AND :snapshot",
+        FilterExpression: "#e IN (:eventType, :snapshotType)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk", "#e": "__edd_e__" },
+        ExpressionAttributeValues: toAttributeMap({
+          ":pk": composeStreamPk(streamId as Record<string, unknown>),
+          ":first": eventSkPrefix,
+          ":snapshot": snapshotSk,
+          ":eventType": entityType,
+          ":snapshotType": snapshotEntityType,
+        }),
+        ScanIndexForward: false,
+        ...(options?.consistentRead === true ? { ConsistentRead: true } : {}),
+      }
+
+      let snapshotRaw: Record<string, unknown> | undefined
+      /** Event items, newest first. */
+      const eventRaws: Array<Record<string, unknown>> = []
+      // The first page is sized for the snapshot plus a lag of up to `every`
+      // events, so a current (or modestly lagging) snapshot loads in one
+      // request.
+      let limit: number | undefined = (snapshot.every ?? 1) + 1
+      let startKey: Record<string, AttributeValue> | undefined
+      for (;;) {
+        const page = yield* client.query({
+          ...base,
+          ...(limit !== undefined ? { Limit: limit } : {}),
+          ...(startKey !== undefined ? { ExclusiveStartKey: startKey } : {}),
+        })
+        for (const item of page.Items ?? []) {
+          const raw = fromAttributeMap(item)
+          if (raw.__edd_e__ === snapshotEntityType) snapshotRaw = raw
+          else eventRaws.push(raw)
+        }
+        startKey = page.LastEvaluatedKey
+        if (startKey === undefined) break
+        // Without a snapshot (it would have been the first item evaluated),
+        // read on, unlimited, to the start of the stream.
+        if (snapshotRaw === undefined) {
+          limit = undefined
+          continue
+        }
+        // Done once an event at or below the snapshot's version has been seen:
+        // everything older is already folded into the snapshot. Otherwise read
+        // exactly the events down to it — versions are contiguous, so that is
+        // `oldest - asOfVersion` items (DynamoDB's 1 MB page cap aside).
+        const asOfVersion = snapshotRaw.asOfVersion as number
+        const oldest = eventRaws[eventRaws.length - 1]?.version as number | undefined
+        if (oldest !== undefined && oldest <= asOfVersion) break
+        limit = oldest === undefined ? undefined : Math.max(1, oldest - asOfVersion)
+      }
+
+      const latest =
+        snapshotRaw === undefined
+          ? Option.none<Snapshot<unknown>>()
+          : Option.some(yield* decodeSnapshotItem(snapshotRaw, "EventStore.readLatest"))
+      const asOfVersion = Option.isSome(latest) ? latest.value.asOfVersion : 0
+      const delta = eventRaws.filter((raw) => (raw.version as number) > asOfVersion).reverse()
+      const events = yield* Effect.forEach(delta, (raw) => decodeStreamEvent(raw))
+      return {
+        snapshot: latest,
+        events,
+        version: events[events.length - 1]?.version ?? asOfVersion,
+      }
+    }) as Effect.Effect<
+      LatestState<unknown, TEvent>,
       DynamoClientError | ValidationError,
       DynamoClient | TableConfig
     >
@@ -1287,6 +1899,7 @@ export const makeStream = <
     read,
     readFrom,
     currentVersion,
+    readLatest,
     query: queryNamespace,
     [StreamIdFormatter]: composeStreamIdString,
     [CommandSentinelProbe]: hasCommandSentinel,
@@ -1347,11 +1960,12 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
 
+  /** See {@link EventStream.append}. */
   append(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<TMetadata> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, never>
 
   /** See {@link EventStream.read}. */
@@ -1380,6 +1994,16 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, never>
+
+  /** See {@link EventStream.readLatest}. */
+  readLatest(
+    streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
+  ): Effect.Effect<
+    LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
+    DynamoClientError | ValidationError,
+    never
+  >
 
   readonly query: {
     events(
@@ -1443,6 +2067,7 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
       readFrom: (streamId, afterVersion, options) =>
         provide(stream.readFrom(streamId, afterVersion, options)),
       currentVersion: (streamId, options) => provide(stream.currentVersion(streamId, options)),
+      readLatest: (streamId, options) => provide(stream.readLatest(streamId, options)),
       query: stream.query,
       provide,
       [StreamIdFormatter]: (id: Record<string, unknown>) => formatStreamIdOf(stream, id),
@@ -1477,7 +2102,8 @@ export interface CommandHandlerOptions {
    * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
    * initial attempt). Omit for the default: no retry.
    *
-   * `DuplicateCommand` is deliberately NOT retried — it is terminal. Nor is any
+   * `DuplicateCommand` is deliberately NOT retried — it is terminal — and nor
+   * is `PartialAppend` (part of the decision is already written). Nor is any
    * call that supplies {@link CommandOptions.expectedVersion}: the caller asked
    * for a conditional write, so its `VersionConflict` is always surfaced.
    */
@@ -1493,9 +2119,17 @@ export interface CommandHandlerOptions {
    * against stale state and the append then fails with `VersionConflict` (or
    * burns a retry). A consistent load costs twice the read capacity of an
    * eventually consistent one. Set `false` to trade that for the occasional
-   * conflict. The snapshot read is always consistent.
+   * conflict. On a snapshot-configured stream the snapshot and its delta are
+   * one query ({@link EventStream.readLatest}), so the setting covers both.
    */
   readonly consistentRead?: boolean | undefined
+
+  /**
+   * Default for {@link CommandOptions.chunked}: split an append too large for
+   * one transaction across several — see {@link AppendOptions.chunked}. A
+   * per-call `chunked` overrides it. Default `false`.
+   */
+  readonly chunked?: boolean | undefined
 }
 
 /**
@@ -1596,6 +2230,15 @@ export interface CommandOptions<
    * `AdditionalItemConditionFailed` refer to the array it returned.
    */
   readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
+  /**
+   * Split this call's append across transactions when it is too large for
+   * one — see {@link AppendOptions.chunked}. Overrides the handler's
+   * {@link CommandHandlerOptions.chunked}. **Not atomic** past the first
+   * transaction: a failure after it surfaces as `PartialAppend`, which is
+   * never retried. The `additionalItems`, idempotency sentinel and inline
+   * snapshot ride on the final transaction.
+   */
+  readonly chunked?: boolean | undefined
 }
 
 /** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
@@ -1629,6 +2272,7 @@ type CommandHandlerErrors<E> =
   | E
   | VersionConflict
   | DuplicateCommand
+  | PartialAppend
   | AdditionalItemConditionFailed
   | AppendTooLarge
   | DynamoClientError
@@ -1775,28 +2419,27 @@ const makeCommandHandlerImpl = <
 
       const snapshotSettings = stream.snapshotConfig
 
-      // 1. Establish the base state + version — from a snapshot plus its delta
-      //    when the stream has snapshots enabled and one exists, otherwise from
-      //    a full replay.
+      // 1. Establish the base state + version. A snapshot-configured stream
+      //    loads its snapshot, the events after it and its head in one
+      //    request (#138); any other stream replays from the beginning.
       let state = decider.initialState
       let baseVersion = 0
       let snapshotAsOfVersion = 0
 
-      const snapshot =
-        snapshotSettings === undefined
-          ? Option.none<Snapshot<State>>()
-          : ((yield* stream.readSnapshot(streamId)) as Option.Option<Snapshot<State>>)
-
-      if (Option.isSome(snapshot)) {
-        snapshotAsOfVersion = snapshot.value.asOfVersion
-        baseVersion = snapshot.value.asOfVersion
-        state = snapshot.value.state
-        const delta = yield* stream.readFrom(streamId, snapshot.value.asOfVersion, readOptions)
-        for (const event of delta) {
+      if (snapshotSettings !== undefined) {
+        const latest = (yield* stream.readLatest(streamId, readOptions)) as LatestState<
+          State,
+          TEvent,
+          unknown
+        >
+        if (Option.isSome(latest.snapshot)) {
+          snapshotAsOfVersion = latest.snapshot.value.asOfVersion
+          state = latest.snapshot.value.state
+        }
+        for (const event of latest.events) {
           state = decider.evolve(state, event.data)
         }
-        const newest = delta[delta.length - 1]
-        if (newest !== undefined) baseVersion = newest.version
+        baseVersion = latest.version
       } else {
         const events = yield* stream.read(streamId, readOptions)
         for (const event of events) {
@@ -1861,13 +2504,16 @@ const makeCommandHandlerImpl = <
         version: baseVersion,
       })
 
-      // 7. Append with optimistic concurrency, plus the caller's items and the
-      //    dedup sentinel, all in one transaction. `baseVersion` equals any
+      // 7. Append with optimistic concurrency, plus the caller's items, the
+      //    dedup sentinel and an inline snapshot, all in one transaction (or,
+      //    chunked, with all three on the final one). `baseVersion` equals any
       //    caller-supplied `expectedVersion` here (checked in step 2).
       const appendOptions: {
         metadata?: TMetadata
         additionalItems?: ReadonlyArray<TransactWriteOp>
         idempotency?: AppendIdempotency
+        snapshot?: State
+        chunked?: boolean
       } = {}
       if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
       if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
@@ -1877,19 +2523,37 @@ const makeCommandHandlerImpl = <
             ? { commandId: callOptions.commandId, ttl: options.idempotency.ttl }
             : { commandId: callOptions.commandId }
       }
+      if ((callOptions?.chunked ?? options?.chunked) === true) appendOptions.chunked = true
+
+      // Inline snapshots (#138) ride in the append transaction: on every
+      // append, or once `every` events have accumulated since the snapshot.
+      const mode = snapshotSettings?.mode ?? "after-append"
+      const every = snapshotSettings?.every
+      const newVersion = baseVersion + newEvents.length
+      if (
+        snapshotSettings !== undefined &&
+        mode === "inline" &&
+        (every === undefined || newVersion - snapshotAsOfVersion >= every)
+      ) {
+        appendOptions.snapshot = next
+      }
 
       const result = yield* stream.append(
         streamId,
         newEvents,
         baseVersion,
-        appendOptions as AppendOptions<TMetadata>,
+        appendOptions as AppendOptions<TMetadata, any>,
       )
 
-      // 8. Auto-snapshot once the cadence threshold is crossed. Best-effort:
-      //    the events are already durable, so a snapshot-write failure must not
-      //    report the command as failed. The next threshold crossing retries it.
-      const every = snapshotSettings?.every
-      if (every !== undefined && result.version - snapshotAsOfVersion >= every) {
+      // 8. After-append snapshots, once the cadence threshold is crossed.
+      //    Best-effort: the events are already durable, so a snapshot-write
+      //    failure must not report the command as failed. The next threshold
+      //    crossing retries it.
+      if (
+        mode === "after-append" &&
+        every !== undefined &&
+        result.version - snapshotAsOfVersion >= every
+      ) {
         yield* stream
           .writeSnapshot(streamId, next, result.version)
           .pipe(
@@ -1917,8 +2581,9 @@ const makeCommandHandlerImpl = <
           // effect's *full* error union, and `Schedule` is contravariant on input.
           schedule: schedule as Schedule.Schedule<unknown, unknown>,
           // `VersionConflict` only. `DuplicateCommand` is terminal — the same
-          // commandId can never succeed — and `AdditionalItemConditionFailed`
-          // will not resolve itself by re-deciding either.
+          // commandId can never succeed — `AdditionalItemConditionFailed`
+          // will not resolve itself by re-deciding either, and a
+          // `PartialAppend` has already written part of the decision.
           while: (error: unknown) => error instanceof VersionConflict,
         })
   }
@@ -1957,6 +2622,9 @@ const makeCommandHandlerImpl = <
  * yield* handle({ matchId: "m-1" }, command, {
  *   additionalItems: ({ state }) => [Scoreboard.put({ matchId: "m-1", runs: state.runs })],
  * })
+ *
+ * // A command that may emit more events than one transaction holds
+ * yield* handle({ matchId: "m-1" }, importCommand, { chunked: true })
  * ```
  *
  * Each invocation runs
@@ -1964,15 +2632,22 @@ const makeCommandHandlerImpl = <
  *
  * - **Load.** Strongly consistent by default — see
  *   {@link CommandHandlerOptions.consistentRead}. When the stream declares a
- *   `snapshot` config, the snapshot is read and only the events after it are
- *   folded, instead of replaying the stream from the beginning.
+ *   `snapshot` config, state is loaded with {@link EventStream.readLatest} —
+ *   the snapshot, the events after it and the head in one request in steady
+ *   state — and only those events are folded, instead of replaying the stream
+ *   from the beginning.
  * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
  * - **Fold before append.** The new events are folded into state before the
  *   append, so the state returned, snapshotted and handed to a function-form
  *   `additionalItems` (see {@link Decision}) is always the `evolve` fold.
- * - **Snapshot.** With `snapshot.every` set, a fresh snapshot is written
- *   (best-effort) after a successful append once the cadence threshold is
- *   crossed.
+ * - **Snapshot.** With `snapshot.mode: "inline"`, the snapshot is written in
+ *   the append transaction itself — on every append, or at the `every`
+ *   cadence. With the default `"after-append"` and `snapshot.every` set, a
+ *   fresh snapshot is written (best-effort) after a successful append once the
+ *   cadence threshold is crossed. See {@link SnapshotMode}.
+ * - **Chunked.** `chunked: true` (handler default or per call) splits an
+ *   append too large for one transaction — see {@link AppendOptions.chunked}.
+ *   A `PartialAppend` is never retried.
  *
  * The handler is generic per call over the error and requirements of a
  * function-form `additionalItems` that returns an `Effect`: they join the

@@ -148,8 +148,9 @@ snapshot: { schema: StateSchema, mode: "inline", every: 10 }  // inline, at a ca
 snapshot: { schema: StateSchema, every: 100 }                 // mode "after-append" (default, today's behaviour)
 ```
 
-`SnapshotConfig.mode?: "after-append" | "inline"` defaults to `"after-append"`,
-and `SnapshotSettings` exposes `mode`.
+`SnapshotConfig.mode?: "after-append" | "inline"` (exported as `SnapshotMode`)
+defaults to `"after-append"`, and `SnapshotSettings` exposes `mode`. Any other
+value throws `[EDD-9062]` at `makeStream`.
 
 ### Append primitive
 
@@ -164,7 +165,11 @@ and `SnapshotSettings` exposes `mode`.
   for example) reports `TransactionCancelled`.
 - It counts towards the item and size limits.
 - On a stream without a `snapshot` config it dies with `[EDD-9026]`, as
-  `writeSnapshot` does.
+  `writeSnapshot` does. (Its type is `AppendOptions<TMetadata, TState>`'s
+  `TState`, which is `never` there, so typed callers cannot supply one.)
+- It requires at least one event. With none, nothing proves the writer owns
+  `asOfVersion`, so an append with a snapshot and no events fails with
+  `ValidationError` before anything is written. `undefined` means no snapshot.
 
 ### Handler behaviour
 
@@ -180,7 +185,8 @@ In every mode the snapshot state is the post-fold `state` (§3).
 
 ```ts
 stream.readLatest(streamId, options?: ReadOptions)
-  : Effect<{ snapshot: Option<Snapshot<TState>>; events: ReadonlyArray<StreamEvent<…>>; version: number }, …>
+  : Effect<LatestState<TState, TEvent, M>, DynamoClientError | ValidationError, …>
+// LatestState = { snapshot: Option<Snapshot<TState>>; events: ReadonlyArray<StreamEvent<…>>; version: number }
 ```
 
 `events` holds the events after the snapshot (all events when there is none),
@@ -194,11 +200,23 @@ Implementation:
    `sk BETWEEN <first event SK> AND <snapshot SK>`, `__edd_e__ IN (event, snapshot)`.
    - The snapshot SK sorts after every event, and command sentinels
      (`.command`) sort before `.event`, so the range holds exactly the events
-     plus the snapshot.
+     plus the snapshot. Verified against `DynamoSchema`'s key formats: the
+     three SKs share `<prefix>#<label>.` and first differ at the literal
+     suffix (`command#<id>` < `event_1#<version>` < `snapshot`). A stream or
+     schema `casing` applies to all three alike (`"uppercase"` gives
+     `COMMAND` < `EVENT_1` < `SNAPSHOT`; `"preserve"` keeps the lower-case
+     suffixes), so the order holds under every casing. A unit test asserts it
+     for every schema × stream casing combination.
+   - The lower bound is the event SK prefix (`<label>.event_1#`), which sorts
+     before the first event and after every sentinel.
    - First page `Limit`: `(every ?? 1) + 1`.
-2. Keep paging, without a `Limit`, until an event at `version <= asOfVersion`
-   has been seen or the partition is exhausted. When there is no snapshot, page
-   to the start.
+2. Keep paging until an event at `version <= asOfVersion` has been seen or the
+   partition is exhausted. When there is no snapshot (it would have been the
+   first item evaluated), page to the start without a `Limit`. When there is
+   one, each further page's `Limit` is the number of events still missing,
+   `oldestSeen - asOfVersion` (versions are contiguous), so a snapshot lagging
+   past the first page costs exactly one more request (DynamoDB's 1 MB page cap
+   aside) rather than reading the rest of the partition.
 3. Decode the snapshot through the state schema. Decode failure is a
    `ValidationError`, as `readSnapshot` reports.
 4. Drop events at or below `asOfVersion`, and return the rest ascending.
@@ -208,7 +226,7 @@ Request counts:
 - A current inline snapshot loads in one request.
 - A lagging snapshot (data written before `inline` was enabled, or an
   `after-append` cadence) still loads in one request whenever the lag fits the
-  first page.
+  first page, and in two otherwise.
 
 `commandHandler` uses `readLatest` for **every** snapshot-configured stream,
 whatever the mode, consistent by default. Streams without a snapshot config
@@ -232,6 +250,15 @@ With `chunked: true`:
 2. **Splitting.** Otherwise events are split, in order, into chunks that each
    fit 100 items and 4 MB, counting each chunk's guard items. Chunks are
    written at successive versions, sequentially.
+   - "Fits in one" is the same lower-bound size measure the non-chunked
+     4 MB refusal uses (`measureTransaction` in `internal/TransactWriteOps.ts`),
+     so anything a non-chunked append would send is sent unchanged.
+   - Chunks are filled greedily by the **upper** bound of the same item-size
+     rules (`transactEntryBytes(item, "upper")`, shared with the refusal), so a
+     planned chunk never overfills, until the remaining events fit the final
+     chunk with its inline items.
+   - The whole append is checked for repeated items (`refuseRepeatedItems`)
+     before anything is written, exactly as a non-chunked one.
 3. **First chunk.** It carries the version-contiguity `ConditionCheck` on
    `expectedVersion` (when > 0) and the event puts (`attribute_not_exists`).
    With idempotency it also carries a
@@ -248,11 +275,15 @@ With `chunked: true`:
    inline snapshot (§4), and the idempotency sentinel `Put`. Read models
    therefore never show a partially written command.
    - The final chunk reserves room for these items. If they cannot fit
-     alongside at least one event, the call fails with `AppendTooLarge` before
-     anything is written.
+     alongside at least one event, the call fails before anything is written:
+     with `AppendTooLarge` for the item count (`count` is the size of that
+     smallest final chunk), or with `ValidationError` for the 4 MB size, as a
+     non-chunked oversized append does (`AppendTooLarge` carries only a count).
    - `additionalItems` expansion (guarded puts, #133) is accounted for. Its
      cancellation mapping (`AdditionalItemConditionFailed`, guarded-put retry
-     and verdicts) runs on the final chunk.
+     and verdicts) runs on the final chunk. A guarded put that loses a race
+     rebuilds and resends the final chunk alone; earlier chunks are never
+     resent.
 6. **Failure after chunk 1.** Any failure of chunk k ≥ 2, whether a condition
    (another writer slipped in), an item condition, a transport error or
    anything else, surfaces as a new error:
@@ -269,6 +300,11 @@ With `chunked: true`:
 
    `PartialAppend` is never retried by `commandHandler`, and it is added to
    `AppendError` and the handler's error channel.
+   - A `VersionConflict` in `cause` carries the failing chunk's base version
+     (`committedVersion`) as its `expectedVersion`.
+   - When `cause` is a transport error, the failing chunk's own outcome is
+     unknown (DynamoDB may have committed it), so `committedVersion` is the
+     last version *known* to be written. The JSDoc says so.
 7. **Not atomic.** This must be stated plainly in JSDoc and the docs:
    - Between chunks another writer can append, which aborts the remainder with
      `PartialAppend`.
@@ -306,7 +342,7 @@ const Entries = EventStore.makeStream({
   - `undefined` leaves the event out of the index (sparse).
   - An empty string is a `ValidationError` at append time, because DynamoDB
     rejects empty key values.
-- **Definition-time validation** (thrown errors, new `EDD-` codes from 9062):
+- **Definition-time validation** (thrown errors, new `EDD-` codes from 9063 — 9062 is `snapshot.mode`, §4):
   - Index attribute names must not collide with stream-owned attributes
     (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
     `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, and the TTL
@@ -354,10 +390,12 @@ conflicting definitions of the same physical index.
 |---|---|
 | `VersionConflict.actualVersion?: number` | `packages/schema/src/Errors.ts` |
 | `PartialAppend` (new tagged error) | `packages/schema/src/Errors.ts`, re-exported |
-| `ReadOptions`, `Decision`, `readLatest`, `readIndex`, `query.index`, `indexDefinitions` | `EventStore.ts` |
+| `ReadOptions`, `Decision`, `readLatest` / `LatestState`, `SnapshotMode`, `readIndex`, `query.index`, `indexDefinitions` | `EventStore.ts` |
 | `CommandOptions.expectedVersion` / `chunked`, function form of `additionalItems` | `EventStore.ts` |
 | `CommandHandlerOptions.consistentRead` / `chunked` | `EventStore.ts` |
-| `AppendOptions.snapshot` / `chunked`, `SnapshotConfig.mode` | `EventStore.ts` |
+| `AppendOptions.snapshot` / `chunked` (`AppendOptions` gains a `TState` parameter, default `never`), `SnapshotConfig.mode` | `EventStore.ts` |
+| `transactEntryBytes` / `measureTransaction` / `fitsOneTransaction` (shared size measure, lower or upper bound) | `internal/TransactWriteOps.ts` |
+| `[EDD-9062]` — invalid `snapshot.mode` | `EventStore.ts` (`makeStream`) |
 
 ## 8. Out of scope — #142 (read-only `decide` state)
 

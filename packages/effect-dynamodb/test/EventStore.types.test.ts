@@ -7,14 +7,22 @@
  *   handler. The static and pure forms add nothing.
  * - `idempotency` keeps the options parameter (and `commandId`) required, with
  *   every `additionalItems` form, in all four call shapes.
+ * - `readLatest` (#138) returns the stream's snapshot state type; an inline
+ *   `AppendOptions.snapshot` is typed by it (and refused on a snapshot-less
+ *   stream); `chunked` (#141) is accepted per call and per handler, and
+ *   `PartialAppend` joins the append and handler error channels.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type { ValidationError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
-import { Context, Data, Effect, Schema } from "effect"
+import type {
+  PartialAppend,
+  ValidationError,
+  VersionConflict,
+} from "@effect-dynamodb/schema/Errors.js"
+import { Context, Data, Effect, type Option, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -278,6 +286,52 @@ describe("EventStore.commandHandler types", () => {
       handle(key, command, { expectedVersion: undefined })
       // @ts-expect-error — expectedVersion is a number
       handle(key, command, { expectedVersion: "3" })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("readLatest, inline snapshots and chunked appends are typed (#138, #141)", () => {
+    typeOnly(() => {
+      const Snapshotted = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Snapshotted",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        snapshot: { schema: Schema.Struct({ total: Schema.Number }), mode: "inline", every: 5 },
+      })
+      const latest = Snapshotted.readLatest(key, { consistentRead: true })
+      expectTypeOf<Effect.Success<typeof latest>["snapshot"]>().toEqualTypeOf<
+        Option.Option<EventStore.Snapshot<{ readonly total: number }>>
+      >()
+      expectTypeOf<
+        Effect.Success<typeof latest>["events"][number]["data"]
+      >().toEqualTypeOf<Incremented>()
+      expectTypeOf<Effect.Success<typeof latest>["version"]>().toEqualTypeOf<number>()
+
+      // An inline snapshot is the stream's state type...
+      const appended = Snapshotted.append(key, [new Incremented({ by: 1 })], 0, {
+        snapshot: { total: 1 },
+        chunked: true,
+      })
+      expectTypeOf<Effect.Error<typeof appended>>().toExtend<
+        EventStore.AppendError | PartialAppend
+      >()
+      expectTypeOf<PartialAppend>().toExtend<Effect.Error<typeof appended>>()
+      // @ts-expect-error — not the state type
+      Snapshotted.append(key, [new Incremented({ by: 1 })], 0, { snapshot: { label: "x" } })
+      // ...and there is none on a stream without a snapshot config.
+      // @ts-expect-error — `never` on a snapshot-less stream
+      Counter.append(key, [new Incremented({ by: 1 })], 0, { snapshot: { total: 1 } })
+
+      const handle = EventStore.commandHandler(decider, Counter, { chunked: true })
+      const handled = handle(key, command, { chunked: false })
+      expectTypeOf<PartialAppend>().toExtend<Effect.Error<typeof handled>>()
+
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Snapshotted)
+        const boundLatest = bound.readLatest(key)
+        expectTypeOf<Effect.Services<typeof boundLatest>>().toEqualTypeOf<never>()
+      })
     })
     expect(true).toBe(true)
   })

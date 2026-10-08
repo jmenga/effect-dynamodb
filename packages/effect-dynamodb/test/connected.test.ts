@@ -49,6 +49,7 @@ import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import type {
   AdditionalItemConditionFailed,
   DuplicateCommand,
+  PartialAppend,
   UniqueConstraintViolation,
   ValidationError,
   VersionConflict,
@@ -7836,7 +7837,7 @@ describeConnected("EventStore snapshots + retry (closes #84)", () => {
   it.effect("bind carries the snapshot primitives with R = never", () =>
     Effect.gen(function* () {
       const bound = yield* EventStore.bind(SnapLedger)
-      expect(bound.snapshotConfig).toEqual({ every: 3 })
+      expect(bound.snapshotConfig).toEqual({ mode: "after-append", every: 3 })
 
       const program: Effect.Effect<number, unknown, never> = Effect.gen(function* () {
         yield* bound.writeSnapshot({ accountId: "bind-1" }, { balance: 11, txCount: 1 }, 1)
@@ -8880,6 +8881,498 @@ describeConnected("EventStore command path (#139, #136, #137)", () => {
       const tally = yield* EsCmdTallies.get({ accountId: "proj-5" })
       expect(tally.balance).toBe(9)
     }).pipe(provideEsCmd),
+  )
+})
+
+// ===========================================================================
+// EventStore inline snapshots + single-request state load (#138), opt-in
+// chunked append (#141)
+// ===========================================================================
+
+const esLatSchema = DynamoSchema.make({ name: "es-lat", version: 1 })
+const esLatTableName = `es-lat-${Date.now()}`
+
+/** Inline projection carried by a chunked command's final transaction. */
+class EsLatTally extends Schema.Class<EsLatTally>("EsLatTally")({
+  accountId: Schema.String,
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const EsLatTallies = Entity.make({
+  model: EsLatTally,
+  entityType: "EsLatTally",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsLatTable = Table.make({ schema: esLatSchema, entities: { EsLatTallies } })
+
+const EsLatState = Schema.Struct({ balance: Schema.Number, txCount: Schema.Number })
+
+const esLatStream = (
+  streamName: string,
+  snapshot?: { readonly mode?: "inline" | "after-append"; readonly every?: number },
+) =>
+  EventStore.makeStream({
+    table: EsLatTable,
+    streamName,
+    events: [EsCmdDeposited, EsCmdWithdrew],
+    streamId: { composite: ["accountId"] },
+    snapshot: { schema: EsLatState, ...snapshot },
+  })
+
+/** Inline snapshot on every append. */
+const EsLedger = esLatStream("Ledger", { mode: "inline" })
+/** Inline snapshot every 5 events. */
+const EsBatched = esLatStream("Batched", { mode: "inline", every: 5 })
+/** After-append snapshots every 3 events — later switched to inline. */
+const EsLegacy = esLatStream("Legacy", { every: 3 })
+const EsLegacyInline = esLatStream("Legacy", { mode: "inline" })
+/** Chunked appends, with inline snapshots. */
+const EsBulk = esLatStream("Bulk", { mode: "inline" })
+/** No snapshot config at all. */
+const EsPlain = EventStore.makeStream({
+  table: EsLatTable,
+  streamName: "Plain",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** No snapshot config; events carry (large) metadata. */
+const EsPlainMeta = EventStore.makeStream({
+  table: EsLatTable,
+  streamName: "PlainMeta",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+  metadata: Schema.Struct({ note: Schema.String }),
+})
+
+/** A decider that deposits `amount` one unit at a time — a command of `amount` events. */
+const esBulkDecider: EventStore.Decider<EsCmdState, number, EsCmdEvent> = {
+  initialState: { balance: 0, txCount: 0 },
+  decide: (count) =>
+    Effect.succeed(Array.from({ length: count }, () => new EsCmdDeposited({ amount: 1 }))),
+  evolve: (state, event) =>
+    event instanceof EsCmdDeposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+}
+
+/** Every request this suite sends, with the partition it targets. */
+const esLatLog: Array<{
+  readonly op: "query" | "transactWriteItems" | "putItem" | "getItem"
+  readonly pk: string | undefined
+  readonly items?: ReadonlyArray<Record<string, unknown>>
+}> = []
+
+/**
+ * Runs before a `TransactWriteItems` is forwarded — with the raw client, so a
+ * test can play "another writer" between two chunks of a chunked append.
+ */
+let esLatBeforeTransact:
+  | ((
+      raw: DynamoClientService,
+      items: ReadonlyArray<Record<string, unknown>>,
+    ) => Effect.Effect<void, unknown>)
+  | undefined
+
+/** The stream partition a transact item touches. */
+const transactPk = (item: Record<string, any>): string | undefined => {
+  const entry = item.Put?.Item ?? item.ConditionCheck?.Key ?? item.Delete?.Key ?? item.Update?.Key
+  return entry?.pk?.S
+}
+
+const EsLatClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        esLatLog.push({ op: "query", pk: input.ExpressionAttributeValues?.[":pk"]?.S })
+        return client.query(input)
+      },
+      getItem: (input) => {
+        esLatLog.push({ op: "getItem", pk: input.Key?.pk?.S })
+        return client.getItem(input)
+      },
+      putItem: (input) => {
+        esLatLog.push({ op: "putItem", pk: input.Item?.pk?.S })
+        return client.putItem(input)
+      },
+      transactWriteItems: (input) => {
+        const items = (input.TransactItems ?? []) as unknown as ReadonlyArray<
+          Record<string, unknown>
+        >
+        esLatLog.push({
+          op: "transactWriteItems",
+          pk: items.map(transactPk).find((pk) => pk?.includes("#v1#") === true),
+          items,
+        })
+        const before = esLatBeforeTransact
+        return before === undefined
+          ? client.transactWriteItems(input)
+          : Effect.orDie(before(client, items)).pipe(
+              Effect.andThen(client.transactWriteItems(input)),
+            )
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsLatLayer = Layer.mergeAll(EsLatClientLayer, EsLatTable.layer({ name: esLatTableName }))
+const provideEsLat = Effect.provide(EsLatLayer)
+
+/** The requests sent to one stream's partition (`label` is the lower-cased stream name). */
+const esLatRequests = (label: string, accountId: string) =>
+  esLatLog.filter((entry) => entry.pk === `$es-lat#v1#${label}#${accountId}`)
+
+const esLatDeposits = (n: number) =>
+  Array.from({ length: n }, () => new EsCmdDeposited({ amount: 1 }))
+
+describeConnected("EventStore inline snapshots and chunked append (#138, #141)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esLatTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsLatTable),
+        })
+      }).pipe(provideEsLat, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esLatTableName })
+      }).pipe(
+        provideEsLat,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  beforeEach(() => {
+    esLatBeforeTransact = undefined
+  })
+
+  // -------------------------------------------------------------------------
+  // #138 — inline snapshots + readLatest
+  // -------------------------------------------------------------------------
+
+  it.effect("#138 an inline snapshot is current after every command", () =>
+    Effect.gen(function* () {
+      const accountId = "inline-1"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger)
+
+      const commands: ReadonlyArray<EsCmdCommand> = [
+        { _tag: "Deposit", amount: 40 },
+        { _tag: "Withdraw", amount: 15 },
+        { _tag: "Deposit", amount: 5 },
+      ]
+      for (const command of commands) {
+        const result = yield* handle(key, command)
+        const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+        expect(snapshot.asOfVersion).toBe(result.version)
+        expect(snapshot.state).toEqual(result.state)
+      }
+      expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).state).toEqual({
+        balance: 30,
+        txCount: 3,
+      })
+
+      // The snapshot rode in each append transaction: no separate write, and
+      // each command was one load plus one transaction.
+      const requests = esLatRequests("ledger", accountId)
+      expect(requests.filter((r) => r.op === "putItem")).toHaveLength(0)
+      expect(requests.filter((r) => r.op === "transactWriteItems")).toHaveLength(3)
+      expect(requests.filter((r) => r.op === "query")).toHaveLength(3)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 readLatest loads state in one request in steady state", () =>
+    Effect.gen(function* () {
+      const accountId = "inline-2"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger)
+      for (let i = 0; i < 6; i++) yield* handle(key, { _tag: "Deposit", amount: 1 })
+
+      const before = esLatRequests("ledger", accountId).length
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      const after = esLatRequests("ledger", accountId).slice(before)
+      expect(after.map((r) => r.op)).toEqual(["query"])
+      expect(Option.getOrThrow(latest.snapshot).asOfVersion).toBe(6)
+      expect(latest.events).toEqual([])
+      expect(latest.version).toBe(6)
+
+      // A command loads in one request too, then writes in one transaction.
+      const mark = esLatRequests("ledger", accountId).length
+      const result = yield* handle(key, { _tag: "Withdraw", amount: 2 })
+      expect(result.state).toEqual({ balance: 4, txCount: 7 })
+      expect(
+        esLatRequests("ledger", accountId)
+          .slice(mark)
+          .map((r) => r.op),
+      ).toEqual(["query", "transactWriteItems"])
+
+      // Bound streams expose it with R = never.
+      const bound = yield* EventStore.bind(EsLedger)
+      expect((yield* bound.readLatest(key)).version).toBe(7)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 falls back when the snapshot is missing", () =>
+    Effect.gen(function* () {
+      const accountId = "missing-1"
+      const key = { accountId }
+      // Events written without any snapshot.
+      yield* EsLedger.append(key, esLatDeposits(4), 0)
+
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      expect(Option.isNone(latest.snapshot)).toBe(true)
+      expect(latest.events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      expect(latest.version).toBe(4)
+
+      // The handler folds the full stream, then writes the snapshot inline.
+      const result = yield* EventStore.commandHandler(esCmdDecider(accountId), EsLedger)(key, {
+        _tag: "Deposit",
+        amount: 10,
+      })
+      expect(result).toMatchObject({ version: 5, state: { balance: 14, txCount: 5 } })
+      const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+      expect(snapshot).toMatchObject({ asOfVersion: 5, state: { balance: 14, txCount: 5 } })
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a lagging snapshot loads within the first page, or one page more", () =>
+    Effect.gen(function* () {
+      const accountId = "lag-1"
+      const key = { accountId }
+      // Snapshot at v2, head at v12: ten events behind, past `every: 5`.
+      yield* EsBatched.append(key, esLatDeposits(2), 0)
+      yield* EsBatched.writeSnapshot(key, { balance: 2, txCount: 2 }, 2)
+      yield* EsBatched.append(key, esLatDeposits(10), 2)
+
+      const mark = esLatRequests("batched", accountId).length
+      const lagging = yield* EsBatched.readLatest(key, { consistentRead: true })
+      expect(esLatRequests("batched", accountId).slice(mark)).toHaveLength(2)
+      expect(Option.getOrThrow(lagging.snapshot).asOfVersion).toBe(2)
+      expect(lagging.events.map((e) => e.version)).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+      expect(lagging.version).toBe(12)
+
+      // The handler folds snapshot + delta, and — 13 - 2 >= 5 — snapshots inline.
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsBatched)
+      const result = yield* handle(key, { _tag: "Deposit", amount: 1 })
+      expect(result).toMatchObject({ version: 13, state: { balance: 13, txCount: 13 } })
+      expect(Option.getOrThrow(yield* EsBatched.readSnapshot(key)).asOfVersion).toBe(13)
+
+      // Lagging by less than `every`: still one request.
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      const mark2 = esLatRequests("batched", accountId).length
+      const within = yield* EsBatched.readLatest(key, { consistentRead: true })
+      expect(esLatRequests("batched", accountId).slice(mark2)).toHaveLength(1)
+      expect(within.events.map((e) => e.version)).toEqual([14, 15])
+      expect(within.version).toBe(15)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a pre-existing after-append stream switched to inline", () =>
+    Effect.gen(function* () {
+      const accountId = "switch-1"
+      const key = { accountId }
+      const legacy = EventStore.commandHandler(esCmdDecider(accountId), EsLegacy)
+      for (let i = 0; i < 4; i++) yield* legacy(key, { _tag: "Deposit", amount: 10 })
+      // after-append, every 3: the snapshot was written by a separate put at v3.
+      expect(Option.getOrThrow(yield* EsLegacy.readSnapshot(key)).asOfVersion).toBe(3)
+      expect(esLatRequests("legacy", accountId).filter((r) => r.op === "putItem")).toHaveLength(1)
+
+      // Same stream, now inline: the first command catches the lag up...
+      const inline = EventStore.commandHandler(esCmdDecider(accountId), EsLegacyInline)
+      const first = yield* inline(key, { _tag: "Withdraw", amount: 5 })
+      expect(first).toMatchObject({ version: 5, state: { balance: 35, txCount: 5 } })
+      expect(Option.getOrThrow(yield* EsLegacyInline.readSnapshot(key)).asOfVersion).toBe(5)
+
+      // ...and from then on a command is one load and one transaction.
+      const mark = esLatRequests("legacy", accountId).length
+      const second = yield* inline(key, { _tag: "Deposit", amount: 1 })
+      expect(second.state).toEqual({ balance: 36, txCount: 6 })
+      expect(
+        esLatRequests("legacy", accountId)
+          .slice(mark)
+          .map((r) => r.op),
+      ).toEqual(["query", "transactWriteItems"])
+    }).pipe(provideEsLat),
+  )
+
+  // -------------------------------------------------------------------------
+  // #141 — chunked append
+  // -------------------------------------------------------------------------
+
+  it.effect("#141 250 events with chunked: true commit in three contiguous transactions", () =>
+    Effect.gen(function* () {
+      const accountId = "chunk-1"
+      const key = { accountId }
+
+      const result = yield* EsBulk.append(key, esLatDeposits(250), 0, { chunked: true })
+      expect(result.version).toBe(250)
+
+      const transacts = esLatRequests("bulk", accountId).filter(
+        (r) => r.op === "transactWriteItems",
+      )
+      expect(transacts.map((t) => t.items?.length)).toEqual([100, 100, 52])
+      const events = yield* EsBulk.read(key, { consistentRead: true })
+      expect(events.map((e) => e.version)).toEqual(Array.from({ length: 250 }, (_, i) => i + 1))
+      expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(250)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "#141 the final chunk carries the projection, the snapshot and the sentinel; a replay is a DuplicateCommand",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "chunk-2"
+        const key = { accountId }
+        const handle = EventStore.commandHandler(esBulkDecider, EsBulk, {
+          idempotency: {},
+          chunked: true,
+        })
+        const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+          EsLatTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+        ]
+
+        const result = yield* handle(key, 150, { commandId: "bulk-1", additionalItems: project })
+        expect(result).toMatchObject({ version: 150, state: { balance: 150, txCount: 150 } })
+
+        const transacts = esLatRequests("bulk", accountId).filter(
+          (r) => r.op === "transactWriteItems",
+        )
+        expect(transacts).toHaveLength(2)
+        // Chunk 1 ends with the sentinel's ConditionCheck.
+        const first = transacts[0]!.items!
+        expect((first[first.length - 1] as any).ConditionCheck.ConditionExpression).toBe(
+          "attribute_not_exists(pk)",
+        )
+        // The final chunk ends with the projection, the sentinel and the snapshot.
+        const final = transacts[1]!.items!
+        const tail = final
+          .slice(-3)
+          .map((item) => fromAttributeMap((item as any).Put.Item).__edd_e__)
+        expect(tail).toEqual(["EsLatTally", "bulk.command", "bulk.snapshot"])
+
+        // All three are durable.
+        const tally = yield* EsLatTallies.get({ accountId })
+        expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(result.state)
+        const snapshot = Option.getOrThrow(yield* EsBulk.readSnapshot(key))
+        expect(snapshot).toMatchObject({ asOfVersion: 150, state: result.state })
+
+        // A replay fails on the first chunk's sentinel check: nothing written.
+        const replay = yield* handle(key, 150, {
+          commandId: "bulk-1",
+          additionalItems: project,
+        }).pipe(Effect.flip)
+        expect(replay._tag).toBe("DuplicateCommand")
+        const direct = yield* EsBulk.append(key, esLatDeposits(150), 150, {
+          chunked: true,
+          idempotency: { commandId: "bulk-1" },
+        }).pipe(Effect.flip)
+        expect(direct._tag).toBe("DuplicateCommand")
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(150)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "#141 a conflict injected before chunk 2 is a PartialAppend at the committed version",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "chunk-3"
+        const key = { accountId }
+        const tableLayer = EsLatTable.layer({ name: esLatTableName })
+
+        // Another writer appends v101 between chunk 1 and chunk 2.
+        let transactions = 0
+        esLatBeforeTransact = (raw, items) => {
+          if (!items.some((item) => transactPk(item)?.endsWith(`#bulk#${accountId}`))) {
+            return Effect.void
+          }
+          transactions++
+          if (transactions !== 2) return Effect.void
+          return EsBulk.append(key, [new EsCmdWithdrew({ amount: 7 })], 100).pipe(
+            Effect.asVoid,
+            Effect.provideService(DynamoClient, raw),
+            Effect.provide(tableLayer),
+          )
+        }
+
+        const error = yield* EventStore.commandHandler(esBulkDecider, EsBulk, {
+          chunked: true,
+          retry: 3,
+        })(key, 250).pipe(Effect.flip)
+        esLatBeforeTransact = undefined
+
+        expect(error._tag).toBe("PartialAppend")
+        const partial = error as PartialAppend
+        expect(partial.streamName).toBe("Bulk")
+        expect(partial.streamId).toBe(accountId)
+        expect(partial.expectedVersion).toBe(0)
+        expect(partial.committedVersion).toBe(100)
+        expect(partial.intendedVersion).toBe(250)
+        expect((partial.cause as VersionConflict)._tag).toBe("VersionConflict")
+        // Never retried: chunk 1 and the failed chunk 2, nothing more.
+        expect(transactions).toBe(2)
+
+        // The stream holds our first 100 events and the other writer's v101.
+        const events = yield* EsBulk.read(key, { consistentRead: true })
+        expect(events).toHaveLength(101)
+        expect(events[100]!.data).toEqual(new EsCmdWithdrew({ amount: 7 }))
+        // No snapshot rode along: it belongs to the final chunk.
+        expect(Option.isNone(yield* EsBulk.readSnapshot(key))).toBe(true)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect("#141 chunks split by size as well as count, and DynamoDB accepts each", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "chunk-5" }
+      const big = "x".repeat(300_000)
+      // 30 events of ~300 KB: ~9 MB, well under 100 items but over 4 MB.
+      const events = Array.from({ length: 30 }, () => new EsCmdDeposited({ amount: 1 }))
+      const metadata = { note: big }
+
+      const refused = yield* EsPlainMeta.append(key, events, 0, { metadata }).pipe(Effect.flip)
+      expect(refused._tag).toBe("ValidationError")
+
+      const result = yield* EsPlainMeta.append(key, events, 0, { metadata, chunked: true })
+      expect(result.version).toBe(30)
+      const transacts = esLatRequests("plainmeta", "chunk-5").filter(
+        (r) => r.op === "transactWriteItems",
+      )
+      expect(transacts.length).toBeGreaterThanOrEqual(3)
+      expect(transacts.every((t) => (t.items?.length ?? 0) <= 14)).toBe(true)
+      const stored = yield* EsPlainMeta.read(key, { consistentRead: true })
+      expect(stored.map((e) => e.version)).toEqual(Array.from({ length: 30 }, (_, i) => i + 1))
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#141 without chunked, an append over the limit is AppendTooLarge", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "chunk-4" }
+      const error = yield* EsPlain.append(key, esLatDeposits(250), 0).pipe(Effect.flip)
+      expect(error._tag).toBe("AppendTooLarge")
+      expect(yield* EsPlain.currentVersion(key, { consistentRead: true })).toBe(0)
+
+      // The same append, chunked, goes through on a snapshot-less stream too.
+      const result = yield* EsPlain.append(key, esLatDeposits(250), 0, { chunked: true })
+      expect(result.version).toBe(250)
+    }).pipe(provideEsLat),
   )
 })
 
