@@ -2789,10 +2789,16 @@ const program = Effect.gen(function* () {
 })
 ```
 
-`read`, `readFrom` and `currentVersion` take an optional `ReadOptions`
-(`{ consistentRead?: boolean }`, default `false`); `consistentRead: true` sets
-`ConsistentRead` on every `Query` page for read-your-writes (#139).
-`query.events` composes with `Query.consistentRead` instead.
+### Consistent Reads (#139)
+
+`read`, `readFrom`, `currentVersion` and `readLatest` take an optional
+`ReadOptions` (`{ consistentRead?: boolean }`, default `false`);
+`consistentRead: true` sets `ConsistentRead` on every `Query` page for
+read-your-writes. `query.events` composes with `Query.consistentRead` instead.
+`commandHandler` loads state strongly consistently **by default**
+(`CommandHandlerOptions.consistentRead: false` opts out): an eventually
+consistent load can hand `decide` stale state, which then fails the append with
+`VersionConflict`.
 
 ### Key Layout
 
@@ -2823,7 +2829,7 @@ const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" 
 // result: { state, version, events }
 ```
 
-Full design of the command path: `docs/designs/eventstore-command-path.md`
+Full design of the command path: [`docs/designs/eventstore-command-path.md`](docs/designs/eventstore-command-path.md)
 (#136–#141). Each invocation runs:
 
 ```
@@ -2831,8 +2837,9 @@ load → [expectedVersion check] → decide → fold new events → derive items
 ```
 
 - **Load (#139).** Strongly consistent by default;
-  `CommandHandlerOptions.consistentRead: false` opts out. The snapshot `GetItem`
-  is always consistent.
+  `CommandHandlerOptions.consistentRead: false` opts out. A snapshot-configured
+  stream loads through `readLatest` (one `Query` for the snapshot and its
+  delta), so the option covers the snapshot too.
 - **Caller expected version — If-Match (#136).** Per call,
   `handle(streamId, command, { expectedVersion })`. A loaded version other than
   `expectedVersion` fails with `VersionConflict` carrying
@@ -2846,14 +2853,47 @@ load → [expectedVersion check] → decide → fold new events → derive items
   `ValidationError`, raised before anything is read.
 - **Fold before append (#137).** The new events are folded into state before
   the append, so the returned, snapshotted and projected state is always the
-  `evolve` fold — never anything produced inside `decide`. `evolve` may mutate
-  in place.
+  `evolve` fold — never anything produced inside `decide`.
 - **Decision-derived items (#137).** `CommandOptions.additionalItems` takes a
   static array or a function of the `Decision`
   (`{ events, state, previous, version }`) returning the ops or an `Effect` of
-  them. The items commit in the same transaction as the events; the function
-  is skipped for a no-op decision and re-run on every retry attempt. The
-  effect's `E2` / `R2` join the handler's error channel and requirements.
+  them — an inline projection. See below.
+- **Chunked (#141).** `CommandOptions.chunked` (or the handler-level default
+  `CommandHandlerOptions.chunked`) splits an oversized append — see
+  [Chunked Append](#chunked-append-141).
+
+#### Decision-derived `additionalItems` — inline projections (#137)
+
+```typescript
+yield* handle({ matchId }, command, {
+  additionalItems: ({ state, previous, events, version }) => [
+    MatchStatus.put({ matchId, status: state.status }),
+  ],
+})
+```
+
+- `events` is what `decide` returned (never empty — the function is not called
+  for a no-op decision); `state` is the `evolve` fold of `previous` with
+  `events`; `previous` is the state `decide` was given; `version` is the version
+  the events are appended after.
+- The function may return the ops directly or an `Effect` of them. The effect's
+  `E2` / `R2` join the handler's error channel and requirements (both default to
+  `never`, so the static and pure forms add nothing).
+- The items commit in the **same** `TransactWriteItems` as the events. They
+  count towards `AppendTooLarge` and the 4 MB check, and a failing item
+  condition is `AdditionalItemConditionFailed`, with `indices` into the
+  returned array.
+- The function runs after `decide` and the fold, and is re-run on every retry
+  attempt against the fresh decision.
+
+**The evolve-fold state contract.** The state the handler returns, writes as a
+snapshot and passes to `additionalItems` is always the `evolve` fold of stored
+and new events. `evolve` **may mutate state in place** — the library does not
+require immutable state, and does not enforce `decide` purity (#142 is a design
+decision left to the application; see the design doc §8). When `evolve` mutates
+and returns the same object, `previous` and `state` are the same reference and
+`previous` already reflects the new events; a projection that needs a pristine
+`previous` needs an `evolve` that returns new state.
 
 ### Snapshots
 
@@ -2900,11 +2940,124 @@ State round-trips through the user-supplied `snapshot.schema` — `Schema.encode
 on write, `Schema.decodeUnknownEffect` on read — so transforming schemas work.
 
 **Snapshot-aware commandHandler.** When the stream declares `snapshot`, each handler
-invocation loads `readSnapshot → readFrom(asOfVersion)` instead of a full replay,
-then runs the command path above. With `every: N`, the handler writes a fresh
-snapshot of the post-fold state after a successful append once ≥ N events
-accumulated since the last snapshot (best-effort — a snapshot-write failure is
-logged and never fails the command).
+invocation loads state with `readLatest` (the snapshot plus its delta in one `Query`,
+below) instead of a full replay, then runs the command path above. In the default
+`mode: "after-append"`, with `every: N`, the handler writes a fresh snapshot of the
+post-fold state after a successful append once ≥ N events accumulated since the last
+snapshot (best-effort — a snapshot-write failure is logged and never fails the command).
+
+### Inline Snapshots and `readLatest` (#138)
+
+```typescript
+snapshot: { schema: StateSchema, mode: "inline" }             // every append
+snapshot: { schema: StateSchema, mode: "inline", every: 10 }  // inline, at a cadence
+snapshot: { schema: StateSchema, every: 100 }                 // "after-append" (default)
+```
+
+`SnapshotConfig.mode` (`SnapshotMode`: `"after-append" | "inline"`) defaults to
+`"after-append"`; any other value throws `[EDD-9062]` at `makeStream`. In `"inline"`
+mode the handler passes the post-fold state as `AppendOptions.snapshot`, and `append`
+adds an unconditional snapshot `Put` (`asOfVersion = expectedVersion + events.length`)
+to the **same transaction**, after the idempotency sentinel. It commits if and only if
+the events do; the event puts already prove the writer owns `asOfVersion`, so it cannot
+regress. It counts towards the item and size limits, requires at least one event
+(`ValidationError` otherwise), and on a stream without `snapshot` dies with
+`[EDD-9026]`.
+
+```typescript
+stream.readLatest(streamId, { consistentRead? })
+// Effect<LatestState<State, Event>, DynamoClientError | ValidationError, …>
+// LatestState = { snapshot: Option<Snapshot<State>>; events; version }
+```
+
+`readLatest` issues one reverse `Query` over `sk BETWEEN <event SK prefix> AND
+<snapshot SK>` filtered to the stream's event and snapshot items. The snapshot SK sorts
+after every event and command sentinels sort before events under every casing, so the
+range holds exactly the events plus the snapshot. The first page's `Limit` is
+`(every ?? 1) + 1`; it pages on (each further page sized to the events still missing)
+until the event at `asOfVersion + 1` is in hand or the partition is exhausted, then
+returns the events after `asOfVersion` ascending. A current inline snapshot loads in one
+request; a snapshot lagging by up to `every` events also loads in one, otherwise two.
+The first page is read whatever the lag, so an `"after-append"` stream with a large
+`every` reads up to `every + 1` items per load — the `SnapshotConfig.every` JSDoc says
+so. On a stream without `snapshot`, `readLatest` is `read` plus the head.
+
+### Chunked Append (#141)
+
+```typescript
+stream.append(streamId, events, expectedVersion, { chunked: true })
+yield* handle(streamId, command, { chunked: true })      // per call
+commandHandler(decider, stream, { chunked: true })       // handler default
+```
+
+By default an append over 100 items or 4 MB fails before anything is written
+(`AppendTooLarge`, or `ValidationError` for size). With `chunked: true` an append that
+fits one transaction is written exactly as without it. A larger one is split, in order,
+into transactions that each fit both limits, written sequentially at successive
+versions. **A chunked append is not atomic**: readers can observe a prefix of the
+events, and another writer appending between two chunks aborts the rest.
+
+- The **first** chunk carries the contiguity check on `expectedVersion`. Concurrency is
+  decided there, and its failure maps exactly as a non-chunked append's (a cancellation
+  writes nothing). With idempotency it also claims the command with a `pending`
+  sentinel guarded by `attribute_not_exists`, so every other delivery of the
+  `commandId` — a replay, a redelivery while the append is in flight, or one after a
+  `PartialAppend` — fails with `DuplicateCommand`. A command is never applied twice,
+  but a redelivery does not complete a partial one either.
+- Each **later** chunk checks that the previous chunk's last event exists.
+- The **final** chunk carries `additionalItems`, the inline snapshot and the completed
+  sentinel, so read models never show a partially written command. If they cannot fit
+  beside one event, the append fails before anything is written.
+- Any failure after the first chunk surfaces as **`PartialAppend`**
+  (`expectedVersion`, `committedVersion` — the last version known to be written —
+  `intendedVersion`, `cause`). When `cause` is a transport error the failing chunk's
+  outcome is unknown, so the stream may be further along. `commandHandler` never
+  retries it.
+
+### Stream Indexes (#140)
+
+```typescript
+const Entries = EventStore.makeStream({
+  …,
+  indexes: {
+    byEntry: { index: "lsi1", sk: "lsi1sk", key: (event, version) => … },          // LSI (default)
+    byDay: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", key: … },     // GSI
+  },
+})
+
+stream.readIndex("byEntry", streamId, { beginsWith?, between?, reverse?, limit?, consistentRead? })
+stream.query.index("byEntry", streamId)            // Query<StreamEvent<…>>
+EventStore.indexDefinitions(...streams)             // CreateTable fragments
+```
+
+A stream index is a sub-stream of the stream's events ordered by a key derived from
+each event. `key(event, version)` returns the sort key, stored **raw** (no casing, no
+prefix), or `undefined` to leave the event out (sparse); an empty or non-string key, a
+key over 1024 bytes or a throwing `key` fails the append with `ValidationError` before
+anything is written. Only event items carry index attributes — snapshots and sentinels
+are never indexed. Index names are a type parameter (`TIndexName`) inferred from
+`indexes`; an undeclared name at runtime is a defect (`[EDD-9066]`). Definition errors:
+`[EDD-9063]` malformed entry, `[EDD-9064]` attribute owned by the stream, `[EDD-9065]`
+indexes sharing a physical index or attribute.
+
+- **LSI** (`type: "lsi"`, default) uses the table's `pk`, so it holds exactly the
+  stream's indexed events and supports strongly consistent reads. An LSI **must be
+  created with the table**, and a table with any LSI caps the item collection of
+  **every** partition key value at **10 GB** — every stream's partitions and every
+  entity partition sharing the table, not only the indexed stream's.
+- **GSI** (`type: "gsi"`) names a `pk` attribute that `append` fills with the stream's
+  partition key value, so it is the eventually consistent, uncapped equivalent scoped
+  to the same stream. `consistentRead` on it is refused.
+- **Projection `ALL`** — events are decoded from the index item.
+  `EventStore.indexDefinitions(...streams)` returns `AttributeDefinitions`,
+  `LocalSecondaryIndexes` and `GlobalSecondaryIndexes` (projection `ALL`) to merge
+  into the caller's `CreateTable` input; event tables are not derived by
+  `Table.definition`. Conflicting definitions of one physical index throw
+  `[EDD-9067]`.
+- Index attributes are written only by `append` and events are never rewritten, so an
+  index added to a stream that already holds events (a GSI added by `UpdateTable`), or
+  a changed `key`, covers only events appended from then on. The library does not
+  backfill.
 
 ### Command Handler Retry
 
@@ -2919,7 +3072,7 @@ EventStore.commandHandler(matchDecider, matchEvents, {
 On `VersionConflict` the **full read–decide–append cycle re-runs** — never a blind
 re-append of stale events, and a function-form `additionalItems` is re-derived from
 the fresh decision. Only `VersionConflict` is retried; domain errors,
-`DuplicateCommand` and infrastructure errors fail immediately. A call that
+`DuplicateCommand`, `PartialAppend` and infrastructure errors fail immediately. A call that
 supplies `expectedVersion` is never retried — its `VersionConflict` is the answer
 to a conditional write. A number `n` is shorthand for
 `Schedule.recurs(n)` (n retries after the initial attempt). Default: no retry.
@@ -3303,6 +3456,11 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
+| `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version) and unset on an append-time conflict, where the actual version is unknown without another read |
+| `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream (or, for a chunked append, already claimed) |
+| `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
+| `AppendTooLarge` | An `EventStore` append exceeds 100 transact items (without `chunked`), or a chunked append's final-chunk items cannot fit beside one event |
+| `PartialAppend` | A chunked `EventStore` append (#141) failed after its first transaction committed: versions `expectedVersion + 1 … committedVersion` are written, `intendedVersion` was not reached, `cause` is the failing chunk's error. Never retried by `commandHandler` |
 
 ### Declared Errors per Operation
 
@@ -3324,7 +3482,8 @@ plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `PartialAppend`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 
@@ -3384,6 +3543,9 @@ for unrelated errors and the collision was caught only at review.
 | 9030–9040 | Vector search |
 | 9041–9044 | Aggregates, timestamps |
 | 9045–9050 | Query sort-key conditions, `purge`, multi-item write paths, key encoding |
+| 9051–9058 | Aggregate cursors, read-path descriptors, sort-key pins, client predicates, collection casing, nested aggregates, self dates |
+| 9059–9061 | Reserved — PR #129 (`transactWrite` updates) |
+| 9062–9067 | EventStore command path: snapshot mode, stream indexes |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -3436,13 +3598,18 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's `begins_with`, so the condition would discard the pin and return rows outside it rather than narrowing within it |
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
-
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
-
 | `EDD-9057` | `internal/EntitySchemas.ts` | A `DynamoModel.configure` `storedAs` override on a union field with more than one self-date member — the override cannot say which member it applies to. Annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead |
 | `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
+| `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
+| `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
+| `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, or a `key` that is not a function |
+| `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `pending`, `_ttl`) |
+| `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
+| `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
+| `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently |
 
-Next free code: **`EDD-9059`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9068`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

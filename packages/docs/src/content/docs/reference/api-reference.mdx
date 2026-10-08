@@ -1122,8 +1122,9 @@ import { EventStore } from "effect-dynamodb"
 
 | Export | Description |
 |--------|-------------|
-| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, casing? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata>` bound to a `Table`. `events` is an array of `Schema.Class` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. Optional `casing` sets the key casing for the stream (stream name, stream ids, command ids); omitted, the stream name is lower-cased and the rest follows the schema — see [Stream key casing](/effect-dynamodb/tutorials/event-sourcing/#stream-key-casing). |
+| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, casing?, indexes? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>` bound to a `Table`. `events` is an array of `Schema.TaggedClass` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. Optional `snapshot` is `{ schema, mode?, every? }` — `mode` is `"after-append"` (default) or `"inline"` (see [Inline snapshots](/effect-dynamodb/tutorials/event-sourcing/#step-17-inline-snapshots-and-readlatest)). Optional `casing` sets the key casing for the stream (stream name, stream ids, command ids); omitted, the stream name is lower-cased and the rest follows the schema — see [Stream key casing](/effect-dynamodb/tutorials/event-sourcing/#stream-key-casing). Optional `indexes` declares stream indexes: `{ [name]: { type?: "lsi" \| "gsi", index, sk, pk?, key: (event, version) => string \| undefined } }` — see [Stream indexes](/effect-dynamodb/tutorials/event-sourcing/#step-19-stream-indexes). |
 | `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `Context.Service` make effects. |
+| `EventStore.indexDefinitions(...streams)` | `CreateTable` fragments for the streams' indexes: `{ AttributeDefinitions, LocalSecondaryIndexes?, GlobalSecondaryIndexes? }`, each index projecting `ALL`, to merge into your own `CreateTable` input (the table's `pk` / `sk` are not included). An LSI must be created with the table and caps every partition key value's item collection at 10 GB. Throws `[EDD-9067]` for conflicting definitions of one physical index. |
 
 ### Decider
 
@@ -1132,7 +1133,7 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | Field | Type |
 |-------|------|
 | `decide` | `(command: Command, state: State) => Effect<ReadonlyArray<Event>, E>` |
-| `evolve` | `(state: State, event: Event) => State` (pure) |
+| `evolve` | `(state: State, event: Event) => State` — may mutate `state` in place; the handler's state is always the `evolve` fold |
 | `initialState` | `State` |
 
 ### Operations
@@ -1141,11 +1142,16 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Method | Returns |
 |--------|---------|
-| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Optional `options.metadata` is validated against the stream's metadata schema. |
-| `read(streamId)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. |
-| `readFrom(streamId, afterVersion)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
-| `currentVersion(streamId)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
+| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| PartialAppend \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Options: `metadata` (validated against the stream's metadata schema), `additionalItems`, `idempotency: { commandId, ttl? }`, `snapshot` (an inline snapshot `Put` in the same transaction; needs at least one event) and `chunked` (split an oversized append across transactions — **not atomic**; a failure after the first transaction is `PartialAppend`). |
+| `read(streamId, options?)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. `options` is `ReadOptions` (`{ consistentRead?: boolean }`). |
+| `readFrom(streamId, afterVersion, options?)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
+| `currentVersion(streamId, options?)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
+| `readLatest(streamId, options?)` | `Effect<LatestState<TState, TEvent>, DynamoClientError \| ValidationError, R>` — the snapshot (if any), the events after it (ascending) and the head version, in one `Query` when the snapshot is current. |
+| `writeSnapshot(streamId, state, asOfVersion)` / `readSnapshot(streamId)` | Snapshot primitives on a stream with a `snapshot` config. Writes are monotonic; `readSnapshot` returns `Option<Snapshot<TState>>`. |
+| `readIndex(name, streamId, options?)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read a stream index's sub-stream in index order. `options`: `beginsWith` or `between`, `reverse`, `limit`, `consistentRead` (refused on a GSI). |
 | `query.events(streamId)` | `Query<StreamEvent<TEvent>>` — raw query handle for use with `Query` combinators. |
+| `query.index(name, streamId)` | `Query<StreamEvent<TEvent>>` — raw query handle over a stream index. |
+| `indexes` | `{ [name]: StreamIndexSettings }` — each index's `{ type, index, pk, sk }`. |
 
 `BoundEventStream` additionally exposes `provide(effect)` as an escape hatch to push services into an arbitrary effect.
 
@@ -1153,7 +1159,26 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Export | Description |
 |--------|-------------|
-| `EventStore.commandHandler(decider, stream)` | Build a `(streamId, command, options?) => Effect<CommandHandlerResult, …, R>` that reads, folds, decides, and appends atomically. Dual API: `commandHandler(decider, stream)` (data-first) or `stream.pipe(EventStore.commandHandler(decider))` (data-last). Works with both `EventStream` (R = `DynamoClient \| TableConfig`) and `BoundEventStream` (R = `never`). On a no-op command (`decide` returns `[]`) the handler returns the current state and version without writing. |
+| `EventStore.commandHandler(decider, stream, options?)` | Build a `(streamId, command, options?) => Effect<CommandHandlerResult, …, R>` that loads (strongly consistent by default), decides, folds the new events and appends atomically. Dual API: `commandHandler(decider, stream)` (data-first) or `stream.pipe(EventStore.commandHandler(decider))` (data-last). Works with both `EventStream` (R = `DynamoClient \| TableConfig`) and `BoundEventStream` (R = `never`). On a no-op command (`decide` returns `[]`) the handler returns the current state and version without writing. |
+
+Handler options (`CommandHandlerOptions`):
+
+| Option | Description |
+|--------|-------------|
+| `retry` | A number or `Schedule`; re-runs the whole load–decide–append cycle on `VersionConflict` only. Default: no retry |
+| `idempotency` | `{ ttl? }` — makes a per-call `commandId` required and writes a dedup sentinel with the events |
+| `consistentRead` | Load state with strongly consistent reads. Default `true` |
+| `chunked` | Default for the per-call `chunked`. Default `false` |
+
+Per-call options (`CommandOptions`):
+
+| Option | Description |
+|--------|-------------|
+| `metadata` | Event metadata, validated against the stream's metadata schema |
+| `commandId` | The delivery's id; required with `idempotency` |
+| `expectedVersion` | If-Match: a loaded version other than this fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs. Never retried |
+| `additionalItems` | A static array of transact ops, or a function of the `Decision` (`{ events, state, previous, version }`) returning the ops or an `Effect` of them, committed in the same transaction as the events |
+| `chunked` | Split an oversized append across transactions (**not atomic**) |
 
 ### Fold helpers
 
@@ -1169,6 +1194,13 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | `StreamEvent<A>` | `{ streamId, version, eventType, data: A, metadata, timestamp }` |
 | `AppendResult<A>` | `{ version: number, events: ReadonlyArray<A> }` |
 | `CommandHandlerResult<State, Event>` | `AppendResult<Event> & { state: State }` |
+| `Decision<State, Event>` | `{ events, state, previous, version }` — handed to a function-form `additionalItems`. `previous` and `state` are the same reference when `evolve` mutates in place |
+| `ReadOptions` | `{ consistentRead?: boolean }` |
+| `LatestState<State, Event>` | `{ snapshot: Option<Snapshot<State>>, events: ReadonlyArray<StreamEvent<Event>>, version: number }` |
+| `Snapshot<State>` | `{ state, asOfVersion, timestamp }` |
+| `SnapshotMode` | `"after-append" \| "inline"` |
+| `ReadIndexOptions` | `{ beginsWith? \| between?, reverse?, limit?, consistentRead? }` |
+| `StreamIndexSettings` | `{ type: "lsi" \| "gsi", index, pk, sk }` |
 | `EventStream<TEvent, TStreamIdFields, TMetadata>` | Repository interface returned by `makeStream` |
 | `BoundEventStream<TEvent, TStreamIdFields, TMetadata>` | Same shape as `EventStream` with `R = never` on every operation |
 
@@ -1178,11 +1210,11 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 import { EventStore } from "effect-dynamodb"
 import { Effect, Schema, Context } from "effect"
 
-class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
+class MatchStarted extends Schema.TaggedClass<MatchStarted>()("MatchStarted", {
   venue: Schema.String,
 }) {}
 
-class InningsCompleted extends Schema.Class<InningsCompleted>("InningsCompleted")({
+class InningsCompleted extends Schema.TaggedClass<InningsCompleted>()("InningsCompleted", {
   innings: Schema.Number,
   runs: Schema.Number,
 }) {}
@@ -1241,7 +1273,7 @@ import {
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
   CascadePartialFailure, VersionConflict, AppendTooLarge,
-  AdditionalItemConditionFailed, DuplicateCommand,
+  AdditionalItemConditionFailed, DuplicateCommand, PartialAppend,
 } from "effect-dynamodb"
 ```
 
@@ -1258,7 +1290,7 @@ import {
 | `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
-| `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`) |
+| `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit, or a chunked append's final-transaction items cannot fit beside one event (`streamName`, `streamId`, `count`, `limit`) |
 | `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create/upsert/update, or by a put in `transactWrite` / `append`'s `additionalItems` |
 | `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
 | `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
@@ -1272,7 +1304,8 @@ import {
 | `AggregateDecompositionError` | `"AggregateDecompositionError"` | Aggregate write path failed — schema validation or structural error (`aggregate`, `member`, `reason`) |
 | `AggregateTransactionOverflow` | `"AggregateTransactionOverflow"` | Sub-aggregate exceeds 100-item transaction limit (`aggregate`, `subgraph`, `itemCount`, `limit`) |
 | `CascadePartialFailure` | `"CascadePartialFailure"` | Cascade update partially failed in eventual mode (`sourceEntity`, `sourceId`, `succeeded`, `failed`, `errors`) |
-| `VersionConflict` | `"VersionConflict"` | Event store version mismatch |
+| `VersionConflict` | `"VersionConflict"` | Event store version mismatch: an append's version guard failed, or a command handler call's `expectedVersion` did not match the loaded version (`streamName`, `streamId`, `expectedVersion`, `actualVersion?` — set by the pre-decide If-Match check, unset on an append-time conflict) |
+| `PartialAppend` | `"PartialAppend"` | A chunked `EventStore.append` failed after its first transaction committed; versions `expectedVersion + 1 … committedVersion` are written (`streamName`, `streamId`, `expectedVersion`, `committedVersion`, `intendedVersion`, `cause`). Never retried by `commandHandler` |
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
 
@@ -1293,7 +1326,7 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `PartialAppend`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage
 
