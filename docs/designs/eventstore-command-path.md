@@ -59,6 +59,9 @@ Per-call `CommandOptions.expectedVersion?: number`. When it is supplied:
    conditional write.
 4. A no-op decision (`decide` returns `[]`) at the matching version succeeds,
    returning the current state and version, exactly as today.
+5. A value that is not a non-negative integer (`NaN` from a failed `If-Match`
+   parse, a negative or fractional number) is a caller bug, not a conflict: it
+   fails with `ValidationError` before anything is read, and is not retried.
 
 `VersionConflict` gains an **optional** `actualVersion?: number`:
 

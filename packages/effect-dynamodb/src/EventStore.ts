@@ -4,10 +4,13 @@
  * Provides:
  * - `Decider` type for command-event-state modeling
  * - `makeStream` factory for creating event streams bound to a Table
- * - Core operations: `append`, `read`, `readFrom`, `currentVersion`
+ * - Core operations: `append`, `read`, `readFrom`, `currentVersion` (reads
+ *   optionally strongly consistent)
  * - Snapshot primitives: `writeSnapshot`, `readSnapshot`
- * - `commandHandler` combinator for read-decide-append cycle (snapshot-aware,
- *   with an optional `VersionConflict` retry policy)
+ * - `commandHandler` combinator for the load-decide-fold-append cycle
+ *   (snapshot-aware, consistent loads, an optional `VersionConflict` retry
+ *   policy, caller-supplied `expectedVersion`, decision-derived
+ *   `additionalItems`)
  * - `fold` / `foldFrom` helpers for state reconstruction
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
@@ -64,8 +67,13 @@ import { resolveTtlAttributeName, type Table, type TableConfig } from "./Table.j
  * A Decider encodes the command-event-state triad for an aggregate.
  *
  * - `decide` — given a command and current state, produce events (or fail with E)
- * - `evolve` — pure left fold: apply one event to a state
- * - `initialState` — starting state for a new aggregate
+ * - `evolve` — left fold: apply one event to a state. It may return new state or
+ *   mutate the given state in place and return it; the library requires
+ *   neither. State the library persists, returns or projects is always this
+ *   fold, never anything produced inside `decide`.
+ * - `initialState` — starting state for a new aggregate. An `evolve` that
+ *   mutates in place must not mutate a shared `initialState` object (declare it
+ *   as a getter that returns a fresh value).
  */
 export interface Decider<State, Command, Event, E = never> {
   readonly decide: (command: Command, state: State) => Effect.Effect<ReadonlyArray<Event>, E>
@@ -247,6 +255,25 @@ export type AppendError =
   | ConcurrentModification
 
 // ---------------------------------------------------------------------------
+// Read options
+// ---------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link EventStream.read}, {@link EventStream.readFrom} and
+ * {@link EventStream.currentVersion}.
+ *
+ * `consistentRead: true` sets `ConsistentRead` on every `Query` page, so the
+ * read observes every append acknowledged before it started (read-your-writes).
+ * Default `false`: eventually consistent, at half the read cost.
+ *
+ * {@link commandHandler} loads state with strongly consistent reads by default —
+ * see {@link CommandHandlerOptions.consistentRead}.
+ */
+export interface ReadOptions {
+  readonly consistentRead?: boolean | undefined
+}
+
+// ---------------------------------------------------------------------------
 // StreamIdInput — maps composite field names to a required record
 // ---------------------------------------------------------------------------
 
@@ -260,6 +287,23 @@ type StreamIdInput<T extends ReadonlyArray<string>> = {
 
 const EventStreamTypeId: unique symbol = Symbol.for("effect-dynamodb/EventStream")
 export type EventStreamTypeId = typeof EventStreamTypeId
+
+/**
+ * @internal Carries the stream's stream-id formatter (composites joined in
+ * declaration order — the `streamId` reported on errors and stored on items),
+ * so {@link commandHandler} can report a pre-decide `VersionConflict` exactly
+ * as `append` would. Not part of the public interface: `makeStream` and `bind`
+ * attach it; a hand-built stream object falls back to joining the id's values.
+ */
+const StreamIdFormatter: unique symbol = Symbol.for("effect-dynamodb/EventStream/StreamIdFormatter")
+
+/** @internal */
+const formatStreamIdOf = (stream: object, streamId: Record<string, unknown>): string => {
+  const formatter = (stream as { [StreamIdFormatter]?: (id: Record<string, unknown>) => string })[
+    StreamIdFormatter
+  ]
+  return formatter !== undefined ? formatter(streamId) : Object.values(streamId).join("#")
+}
 
 // ---------------------------------------------------------------------------
 // EventStream interface
@@ -332,25 +376,41 @@ export interface EventStream<
     options?: AppendOptions<TMetadata> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
 
+  /**
+   * Read every event of the stream, ascending by version. Pass
+   * `{ consistentRead: true }` for read-your-writes — see {@link ReadOptions}.
+   */
   read(
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
+  /**
+   * Read the events after `afterVersion` (exclusive), ascending. Pass
+   * `{ consistentRead: true }` for read-your-writes — see {@link ReadOptions}.
+   */
   readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
+  /**
+   * The version of the stream's newest event (`0` for an empty stream), in one
+   * request. Pass `{ consistentRead: true }` for read-your-writes — see
+   * {@link ReadOptions}.
+   */
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   readonly query: {
@@ -952,15 +1012,20 @@ export const makeStream = <
   // read
   // ---------------------------------------------------------------------------
 
+  /** Apply {@link ReadOptions} to an event query. */
+  const withReadOptions = <A>(query: Query.Query<A>, options: ReadOptions | undefined) =>
+    options?.consistentRead === true ? Query.consistentRead(query) : query
+
   const read = (
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const query = buildEventsQuery(streamId)
+      const query = withReadOptions(buildEventsQuery(streamId), options)
       return yield* Query.collect(query)
     })
 
@@ -971,6 +1036,7 @@ export const makeStream = <
   const readFrom = (
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
     DynamoClientError | ValidationError,
@@ -981,8 +1047,11 @@ export const makeStream = <
       // is exactly the old exclusive `#sk > eventSk(afterVersion)`. The upper
       // bound keeps the snapshot item (which sorts after every event) out of the
       // scanned range.
-      const query = buildEventsQuery(streamId).pipe(
-        Query.where({ between: [composeEventSk(afterVersion + 1), maxEventSk] }),
+      const query = withReadOptions(
+        buildEventsQuery(streamId).pipe(
+          Query.where({ between: [composeEventSk(afterVersion + 1), maxEventSk] }),
+        ),
+        options,
       )
       return yield* Query.collect(query)
     })
@@ -993,6 +1062,7 @@ export const makeStream = <
 
   const currentVersion = (
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       // Single page, not `collect`: with `Limit: 1` DynamoDB returns a
@@ -1000,7 +1070,10 @@ export const makeStream = <
       // whole partition one request per item. The `begins_with` bound on
       // `buildEventsQuery` guarantees the single evaluated item is the newest
       // *event* (never the snapshot, which sorts last).
-      const query = buildEventsQuery(streamId).pipe(Query.reverse, Query.limit(1))
+      const query = withReadOptions(
+        buildEventsQuery(streamId).pipe(Query.reverse, Query.limit(1)),
+        options,
+      )
       const page = yield* Query.execute(query)
       const newest = page.items[0]
       if (newest === undefined) return 0
@@ -1174,6 +1247,7 @@ export const makeStream = <
     readFrom,
     currentVersion,
     query: queryNamespace,
+    [StreamIdFormatter]: composeStreamIdString,
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,
@@ -1238,25 +1312,31 @@ export interface BoundEventStream<
     options?: AppendOptions<TMetadata> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, never>
 
+  /** See {@link EventStream.read}. */
   read(
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     never
   >
 
+  /** See {@link EventStream.readFrom}. */
   readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
     never
   >
 
+  /** See {@link EventStream.currentVersion}. */
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, never>
 
   readonly query: {
@@ -1316,11 +1396,13 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
       readSnapshot: (streamId) => provide(stream.readSnapshot(streamId)),
       append: (streamId, events, expectedVersion, options) =>
         provide(stream.append(streamId, events, expectedVersion, options)),
-      read: (streamId) => provide(stream.read(streamId)),
-      readFrom: (streamId, afterVersion) => provide(stream.readFrom(streamId, afterVersion)),
-      currentVersion: (streamId) => provide(stream.currentVersion(streamId)),
+      read: (streamId, options) => provide(stream.read(streamId, options)),
+      readFrom: (streamId, afterVersion, options) =>
+        provide(stream.readFrom(streamId, afterVersion, options)),
+      currentVersion: (streamId, options) => provide(stream.currentVersion(streamId, options)),
       query: stream.query,
       provide,
+      [StreamIdFormatter]: (id: Record<string, unknown>) => formatStreamIdOf(stream, id),
     } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>
   })
 
@@ -1342,33 +1424,128 @@ export interface CommandHandlerOptions {
    * The retried unit is the entire read–decide–append cycle, so every attempt
    * decides against freshly read state — a blind re-append of stale events is
    * impossible by construction. Snapshot reads participate: a retried attempt
-   * re-reads the snapshot and its delta.
+   * re-reads the snapshot and its delta, and a function-form `additionalItems`
+   * is re-evaluated against the new decision.
    *
    * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
    * initial attempt). Omit for the default: no retry.
    *
-   * `DuplicateCommand` is deliberately NOT retried — it is terminal.
+   * `DuplicateCommand` is deliberately NOT retried — it is terminal. Nor is any
+   * call that supplies {@link CommandOptions.expectedVersion}: the caller asked
+   * for a conditional write, so its `VersionConflict` is always surfaced.
    */
   readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
 
   /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
   readonly idempotency?: { readonly ttl?: Duration.Duration | string }
+
+  /**
+   * Load state with strongly consistent reads. Default `true`.
+   *
+   * An eventually consistent load can miss the newest events, so `decide` runs
+   * against stale state and the append then fails with `VersionConflict` (or
+   * burns a retry). A consistent load costs twice the read capacity of an
+   * eventually consistent one. Set `false` to trade that for the occasional
+   * conflict. The snapshot read is always consistent.
+   */
+  readonly consistentRead?: boolean | undefined
 }
 
-/** Per-call options accepted by a handler produced by {@link commandHandler}. */
-export interface CommandOptions<TMetadata> {
+/**
+ * The outcome of one `decide` call, handed to a function-form
+ * {@link CommandOptions.additionalItems}.
+ *
+ * - `events` — what `decide` returned (never empty: the function is not called
+ *   for a no-op decision).
+ * - `state` — the `evolve` fold of `previous` with `events`: the state the
+ *   handler returns and snapshots.
+ * - `previous` — the state `decide` was given.
+ * - `version` — the stream version the events are appended after; the new
+ *   events take `version + 1 … version + events.length`.
+ *
+ * `evolve` may mutate state in place. When it does, `previous` and `state` are
+ * the same reference and `previous` already reflects `events`; a projection
+ * that needs a pristine `previous` requires an `evolve` that returns new state.
+ */
+export interface Decision<State, Event> {
+  readonly events: ReadonlyArray<Event>
+  readonly state: State
+  readonly previous: State
+  readonly version: number
+}
+
+/**
+ * The forms {@link CommandOptions.additionalItems} accepts: a static array of
+ * transact ops, or a function of the {@link Decision} returning the array
+ * directly (pure projection) or as an `Effect` (a projection that needs a read).
+ * The effect's `E2` joins the handler's error channel and its `R2` the handler's
+ * requirements.
+ */
+export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
+  | ReadonlyArray<TransactWriteOp>
+  | ((
+      decision: Decision<State, Event>,
+    ) => ReadonlyArray<TransactWriteOp> | Effect.Effect<ReadonlyArray<TransactWriteOp>, E2, R2>)
+
+/**
+ * Per-call options accepted by a handler produced by {@link commandHandler}.
+ *
+ * `State` / `Event` type the {@link Decision} a function-form `additionalItems`
+ * receives; `E2` / `R2` are the error and requirements of the `Effect` it may
+ * return. The handler infers all four, so they only need naming when this type
+ * is written out by hand.
+ */
+export interface CommandOptions<
+  TMetadata,
+  State = unknown,
+  Event = unknown,
+  E2 = never,
+  R2 = never,
+> {
   readonly metadata?: TMetadata
   /**
    * Identifier for this command delivery. Required when the handler was created
    * with `idempotency`; a replayed id fails with `DuplicateCommand`.
    */
   readonly commandId?: string
-  /** Caller-owned transact items committed atomically with the produced events. */
-  readonly additionalItems?: ReadonlyArray<TransactWriteOp>
+  /**
+   * The stream version the caller last saw — an HTTP `If-Match`.
+   *
+   * After state is loaded and **before `decide` runs**, a stream at any other
+   * version fails the call with `VersionConflict`, carrying the loaded version
+   * as `actualVersion`; `decide` never sees state the caller did not. Otherwise
+   * the append is conditioned on this version, so a writer that slips in
+   * between the load and the append also fails it with `VersionConflict`
+   * (without `actualVersion`). Neither is retried, whatever the handler's
+   * `retry` policy says.
+   *
+   * A no-op decision (`decide` returns `[]`) at the matching version succeeds
+   * with the current state and version. Must be a non-negative integer — any
+   * other value fails with `ValidationError` before anything is read.
+   */
+  readonly expectedVersion?: number | undefined
+  /**
+   * Caller-owned transact items committed atomically with the produced events
+   * (see {@link AppendOptions.additionalItems}).
+   *
+   * Either a static array, or a function of the {@link Decision} — an inline
+   * projection — returning the array or an `Effect` of it. The function runs
+   * after `decide` and after the new events are folded, is not called when
+   * `decide` returns no events, and is re-run on every retry attempt. The items
+   * it returns count towards `AppendTooLarge`, and the `indices` of an
+   * `AdditionalItemConditionFailed` refer to the array it returned.
+   */
+  readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
 }
 
 /** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
-export interface IdempotentCommandOptions<TMetadata> extends CommandOptions<TMetadata> {
+export interface IdempotentCommandOptions<
+  TMetadata,
+  State = unknown,
+  Event = unknown,
+  E2 = never,
+  R2 = never,
+> extends CommandOptions<TMetadata, State, Event, E2, R2> {
   readonly commandId: string
 }
 
@@ -1380,9 +1557,13 @@ export interface IdempotentCommandOptions<TMetadata> extends CommandOptions<TMet
 type CommandOptionsArgs<
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined,
+  State,
+  TEvent,
+  E2,
+  R2,
 > = TConfig extends { readonly idempotency: object }
-  ? [options: IdempotentCommandOptions<TMetadata>]
-  : [options?: CommandOptions<TMetadata> | undefined]
+  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2>]
+  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2> | undefined]
 
 type CommandHandlerErrors<E> =
   | E
@@ -1397,6 +1578,11 @@ type CommandHandlerErrors<E> =
   | OptimisticLockError
   | ConcurrentModification
 
+/**
+ * A handler over an {@link EventStream}. Generic per call over the error (`E2`)
+ * and requirements (`R2`) of a function-form `additionalItems` that returns an
+ * `Effect`; both are `never` otherwise.
+ */
 type CommandHandler<
   State,
   Command,
@@ -1405,16 +1591,20 @@ type CommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = (
+> = <E2 = never, R2 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E>,
-  DynamoClient | TableConfig
+  CommandHandlerErrors<E> | E2,
+  DynamoClient | TableConfig | R2
 >
 
+/**
+ * A handler over a {@link BoundEventStream}: the stream's services are already
+ * provided, so a function-form `additionalItems`' `R2` is its only requirement.
+ */
 type BoundCommandHandler<
   State,
   Command,
@@ -1423,15 +1613,45 @@ type BoundCommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = (
+> = <E2 = never, R2 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig>
-) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E>, never>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
+) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E> | E2, R2>
+
+/**
+ * The handler the data-last {@link commandHandler} returns for stream `S`: a
+ * {@link BoundCommandHandler} for a `BoundEventStream` (checked first — a bound
+ * stream is also structurally an `EventStream`), a {@link CommandHandler}
+ * otherwise.
+ */
+type CommandHandlerFor<
+  S,
+  State,
+  Command,
+  TEvent,
+  E,
+  TConfig extends CommandHandlerOptions | undefined,
+> =
+  S extends BoundEventStream<any, infer TStreamIdFields, infer TMetadata, any>
+    ? BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
+    : S extends EventStream<any, infer TStreamIdFields, infer TMetadata, any>
+      ? CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
+      : never
 
 /** @internal Both `EventStream` and `BoundEventStream` carry this brand. */
 const hasEventStreamBrand = (u: unknown): boolean =>
   typeof u === "object" && u !== null && EventStreamTypeId in u
+
+/** @internal Resolve a {@link CommandOptions.additionalItems} against a decision. */
+const deriveAdditionalItems = <State, Event>(
+  input: AdditionalItemsInput<State, Event, unknown, unknown> | undefined,
+  decision: Decision<State, Event>,
+): Effect.Effect<ReadonlyArray<TransactWriteOp> | undefined, unknown, unknown> => {
+  if (typeof input !== "function") return Effect.succeed(input)
+  const derived = input(decision)
+  return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
+}
 
 /** @internal */
 const makeCommandHandlerImpl = <
@@ -1455,12 +1675,17 @@ const makeCommandHandlerImpl = <
       : typeof retryPolicy === "number"
         ? Schedule.recurs(retryPolicy)
         : retryPolicy
+  // Consistent by default: an eventually consistent load can hand `decide`
+  // state that misses acknowledged events (#139).
+  const readOptions: ReadOptions = { consistentRead: options?.consistentRead ?? true }
 
   return (
     streamId: StreamIdInput<TStreamIdFields>,
     command: Command,
-    callOptions?: CommandOptions<TMetadata> | undefined,
+    callOptions?: CommandOptions<TMetadata, State, TEvent, unknown, unknown> | undefined,
   ) => {
+    const expectedVersion = callOptions?.expectedVersion
+
     const attempt = Effect.gen(function* () {
       // Backstop for JS callers and `any`-shaped call sites: silently degrading
       // to at-least-once would look like success right up until the day a
@@ -1471,6 +1696,20 @@ const makeCommandHandlerImpl = <
           entityType: stream.streamName,
           operation: "EventStore.commandHandler",
           cause: "commandId is required when commandHandler is configured with `idempotency`.",
+        })
+      }
+
+      // A malformed If-Match (`NaN` from a failed parse, a negative or
+      // fractional number) is a caller bug, not a conflict — refuse it before
+      // reading anything.
+      if (
+        expectedVersion !== undefined &&
+        (!Number.isInteger(expectedVersion) || expectedVersion < 0)
+      ) {
+        return yield* new ValidationError({
+          entityType: stream.streamName,
+          operation: "EventStore.commandHandler",
+          cause: `expectedVersion must be a non-negative integer; received ${String(expectedVersion)}.`,
         })
       }
 
@@ -1492,14 +1731,14 @@ const makeCommandHandlerImpl = <
         snapshotAsOfVersion = snapshot.value.asOfVersion
         baseVersion = snapshot.value.asOfVersion
         state = snapshot.value.state
-        const delta = yield* stream.readFrom(streamId, snapshot.value.asOfVersion)
+        const delta = yield* stream.readFrom(streamId, snapshot.value.asOfVersion, readOptions)
         for (const event of delta) {
           state = decider.evolve(state, event.data)
         }
         const newest = delta[delta.length - 1]
         if (newest !== undefined) baseVersion = newest.version
       } else {
-        const events = yield* stream.read(streamId)
+        const events = yield* stream.read(streamId, readOptions)
         for (const event of events) {
           state = decider.evolve(state, event.data)
         }
@@ -1507,25 +1746,54 @@ const makeCommandHandlerImpl = <
         baseVersion = newest === undefined ? 0 : newest.version
       }
 
-      // 2. Decide
+      // 2. If-Match (#136): the caller saw a different version, so `decide`
+      //    must not run against state the caller never saw.
+      if (expectedVersion !== undefined && expectedVersion !== baseVersion) {
+        return yield* new VersionConflict({
+          streamName: stream.streamName,
+          streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
+          expectedVersion,
+          actualVersion: baseVersion,
+        })
+      }
+
+      // 3. Decide
       const newEvents = yield* decider.decide(command, state)
 
-      // 3. No-op command — return current state
+      // 4. No-op command — return current state
       if (newEvents.length === 0) {
         return { state, version: baseVersion, events: [] }
       }
 
-      // 4. Append with optimistic concurrency, plus any caller-owned items and
-      //    the dedup sentinel, all in one transaction.
+      // 5. Fold the new events BEFORE appending (#137): the post-decision state
+      //    is what a function-form `additionalItems` projects, what a snapshot
+      //    records, and what the handler returns — always the `evolve` fold,
+      //    never anything produced inside `decide`.
+      const previous = state
+      let next = state
+      for (const event of newEvents) {
+        next = decider.evolve(next, event)
+      }
+
+      // 6. Derive the caller's items from the decision. Re-run on every
+      //    attempt, because the whole cycle is the retried unit.
+      const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, {
+        events: newEvents,
+        state: next,
+        previous,
+        version: baseVersion,
+      })
+
+      // 7. Append with optimistic concurrency, plus the caller's items and the
+      //    dedup sentinel, all in one transaction. `baseVersion` equals any
+      //    caller-supplied `expectedVersion` here (checked in step 2).
       const appendOptions: {
         metadata?: TMetadata
         additionalItems?: ReadonlyArray<TransactWriteOp>
         idempotency?: AppendIdempotency
       } = {}
       if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
-      if (callOptions?.additionalItems !== undefined) {
-        appendOptions.additionalItems = callOptions.additionalItems
-      }
+      if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
       if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
         appendOptions.idempotency =
           options.idempotency.ttl !== undefined
@@ -1540,18 +1808,13 @@ const makeCommandHandlerImpl = <
         appendOptions as AppendOptions<TMetadata>,
       )
 
-      // 5. Evolve state through the new events
-      for (const event of newEvents) {
-        state = decider.evolve(state, event)
-      }
-
-      // 6. Auto-snapshot once the cadence threshold is crossed. Best-effort:
+      // 8. Auto-snapshot once the cadence threshold is crossed. Best-effort:
       //    the events are already durable, so a snapshot-write failure must not
       //    report the command as failed. The next threshold crossing retries it.
       const every = snapshotSettings?.every
       if (every !== undefined && result.version - snapshotAsOfVersion >= every) {
         yield* stream
-          .writeSnapshot(streamId, state, result.version)
+          .writeSnapshot(streamId, next, result.version)
           .pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
@@ -1562,10 +1825,13 @@ const makeCommandHandlerImpl = <
           )
       }
 
-      return { state, version: result.version, events: newEvents }
+      return { state: next, version: result.version, events: newEvents }
     })
 
-    return schedule === undefined
+    // A caller-supplied `expectedVersion` is a conditional write: its
+    // `VersionConflict` (pre-decide or from the append) is the answer, never a
+    // cue to re-read and re-decide.
+    return schedule === undefined || expectedVersion !== undefined
       ? attempt
       : Effect.retry(attempt, {
           // `while` runs before the schedule, so the schedule only ever sees a
@@ -1606,12 +1872,35 @@ const makeCommandHandlerImpl = <
  *   idempotency: { ttl: Duration.days(1) },
  * })
  * yield* handle({ matchId: "m-1" }, command, { commandId: "cmd-7f3a" })
+ *
+ * // If-Match: fail with VersionConflict (never retried) unless the stream is at v7
+ * yield* handle({ matchId: "m-1" }, command, { expectedVersion: 7 })
+ *
+ * // Inline projection, committed in the same transaction as the events
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   additionalItems: ({ state }) => [Scoreboard.put({ matchId: "m-1", runs: state.runs })],
+ * })
  * ```
  *
- * When the stream declares a `snapshot` config, each invocation reads the
- * snapshot and folds only the events after it, instead of replaying the stream
- * from the beginning. With `snapshot.every` set, a fresh snapshot is written
- * (best-effort) after a successful append once the cadence threshold is crossed.
+ * Each invocation runs
+ * `load → [expectedVersion check] → decide → fold new events → derive items → append → [snapshot]`.
+ *
+ * - **Load.** Strongly consistent by default — see
+ *   {@link CommandHandlerOptions.consistentRead}. When the stream declares a
+ *   `snapshot` config, the snapshot is read and only the events after it are
+ *   folded, instead of replaying the stream from the beginning.
+ * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
+ * - **Fold before append.** The new events are folded into state before the
+ *   append, so the state returned, snapshotted and handed to a function-form
+ *   `additionalItems` (see {@link Decision}) is always the `evolve` fold.
+ * - **Snapshot.** With `snapshot.every` set, a fresh snapshot is written
+ *   (best-effort) after a successful append once the cadence threshold is
+ *   crossed.
+ *
+ * The handler is generic per call over the error and requirements of a
+ * function-form `additionalItems` that returns an `Effect`: they join the
+ * handler's error channel and requirements (on a `BoundEventStream` handler
+ * they are its only requirements).
  *
  * Without `idempotency`, command processing is **at-least-once**: a retry after
  * an acked-but-lost response re-runs `decide` and appends again.
@@ -1623,18 +1912,20 @@ const makeCommandHandlerImpl = <
  * `EventStreamTypeId` brand of the second argument.
  */
 export const commandHandler: {
-  // Data-last overloads
+  // Data-last. One generic signature, not a Bound/unbound overload pair:
+  // `pipe` infers from an overloaded argument using its LAST signature only,
+  // which typed `bound.pipe(commandHandler(decider))` as an unbound handler
+  // still requiring `DynamoClient | TableConfig`.
   <State, Command, TEvent, E, const TConfig extends CommandHandlerOptions | undefined = undefined>(
     decider: Decider<State, Command, TEvent, E>,
     options?: TConfig,
-  ): {
-    <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
-      stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
-    <TStreamIdFields extends ReadonlyArray<string>, TMetadata, TState extends State>(
-      stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState>,
-    ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
-  }
+  ): <
+    S extends
+      | BoundEventStream<TEvent, any, any, State>
+      | EventStream<TEvent, ReadonlyArray<string>, any, State>,
+  >(
+    stream: S,
+  ) => CommandHandlerFor<S, State, Command, TEvent, E, TConfig>
 
   // Data-first: BoundEventStream → BoundCommandHandler
   <

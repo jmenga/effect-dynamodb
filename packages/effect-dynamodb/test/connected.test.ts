@@ -16,6 +16,7 @@ import { it } from "@effect/vitest"
 import {
   Cause,
   Config,
+  Context,
   Data,
   DateTime,
   Duration,
@@ -8429,6 +8430,411 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
       // All-or-nothing: the refused append wrote no events either.
       expect(yield* EsIdemMatchEvents.read({ matchId: "ups-es" })).toHaveLength(0)
     }).pipe(provideEsIdem),
+  )
+})
+
+// ===========================================================================
+// EventStore command path — consistent reads (#139), caller expectedVersion
+// (#136), decision-derived additionalItems with fold-before-append (#137)
+// ===========================================================================
+
+const esCmdSchema = DynamoSchema.make({ name: "es-cmd", version: 1 })
+const esCmdTableName = `es-cmd-${Date.now()}`
+
+/** Inline projection of an account — written in the same transaction as its events. */
+class EsCmdTally extends Schema.Class<EsCmdTally>("EsCmdTally")({
+  accountId: Schema.String,
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const EsCmdTallies = Entity.make({
+  model: EsCmdTally,
+  entityType: "EsCmdTally",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsCmdTable = Table.make({ schema: esCmdSchema, entities: { EsCmdTallies } })
+
+class EsCmdDeposited extends Schema.TaggedClass<EsCmdDeposited>()("EsCmdDeposited", {
+  amount: Schema.Number,
+}) {}
+
+class EsCmdWithdrew extends Schema.TaggedClass<EsCmdWithdrew>()("EsCmdWithdrew", {
+  amount: Schema.Number,
+}) {}
+
+type EsCmdEvent = EsCmdDeposited | EsCmdWithdrew
+
+interface EsCmdState {
+  readonly balance: number
+  readonly txCount: number
+}
+
+type EsCmdCommand =
+  | { readonly _tag: "Deposit"; readonly amount: number }
+  | { readonly _tag: "Withdraw"; readonly amount: number }
+
+class EsCmdInsufficientFunds extends Data.TaggedError("EsCmdInsufficientFunds") {}
+
+const EsCmdAccounts = EventStore.makeStream({
+  table: EsCmdTable,
+  streamName: "Account",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** Every `decide` call, by account — proves a stale If-Match never reaches it. */
+const esCmdDecideLog: Array<string> = []
+
+const esCmdDecider = (
+  accountId: string,
+): EventStore.Decider<EsCmdState, EsCmdCommand, EsCmdEvent, EsCmdInsufficientFunds> => ({
+  initialState: { balance: 0, txCount: 0 },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      esCmdDecideLog.push(accountId)
+      if (command._tag === "Deposit") return [new EsCmdDeposited({ amount: command.amount })]
+      if (state.balance < command.amount) return yield* new EsCmdInsufficientFunds()
+      return [new EsCmdWithdrew({ amount: command.amount })]
+    }),
+  evolve: (state, event) =>
+    event instanceof EsCmdDeposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+})
+
+/** Every `query` this suite issues: the partition it reads and its `ConsistentRead`. */
+const esCmdQueryLog: Array<{ readonly pk: string | undefined; readonly consistent: boolean }> = []
+
+const EsCmdClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        esCmdQueryLog.push({
+          pk: input.ExpressionAttributeValues?.[":pk"]?.S,
+          consistent: input.ConsistentRead === true,
+        })
+        return client.query(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsCmdLayer = Layer.mergeAll(EsCmdClientLayer, EsCmdTable.layer({ name: esCmdTableName }))
+const provideEsCmd = Effect.provide(EsCmdLayer)
+
+/** The queries issued against one account's stream partition. */
+const esCmdQueriesFor = (accountId: string) =>
+  esCmdQueryLog.filter((entry) => entry.pk === `$es-cmd#v1#account#${accountId}`)
+
+class EsCmdOwner extends Context.Service<EsCmdOwner, { readonly accountId: string }>()(
+  "test/EsCmdOwner",
+) {}
+
+describeConnected("EventStore command path (#139, #136, #137)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esCmdTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsCmdTable),
+        })
+      }).pipe(provideEsCmd, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esCmdTableName })
+      }).pipe(
+        provideEsCmd,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // -------------------------------------------------------------------------
+  // #139 — consistent reads
+  // -------------------------------------------------------------------------
+
+  it.effect("#139 consistentRead reads its own writes on every read primitive", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ryw-1" }
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 10 })], 0)
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 5 })], 1)
+
+      const all = yield* EsCmdAccounts.read(key, { consistentRead: true })
+      const after = yield* EsCmdAccounts.readFrom(key, 1, { consistentRead: true })
+      const head = yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })
+      expect(all.map((e) => e.version)).toEqual([1, 2])
+      expect(after.map((e) => e.data)).toEqual([new EsCmdDeposited({ amount: 5 })])
+      expect(head).toBe(2)
+
+      const bound = yield* EventStore.bind(EsCmdAccounts)
+      expect(yield* bound.currentVersion(key, { consistentRead: true })).toBe(2)
+
+      // Every one of those requests asked for a strongly consistent read.
+      const queries = esCmdQueriesFor("ryw-1")
+      expect(queries).toHaveLength(4)
+      expect(queries.every((q) => q.consistent)).toBe(true)
+
+      // The default is unchanged: eventually consistent.
+      yield* EsCmdAccounts.read(key)
+      expect(esCmdQueriesFor("ryw-1").at(-1)?.consistent).toBe(false)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect(
+    "#139 commandHandler loads consistently by default; consistentRead: false opts out",
+    () =>
+      Effect.gen(function* () {
+        const key = { accountId: "ryw-2" }
+        const consistent = EventStore.commandHandler(esCmdDecider("ryw-2"), EsCmdAccounts)
+        const relaxed = EsCmdAccounts.pipe(
+          EventStore.commandHandler(esCmdDecider("ryw-2"), { consistentRead: false }),
+        )
+
+        // Each command sees the previous one's event immediately.
+        expect((yield* consistent(key, { _tag: "Deposit", amount: 7 })).version).toBe(1)
+        expect((yield* consistent(key, { _tag: "Withdraw", amount: 2 })).state).toEqual({
+          balance: 5,
+          txCount: 2,
+        })
+        expect(esCmdQueriesFor("ryw-2").map((q) => q.consistent)).toEqual([true, true])
+
+        yield* relaxed(key, { _tag: "Deposit", amount: 1 })
+        expect(esCmdQueriesFor("ryw-2").at(-1)?.consistent).toBe(false)
+      }).pipe(provideEsCmd),
+  )
+
+  // -------------------------------------------------------------------------
+  // #136 — caller-supplied expectedVersion (If-Match)
+  // -------------------------------------------------------------------------
+
+  it.effect("#136 a stale expectedVersion fails before decide, with actualVersion, unretried", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ifm-1" }
+      yield* EsCmdAccounts.append(
+        key,
+        [new EsCmdDeposited({ amount: 10 }), new EsCmdDeposited({ amount: 20 })],
+        0,
+      )
+      const handle = EventStore.commandHandler(esCmdDecider("ifm-1"), EsCmdAccounts, {
+        retry: 5,
+      })
+
+      const error = yield* handle(
+        key,
+        { _tag: "Withdraw", amount: 5 },
+        { expectedVersion: 1 },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      const conflict = error as VersionConflict
+      expect(conflict.streamName).toBe("Account")
+      expect(conflict.streamId).toBe("ifm-1")
+      expect(conflict.expectedVersion).toBe(1)
+      expect(conflict.actualVersion).toBe(2)
+      // `decide` never ran, the retry policy was not applied (one load), and
+      // nothing was written.
+      expect(esCmdDecideLog.filter((id) => id === "ifm-1")).toHaveLength(0)
+      expect(esCmdQueriesFor("ifm-1")).toHaveLength(1)
+      expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(2)
+
+      // The matching version goes through.
+      const ok = yield* handle(key, { _tag: "Withdraw", amount: 5 }, { expectedVersion: 2 })
+      expect(ok.version).toBe(3)
+      expect(ok.state).toEqual({ balance: 25, txCount: 3 })
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#136 concurrent writers at the same expectedVersion — exactly one lands", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ifm-2" }
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 100 })], 0)
+      const handle = EventStore.commandHandler(esCmdDecider("ifm-2"), EsCmdAccounts, {
+        retry: 5,
+      })
+
+      const results = yield* Effect.all(
+        [1, 2, 3].map((amount) =>
+          handle(key, { _tag: "Withdraw", amount }, { expectedVersion: 1 }).pipe(Effect.result),
+        ),
+        { concurrency: 3 },
+      )
+
+      const successes = results.filter((r) => r._tag === "Success")
+      const failures = results.filter((r) => r._tag === "Failure")
+      expect(successes).toHaveLength(1)
+      expect(failures).toHaveLength(2)
+      for (const failure of failures) {
+        expect((failure as { failure: { _tag: string } }).failure._tag).toBe("VersionConflict")
+      }
+      // Retry never re-decided a loser: one decide per command at most.
+      expect(esCmdDecideLog.filter((id) => id === "ifm-2").length).toBeLessThanOrEqual(3)
+      expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(2)
+    }).pipe(provideEsCmd),
+  )
+
+  // -------------------------------------------------------------------------
+  // #137 — decision-derived additionalItems
+  // -------------------------------------------------------------------------
+
+  it.effect("#137 a decision-derived projection commits atomically with the events", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-1"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+        EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+      ]
+
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 50 }, { additionalItems: project })
+      const last = yield* handle(
+        { accountId },
+        { _tag: "Withdraw", amount: 20 },
+        { additionalItems: project },
+      )
+
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(last.state)
+      expect(last.state).toEqual({ balance: 30, txCount: 2 })
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 an Effect-form projection may read before writing", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-2"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      // Reads the current projection row (absent on the first command) and
+      // guards the write on it — an optimistic projection.
+      const project = ({ state, version }: EventStore.Decision<EsCmdState, EsCmdEvent>) =>
+        Effect.gen(function* () {
+          const current = yield* EsCmdTallies.get({ accountId }).asEffect().pipe(Effect.option)
+          expect(Option.map(current, (t) => t.txCount)).toEqual(
+            version === 0 ? Option.none() : Option.some(version),
+          )
+          return [EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount })]
+        })
+
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 5 }, { additionalItems: project })
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 6 }, { additionalItems: project })
+
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect(tally.balance).toBe(11)
+      expect(tally.txCount).toBe(2)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 a failing projection condition leaves no events behind", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-3"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      yield* handle(
+        { accountId },
+        { _tag: "Deposit", amount: 40 },
+        {
+          additionalItems: ({ state }) => [
+            EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+          ],
+        },
+      )
+
+      const error = yield* handle(
+        { accountId },
+        { _tag: "Withdraw", amount: 15 },
+        {
+          additionalItems: ({ state }) => [
+            EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+            // No guard row exists — this check cannot hold.
+            Transaction.check(
+              EsCmdTallies.get({ accountId: "proj-3-guard" }),
+              Expression.condition({ attributeExists: "pk" }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      expect((error as AdditionalItemConditionFailed).indices).toEqual([1])
+
+      // All-or-nothing: neither the event nor the projection moved.
+      const events = yield* EsCmdAccounts.read({ accountId }, { consistentRead: true })
+      expect(events.map((e) => e.version)).toEqual([1])
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect(tally.balance).toBe(40)
+      expect(tally.txCount).toBe(1)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 retried commands re-derive the projection from the fresh decision", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-4"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts, {
+        retry: 10,
+      })
+      const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+        EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+      ]
+
+      yield* Effect.all(
+        [10, 20, 30, 40].map((amount) =>
+          handle({ accountId }, { _tag: "Deposit", amount }, { additionalItems: project }),
+        ),
+        { concurrency: 4 },
+      )
+
+      // Each commit's projection is the fold through its own version, and the
+      // last commit is the highest version, so the row equals the full fold —
+      // a projection derived from a stale (pre-retry) decision would not.
+      const events = yield* EsCmdAccounts.read({ accountId }, { consistentRead: true })
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(
+        EventStore.fold(esCmdDecider(accountId), events),
+      )
+      expect(tally.balance).toBe(100)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 a bound handler needs only the projection's own services", () =>
+    Effect.gen(function* () {
+      const bound = yield* EventStore.bind(EsCmdAccounts)
+      const handle = bound.pipe(EventStore.commandHandler(esCmdDecider("proj-5")))
+
+      const program = handle(
+        { accountId: "proj-5" },
+        { _tag: "Deposit", amount: 9 },
+        {
+          additionalItems: ({ state }) =>
+            Effect.gen(function* () {
+              const { accountId } = yield* EsCmdOwner
+              return [
+                EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+              ]
+            }),
+        },
+      )
+      // R is exactly the projection's service — the stream's are bound.
+      const provided: Effect.Effect<unknown, unknown, never> = program.pipe(
+        Effect.provideService(EsCmdOwner, { accountId: "proj-5" }),
+      )
+      yield* provided
+
+      const tally = yield* EsCmdTallies.get({ accountId: "proj-5" })
+      expect(tally.balance).toBe(9)
+    }).pipe(provideEsCmd),
   )
 })
 
