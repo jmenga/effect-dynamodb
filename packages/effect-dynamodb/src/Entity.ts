@@ -102,6 +102,7 @@ import {
   INCARNATION_TOKEN,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
+import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
 import {
   decodeSparseFields,
   encodeSparseFields,
@@ -708,6 +709,38 @@ export interface Entity<
    * decide between expanding (put) and rejecting (delete, and all of Batch).
    */
   readonly _multiItemWriteFeatures: ReadonlyArray<"unique" | "retain" | "softDelete">
+
+  /**
+   * @internal Compile an `update` into the transact items it would issue,
+   * without issuing them — for `Transaction.transactWrite`.
+   *
+   * Runs the standalone update itself (`updateOrCreate`, so `patch` and an
+   * update of a missing row behave exactly as standalone) with its write
+   * recorded instead of sent (`internal/TransactPlan.planWrite`). The plan is
+   * therefore the standalone write, guards included. It reads first wherever
+   * the standalone update does, which is why the read's outcomes
+   * (`ItemNotFound`, `OptimisticLockError`, …) can surface here.
+   */
+  readonly _planUpdate: (
+    key: unknown,
+    state: UpdateState,
+  ) => Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig>
+
+  /**
+   * @internal Compile a `delete` into the transact items it would issue — the
+   * `delete` counterpart of `_planUpdate`. For an entity with `unique`,
+   * `versioned: { retain: true }` or `softDelete` this includes the read of the
+   * stored row the sentinel releases, snapshot and tombstone are built from:
+   * the read whose absence is why the plain compile path refuses these
+   * deletes (EDD-9048).
+   */
+  readonly _planDelete: (
+    key: unknown,
+    opts: {
+      readonly condition: Expr | ConditionInput | undefined
+      readonly mustExist: boolean
+    },
+  ) => Effect.Effect<TransactPlan, PlanDeleteError, DynamoClient | TableConfig>
 
   /**
    * @internal Which of this entity's rows are items: a row is live iff the
@@ -6641,9 +6674,12 @@ const makeImpl = <
       // Sparse-map .clearMap — Get-then-Update helper. Reads the current
       // item with a consistent read to discover which `<prefix>#*` attrs
       // exist, then folds the resulting REMOVEs into this same UpdateItem.
-      // The version CAS (when configured) provides atomicity; non-versioned
-      // entities are best-effort (a concurrent writer can add a new bucket
-      // between the read and the update — that bucket survives).
+      // On a versioned entity the update is conditioned on the version that
+      // read found (`casRead`), so a writer adding a bucket in between makes
+      // it fail rather than survive the clear; a stale `expectedVersion` is
+      // refused before anything is sent. Non-versioned entities are
+      // best-effort (a concurrent writer can add a new bucket between the read
+      // and the update — that bucket survives).
       if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
         for (const field of uState.sparseClearFields) {
           if (!hasSparseFields || !(field in sparseFields)) {
@@ -6661,6 +6697,23 @@ const makeImpl = <
           ConsistentRead: true,
         })
         if (clearGetResult.Item) {
+          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
+            yield* checkVersion(clearGetResult.Item, "update")
+            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
+              string,
+              unknown
+            >
+            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
+            if (evExpected !== undefined && version !== evExpected) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: evExpected,
+                actualVersion: version,
+              })
+            }
+            casRead = { raw: clearGetResult.Item, version }
+          }
           const clearItemKeys = Object.keys(clearGetResult.Item)
           for (const field of uState.sparseClearFields) {
             const sparse = sparseFields[field]!
@@ -7018,6 +7071,184 @@ const makeImpl = <
       self,
       key as globalThis.Record<string, unknown>,
     )
+
+  /**
+   * Run one of this entity's write ops with its write recorded instead of
+   * sent (`planWrite`), and say how to read a cancellation of what it would
+   * have written. The op is the standalone op itself, so the plan carries
+   * every read it makes, every item it writes and every guard it puts on them
+   * — see `internal/TransactPlan.ts`.
+   *
+   * The verdict follows a guarded put's (`_planPut`): a cancelled sentinel
+   * reservation is the `UniqueConstraintViolation` the standalone op reports;
+   * a cancelled main item is the caller's condition when there is one
+   * (`TransactionCancelled`); anything else is a lost race — the row changed
+   * between the read and the transaction — and `transactWrite` plans it again
+   * from a fresh read.
+   *
+   * `payload` is what the caller asked to write. With the op's own read of
+   * the row, it lets a reservation say which values it reserves.
+   */
+  const planned = <E, R>(
+    operation: string,
+    key: unknown,
+    /** The op itself — a factory, because a missing row means running it again. */
+    op: () => Effect.Effect<unknown, E, R>,
+    request: {
+      readonly payload: globalThis.Record<string, unknown>
+      /** Values `.add()` / `.subtract()` change by, for the reported reservation. */
+      readonly deltas?: globalThis.Record<string, number> | undefined
+      /** The caller's own `.condition()` — not `patch`'s or `deleteIfExists`'s guard. */
+      readonly callerCondition: boolean
+      readonly expectedVersion?: number | undefined
+    },
+  ) =>
+    Effect.gen(function* () {
+      const encodedKey = yield* encodeKey(key, `${operation}.decodeKey`)
+      const primaryKey = composePrimaryKey(encodedKey)
+      const ownKey = toAttributeMap(primaryKey)
+      const recorded = yield* planWrite(operation, op(), ownKey)
+      let { items, ownRow } = recorded
+      // An op that wrote without reading its row relies on its write's own
+      // condition to find the row missing — a standalone `update` then
+      // creates it (or fails `ItemNotFound`), `patch` fails
+      // `ConditionalCheckFailed`. A transaction cannot follow that fallback,
+      // so the row is read here, and a missing row is answered to the op as
+      // its write would have been answered: it takes the same path.
+      if (!recorded.readOwnRow && items.length > 0) {
+        const client = yield* DynamoClient
+        const { name: tableName } = yield* tableTag
+        const read = yield* client.getItem({
+          TableName: tableName,
+          Key: ownKey,
+          ConsistentRead: true,
+        })
+        if (read.Item === undefined) {
+          ;({ items, ownRow } = yield* planWrite(operation, op(), ownKey, { rowMissing: true }))
+        } else {
+          ownRow = read.Item
+          // A pinned version the row no longer has is refused before sending,
+          // as the read-first paths do — not retried as if it were a race.
+          if (request.expectedVersion !== undefined && systemFields.version) {
+            const stored = fromAttributeMap(read.Item)[systemFields.version]
+            const actual = typeof stored === "number" ? stored : 0
+            if (actual !== request.expectedVersion) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: request.expectedVersion,
+                actualVersion: actual,
+              })
+            }
+          }
+        }
+      }
+      const pkField = config.indexes.primary.pk.field
+      const skField = config.indexes.primary.sk.field
+      const isOwn = (row: globalThis.Record<string, AttributeValue> | undefined) => {
+        if (row === undefined) return false
+        const plain = fromAttributeMap(row)
+        return plain[pkField] === primaryKey[pkField] && plain[skField] === primaryKey[skField]
+      }
+      // What the row looks like after the write, in domain names: the main
+      // Put's item when the op writes the whole row, else the row it read
+      // overlaid with the payload.
+      const mainPut = items.find((i) => i.Put !== undefined && isOwn(i.Put.Item))?.Put?.Item
+      const read = ownRow === undefined ? {} : toDomainView(fromAttributeMap(ownRow))
+      const after: globalThis.Record<string, unknown> =
+        mainPut !== undefined
+          ? toDomainView(fromAttributeMap(mainPut))
+          : { ...read, ...request.payload }
+      if (mainPut === undefined) {
+        for (const [field, delta] of Object.entries(request.deltas ?? {})) {
+          const base = read[field]
+          after[field] = (typeof base === "number" ? base : 0) + delta
+        }
+      }
+      const sentinelPrefix = `${entityType}._unique.`
+      type Role =
+        | { readonly _tag: "main" }
+        | { readonly _tag: "side" }
+        | { readonly _tag: "reserve"; readonly error: UniqueConstraintViolation }
+      const roles = items.map((item): Role => {
+        if (isOwn(item.Put?.Item) || isOwn(item.Update?.Key) || isOwn(item.Delete?.Key)) {
+          return { _tag: "main" }
+        }
+        const tag = item.Put?.Item?.__edd_e__?.S
+        if (
+          item.Put === undefined ||
+          item.Put.ConditionExpression === undefined ||
+          tag === undefined ||
+          !tag.startsWith(sentinelPrefix)
+        ) {
+          return { _tag: "side" }
+        }
+        const constraintName = tag.slice(sentinelPrefix.length)
+        const constraintDef = config.unique?.[constraintName]
+        const reserved =
+          constraintDef === undefined
+            ? undefined
+            : composeUniqueSentinel(schema, entityType, constraintName, constraintDef, after)
+        const putKey = fromAttributeMap(item.Put.Item ?? {})
+        // Only values that recompose THIS sentinel are reported — never a guess.
+        const fields =
+          reserved !== undefined &&
+          reserved.key.pk === putKey[pkField] &&
+          reserved.key.sk === putKey[skField]
+            ? reserved.fieldsRecord
+            : {}
+        return {
+          _tag: "reserve",
+          error: new UniqueConstraintViolation({ entityType, constraint: constraintName, fields }),
+        }
+      })
+      const lostRace = new ConcurrentModification({
+        entityType,
+        key: encodedKey as globalThis.Record<string, unknown>,
+        attributes: [],
+        current: Option.none(),
+      })
+      return {
+        items,
+        // Everything but a taken unique value and the caller's own condition
+        // is retried, and every attempt plans again from fresh reads — so a
+        // row now missing takes the op's missing-row path, and a pinned
+        // version the row no longer has fails `OptimisticLockError`, exactly
+        // as standalone.
+        verdict: (reasons) => {
+          let failed = false
+          let callerRejected = false
+          for (const [i, role] of roles.entries()) {
+            const reason = reasons[i]
+            if (reason?.Code !== "ConditionalCheckFailed") continue
+            if (role._tag === "reserve") return { _tag: "Fail", error: role.error }
+            failed = true
+            // The row is there, so the existence guards held: only the
+            // caller's own condition can have rejected it — or a race.
+            if (role._tag === "main" && request.callerCondition && reason.Item !== undefined) {
+              callerRejected = true
+            }
+          }
+          if (!failed) return undefined
+          if (callerRejected) return { _tag: "Condition" }
+          return { _tag: "Retry", stored: undefined, error: lostRace }
+        },
+      } satisfies TransactPlan
+    })
+
+  /** Compile an update for `Transaction.transactWrite` — see `_planUpdate`. */
+  const planUpdate = (key: unknown, uState: UpdateState) =>
+    planned("transactWrite.update", key, () => updateOrCreate(key, "native", uState), {
+      payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
+      deltas: {
+        ...uState.add,
+        ...Object.fromEntries(
+          Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
+        ),
+      },
+      callerCondition: uState.condition !== undefined,
+      expectedVersion: uState.expectedVersion,
+    })
 
   // ---------------------------------------------------------------------------
   // delete operation
@@ -7558,6 +7789,21 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
   // deleteIfExists operation — delete + attribute_exists condition
   // ---------------------------------------------------------------------------
+
+  /** Compile a delete for `Transaction.transactWrite` — see `_planDelete`. */
+  const planDelete = (
+    key: unknown,
+    opts: {
+      readonly condition: Expr | ConditionInput | undefined
+      readonly mustExist: boolean
+    },
+  ) =>
+    planned(
+      "transactWrite.delete",
+      key,
+      () => del(key)._builder({ ...opts, returnValues: undefined }),
+      { payload: {}, callerCondition: opts.condition !== undefined },
+    )
 
   const deleteIfExists = (key: unknown) => {
     const op = del(key)
@@ -9394,6 +9640,19 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
+    _planUpdate: (key: unknown, state: UpdateState) =>
+      planUpdate(key, state).pipe(
+        // Planning stops at the write, so only what an update raises BEFORE
+        // writing can surface; anything else is a defect (`isPlanUpdateError`).
+        Effect.catch((e: unknown) => (isPlanUpdateError(e) ? Effect.fail(e) : Effect.die(e))),
+      ),
+    _planDelete: (
+      key: unknown,
+      opts: { readonly condition: Expr | ConditionInput | undefined; readonly mustExist: boolean },
+    ) =>
+      planDelete(key, opts).pipe(
+        Effect.catch((e: unknown) => (isPlanDeleteError(e) ? Effect.fail(e) : Effect.die(e))),
+      ),
     _liveRows: liveRows,
     _attachPrototype: attachPrototype,
     _configure: (
@@ -9871,6 +10130,60 @@ export const bind = <
 // Extraction protocol — used by Transaction and Batch modules
 // ---------------------------------------------------------------------------
 
+/**
+ * What planning an update for a transaction can fail with: everything the
+ * update raises before it writes — its reads (`DynamoClientError`, `ItemNotFound`,
+ * `RefNotFound`), a stale `expectedVersion`, `patch` of a missing row
+ * (`ConditionalCheckFailed`), an op too large for one transaction, and a
+ * refused op (`ValidationError`).
+ */
+export type PlanUpdateError =
+  | DynamoClientError
+  | ValidationError
+  | ConditionalCheckFailed
+  | ItemNotFound
+  | TransactionOverflow
+  | OptimisticLockError
+  | RefNotFound
+  | UniqueConstraintViolation
+
+/** What planning a delete for a transaction can fail with — see {@link PlanUpdateError}. */
+export type PlanDeleteError =
+  | DynamoClientError
+  | ValidationError
+  | ConditionalCheckFailed
+  | ItemNotFound
+  | TransactionOverflow
+
+const tagged =
+  <A>(tags: ReadonlySet<string>) =>
+  (e: unknown): e is A =>
+    typeof e === "object" && e !== null && "_tag" in e && tags.has(String(e._tag))
+
+const clientErrorTags = [
+  "DynamoError",
+  "ThrottlingError",
+  "DynamoValidationError",
+  "InternalServerError",
+  "ResourceNotFoundError",
+]
+const planDeleteErrorTags = [
+  ...clientErrorTags,
+  "ValidationError",
+  "ConditionalCheckFailed",
+  "ItemNotFound",
+  "TransactionOverflow",
+]
+const isPlanDeleteError = tagged<PlanDeleteError>(new Set(planDeleteErrorTags))
+const isPlanUpdateError = tagged<PlanUpdateError>(
+  new Set([
+    ...planDeleteErrorTags,
+    "OptimisticLockError",
+    "RefNotFound",
+    "UniqueConstraintViolation",
+  ]),
+)
+
 export interface TransactableInfo {
   readonly opType: "get" | "put" | "update" | "delete"
   readonly entity: Entity
@@ -9891,6 +10204,20 @@ export interface TransactableInfo {
    * a `Put` MUST reject `"upsert"` rather than compile it (#100).
    */
   readonly putKind?: PutKind | undefined
+  /** For `opType: "update"` — the accumulated update (`.set()`, `.remove()`, `patch`, …). */
+  readonly updateState?: UpdateState | undefined
+  /**
+   * For `opType: "delete"` — the request as the caller built it: its own
+   * condition (without `deleteIfExists`'s guard, which `mustExist` carries),
+   * and its return mode, which a transaction cannot honour (EDD-9060).
+   */
+  readonly deleteRequest?:
+    | {
+        readonly condition: Expr | ConditionInput | undefined
+        readonly mustExist: boolean
+        readonly returnValues: ReturnValuesMode | undefined
+      }
+    | undefined
 }
 
 /** @internal */
@@ -9912,6 +10239,7 @@ interface InternalEntityDelete {
   readonly _key: globalThis.Record<string, unknown>
   readonly _condition?: Expr | ConditionInput | undefined
   readonly _mustExist?: boolean
+  readonly _returnValues?: ReturnValuesMode | undefined
 }
 
 const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
@@ -9965,13 +10293,15 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
       }
     }
     if (target._opType === "update") {
-      // Every multi-item path (transactions, `Batch.write`, `EventStore`
-      // additional items) refuses an update, so no guard is carried here.
+      // `Transaction.transactWrite` plans an update from its whole state
+      // (`_planUpdate`), which applies `patch`'s guard itself; every other
+      // multi-item path refuses an update.
       return {
         opType: "update",
         entity: target._entity,
         key: target._key,
         condition: target._updateState?.condition,
+        updateState: target._updateState,
       }
     }
   }
@@ -9989,6 +10319,11 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
           : undefined,
         target._condition,
       ),
+      deleteRequest: {
+        condition: target._condition,
+        mustExist: target._mustExist === true,
+        returnValues: target._returnValues,
+      },
     }
   }
 
