@@ -22,7 +22,7 @@
  *   npx tsx examples/version-control.ts
  */
 
-import { Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -613,10 +613,10 @@ const program = Effect.gen(function* () {
 
 // #region layer
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   VcsTable.layer({ name: "vcs-table" }),
 )

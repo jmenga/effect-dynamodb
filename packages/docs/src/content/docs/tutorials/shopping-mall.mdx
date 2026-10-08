@@ -357,10 +357,10 @@ The example wires dependencies via Effect Layers -- no global config or construc
 
 ```typescript title="main.ts" region="run" example="shopping-mall.ts"
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MallTable.layer({ name: "mall-table" }),
 )

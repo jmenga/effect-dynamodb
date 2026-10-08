@@ -18,7 +18,7 @@
  *   npx tsx examples/guide-modeling.ts
  */
 
-import { Console, DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { Config, Console, DateTime, Duration, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -178,10 +178,10 @@ const program = Effect.gen(function* () {
 
 // #region run
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "modeling-guide-table" }),
 )
