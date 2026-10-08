@@ -3590,6 +3590,94 @@ describe("EventStore", () => {
         expect(mockQuery).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    it.effect(
+      "a redelivered idempotent command with its original expectedVersion is a DuplicateCommand",
+      () =>
+        Effect.gen(function* () {
+          // The first delivery committed v2 (its response was lost); the
+          // redelivery carries the same commandId and the same If-Match.
+          mockQuery.mockResolvedValue(atV2())
+          mockGetItem.mockResolvedValue({ Item: toAttributeMap({ pk: "x" }) })
+          const { decide, decider } = spied()
+
+          const error = yield* EventStore.commandHandler(decider, MatchEvents, {
+            idempotency: {},
+            retry: 5,
+          })({ matchId: "m-1" }, completeInnings, {
+            commandId: "cmd-1",
+            expectedVersion: 1,
+          }).pipe(Effect.flip)
+
+          expect(error._tag).toBe("DuplicateCommand")
+          const duplicate = error as DuplicateCommand
+          expect(duplicate.streamName).toBe("Match")
+          expect(duplicate.streamId).toBe("m-1")
+          expect(duplicate.commandId).toBe("cmd-1")
+          // One strongly consistent read of the sentinel key, no decide, no write.
+          expect(mockGetItem).toHaveBeenCalledOnce()
+          const probe = mockGetItem.mock.calls[0]![0]
+          expect(probe.ConsistentRead).toBe(true)
+          expect(fromAttributeMap(probe.Key)).toEqual({
+            pk: "$cricket#v1#match#m-1",
+            sk: "$cricket#v1#match.command#cmd-1",
+          })
+          expect(decide).not.toHaveBeenCalled()
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expect(mockQuery).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an idempotent command whose sentinel is absent still reports VersionConflict", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(atV2())
+        const { decide, decider } = spied()
+
+        const error = yield* EventStore.commandHandler(decider, MatchEvents, {
+          idempotency: {},
+        })({ matchId: "m-1" }, completeInnings, {
+          commandId: "cmd-2",
+          expectedVersion: 1,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).actualVersion).toBe(2)
+        expect(mockGetItem).toHaveBeenCalledOnce()
+        expect(decide).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound stream probes the sentinel with its own services", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(MatchEvents)
+        mockQuery.mockResolvedValue(atV2())
+        mockGetItem.mockResolvedValue({ Item: toAttributeMap({ pk: "x" }) })
+
+        const error = yield* EventStore.commandHandler(matchDecider, bound, {
+          idempotency: {},
+        })({ matchId: "m-1" }, completeInnings, {
+          commandId: "cmd-3",
+          expectedVersion: 0,
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DuplicateCommand")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a handler without idempotency never probes on a conflict", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(atV2())
+
+        const error = yield* EventStore.commandHandler(matchDecider, MatchEvents)(
+          { matchId: "m-1" },
+          completeInnings,
+          { commandId: "cmd-4", expectedVersion: 1 },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   // -------------------------------------------------------------------------

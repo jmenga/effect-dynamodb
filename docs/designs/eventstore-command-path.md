@@ -59,7 +59,16 @@ Per-call `CommandOptions.expectedVersion?: number`. When it is supplied:
    conditional write.
 4. A no-op decision (`decide` returns `[]`) at the matching version succeeds,
    returning the current state and version, exactly as today.
-5. A value that is not a non-negative integer (`NaN` from a failed `If-Match`
+5. **Idempotency precedence.** With `idempotency` configured and a
+   `commandId` supplied, a pre-decide mismatch first checks the command's
+   sentinel with one strongly consistent `GetItem` (paid on the mismatch path
+   only). If the sentinel exists, the call fails with `DuplicateCommand`, not
+   `VersionConflict`: a redelivery whose response was lost carries its original
+   If-Match, which the stream has since moved past, and it must be reported as
+   already applied rather than as a lost race. This is the same precedence
+   `append` applies (and §5 keeps for chunked appends). An append-time conflict
+   needs no probe — `append` already ranks the sentinel first.
+6. A value that is not a non-negative integer (`NaN` from a failed `If-Match`
    parse, a negative or fractional number) is a caller bug, not a conflict: it
    fails with `ValidationError` before anything is read, and is not retried.
 
@@ -373,7 +382,9 @@ Required connected scenarios:
 
 - **#139**: read-your-writes through `consistentRead`.
 - **#136**: stale `expectedVersion` → `VersionConflict` with `actualVersion`.
-  `decide` is not invoked, and a `retry` policy is not applied.
+  `decide` is not invoked, and a `retry` policy is not applied. A redelivered
+  idempotent command carrying its original `expectedVersion` →
+  `DuplicateCommand`.
 - **#137**: the function form commits projection rows atomically with the
   events. A failing projection condition leaves no events behind.
 - **#138**:

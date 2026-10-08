@@ -8682,10 +8682,55 @@ describeConnected("EventStore command path (#139, #136, #137)", () => {
       for (const failure of failures) {
         expect((failure as { failure: { _tag: string } }).failure._tag).toBe("VersionConflict")
       }
-      // Retry never re-decided a loser: one decide per command at most.
-      expect(esCmdDecideLog.filter((id) => id === "ifm-2").length).toBeLessThanOrEqual(3)
+      // The retry policy never ran: exactly one load per command. A retried
+      // loser — whether it lost at the append or at the pre-decide check —
+      // would have reloaded the partition (decide counts cannot show this: a
+      // retried loser fails pre-decide and never reaches decide).
+      expect(esCmdQueriesFor("ifm-2")).toHaveLength(3)
       expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(2)
     }).pipe(provideEsCmd),
+  )
+
+  it.effect(
+    "#136 a redelivered idempotent command with its original expectedVersion is a DuplicateCommand",
+    () =>
+      Effect.gen(function* () {
+        const key = { accountId: "ifm-3" }
+        const handle = EventStore.commandHandler(esCmdDecider("ifm-3"), EsCmdAccounts, {
+          idempotency: {},
+          retry: 5,
+        })
+
+        // First delivery commits; its response is "lost".
+        const first = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-1", expectedVersion: 0 },
+        )
+        expect(first.version).toBe(1)
+
+        // The redelivery carries the same commandId and If-Match: already applied.
+        const replay = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-1", expectedVersion: 0 },
+        ).pipe(Effect.flip)
+        expect(replay._tag).toBe("DuplicateCommand")
+        expect((replay as DuplicateCommand).commandId).toBe("cmd-1")
+
+        // A different command at the stale version lost a race.
+        const stale = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-2", expectedVersion: 0 },
+        ).pipe(Effect.flip)
+        expect(stale._tag).toBe("VersionConflict")
+        expect((stale as VersionConflict).actualVersion).toBe(1)
+
+        // Neither reached decide, and nothing was written twice.
+        expect(esCmdDecideLog.filter((id) => id === "ifm-3")).toHaveLength(1)
+        expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(1)
+      }).pipe(provideEsCmd),
   )
 
   // -------------------------------------------------------------------------

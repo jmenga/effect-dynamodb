@@ -305,6 +305,27 @@ const formatStreamIdOf = (stream: object, streamId: Record<string, unknown>): st
   return formatter !== undefined ? formatter(streamId) : Object.values(streamId).join("#")
 }
 
+/**
+ * @internal Carries a probe for a command's idempotency sentinel (one strongly
+ * consistent `GetItem`), so {@link commandHandler} can tell a redelivered
+ * command from a lost race when its pre-decide If-Match check fails. Not part
+ * of the public interface: `makeStream` and `bind` attach it (a bound stream's
+ * probe has its services provided); a hand-built stream object has none.
+ */
+const CommandSentinelProbe: unique symbol = Symbol.for(
+  "effect-dynamodb/EventStream/CommandSentinelProbe",
+)
+
+/** @internal */
+type CommandSentinelProbeFn = (
+  streamId: Record<string, unknown>,
+  commandId: string,
+) => Effect.Effect<boolean, DynamoClientError, DynamoClient | TableConfig>
+
+/** @internal */
+const commandSentinelProbeOf = (stream: object): CommandSentinelProbeFn | undefined =>
+  (stream as { [CommandSentinelProbe]?: CommandSentinelProbeFn })[CommandSentinelProbe]
+
 // ---------------------------------------------------------------------------
 // EventStream interface
 // ---------------------------------------------------------------------------
@@ -566,6 +587,10 @@ export const makeStream = <
 
   const composeEventSk = (version: number): string =>
     DynamoSchema.composeEventVersionKey(schema, eventKeyLabel, version, keyOptions)
+
+  /** Sort key of a command's idempotency sentinel. */
+  const composeCommandSk = (commandId: string): string =>
+    DynamoSchema.composeKey(schema, commandKeyLabel, [commandId], keyOptions)
 
   /**
    * Every event SK begins with this; nothing else in the stream partition does.
@@ -867,12 +892,7 @@ export const makeStream = <
         if (idempotency !== undefined) {
           const sentinel: Record<string, unknown> = {
             pk,
-            sk: DynamoSchema.composeKey(
-              schema,
-              commandKeyLabel,
-              [idempotency.commandId],
-              keyOptions,
-            ),
+            sk: composeCommandSk(idempotency.commandId),
             __edd_e__: commandEntityType,
             streamId: streamIdStr,
             commandId: idempotency.commandId,
@@ -1195,6 +1215,27 @@ export const makeStream = <
     >
 
   // ---------------------------------------------------------------------------
+  // hasCommandSentinel (internal — see CommandSentinelProbe)
+  // ---------------------------------------------------------------------------
+
+  const hasCommandSentinel = (
+    streamId: Record<string, unknown>,
+    commandId: string,
+  ): Effect.Effect<boolean, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+      const result = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap({ pk: composeStreamPk(streamId), sk: composeCommandSk(commandId) }),
+        ConsistentRead: true,
+        ProjectionExpression: "#pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+      })
+      return result.Item !== undefined
+    }) as Effect.Effect<boolean, DynamoClientError, DynamoClient | TableConfig>
+
+  // ---------------------------------------------------------------------------
   // query.events helper
   // ---------------------------------------------------------------------------
 
@@ -1248,6 +1289,7 @@ export const makeStream = <
     currentVersion,
     query: queryNamespace,
     [StreamIdFormatter]: composeStreamIdString,
+    [CommandSentinelProbe]: hasCommandSentinel,
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,
@@ -1381,6 +1423,7 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+    const probe = commandSentinelProbeOf(stream)
 
     return {
       [EventStreamTypeId]: EventStreamTypeId,
@@ -1403,6 +1446,10 @@ export const bind = <TEvent, TStreamIdFields extends ReadonlyArray<string>, TMet
       query: stream.query,
       provide,
       [StreamIdFormatter]: (id: Record<string, unknown>) => formatStreamIdOf(stream, id),
+      [CommandSentinelProbe]:
+        probe === undefined
+          ? undefined
+          : (id: Record<string, unknown>, commandId: string) => provide(probe(id, commandId)),
     } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState>
   })
 
@@ -1505,7 +1552,14 @@ export interface CommandOptions<
   readonly metadata?: TMetadata
   /**
    * Identifier for this command delivery. Required when the handler was created
-   * with `idempotency`; a replayed id fails with `DuplicateCommand`.
+   * with `idempotency`; a replayed id fails with `DuplicateCommand` — also when
+   * the replay carries an {@link expectedVersion} the stream has since moved
+   * past (see there).
+   *
+   * Otherwise the sentinel is consulted when the events are appended, after
+   * `decide`, so a replay whose `decide` fails against the advanced state
+   * reports that failure, and one whose `decide` returns no events succeeds as
+   * a no-op.
    */
   readonly commandId?: string
   /**
@@ -1518,6 +1572,12 @@ export interface CommandOptions<
    * between the load and the append also fails it with `VersionConflict`
    * (without `actualVersion`). Neither is retried, whatever the handler's
    * `retry` policy says.
+   *
+   * With `idempotency`, a mismatch is first checked against the command's
+   * sentinel (one strongly consistent `GetItem`, on the mismatch path only): a
+   * redelivery of a command that already committed — its response lost, the
+   * same `commandId` and If-Match sent again — fails with `DuplicateCommand`,
+   * not `VersionConflict`, matching the precedence `append` applies.
    *
    * A no-op decision (`decide` returns `[]`) at the matching version succeeds
    * with the current state and version. Must be a non-negative integer — any
@@ -1749,6 +1809,23 @@ const makeCommandHandlerImpl = <
       // 2. If-Match (#136): the caller saw a different version, so `decide`
       //    must not run against state the caller never saw.
       if (expectedVersion !== undefined && expectedVersion !== baseVersion) {
+        // A redelivery of a command that already committed (its response was
+        // lost) arrives with its original If-Match, which the stream has since
+        // moved past. It is a duplicate, not a lost race — `append` ranks
+        // `DuplicateCommand` above `VersionConflict` for the same reason — so
+        // consult the sentinel before reporting the conflict. The extra read is
+        // paid on this conflict path only.
+        const probe = commandSentinelProbeOf(stream)
+        const commandId = callOptions?.commandId
+        if (options?.idempotency !== undefined && commandId !== undefined && probe !== undefined) {
+          if (yield* probe(streamId as Record<string, unknown>, commandId)) {
+            return yield* new DuplicateCommand({
+              streamName: stream.streamName,
+              streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
+              commandId,
+            })
+          }
+        }
         return yield* new VersionConflict({
           streamName: stream.streamName,
           streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
