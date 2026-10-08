@@ -9048,6 +9048,37 @@ const esLatSentinel = (accountId: string, commandId: string) =>
 const esLatDeposits = (n: number) =>
   Array.from({ length: n }, () => new EsCmdDeposited({ amount: 1 }))
 
+/**
+ * A `Schema.Class` state folded by an immutable `evolve` that spreads — the
+ * fold yields a plain object the class encoder alone refuses.
+ */
+class EsLatClassState extends Schema.Class<EsLatClassState>("EsLatClassState")({
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const esLatClassDecider: EventStore.Decider<EsLatClassState, number, EsCmdEvent> = {
+  initialState: new EsLatClassState({ balance: 0, txCount: 0 }),
+  decide: (amount) => Effect.succeed([new EsCmdDeposited({ amount })]),
+  evolve: (state, event) => ({
+    ...state,
+    balance: state.balance + (event instanceof EsCmdDeposited ? event.amount : -event.amount),
+    txCount: state.txCount + 1,
+  }),
+}
+
+const esLatClassStream = (streamName: string, mode: "inline" | "after-append") =>
+  EventStore.makeStream({
+    table: EsLatTable,
+    streamName,
+    events: [EsCmdDeposited, EsCmdWithdrew],
+    streamId: { composite: ["accountId"] },
+    snapshot: { schema: EsLatClassState, mode, every: 1 },
+  })
+
+const EsClassInline = esLatClassStream("ClassInline", "inline")
+const EsClassAfter = esLatClassStream("ClassAfter", "after-append")
+
 describeConnected("EventStore inline snapshots and chunked append (#138, #141)", () => {
   beforeAll(async () => {
     await Effect.runPromise(
@@ -9165,6 +9196,28 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
       expect(result).toMatchObject({ version: 5, state: { balance: 14, txCount: 5 } })
       const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
       expect(snapshot).toMatchObject({ asOfVersion: 5, state: { balance: 14, txCount: 5 } })
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a Schema.Class state from a spreading evolve snapshots in both modes", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "class-1" }
+      for (const stream of [EsClassInline, EsClassAfter]) {
+        const handle = EventStore.commandHandler(esLatClassDecider, stream)
+        yield* handle(key, 30)
+        const result = yield* handle(key, 12)
+        expect(result).toMatchObject({ version: 2, state: { balance: 42, txCount: 2 } })
+
+        // The snapshot was written, and decodes back into the class.
+        const snapshot = Option.getOrThrow(yield* stream.readSnapshot(key))
+        expect(snapshot.asOfVersion).toBe(2)
+        expect(snapshot.state).toBeInstanceOf(EsLatClassState)
+        expect(snapshot.state).toMatchObject({ balance: 42, txCount: 2 })
+
+        // The next command folds from it.
+        const next = yield* handle(key, 8)
+        expect(next).toMatchObject({ version: 3, state: { balance: 50, txCount: 3 } })
+      }
     }).pipe(provideEsLat),
   )
 

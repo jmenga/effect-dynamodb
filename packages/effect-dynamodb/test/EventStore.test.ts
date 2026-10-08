@@ -4665,6 +4665,97 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
   })
+
+  // A `Schema.Class` state with an immutable `evolve` that spreads: the fold
+  // yields a structurally matching plain object, which TypeScript accepts as
+  // the class type but a plain `Schema.encode` refuses (`Expected Tally`).
+  // The snapshot encoder decodes it first, as events and metadata are.
+  describe("Schema.Class state with a spreading evolve", () => {
+    class Tally extends Schema.Class<Tally>("Tally")({
+      innings: Schema.Number,
+      runs: Schema.Number,
+    }) {}
+
+    const tallyDecider: EventStore.Decider<Tally, number, MatchEvent> = {
+      initialState: new Tally({ innings: 0, runs: 0 }),
+      decide: (runs, state) =>
+        Effect.succeed([new InningsCompleted({ innings: state.innings + 1, runs, wickets: 0 })]),
+      evolve: (state, event) =>
+        event instanceof InningsCompleted
+          ? { ...state, innings: state.innings + 1, runs: state.runs + event.runs }
+          : state,
+    }
+
+    const InlineTally = EventStore.makeStream({
+      table: EventsTable,
+      streamName: "InlineTally",
+      events: [MatchStarted, InningsCompleted, MatchEnded],
+      streamId: { composite: ["matchId"] },
+      snapshot: { schema: Tally, mode: "inline" },
+    })
+
+    const AfterAppendTally = EventStore.makeStream({
+      table: EventsTable,
+      streamName: "AfterTally",
+      events: [MatchStarted, InningsCompleted, MatchEnded],
+      streamId: { composite: ["matchId"] },
+      snapshot: { schema: Tally, every: 1 },
+    })
+
+    it.effect("inline: the spread state is written in the append transaction", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* EventStore.commandHandler(tallyDecider, InlineTally)(
+          { matchId: "m-1" },
+          120,
+        )
+
+        expect(result.version).toBe(1)
+        expect(result.state).toEqual({ innings: 1, runs: 120 })
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        const snapshot = fromAttributeMap(items[items.length - 1].Put.Item)
+        expect(snapshot.__edd_e__).toBe("inlinetally.snapshot")
+        expect(snapshot.asOfVersion).toBe(1)
+        expect(snapshot.state).toEqual({ innings: 1, runs: 120 })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("after-append: the spread state is written by writeSnapshot", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+        mockPutItem.mockResolvedValue({})
+
+        const result = yield* EventStore.commandHandler(tallyDecider, AfterAppendTally)(
+          { matchId: "m-1" },
+          80,
+        )
+
+        expect(result.version).toBe(1)
+        expect(mockPutItem).toHaveBeenCalledOnce()
+        const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+        expect(snapshot.__edd_e__).toBe("aftertally.snapshot")
+        expect(snapshot.state).toEqual({ innings: 1, runs: 80 })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("append({ snapshot }) still refuses a state that matches neither shape", () =>
+      Effect.gen(function* () {
+        const error = yield* InlineTally.append(
+          { matchId: "m-1" },
+          [new InningsCompleted({ innings: 1, runs: 1, wickets: 0 })],
+          0,
+          { snapshot: { innings: "one" } as unknown as Tally },
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("inlinetally.snapshot")
+        expect((error as ValidationError).operation).toBe("EventStore.append.snapshot")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -5070,6 +5161,32 @@ describe("EventStore chunked append (#141)", () => {
         })
         expect((yield* handle({ matchId: "m-1" }, 150)).version).toBe(150)
         expect(mockQuery).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Documented, not probed: the sentinel is consulted only by `append`, so a
+    // redelivery whose `decide` returns no events against the committed prefix
+    // of a `PartialAppend` succeeds as a no-op — whether it must be told apart
+    // is the application's call.
+    it.effect("a no-op redelivery after a PartialAppend succeeds without reading the claim", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: Array.from({ length: 3 }, (_, i) =>
+            makeEventItem("m-1", i + 1, "InningsCompleted", {
+              innings: i + 1,
+              runs: 1,
+              wickets: 1,
+            }),
+          ),
+        })
+        const handle = EventStore.commandHandler(BulkDecider, MatchEvents, {
+          chunked: true,
+          idempotency: {},
+        })
+        const result = yield* handle({ matchId: "m-1" }, 0, { commandId: "big" })
+        expect(result).toEqual({ state: 3, version: 3, events: [] })
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

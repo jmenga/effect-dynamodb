@@ -65,6 +65,12 @@ malformed stream index, `[EDD-9064]` index attribute owned by the stream,
 `[EDD-9065]` indexes sharing an index or attribute, `[EDD-9066]` undeclared
 index name, `[EDD-9067]` conflicting physical index definitions.
 
+Fix: snapshot state is now encoded with the same `decode → encode` fallback as
+events. A `Schema.Class` state folded by an immutable `evolve` that spreads
+(`({ ...s, balance })`) is a plain object, which the state schema's encoder
+alone refused; an after-append snapshot was then silently never written, and
+an inline one would have failed every command on the stream.
+
 Whether `decide` may mutate state (#142) is left to the application: the
 library adds no read-only types or runtime guard.
 

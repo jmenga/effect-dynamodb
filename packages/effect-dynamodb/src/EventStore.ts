@@ -207,6 +207,12 @@ export interface Snapshot<State> {
  * `mode: "inline"`, which keeps the snapshot current so the page stays small.
  */
 export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
+  /**
+   * The state schema. Snapshot state is encoded through it, falling back to
+   * `decode → encode` (as events are) for a value not already in its type
+   * shape — so a `Schema.Class` state folded by an immutable `evolve` that
+   * spreads (`({ ...s, balance })`, a plain object) still encodes.
+   */
   readonly schema: TSchema
   readonly mode?: SnapshotMode | undefined
   readonly every?: number | undefined
@@ -247,12 +253,20 @@ export interface SnapshotSettings {
  * A chunked append split across transactions ({@link AppendOptions.chunked})
  * claims the command in its **first** transaction, with a `pending` sentinel,
  * and completes the sentinel in its final one. From the first transaction on,
- * every other delivery of the `commandId` — concurrent with the append, or
+ * every other append of the `commandId` — concurrent with the append, or
  * after it failed partway with `PartialAppend` — fails with `DuplicateCommand`
  * and writes nothing. A command whose chunked append failed partway is
  * therefore never applied twice, but nor is it completed by a redelivery: the
  * prefix it left stays recorded under the command, and repairing it is the
  * application's call.
+ *
+ * The sentinel is consulted only by an append. Through `commandHandler`, a
+ * redelivery whose `decide` returns no events against the loaded state never
+ * appends, so it succeeds as a no-op instead of failing with
+ * `DuplicateCommand` — including after a `PartialAppend`, when that state is
+ * the committed prefix. Success then does not mean the command completed.
+ * Whether a no-op redelivery needs to be told apart is the application's
+ * call (see {@link CommandOptions.commandId}).
  *
  * The sentinel is co-located in the stream's own partition, so `commandId`
  * uniqueness is scoped to the stream (which is what "have I already applied this
@@ -338,7 +352,8 @@ export interface AppendOptions<TMetadata, TState = never> {
    * - The **first** carries the version-contiguity check on `expectedVersion`
    *   and, with `idempotency`, claims the command with a `pending` sentinel
    *   (see {@link AppendIdempotency}), so a replay — or a redelivery while
-   *   this append is in flight — fails with `DuplicateCommand`. Concurrency is
+   *   this append is in flight — that appends fails with `DuplicateCommand`
+   *   (a `commandHandler` no-op decision never appends). Concurrency is
    *   decided here: its failure maps exactly as a non-chunked append's does. A
    *   cancellation (`VersionConflict`, `DuplicateCommand`, …) means nothing
    *   was written; a transport error leaves the first transaction's outcome
@@ -1299,6 +1314,7 @@ export const makeStream = <
     codec: Schema.Codec<any>,
     input: unknown,
     operation: string,
+    errorEntityType: string = entityType,
   ): Effect.Effect<unknown, ValidationError> =>
     Schema.encodeUnknownEffect(codec)(input).pipe(
       Effect.catch((primaryCause) =>
@@ -1307,7 +1323,9 @@ export const makeStream = <
           // Surface the original encode error — its message is keyed on the
           // caller's input shape, which is what the user expects to see.
           Effect.catch(() =>
-            Effect.fail(new ValidationError({ entityType, operation, cause: primaryCause })),
+            Effect.fail(
+              new ValidationError({ entityType: errorEntityType, operation, cause: primaryCause }),
+            ),
           ),
         ),
       ),
@@ -1404,17 +1422,23 @@ export const makeStream = <
       }),
     )
 
-  /** Encode snapshot state to wire form through the state schema. */
+  /**
+   * Encode snapshot state to wire form through the state schema, with the
+   * same `decode → encode` fallback as events and metadata. A structurally
+   * matching plain object — what an immutable `evolve` that spreads a
+   * `Schema.Class` state returns (`({ ...s, balance })`), which TypeScript
+   * accepts as the class type — is decoded into the schema's type first
+   * rather than refused with `Expected <Class>`.
+   */
   const encodeSnapshotState = (
     state: unknown,
     operation: string,
   ): Effect.Effect<unknown, ValidationError> =>
-    Schema.encodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
+    encodeToWire(
+      (snapshot as SnapshotConfig).schema as Schema.Codec<unknown>,
       state,
-    ).pipe(
-      Effect.mapError(
-        (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
-      ),
+      operation,
+      snapshotEntityType,
     )
 
   /**
@@ -2975,7 +2999,10 @@ export interface CommandOptions<
    * Otherwise the sentinel is consulted when the events are appended, after
    * `decide`, so a replay whose `decide` fails against the advanced state
    * reports that failure, and one whose `decide` returns no events succeeds as
-   * a no-op.
+   * a no-op. That holds for a chunked command too: a redelivery after its
+   * `PartialAppend` whose `decide` returns no events against the committed
+   * prefix succeeds, although the command never completed. Only a redelivery
+   * that appends fails with `DuplicateCommand`.
    */
   readonly commandId?: string
   /**
@@ -3020,7 +3047,9 @@ export interface CommandOptions<
    * never retried. The `additionalItems`, the completed idempotency sentinel
    * and the inline snapshot ride on the final transaction; the first one
    * claims the command, so a redelivery never applies it twice (see
-   * {@link AppendIdempotency}).
+   * {@link AppendIdempotency}; a redelivery whose `decide` returns no events
+   * succeeds as a no-op without consulting the claim — see
+   * {@link CommandOptions.commandId}).
    */
   readonly chunked?: boolean | undefined
 }

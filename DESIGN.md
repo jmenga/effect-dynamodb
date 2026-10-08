@@ -3002,8 +3002,11 @@ events, and another writer appending between two chunks aborts the rest.
   writes nothing). With idempotency it also claims the command with a `pending`
   sentinel guarded by `attribute_not_exists`, so every other delivery of the
   `commandId` — a replay, a redelivery while the append is in flight, or one after a
-  `PartialAppend` — fails with `DuplicateCommand`. A command is never applied twice,
-  but a redelivery does not complete a partial one either.
+  `PartialAppend` — that appends fails with `DuplicateCommand`. A command is never
+  applied twice, but a redelivery does not complete a partial one either. The sentinel
+  is consulted only by `append`: through `commandHandler`, a redelivery whose `decide`
+  returns no events against the loaded state (after a `PartialAppend`, the committed
+  prefix) succeeds as a no-op, which does not mean the command completed.
 - Each **later** chunk checks that the previous chunk's last event exists.
 - The **final** chunk carries `additionalItems`, the inline snapshot and the completed
   sentinel, so read models never show a partially written command. If they cannot fit

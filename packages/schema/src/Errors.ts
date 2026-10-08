@@ -450,10 +450,13 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
  * that final chunk (whose outcome is unknown), none of them is written, so
  * read models never show a partially written command. With idempotency, the
  * first chunk has already claimed the command with a `pending` sentinel: a
- * redelivery of the same `commandId` fails with {@link DuplicateCommand}
- * rather than applying the command again on top of the prefix, so repairing
- * the prefix is the application's call. `EventStore.commandHandler` never
- * retries this error.
+ * redelivery of the same `commandId` that appends fails with
+ * {@link DuplicateCommand} rather than applying the command again on top of
+ * the prefix, so repairing the prefix is the application's call. Through
+ * `EventStore.commandHandler`, a redelivery whose `decide` returns no events
+ * against the prefix never appends, so it succeeds as a no-op — not a sign
+ * that the command completed. `EventStore.commandHandler` never retries this
+ * error.
  */
 export class PartialAppend extends Data.TaggedError("PartialAppend")<{
   readonly streamName: string

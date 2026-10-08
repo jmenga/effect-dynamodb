@@ -160,7 +160,12 @@ value throws `[EDD-9062]` at `makeStream`.
 `AppendOptions.snapshot?: TState`:
 
 - `append` adds a snapshot `Put` (`{ state, asOfVersion: expectedVersion + events.length, timestamp }`,
-  encoded through the state schema) to the **same transaction**.
+  encoded through the state schema) to the **same transaction**. Snapshot
+  state is encoded as events are, with a `decode → encode` fallback for a
+  value not already in the schema's type shape: a `Schema.Class` state folded
+  by an immutable `evolve` that spreads yields a plain object, which a bare
+  encode refuses (`Expected <Class>`) and would fail every inline command.
+  `writeSnapshot` uses the same encoder.
 - The `Put` is unconditional. The event puts already prove this writer owns
   `asOfVersion`, so the snapshot cannot regress.
 - It is placed after the idempotency sentinel. Existing positional indices are
@@ -296,6 +301,14 @@ With `chunked: true`:
    - A command whose chunked append failed partway is never applied twice, but
      nor is it completed by a redelivery: its prefix stays recorded under the
      `pending` claim, and repairing it is the application's call.
+   - "Every other delivery" means every one that **appends**: the sentinel is
+     consulted only by `append`. Through `commandHandler`, a redelivery whose
+     `decide` returns `[]` against the loaded state (the completed state after
+     a replay, or the committed prefix after a `PartialAppend`) never appends,
+     so it succeeds as a no-op, as any no-op replay does (§2.4). After a
+     `PartialAppend` that success does not mean the command completed. The
+     library does not probe the sentinel on the no-op path: whether a no-op
+     redelivery must be told apart is the application's design decision.
 4. **Chunks 2..n.** Each carries a contiguity `ConditionCheck`
    (`attribute_exists`) on the previous chunk's last event, plus its event
    puts.
