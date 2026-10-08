@@ -9824,6 +9824,67 @@ describeConnected("EventStore stream indexes (#140)", () => {
     }).pipe(provideEsIdx),
   )
 
+  it.effect(
+    "#140 readIndex refuses key bounds DynamoDB rejects, ordering them as DynamoDB does",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "bounds-1" }
+        yield* EsIdxLedger.append(key, [new EsIdxRecorded({ section: 1, item: 1 })], 0)
+
+        // Each of these is a DynamoValidationError if sent; readIndex refuses
+        // them with the library's ValidationError instead.
+        for (const options of [
+          { beginsWith: "" },
+          { between: ["", "ENTRY#9"] },
+          { between: ["ENTRY#9", "ENTRY#0"] },
+        ] as ReadonlyArray<EventStore.ReadIndexOptions>) {
+          const error = yield* EsIdxLedger.readIndex("byEntry", key, options).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+
+        // U+FFFF sorts after U+1F600 by UTF-16 code units but before it by
+        // UTF-8 bytes — DynamoDB's order — so DynamoDB accepts this range.
+        const accepted = yield* EsIdxLedger.readIndex("byEntry", key, {
+          between: ["￿", "\u{1F600}"],
+        })
+        expect(accepted).toEqual([])
+        const all = yield* EsIdxLedger.readIndex("byEntry", key, {
+          between: ["ENTRY#1-0001-0001", "ENTRY#1-0001-0001"],
+        })
+        expect(all.map((event) => event.version)).toEqual([1])
+      }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 events appended before an index is declared are not in it", () =>
+    Effect.gen(function* () {
+      // The documented contract: index attributes are written only at append
+      // time and the library does not backfill.
+      const Before = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "LateIndex",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+      })
+      const After = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "LateIndex",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: { byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey } },
+      })
+      const key = { ledgerId: "late-1" }
+      yield* Before.append(
+        key,
+        [new EsIdxRecorded({ section: 1, item: 1 }), new EsIdxRecorded({ section: 1, item: 2 })],
+        0,
+      )
+      yield* After.append(key, [new EsIdxRecorded({ section: 1, item: 3 })], 2)
+      expect(yield* After.read(key, { consistentRead: true })).toHaveLength(3)
+      const indexed = yield* After.readIndex("byEntry", key, { consistentRead: true })
+      expect(indexed.map((event) => event.version)).toEqual([3])
+    }).pipe(provideEsIdx),
+  )
+
   it("#140 definition-time collisions are refused", () => {
     const define = (indexes: unknown) => () =>
       EventStore.makeStream({

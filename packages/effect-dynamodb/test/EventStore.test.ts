@@ -5470,6 +5470,63 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("readIndex refuses empty and inverted key bounds before sending", () =>
+      Effect.gen(function* () {
+        const refused: ReadonlyArray<EventStore.ReadIndexOptions> = [
+          { beginsWith: "" },
+          { between: ["", "INN#0009"] },
+          { between: ["INN#0001", ""] },
+          { between: ["INN#0009", "INN#0001"] },
+          { between: ["INN#0001"] } as never,
+          { between: ["INN#0001", 9] } as never,
+          { beginsWith: 1 } as never,
+        ]
+        for (const options of refused) {
+          const error = yield* IndexedMatch.readIndex(
+            "byInnings",
+            { matchId: "m-1" },
+            options,
+          ).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as { cause: unknown }).cause)).toContain("Nothing was sent")
+        }
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("readIndex orders between bounds by UTF-8 bytes, as DynamoDB does", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        // UTF-16 code units put U+FFFF after U+1F600 (a surrogate pair, 0xD83D…);
+        // UTF-8 bytes — DynamoDB's order — put it before (EF… < F0…).
+        yield* IndexedMatch.readIndex(
+          "byInnings",
+          { matchId: "m-1" },
+          {
+            between: ["￿", "\u{1F600}"],
+          },
+        )
+        // Equal bounds are a valid (point) range.
+        yield* IndexedMatch.readIndex(
+          "byInnings",
+          { matchId: "m-1" },
+          {
+            between: ["INN#0001", "INN#0001"],
+          },
+        )
+        expect(mockQuery).toHaveBeenCalledTimes(2)
+        const reversed = yield* IndexedMatch.readIndex(
+          "byInnings",
+          { matchId: "m-1" },
+          {
+            between: ["\u{1F600}", "￿"],
+          },
+        ).pipe(Effect.flip)
+        expect(reversed._tag).toBe("ValidationError")
+        expect(mockQuery).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("an undeclared index name is a defect (EDD-9066)", () =>
       Effect.gen(function* () {
         expect(() =>

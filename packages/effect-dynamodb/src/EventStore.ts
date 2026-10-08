@@ -426,6 +426,14 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
  *   `ValidationError` before anything is written — DynamoDB rejects empty key
  *   values. So do a key over DynamoDB's 1024-byte sort-key limit and a `key`
  *   that throws.
+ *
+ * The key is derived only when an event is appended. Events are never
+ * rewritten, so changing `key` later leaves events already stored under their
+ * old keys (or out of the index), and declaring an index on a stream that
+ * already holds events indexes only the events appended from then on. The
+ * library does not backfill: re-deriving and writing the index attributes on
+ * existing events is the application's decision (see `indexes` on
+ * {@link makeStream}).
  */
 export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string | undefined
 
@@ -438,9 +446,12 @@ export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string 
  * - `sk` — the attribute carrying the derived key (the LSI's sort key).
  * - `key` — see {@link StreamIndexKey}.
  *
- * An LSI must be created with the table and caps each stream partition's item
- * collection at 10 GB. Its projection must be `ALL`, because events are
- * decoded from the index item — see {@link indexDefinitions}.
+ * An LSI must be created with the table. A table with any LSI caps the item
+ * collection of **every** partition key value in it at 10 GB — not only the
+ * indexed stream's partitions, but every stream's (indexed or not) and every
+ * entity partition sharing the table; a write that would exceed it fails. Its
+ * projection must be `ALL`, because events are decoded from the index item —
+ * see {@link indexDefinitions}.
  */
 export interface LocalStreamIndexConfig<TEvent> {
   readonly type?: "lsi" | undefined
@@ -454,9 +465,14 @@ export interface LocalStreamIndexConfig<TEvent> {
 /**
  * A stream index on a **global** secondary index. `append` writes the stream's
  * partition key value into the `pk` attribute of each indexed event, so the
- * index is scoped to the same stream: the eventually consistent equivalent of an LSI, which can be
- * added to an existing table and has no 10 GB partition cap. A strongly
- * consistent read of it is refused with `ValidationError`.
+ * index is scoped to the same stream: the eventually consistent equivalent of
+ * an LSI, without the LSI's 10 GB item-collection cap. A strongly consistent
+ * read of it is refused with `ValidationError`.
+ *
+ * Unlike an LSI, the GSI itself can be added to an existing table
+ * (`UpdateTable`), but that does not index the stream's existing events: the
+ * index attributes are written only by `append`, so only events appended after
+ * the index is declared are in it — see {@link StreamIndexKey}.
  *
  * - `index` — the physical GSI name.
  * - `pk` — the attribute carrying the stream's partition key (the GSI's HASH key).
@@ -496,7 +512,10 @@ export interface StreamIndexSettings {
  * Options accepted by {@link EventStream.readIndex}.
  *
  * - `beginsWith` / `between` — a sort-key condition on the derived key (at most
- *   one of them). Omitted, the whole sub-stream is read.
+ *   one of them). Omitted, the whole sub-stream is read. Each bound must be a
+ *   non-empty string, and `between`'s lower bound must not sort (by UTF-8
+ *   bytes, as DynamoDB sorts) after its upper bound; otherwise the read fails
+ *   with `ValidationError` before anything is sent.
  * - `reverse` — descending key order.
  * - `limit` — return at most this many events (a positive integer).
  * - `consistentRead` — strongly consistent read. Refused with
@@ -517,6 +536,57 @@ const MAX_INDEX_SORT_KEY_BYTES = 1024
 
 /** @internal */
 const utf8 = new TextEncoder()
+
+/**
+ * @internal Compare two strings by their UTF-8 bytes — the order DynamoDB
+ * sorts (and evaluates `BETWEEN` on) string keys. JavaScript's `<` compares
+ * UTF-16 code units, which disagrees for characters outside the BMP.
+ */
+const compareUtf8 = (a: string, b: string): number => {
+  const left = utf8.encode(a)
+  const right = utf8.encode(b)
+  const length = Math.min(left.length, right.length)
+  for (let i = 0; i < length; i++) {
+    const diff = left[i]! - right[i]!
+    if (diff !== 0) return diff
+  }
+  return left.length - right.length
+}
+
+/**
+ * @internal Why a {@link ReadIndexOptions} key condition cannot be sent, or
+ * `undefined` when it can. DynamoDB rejects an empty key value and a
+ * `BETWEEN` whose lower bound sorts after its upper bound.
+ */
+const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string | undefined => {
+  if (options?.beginsWith !== undefined && options.between !== undefined) {
+    return "Pass at most one of beginsWith and between."
+  }
+  const beginsWith: unknown = options?.beginsWith
+  if (beginsWith !== undefined) {
+    if (typeof beginsWith !== "string" || beginsWith.length === 0) {
+      return (
+        "beginsWith must be a non-empty string — DynamoDB rejects an empty key value; " +
+        "omit it to read the whole sub-stream."
+      )
+    }
+    return undefined
+  }
+  const between: unknown = options?.between
+  if (between === undefined) return undefined
+  if (
+    !Array.isArray(between) ||
+    between.length !== 2 ||
+    !between.every((bound) => typeof bound === "string" && bound.length > 0)
+  ) {
+    return "between must be a pair of non-empty strings — DynamoDB rejects an empty key value."
+  }
+  const [low, high] = between as [string, string]
+  if (compareUtf8(low, high) > 0) {
+    return `between's lower bound ${JSON.stringify(low)} sorts after its upper bound ${JSON.stringify(high)}.`
+  }
+  return undefined
+}
 
 /**
  * @internal A validated stream index: its logical name, settings and key
@@ -999,7 +1069,15 @@ interface AppendChunk {
  * event's derived key (and, for a GSI, the stream's partition key) on the
  * event item; snapshots and idempotency sentinels never carry them, so they
  * are never in an index. Read with {@link EventStream.readIndex} or
- * `query.index`, and create the indexes with {@link indexDefinitions}:
+ * `query.index`, and create the indexes with {@link indexDefinitions}.
+ *
+ * Index attributes are written only at append time and events are never
+ * rewritten. Declaring an index on a stream that already holds events, or
+ * changing an index's `key`, therefore leaves the earlier events out of the
+ * index (or under their old keys), and `readIndex` returns only what was
+ * indexed — without an error. The library does not backfill; whether and how
+ * to re-index existing events (for example, an `UpdateItem` per event setting
+ * the derived attributes) is the application's decision.
  *
  * @example
  * ```typescript
@@ -2389,8 +2467,9 @@ export const makeStream = <
     Effect.gen(function* () {
       const refuse = (cause: string) =>
         new ValidationError({ entityType, operation: "EventStore.readIndex", cause })
-      if (options?.beginsWith !== undefined && options.between !== undefined) {
-        return yield* refuse("Pass at most one of beginsWith and between. Nothing was sent.")
+      const invalidCondition = invalidIndexKeyCondition(options)
+      if (invalidCondition !== undefined) {
+        return yield* refuse(`${invalidCondition} Nothing was sent.`)
       }
       const limit = options?.limit
       if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
@@ -2686,8 +2765,9 @@ export interface StreamIndexDefinitions {
  * An index shared by several streams with the same definition is emitted
  * once. Lists are sorted by index name, attributes by attribute name.
  *
- * - An LSI can only be created with the table, and caps each stream
- *   partition's item collection at 10 GB.
+ * - An LSI can only be created with the table, and caps the item collection
+ *   of every partition key value in the table at 10 GB — entity partitions
+ *   and streams without indexes included.
  * - The projection must stay `ALL`: events are decoded from the index item.
  *
  * @example

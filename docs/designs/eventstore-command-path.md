@@ -424,7 +424,11 @@ stream.readIndex("byEntry", streamId, { beginsWith?, between?, reverse?, limit?,
 - `consistentRead` on a GSI is refused by the existing `Query` guard.
 - `readIndex` accepts at most one of `beginsWith` / `between` (a union type,
   and a `ValidationError` for untyped callers), and `limit` must be a positive
-  integer (`ValidationError` otherwise). Nothing is sent in either case.
+  integer (`ValidationError` otherwise). Each key bound must be a non-empty
+  string, and `between`'s lower bound must not sort after its upper bound
+  (compared by UTF-8 bytes, as DynamoDB orders string keys); DynamoDB rejects
+  both, so `readIndex` refuses them with `ValidationError`. Omit the condition
+  to read the whole sub-stream. Nothing is sent in any of these cases.
 
 ### Table creation
 
@@ -439,7 +443,17 @@ table's own `pk` / `sk` are not included, and empty index lists are omitted.
 ### Documentation notes
 
 - An LSI must be created with the table.
-- An LSI caps each stream partition's item collection at 10 GB.
+- A table with any LSI caps the item collection of **every** partition key
+  value in it at 10 GB — every stream's partitions (indexed or not) and every
+  entity partition sharing the table, not only the indexed stream's.
+- A GSI can be added to an existing table, but that does not index existing
+  events. Index attributes are written only by `append`, and events are never
+  rewritten, so declaring an index on a stream that already holds events
+  indexes only the events appended from then on, and changing a `key` leaves
+  earlier events under their old keys. `readIndex` / `query.index` then return
+  only what was indexed, without an error. The library provides no backfill:
+  whether and how to re-index existing events is the application's decision.
+  The `StreamIndexKey`, `GlobalStreamIndexConfig` and `makeStream` JSDoc say so.
 - The projection must be `ALL`, because events are decoded from the index
   item.
 
