@@ -370,20 +370,38 @@ const Entries = EventStore.makeStream({
   - A GSI requires a `pk` attribute name. `append` writes the stream's partition
     key value into it, so a GSI is the eventually consistent equivalent scoped
     to the same stream.
-- **`key`** receives the domain event (pre-encode) and its version.
+- **`key`** receives the domain event (pre-encode, after it validates) and its
+  version.
   - It returns a string, which is stored **raw**: no casing and no prefixing.
-  - `undefined` leaves the event out of the index (sparse).
+  - `undefined` leaves the event out of the index (sparse). For a GSI the `pk`
+    attribute is then not written either.
   - An empty string is a `ValidationError` at append time, because DynamoDB
-    rejects empty key values.
+    rejects empty key values. So are any other non-string value, a key over
+    DynamoDB's 1024-byte sort-key limit, and a `key` that throws. Nothing is
+    written.
 - **Definition-time validation** (thrown errors, new `EDD-` codes from 9063 — 9062 is `snapshot.mode`, §4):
-  - Index attribute names must not collide with stream-owned attributes
-    (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
-    `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `pending`,
-    and the TTL attribute name where knowable).
-  - Attribute names and physical index names must not collide with each other.
-  - A `gsi` without `pk`, or an `lsi` with `pk`, is rejected.
+  - `[EDD-9063]` — a malformed entry: a `type` other than `"lsi"` / `"gsi"`,
+    a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`,
+    or a `key` that is not a function. (The config type is a union on `type`,
+    so the `pk` rules are compile errors too.)
+  - `[EDD-9064]` — an index attribute name collides with a stream-owned
+    attribute (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`,
+    `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`,
+    `pending`, and the default TTL attribute `_ttl`).
+  - `[EDD-9065]` — two indexes of the stream share a physical index name or
+    an attribute name, or a GSI's `pk` and `sk` are the same attribute.
+  - A custom `TableConfig.ttlAttributeName` is only known at runtime. An index
+    attribute equal to it fails each append with `ValidationError` before
+    anything is written (the sentinel's numeric TTL would otherwise land in a
+    string-typed index key).
 - **Item scope.** Index attributes are written on event items only. Snapshot
   and sentinel items never carry them, so those items are never in an index.
+  The attributes are part of the event item, so every transaction that
+  carries an event — a whole append or one chunk of a chunked append (§5) —
+  carries them, and they count towards the 4 MB check.
+- **Exposed settings.** `EventStream.indexes` / `BoundEventStream.indexes` map
+  each index name to `StreamIndexSettings` (`{ type, index, pk, sk }`, where
+  an LSI's `pk` is the table's `pk`). `indexDefinitions` reads them.
 
 ### Query
 
@@ -397,10 +415,16 @@ stream.readIndex("byEntry", streamId, { beginsWith?, between?, reverse?, limit?,
 ```
 
 - Index names are type-checked: `EventStream` / `BoundEventStream` gain a
-  trailing type parameter `TIndexName extends string = never`.
+  trailing type parameter `TIndexName extends string = never`, inferred by
+  `makeStream` from the `indexes` keys and carried through `bind` and every
+  `commandHandler` form. An undeclared name reached at runtime (an untyped
+  caller) is a defect, `[EDD-9066]`.
 - Results are decoded `StreamEvent`s in index order. The `__edd_e__ = <stream>.event`
   filter still applies.
 - `consistentRead` on a GSI is refused by the existing `Query` guard.
+- `readIndex` accepts at most one of `beginsWith` / `between` (a union type,
+  and a `ValidationError` for untyped callers), and `limit` must be a positive
+  integer (`ValidationError` otherwise). Nothing is sent in either case.
 
 ### Table creation
 
@@ -408,7 +432,9 @@ Event tables are not derived by `Table.definition`.
 `EventStore.indexDefinitions(...streams)` returns CreateTable fragments
 (`AttributeDefinitions`, `LocalSecondaryIndexes`, `GlobalSecondaryIndexes`,
 projection `ALL`) to merge into the caller's `CreateTable` input. It refuses
-conflicting definitions of the same physical index.
+conflicting definitions of the same physical index with `[EDD-9067]`, and
+emits an identically defined index shared by several streams once. The
+table's own `pk` / `sk` are not included, and empty index lists are omitted.
 
 ### Documentation notes
 
@@ -429,6 +455,10 @@ conflicting definitions of the same physical index.
 | `AppendOptions.snapshot` / `chunked` (`AppendOptions` gains a `TState` parameter, default `never`), `SnapshotConfig.mode` | `EventStore.ts` |
 | `transactEntryBytes` / `measureTransaction` / `fitsOneTransaction` (shared size measure, lower or upper bound) | `internal/TransactWriteOps.ts` |
 | `[EDD-9062]` — invalid `snapshot.mode` | `EventStore.ts` (`makeStream`) |
+| `StreamIndexConfig` / `StreamIndexKey` / `StreamIndexSettings` / `ReadIndexOptions` / `StreamIndexDefinitions`, `EventStream.indexes`, trailing `TIndexName` type parameter | `EventStore.ts` |
+| `[EDD-9063]` malformed index, `[EDD-9064]` index attribute owned by the stream, `[EDD-9065]` indexes sharing an index or attribute | `EventStore.ts` (`makeStream`) |
+| `[EDD-9066]` undeclared index name (defect) | `EventStore.ts` (`query.index` / `readIndex`) |
+| `[EDD-9067]` conflicting physical index definitions | `EventStore.ts` (`indexDefinitions`) |
 
 ## 8. Out of scope — #142 (read-only `decide` state)
 

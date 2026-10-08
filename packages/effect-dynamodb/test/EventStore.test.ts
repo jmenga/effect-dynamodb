@@ -33,7 +33,12 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { refuseRepeatedItems, transactItemTarget } from "../src/internal/TransactWriteOps.js"
+import { TRANSACT_WRITE_MAX_BYTES } from "../src/internal/ItemSize.js"
+import {
+  measureTransaction,
+  refuseRepeatedItems,
+  transactItemTarget,
+} from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -5067,5 +5072,498 @@ describe("EventStore chunked append (#141)", () => {
         expect(mockQuery).toHaveBeenCalledTimes(2)
       }).pipe(Effect.provide(TestLayer)),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stream indexes — sub-streams by derived key (#140)
+// ---------------------------------------------------------------------------
+
+describe("EventStore stream indexes (#140)", () => {
+  const pad = (n: number) => String(n).padStart(4, "0")
+
+  /** `byInnings` (LSI) indexes InningsCompleted only; `byResult` (GSI) MatchEnded only. */
+  const IndexedMatch = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "IndexedMatch",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, mode: "inline" },
+    indexes: {
+      byInnings: {
+        index: "lsi1",
+        sk: "lsi1sk",
+        key: (event, version) =>
+          event instanceof InningsCompleted
+            ? `INN#${pad(event.innings)}#${pad(version)}`
+            : undefined,
+      },
+      byResult: {
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        key: (event) => (event instanceof MatchEnded ? `RESULT#${event.result}` : undefined),
+      },
+    },
+  })
+
+  const pk = "$cricket#v1#indexedmatch#m-1"
+  const started = () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })
+  const innings = (n: number) => new InningsCompleted({ innings: n, runs: 100 + n, wickets: n })
+
+  /** Every Put item of one TransactWriteItems call, decoded. */
+  const putsOf = (call: { TransactItems: ReadonlyArray<any> }) =>
+    call.TransactItems.filter((i) => i.Put !== undefined).map((i) => fromAttributeMap(i.Put.Item))
+  const eventPutsOf = (call: { TransactItems: ReadonlyArray<any> }) =>
+    putsOf(call).filter((item) => String(item.__edd_e__).endsWith(".event"))
+
+  const make = (indexes: unknown) => () =>
+    EventStore.makeStream({
+      table: EventsTable,
+      streamName: "Bad",
+      events: [MatchStarted],
+      streamId: { composite: ["matchId"] },
+      indexes: indexes as never,
+    })
+
+  describe("definition-time validation", () => {
+    const key = () => undefined
+
+    it("exposes each index's settings", () => {
+      expect(IndexedMatch.indexes).toEqual({
+        byInnings: { type: "lsi", index: "lsi1", pk: "pk", sk: "lsi1sk" },
+        byResult: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+      })
+      expect(MatchEvents.indexes).toEqual({})
+    })
+
+    it("throws EDD-9063 for a malformed index", () => {
+      expect(make({ a: { type: "lsx", index: "i", sk: "s", key } })).toThrow(/EDD-9063.*type/)
+      expect(make({ a: { type: "gsi", index: "i", sk: "s", key } })).toThrow(/EDD-9063.*pk/)
+      expect(make({ a: { index: "i", pk: "p", sk: "s", key } })).toThrow(/EDD-9063.*lsi/)
+      expect(make({ a: { index: "", sk: "s", key } })).toThrow(/EDD-9063.*index/)
+      expect(make({ a: { index: "i", sk: "", key } })).toThrow(/EDD-9063.*sk/)
+      expect(make({ a: { index: "i", sk: "s", key: "x" } })).toThrow(/EDD-9063.*key/)
+      expect(make({ a: null })).toThrow(/EDD-9063/)
+    })
+
+    it("throws EDD-9064 for an attribute the stream writes itself", () => {
+      for (const attribute of ["pk", "sk", "__edd_e__", "version", "data", "state", "_ttl"]) {
+        expect(make({ a: { index: "i", sk: attribute, key } })).toThrow(/EDD-9064/)
+      }
+      expect(make({ a: { type: "gsi", index: "i", pk: "streamId", sk: "s", key } })).toThrow(
+        /EDD-9064.*streamId/,
+      )
+      expect(make({ a: { type: "gsi", index: "i", pk: "p", sk: "pending", key } })).toThrow(
+        /EDD-9064.*pending/,
+      )
+    })
+
+    it("throws EDD-9065 for indexes sharing an index or an attribute", () => {
+      expect(make({ a: { index: "i", sk: "s1", key }, b: { index: "i", sk: "s2", key } })).toThrow(
+        /EDD-9065.*physical index "i"/,
+      )
+      expect(make({ a: { index: "i1", sk: "s", key }, b: { index: "i2", sk: "s", key } })).toThrow(
+        /EDD-9065.*attribute "s"/,
+      )
+      expect(
+        make({
+          a: { type: "gsi", index: "g1", pk: "gpk", sk: "s1", key },
+          b: { type: "gsi", index: "g2", pk: "gpk", sk: "s2", key },
+        }),
+      ).toThrow(/EDD-9065.*attribute "gpk"/)
+      expect(make({ a: { type: "gsi", index: "g", pk: "k", sk: "k", key } })).toThrow(/EDD-9065/)
+    })
+  })
+
+  describe("append", () => {
+    it.effect("writes the derived keys on indexed event items only", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* IndexedMatch.append(
+          { matchId: "m-1" },
+          [started(), innings(1), new MatchEnded({ result: "AUS won" })],
+          0,
+          { idempotency: { commandId: "cmd-1" }, snapshot: { status: "completed", innings: [] } },
+        )
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const [first, second, third] = eventPutsOf(call)
+        // Sparse: MatchStarted is in neither index.
+        expect(first).not.toHaveProperty("lsi1sk")
+        expect(first).not.toHaveProperty("gsi1pk")
+        expect(first).not.toHaveProperty("gsi1sk")
+        // LSI: the derived key, raw (no casing, no prefix).
+        expect(second!.lsi1sk).toBe("INN#0001#0002")
+        expect(second).not.toHaveProperty("gsi1pk")
+        // GSI: the stream's partition key plus the derived key.
+        expect(third!.gsi1pk).toBe(pk)
+        expect(third!.gsi1sk).toBe("RESULT#AUS won")
+        expect(third).not.toHaveProperty("lsi1sk")
+        // The sentinel and the snapshot never carry index attributes.
+        const others = putsOf(call).filter((item) => !String(item.__edd_e__).endsWith(".event"))
+        expect(others.map((item) => item.__edd_e__).sort()).toEqual([
+          "indexedmatch.command",
+          "indexedmatch.snapshot",
+        ])
+        for (const item of others) {
+          for (const attribute of ["lsi1sk", "gsi1pk", "gsi1sk"]) {
+            expect(item).not.toHaveProperty(attribute)
+          }
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("writes the derived keys in every chunk of a chunked append", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const events = Array.from({ length: 250 }, (_, i) => innings(i + 1))
+        yield* IndexedMatch.append({ matchId: "m-1" }, events, 0, { chunked: true })
+        const calls = mockTransactWriteItems.mock.calls.map((c) => c[0])
+        expect(calls).toHaveLength(3)
+        for (const call of calls) {
+          const puts = eventPutsOf(call)
+          expect(puts.length).toBeGreaterThan(0)
+          for (const item of puts) {
+            expect(item.lsi1sk).toBe(
+              `INN#${pad(item.version as number)}#${pad(item.version as number)}`,
+            )
+          }
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("counts the index attributes towards the 4 MB check", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        // A 1000-byte key on each of 100 events: alone it adds ~100 KB, which
+        // tips a transaction sized just under 4 MB without the keys over it.
+        const big = (version: number) => `K${pad(version)}${"x".repeat(995)}`
+        const Heavy = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Heavy",
+          events: [MatchEnded],
+          streamId: { composite: ["matchId"] },
+          indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: (_, version) => big(version) } },
+        })
+        const Light = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Heavy",
+          events: [MatchEnded],
+          streamId: { composite: ["matchId"] },
+        })
+        const events = (length: number) =>
+          Array.from({ length: 99 }, () => new MatchEnded({ result: "r".repeat(length) }))
+        // Calibrate: size the events so the transaction without keys sits
+        // 50 KB under the limit.
+        yield* Light.append({ matchId: "m-1" }, events(40_000), 0)
+        const probe = measureTransaction(mockTransactWriteItems.mock.calls[0]![0].TransactItems)
+        const length = 40_000 + Math.floor((TRANSACT_WRITE_MAX_BYTES - 50_000 - probe.total) / 99)
+        yield* Light.append({ matchId: "m-1" }, events(length), 0)
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        const error = yield* Heavy.append({ matchId: "m-1" }, events(length), 0).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("4 MB")
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses an empty, non-string, oversized or throwing key before writing", () =>
+      Effect.gen(function* () {
+        const withKey = (key: (event: unknown) => unknown) =>
+          EventStore.makeStream({
+            table: EventsTable,
+            streamName: "KeyCheck",
+            events: [MatchStarted],
+            streamId: { composite: ["matchId"] },
+            indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: key as () => string } },
+          })
+        const cases: ReadonlyArray<[(event: unknown) => unknown, RegExp]> = [
+          [() => "", /empty string/],
+          [() => 42, /non-empty string/],
+          [() => "x".repeat(1025), /1024-byte/],
+          [
+            () => {
+              throw new Error("boom")
+            },
+            /boom/,
+          ],
+        ]
+        for (const [key, pattern] of cases) {
+          const error = yield* withKey(key)
+            .append({ matchId: "m-1" }, [started()], 0)
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toMatch(pattern)
+        }
+        // Exactly 1024 bytes is accepted.
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* withKey(() => "é".repeat(512)).append({ matchId: "m-1" }, [started()], 0)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses an index attribute equal to a custom TTL attribute", () =>
+      Effect.gen(function* () {
+        const Stream = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "TtlClash",
+          events: [MatchStarted],
+          streamId: { composite: ["matchId"] },
+          indexes: { byKey: { index: "lsi1", sk: "expiresAt", key: () => "k" } },
+        })
+        const error = yield* Stream.append({ matchId: "m-1" }, [started()], 0).pipe(
+          Effect.flip,
+          Effect.provide(
+            Layer.merge(
+              TestDynamoClient,
+              EventsTable.layer({ name: "events-table", ttlAttributeName: "expiresAt" }),
+            ),
+          ),
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("TTL attribute")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }),
+    )
+
+    it.effect("commandHandler writes the derived keys", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+        const handle = EventStore.commandHandler(matchDecider, IndexedMatch)
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        )
+        expect(eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])[0]).not.toHaveProperty(
+          "lsi1sk",
+        )
+        mockQuery.mockResolvedValue({
+          Items: [
+            toAttributeMap({
+              pk,
+              sk: DynamoSchema.composeKey(AppSchema, "indexedmatch.snapshot", []),
+              __edd_e__: "indexedmatch.snapshot",
+              streamId: "m-1",
+              asOfVersion: 1,
+              state: { status: "i", innings: [] },
+              timestamp: "2026-03-08T12:00:00.000Z",
+            }),
+          ],
+        })
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "CompleteInnings", innings: 1, runs: 250, wickets: 10 },
+        )
+        expect(eventPutsOf(mockTransactWriteItems.mock.calls[1]![0])[0]!.lsi1sk).toBe(
+          "INN#0001#0002",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("query.index / readIndex", () => {
+    const indexedItem = (version: number, extra: Record<string, unknown>) =>
+      toAttributeMap({
+        pk,
+        sk: DynamoSchema.composeEventVersionKey(AppSchema, "indexedmatch.event", version),
+        __edd_e__: "indexedmatch.event",
+        streamId: "m-1",
+        version,
+        eventType: "InningsCompleted",
+        data: { _tag: "InningsCompleted", innings: version, runs: 1, wickets: 0 },
+        timestamp: "2026-03-08T12:00:00.000Z",
+        ...extra,
+      })
+
+    it.effect("queries the LSI in the stream's partition and decodes events", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [indexedItem(4, { lsi1sk: "INN#0001#0004" })],
+        })
+        const events = yield* IndexedMatch.query
+          .index("byInnings", { matchId: "m-1" })
+          .pipe(Query.where({ beginsWith: "INN#0001" }), Query.consistentRead(), Query.collect)
+        expect(events).toHaveLength(1)
+        expect(events[0]!.version).toBe(4)
+        expect(events[0]!.data).toBeInstanceOf(InningsCompleted)
+
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.TableName).toBe("events-table")
+        expect(call.IndexName).toBe("lsi1")
+        expect(call.ConsistentRead).toBe(true)
+        expect(call.KeyConditionExpression).toContain("begins_with")
+        expect(Object.values(call.ExpressionAttributeNames)).toEqual(
+          expect.arrayContaining(["pk", "lsi1sk"]),
+        )
+        expect(fromAttributeMap(call.ExpressionAttributeValues)).toMatchObject({
+          ":pk": pk,
+          ":sk": "INN#0001",
+        })
+        expect(call.FilterExpression).toBeDefined()
+        expect(Object.values(fromAttributeMap(call.ExpressionAttributeValues))).toContain(
+          "indexedmatch.event",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("queries a GSI by its pk attribute and refuses consistentRead on it", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        yield* IndexedMatch.query.index("byResult", { matchId: "m-1" }).pipe(Query.collect)
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.IndexName).toBe("gsi1")
+        expect(Object.values(call.ExpressionAttributeNames)).toContain("gsi1pk")
+        expect(fromAttributeMap(call.ExpressionAttributeValues)[":pk"]).toBe(pk)
+        expect(call.ConsistentRead).toBeUndefined()
+
+        const error = yield* IndexedMatch.readIndex(
+          "byResult",
+          { matchId: "m-1" },
+          { consistentRead: true },
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(mockQuery).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("readIndex applies between, reverse and limit", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [indexedItem(3, { lsi1sk: "INN#0003#0003" })],
+        })
+        const events = yield* IndexedMatch.readIndex(
+          "byInnings",
+          { matchId: "m-1" },
+          { between: ["INN#0001", "INN#0003~"], reverse: true, limit: 1 },
+        )
+        expect(events.map((event) => event.version)).toEqual([3])
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.IndexName).toBe("lsi1")
+        expect(call.KeyConditionExpression).toContain("BETWEEN")
+        expect(call.ScanIndexForward).toBe(false)
+        expect(call.Limit).toBe(1)
+        expect(fromAttributeMap(call.ExpressionAttributeValues)).toMatchObject({
+          ":sk1": "INN#0001",
+          ":sk2": "INN#0003~",
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("readIndex refuses both key conditions and a bad limit before sending", () =>
+      Effect.gen(function* () {
+        const both = yield* IndexedMatch.readIndex("byInnings", { matchId: "m-1" }, {
+          beginsWith: "a",
+          between: ["a", "b"],
+        } as never).pipe(Effect.flip)
+        expect(both._tag).toBe("ValidationError")
+        for (const limit of [0, -1, 1.5]) {
+          const error = yield* IndexedMatch.readIndex(
+            "byInnings",
+            { matchId: "m-1" },
+            { limit },
+          ).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an undeclared index name is a defect (EDD-9066)", () =>
+      Effect.gen(function* () {
+        expect(() =>
+          (IndexedMatch.query.index as (n: string, id: object) => unknown)("nope", {
+            matchId: "m-1",
+          }),
+        ).toThrow(/EDD-9066.*"byInnings", "byResult"/)
+        const exit = yield* (MatchEvents as unknown as { readIndex: typeof IndexedMatch.readIndex })
+          .readIndex("byInnings", { matchId: "m-1" })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause)).toContain(
+          "declares no indexes",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound stream carries the indexes and resolves its services", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [indexedItem(2, { lsi1sk: "INN#0002#0002" })] })
+        const bound = yield* EventStore.bind(IndexedMatch)
+        expect(bound.indexes).toEqual(IndexedMatch.indexes)
+        const events = yield* bound.readIndex("byInnings", { matchId: "m-1" })
+        expect(events.map((event) => event.version)).toEqual([2])
+        expect(mockQuery.mock.calls[0]![0].IndexName).toBe("lsi1")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("indexDefinitions", () => {
+    const Other = EventStore.makeStream({
+      table: EventsTable,
+      streamName: "Other",
+      events: [MatchStarted],
+      streamId: { composite: ["matchId"] },
+      indexes: {
+        // The same physical LSI as IndexedMatch's byInnings, defined identically.
+        byVenue: { index: "lsi1", sk: "lsi1sk", key: (event) => event.venue },
+        byTeam: { type: "gsi", index: "gsi2", pk: "gsi2pk", sk: "gsi2sk", key: (e) => e.homeTeam },
+      },
+    })
+
+    it("derives LSI and GSI fragments with projection ALL, deduplicated", () => {
+      expect(EventStore.indexDefinitions(IndexedMatch, Other, MatchEvents)).toEqual({
+        AttributeDefinitions: ["gsi1pk", "gsi1sk", "gsi2pk", "gsi2sk", "lsi1sk"].map(
+          (AttributeName) => ({ AttributeName, AttributeType: "S" }),
+        ),
+        LocalSecondaryIndexes: [
+          {
+            IndexName: "lsi1",
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "lsi1sk", KeyType: "RANGE" },
+            ],
+            Projection: { ProjectionType: "ALL" },
+          },
+        ],
+        GlobalSecondaryIndexes: ["gsi1", "gsi2"].map((IndexName) => ({
+          IndexName,
+          KeySchema: [
+            { AttributeName: `${IndexName}pk`, KeyType: "HASH" },
+            { AttributeName: `${IndexName}sk`, KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        })),
+      })
+    })
+
+    it("omits empty index lists", () => {
+      expect(EventStore.indexDefinitions(MatchEvents)).toEqual({ AttributeDefinitions: [] })
+      expect(EventStore.indexDefinitions()).toEqual({ AttributeDefinitions: [] })
+    })
+
+    it("throws EDD-9067 for conflicting definitions of one physical index", () => {
+      const Conflicting = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "Conflicting",
+        events: [MatchStarted],
+        streamId: { composite: ["matchId"] },
+        indexes: { byVenue: { index: "lsi1", sk: "venueSk", key: (event) => event.venue } },
+      })
+      expect(() => EventStore.indexDefinitions(IndexedMatch, Conflicting)).toThrow(
+        /EDD-9067.*"lsi1"/,
+      )
+      const AsGsi = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "AsGsi",
+        events: [MatchStarted],
+        streamId: { composite: ["matchId"] },
+        indexes: {
+          byVenue: { type: "gsi", index: "lsi1", pk: "x", sk: "lsi1sk", key: (e) => e.venue },
+        },
+      })
+      expect(() => EventStore.indexDefinitions(IndexedMatch, AsGsi)).toThrow(/EDD-9067/)
+    })
   })
 })

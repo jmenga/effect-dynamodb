@@ -9504,6 +9504,362 @@ describeConnected("EventStore inline snapshots and chunked append (#138, #141)",
 })
 
 // ===========================================================================
+// EventStore stream indexes — sub-streams by derived key (#140)
+// ===========================================================================
+
+const esIdxSchema = DynamoSchema.make({ name: "es-idx", version: 1 })
+const esIdxTableName = `es-idx-${Date.now()}`
+const EsIdxTable = Table.make({ schema: esIdxSchema, entities: {} })
+
+class EsIdxRecorded extends Schema.TaggedClass<EsIdxRecorded>()("EsIdxRecorded", {
+  section: Schema.Number,
+  item: Schema.Number,
+}) {}
+
+class EsIdxNoted extends Schema.TaggedClass<EsIdxNoted>()("EsIdxNoted", {
+  day: Schema.String,
+}) {}
+
+type EsIdxEvent = EsIdxRecorded | EsIdxNoted
+
+const esIdxPad = (n: number) => String(n).padStart(4, "0")
+
+const esIdxEntryKey = (event: EsIdxEvent, version: number) =>
+  event._tag === "EsIdxRecorded"
+    ? `ENTRY#${event.section}-${esIdxPad(event.item)}-${esIdxPad(version)}`
+    : undefined
+
+/**
+ * Recorded entries on an LSI (`byEntry`), notes on a GSI (`byDay`) — each
+ * index sparse with respect to the other event type. Inline snapshots and
+ * idempotency sentinels share the partition and must stay out of both.
+ */
+const EsIdxLedger = EventStore.makeStream({
+  table: EsIdxTable,
+  streamName: "Ledger",
+  events: [EsIdxRecorded, EsIdxNoted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: Schema.Struct({ entries: Schema.Number }), mode: "inline" },
+  indexes: {
+    byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey },
+    byDay: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      key: (event) => (event._tag === "EsIdxNoted" ? `DAY#${event.day}` : undefined),
+    },
+  },
+})
+
+/** A second stream on the same LSI (an identical definition, deduplicated). */
+const EsIdxJournal = EventStore.makeStream({
+  table: EsIdxTable,
+  streamName: "Journal",
+  events: [EsIdxRecorded, EsIdxNoted],
+  streamId: { composite: ["ledgerId"] },
+  indexes: { byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey } },
+})
+
+const esIdxDecider: EventStore.Decider<{ readonly entries: number }, number, EsIdxEvent> = {
+  initialState: { entries: 0 },
+  decide: (count, state) =>
+    Effect.succeed(
+      Array.from(
+        { length: count },
+        (_, i) => new EsIdxRecorded({ section: 1, item: state.entries + i + 1 }),
+      ),
+    ),
+  evolve: (state, event) =>
+    event._tag === "EsIdxRecorded" ? { entries: state.entries + 1 } : state,
+}
+
+const EsIdxLayer = Layer.mergeAll(ClientLayer, EsIdxTable.layer({ name: esIdxTableName }))
+const provideEsIdx = Effect.provide(EsIdxLayer)
+
+/** Every item of one physical index for a stream partition, raw (no filter). */
+const esIdxRawIndex = (index: string, pkField: string, pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: esIdxTableName,
+      IndexName: index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": pkField },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+describeConnected("EventStore stream indexes (#140)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const fragments = EventStore.indexDefinitions(EsIdxLedger, EsIdxJournal)
+        yield* client.createTable({
+          TableName: esIdxTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            ...fragments.AttributeDefinitions,
+          ],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+          GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+        })
+      }).pipe(provideEsIdx, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esIdxTableName })
+      }).pipe(
+        provideEsIdx,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#140 indexDefinitions creates the LSI and GSI with projection ALL", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: esIdxTableName })
+      const lsis = described.Table?.LocalSecondaryIndexes ?? []
+      const gsis = described.Table?.GlobalSecondaryIndexes ?? []
+      expect(lsis.map((index) => index.IndexName)).toEqual(["lsi1"])
+      expect(gsis.map((index) => index.IndexName)).toEqual(["gsi1"])
+      expect(lsis[0]!.KeySchema).toEqual([
+        { AttributeName: "pk", KeyType: "HASH" },
+        { AttributeName: "lsi1sk", KeyType: "RANGE" },
+      ])
+      expect(gsis[0]!.KeySchema).toEqual([
+        { AttributeName: "gsi1pk", KeyType: "HASH" },
+        { AttributeName: "gsi1sk", KeyType: "RANGE" },
+      ])
+      expect(lsis[0]!.Projection?.ProjectionType).toBe("ALL")
+      expect(gsis[0]!.Projection?.ProjectionType).toBe("ALL")
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 a sparse LSI sub-stream reads in derived-key order", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "sparse-1" }
+      yield* EsIdxLedger.append(
+        key,
+        [
+          new EsIdxRecorded({ section: 2, item: 1 }),
+          new EsIdxNoted({ day: "2026-10-01" }),
+          new EsIdxRecorded({ section: 1, item: 2 }),
+          new EsIdxRecorded({ section: 1, item: 1 }),
+        ],
+        0,
+        { idempotency: { commandId: "cmd-1" }, snapshot: { entries: 3 } },
+      )
+
+      // Index order, not stream order; the note is not in the index.
+      const entries = yield* EsIdxLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => event.version)).toEqual([4, 3, 1])
+      expect(entries.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 1 }),
+        new EsIdxRecorded({ section: 1, item: 2 }),
+        new EsIdxRecorded({ section: 2, item: 1 }),
+      ])
+
+      // The physical index holds exactly the three entries: no note, no
+      // snapshot, no idempotency sentinel.
+      const pk = "$es-idx#v1#ledger#sparse-1"
+      const raw = yield* esIdxRawIndex("lsi1", "pk", pk)
+      expect(raw.map((item) => item.__edd_e__)).toEqual([
+        "ledger.event",
+        "ledger.event",
+        "ledger.event",
+      ])
+      expect(raw.map((item) => item.lsi1sk)).toEqual([
+        "ENTRY#1-0001-0004",
+        "ENTRY#1-0002-0003",
+        "ENTRY#2-0001-0001",
+      ])
+      // ...and the partition really holds a snapshot and a sentinel.
+      expect(Option.isSome(yield* EsIdxLedger.readSnapshot(key))).toBe(true)
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 beginsWith, between, reverse, limit and consistentRead on the LSI", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "range-1" }
+      const events = [1, 2, 3].flatMap((section) =>
+        [1, 2, 3].map((item) => new EsIdxRecorded({ section, item })),
+      )
+      yield* EsIdxLedger.append(key, events, 0)
+      const versionsOf = (read: ReadonlyArray<EventStore.StreamEvent<EsIdxEvent>>) =>
+        read.map((event) => event.version)
+
+      const section2 = yield* EsIdxLedger.readIndex("byEntry", key, {
+        beginsWith: "ENTRY#2-",
+        consistentRead: true,
+      })
+      expect(versionsOf(section2)).toEqual([4, 5, 6])
+
+      const between = yield* EsIdxLedger.readIndex("byEntry", key, {
+        between: ["ENTRY#1-0002", "ENTRY#2-0002~"],
+      })
+      expect(versionsOf(between)).toEqual([2, 3, 4, 5])
+
+      const newestTwo = yield* EsIdxLedger.readIndex("byEntry", key, { reverse: true, limit: 2 })
+      expect(versionsOf(newestTwo)).toEqual([9, 8])
+
+      // The same through the composable Query, with a cursor across pages.
+      const query = EsIdxLedger.query
+        .index("byEntry", key)
+        .pipe(Query.where({ beginsWith: "ENTRY#3-" }), Query.consistentRead(), Query.limit(2))
+      const first = yield* Query.execute(query)
+      expect(first.items.map((event) => event.version)).toEqual([7, 8])
+      expect(first.cursor).not.toBeNull()
+      const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+      expect(second.items.map((event) => event.version)).toEqual([9])
+
+      const pages = yield* Query.paginate(
+        EsIdxLedger.query.index("byEntry", key).pipe(Query.reverse),
+      ).pipe(Effect.flatMap((stream) => Stream.runCollect(stream)))
+      expect(pages.flat().map((event) => event.version)).toEqual([9, 8, 7, 6, 5, 4, 3, 2, 1])
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 a GSI sub-stream is scoped to its stream; consistentRead is refused", () =>
+    Effect.gen(function* () {
+      const a = { ledgerId: "gsi-a" }
+      const b = { ledgerId: "gsi-b" }
+      yield* EsIdxLedger.append(
+        a,
+        [
+          new EsIdxNoted({ day: "2026-10-03" }),
+          new EsIdxRecorded({ section: 1, item: 1 }),
+          new EsIdxNoted({ day: "2026-10-01" }),
+        ],
+        0,
+      )
+      yield* EsIdxLedger.append(b, [new EsIdxNoted({ day: "2026-10-02" })], 0)
+
+      const notes = yield* EsIdxLedger.readIndex("byDay", a)
+      expect(notes.map((event) => event.version)).toEqual([3, 1])
+      expect(notes.every((event) => event.streamId === "gsi-a")).toBe(true)
+      const early = yield* EsIdxLedger.readIndex("byDay", a, { beginsWith: "DAY#2026-10-01" })
+      expect(early.map((event) => event.version)).toEqual([3])
+
+      // The GSI's pk attribute carries the stream's partition key.
+      const raw = yield* esIdxRawIndex("gsi1", "gsi1pk", "$es-idx#v1#ledger#gsi-a")
+      expect(raw.map((item) => item.gsi1sk)).toEqual(["DAY#2026-10-01", "DAY#2026-10-03"])
+
+      const refused = yield* EsIdxLedger.readIndex("byDay", a, { consistentRead: true }).pipe(
+        Effect.flip,
+      )
+      expect(refused._tag).toBe("ValidationError")
+      const refusedQuery = yield* EsIdxLedger.query
+        .index("byDay", a)
+        .pipe(Query.consistentRead(), Query.collect, Effect.flip)
+      expect(refusedQuery._tag).toBe("ValidationError")
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 every chunk of a chunked commandHandler append is indexed", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "chunked-1" }
+      const bound = yield* EventStore.bind(EsIdxLedger)
+      const handle = EventStore.commandHandler(esIdxDecider, bound, { chunked: true })
+      const result = yield* handle(key, 230)
+      expect(result.version).toBe(230)
+      expect(result.state).toEqual({ entries: 230 })
+
+      const indexed = yield* bound.readIndex("byEntry", key, { consistentRead: true })
+      expect(indexed.map((event) => event.version)).toEqual(
+        Array.from({ length: 230 }, (_, i) => i + 1),
+      )
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 streams sharing an LSI never see each other's events", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "shared-1" }
+      yield* EsIdxLedger.append(key, [new EsIdxRecorded({ section: 1, item: 1 })], 0)
+      yield* EsIdxJournal.append(key, [new EsIdxRecorded({ section: 1, item: 2 })], 0)
+      const ledger = yield* EsIdxLedger.readIndex("byEntry", key)
+      const journal = yield* EsIdxJournal.readIndex("byEntry", key)
+      expect(ledger.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 1 }),
+      ])
+      expect(journal.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 2 }),
+      ])
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 an empty derived key fails the append and writes nothing", () =>
+    Effect.gen(function* () {
+      const EmptyKey = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "EmptyKey",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: {
+          byEntry: { index: "lsi1", sk: "lsi1sk", key: (event) => (event.item > 1 ? "" : "k") },
+        },
+      })
+      const key = { ledgerId: "empty-1" }
+      const error = yield* EmptyKey.append(
+        key,
+        [new EsIdxRecorded({ section: 1, item: 1 }), new EsIdxRecorded({ section: 1, item: 2 })],
+        0,
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(yield* EmptyKey.currentVersion(key, { consistentRead: true })).toBe(0)
+    }).pipe(provideEsIdx),
+  )
+
+  it("#140 definition-time collisions are refused", () => {
+    const define = (indexes: unknown) => () =>
+      EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "Colliding",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: indexes as never,
+      })
+    const key = () => undefined
+    expect(define({ a: { index: "lsi1", sk: "version", key } })).toThrow(/EDD-9064/)
+    expect(define({ a: { type: "gsi", index: "gsi1", pk: "pk", sk: "s", key } })).toThrow(
+      /EDD-9064/,
+    )
+    expect(
+      define({ a: { index: "lsi1", sk: "s1", key }, b: { index: "lsi1", sk: "s2", key } }),
+    ).toThrow(/EDD-9065/)
+    expect(
+      define({ a: { index: "lsi1", sk: "s", key }, b: { index: "lsi2", sk: "s", key } }),
+    ).toThrow(/EDD-9065/)
+    expect(define({ a: { type: "gsi", index: "gsi1", sk: "s", key } })).toThrow(/EDD-9063/)
+    expect(define({ a: { index: "lsi1", pk: "p", sk: "s", key } })).toThrow(/EDD-9063/)
+
+    // Two streams defining one physical index differently cannot share a table.
+    const Other = EventStore.makeStream({
+      table: EsIdxTable,
+      streamName: "Other",
+      events: [EsIdxRecorded],
+      streamId: { composite: ["ledgerId"] },
+      indexes: { byEntry: { index: "lsi1", sk: "otherSk", key: () => undefined } },
+    })
+    expect(() => EventStore.indexDefinitions(EsIdxLedger, Other)).toThrow(/EDD-9067/)
+  })
+})
+
+// ===========================================================================
 // Aggregate assembly off the base table (#93)
 // ===========================================================================
 //

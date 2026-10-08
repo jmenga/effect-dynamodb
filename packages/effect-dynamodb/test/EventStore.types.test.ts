@@ -11,6 +11,10 @@
  *   `AppendOptions.snapshot` is typed by it (and refused on a snapshot-less
  *   stream); `chunked` (#141) is accepted per call and per handler, and
  *   `PartialAppend` joins the append and handler error channels.
+ * - Stream indexes (#140): the index names are a trailing `TIndexName` type
+ *   parameter, so `readIndex` / `query.index` refuse an undeclared name, the
+ *   `key` callback is typed by the stream's events, and indexed streams still
+ *   flow through `bind` and every `commandHandler` form.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
@@ -27,6 +31,7 @@ import { describe, expect, expectTypeOf, it } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -331,6 +336,141 @@ describe("EventStore.commandHandler types", () => {
         const bound = yield* EventStore.bind(Snapshotted)
         const boundLatest = bound.readLatest(key)
         expectTypeOf<Effect.Services<typeof boundLatest>>().toEqualTypeOf<never>()
+      })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("stream indexes type their names and key callbacks (#140)", () => {
+    typeOnly(() => {
+      class Reset extends Schema.TaggedClass<Reset>()("Reset", { reason: Schema.String }) {}
+      const Indexed = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Indexed",
+        events: [Incremented, Reset],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          byAmount: {
+            index: "lsi1",
+            sk: "lsi1sk",
+            key: (event, version) => {
+              expectTypeOf(event).toEqualTypeOf<Incremented | Reset>()
+              expectTypeOf(version).toEqualTypeOf<number>()
+              return event._tag === "Incremented" ? `by#${event.by}` : undefined
+            },
+          },
+          byReason: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            key: (event) => (event._tag === "Reset" ? event.reason : undefined),
+          },
+        },
+      })
+      expectTypeOf(Indexed).toEqualTypeOf<
+        EventStore.EventStream<
+          Incremented | Reset,
+          readonly ["counterId"],
+          undefined,
+          never,
+          "byAmount" | "byReason"
+        >
+      >()
+      expectTypeOf<keyof typeof Indexed.indexes>().toEqualTypeOf<"byAmount" | "byReason">()
+
+      const read = Indexed.readIndex("byAmount", key, { beginsWith: "by#", limit: 5 })
+      expectTypeOf<Effect.Success<typeof read>[number]["data"]>().toEqualTypeOf<
+        Incremented | Reset
+      >()
+      expectTypeOf<Effect.Services<typeof read>>().toEqualTypeOf<Base>()
+      Indexed.readIndex("byReason", key, { between: ["a", "m"], reverse: true })
+      // @ts-expect-error — beginsWith and between are exclusive
+      Indexed.readIndex("byAmount", key, { beginsWith: "a", between: ["a", "b"] })
+      // @ts-expect-error — not a declared index name
+      Indexed.readIndex("byNothing", key)
+      // @ts-expect-error — not a declared index name
+      Indexed.query.index("byNothing", key)
+      const query = Indexed.query.index("byReason", key)
+      expectTypeOf(query).toEqualTypeOf<
+        Query.Query<
+          EventStore.StreamEvent<Incremented | Reset, Record<string, unknown> | undefined>
+        >
+      >()
+
+      // A stream without indexes accepts no index name at all.
+      // @ts-expect-error — the stream declares no indexes
+      Counter.readIndex("byAmount", key)
+      // @ts-expect-error — the stream declares no indexes
+      Counter.query.index("byAmount", key)
+
+      // The key callback is typed by the stream's events.
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadKey",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — `reason` is not a field of Incremented
+          bad: { index: "lsi1", sk: "lsi1sk", key: (event) => event.reason },
+        },
+      })
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadShape",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — a gsi requires pk
+          noPk: { type: "gsi", index: "gsi1", sk: "gsi1sk", key: () => undefined },
+        },
+      })
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadShape",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — an lsi uses the table pk
+          withPk: { index: "lsi1", pk: "x", sk: "lsi1sk", key: () => undefined },
+        },
+      })
+
+      // Indexed streams flow through every commandHandler form and bind.
+      const IndexedCounter = EventStore.makeStream({
+        table: AppTable,
+        streamName: "IndexedCounter",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: { byAmount: { index: "lsi1", sk: "lsi1sk", key: (e) => `${e.by}` } },
+      })
+      const dataFirst = EventStore.commandHandler(decider, IndexedCounter)(key, command)
+      expectTypeOf<Effect.Services<typeof dataFirst>>().toEqualTypeOf<Base>()
+      const dataLast = IndexedCounter.pipe(EventStore.commandHandler(decider))(key, command)
+      expectTypeOf<Effect.Services<typeof dataLast>>().toEqualTypeOf<Base>()
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(IndexedCounter)
+        expectTypeOf(bound).toEqualTypeOf<
+          EventStore.BoundEventStream<
+            Incremented,
+            readonly ["counterId"],
+            undefined,
+            never,
+            "byAmount"
+          >
+        >()
+        const boundRead = bound.readIndex("byAmount", key)
+        expectTypeOf<Effect.Services<typeof boundRead>>().toEqualTypeOf<never>()
+        // @ts-expect-error — not a declared index name
+        bound.readIndex("byNothing", key)
+        const boundFirst = EventStore.commandHandler(decider, bound)(key, command)
+        expectTypeOf<Effect.Services<typeof boundFirst>>().toEqualTypeOf<never>()
+        const boundLast = bound.pipe(EventStore.commandHandler(decider))(key, command)
+        expectTypeOf<Effect.Services<typeof boundLast>>().toEqualTypeOf<never>()
+
+        // indexDefinitions accepts plain and bound streams, with or without indexes.
+        const fragments = EventStore.indexDefinitions(IndexedCounter, bound, Counter, Indexed)
+        expectTypeOf(fragments).toEqualTypeOf<EventStore.StreamIndexDefinitions>()
       })
     })
     expect(true).toBe(true)
