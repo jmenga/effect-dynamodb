@@ -9275,6 +9275,215 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
   )
 
   // -------------------------------------------------------------------------
+  // verifySnapshot: false — the inline snapshot alone, with verified fallbacks
+  // -------------------------------------------------------------------------
+
+  /** The ops sent to a "ledger" partition since `mark`. */
+  const ledgerOpsSince = (accountId: string, mark: number) =>
+    esLatRequests("ledger", accountId)
+      .slice(mark)
+      .map((r) => r.op)
+  const decisions = (accountId: string) => esCmdDecideLog.filter((id) => id === accountId).length
+
+  it.effect("verifySnapshot: false loads a command's state with one GetItem", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-1"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+        verifySnapshot: false,
+      })
+      // The first command finds no snapshot and falls back to the verified load.
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      expect(ledgerOpsSince(accountId, 0)).toEqual(["getItem", "query", "transactWriteItems"])
+
+      // From then on: one GetItem of the snapshot, one transaction.
+      for (let i = 0; i < 3; i++) {
+        const mark = esLatRequests("ledger", accountId).length
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "transactWriteItems"])
+      }
+      const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+      expect(snapshot).toMatchObject({ asOfVersion: 4, state: { balance: 40, txCount: 4 } })
+
+      // readLatest: the snapshot alone, its version unverified.
+      const mark = esLatRequests("ledger", accountId).length
+      const latest = yield* EsLedger.readLatest(key, {
+        verifySnapshot: false,
+        consistentRead: true,
+      })
+      expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem"])
+      expect(latest.events).toEqual([])
+      expect(latest.version).toBe(4)
+      expect(Option.getOrThrow(latest.snapshot).state).toEqual({ balance: 40, txCount: 4 })
+
+      // Bound: the same single GetItem.
+      const bound = yield* EventStore.bind(EsLedger)
+      const boundMark = esLatRequests("ledger", accountId).length
+      const result = yield* bound.pipe(
+        EventStore.commandHandler(esCmdDecider(accountId), { verifySnapshot: false }),
+      )(key, { _tag: "Withdraw", amount: 5 })
+      expect(result).toMatchObject({ version: 5, state: { balance: 35, txCount: 5 } })
+      expect(ledgerOpsSince(accountId, boundMark)).toEqual(["getItem", "transactWriteItems"])
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false re-decides once on a stale snapshot, without a retry policy",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-stale"
+        const key = { accountId }
+        const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+          verifySnapshot: false,
+        })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        // Three events appended raw, without a snapshot: snapshot v2, head v5.
+        yield* EsLedger.append(key, esLatDeposits(3), 2)
+
+        const before = decisions(accountId)
+        const mark = esLatRequests("ledger", accountId).length
+        const result = yield* handle(key, { _tag: "Withdraw", amount: 4 })
+
+        // Decided on the stale snapshot, conflicted, re-read verified (a snapshot
+        // lagging past the verified read's first page costs one page more),
+        // decided again.
+        expect(decisions(accountId) - before).toBe(2)
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "transactWriteItems",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+        expect(result).toMatchObject({ version: 6, state: { balance: 19, txCount: 6 } })
+        // The successful inline append repaired the snapshot.
+        const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+        expect(snapshot).toMatchObject({ asOfVersion: 6, state: { balance: 19, txCount: 6 } })
+        expect((yield* EsLedger.read(key, { consistentRead: true })).map((e) => e.version)).toEqual(
+          [1, 2, 3, 4, 5, 6],
+        )
+      }).pipe(provideEsLat),
+  )
+
+  it.effect("verifySnapshot: false surfaces a genuine race, without a retry policy", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-race"
+      const key = { accountId }
+      const bound = yield* EventStore.bind(EsLedger)
+      const rival = EventStore.commandHandler(esCmdDecider(accountId), bound)
+      yield* rival(key, { _tag: "Deposit", amount: 10 })
+
+      // A decider that lets a rival handler commit between its load and its
+      // append — the rival writes its inline snapshot, so the head is snapshotted.
+      let raced = false
+      const base = esCmdDecider(accountId)
+      const racing: typeof base = {
+        ...base,
+        decide: (command, state) =>
+          Effect.gen(function* () {
+            if (!raced) {
+              raced = true
+              yield* rival(key, { _tag: "Deposit", amount: 1 }).pipe(Effect.orDie)
+            }
+            return yield* base.decide(command, state)
+          }),
+      }
+
+      const before = decisions(accountId)
+      const error = yield* EventStore.commandHandler(racing, EsLedger, { verifySnapshot: false })(
+        key,
+        { _tag: "Deposit", amount: 5 },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      // Our decide plus the rival's: no re-decision on a genuine race.
+      expect(decisions(accountId) - before).toBe(2)
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      expect(latest.version).toBe(2)
+      expect(Option.getOrThrow(latest.snapshot).state).toEqual({ balance: 11, txCount: 2 })
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("verifySnapshot: false re-reads a stale snapshot before the If-Match check", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-ifm"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+        verifySnapshot: false,
+      })
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      yield* EsLedger.append(key, esLatDeposits(3), 2)
+
+      // A genuine mismatch: the actual version is the verified head, not the snapshot's.
+      const before = decisions(accountId)
+      const error = yield* handle(key, { _tag: "Deposit", amount: 1 }, { expectedVersion: 3 }).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as VersionConflict).actualVersion).toBe(5)
+      expect(decisions(accountId) - before).toBe(0)
+
+      // The caller's version matches the verified head: decided once, applied.
+      const mark = esLatRequests("ledger", accountId).length
+      const result = yield* handle(key, { _tag: "Deposit", amount: 1 }, { expectedVersion: 5 })
+      expect(result).toMatchObject({ version: 6, state: { balance: 24, txCount: 6 } })
+      expect(decisions(accountId) - before).toBe(1)
+      // The verified read of the lagging snapshot is two pages (see above).
+      expect(ledgerOpsSince(accountId, mark)).toEqual([
+        "getItem",
+        "query",
+        "query",
+        "transactWriteItems",
+      ])
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false falls back to the verified load when the snapshot is missing",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-missing"
+        const key = { accountId }
+        // Events written before inline snapshots: no snapshot item at all.
+        yield* EsLedger.append(key, esLatDeposits(4), 0)
+
+        const latest = yield* EsLedger.readLatest(key, {
+          verifySnapshot: false,
+          consistentRead: true,
+        })
+        expect(Option.isNone(latest.snapshot)).toBe(true)
+        expect(latest.version).toBe(4)
+
+        const before = decisions(accountId)
+        const mark = esLatRequests("ledger", accountId).length
+        const result = yield* EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+          verifySnapshot: false,
+        })(key, { _tag: "Deposit", amount: 6 })
+        expect(result).toMatchObject({ version: 5, state: { balance: 10, txCount: 5 } })
+        expect(decisions(accountId) - before).toBe(1)
+        // No snapshot: the verified read pages to the start of the stream.
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+        expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).asOfVersion).toBe(5)
+      }).pipe(provideEsLat),
+  )
+
+  it("verifySnapshot: false is refused unless the stream is inline without `every` (EDD-9068)", () => {
+    expect(() =>
+      EventStore.commandHandler(esCmdDecider("x"), EsBatched, { verifySnapshot: false }),
+    ).toThrow(/EDD-9068/)
+    expect(() =>
+      EsLegacy.pipe(EventStore.commandHandler(esCmdDecider("x"), { verifySnapshot: false })),
+    ).toThrow(/EDD-9068/)
+  })
+
+  // -------------------------------------------------------------------------
   // Large commands — stepped commands, one atomic append each
   // -------------------------------------------------------------------------
 

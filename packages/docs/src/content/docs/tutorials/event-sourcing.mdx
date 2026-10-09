@@ -848,6 +848,39 @@ It returns `{ snapshot, events, version }`: the snapshot if there is one, the ev
 
 On a stream without a snapshot config, `readLatest` is `read` plus the head.
 
+### Loading from the snapshot alone
+
+With `mode: "inline"` and no `every`, the snapshot is written in every append, so it is normally at the head. `readLatest` still reads two items to prove it: the snapshot and the newest event. A `Query` is charged for every item it reads, while a `GetItem` reads only the snapshot, so when events are large that read costs about twice as much as it needs to. `verifySnapshot: false` loads the snapshot item alone, with one `GetItem`:
+
+```typescript region="verify-snapshot" example="event-sourcing.ts"
+// Inline without `every`: the snapshot is normally at the head, so load it alone.
+const handleLean = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+  verifySnapshot: false,
+})
+// One GetItem of the snapshot, then one transaction.
+const ended = yield* handleLean(
+  { matchId: "m-6" },
+  { _tag: "EndMatch", result: "SAF won by 6 wickets" },
+)
+// → version 3, status "completed"
+
+// The snapshot alone; its version is the snapshot's, unverified.
+const lean = yield* inlineMatchEvents.readLatest({ matchId: "m-6" }, { verifySnapshot: false })
+// → snapshot asOfVersion 3, events [], version 3
+```
+
+`readLatest({ verifySnapshot: false })` returns `{ snapshot, events: [], version: snapshot.asOfVersion }`. That version is **unverified**: events appended without a snapshot (a raw `append`, or data written before the stream switched to inline) may follow it. When there is no snapshot item, it falls back to the verified read.
+
+The handler checks for itself. A stale snapshot always shows up before anything is written, because the append's version condition fails. The handler then falls back to a verified load:
+
+- **No snapshot item** (a new stream, or data from before inline mode): it loads verified straight away, and `decide` runs once.
+- **With `expectedVersion`**: a snapshot at a different version is re-read verified before the If-Match check, so `VersionConflict` is reported only for a real mismatch, with the verified head as `actualVersion`. A snapshot at the expected version is decided on, and an append-time conflict is reported as usual.
+- **Without `expectedVersion`**: if the append conflicts, one verified load tells the two causes apart. If events follow the snapshot, the first decision was made on stale state, so the handler **decides again once** on the verified state and appends. If the snapshot is at the head, another writer won the race, and the `VersionConflict` goes to the `retry` policy as usual.
+
+So in that last case, `decide` (and a function-form `additionalItems`) **can run twice for one call**. The first decision is discarded because it was made on stale state. Without this re-read, a stale snapshot would make every command on the stream fail, because only a successful inline append rewrites the snapshot.
+
+The option is accepted only on a `mode: "inline"` stream without `every`, the only mode that keeps the snapshot at the head. On any other snapshot config, creating the handler throws `[EDD-9068]`, and `readLatest` dies with it. On a stream without a snapshot config the option is ignored.
+
 ---
 
 ## Step 18: Large Commands — Stepped Commands
@@ -1152,7 +1185,7 @@ Effect.runPromise(main).then(
 | **Consistent reads** | `{ consistentRead: true }` on `read` / `readFrom` / `currentVersion`; the command handler loads consistently by default |
 | **If-Match** | `handle(id, command, { expectedVersion })` fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs; never retried |
 | **Inline projections** | `additionalItems: (decision) => items` derives side writes from the post-fold state, in the same transaction |
-| **Inline snapshots** | `snapshot: { schema, mode: "inline" }` writes the snapshot in the append transaction; `readLatest` loads state in one `Query` |
+| **Inline snapshots** | `snapshot: { schema, mode: "inline" }` writes the snapshot in the append transaction; `readLatest` loads state in one `Query`, or, with `verifySnapshot: false` (inline without `every`), one `GetItem` of the snapshot with verified fallbacks |
 | **Stepped commands** | A command too large for one transaction is split by the application into fixed-size commands chained by `expectedVersion` — each one atomic |
 | **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
 

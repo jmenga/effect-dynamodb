@@ -694,6 +694,26 @@ const program = Effect.gen(function* () {
     `readLatest: version ${loadedState.version}, ${loadedState.events.length} events after the snapshot, status=${current.status}`,
   )
 
+  // #region verify-snapshot
+  // Inline without `every`: the snapshot is normally at the head, so load it alone.
+  const handleLean = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+    verifySnapshot: false,
+  })
+  // One GetItem of the snapshot, then one transaction.
+  const ended = yield* handleLean(
+    { matchId: "m-6" },
+    { _tag: "EndMatch", result: "SAF won by 6 wickets" },
+  )
+  // → version 3, status "completed"
+
+  // The snapshot alone; its version is the snapshot's, unverified.
+  const lean = yield* inlineMatchEvents.readLatest({ matchId: "m-6" }, { verifySnapshot: false })
+  // → snapshot asOfVersion 3, events [], version 3
+  // #endregion
+  yield* Console.log(
+    `verifySnapshot: false: version ${ended.version}, status=${ended.state.status}; readLatest version ${lean.version}`,
+  )
+
   // --- Large commands: stepped commands ---
   yield* Console.log("\n=== Stepped commands ===")
   // #region stepped-command

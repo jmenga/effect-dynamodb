@@ -38,6 +38,21 @@
     snapshot is current, and `commandHandler` now loads every snapshot-configured
     stream this way. On an `"after-append"` stream with a large `every`, a load
     reads up to `every + 1` items in exchange for fewer requests.
+  - **Snapshot-only loads.** On a `mode: "inline"` stream without `every`,
+    `commandHandler(decider, stream, { verifySnapshot: false })` and
+    `readLatest(streamId, { verifySnapshot: false })` read the snapshot item
+    alone with one `GetItem`, instead of a `Query` that also reads the newest
+    event. A `Query` is charged for every item it reads, so with large events
+    this roughly halves a command's read capacity. `readLatest` then returns the
+    snapshot's `asOfVersion` as an **unverified** `version`. The handler falls
+    back to a verified load itself: at once when there is no snapshot; before
+    reporting an If-Match mismatch, so `actualVersion` is the verified head; and,
+    without `expectedVersion`, when the append conflicts. If that load shows
+    events after the snapshot, the decision was made on stale state, and
+    `decide` (with a function-form `additionalItems`) runs a second time on the
+    verified state; a snapshot at the head is a genuine race, left to the
+    `retry` policy. Any other snapshot config is refused with `[EDD-9068]`; a
+    stream without a snapshot config ignores the option.
   - **Stream indexes ([#140](https://github.com/jmenga/effect-dynamodb/issues/140)).** `makeStream({ indexes })` declares sub-streams of a
     stream's events ordered by a key derived from each event, on an LSI (default,
     strongly consistent) or a GSI (`type: "gsi"`, scoped to the same stream).
@@ -62,7 +77,10 @@
   New definition-time errors: `[EDD-9062]` invalid `snapshot.mode`, `[EDD-9063]`
   malformed stream index, `[EDD-9064]` index attribute owned by the stream,
   `[EDD-9065]` indexes sharing an index or attribute, `[EDD-9066]` undeclared
-  index name, `[EDD-9067]` conflicting physical index definitions.
+  index name, `[EDD-9067]` conflicting physical index definitions, and
+  `[EDD-9068]` `verifySnapshot: false` on a stream that is not `mode: "inline"`
+  without `every` (thrown when the handler is created; a defect from
+  `readLatest`).
 
   Fix: snapshot state is now encoded with the same `decode → encode` fallback as
   events. A `Schema.Class` state folded by an immutable `evolve` that spreads

@@ -4791,6 +4791,557 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
 // Stream indexes — sub-streams by derived key (#140)
 // ---------------------------------------------------------------------------
 
+describe("EventStore verifySnapshot: false — unverified snapshot loads", () => {
+  /** The one mode that accepts `verifySnapshot: false`. */
+  const Inline = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "Unverified",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, mode: "inline" },
+  })
+  const InlineEvery = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "UnverifiedEvery",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, mode: "inline", every: 5 },
+  })
+  const AfterAppend = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "UnverifiedAfter",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, every: 5 },
+  })
+
+  const label = "unverified"
+  const snapshotKey = {
+    pk: "$cricket#v1#unverified#m-1",
+    sk: DynamoSchema.composeKey(AppSchema, "unverified.snapshot", []),
+  }
+  /** A stored snapshot at `asOfVersion` with `innings` completed innings. */
+  const snapshotAt = (asOfVersion: number, innings: number) =>
+    makeSnapshotItem(label, "m-1", asOfVersion, {
+      status: "i",
+      innings: Array.from({ length: innings }, (_, i) => `${i + 1}/${i + 1}`),
+    })
+  const inningsItem = (version: number) =>
+    makeStreamEventItem(label, "m-1", version, "InningsCompleted", {
+      innings: version,
+      runs: version,
+      wickets: version,
+    })
+  /** Answer snapshot-key `GetItem`s with `item`; any other key finds nothing. */
+  const snapshotGetItem = (item: ReturnType<typeof makeSnapshotItem> | undefined) =>
+    mockGetItem.mockImplementation(async (input: any) =>
+      fromAttributeMap(input.Key).sk === snapshotKey.sk && item !== undefined ? { Item: item } : {},
+    )
+  const conflict = {
+    name: "TransactionCanceledException",
+    CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+  }
+  const command: MatchCommand = { _tag: "CompleteInnings", innings: 9, runs: 9, wickets: 9 }
+  const spied = () => {
+    const decide = vi.fn(matchDecider.decide)
+    const decider: EventStore.Decider<
+      MatchState,
+      MatchCommand,
+      MatchEvent,
+      AlreadyStarted | NotStarted
+    > = { ...matchDecider, decide }
+    return { decide, decider }
+  }
+  /** The `asOfVersion` / event versions of a recorded transaction. */
+  const transactShape = (call: { TransactItems: ReadonlyArray<any> }) =>
+    call.TransactItems.filter((i) => i.Put !== undefined).map((i) => {
+      const item = fromAttributeMap(i.Put.Item)
+      return item.__edd_e__ === `${label}.snapshot`
+        ? `snapshot@${String(item.asOfVersion)}`
+        : `event@${String(item.version)}`
+    })
+
+  describe("readLatest", () => {
+    it.effect("reads the snapshot item alone with one GetItem and trusts its version", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+
+        const latest = yield* Inline.readLatest({ matchId: "m-1" }, { verifySnapshot: false })
+
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(mockGetItem).toHaveBeenCalledOnce()
+        const call = mockGetItem.mock.calls[0]![0]
+        expect(call.TableName).toBe("events-table")
+        expect(fromAttributeMap(call.Key)).toEqual(snapshotKey)
+        // Eventually consistent unless asked, as the verified read is.
+        expect(call.ConsistentRead).toBeUndefined()
+        expect(latest.events).toEqual([])
+        expect(latest.version).toBe(4)
+        expect(Option.getOrThrow(latest.snapshot).state).toEqual({
+          status: "in-progress",
+          innings: [
+            { runs: 1, wickets: 1 },
+            { runs: 2, wickets: 2 },
+          ],
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("honours consistentRead on the GetItem", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(1, 0))
+        yield* Inline.readLatest(
+          { matchId: "m-1" },
+          { verifySnapshot: false, consistentRead: true },
+        )
+        expect(mockGetItem.mock.calls[0]![0].ConsistentRead).toBe(true)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("falls back to the verified read when there is no snapshot item", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(undefined)
+        mockQuery.mockResolvedValue({ Items: [inningsItem(2), inningsItem(1)] })
+
+        const latest = yield* Inline.readLatest({ matchId: "m-1" }, { verifySnapshot: false })
+
+        expect(mockGetItem).toHaveBeenCalledOnce()
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(mockQuery.mock.calls[0]![0].KeyConditionExpression).toBe(
+          "#pk = :pk AND #sk BETWEEN :first AND :snapshot",
+        )
+        expect(Option.isNone(latest.snapshot)).toBe(true)
+        expect(latest.events.map((e) => e.version)).toEqual([1, 2])
+        expect(latest.version).toBe(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("fails with ValidationError when the snapshot does not decode", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(makeSnapshotItem(label, "m-1", 2, { status: "nope", innings: [] }))
+        const error = yield* Inline.readLatest({ matchId: "m-1" }, { verifySnapshot: false }).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.readLatest")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("verifySnapshot: true is the verified Query", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(1, 0)))
+        yield* Inline.readLatest({ matchId: "m-1" }, { verifySnapshot: true })
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("dies with EDD-9068 unless the stream is inline without `every`", () =>
+      Effect.gen(function* () {
+        for (const stream of [InlineEvery, AfterAppend] as const) {
+          const exit = yield* stream
+            .readLatest({ matchId: "m-1" }, { verifySnapshot: false })
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            expect(Cause.hasDies(exit.cause)).toBe(true)
+            expect(String(Cause.squash(exit.cause))).toMatch(/EDD-9068/)
+          }
+        }
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("is ignored on a stream without a snapshot config", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const latest = yield* MatchEvents.readLatest({ matchId: "m-1" }, { verifySnapshot: false })
+        expect(latest.version).toBe(0)
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockQuery.mock.calls[0]![0].KeyConditionExpression).toContain("begins_with")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound stream forwards the option", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(3, 1))
+        const bound = yield* EventStore.bind(Inline)
+        const latest = yield* bound.readLatest({ matchId: "m-1" }, { verifySnapshot: false })
+        expect(latest.version).toBe(3)
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("commandHandler", () => {
+    it.effect("loads with exactly one strongly consistent GetItem on the happy path", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+        mockTransactWriteItems.mockResolvedValue({})
+        const { decide, decider } = spied()
+
+        const result = yield* EventStore.commandHandler(decider, Inline, {
+          verifySnapshot: false,
+        })({ matchId: "m-1" }, command)
+
+        expect(mockGetItem).toHaveBeenCalledOnce()
+        const call = mockGetItem.mock.calls[0]![0]
+        expect(fromAttributeMap(call.Key)).toEqual(snapshotKey)
+        expect(call.ConsistentRead).toBe(true)
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(decide).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
+          "event@5",
+          "snapshot@5",
+        ])
+        expect(result.version).toBe(5)
+        expect(result.state.innings).toHaveLength(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("consistentRead: false makes the GetItem eventually consistent", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(1, 0))
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* EventStore.commandHandler(matchDecider, Inline, {
+          verifySnapshot: false,
+          consistentRead: false,
+        })({ matchId: "m-1" }, command)
+        expect(mockGetItem.mock.calls[0]![0].ConsistentRead).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a missing snapshot falls back to the verified load at once; decide runs once", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(undefined)
+        mockQuery.mockResolvedValue({
+          Items: [
+            inningsItem(2),
+            makeStreamEventItem(label, "m-1", 1, "MatchStarted", {
+              venue: "MCG",
+              homeTeam: "AUS",
+              awayTeam: "ENG",
+            }),
+          ],
+        })
+        mockTransactWriteItems.mockResolvedValue({})
+        const { decide, decider } = spied()
+
+        const result = yield* EventStore.commandHandler(decider, Inline, {
+          verifySnapshot: false,
+        })({ matchId: "m-1" }, command)
+
+        expect(mockGetItem).toHaveBeenCalledOnce()
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(mockQuery.mock.calls[0]![0].ConsistentRead).toBe(true)
+        expect(decide).toHaveBeenCalledOnce()
+        expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
+          "event@3",
+          "snapshot@3",
+        ])
+        expect(result.version).toBe(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a stale snapshot is re-read verified and decided on again, without a retry policy",
+      () =>
+        Effect.gen(function* () {
+          // The snapshot is at v4, but events 5 and 6 were appended without one.
+          snapshotGetItem(snapshotAt(4, 2))
+          mockQuery.mockResolvedValue(
+            latestPage(snapshotAt(4, 2), [inningsItem(5), inningsItem(6)]),
+          )
+          mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+          const { decide, decider } = spied()
+
+          const result = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command)
+
+          // One unverified load, one verified load, two decisions, two appends.
+          expect(mockGetItem).toHaveBeenCalledOnce()
+          expect(mockQuery).toHaveBeenCalledOnce()
+          expect(mockQuery.mock.calls[0]![0].ConsistentRead).toBe(true)
+          expect(decide).toHaveBeenCalledTimes(2)
+          expect(decide.mock.calls[0]![1].innings).toHaveLength(2)
+          expect(decide.mock.calls[1]![1].innings).toHaveLength(4)
+          expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
+            "event@5",
+            "snapshot@5",
+          ])
+          expect(transactShape(mockTransactWriteItems.mock.calls[1]![0])).toEqual([
+            "event@7",
+            "snapshot@7",
+          ])
+          expect(result.version).toBe(7)
+          expect(result.state.innings).toHaveLength(5)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("re-evaluates a function-form additionalItems on the re-decision", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(4, 2), [inningsItem(5)]))
+        mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+        const versions: Array<number> = []
+
+        yield* EventStore.commandHandler(matchDecider, Inline, { verifySnapshot: false })(
+          { matchId: "m-1" },
+          command,
+          {
+            additionalItems: ({ version }) => {
+              versions.push(version)
+              return []
+            },
+          },
+        )
+
+        expect(versions).toEqual([4, 5])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a snapshot at the head after a conflict is a genuine race: surfaced", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+        // A concurrent handler appended v5 and its inline snapshot.
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(5, 3)))
+        mockTransactWriteItems.mockRejectedValue(conflict)
+        const { decide, decider } = spied()
+
+        const error = yield* EventStore.commandHandler(decider, Inline, {
+          verifySnapshot: false,
+        })({ matchId: "m-1" }, command).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).actualVersion).toBeUndefined()
+        expect(decide).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockQuery).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a genuine race goes to the retry policy, which reloads unverified", () =>
+      Effect.gen(function* () {
+        mockGetItem
+          .mockResolvedValueOnce({ Item: snapshotAt(4, 2) })
+          .mockResolvedValue({ Item: snapshotAt(5, 3) })
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(5, 3)))
+        mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+        const { decide, decider } = spied()
+
+        const result = yield* EventStore.commandHandler(decider, Inline, {
+          verifySnapshot: false,
+          retry: 1,
+        })({ matchId: "m-1" }, command)
+
+        expect(mockGetItem).toHaveBeenCalledTimes(2)
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(decide).toHaveBeenCalledTimes(2)
+        expect(transactShape(mockTransactWriteItems.mock.calls[1]![0])).toEqual([
+          "event@6",
+          "snapshot@6",
+        ])
+        expect(result.version).toBe(6)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the re-decision happens once; its own conflict follows the policy", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(4, 2), [inningsItem(5)]))
+        mockTransactWriteItems.mockRejectedValue(conflict)
+        const { decide, decider } = spied()
+
+        const error = yield* EventStore.commandHandler(decider, Inline, {
+          verifySnapshot: false,
+        })({ matchId: "m-1" }, command).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect(decide).toHaveBeenCalledTimes(2)
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        expect(mockQuery).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("does not touch domain errors from decide", () =>
+      Effect.gen(function* () {
+        snapshotGetItem(snapshotAt(4, 2))
+        const error = yield* EventStore.commandHandler(matchDecider, Inline, {
+          verifySnapshot: false,
+        })(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "x", homeTeam: "a", awayTeam: "b" },
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("AlreadyStarted")
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    describe("with expectedVersion", () => {
+      it.effect("a snapshot at the expected version is decided on without a verified read", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(snapshotAt(4, 2))
+          mockTransactWriteItems.mockResolvedValue({})
+          const result = yield* EventStore.commandHandler(matchDecider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command, { expectedVersion: 4 })
+          expect(mockQuery).not.toHaveBeenCalled()
+          expect(result.version).toBe(5)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("its append-time conflict is reported, never re-read or retried", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(snapshotAt(4, 2))
+          mockTransactWriteItems.mockRejectedValue(conflict)
+          const { decide, decider } = spied()
+
+          const error = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+            retry: 5,
+          })({ matchId: "m-1" }, command, { expectedVersion: 4 }).pipe(Effect.flip)
+
+          expect(error._tag).toBe("VersionConflict")
+          expect((error as VersionConflict).actualVersion).toBeUndefined()
+          expect(decide).toHaveBeenCalledOnce()
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+          expect(mockQuery).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a lagging snapshot is re-read verified before the If-Match check", () =>
+        Effect.gen(function* () {
+          // The caller saw v6; the snapshot lags at v4.
+          snapshotGetItem(snapshotAt(4, 2))
+          mockQuery.mockResolvedValue(
+            latestPage(snapshotAt(4, 2), [inningsItem(5), inningsItem(6)]),
+          )
+          mockTransactWriteItems.mockResolvedValue({})
+          const { decide, decider } = spied()
+
+          const result = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command, { expectedVersion: 6 })
+
+          expect(mockQuery).toHaveBeenCalledOnce()
+          expect(decide).toHaveBeenCalledOnce()
+          expect(decide.mock.calls[0]![1].innings).toHaveLength(4)
+          expect(result.version).toBe(7)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a genuine mismatch reports the verified head as actualVersion", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(snapshotAt(4, 2))
+          mockQuery.mockResolvedValue(
+            latestPage(snapshotAt(4, 2), [inningsItem(5), inningsItem(6)]),
+          )
+          const { decide, decider } = spied()
+
+          const error = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command, { expectedVersion: 3 }).pipe(Effect.flip)
+
+          expect(error._tag).toBe("VersionConflict")
+          expect((error as VersionConflict).actualVersion).toBe(6)
+          expect(decide).not.toHaveBeenCalled()
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("an idempotent redelivery is still a DuplicateCommand", () =>
+        Effect.gen(function* () {
+          mockGetItem.mockImplementation(async (input: any) => ({
+            Item:
+              fromAttributeMap(input.Key).sk === snapshotKey.sk
+                ? snapshotAt(5, 3)
+                : toAttributeMap({ pk: "x" }),
+          }))
+          mockQuery.mockResolvedValue(latestPage(snapshotAt(5, 3)))
+
+          const error = yield* EventStore.commandHandler(matchDecider, Inline, {
+            verifySnapshot: false,
+            idempotency: {},
+          })({ matchId: "m-1" }, command, { commandId: "cmd-1", expectedVersion: 4 }).pipe(
+            Effect.flip,
+          )
+
+          expect(error._tag).toBe("DuplicateCommand")
+          // Snapshot GetItem, verified Query, then the sentinel probe.
+          expect(mockGetItem).toHaveBeenCalledTimes(2)
+          expect(fromAttributeMap(mockGetItem.mock.calls[1]![0].Key).sk).toBe(
+            "$cricket#v1#unverified.command#cmd-1",
+          )
+          expect(mockQuery).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+
+    describe("EDD-9068", () => {
+      it.effect("refuses every form unless the stream is inline without `every`", () =>
+        Effect.gen(function* () {
+          const bound = yield* EventStore.bind(InlineEvery)
+          const boundAfter = yield* EventStore.bind(AfterAppend)
+          const options = { verifySnapshot: false } as const
+          expect(() => EventStore.commandHandler(matchDecider, InlineEvery, options)).toThrow(
+            /EDD-9068.*"inline" without "every".*mode "inline" with every: 5/,
+          )
+          expect(() => EventStore.commandHandler(matchDecider, AfterAppend, options)).toThrow(
+            /EDD-9068.*mode "after-append" with every: 5/,
+          )
+          expect(() => EventStore.commandHandler(matchDecider, bound, options)).toThrow(/EDD-9068/)
+          expect(() => InlineEvery.pipe(EventStore.commandHandler(matchDecider, options))).toThrow(
+            /EDD-9068/,
+          )
+          expect(() => boundAfter.pipe(EventStore.commandHandler(matchDecider, options))).toThrow(
+            /EDD-9068/,
+          )
+          // `true` (or omitted) is accepted everywhere.
+          EventStore.commandHandler(matchDecider, InlineEvery, { verifySnapshot: true })
+          AfterAppend.pipe(EventStore.commandHandler(matchDecider))
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("accepts the inline stream in every form", () =>
+        Effect.gen(function* () {
+          const bound = yield* EventStore.bind(Inline)
+          snapshotGetItem(snapshotAt(4, 2))
+          mockTransactWriteItems.mockResolvedValue({})
+          const handlers = [
+            EventStore.commandHandler(matchDecider, bound, { verifySnapshot: false }),
+            bound.pipe(EventStore.commandHandler(matchDecider, { verifySnapshot: false })),
+          ]
+          for (const handle of handlers) yield* handle({ matchId: "m-1" }, command)
+          yield* Inline.pipe(EventStore.commandHandler(matchDecider, { verifySnapshot: false }))(
+            { matchId: "m-1" },
+            command,
+          )
+          expect(mockQuery).not.toHaveBeenCalled()
+          expect(mockGetItem).toHaveBeenCalledTimes(3)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("is ignored on a stream without a snapshot config", () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValue({ Items: [] })
+          mockTransactWriteItems.mockResolvedValue({})
+          const result = yield* EventStore.commandHandler(matchDecider, MatchEvents, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, { _tag: "StartMatch", venue: "x", homeTeam: "a", awayTeam: "b" })
+          expect(result.version).toBe(1)
+          expect(mockGetItem).not.toHaveBeenCalled()
+          expect(mockQuery).toHaveBeenCalledOnce()
+          expect(mockQuery.mock.calls[0]![0].ConsistentRead).toBe(true)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+  })
+})
+
 describe("EventStore stream indexes (#140)", () => {
   const pad = (n: number) => String(n).padStart(4, "0")
 

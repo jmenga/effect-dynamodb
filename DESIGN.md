@@ -2792,7 +2792,8 @@ const program = Effect.gen(function* () {
 ### Consistent Reads (#139)
 
 `read`, `readFrom`, `currentVersion` and `readLatest` take an optional
-`ReadOptions` (`{ consistentRead?: boolean }`, default `false`);
+`ReadOptions` (`{ consistentRead?: boolean }`, default `false`; `readLatest`'s
+`ReadLatestOptions` adds `verifySnapshot`);
 `consistentRead: true` sets `ConsistentRead` on every `Query` page for
 read-your-writes. `query.events` composes with `Query.consistentRead` instead.
 `commandHandler` loads state strongly consistently **by default**
@@ -2840,7 +2841,10 @@ load → [expectedVersion check] → decide → fold new events → derive items
 - **Load (#139).** Strongly consistent by default;
   `CommandHandlerOptions.consistentRead: false` opts out. A snapshot-configured
   stream loads through `readLatest` (one `Query` for the snapshot and its
-  delta), so the option covers the snapshot too.
+  delta), so the option covers the snapshot too. On a `mode: "inline"` stream
+  without `every`, `CommandHandlerOptions.verifySnapshot: false` loads the
+  snapshot item alone (one `GetItem`), with verified fallbacks — see
+  [Unverified snapshot loads](#unverified-snapshot-loads--verifysnapshot-false).
 - **Caller expected version — If-Match (#136).** Per call,
   `handle(streamId, command, { expectedVersion })`. A loaded version other than
   `expectedVersion` fails with `VersionConflict` carrying
@@ -2983,6 +2987,49 @@ request; a snapshot lagging by up to `every` events also loads in one, otherwise
 The first page is read whatever the lag, so an `"after-append"` stream with a large
 `every` reads up to `every + 1` items per load — the `SnapshotConfig.every` JSDoc says
 so. On a stream without `snapshot`, `readLatest` is `read` plus the head.
+
+#### Unverified snapshot loads — `verifySnapshot: false`
+
+```typescript
+stream.readLatest(streamId, { verifySnapshot: false })          // ReadLatestOptions
+EventStore.commandHandler(decider, stream, { verifySnapshot: false })
+```
+
+`verifySnapshot` (default `true`) is a `readLatest` option (`ReadLatestOptions`, which
+extends `ReadOptions`; `read` / `readFrom` / `currentVersion` do not take it) and a
+`CommandHandlerOptions` field. With an inline snapshot written in every append, the
+snapshot is normally at the head, yet the verified `Query` still reads the snapshot
+**and** the newest event (`Limit: 2`). A `Query`'s read capacity counts every item it
+reads; a `GetItem` reads only the snapshot — with large events, roughly half the read
+capacity per command. `false` therefore reads the snapshot item alone with one `GetItem`
+(consistent per `consistentRead`, so strongly consistent in `commandHandler` by
+default):
+
+- **`readLatest`** returns `{ snapshot, events: [], version: snapshot.asOfVersion }` —
+  `version` is **unverified** (events appended without a snapshot may follow it). With no
+  snapshot item it falls back to the verified read and returns that.
+- **Accepted only on `mode: "inline"` without `every`** — the only mode in which the
+  snapshot is normally at the head. Any other snapshot config: `commandHandler` throws
+  `[EDD-9068]` when the handler is created (data-first and data-last, `EventStream` and
+  `BoundEventStream`), and `readLatest` dies with `[EDD-9068]` (a defect, like
+  `[EDD-9026]`). On a stream without `snapshot` the option is ignored (the full verified
+  read, as before).
+
+A stale snapshot (events appended raw, or data predating `mode: "inline"`) always
+surfaces before anything is written, and `commandHandler` falls back to a verified load
+itself:
+
+| Situation | Behaviour |
+|---|---|
+| No snapshot item | `readLatest` falls back to the verified read at once; `decide` runs once |
+| `expectedVersion`, snapshot `asOfVersion` ≠ it | Verified `readLatest`, then the normal If-Match check: `VersionConflict.actualVersion` is the **verified** head; the `DuplicateCommand` probe keeps its precedence |
+| `expectedVersion`, snapshot `asOfVersion` = it | Decide and append; an append-time `VersionConflict` is reported, never retried (the If-Match rule) |
+| No `expectedVersion`, the append fails with `VersionConflict` | One verified `readLatest`. Events past the current snapshot → the load was stale: **decide again once** on the verified state and append (outside, and in addition to, the `retry` policy; its own conflict follows the policy). Snapshot at the head → a genuine race: the `VersionConflict` goes to the `retry` policy as always, and a retried attempt loads unverified again |
+
+`decide` — and a function-form `additionalItems` — can therefore run **twice for one
+call** (the last row): the first decision was made on stale state. Without the automatic
+re-read, a lagging snapshot would fail every command on the stream, because only a
+successful inline append rewrites it.
 
 ### Large Commands — Stepped Commands
 
@@ -3454,7 +3501,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
-| `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version) and unset on an append-time conflict, where the actual version is unknown without another read |
+| `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and unset on an append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
 | `AppendTooLarge` | An `EventStore` append exceeds 100 transact items; nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
@@ -3605,8 +3652,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
 | `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
 | `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently |
+| `EDD-9068` | `EventStore.ts` | `verifySnapshot: false` on a stream whose snapshot config is not `mode: "inline"` without `every` — thrown by `commandHandler` at handler construction, a defect from `readLatest` |
 
-Next free code: **`EDD-9068`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9069`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

@@ -11,6 +11,9 @@
  *   `AppendOptions.snapshot` is typed by it (and refused on a snapshot-less
  *   stream). An append is always one atomic transaction: there is no
  *   `chunked` option on `append` or `commandHandler`.
+ * - `verifySnapshot` is accepted by `readLatest` (`ReadLatestOptions`) and the
+ *   handler options only — not by `read` / `readFrom` / `currentVersion`, nor
+ *   per call.
  * - Stream indexes (#140): the index names are a trailing `TIndexName` type
  *   parameter, so `readIndex` / `query.index` refuse an undeclared name, the
  *   `key` callback is typed by the stream's events, and indexed streams still
@@ -334,6 +337,40 @@ describe("EventStore.commandHandler types", () => {
         const boundLatest = bound.readLatest(key)
         expectTypeOf<Effect.Services<typeof boundLatest>>().toEqualTypeOf<never>()
       })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("verifySnapshot is a readLatest and handler option only", () => {
+    typeOnly(() => {
+      const Inline = EventStore.makeStream({
+        table: AppTable,
+        streamName: "InlineTyped",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        snapshot: { schema: Schema.Struct({ total: Schema.Number }), mode: "inline" },
+      })
+      const options: EventStore.ReadLatestOptions = { verifySnapshot: false, consistentRead: true }
+      const latest = Inline.readLatest(key, options)
+      expectTypeOf<Effect.Success<typeof latest>["version"]>().toEqualTypeOf<number>()
+      // @ts-expect-error — not a ReadOptions field: only readLatest verifies a snapshot
+      Inline.read(key, { verifySnapshot: false })
+      // @ts-expect-error — not a ReadOptions field
+      Inline.currentVersion(key, { verifySnapshot: false })
+      // @ts-expect-error — a boolean
+      Inline.readLatest(key, { verifySnapshot: "no" })
+
+      const handle = EventStore.commandHandler(decider, Inline, { verifySnapshot: false })
+      handle(key, command, { expectedVersion: 3 })
+      Inline.pipe(EventStore.commandHandler(decider, { verifySnapshot: false, retry: 1 }))
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Inline)
+        const boundLatest = bound.readLatest(key, { verifySnapshot: false })
+        expectTypeOf<Effect.Services<typeof boundLatest>>().toEqualTypeOf<never>()
+        bound.pipe(EventStore.commandHandler(decider, { verifySnapshot: false }))
+      })
+      // @ts-expect-error — a handler option, not a per-call option
+      handle(key, command, { verifySnapshot: false })
     })
     expect(true).toBe(true)
   })

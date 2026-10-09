@@ -193,7 +193,7 @@ In every mode the snapshot state is the post-fold `state` (§3).
 ### `readLatest` — single-request state load
 
 ```ts
-stream.readLatest(streamId, options?: ReadOptions)
+stream.readLatest(streamId, options?: ReadLatestOptions)   // ReadOptions + verifySnapshot (below)
   : Effect<LatestState<TState, TEvent, M>, DynamoClientError | ValidationError, …>
 // LatestState = { snapshot: Option<Snapshot<TState>>; events: ReadonlyArray<StreamEvent<…>>; version: number }
 ```
@@ -250,6 +250,82 @@ page at two items.
 `commandHandler` uses `readLatest` for **every** snapshot-configured stream,
 whatever the mode, consistent by default. Streams without a snapshot config
 keep `read` (consistent).
+
+### Unverified snapshot loads — `verifySnapshot: false`
+
+Accepted from maintainer review on this PR. With `mode: "inline"` and no
+`every`, the snapshot is written in every append's transaction, so it is
+normally exactly at the head — yet `readLatest` still reads
+`Limit: every + 1 = 2` items: the snapshot and the newest event. A `Query`'s
+read capacity counts every item it reads, so when the newest event is large
+that roughly doubles the read capacity per command compared with a `GetItem`,
+which reads only the snapshot.
+
+```ts
+interface ReadLatestOptions extends ReadOptions { readonly verifySnapshot?: boolean }  // default true
+
+stream.readLatest(streamId, { verifySnapshot: false })
+EventStore.commandHandler(decider, stream, { verifySnapshot: false })   // CommandHandlerOptions
+```
+
+- `true` (default): the verified `Query` above.
+- `false`: one `GetItem` of the snapshot item only, consistent per
+  `consistentRead` (so strongly consistent in `commandHandler`, whose loads
+  are consistent by default). `ReadLatestOptions` is `readLatest`'s own type,
+  so `read` / `readFrom` / `currentVersion` do not accept the option, and it
+  is a handler-level option, not a per-call one.
+- **Refused** unless the stream's snapshot config is `mode: "inline"`
+  **without** `every`, the only mode in which the snapshot is normally at the
+  head. `commandHandler` throws `[EDD-9068]` when the handler is created
+  (data-first and data-last, `EventStream` and `BoundEventStream`);
+  `readLatest` dies with `[EDD-9068]` (a defect, like `[EDD-9026]`).
+- On a stream **without** a snapshot config the option is ignored: the full
+  verified read path, as before.
+
+`readLatest({ verifySnapshot: false })` returns
+`{ snapshot, events: [], version: snapshot.asOfVersion }`. That `version` is
+**unverified**: events appended without a snapshot (a raw `append`, data
+written before `mode: "inline"`) may follow it. With no snapshot item it falls
+back to the verified read and returns its result.
+
+**Why it is safe in `commandHandler`.** A stale snapshot always surfaces
+before anything is written — the append's version condition fails — and the
+handler then falls back to a verified load itself:
+
+1. **Missing snapshot** (`GetItem` finds nothing — a new stream, or data
+   predating inline mode): `readLatest` falls back to the verified read
+   immediately. `decide` runs once.
+2. **With `expectedVersion`**, snapshot `asOfVersion` ≠ `expectedVersion`: a
+   verified `readLatest`, then the normal If-Match check (§2) — a
+   `VersionConflict` carries the **verified** head as `actualVersion`, and the
+   `DuplicateCommand` probe keeps its precedence. Only a genuine mismatch is
+   reported.
+3. **With `expectedVersion`**, snapshot `asOfVersion` = `expectedVersion`:
+   decide and append. An append-time `VersionConflict` is reported, never
+   retried (the If-Match rule, unchanged).
+4. **Without `expectedVersion`**, the append fails with `VersionConflict`
+   after an unverified load: one verified `readLatest` tells a stale load from
+   a lost race.
+   - **Events past the current snapshot** (its `asOfVersion` < the head):
+     the load was stale. The handler decides again **once** on the verified
+     state and appends — outside, and in addition to, the `retry` policy. A
+     conflict of that second append follows the policy.
+   - **Snapshot at the head**: another `commandHandler` wrote — a genuine
+     race. The `VersionConflict` goes to the `retry` policy exactly as
+     today; a retried attempt loads (unverified) again.
+
+**`decide` may run twice for one call** in case 4 — and so may a function-form
+`additionalItems`, including its `Effect` form. The first decision was made on
+stale state and discarded; the second is the one appended. Without the
+automatic re-read, a stale snapshot would make every command on the stream
+fail, since only a successful inline append rewrites it. The re-decision
+happens at most once per attempt.
+
+Request counts with `verifySnapshot: false`: a current snapshot loads with one
+`GetItem` (one item read); a missing one costs the `GetItem` plus the verified
+read; a stale one costs the `GetItem`, the failed transaction, the verified
+read and a second transaction — once, after which the snapshot is current
+again.
 
 ## 5. Large commands — stepped commands (#141, not implemented)
 
@@ -412,6 +488,8 @@ table's own `pk` / `sk` are not included, and empty index lists are omitted.
 | `ReadOptions`, `Decision`, `readLatest` / `LatestState`, `SnapshotMode`, `readIndex`, `query.index`, `indexDefinitions` | `EventStore.ts` |
 | `CommandOptions.expectedVersion`, function form of `additionalItems` | `EventStore.ts` |
 | `CommandHandlerOptions.consistentRead` | `EventStore.ts` |
+| `CommandHandlerOptions.verifySnapshot`, `ReadLatestOptions` (`readLatest`'s options: `ReadOptions` + `verifySnapshot`) | `EventStore.ts` |
+| `[EDD-9068]` — `verifySnapshot: false` on a stream not `mode: "inline"` without `every` (thrown by `commandHandler` at construction; a defect from `readLatest`) | `EventStore.ts` |
 | `AppendOptions.snapshot` (`AppendOptions` gains a `TState` parameter, default `never`), `SnapshotConfig.mode` | `EventStore.ts` |
 | `[EDD-9062]` — invalid `snapshot.mode` | `EventStore.ts` (`makeStream`) |
 | `StreamIndexConfig` / `StreamIndexKey` / `StreamIndexSettings` / `ReadIndexOptions` / `StreamIndexDefinitions`, `EventStream.indexes`, trailing `TIndexName` type parameter | `EventStore.ts` |
@@ -453,6 +531,11 @@ Required connected scenarios:
     with a counting client wrapper).
   - Fallback when the snapshot is missing or lagging.
   - Pre-existing streams switched to inline.
+  - `verifySnapshot: false`: a command loads with exactly one `GetItem`; a
+    stale snapshot after a raw append → correct state, `decide` twice,
+    success without a retry policy; a concurrent `commandHandler` race without
+    a retry policy → `VersionConflict`; an If-Match mismatch via a stale
+    snapshot → the verified `actualVersion`; the missing-snapshot fallback.
 - **Large commands (#141 guidance)**:
   - An append over 100 items → `AppendTooLarge` (`count`, `limit`), over
     4 MB → `ValidationError`; nothing written.

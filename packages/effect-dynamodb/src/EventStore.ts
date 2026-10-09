@@ -356,6 +356,35 @@ export interface ReadOptions {
 }
 
 /**
+ * Options accepted by {@link EventStream.readLatest}: {@link ReadOptions} plus
+ * `verifySnapshot`.
+ *
+ * - `verifySnapshot` — default `true`: one `Query` reads the snapshot and the
+ *   events after it, so the result is verified against the stream head.
+ *   `false` reads **only the snapshot item**, with one `GetItem` (consistent
+ *   per `consistentRead`), and returns
+ *   `{ snapshot, events: [], version: snapshot.asOfVersion }` **without
+ *   checking that no event follows it** — `version` is then the snapshot's
+ *   version, not a verified head. When there is no snapshot item, it falls
+ *   back to the verified read and returns that result.
+ *
+ *   Why: a `Query`'s read capacity counts every item it reads, and the
+ *   verified read's first page is the snapshot **plus** the newest event,
+ *   even when the snapshot is current; a `GetItem` reads the snapshot alone.
+ *   With large events that roughly halves the read capacity of a load.
+ *
+ *   Only a stream whose snapshot config is `mode: "inline"` **without**
+ *   `every` (the only mode that writes the snapshot in every append, so it is
+ *   normally at the head) accepts `false`; any other snapshot config dies with
+ *   `[EDD-9068]`. On a stream without a `snapshot` config the option is
+ *   ignored. {@link commandHandler} exposes the same trade-off, with
+ *   automatic fallbacks, as {@link CommandHandlerOptions.verifySnapshot}.
+ */
+export interface ReadLatestOptions extends ReadOptions {
+  readonly verifySnapshot?: boolean | undefined
+}
+
+/**
  * A stream's latest state as {@link EventStream.readLatest} loads it.
  *
  * - `snapshot` — the stream's snapshot, if one exists (always `None` on a
@@ -363,7 +392,11 @@ export interface ReadOptions {
  * - `events` — the events after the snapshot (every event when there is
  *   none), ascending by version. Fold them onto the snapshot's state.
  * - `version` — the stream head: the newest event's version, the snapshot's
- *   `asOfVersion` when no event follows it, `0` for an empty stream.
+ *   `asOfVersion` when no event follows it, `0` for an empty stream. With
+ *   `verifySnapshot: false` (see {@link ReadLatestOptions}) and a snapshot
+ *   present, it is the snapshot's `asOfVersion` and `events` is empty —
+ *   **unverified**: events appended without a snapshot (a raw `append`, data
+ *   written before `mode: "inline"`) may follow it.
  */
 export interface LatestState<TState, TEvent, M = Record<string, unknown> | undefined> {
   readonly snapshot: Option.Option<Snapshot<TState>>
@@ -734,6 +767,25 @@ type CommandSentinelProbeFn = (
 const commandSentinelProbeOf = (stream: object): CommandSentinelProbeFn | undefined =>
   (stream as { [CommandSentinelProbe]?: CommandSentinelProbeFn })[CommandSentinelProbe]
 
+/**
+ * @internal `[EDD-9068]`: `verifySnapshot: false` is accepted only by a stream
+ * whose snapshot is written in every append (`mode: "inline"` without `every`),
+ * the only mode in which the snapshot is normally at the head. Returns the
+ * refusal message, or `undefined` when the option is acceptable — including on
+ * a stream without a snapshot config, where it is ignored.
+ */
+const unverifiedSnapshotRefusal = (
+  streamName: string,
+  settings: SnapshotSettings | undefined,
+  operation: string,
+): string | undefined =>
+  settings === undefined || (settings.mode === "inline" && settings.every === undefined)
+    ? undefined
+    : `[EDD-9068] EventStream "${streamName}": ${operation} with verifySnapshot: false requires ` +
+      `snapshot mode "inline" without "every" — the only mode that writes the snapshot in every ` +
+      `append, so it is normally at the head. This stream's snapshot is mode "${settings.mode}"` +
+      `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`
+
 // ---------------------------------------------------------------------------
 // EventStream interface
 // ---------------------------------------------------------------------------
@@ -881,10 +933,17 @@ export interface EventStream<
    * A snapshot that fails to decode through the state schema fails with
    * `ValidationError`, as {@link EventStream.readSnapshot} does. On a stream
    * without a `snapshot` config it is {@link EventStream.read} plus the head.
+   *
+   * `{ verifySnapshot: false }` reads only the snapshot item, with one
+   * `GetItem`, and returns it with no events and its `asOfVersion` as an
+   * **unverified** `version`; with no snapshot item it falls back to the
+   * verified read. Accepted only on a `mode: "inline"` stream without `every`
+   * (otherwise a defect, `[EDD-9068]`), ignored on a stream without a
+   * `snapshot` config — see {@link ReadLatestOptions}.
    */
   readLatest(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
     DynamoClientError | ValidationError,
@@ -1957,6 +2016,33 @@ export const makeStream = <
       ),
     )
 
+  /** The raw snapshot item, by its exact key, in one `GetItem`. */
+  const getSnapshotItem = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    consistentRead: boolean,
+  ): Effect.Effect<
+    Record<string, unknown> | undefined,
+    DynamoClientError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+      const result = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap({
+          pk: composeStreamPk(streamId as Record<string, unknown>),
+          sk: snapshotSk,
+        }),
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      })
+      return result.Item === undefined ? undefined : fromAttributeMap(result.Item)
+    }) as Effect.Effect<
+      Record<string, unknown> | undefined,
+      DynamoClientError,
+      DynamoClient | TableConfig
+    >
+
   const readSnapshot = (
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
@@ -1966,23 +2052,9 @@ export const makeStream = <
   > =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("readSnapshot")
-
-      const client = yield* DynamoClient
-      const { name: tableName } = yield* config.table.Tag
-
-      const result = yield* client.getItem({
-        TableName: tableName,
-        Key: toAttributeMap({
-          pk: composeStreamPk(streamId as Record<string, unknown>),
-          sk: snapshotSk,
-        }),
-        ConsistentRead: true,
-      })
-
-      if (result.Item === undefined) return Option.none<Snapshot<unknown>>()
-      return Option.some(
-        yield* decodeSnapshotItem(fromAttributeMap(result.Item), "EventStore.readSnapshot"),
-      )
+      const raw = yield* getSnapshotItem(streamId, true)
+      if (raw === undefined) return Option.none<Snapshot<unknown>>()
+      return Option.some(yield* decodeSnapshotItem(raw, "EventStore.readSnapshot"))
     }) as Effect.Effect<
       Option.Option<Snapshot<unknown>>,
       DynamoClientError | ValidationError,
@@ -1995,20 +2067,40 @@ export const makeStream = <
 
   const readLatest = (
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<unknown, TEvent>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      // Without a snapshot config there is nothing to read but the events.
+      // Without a snapshot config there is nothing to read but the events
+      // (`verifySnapshot` is ignored).
       if (snapshot === undefined) {
         const events = yield* read(streamId, options)
         return {
           snapshot: Option.none<Snapshot<unknown>>(),
           events,
           version: events[events.length - 1]?.version ?? 0,
+        }
+      }
+
+      // `verifySnapshot: false` — the snapshot item alone, by its exact key:
+      // a `GetItem` reads one item where the verified `Query` reads the
+      // snapshot and at least the newest event. Its version is unverified
+      // (see `ReadLatestOptions`). Without a snapshot item there is nothing to
+      // trust, so fall through to the verified read.
+      if (options?.verifySnapshot === false) {
+        const refusal = unverifiedSnapshotRefusal(config.streamName, snapshotSettings, "readLatest")
+        if (refusal !== undefined) return yield* Effect.die(new Error(refusal))
+        const raw = yield* getSnapshotItem(streamId, options.consistentRead === true)
+        if (raw !== undefined) {
+          const current = yield* decodeSnapshotItem(raw, "EventStore.readLatest")
+          return {
+            snapshot: Option.some(current),
+            events: [],
+            version: current.asOfVersion,
+          }
         }
       }
 
@@ -2353,7 +2445,7 @@ export interface BoundEventStream<
   /** See {@link EventStream.readLatest}. */
   readLatest(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
     DynamoClientError | ValidationError,
@@ -2602,8 +2694,9 @@ export interface CommandHandlerOptions {
    * The retried unit is the entire read–decide–append cycle, so every attempt
    * decides against freshly read state — a blind re-append of stale events is
    * impossible by construction. Snapshot reads participate: a retried attempt
-   * re-reads the snapshot and its delta, and a function-form `additionalItems`
-   * is re-evaluated against the new decision.
+   * re-reads the snapshot and its delta (the snapshot alone with
+   * {@link verifySnapshot}`: false`), and a function-form `additionalItems` is
+   * re-evaluated against the new decision.
    *
    * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
    * initial attempt). Omit for the default: no retry.
@@ -2628,6 +2721,50 @@ export interface CommandHandlerOptions {
    * one query ({@link EventStream.readLatest}), so the setting covers both.
    */
   readonly consistentRead?: boolean | undefined
+
+  /**
+   * Verify the snapshot against the stream head when loading state. Default
+   * `true`.
+   *
+   * With `true`, a snapshot-configured stream loads with one `Query` that
+   * reads the snapshot **and** the newest event (more on a lagging snapshot),
+   * so the state `decide` sees is verified current. `false` loads with one
+   * `GetItem` of the snapshot item only ({@link EventStream.readLatest} with
+   * `verifySnapshot: false`). A `Query`'s read capacity counts every item it
+   * reads, a `GetItem` only the snapshot, so with large events `false`
+   * roughly halves the read capacity per command.
+   *
+   * Accepted only when the stream's snapshot config is `mode: "inline"`
+   * **without** `every` — the only mode that writes the snapshot in every
+   * append's transaction, so it is normally at the head. Any other snapshot
+   * config throws `[EDD-9068]` when the handler is created (data-first or
+   * data-last). On a stream without a `snapshot` config the option is
+   * ignored: state is replayed and verified as always.
+   *
+   * The snapshot can still lag the head — events appended without one (a raw
+   * `append`, data written before `mode: "inline"`). That staleness always
+   * surfaces before anything is written, and the handler then falls back to a
+   * verified load itself:
+   *
+   * - **No snapshot item** (a stream not yet snapshotted): the verified load
+   *   runs at once, and `decide` runs once.
+   * - **With {@link CommandOptions.expectedVersion}**: a snapshot whose
+   *   `asOfVersion` differs from it is re-read verified before the If-Match
+   *   check, so only a genuine mismatch is reported (its `actualVersion` is
+   *   the verified head). A snapshot at the expected version is decided and
+   *   appended on; an append-time conflict is reported, never retried.
+   * - **Without it**: an append that fails with `VersionConflict` triggers
+   *   one verified load. If that shows events after the current snapshot,
+   *   the first decision was made on stale state, so the handler decides
+   *   again on the verified state and appends once more — **`decide` (and a
+   *   function-form `additionalItems`) runs twice for that call**. Without
+   *   this, a lagging snapshot would fail every command on the stream, since
+   *   only a successful inline append rewrites it. If the snapshot is at the
+   *   head, another writer won a genuine race: the `VersionConflict` goes to
+   *   the {@link retry} policy as it always does. The re-decision happens at
+   *   most once per attempt, and its own conflict follows the policy too.
+   */
+  readonly verifySnapshot?: boolean | undefined
 }
 
 /**
@@ -2860,6 +2997,17 @@ const makeCommandHandlerImpl = <
     | BoundEventStream<TEvent, TStreamIdFields, TMetadata, any, any>,
   options: CommandHandlerOptions | undefined,
 ) => {
+  // `verifySnapshot: false` is refused up front unless the stream writes its
+  // snapshot in every append (EDD-9068) — at handler construction, so a
+  // misconfiguration fails at startup rather than on the first command.
+  const snapshotSettings = stream.snapshotConfig
+  if (options?.verifySnapshot === false) {
+    const refusal = unverifiedSnapshotRefusal(stream.streamName, snapshotSettings, "commandHandler")
+    if (refusal !== undefined) throw new Error(refusal)
+  }
+  // Ignored on a stream without a snapshot config: there is no snapshot to trust.
+  const unverifiedLoads = options?.verifySnapshot === false && snapshotSettings !== undefined
+
   const retryPolicy = options?.retry
   const schedule =
     retryPolicy === undefined
@@ -2869,7 +3017,8 @@ const makeCommandHandlerImpl = <
         : retryPolicy
   // Consistent by default: an eventually consistent load can hand `decide`
   // state that misses acknowledged events (#139).
-  const readOptions: ReadOptions = { consistentRead: options?.consistentRead ?? true }
+  const readOptions: ReadLatestOptions = { consistentRead: options?.consistentRead ?? true }
+  const unverifiedReadOptions: ReadLatestOptions = { ...readOptions, verifySnapshot: false }
 
   return (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -2877,6 +3026,183 @@ const makeCommandHandlerImpl = <
     callOptions?: CommandOptions<TMetadata, State, TEvent, unknown, unknown> | undefined,
   ) => {
     const expectedVersion = callOptions?.expectedVersion
+
+    /** The state a decision is made on, and how far it can be trusted. */
+    interface Loaded {
+      readonly state: State
+      /** The version the events are appended after. */
+      readonly version: number
+      readonly snapshotAsOfVersion: number
+      /** `false` when the version is an unverified snapshot's `asOfVersion`. */
+      readonly verified: boolean
+      /** Events past the current snapshot (all events without one). */
+      readonly eventsAfterSnapshot: number
+    }
+
+    // 1. Establish the base state + version. A snapshot-configured stream
+    //    loads its snapshot, the events after it and its head in one request
+    //    (#138) — or, unverified, the snapshot item alone; any other stream
+    //    replays from the beginning.
+    const load = (verify: boolean) =>
+      Effect.gen(function* () {
+        let state = decider.initialState
+        if (snapshotSettings !== undefined) {
+          const latest = (yield* stream.readLatest(
+            streamId,
+            verify ? readOptions : unverifiedReadOptions,
+          )) as LatestState<State, TEvent, unknown>
+          let snapshotAsOfVersion = 0
+          if (Option.isSome(latest.snapshot)) {
+            snapshotAsOfVersion = latest.snapshot.value.asOfVersion
+            state = latest.snapshot.value.state
+          }
+          for (const event of latest.events) {
+            state = decider.evolve(state, event.data)
+          }
+          const loaded: Loaded = {
+            state,
+            version: latest.version,
+            snapshotAsOfVersion,
+            // An unverified read returns a snapshot alone; without one it has
+            // already fallen back to the verified read.
+            verified: verify || Option.isNone(latest.snapshot),
+            eventsAfterSnapshot: latest.events.length,
+          }
+          return loaded
+        }
+        const events = yield* stream.read(streamId, readOptions)
+        for (const event of events) {
+          state = decider.evolve(state, event.data)
+        }
+        const loaded: Loaded = {
+          state,
+          version: events[events.length - 1]?.version ?? 0,
+          snapshotAsOfVersion: 0,
+          verified: true,
+          eventsAfterSnapshot: events.length,
+        }
+        return loaded
+      })
+
+    // 3–8. Decide, fold, derive items, append, snapshot. With
+    //    `returnAppendConflict`, an append that fails with `VersionConflict`
+    //    returns the conflict instead of failing, so the caller can tell a
+    //    stale unverified load from a lost race.
+    const decideAndAppend = (loaded: Loaded, returnAppendConflict: boolean) =>
+      Effect.gen(function* () {
+        const baseVersion = loaded.version
+        const state = loaded.state
+
+        // 3. Decide
+        const newEvents = yield* decider.decide(command, state)
+
+        // 4. No-op command — return current state
+        if (newEvents.length === 0) {
+          const noop: CommandHandlerResult<State, TEvent> = {
+            state,
+            version: baseVersion,
+            events: [],
+          }
+          return noop
+        }
+
+        // 5. Fold the new events BEFORE appending (#137): the post-decision
+        //    state is what a function-form `additionalItems` projects, what a
+        //    snapshot records, and what the handler returns — always the
+        //    `evolve` fold, never anything produced inside `decide`.
+        const previous = state
+        let next = state
+        for (const event of newEvents) {
+          next = decider.evolve(next, event)
+        }
+
+        // 6. Derive the caller's items from the decision. Re-run on every
+        //    attempt (and on a re-decision), because the whole cycle is the
+        //    retried unit.
+        const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, {
+          events: newEvents,
+          state: next,
+          previous,
+          version: baseVersion,
+        })
+
+        // 7. Append with optimistic concurrency, plus the caller's items, the
+        //    dedup sentinel and an inline snapshot, all in one transaction.
+        //    `baseVersion` equals any caller-supplied `expectedVersion` here
+        //    (checked in step 2).
+        const appendOptions: {
+          metadata?: TMetadata
+          additionalItems?: ReadonlyArray<TransactWriteOp>
+          idempotency?: AppendIdempotency
+          snapshot?: State
+        } = {}
+        if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
+        if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
+        if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
+          appendOptions.idempotency =
+            options.idempotency.ttl !== undefined
+              ? { commandId: callOptions.commandId, ttl: options.idempotency.ttl }
+              : { commandId: callOptions.commandId }
+        }
+
+        // Inline snapshots (#138) ride in the append transaction: on every
+        // append, or once `every` events have accumulated since the snapshot.
+        const mode = snapshotSettings?.mode ?? "after-append"
+        const every = snapshotSettings?.every
+        const newVersion = baseVersion + newEvents.length
+        if (
+          snapshotSettings !== undefined &&
+          mode === "inline" &&
+          (every === undefined || newVersion - loaded.snapshotAsOfVersion >= every)
+        ) {
+          appendOptions.snapshot = next
+        }
+
+        const appended = stream.append(
+          streamId,
+          newEvents,
+          baseVersion,
+          appendOptions as AppendOptions<TMetadata, any>,
+        ) as Effect.Effect<AppendResult<TEvent>, AppendError, unknown>
+        const outcome = yield* returnAppendConflict
+          ? appended.pipe(
+              Effect.catchIf(
+                (error): error is VersionConflict => error instanceof VersionConflict,
+                (conflict) => Effect.succeed(conflict),
+              ),
+            )
+          : appended
+        if (outcome instanceof VersionConflict) return outcome
+        const result = outcome
+
+        // 8. After-append snapshots, once the cadence threshold is crossed.
+        //    Best-effort: the events are already durable, so a snapshot-write
+        //    failure must not report the command as failed. The next threshold
+        //    crossing retries it.
+        if (
+          mode === "after-append" &&
+          every !== undefined &&
+          result.version - loaded.snapshotAsOfVersion >= every
+        ) {
+          yield* stream
+            .writeSnapshot(streamId, next, result.version)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  `EventStore: snapshot write failed for stream "${stream.streamName}" at version ${result.version}`,
+                  cause,
+                ),
+              ),
+            )
+        }
+
+        const done: CommandHandlerResult<State, TEvent> = {
+          state: next,
+          version: result.version,
+          events: newEvents,
+        }
+        return done
+      })
 
     const attempt = Effect.gen(function* () {
       // Backstop for JS callers and `any`-shaped call sites: silently degrading
@@ -2905,41 +3231,19 @@ const makeCommandHandlerImpl = <
         })
       }
 
-      const snapshotSettings = stream.snapshotConfig
+      // 1. Load (see `load`).
+      let loaded = yield* load(!unverifiedLoads)
 
-      // 1. Establish the base state + version. A snapshot-configured stream
-      //    loads its snapshot, the events after it and its head in one
-      //    request (#138); any other stream replays from the beginning.
-      let state = decider.initialState
-      let baseVersion = 0
-      let snapshotAsOfVersion = 0
-
-      if (snapshotSettings !== undefined) {
-        const latest = (yield* stream.readLatest(streamId, readOptions)) as LatestState<
-          State,
-          TEvent,
-          unknown
-        >
-        if (Option.isSome(latest.snapshot)) {
-          snapshotAsOfVersion = latest.snapshot.value.asOfVersion
-          state = latest.snapshot.value.state
-        }
-        for (const event of latest.events) {
-          state = decider.evolve(state, event.data)
-        }
-        baseVersion = latest.version
-      } else {
-        const events = yield* stream.read(streamId, readOptions)
-        for (const event of events) {
-          state = decider.evolve(state, event.data)
-        }
-        const newest = events[events.length - 1]
-        baseVersion = newest === undefined ? 0 : newest.version
+      // An unverified snapshot at another version than the caller's If-Match
+      // may merely lag the head: re-read verified, so only a genuine mismatch
+      // is reported, with the verified head as its `actualVersion`.
+      if (expectedVersion !== undefined && !loaded.verified && loaded.version !== expectedVersion) {
+        loaded = yield* load(true)
       }
 
       // 2. If-Match (#136): the caller saw a different version, so `decide`
       //    must not run against state the caller never saw.
-      if (expectedVersion !== undefined && expectedVersion !== baseVersion) {
+      if (expectedVersion !== undefined && expectedVersion !== loaded.version) {
         // A redelivery of a command that already committed (its response was
         // lost) arrives with its original If-Match, which the stream has since
         // moved past. It is a duplicate, not a lost race — `append` ranks
@@ -2961,98 +3265,29 @@ const makeCommandHandlerImpl = <
           streamName: stream.streamName,
           streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
           expectedVersion,
-          actualVersion: baseVersion,
+          actualVersion: loaded.version,
         })
       }
 
-      // 3. Decide
-      const newEvents = yield* decider.decide(command, state)
-
-      // 4. No-op command — return current state
-      if (newEvents.length === 0) {
-        return { state, version: baseVersion, events: [] }
+      // An If-Match call's append-time conflict is its answer (never re-read
+      // or retried), and a verified load's conflict is a lost race.
+      if (expectedVersion !== undefined || loaded.verified) {
+        return (yield* decideAndAppend(loaded, false)) as CommandHandlerResult<State, TEvent>
       }
 
-      // 5. Fold the new events BEFORE appending (#137): the post-decision state
-      //    is what a function-form `additionalItems` projects, what a snapshot
-      //    records, and what the handler returns — always the `evolve` fold,
-      //    never anything produced inside `decide`.
-      const previous = state
-      let next = state
-      for (const event of newEvents) {
-        next = decider.evolve(next, event)
-      }
-
-      // 6. Derive the caller's items from the decision. Re-run on every
-      //    attempt, because the whole cycle is the retried unit.
-      const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, {
-        events: newEvents,
-        state: next,
-        previous,
-        version: baseVersion,
-      })
-
-      // 7. Append with optimistic concurrency, plus the caller's items, the
-      //    dedup sentinel and an inline snapshot, all in one transaction.
-      //    `baseVersion` equals any caller-supplied `expectedVersion` here
-      //    (checked in step 2).
-      const appendOptions: {
-        metadata?: TMetadata
-        additionalItems?: ReadonlyArray<TransactWriteOp>
-        idempotency?: AppendIdempotency
-        snapshot?: State
-      } = {}
-      if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
-      if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
-      if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
-        appendOptions.idempotency =
-          options.idempotency.ttl !== undefined
-            ? { commandId: callOptions.commandId, ttl: options.idempotency.ttl }
-            : { commandId: callOptions.commandId }
-      }
-
-      // Inline snapshots (#138) ride in the append transaction: on every
-      // append, or once `every` events have accumulated since the snapshot.
-      const mode = snapshotSettings?.mode ?? "after-append"
-      const every = snapshotSettings?.every
-      const newVersion = baseVersion + newEvents.length
-      if (
-        snapshotSettings !== undefined &&
-        mode === "inline" &&
-        (every === undefined || newVersion - snapshotAsOfVersion >= every)
-      ) {
-        appendOptions.snapshot = next
-      }
-
-      const result = yield* stream.append(
-        streamId,
-        newEvents,
-        baseVersion,
-        appendOptions as AppendOptions<TMetadata, any>,
-      )
-
-      // 8. After-append snapshots, once the cadence threshold is crossed.
-      //    Best-effort: the events are already durable, so a snapshot-write
-      //    failure must not report the command as failed. The next threshold
-      //    crossing retries it.
-      if (
-        mode === "after-append" &&
-        every !== undefined &&
-        result.version - snapshotAsOfVersion >= every
-      ) {
-        yield* stream
-          .writeSnapshot(streamId, next, result.version)
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning(
-                `EventStore: snapshot write failed for stream "${stream.streamName}" at version ${result.version}`,
-                cause,
-              ),
-            ),
-          )
-      }
-
-      return { state: next, version: result.version, events: newEvents }
+      // Unverified load, no If-Match: a conflict means either the snapshot
+      // lagged the head (events appended without one — the decision was made
+      // on stale state) or another writer won the race. One verified load
+      // tells them apart. A lagging snapshot is decided on again, once: only
+      // a successful inline append rewrites the snapshot, so surfacing the
+      // conflict would fail every command on the stream until something else
+      // repaired it. A snapshot at the head means a genuine race, which the
+      // retry policy handles as it always has.
+      const first = yield* decideAndAppend(loaded, true)
+      if (!(first instanceof VersionConflict)) return first
+      const verified = yield* load(true)
+      if (verified.eventsAfterSnapshot === 0) return yield* first
+      return (yield* decideAndAppend(verified, false)) as CommandHandlerResult<State, TEvent>
     })
 
     // A caller-supplied `expectedVersion` is a conditional write: its
@@ -3100,6 +3335,9 @@ const makeCommandHandlerImpl = <
  * })
  * yield* handle({ matchId: "m-1" }, command, { commandId: "cmd-7f3a" })
  *
+ * // Load state from the inline snapshot alone (mode "inline" without `every`)
+ * const handle = EventStore.commandHandler(decider, stream, { verifySnapshot: false })
+ *
  * // If-Match: fail with VersionConflict (never retried) unless the stream is at v7
  * yield* handle({ matchId: "m-1" }, command, { expectedVersion: 7 })
  *
@@ -3117,7 +3355,10 @@ const makeCommandHandlerImpl = <
  *   `snapshot` config, state is loaded with {@link EventStream.readLatest} —
  *   the snapshot, the events after it and the head in one request in steady
  *   state — and only those events are folded, instead of replaying the stream
- *   from the beginning.
+ *   from the beginning. On a `mode: "inline"` stream without `every`,
+ *   {@link CommandHandlerOptions.verifySnapshot}`: false` loads the snapshot
+ *   item alone (one `GetItem`) and falls back to the verified load when that
+ *   snapshot proves stale — in which case `decide` may run twice.
  * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
  * - **Fold before append.** The new events are folded into state before the
  *   append, so the state returned, snapshotted and handed to a function-form
