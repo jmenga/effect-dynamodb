@@ -2,16 +2,19 @@
  * Event Sourcing example — effect-dynamodb EventStore
  *
  * Demonstrates: event stream definition, decider pattern, command handler,
- * append/read/readFrom/currentVersion operations, fold helpers, Query combinators.
+ * append/read/readFrom/currentVersion operations, fold helpers, Query combinators,
+ * snapshots, atomic side writes, idempotency, consistent reads, If-Match
+ * expected versions, inline projections, inline snapshots + readLatest,
+ * large commands as stepped commands, and stream indexes.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
  *
- * Run:
+ * Run (DYNAMODB_ENDPOINT overrides the default http://localhost:8000):
  *   npx tsx examples/event-sourcing.ts
  */
 
-import { Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
+import { Config, Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -214,13 +217,119 @@ const SnapshotMatchEvents = EventStore.makeStream({
 })
 // #endregion
 
+// #region inline-snapshot-stream
+const InlineMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "InlineMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, mode: "inline" },
+})
+// #endregion
+
 // ---------------------------------------------------------------------------
-// 6. Main program
+// 6. Stepped commands — a large command as fixed-size atomic steps
+// ---------------------------------------------------------------------------
+
+// #region stepped-decider
+// Ball-by-ball deliveries from a scoring feed, and their compensating undo.
+class DeliveryRecorded extends Schema.TaggedClass<DeliveryRecorded>()("DeliveryRecorded", {
+  ball: Schema.Number,
+}) {}
+
+class DeliveryReverted extends Schema.TaggedClass<DeliveryReverted>()("DeliveryReverted", {
+  ball: Schema.Number,
+}) {}
+
+type DeliveryEvent = DeliveryRecorded | DeliveryReverted
+
+const DeliveryState = Schema.Struct({ live: Schema.Array(Schema.Number) })
+type DeliveryState = typeof DeliveryState.Type
+
+const Deliveries = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Deliveries",
+  events: [DeliveryRecorded, DeliveryReverted],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: DeliveryState, mode: "inline" },
+})
+
+type DeliveryCommand =
+  | { readonly _tag: "RecordDeliveries"; readonly balls: ReadonlyArray<number> }
+  | { readonly _tag: "RevertDeliveries"; readonly balls: ReadonlyArray<number> }
+
+class NotRecorded extends Data.TaggedError("NotRecorded")<{ readonly ball: number }> {}
+
+const deliveryDecider: EventStore.Decider<
+  DeliveryState,
+  DeliveryCommand,
+  DeliveryEvent,
+  NotRecorded
+> = {
+  initialState: { live: [] },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "RecordDeliveries") {
+        return command.balls.map((ball) => new DeliveryRecorded({ ball }))
+      }
+      for (const ball of command.balls) {
+        if (!state.live.includes(ball)) return yield* new NotRecorded({ ball })
+      }
+      return command.balls.map((ball) => new DeliveryReverted({ ball }))
+    }),
+  evolve: (state, event) => ({
+    live:
+      event._tag === "DeliveryRecorded"
+        ? [...state.live, event.ball]
+        : state.live.filter((ball) => ball !== event.ball),
+  }),
+}
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 7. Stream indexes — sub-streams ordered by a key derived from each event
+// ---------------------------------------------------------------------------
+
+// #region index-stream
+// An LSI can only be created with its table, so indexed streams get their own.
+const ScorecardTable = Table.make({ schema: AppSchema, entities: {} })
+
+const pad = (n: number) => String(n).padStart(4, "0")
+
+const Scorecards = EventStore.makeStream({
+  table: ScorecardTable,
+  streamName: "Scorecard",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  indexes: {
+    // LSI (the default type): innings in innings order, strongly consistent.
+    byInnings: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      key: (event) =>
+        event._tag === "InningsCompleted" ? `INNINGS#${pad(event.innings)}` : undefined,
+    },
+    // GSI: innings by runs scored, eventually consistent, no 10 GB cap.
+    byRuns: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      key: (event, version) =>
+        event._tag === "InningsCompleted" ? `RUNS#${pad(event.runs)}#${pad(version)}` : undefined,
+    },
+  },
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 8. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
   const client = yield* DynamoClient
   const tableConfig = yield* EventsTable.Tag
+  const scorecardConfig = yield* ScorecardTable.Tag
 
   // --- Bind event stream ---
   // #region command-handler
@@ -475,24 +584,305 @@ const program = Effect.gen(function* () {
   const m3 = yield* matchEvents.read({ matchId: "m-3" })
   yield* Console.log(`Events on m-3 after the replay: ${m3.length}`)
 
+  // --- Consistent reads ---
+  yield* Console.log("\n=== Consistent reads ===")
+  // #region consistent-read
+  const fresh = yield* matchEvents.read({ matchId: "m-1" }, { consistentRead: true })
+  const head = yield* matchEvents.currentVersion({ matchId: "m-1" }, { consistentRead: true })
+
+  // commandHandler loads state consistently by default. Opt out per handler:
+  const handleRelaxed = EventStore.commandHandler(matchDecider, matchEvents, {
+    consistentRead: false,
+  })
+  yield* handleRelaxed(
+    { matchId: "m-7" },
+    { _tag: "StartMatch", venue: "Gabba", homeTeam: "AUS", awayTeam: "PAK" },
+  )
+  // #endregion
+  yield* Console.log(`Read ${fresh.length} events consistently; head is v${head}`)
+
+  // --- If-Match: a caller-supplied expected version ---
+  yield* Console.log("\n=== If-Match expected version ===")
+  // #region if-match
+  // The client last saw m-1 at version 2; the stream has since moved to 4.
+  const stale = yield* handleMatch(
+    { matchId: "m-1" },
+    { _tag: "EndMatch", result: "Abandoned" },
+    { expectedVersion: 2 },
+  ).pipe(Effect.flip)
+  const actual = stale._tag === "VersionConflict" ? stale.actualVersion : undefined
+  // → VersionConflict, actualVersion 4 — decide never ran, nothing was retried
+
+  // The version the client saw goes through.
+  const matched = yield* handleMatch(
+    { matchId: "m-4" },
+    { _tag: "CompleteInnings", innings: 1, runs: 220, wickets: 9 },
+    { expectedVersion: 1 },
+  )
+  // #endregion
+  yield* Console.log(`Stale: ${stale._tag} (actualVersion ${actual})`)
+  yield* Console.log(`Matched: version ${matched.version}`)
+
+  // --- Inline projections: additionalItems derived from the decision ---
+  yield* Console.log("\n=== Inline projection ===")
+  // #region inline-projection
+  const handleProjected = EventStore.commandHandler(matchDecider, matchEvents)
+
+  // Pure form: the read-model row comes from the post-fold state.
+  yield* handleProjected(
+    { matchId: "m-5" },
+    { _tag: "StartMatch", venue: "Eden Park", homeTeam: "NZL", awayTeam: "AUS" },
+    {
+      additionalItems: ({ state }) => [
+        db.entities.MatchStatus.put({ matchId: "m-5", status: state.status }),
+      ],
+    },
+  )
+
+  // Effect form: a projection that reads before it writes.
+  yield* handleProjected(
+    { matchId: "m-5" },
+    { _tag: "EndMatch", result: "NZL won by 4 wickets" },
+    {
+      additionalItems: ({ state, version }) =>
+        Effect.gen(function* () {
+          const row = yield* db.entities.MatchStatus.get({ matchId: "m-5" })
+          return [
+            db.entities.MatchStatus.put({
+              matchId: "m-5",
+              status: `${row.status} -> ${state.status} (v${version + 1})`,
+            }),
+          ]
+        }),
+    },
+  )
+  // #endregion
+  const projectedRow = yield* db.entities.MatchStatus.get({ matchId: "m-5" })
+  yield* Console.log(`Projected read model: status=${projectedRow.status}`)
+
+  // --- Inline snapshots + readLatest ---
+  yield* Console.log("\n=== Inline snapshots ===")
+  // #region inline-snapshot
+  const inlineMatchEvents = yield* EventStore.bind(InlineMatchEvents)
+  const handleInline = EventStore.commandHandler(matchDecider, inlineMatchEvents)
+
+  yield* handleInline(
+    { matchId: "m-6" },
+    { _tag: "StartMatch", venue: "Newlands", homeTeam: "SAF", awayTeam: "IND" },
+  )
+  // The snapshot rides in each append's transaction: current after every command.
+  const inlined = yield* handleInline(
+    { matchId: "m-6" },
+    { _tag: "CompleteInnings", innings: 1, runs: 198, wickets: 10 },
+  )
+  // #endregion
+  yield* Console.log(`State: ${inlined.state.status}, Version: ${inlined.version}`)
+
+  // #region read-latest
+  // One Query: the snapshot plus every event after it.
+  const loadedState = yield* inlineMatchEvents.readLatest(
+    { matchId: "m-6" },
+    { consistentRead: true },
+  )
+  const current = Option.match(loadedState.snapshot, {
+    onNone: () => EventStore.fold(matchDecider, loadedState.events),
+    onSome: (s) => EventStore.foldFrom(matchDecider, s.state, loadedState.events),
+  })
+  // → snapshot asOfVersion 2, no events after it, version 2
+  // #endregion
+  yield* Console.log(
+    `readLatest: version ${loadedState.version}, ${loadedState.events.length} events after the snapshot, status=${current.status}`,
+  )
+
+  // #region verify-snapshot
+  // Inline without `every`: the snapshot is normally at the head, so load it alone.
+  const handleLean = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+    verifySnapshot: false,
+  })
+  // One GetItem of the snapshot, then one transaction.
+  const ended = yield* handleLean(
+    { matchId: "m-6" },
+    { _tag: "EndMatch", result: "SAF won by 6 wickets" },
+  )
+  // → version 3, status "completed"
+
+  // The snapshot alone; its version is the snapshot's, unverified.
+  const lean = yield* inlineMatchEvents.readLatest({ matchId: "m-6" }, { verifySnapshot: false })
+  // → snapshot asOfVersion 3, events [], version 3
+  // #endregion
+  yield* Console.log(
+    `verifySnapshot: false: version ${ended.version}, status=${ended.state.status}; readLatest version ${lean.version}`,
+  )
+
+  // --- Large commands: stepped commands ---
+  yield* Console.log("\n=== Stepped commands ===")
+  // #region stepped-command
+  const deliveries = yield* EventStore.bind(Deliveries)
+  const handleDeliveries = EventStore.commandHandler(deliveryDecider, deliveries, {
+    idempotency: { ttl: Duration.days(1) },
+  })
+
+  // A fixed step size, not one computed from event sizes: event content varies.
+  const STEP_SIZE = 50
+
+  /**
+   * Run one large command as fixed-size steps, chained by `expectedVersion`.
+   * Redelivered with the same `commandId` and `expectedVersion`, it resumes.
+   */
+  const stepped = (
+    matchId: string,
+    balls: ReadonlyArray<number>,
+    toCommand: (step: ReadonlyArray<number>) => DeliveryCommand,
+    commandId: string,
+    expectedVersion: number,
+  ) =>
+    Effect.gen(function* () {
+      let version = expectedVersion
+      let skipping = false
+      for (let n = 0; n * STEP_SIZE < balls.length; n++) {
+        const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
+        // An ordinary command: decide, fold, one atomic append with its own
+        // snapshot and sentinel. Each step has its own commandId.
+        const run = (expected: number) =>
+          handleDeliveries({ matchId }, toCommand(step), {
+            commandId: `${commandId}#step-${n}`,
+            expectedVersion: expected,
+          }).pipe(Effect.map((result) => result.version))
+        const committed = yield* run(version).pipe(
+          // An earlier delivery committed this step. Keep the stale version, so
+          // the next step is checked against its sentinel too, before `decide`.
+          Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+          // After skipped steps: the first step not committed. Run it at the head.
+          Effect.catchTag("VersionConflict", (conflict) =>
+            skipping && conflict.actualVersion !== undefined
+              ? run(conflict.actualVersion)
+              : Effect.fail(conflict),
+          ),
+        )
+        skipping = committed === undefined
+        if (committed !== undefined) version = committed
+      }
+      // Every step was committed before: the stream's head.
+      return skipping
+      ? yield* deliveries.currentVersion({ matchId }, { consistentRead: true })
+      : version
+    })
+
+  const feed = Array.from({ length: 150 }, (_, i) => i + 1)
+  const record = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+    _tag: "RecordDeliveries",
+    balls,
+  })
+  const revert = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+    _tag: "RevertDeliveries",
+    balls,
+  })
+
+  // One decision of 150 events cannot be one atomic append.
+  const tooLarge = yield* handleDeliveries({ matchId: "m-8" }, record(feed), {
+    commandId: "feed-1",
+  }).pipe(Effect.flip)
+  // → AppendTooLarge (count 152, limit 100) — nothing written
+
+  const imported = yield* stepped("m-8", feed, record, "feed-1", 0)
+  // → version 150, in three atomic steps
+
+  // The compensating undo: planned newest first, in the same fixed-size steps.
+  const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+  // → version 300. A failure partway stops at the last step's real state.
+
+  // Redelivered (its response lost): every step is a duplicate, nothing is written.
+  const redelivered = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+  // → version 300
+  // #endregion
+  yield* Console.log(
+    `One command: ${tooLarge._tag}; stepped import: v${imported}; stepped undo: v${undone}; redelivered undo: v${redelivered}`,
+  )
+
+  // --- Stream indexes ---
+  yield* Console.log("\n=== Stream indexes ===")
+  // #region index-table
+  const fragments = EventStore.indexDefinitions(Scorecards)
+  yield* client.createTable({
+    TableName: scorecardConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [
+      { AttributeName: "pk", KeyType: "HASH" },
+      { AttributeName: "sk", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "pk", AttributeType: "S" },
+      { AttributeName: "sk", AttributeType: "S" },
+      ...fragments.AttributeDefinitions,
+    ],
+    LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+    GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+  })
+  // #endregion
+
+  // #region index-read
+  const scorecards = yield* EventStore.bind(Scorecards)
+  yield* scorecards.append(
+    { matchId: "m-10" },
+    [
+      new MatchStarted({ venue: "Lords", homeTeam: "ENG", awayTeam: "AUS" }),
+      new InningsCompleted({ innings: 1, runs: 245, wickets: 10 }),
+      new InningsCompleted({ innings: 2, runs: 310, wickets: 7 }),
+      new InningsCompleted({ innings: 3, runs: 120, wickets: 10 }),
+      new InningsCompleted({ innings: 4, runs: 56, wickets: 2 }),
+    ],
+    0,
+  )
+
+  // LSI sub-stream: the second-half innings, strongly consistent.
+  const secondHalf = yield* scorecards.readIndex(
+    "byInnings",
+    { matchId: "m-10" },
+    { between: ["INNINGS#0003", "INNINGS#0004"], consistentRead: true },
+  )
+  // → versions 4 and 5 (MatchStarted is not in the index)
+
+  // GSI sub-stream: the highest-scoring innings.
+  const [top] = yield* scorecards.readIndex(
+    "byRuns",
+    { matchId: "m-10" },
+    { reverse: true, limit: 1 },
+  )
+  // → innings 2, 310 runs
+
+  // query.index composes with the Query combinators.
+  const firstInnings = yield* scorecards.provide(
+    scorecards.query
+      .index("byInnings", { matchId: "m-10" })
+      .pipe(Query.where({ beginsWith: "INNINGS#0001" }), Query.consistentRead(), Query.collect),
+  )
+  // #endregion
+  yield* Console.log(`Second half: versions ${secondHalf.map((e) => e.version).join(", ")}`)
+  if (top !== undefined && top.data._tag === "InningsCompleted") {
+    yield* Console.log(`Top innings: #${top.data.innings} with ${top.data.runs} runs`)
+  }
+  yield* Console.log(`First innings: ${firstInnings.length} event`)
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
-  yield* Console.log("Table deleted.")
+  yield* client.deleteTable({ TableName: scorecardConfig.name })
+  yield* Console.log("Tables deleted.")
 })
 
 // ---------------------------------------------------------------------------
-// 6. Provide dependencies and run
+// 9. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region layer-setup
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   EventsTable.layer({ name: "event-sourcing-example" }),
+  ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

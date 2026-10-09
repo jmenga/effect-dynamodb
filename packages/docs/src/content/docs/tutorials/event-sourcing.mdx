@@ -12,6 +12,12 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Reading events (`read`, `readFrom`, `currentVersion`)
 - Reconstructing state with `EventStore.fold`
 - Query combinators on event streams (reverse, limit)
+- Snapshots, atomic side writes and exactly-once commands
+- Consistent reads and If-Match expected versions
+- Inline projections derived from the decision
+- Inline snapshots and single-request state loads (`readLatest`)
+- Large commands as stepped commands, each one atomic append
+- Stream indexes: sub-streams ordered by a key derived from each event
 
 ---
 
@@ -49,7 +55,7 @@ Define events with `Schema.TaggedClass`, not plain `Schema.Class`. The event sto
 
 ## Step 2: Schema and Table
 
-Define the application schema and a table for the event store. The stream itself manages the event items — no entity registration is needed for them. Entities are only registered here so that ordinary records can be written **atomically alongside events** (see [Step 10](#step-10-atomic-side-writes)):
+Define the application schema and a table for the event store. The stream itself manages the event items — no entity registration is needed for them. Entities are only registered here so that ordinary records can be written **atomically alongside events** (see [Step 12](#step-12-atomic-side-writes)):
 
 ```typescript title="infrastructure.ts" region="infrastructure" example="event-sourcing.ts"
 const AppSchema = DynamoSchema.make({ name: "cricket", version: 1 })
@@ -238,17 +244,22 @@ const handleMatch = EventStore.commandHandler(matchDecider, matchEvents)
 ```
 
 Each call to `handleMatch`:
-1. Reads all events for the stream ID
+1. Reads all events for the stream ID, with a strongly consistent read (see [Step 14](#step-14-consistent-reads))
 2. Folds them through `evolve` to reconstruct current state
 3. Runs `decide` with the command and current state
-4. Appends the resulting events with an expected version check
+4. Folds the new events into that state
+5. Appends the new events with an expected version check
+
+The handler returns `{ state, version, events }`, where `state` is the fold from step 4.
 
 ### Append limits and version contiguity
 
 `append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
 
-- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. The batch is deliberately **never chunked** into multiple transactions, because chunking would break append atomicity. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. If you hit this, split the work into smaller commands (separate appends at their own expected versions). The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
-- **4MB total payload per transaction.** This cap is not pre-validated — the marshalled request size is not practical to compute upfront — so exceeding it surfaces as a `DynamoClientError` from AWS. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
+- **4 MB total payload per transaction.** An append whose items pass it fails with a `ValidationError`, also before anything is sent. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+
+An append is **never split** across transactions, because splitting breaks its atomicity. If a command legitimately decides more than one transaction holds, split it into [stepped commands](#step-18-large-commands--stepped-commands): one command, one decision, one atomic append.
 
 `append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
 
@@ -406,7 +417,8 @@ const MatchStateSchema = Schema.Struct({
 
 Then pass it to `makeStream`. `every: N` asks the command handler to write a fresh
 snapshot after a successful append, once at least `N` events have accumulated since the
-last one:
+last one. This is the default `mode: "after-append"`; [Step 17](#step-17-inline-snapshots-and-readlatest)
+covers `mode: "inline"`, which writes the snapshot in the append's own transaction:
 
 ```typescript title="stream.ts" region="snapshot-stream" example="event-sourcing.ts"
 const SnapshotMatchEvents = EventStore.makeStream({
@@ -495,7 +507,8 @@ const asOfVersion = Option.match(snapshot, {
 `state`, the `asOfVersion` it reflects, and a `timestamp`.
 
 The next command folds from that snapshot plus the single event after it, rather than
-replaying all four — and produces exactly the same state:
+replaying all four — and produces exactly the same state. The handler loads both in one
+`Query` ([`readLatest`](#reading-the-latest-state-in-one-request)):
 
 ```typescript region="snapshot-fold" example="event-sourcing.ts"
 const s4 = yield* handleSnapshotMatch(
@@ -648,6 +661,499 @@ What to know about the sentinel:
 - `ttl` is optional and written to the table's TTL attribute (honouring `TableConfig.ttlAttributeName`). Set it to the longest window over which your infrastructure can replay a command; omit it and sentinels are permanent.
 - A replay is **rejected**, not replayed — `DuplicateCommand` carries `streamName`, `streamId`, and `commandId`. If you need the original outcome, catch the error and re-read the stream.
 - A command that produces no events writes no sentinel, because there is no transaction to attach it to.
+- The sentinel is consulted only when events are appended. A redelivery whose `decide` returns no events against the loaded state never appends, so it succeeds as a no-op instead of failing with `DuplicateCommand`. Whether your application must tell a no-op redelivery apart is your call.
+
+---
+
+## Step 14: Consistent Reads
+
+DynamoDB reads are eventually consistent unless asked otherwise, so a read issued right after an append can miss it. `read`, `readFrom` and `currentVersion` take an optional `{ consistentRead: true }`, which sets `ConsistentRead` on every `Query` page: the read then sees every append acknowledged before it started, at twice the read cost. `query.events` composes with `Query.consistentRead()` instead.
+
+The command handler is different: it loads state with strongly consistent reads **by default**. An eventually consistent load can hand `decide` state that is missing the newest events, and the append then fails with `VersionConflict` (or burns a retry). Opt out per handler with `consistentRead: false` when the read cost matters more than the occasional conflict:
+
+```typescript region="consistent-read" example="event-sourcing.ts"
+const fresh = yield* matchEvents.read({ matchId: "m-1" }, { consistentRead: true })
+const head = yield* matchEvents.currentVersion({ matchId: "m-1" }, { consistentRead: true })
+
+// commandHandler loads state consistently by default. Opt out per handler:
+const handleRelaxed = EventStore.commandHandler(matchDecider, matchEvents, {
+  consistentRead: false,
+})
+yield* handleRelaxed(
+  { matchId: "m-7" },
+  { _tag: "StartMatch", venue: "Gabba", homeTeam: "AUS", awayTeam: "PAK" },
+)
+```
+
+On a snapshot-configured stream the snapshot and its delta are read in one query, so the setting covers both.
+
+---
+
+## Step 15: If-Match — Caller Expected Versions
+
+An HTTP API usually wants the client's view of the stream to be the precondition: the client read the match at version 2, and its command should apply only if nothing has happened since. Pass that version per call as `expectedVersion`:
+
+```typescript region="if-match" example="event-sourcing.ts"
+// The client last saw m-1 at version 2; the stream has since moved to 4.
+const stale = yield* handleMatch(
+  { matchId: "m-1" },
+  { _tag: "EndMatch", result: "Abandoned" },
+  { expectedVersion: 2 },
+).pipe(Effect.flip)
+const actual = stale._tag === "VersionConflict" ? stale.actualVersion : undefined
+// → VersionConflict, actualVersion 4 — decide never ran, nothing was retried
+
+// The version the client saw goes through.
+const matched = yield* handleMatch(
+  { matchId: "m-4" },
+  { _tag: "CompleteInnings", innings: 1, runs: 220, wickets: 9 },
+  { expectedVersion: 1 },
+)
+```
+
+How it behaves:
+
+- After state is loaded, a stream at any other version fails the call with `VersionConflict` **before `decide` runs**, so `decide` never sees state the client did not. The error carries `actualVersion`, the version that was loaded, which is what a `412 Precondition Failed` response wants.
+- Otherwise the append is conditioned on `expectedVersion`. A writer that slips in between the load and the append also fails it with `VersionConflict`, this time without `actualVersion` (knowing it would take another read).
+- Neither conflict is retried, whatever the handler's `retry` policy says. The caller asked for a conditional write, so the conflict is the answer.
+- With `idempotency`, a mismatch first checks the command's sentinel. A redelivered command that already committed (its response was lost, so the client sent the same `commandId` and If-Match again) fails with `DuplicateCommand`, not `VersionConflict`.
+- A value that is not a non-negative integer (a `NaN` from a failed header parse, say) fails with `ValidationError` before anything is read.
+
+Omit `expectedVersion` and the handler behaves as before.
+
+---
+
+## Step 16: Inline Projections
+
+[Step 12](#step-12-atomic-side-writes) committed a read model with the events, but the row was built **before** the command ran. A projection usually needs the command's outcome. On a command handler, `additionalItems` can also be a function of the decision:
+
+```typescript region="inline-projection" example="event-sourcing.ts"
+const handleProjected = EventStore.commandHandler(matchDecider, matchEvents)
+
+// Pure form: the read-model row comes from the post-fold state.
+yield* handleProjected(
+  { matchId: "m-5" },
+  { _tag: "StartMatch", venue: "Eden Park", homeTeam: "NZL", awayTeam: "AUS" },
+  {
+    additionalItems: ({ state }) => [
+      db.entities.MatchStatus.put({ matchId: "m-5", status: state.status }),
+    ],
+  },
+)
+
+// Effect form: a projection that reads before it writes.
+yield* handleProjected(
+  { matchId: "m-5" },
+  { _tag: "EndMatch", result: "NZL won by 4 wickets" },
+  {
+    additionalItems: ({ state, version }) =>
+      Effect.gen(function* () {
+        const row = yield* db.entities.MatchStatus.get({ matchId: "m-5" })
+        return [
+          db.entities.MatchStatus.put({
+            matchId: "m-5",
+            status: `${row.status} -> ${state.status} (v${version + 1})`,
+          }),
+        ]
+      }),
+  },
+)
+```
+
+The function receives a `Decision`:
+
+| Field | Meaning |
+|---|---|
+| `events` | What `decide` returned (never empty) |
+| `state` | The `evolve` fold of `previous` with `events`: the state the handler returns and snapshots |
+| `previous` | The state `decide` was given |
+| `version` | The version the events are appended after; they take `version + 1 … version + events.length` |
+
+It may return the items directly or as an `Effect`. The effect's error and requirements join the handler's own, so a projection that reads through the bound client adds that read's errors to the handler's error channel.
+
+To make `state` available, the handler **folds the new events before it appends them**:
+
+```text
+load → [expectedVersion check] → decide → fold new events → derive items → append → [snapshot]
+```
+
+- The items commit in the same transaction as the events. They count towards the 100-item and 4 MB limits, and a failing condition on one of them is still `AdditionalItemConditionFailed`, with `indices` into the array the function returned.
+- The function is not called when `decide` returns no events, and is called again on every retry attempt, against the freshly decided events.
+- **The fold is the only source of state.** The state the handler returns, snapshots and passes here is always the `evolve` fold of the stored and new events. Nothing produced inside `decide` ever becomes state.
+- **`evolve` may mutate state in place.** The library does not require immutable state. If your `evolve` mutates and returns the same object, `previous` and `state` are the same reference, and `previous` already reflects the new events. A projection that needs a pristine `previous` needs an `evolve` that returns new state, as this example's does.
+
+---
+
+## Step 17: Inline Snapshots and `readLatest`
+
+The snapshots in [Step 10](#step-10-snapshots) are written **after** the append, best-effort, at the `every` cadence, so they usually lag the stream. `mode: "inline"` puts the snapshot `Put` into the append's own transaction instead:
+
+```typescript title="stream.ts" region="inline-snapshot-stream" example="event-sourcing.ts"
+const InlineMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "InlineMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: MatchStateSchema, mode: "inline" },
+})
+```
+
+The handler is used exactly as before:
+
+```typescript region="inline-snapshot" example="event-sourcing.ts"
+const inlineMatchEvents = yield* EventStore.bind(InlineMatchEvents)
+const handleInline = EventStore.commandHandler(matchDecider, inlineMatchEvents)
+
+yield* handleInline(
+  { matchId: "m-6" },
+  { _tag: "StartMatch", venue: "Newlands", homeTeam: "SAF", awayTeam: "IND" },
+)
+// The snapshot rides in each append's transaction: current after every command.
+const inlined = yield* handleInline(
+  { matchId: "m-6" },
+  { _tag: "CompleteInnings", innings: 1, runs: 198, wickets: 10 },
+)
+```
+
+| Mode | When the snapshot is written | How |
+|---|---|---|
+| `"inline"`, no `every` | Every append that writes events | In the append transaction |
+| `"inline"`, `every: N` | Once at least `N` events have accumulated since the loaded snapshot | In the append transaction |
+| `"after-append"` (default) | At the `every` cadence | A best-effort `writeSnapshot` after the append succeeds |
+
+An inline snapshot commits if and only if the events do. It is the post-fold state from [Step 16](#step-16-inline-projections), and it takes one of the transaction's 100 item slots. `append` accepts it directly too, as `append(streamId, events, expectedVersion, { snapshot: state })`; it needs at least one event.
+
+### Reading the latest state in one request
+
+`readLatest` loads a stream's state with a single `Query`: the snapshot, which sorts after every event, plus the events after it, newest first:
+
+```typescript region="read-latest" example="event-sourcing.ts"
+// One Query: the snapshot plus every event after it.
+const loadedState = yield* inlineMatchEvents.readLatest(
+  { matchId: "m-6" },
+  { consistentRead: true },
+)
+const current = Option.match(loadedState.snapshot, {
+  onNone: () => EventStore.fold(matchDecider, loadedState.events),
+  onSome: (s) => EventStore.foldFrom(matchDecider, s.state, loadedState.events),
+})
+// → snapshot asOfVersion 2, no events after it, version 2
+```
+
+It returns `{ snapshot, events, version }`: the snapshot if there is one, the events after it in ascending order, and the stream head. The command handler loads every snapshot-configured stream this way, whatever the mode.
+
+- A current inline snapshot loads in one request.
+- A lagging snapshot (an `"after-append"` cadence, or a stream switched to inline after it already held events) still loads in one request when the lag fits the first page, which holds `every + 1` items, and in two otherwise.
+- The first page is read whatever the lag, so a load can read events the snapshot already covers (they are discarded). With `"after-append"` and a large `every`, that trades read capacity for fewer requests; `mode: "inline"` without `every` keeps the page at two items.
+
+On a stream without a snapshot config, `readLatest` is `read` plus the head.
+
+### Loading from the snapshot alone
+
+With `mode: "inline"` and no `every`, the snapshot is written in every append, so it is normally at the head. `readLatest` still reads two items to prove it: the snapshot and the newest event. A `Query` is charged for every item it reads, while a `GetItem` reads only the snapshot, so when events are large that read costs about twice as much as it needs to. `verifySnapshot: false` loads the snapshot item alone, with one `GetItem`:
+
+```typescript region="verify-snapshot" example="event-sourcing.ts"
+// Inline without `every`: the snapshot is normally at the head, so load it alone.
+const handleLean = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+  verifySnapshot: false,
+})
+// One GetItem of the snapshot, then one transaction.
+const ended = yield* handleLean(
+  { matchId: "m-6" },
+  { _tag: "EndMatch", result: "SAF won by 6 wickets" },
+)
+// → version 3, status "completed"
+
+// The snapshot alone; its version is the snapshot's, unverified.
+const lean = yield* inlineMatchEvents.readLatest({ matchId: "m-6" }, { verifySnapshot: false })
+// → snapshot asOfVersion 3, events [], version 3
+```
+
+`readLatest({ verifySnapshot: false })` returns `{ snapshot, events: [], version: snapshot.asOfVersion }`. That version is **unverified**: events appended without a snapshot (a raw `append`, or data written before the stream switched to inline) may follow it. When there is no snapshot item, it falls back to the verified read.
+
+The handler checks for itself. If the snapshot lags, **every** answer made on it is stale: a refusal or a no-op as much as an append. So the handler returns nothing it decided on an unverified snapshot until the head confirms it. A successful append confirms it by itself, because the append's version condition held. Anything else is checked with one more read, and a stale snapshot falls back to a verified load:
+
+- **No snapshot item** (a new stream, or data from before inline mode): it loads verified straight away, and `decide` runs once.
+- **With `expectedVersion`, at a different version than the snapshot**: the snapshot is re-read verified before the If-Match check, so `VersionConflict` is reported only for a real mismatch, with the verified head as `actualVersion`. `decide` does not run.
+- **With `expectedVersion`, at the snapshot's version**: the snapshot is exactly the state the caller saw, so `decide` runs on it. If the decision does not append (a domain error, a no-op, or an append conflict), one head check (below) confirms the stream is still there. If the stream has moved past the caller's version, the decision is discarded and the answer is what a verified load gives: `DuplicateCommand` for a redelivery that already committed, otherwise `VersionConflict` with the head as `actualVersion`.
+- **Without `expectedVersion`, a domain error or a no-op**: one head check. If the head is at the snapshot, the answer stands. If not, the decision was made on stale state, so the handler loads verified and **decides again once**.
+- **Without `expectedVersion`, an append conflict**: one verified load tells the two causes apart. If events follow the snapshot, the first decision was made on stale state, so the handler **decides again once** on the verified state and appends. If the snapshot is at the head, another writer won the race, and the `VersionConflict` goes to the `retry` policy as usual.
+
+So in the last two cases, `decide` **can run twice for one call**, and so can a function-form `additionalItems` when both decisions append. This is the price of skipping the verification read, the same one a `VersionConflict` retry pays: a decision is only as current as the state it was made on, and one made on stale state can't be patched, only made again. Without the second decision, a stale snapshot would make every command on the stream fail or give a stale answer, because only a successful inline append rewrites the snapshot. The second decision's append repairs it.
+
+The head check is a `Query` for any event *after* the snapshot's version (reverse, `Limit: 1`), not a read of the newest event. While the snapshot is current, that range is empty, so the `Query` reads no items and costs only DynamoDB's per-request minimum, however large the events are. It reads an event only when the snapshot lags, and then the event it reads is the head. So a decision that appends nothing costs one extra round trip, not extra item reads.
+
+The option is accepted only on a `mode: "inline"` stream without `every`, the only mode that keeps the snapshot at the head. On any other snapshot config, creating the handler throws `[EDD-9068]`, and `readLatest` dies with it. On a stream without a snapshot config the option is ignored.
+
+---
+
+## Step 18: Large Commands — Stepped Commands
+
+Some commands decide more events than one transaction holds: an import, a bulk correction, a compensating undo. Such a command fails with `AppendTooLarge` before anything is written, and the library never splits it: an append receives **one decision** — many events and the one state after all of them — and has no valid intermediate states to put at transaction boundaries. Only your decider can produce a valid state for each boundary.
+
+So a large command is run as **stepped commands**. Here the scoring feed records deliveries, and a compensating command reverts them:
+
+```typescript title="deliveries.ts" region="stepped-decider" example="event-sourcing.ts"
+// Ball-by-ball deliveries from a scoring feed, and their compensating undo.
+class DeliveryRecorded extends Schema.TaggedClass<DeliveryRecorded>()("DeliveryRecorded", {
+  ball: Schema.Number,
+}) {}
+
+class DeliveryReverted extends Schema.TaggedClass<DeliveryReverted>()("DeliveryReverted", {
+  ball: Schema.Number,
+}) {}
+
+type DeliveryEvent = DeliveryRecorded | DeliveryReverted
+
+const DeliveryState = Schema.Struct({ live: Schema.Array(Schema.Number) })
+type DeliveryState = typeof DeliveryState.Type
+
+const Deliveries = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Deliveries",
+  events: [DeliveryRecorded, DeliveryReverted],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: DeliveryState, mode: "inline" },
+})
+
+type DeliveryCommand =
+  | { readonly _tag: "RecordDeliveries"; readonly balls: ReadonlyArray<number> }
+  | { readonly _tag: "RevertDeliveries"; readonly balls: ReadonlyArray<number> }
+
+class NotRecorded extends Data.TaggedError("NotRecorded")<{ readonly ball: number }> {}
+
+const deliveryDecider: EventStore.Decider<
+  DeliveryState,
+  DeliveryCommand,
+  DeliveryEvent,
+  NotRecorded
+> = {
+  initialState: { live: [] },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "RecordDeliveries") {
+        return command.balls.map((ball) => new DeliveryRecorded({ ball }))
+      }
+      for (const ball of command.balls) {
+        if (!state.live.includes(ball)) return yield* new NotRecorded({ ball })
+      }
+      return command.balls.map((ball) => new DeliveryReverted({ ball }))
+    }),
+  evolve: (state, event) => ({
+    live:
+      event._tag === "DeliveryRecorded"
+        ? [...state.live, event.ball]
+        : state.live.filter((ball) => ball !== event.ball),
+  }),
+}
+```
+
+The application plans the steps, and each step is an ordinary command:
+
+```typescript region="stepped-command" example="event-sourcing.ts"
+const deliveries = yield* EventStore.bind(Deliveries)
+const handleDeliveries = EventStore.commandHandler(deliveryDecider, deliveries, {
+  idempotency: { ttl: Duration.days(1) },
+})
+
+// A fixed step size, not one computed from event sizes: event content varies.
+const STEP_SIZE = 50
+
+/**
+ * Run one large command as fixed-size steps, chained by `expectedVersion`.
+ * Redelivered with the same `commandId` and `expectedVersion`, it resumes.
+ */
+const stepped = (
+  matchId: string,
+  balls: ReadonlyArray<number>,
+  toCommand: (step: ReadonlyArray<number>) => DeliveryCommand,
+  commandId: string,
+  expectedVersion: number,
+) =>
+  Effect.gen(function* () {
+    let version = expectedVersion
+    let skipping = false
+    for (let n = 0; n * STEP_SIZE < balls.length; n++) {
+      const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
+      // An ordinary command: decide, fold, one atomic append with its own
+      // snapshot and sentinel. Each step has its own commandId.
+      const run = (expected: number) =>
+        handleDeliveries({ matchId }, toCommand(step), {
+          commandId: `${commandId}#step-${n}`,
+          expectedVersion: expected,
+        }).pipe(Effect.map((result) => result.version))
+      const committed = yield* run(version).pipe(
+        // An earlier delivery committed this step. Keep the stale version, so
+        // the next step is checked against its sentinel too, before `decide`.
+        Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+        // After skipped steps: the first step not committed. Run it at the head.
+        Effect.catchTag("VersionConflict", (conflict) =>
+          skipping && conflict.actualVersion !== undefined
+            ? run(conflict.actualVersion)
+            : Effect.fail(conflict),
+        ),
+      )
+      skipping = committed === undefined
+      if (committed !== undefined) version = committed
+    }
+    // Every step was committed before: the stream's head.
+    return skipping
+      ? yield* deliveries.currentVersion({ matchId }, { consistentRead: true })
+      : version
+  })
+
+const feed = Array.from({ length: 150 }, (_, i) => i + 1)
+const record = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+  _tag: "RecordDeliveries",
+  balls,
+})
+const revert = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+  _tag: "RevertDeliveries",
+  balls,
+})
+
+// One decision of 150 events cannot be one atomic append.
+const tooLarge = yield* handleDeliveries({ matchId: "m-8" }, record(feed), {
+  commandId: "feed-1",
+}).pipe(Effect.flip)
+// → AppendTooLarge (count 152, limit 100) — nothing written
+
+const imported = yield* stepped("m-8", feed, record, "feed-1", 0)
+// → version 150, in three atomic steps
+
+// The compensating undo: planned newest first, in the same fixed-size steps.
+const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+// → version 300. A failure partway stops at the last step's real state.
+
+// Redelivered (its response lost): every step is a duplicate, nothing is written.
+const redelivered = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+// → version 300
+```
+
+1. **The application plans the steps** — newest first for an undo — each covering at most a configured number of entities. Prefer a fixed size to a size computed from the events: event content varies.
+2. **Each step is an ordinary `commandHandler` call** — decide, fold, one atomic append with its own snapshot, projections and sentinel — with `expectedVersion` set to the version the previous step returned.
+3. **A failure partway leaves the stream at a real, consistent state**: the last step that committed, with its snapshot and read models. A step that conflicts (another writer got in) fails with `VersionConflict` before anything of it is written.
+
+With idempotency, each step needs **its own `commandId`**, `${commandId}#step-${n}` above. That is what lets a **redelivered** large command resume after a partial failure. A redelivery carries the same `commandId` and the original `expectedVersion`, which is now stale, so the handler checks the step's sentinel before deciding, and a committed step fails with `DuplicateCommand`. The helper skips it and **keeps the stale version**, so the next step is checked the same way, without `decide` running. The first step that was not committed fails with `VersionConflict`, whose `actualVersion` is the head, and the helper runs it from there. When every step was committed, nothing is written.
+
+`DuplicateCommand` carries no version, so don't chain the next step from the head after one: `decide` would run against steps already applied, and the undo above would fail with `NotRecorded`. And when a step fails with `AppendTooLarge`, its `count` against `limit` tells you the configured step size is too large for what each entity decides.
+
+The rule of thumb: **one command → one decision → one atomic append.**
+
+---
+
+## Step 19: Stream Indexes
+
+Every read so far follows the stream's version order. A stream index adds a second order: a **sub-stream** of the stream's events, sorted by a key you derive from each event. Declare indexes on `makeStream`:
+
+```typescript title="stream.ts" region="index-stream" example="event-sourcing.ts"
+// An LSI can only be created with its table, so indexed streams get their own.
+const ScorecardTable = Table.make({ schema: AppSchema, entities: {} })
+
+const pad = (n: number) => String(n).padStart(4, "0")
+
+const Scorecards = EventStore.makeStream({
+  table: ScorecardTable,
+  streamName: "Scorecard",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  indexes: {
+    // LSI (the default type): innings in innings order, strongly consistent.
+    byInnings: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      key: (event) =>
+        event._tag === "InningsCompleted" ? `INNINGS#${pad(event.innings)}` : undefined,
+    },
+    // GSI: innings by runs scored, eventually consistent, no 10 GB cap.
+    byRuns: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      key: (event, version) =>
+        event._tag === "InningsCompleted" ? `RUNS#${pad(event.runs)}#${pad(version)}` : undefined,
+    },
+  },
+})
+```
+
+- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. An empty string, a non-string, a key over DynamoDB's 1024-byte limit or a `key` that throws fails the append with `ValidationError` before anything is written.
+- Only event items carry index attributes. Snapshots and idempotency sentinels are never in an index.
+- `type: "lsi"` (the default) uses the table's partition key, so the index holds exactly this stream's indexed events and can be read with strongly consistent reads. `type: "gsi"` names a `pk` attribute too; `append` writes the stream's partition key value into it, so the index is scoped to the same stream, read eventually consistently.
+
+### Creating the table
+
+`Table.definition` does not derive event tables. `EventStore.indexDefinitions(...streams)` returns the `CreateTable` fragments for the streams' indexes, each projecting `ALL`, to merge into your own `CreateTable` input:
+
+```typescript region="index-table" example="event-sourcing.ts"
+const fragments = EventStore.indexDefinitions(Scorecards)
+yield* client.createTable({
+  TableName: scorecardConfig.name,
+  BillingMode: "PAY_PER_REQUEST",
+  KeySchema: [
+    { AttributeName: "pk", KeyType: "HASH" },
+    { AttributeName: "sk", KeyType: "RANGE" },
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "pk", AttributeType: "S" },
+    { AttributeName: "sk", AttributeType: "S" },
+    ...fragments.AttributeDefinitions,
+  ],
+  LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+  GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+})
+```
+
+:::caution[LSIs have table-wide consequences]
+- **An LSI must be created with the table.** It cannot be added later.
+- **A table with any LSI caps the item collection of every partition key value at 10 GB**: every stream's partitions, indexed or not, and every entity partition that shares the table. A write that would pass the cap fails. If a stream can outgrow that, use a GSI.
+- **The projection must be `ALL`**, because events are decoded from the index item. `indexDefinitions` emits `ALL`; keep it if you write the definition yourself.
+:::
+
+A GSI can be added to an existing table, but that does not index the events already in it. Index attributes are written only by `append`, and events are never rewritten, so an index declared on a stream that already holds events contains only the events appended from then on, and changing a `key` leaves earlier events under their old keys. Reads then return only what was indexed, without an error. The library does not backfill; whether and how to re-index existing events is the application's decision.
+
+### Reading a sub-stream
+
+```typescript region="index-read" example="event-sourcing.ts"
+const scorecards = yield* EventStore.bind(Scorecards)
+yield* scorecards.append(
+  { matchId: "m-10" },
+  [
+    new MatchStarted({ venue: "Lords", homeTeam: "ENG", awayTeam: "AUS" }),
+    new InningsCompleted({ innings: 1, runs: 245, wickets: 10 }),
+    new InningsCompleted({ innings: 2, runs: 310, wickets: 7 }),
+    new InningsCompleted({ innings: 3, runs: 120, wickets: 10 }),
+    new InningsCompleted({ innings: 4, runs: 56, wickets: 2 }),
+  ],
+  0,
+)
+
+// LSI sub-stream: the second-half innings, strongly consistent.
+const secondHalf = yield* scorecards.readIndex(
+  "byInnings",
+  { matchId: "m-10" },
+  { between: ["INNINGS#0003", "INNINGS#0004"], consistentRead: true },
+)
+// → versions 4 and 5 (MatchStarted is not in the index)
+
+// GSI sub-stream: the highest-scoring innings.
+const [top] = yield* scorecards.readIndex(
+  "byRuns",
+  { matchId: "m-10" },
+  { reverse: true, limit: 1 },
+)
+// → innings 2, 310 runs
+
+// query.index composes with the Query combinators.
+const firstInnings = yield* scorecards.provide(
+  scorecards.query
+    .index("byInnings", { matchId: "m-10" })
+    .pipe(Query.where({ beginsWith: "INNINGS#0001" }), Query.consistentRead(), Query.collect),
+)
+```
+
+`readIndex(name, streamId, options?)` returns decoded `StreamEvent`s in index order. Its options are `beginsWith` or `between` (at most one; omit both to read the whole sub-stream), `reverse`, `limit` and `consistentRead`. Index names are type-checked against the stream's `indexes`. `consistentRead` on a GSI-backed index is refused with `ValidationError`, as is an empty key bound or a `between` whose lower bound sorts after its upper bound. `query.index(name, streamId)` returns a plain `Query` for the full set of combinators.
 
 ---
 
@@ -663,16 +1169,19 @@ docker run -d -p 8000:8000 amazon/dynamodb-local
 npx tsx examples/event-sourcing.ts
 ```
 
+The client reads its endpoint from the `DYNAMODB_ENDPOINT` config value, defaulting to `http://localhost:8000`, so `DYNAMODB_ENDPOINT=http://localhost:18000 npx tsx examples/event-sourcing.ts` targets another DynamoDB Local.
+
 ### Layer Setup
 
 ```typescript title="main.ts" region="layer-setup" example="event-sourcing.ts"
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   EventsTable.layer({ name: "event-sourcing-example" }),
+  ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))
@@ -702,6 +1211,12 @@ Effect.runPromise(main).then(
 | **Atomic side writes** | `append(..., { additionalItems })` commits `Entity.put` / `Entity.delete` / bound `db.entities.*` builders / `Transaction.check` ops with the events |
 | **Position-aware errors** | `VersionConflict` vs. `AdditionalItemConditionFailed` vs. `DuplicateCommand` — you always know whose condition failed |
 | **Command idempotency** | At-least-once by default; `commandHandler(..., { idempotency })` + a `commandId` makes it exactly-once via a dedup sentinel |
+| **Consistent reads** | `{ consistentRead: true }` on `read` / `readFrom` / `currentVersion`; the command handler loads consistently by default |
+| **If-Match** | `handle(id, command, { expectedVersion })` fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs; never retried |
+| **Inline projections** | `additionalItems: (decision) => items` derives side writes from the post-fold state, in the same transaction |
+| **Inline snapshots** | `snapshot: { schema, mode: "inline" }` writes the snapshot in the append transaction; `readLatest` loads state in one `Query`, or, with `verifySnapshot: false` (inline without `every`), one `GetItem` of the snapshot with verified fallbacks |
+| **Stepped commands** | A command too large for one transaction is split by the application into fixed-size commands chained by `expectedVersion` — each one atomic |
+| **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
 
 ## What's Next?
 

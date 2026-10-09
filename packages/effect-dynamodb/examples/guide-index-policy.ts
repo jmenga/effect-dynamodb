@@ -21,7 +21,7 @@
  *   npx tsx examples/guide-index-policy.ts
  */
 
-import { Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -301,10 +301,10 @@ const scenario3 = Effect.gen(function* () {
 // =============================================================================
 
 // #region run
-const ClientLayer = DynamoClient.layer({
-  region: "us-east-1",
-  endpoint: "http://localhost:8000",
-  credentials: { accessKeyId: "local", secretAccessKey: "local" },
+const ClientLayer = DynamoClient.layerConfig({
+  region: Config.succeed("us-east-1"),
+  endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
 })
 
 const AppLayer = Layer.mergeAll(ClientLayer, AppTable.layer({ name: "indexpolicy-demo" }))

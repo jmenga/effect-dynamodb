@@ -16,6 +16,7 @@ import { it } from "@effect/vitest"
 import {
   Cause,
   Config,
+  Context,
   Data,
   DateTime,
   Duration,
@@ -47,6 +48,7 @@ import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import type {
   AdditionalItemConditionFailed,
+  AppendTooLarge,
   DuplicateCommand,
   UniqueConstraintViolation,
   ValidationError,
@@ -7835,7 +7837,7 @@ describeConnected("EventStore snapshots + retry (closes #84)", () => {
   it.effect("bind carries the snapshot primitives with R = never", () =>
     Effect.gen(function* () {
       const bound = yield* EventStore.bind(SnapLedger)
-      expect(bound.snapshotConfig).toEqual({ every: 3 })
+      expect(bound.snapshotConfig).toEqual({ mode: "after-append", every: 3 })
 
       const program: Effect.Effect<number, unknown, never> = Effect.gen(function* () {
         yield* bound.writeSnapshot({ accountId: "bind-1" }, { balance: 11, txCount: 1 }, 1)
@@ -8430,6 +8432,1801 @@ describeConnected("EventStore — additionalItems + idempotency (closes #85)", (
       expect(yield* EsIdemMatchEvents.read({ matchId: "ups-es" })).toHaveLength(0)
     }).pipe(provideEsIdem),
   )
+})
+
+// ===========================================================================
+// EventStore command path — consistent reads (#139), caller expectedVersion
+// (#136), decision-derived additionalItems with fold-before-append (#137)
+// ===========================================================================
+
+const esCmdSchema = DynamoSchema.make({ name: "es-cmd", version: 1 })
+const esCmdTableName = `es-cmd-${Date.now()}`
+
+/** Inline projection of an account — written in the same transaction as its events. */
+class EsCmdTally extends Schema.Class<EsCmdTally>("EsCmdTally")({
+  accountId: Schema.String,
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const EsCmdTallies = Entity.make({
+  model: EsCmdTally,
+  entityType: "EsCmdTally",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsCmdTable = Table.make({ schema: esCmdSchema, entities: { EsCmdTallies } })
+
+class EsCmdDeposited extends Schema.TaggedClass<EsCmdDeposited>()("EsCmdDeposited", {
+  amount: Schema.Number,
+}) {}
+
+class EsCmdWithdrew extends Schema.TaggedClass<EsCmdWithdrew>()("EsCmdWithdrew", {
+  amount: Schema.Number,
+}) {}
+
+type EsCmdEvent = EsCmdDeposited | EsCmdWithdrew
+
+interface EsCmdState {
+  readonly balance: number
+  readonly txCount: number
+}
+
+type EsCmdCommand =
+  | { readonly _tag: "Deposit"; readonly amount: number }
+  | { readonly _tag: "Withdraw"; readonly amount: number }
+
+class EsCmdInsufficientFunds extends Data.TaggedError("EsCmdInsufficientFunds") {}
+
+const EsCmdAccounts = EventStore.makeStream({
+  table: EsCmdTable,
+  streamName: "Account",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** Every `decide` call, by account — proves a stale If-Match never reaches it. */
+const esCmdDecideLog: Array<string> = []
+
+const esCmdDecider = (
+  accountId: string,
+): EventStore.Decider<EsCmdState, EsCmdCommand, EsCmdEvent, EsCmdInsufficientFunds> => ({
+  initialState: { balance: 0, txCount: 0 },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      esCmdDecideLog.push(accountId)
+      if (command._tag === "Deposit") return [new EsCmdDeposited({ amount: command.amount })]
+      if (state.balance < command.amount) return yield* new EsCmdInsufficientFunds()
+      return [new EsCmdWithdrew({ amount: command.amount })]
+    }),
+  evolve: (state, event) =>
+    event instanceof EsCmdDeposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+})
+
+/** Every `query` this suite issues: the partition it reads and its `ConsistentRead`. */
+const esCmdQueryLog: Array<{ readonly pk: string | undefined; readonly consistent: boolean }> = []
+
+const EsCmdClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        esCmdQueryLog.push({
+          pk: input.ExpressionAttributeValues?.[":pk"]?.S,
+          consistent: input.ConsistentRead === true,
+        })
+        return client.query(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsCmdLayer = Layer.mergeAll(EsCmdClientLayer, EsCmdTable.layer({ name: esCmdTableName }))
+const provideEsCmd = Effect.provide(EsCmdLayer)
+
+/** The queries issued against one account's stream partition. */
+const esCmdQueriesFor = (accountId: string) =>
+  esCmdQueryLog.filter((entry) => entry.pk === `$es-cmd#v1#account#${accountId}`)
+
+class EsCmdOwner extends Context.Service<EsCmdOwner, { readonly accountId: string }>()(
+  "test/EsCmdOwner",
+) {}
+
+describeConnected("EventStore command path (#139, #136, #137)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esCmdTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsCmdTable),
+        })
+      }).pipe(provideEsCmd, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esCmdTableName })
+      }).pipe(
+        provideEsCmd,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // -------------------------------------------------------------------------
+  // #139 — consistent reads
+  // -------------------------------------------------------------------------
+
+  it.effect("#139 consistentRead reads its own writes on every read primitive", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ryw-1" }
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 10 })], 0)
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 5 })], 1)
+
+      const all = yield* EsCmdAccounts.read(key, { consistentRead: true })
+      const after = yield* EsCmdAccounts.readFrom(key, 1, { consistentRead: true })
+      const head = yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })
+      expect(all.map((e) => e.version)).toEqual([1, 2])
+      expect(after.map((e) => e.data)).toEqual([new EsCmdDeposited({ amount: 5 })])
+      expect(head).toBe(2)
+
+      const bound = yield* EventStore.bind(EsCmdAccounts)
+      expect(yield* bound.currentVersion(key, { consistentRead: true })).toBe(2)
+
+      // Every one of those requests asked for a strongly consistent read.
+      const queries = esCmdQueriesFor("ryw-1")
+      expect(queries).toHaveLength(4)
+      expect(queries.every((q) => q.consistent)).toBe(true)
+
+      // The default is unchanged: eventually consistent.
+      yield* EsCmdAccounts.read(key)
+      expect(esCmdQueriesFor("ryw-1").at(-1)?.consistent).toBe(false)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect(
+    "#139 commandHandler loads consistently by default; consistentRead: false opts out",
+    () =>
+      Effect.gen(function* () {
+        const key = { accountId: "ryw-2" }
+        const consistent = EventStore.commandHandler(esCmdDecider("ryw-2"), EsCmdAccounts)
+        const relaxed = EsCmdAccounts.pipe(
+          EventStore.commandHandler(esCmdDecider("ryw-2"), { consistentRead: false }),
+        )
+
+        // Each command sees the previous one's event immediately.
+        expect((yield* consistent(key, { _tag: "Deposit", amount: 7 })).version).toBe(1)
+        expect((yield* consistent(key, { _tag: "Withdraw", amount: 2 })).state).toEqual({
+          balance: 5,
+          txCount: 2,
+        })
+        expect(esCmdQueriesFor("ryw-2").map((q) => q.consistent)).toEqual([true, true])
+
+        yield* relaxed(key, { _tag: "Deposit", amount: 1 })
+        expect(esCmdQueriesFor("ryw-2").at(-1)?.consistent).toBe(false)
+      }).pipe(provideEsCmd),
+  )
+
+  // -------------------------------------------------------------------------
+  // #136 — caller-supplied expectedVersion (If-Match)
+  // -------------------------------------------------------------------------
+
+  it.effect("#136 a stale expectedVersion fails before decide, with actualVersion, unretried", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ifm-1" }
+      yield* EsCmdAccounts.append(
+        key,
+        [new EsCmdDeposited({ amount: 10 }), new EsCmdDeposited({ amount: 20 })],
+        0,
+      )
+      const handle = EventStore.commandHandler(esCmdDecider("ifm-1"), EsCmdAccounts, {
+        retry: 5,
+      })
+
+      const error = yield* handle(
+        key,
+        { _tag: "Withdraw", amount: 5 },
+        { expectedVersion: 1 },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      const conflict = error as VersionConflict
+      expect(conflict.streamName).toBe("Account")
+      expect(conflict.streamId).toBe("ifm-1")
+      expect(conflict.expectedVersion).toBe(1)
+      expect(conflict.actualVersion).toBe(2)
+      // `decide` never ran, the retry policy was not applied (one load), and
+      // nothing was written.
+      expect(esCmdDecideLog.filter((id) => id === "ifm-1")).toHaveLength(0)
+      expect(esCmdQueriesFor("ifm-1")).toHaveLength(1)
+      expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(2)
+
+      // The matching version goes through.
+      const ok = yield* handle(key, { _tag: "Withdraw", amount: 5 }, { expectedVersion: 2 })
+      expect(ok.version).toBe(3)
+      expect(ok.state).toEqual({ balance: 25, txCount: 3 })
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#136 concurrent writers at the same expectedVersion — exactly one lands", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "ifm-2" }
+      yield* EsCmdAccounts.append(key, [new EsCmdDeposited({ amount: 100 })], 0)
+      const handle = EventStore.commandHandler(esCmdDecider("ifm-2"), EsCmdAccounts, {
+        retry: 5,
+      })
+
+      const results = yield* Effect.all(
+        [1, 2, 3].map((amount) =>
+          handle(key, { _tag: "Withdraw", amount }, { expectedVersion: 1 }).pipe(Effect.result),
+        ),
+        { concurrency: 3 },
+      )
+
+      const successes = results.filter((r) => r._tag === "Success")
+      const failures = results.filter((r) => r._tag === "Failure")
+      expect(successes).toHaveLength(1)
+      expect(failures).toHaveLength(2)
+      for (const failure of failures) {
+        expect((failure as { failure: { _tag: string } }).failure._tag).toBe("VersionConflict")
+      }
+      // The retry policy never ran: exactly one load per command. A retried
+      // loser — whether it lost at the append or at the pre-decide check —
+      // would have reloaded the partition (decide counts cannot show this: a
+      // retried loser fails pre-decide and never reaches decide).
+      expect(esCmdQueriesFor("ifm-2")).toHaveLength(3)
+      expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(2)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect(
+    "#136 a redelivered idempotent command with its original expectedVersion is a DuplicateCommand",
+    () =>
+      Effect.gen(function* () {
+        const key = { accountId: "ifm-3" }
+        const handle = EventStore.commandHandler(esCmdDecider("ifm-3"), EsCmdAccounts, {
+          idempotency: {},
+          retry: 5,
+        })
+
+        // First delivery commits; its response is "lost".
+        const first = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-1", expectedVersion: 0 },
+        )
+        expect(first.version).toBe(1)
+
+        // The redelivery carries the same commandId and If-Match: already applied.
+        const replay = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-1", expectedVersion: 0 },
+        ).pipe(Effect.flip)
+        expect(replay._tag).toBe("DuplicateCommand")
+        expect((replay as DuplicateCommand).commandId).toBe("cmd-1")
+
+        // A different command at the stale version lost a race.
+        const stale = yield* handle(
+          key,
+          { _tag: "Deposit", amount: 5 },
+          { commandId: "cmd-2", expectedVersion: 0 },
+        ).pipe(Effect.flip)
+        expect(stale._tag).toBe("VersionConflict")
+        expect((stale as VersionConflict).actualVersion).toBe(1)
+
+        // Neither reached decide, and nothing was written twice.
+        expect(esCmdDecideLog.filter((id) => id === "ifm-3")).toHaveLength(1)
+        expect(yield* EsCmdAccounts.currentVersion(key, { consistentRead: true })).toBe(1)
+      }).pipe(provideEsCmd),
+  )
+
+  // -------------------------------------------------------------------------
+  // #137 — decision-derived additionalItems
+  // -------------------------------------------------------------------------
+
+  it.effect("#137 a decision-derived projection commits atomically with the events", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-1"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+        EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+      ]
+
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 50 }, { additionalItems: project })
+      const last = yield* handle(
+        { accountId },
+        { _tag: "Withdraw", amount: 20 },
+        { additionalItems: project },
+      )
+
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(last.state)
+      expect(last.state).toEqual({ balance: 30, txCount: 2 })
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 an Effect-form projection may read before writing", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-2"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      // Reads the current projection row (absent on the first command) and
+      // guards the write on it — an optimistic projection.
+      const project = ({ state, version }: EventStore.Decision<EsCmdState, EsCmdEvent>) =>
+        Effect.gen(function* () {
+          const current = yield* EsCmdTallies.get({ accountId }).asEffect().pipe(Effect.option)
+          expect(Option.map(current, (t) => t.txCount)).toEqual(
+            version === 0 ? Option.none() : Option.some(version),
+          )
+          return [EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount })]
+        })
+
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 5 }, { additionalItems: project })
+      yield* handle({ accountId }, { _tag: "Deposit", amount: 6 }, { additionalItems: project })
+
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect(tally.balance).toBe(11)
+      expect(tally.txCount).toBe(2)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 a failing projection condition leaves no events behind", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-3"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts)
+      yield* handle(
+        { accountId },
+        { _tag: "Deposit", amount: 40 },
+        {
+          additionalItems: ({ state }) => [
+            EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+          ],
+        },
+      )
+
+      const error = yield* handle(
+        { accountId },
+        { _tag: "Withdraw", amount: 15 },
+        {
+          additionalItems: ({ state }) => [
+            EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+            // No guard row exists — this check cannot hold.
+            Transaction.check(
+              EsCmdTallies.get({ accountId: "proj-3-guard" }),
+              Expression.condition({ attributeExists: "pk" }),
+            ),
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AdditionalItemConditionFailed")
+      expect((error as AdditionalItemConditionFailed).indices).toEqual([1])
+
+      // All-or-nothing: neither the event nor the projection moved.
+      const events = yield* EsCmdAccounts.read({ accountId }, { consistentRead: true })
+      expect(events.map((e) => e.version)).toEqual([1])
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect(tally.balance).toBe(40)
+      expect(tally.txCount).toBe(1)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 retried commands re-derive the projection from the fresh decision", () =>
+    Effect.gen(function* () {
+      const accountId = "proj-4"
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsCmdAccounts, {
+        retry: 10,
+      })
+      const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+        EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+      ]
+
+      yield* Effect.all(
+        [10, 20, 30, 40].map((amount) =>
+          handle({ accountId }, { _tag: "Deposit", amount }, { additionalItems: project }),
+        ),
+        { concurrency: 4 },
+      )
+
+      // Each commit's projection is the fold through its own version, and the
+      // last commit is the highest version, so the row equals the full fold —
+      // a projection derived from a stale (pre-retry) decision would not.
+      const events = yield* EsCmdAccounts.read({ accountId }, { consistentRead: true })
+      expect(events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      const tally = yield* EsCmdTallies.get({ accountId })
+      expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(
+        EventStore.fold(esCmdDecider(accountId), events),
+      )
+      expect(tally.balance).toBe(100)
+    }).pipe(provideEsCmd),
+  )
+
+  it.effect("#137 a bound handler needs only the projection's own services", () =>
+    Effect.gen(function* () {
+      const bound = yield* EventStore.bind(EsCmdAccounts)
+      const handle = bound.pipe(EventStore.commandHandler(esCmdDecider("proj-5")))
+
+      const program = handle(
+        { accountId: "proj-5" },
+        { _tag: "Deposit", amount: 9 },
+        {
+          additionalItems: ({ state }) =>
+            Effect.gen(function* () {
+              const { accountId } = yield* EsCmdOwner
+              return [
+                EsCmdTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+              ]
+            }),
+        },
+      )
+      // R is exactly the projection's service — the stream's are bound.
+      const provided: Effect.Effect<unknown, unknown, never> = program.pipe(
+        Effect.provideService(EsCmdOwner, { accountId: "proj-5" }),
+      )
+      yield* provided
+
+      const tally = yield* EsCmdTallies.get({ accountId: "proj-5" })
+      expect(tally.balance).toBe(9)
+    }).pipe(provideEsCmd),
+  )
+})
+
+// ===========================================================================
+// EventStore inline snapshots + single-request state load (#138), and large
+// commands as stepped commands (each one atomic append)
+// ===========================================================================
+
+const esLatSchema = DynamoSchema.make({ name: "es-lat", version: 1 })
+const esLatTableName = `es-lat-${Date.now()}`
+
+/** Inline projection carried by each step of a stepped command. */
+class EsLatTally extends Schema.Class<EsLatTally>("EsLatTally")({
+  accountId: Schema.String,
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const EsLatTallies = Entity.make({
+  model: EsLatTally,
+  entityType: "EsLatTally",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const EsLatTable = Table.make({ schema: esLatSchema, entities: { EsLatTallies } })
+
+const EsLatState = Schema.Struct({ balance: Schema.Number, txCount: Schema.Number })
+
+const esLatStream = (
+  streamName: string,
+  snapshot?: { readonly mode?: "inline" | "after-append"; readonly every?: number },
+) =>
+  EventStore.makeStream({
+    table: EsLatTable,
+    streamName,
+    events: [EsCmdDeposited, EsCmdWithdrew],
+    streamId: { composite: ["accountId"] },
+    snapshot: { schema: EsLatState, ...snapshot },
+  })
+
+/** Inline snapshot on every append. */
+const EsLedger = esLatStream("Ledger", { mode: "inline" })
+/** Inline snapshot every 5 events. */
+const EsBatched = esLatStream("Batched", { mode: "inline", every: 5 })
+/** After-append snapshots every 3 events — later switched to inline. */
+const EsLegacy = esLatStream("Legacy", { every: 3 })
+const EsLegacyInline = esLatStream("Legacy", { mode: "inline" })
+/** Stepped commands, with inline snapshots. */
+const EsBulk = esLatStream("Bulk", { mode: "inline" })
+/** No snapshot config at all. */
+const EsPlain = EventStore.makeStream({
+  table: EsLatTable,
+  streamName: "Plain",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+})
+
+/** No snapshot config; events carry (large) metadata. */
+const EsPlainMeta = EventStore.makeStream({
+  table: EsLatTable,
+  streamName: "PlainMeta",
+  events: [EsCmdDeposited, EsCmdWithdrew],
+  streamId: { composite: ["accountId"] },
+  metadata: Schema.Struct({ note: Schema.String }),
+})
+
+/** A decider that deposits `amount` one unit at a time — a command of `amount` events. */
+const esBulkDecider: EventStore.Decider<EsCmdState, number, EsCmdEvent> = {
+  initialState: { balance: 0, txCount: 0 },
+  decide: (count) =>
+    Effect.succeed(Array.from({ length: count }, () => new EsCmdDeposited({ amount: 1 }))),
+  evolve: (state, event) =>
+    event instanceof EsCmdDeposited
+      ? { balance: state.balance + event.amount, txCount: state.txCount + 1 }
+      : { balance: state.balance - event.amount, txCount: state.txCount + 1 },
+}
+
+/** Every request this suite sends, with the partition it targets. */
+const esLatLog: Array<{
+  readonly op: "query" | "transactWriteItems" | "putItem" | "getItem"
+  readonly pk: string | undefined
+  readonly items?: ReadonlyArray<Record<string, unknown>>
+  /** Items a `query` read (its `ScannedCount`), recorded when it returns. */
+  scanned?: number | undefined
+}> = []
+
+/** The stream partition a transact item touches. */
+const transactPk = (item: Record<string, any>): string | undefined => {
+  const entry = item.Put?.Item ?? item.ConditionCheck?.Key ?? item.Delete?.Key ?? item.Update?.Key
+  return entry?.pk?.S
+}
+
+const EsLatClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        const entry: (typeof esLatLog)[number] = {
+          op: "query",
+          pk: input.ExpressionAttributeValues?.[":pk"]?.S,
+        }
+        esLatLog.push(entry)
+        return client.query(input).pipe(
+          Effect.tap((output) =>
+            Effect.sync(() => {
+              entry.scanned = output.ScannedCount
+            }),
+          ),
+        )
+      },
+      getItem: (input) => {
+        esLatLog.push({ op: "getItem", pk: input.Key?.pk?.S })
+        return client.getItem(input)
+      },
+      putItem: (input) => {
+        esLatLog.push({ op: "putItem", pk: input.Item?.pk?.S })
+        return client.putItem(input)
+      },
+      transactWriteItems: (input) => {
+        const items = (input.TransactItems ?? []) as unknown as ReadonlyArray<
+          Record<string, unknown>
+        >
+        esLatLog.push({
+          op: "transactWriteItems",
+          pk: items.map(transactPk).find((pk) => pk?.includes("#v1#") === true),
+          items,
+        })
+        return client.transactWriteItems(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsLatLayer = Layer.mergeAll(EsLatClientLayer, EsLatTable.layer({ name: esLatTableName }))
+const provideEsLat = Effect.provide(EsLatLayer)
+
+/** The requests sent to one stream's partition (`label` is the lower-cased stream name). */
+const esLatRequests = (label: string, accountId: string) =>
+  esLatLog.filter((entry) => entry.pk === `$es-lat#v1#${label}#${accountId}`)
+
+/** A command's idempotency sentinel in the "Bulk" stream, read back raw. */
+const esLatSentinel = (accountId: string, commandId: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.getItem({
+      TableName: esLatTableName,
+      Key: toAttributeMap({
+        pk: `$es-lat#v1#bulk#${accountId}`,
+        sk: DynamoSchema.composeKey(esLatSchema, "bulk.command", [commandId]),
+      }),
+      ConsistentRead: true,
+    })
+    return result.Item === undefined ? undefined : fromAttributeMap(result.Item)
+  })
+
+const esLatDeposits = (n: number) =>
+  Array.from({ length: n }, () => new EsCmdDeposited({ amount: 1 }))
+
+/**
+ * A `Schema.Class` state folded by an immutable `evolve` that spreads — the
+ * fold yields a plain object the class encoder alone refuses.
+ */
+class EsLatClassState extends Schema.Class<EsLatClassState>("EsLatClassState")({
+  balance: Schema.Number,
+  txCount: Schema.Number,
+}) {}
+
+const esLatClassDecider: EventStore.Decider<EsLatClassState, number, EsCmdEvent> = {
+  initialState: new EsLatClassState({ balance: 0, txCount: 0 }),
+  decide: (amount) => Effect.succeed([new EsCmdDeposited({ amount })]),
+  evolve: (state, event) => ({
+    ...state,
+    balance: state.balance + (event instanceof EsCmdDeposited ? event.amount : -event.amount),
+    txCount: state.txCount + 1,
+  }),
+}
+
+const esLatClassStream = (streamName: string, mode: "inline" | "after-append") =>
+  EventStore.makeStream({
+    table: EsLatTable,
+    streamName,
+    events: [EsCmdDeposited, EsCmdWithdrew],
+    streamId: { composite: ["accountId"] },
+    snapshot: { schema: EsLatClassState, mode, every: 1 },
+  })
+
+const EsClassInline = esLatClassStream("ClassInline", "inline")
+const EsClassAfter = esLatClassStream("ClassAfter", "after-append")
+
+describeConnected("EventStore inline snapshots and stepped commands (#138)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: esLatTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(EsLatTable),
+        })
+      }).pipe(provideEsLat, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esLatTableName })
+      }).pipe(
+        provideEsLat,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  // -------------------------------------------------------------------------
+  // #138 — inline snapshots + readLatest
+  // -------------------------------------------------------------------------
+
+  it.effect("#138 an inline snapshot is current after every command", () =>
+    Effect.gen(function* () {
+      const accountId = "inline-1"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger)
+
+      const commands: ReadonlyArray<EsCmdCommand> = [
+        { _tag: "Deposit", amount: 40 },
+        { _tag: "Withdraw", amount: 15 },
+        { _tag: "Deposit", amount: 5 },
+      ]
+      for (const command of commands) {
+        const result = yield* handle(key, command)
+        const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+        expect(snapshot.asOfVersion).toBe(result.version)
+        expect(snapshot.state).toEqual(result.state)
+      }
+      expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).state).toEqual({
+        balance: 30,
+        txCount: 3,
+      })
+
+      // The snapshot rode in each append transaction: no separate write, and
+      // each command was one load plus one transaction.
+      const requests = esLatRequests("ledger", accountId)
+      expect(requests.filter((r) => r.op === "putItem")).toHaveLength(0)
+      expect(requests.filter((r) => r.op === "transactWriteItems")).toHaveLength(3)
+      expect(requests.filter((r) => r.op === "query")).toHaveLength(3)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 readLatest loads state in one request in steady state", () =>
+    Effect.gen(function* () {
+      const accountId = "inline-2"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger)
+      for (let i = 0; i < 6; i++) yield* handle(key, { _tag: "Deposit", amount: 1 })
+
+      const before = esLatRequests("ledger", accountId).length
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      const after = esLatRequests("ledger", accountId).slice(before)
+      expect(after.map((r) => r.op)).toEqual(["query"])
+      expect(Option.getOrThrow(latest.snapshot).asOfVersion).toBe(6)
+      expect(latest.events).toEqual([])
+      expect(latest.version).toBe(6)
+
+      // A command loads in one request too, then writes in one transaction.
+      const mark = esLatRequests("ledger", accountId).length
+      const result = yield* handle(key, { _tag: "Withdraw", amount: 2 })
+      expect(result.state).toEqual({ balance: 4, txCount: 7 })
+      expect(
+        esLatRequests("ledger", accountId)
+          .slice(mark)
+          .map((r) => r.op),
+      ).toEqual(["query", "transactWriteItems"])
+
+      // Bound streams expose it with R = never.
+      const bound = yield* EventStore.bind(EsLedger)
+      expect((yield* bound.readLatest(key)).version).toBe(7)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 falls back when the snapshot is missing", () =>
+    Effect.gen(function* () {
+      const accountId = "missing-1"
+      const key = { accountId }
+      // Events written without any snapshot.
+      yield* EsLedger.append(key, esLatDeposits(4), 0)
+
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      expect(Option.isNone(latest.snapshot)).toBe(true)
+      expect(latest.events.map((e) => e.version)).toEqual([1, 2, 3, 4])
+      expect(latest.version).toBe(4)
+
+      // The handler folds the full stream, then writes the snapshot inline.
+      const result = yield* EventStore.commandHandler(esCmdDecider(accountId), EsLedger)(key, {
+        _tag: "Deposit",
+        amount: 10,
+      })
+      expect(result).toMatchObject({ version: 5, state: { balance: 14, txCount: 5 } })
+      const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+      expect(snapshot).toMatchObject({ asOfVersion: 5, state: { balance: 14, txCount: 5 } })
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a Schema.Class state from a spreading evolve snapshots in both modes", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "class-1" }
+      for (const stream of [EsClassInline, EsClassAfter]) {
+        const handle = EventStore.commandHandler(esLatClassDecider, stream)
+        yield* handle(key, 30)
+        const result = yield* handle(key, 12)
+        expect(result).toMatchObject({ version: 2, state: { balance: 42, txCount: 2 } })
+
+        // The snapshot was written, and decodes back into the class.
+        const snapshot = Option.getOrThrow(yield* stream.readSnapshot(key))
+        expect(snapshot.asOfVersion).toBe(2)
+        expect(snapshot.state).toBeInstanceOf(EsLatClassState)
+        expect(snapshot.state).toMatchObject({ balance: 42, txCount: 2 })
+
+        // The next command folds from it.
+        const next = yield* handle(key, 8)
+        expect(next).toMatchObject({ version: 3, state: { balance: 50, txCount: 3 } })
+      }
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a lagging snapshot loads within the first page, or one page more", () =>
+    Effect.gen(function* () {
+      const accountId = "lag-1"
+      const key = { accountId }
+      // Snapshot at v2, head at v12: ten events behind, past `every: 5`.
+      yield* EsBatched.append(key, esLatDeposits(2), 0)
+      yield* EsBatched.writeSnapshot(key, { balance: 2, txCount: 2 }, 2)
+      yield* EsBatched.append(key, esLatDeposits(10), 2)
+
+      const mark = esLatRequests("batched", accountId).length
+      const lagging = yield* EsBatched.readLatest(key, { consistentRead: true })
+      expect(esLatRequests("batched", accountId).slice(mark)).toHaveLength(2)
+      expect(Option.getOrThrow(lagging.snapshot).asOfVersion).toBe(2)
+      expect(lagging.events.map((e) => e.version)).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+      expect(lagging.version).toBe(12)
+
+      // The handler folds snapshot + delta, and — 13 - 2 >= 5 — snapshots inline.
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsBatched)
+      const result = yield* handle(key, { _tag: "Deposit", amount: 1 })
+      expect(result).toMatchObject({ version: 13, state: { balance: 13, txCount: 13 } })
+      expect(Option.getOrThrow(yield* EsBatched.readSnapshot(key)).asOfVersion).toBe(13)
+
+      // Lagging by less than `every`: still one request.
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      yield* handle(key, { _tag: "Deposit", amount: 1 })
+      const mark2 = esLatRequests("batched", accountId).length
+      const within = yield* EsBatched.readLatest(key, { consistentRead: true })
+      expect(esLatRequests("batched", accountId).slice(mark2)).toHaveLength(1)
+      expect(within.events.map((e) => e.version)).toEqual([14, 15])
+      expect(within.version).toBe(15)
+
+      // Lagging by exactly `every`: the first page holds the snapshot and every
+      // missing event, so it is still one request.
+      const exact = { accountId: "lag-2" }
+      yield* EsBatched.append(exact, esLatDeposits(3), 0)
+      yield* EsBatched.writeSnapshot(exact, { balance: 3, txCount: 3 }, 3)
+      yield* EsBatched.append(exact, esLatDeposits(5), 3)
+      const mark3 = esLatRequests("batched", "lag-2").length
+      const boundary = yield* EsBatched.readLatest(exact, { consistentRead: true })
+      expect(esLatRequests("batched", "lag-2").slice(mark3)).toHaveLength(1)
+      expect(boundary.events.map((e) => e.version)).toEqual([4, 5, 6, 7, 8])
+      expect(boundary.version).toBe(8)
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("#138 a pre-existing after-append stream switched to inline", () =>
+    Effect.gen(function* () {
+      const accountId = "switch-1"
+      const key = { accountId }
+      const legacy = EventStore.commandHandler(esCmdDecider(accountId), EsLegacy)
+      for (let i = 0; i < 4; i++) yield* legacy(key, { _tag: "Deposit", amount: 10 })
+      // after-append, every 3: the snapshot was written by a separate put at v3.
+      expect(Option.getOrThrow(yield* EsLegacy.readSnapshot(key)).asOfVersion).toBe(3)
+      expect(esLatRequests("legacy", accountId).filter((r) => r.op === "putItem")).toHaveLength(1)
+
+      // Same stream, now inline: the first command catches the lag up...
+      const inline = EventStore.commandHandler(esCmdDecider(accountId), EsLegacyInline)
+      const first = yield* inline(key, { _tag: "Withdraw", amount: 5 })
+      expect(first).toMatchObject({ version: 5, state: { balance: 35, txCount: 5 } })
+      expect(Option.getOrThrow(yield* EsLegacyInline.readSnapshot(key)).asOfVersion).toBe(5)
+
+      // ...and from then on a command is one load and one transaction.
+      const mark = esLatRequests("legacy", accountId).length
+      const second = yield* inline(key, { _tag: "Deposit", amount: 1 })
+      expect(second.state).toEqual({ balance: 36, txCount: 6 })
+      expect(
+        esLatRequests("legacy", accountId)
+          .slice(mark)
+          .map((r) => r.op),
+      ).toEqual(["query", "transactWriteItems"])
+    }).pipe(provideEsLat),
+  )
+
+  // -------------------------------------------------------------------------
+  // verifySnapshot: false — the inline snapshot alone, with verified fallbacks
+  // -------------------------------------------------------------------------
+
+  /** The ops sent to a "ledger" partition since `mark`. */
+  const ledgerOpsSince = (accountId: string, mark: number) =>
+    esLatRequests("ledger", accountId)
+      .slice(mark)
+      .map((r) => r.op)
+  const decisions = (accountId: string) => esCmdDecideLog.filter((id) => id === accountId).length
+
+  it.effect("verifySnapshot: false loads a command's state with one GetItem", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-1"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+        verifySnapshot: false,
+      })
+      // The first command finds no snapshot and falls back to the verified load.
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      expect(ledgerOpsSince(accountId, 0)).toEqual(["getItem", "query", "transactWriteItems"])
+
+      // From then on: one GetItem of the snapshot, one transaction.
+      for (let i = 0; i < 3; i++) {
+        const mark = esLatRequests("ledger", accountId).length
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "transactWriteItems"])
+      }
+      const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+      expect(snapshot).toMatchObject({ asOfVersion: 4, state: { balance: 40, txCount: 4 } })
+
+      // readLatest: the snapshot alone, its version unverified.
+      const mark = esLatRequests("ledger", accountId).length
+      const latest = yield* EsLedger.readLatest(key, {
+        verifySnapshot: false,
+        consistentRead: true,
+      })
+      expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem"])
+      expect(latest.events).toEqual([])
+      expect(latest.version).toBe(4)
+      expect(Option.getOrThrow(latest.snapshot).state).toEqual({ balance: 40, txCount: 4 })
+
+      // Bound: the same single GetItem.
+      const bound = yield* EventStore.bind(EsLedger)
+      const boundMark = esLatRequests("ledger", accountId).length
+      const result = yield* bound.pipe(
+        EventStore.commandHandler(esCmdDecider(accountId), { verifySnapshot: false }),
+      )(key, { _tag: "Withdraw", amount: 5 })
+      expect(result).toMatchObject({ version: 5, state: { balance: 35, txCount: 5 } })
+      expect(ledgerOpsSince(accountId, boundMark)).toEqual(["getItem", "transactWriteItems"])
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false re-decides once on a stale snapshot, without a retry policy",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-stale"
+        const key = { accountId }
+        const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+          verifySnapshot: false,
+        })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+        // Three events appended raw, without a snapshot: snapshot v2, head v5.
+        yield* EsLedger.append(key, esLatDeposits(3), 2)
+
+        const before = decisions(accountId)
+        const mark = esLatRequests("ledger", accountId).length
+        const result = yield* handle(key, { _tag: "Withdraw", amount: 4 })
+
+        // Decided on the stale snapshot, conflicted, re-read verified (a snapshot
+        // lagging past the verified read's first page costs one page more),
+        // decided again.
+        expect(decisions(accountId) - before).toBe(2)
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "transactWriteItems",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+        expect(result).toMatchObject({ version: 6, state: { balance: 19, txCount: 6 } })
+        // The successful inline append repaired the snapshot.
+        const snapshot = Option.getOrThrow(yield* EsLedger.readSnapshot(key))
+        expect(snapshot).toMatchObject({ asOfVersion: 6, state: { balance: 19, txCount: 6 } })
+        expect((yield* EsLedger.read(key, { consistentRead: true })).map((e) => e.version)).toEqual(
+          [1, 2, 3, 4, 5, 6],
+        )
+      }).pipe(provideEsLat),
+  )
+
+  it.effect("verifySnapshot: false surfaces a genuine race, without a retry policy", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-race"
+      const key = { accountId }
+      const bound = yield* EventStore.bind(EsLedger)
+      const rival = EventStore.commandHandler(esCmdDecider(accountId), bound)
+      yield* rival(key, { _tag: "Deposit", amount: 10 })
+
+      // A decider that lets a rival handler commit between its load and its
+      // append — the rival writes its inline snapshot, so the head is snapshotted.
+      let raced = false
+      const base = esCmdDecider(accountId)
+      const racing: typeof base = {
+        ...base,
+        decide: (command, state) =>
+          Effect.gen(function* () {
+            if (!raced) {
+              raced = true
+              yield* rival(key, { _tag: "Deposit", amount: 1 }).pipe(Effect.orDie)
+            }
+            return yield* base.decide(command, state)
+          }),
+      }
+
+      const before = decisions(accountId)
+      const error = yield* EventStore.commandHandler(racing, EsLedger, { verifySnapshot: false })(
+        key,
+        { _tag: "Deposit", amount: 5 },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("VersionConflict")
+      // Our decide plus the rival's: no re-decision on a genuine race.
+      expect(decisions(accountId) - before).toBe(2)
+      const latest = yield* EsLedger.readLatest(key, { consistentRead: true })
+      expect(latest.version).toBe(2)
+      expect(Option.getOrThrow(latest.snapshot).state).toEqual({ balance: 11, txCount: 2 })
+    }).pipe(provideEsLat),
+  )
+
+  it.effect("verifySnapshot: false re-reads a stale snapshot before the If-Match check", () =>
+    Effect.gen(function* () {
+      const accountId = "unverified-ifm"
+      const key = { accountId }
+      const handle = EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+        verifySnapshot: false,
+      })
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      yield* handle(key, { _tag: "Deposit", amount: 10 })
+      yield* EsLedger.append(key, esLatDeposits(3), 2)
+
+      // A genuine mismatch: the actual version is the verified head, not the snapshot's.
+      const before = decisions(accountId)
+      const error = yield* handle(key, { _tag: "Deposit", amount: 1 }, { expectedVersion: 3 }).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("VersionConflict")
+      expect((error as VersionConflict).actualVersion).toBe(5)
+      expect(decisions(accountId) - before).toBe(0)
+
+      // The caller's version matches the verified head: decided once, applied.
+      const mark = esLatRequests("ledger", accountId).length
+      const result = yield* handle(key, { _tag: "Deposit", amount: 1 }, { expectedVersion: 5 })
+      expect(result).toMatchObject({ version: 6, state: { balance: 24, txCount: 6 } })
+      expect(decisions(accountId) - before).toBe(1)
+      // The verified read of the lagging snapshot is two pages (see above).
+      expect(ledgerOpsSince(accountId, mark)).toEqual([
+        "getItem",
+        "query",
+        "query",
+        "transactWriteItems",
+      ])
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false confirms a domain error or no-op against the head, re-deciding on a stale snapshot",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-noappend"
+        const key = { accountId }
+        const base = esCmdDecider(accountId)
+        // A withdrawal the balance cannot cover is refused by `base`, and a
+        // no-op by `lenient`.
+        const lenient: typeof base = {
+          ...base,
+          decide: (command, state) =>
+            command._tag === "Withdraw" && state.balance < command.amount
+              ? Effect.sync(() => {
+                  esCmdDecideLog.push(accountId)
+                  return []
+                })
+              : base.decide(command, state),
+        }
+        const handle = EventStore.commandHandler(base, EsLedger, { verifySnapshot: false })
+        const lenientHandle = EventStore.commandHandler(lenient, EsLedger, {
+          verifySnapshot: false,
+        })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+
+        // The snapshot is at the head: the refusal and the no-op stand, each
+        // confirmed by one head check.
+        let mark = esLatRequests("ledger", accountId).length
+        const refused = yield* handle(key, { _tag: "Withdraw", amount: 100 }).pipe(Effect.flip)
+        expect(refused._tag).toBe("EsCmdInsufficientFunds")
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "query"])
+        // The head check is bounded above the snapshot, so a current snapshot
+        // costs a Query that reads no items — never the newest event.
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(0)
+        mark = esLatRequests("ledger", accountId).length
+        const noop = yield* lenientHandle(key, { _tag: "Withdraw", amount: 100 })
+        expect(noop).toEqual({ state: { balance: 10, txCount: 1 }, version: 1, events: [] })
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "query"])
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(0)
+
+        // 500 deposited raw, without a snapshot: snapshot v1 (balance 10), head v2.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 1)
+
+        // The refusal made on the stale snapshot is decided again, and applied.
+        let before = decisions(accountId)
+        mark = esLatRequests("ledger", accountId).length
+        const withdrawn = yield* handle(key, { _tag: "Withdraw", amount: 100 })
+        expect(withdrawn).toMatchObject({ version: 3, state: { balance: 410, txCount: 3 } })
+        expect(decisions(accountId) - before).toBe(2)
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+        // On a stale snapshot the head check reads exactly the head event.
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(1)
+
+        // The same for a no-op made on a stale snapshot.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 3)
+        before = decisions(accountId)
+        const applied = yield* lenientHandle(key, { _tag: "Withdraw", amount: 800 })
+        expect(applied).toMatchObject({ version: 5, state: { balance: 110, txCount: 5 } })
+        expect(decisions(accountId) - before).toBe(2)
+        expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).asOfVersion).toBe(5)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false answers an If-Match at a lagging snapshot as the verified load does",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-ifm-lag"
+        const key = { accountId }
+        const base = esCmdDecider(accountId)
+        const lenient: typeof base = {
+          ...base,
+          decide: (command, state) =>
+            command._tag === "Withdraw" && state.balance < command.amount
+              ? Effect.succeed([])
+              : base.decide(command, state),
+        }
+        const unverified = EventStore.commandHandler(base, EsLedger, { verifySnapshot: false })
+        const verified = EventStore.commandHandler(base, EsLedger)
+        const lenientUnverified = EventStore.commandHandler(lenient, EsLedger, {
+          verifySnapshot: false,
+        })
+        const lenientVerified = EventStore.commandHandler(lenient, EsLedger)
+        yield* unverified(key, { _tag: "Deposit", amount: 10 })
+        // Snapshot v1, head v2: the caller's If-Match is the snapshot's version.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 1)
+
+        const cases = [
+          [unverified, verified, { _tag: "Deposit", amount: 1 }],
+          [unverified, verified, { _tag: "Withdraw", amount: 100 }],
+          [lenientUnverified, lenientVerified, { _tag: "Withdraw", amount: 100 }],
+        ] as const
+        for (const [lean, full, command] of cases) {
+          const leanError = yield* lean(key, command, { expectedVersion: 1 }).pipe(Effect.flip)
+          const fullError = yield* full(key, command, { expectedVersion: 1 }).pipe(Effect.flip)
+          expect(leanError).toMatchObject({
+            _tag: "VersionConflict",
+            expectedVersion: 1,
+            actualVersion: 2,
+          })
+          expect(leanError).toEqual(fullError)
+        }
+        expect(yield* EsLedger.currentVersion(key, { consistentRead: true })).toBe(2)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false falls back to the verified load when the snapshot is missing",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-missing"
+        const key = { accountId }
+        // Events written before inline snapshots: no snapshot item at all.
+        yield* EsLedger.append(key, esLatDeposits(4), 0)
+
+        const latest = yield* EsLedger.readLatest(key, {
+          verifySnapshot: false,
+          consistentRead: true,
+        })
+        expect(Option.isNone(latest.snapshot)).toBe(true)
+        expect(latest.version).toBe(4)
+
+        const before = decisions(accountId)
+        const mark = esLatRequests("ledger", accountId).length
+        const result = yield* EventStore.commandHandler(esCmdDecider(accountId), EsLedger, {
+          verifySnapshot: false,
+        })(key, { _tag: "Deposit", amount: 6 })
+        expect(result).toMatchObject({ version: 5, state: { balance: 10, txCount: 5 } })
+        expect(decisions(accountId) - before).toBe(1)
+        // No snapshot: the verified read pages to the start of the stream.
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+        expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).asOfVersion).toBe(5)
+      }).pipe(provideEsLat),
+  )
+
+  it("verifySnapshot: false is refused unless the stream is inline without `every` (EDD-9068)", () => {
+    expect(() =>
+      EventStore.commandHandler(esCmdDecider("x"), EsBatched, { verifySnapshot: false }),
+    ).toThrow(/EDD-9068/)
+    expect(() =>
+      EsLegacy.pipe(EventStore.commandHandler(esCmdDecider("x"), { verifySnapshot: false })),
+    ).toThrow(/EDD-9068/)
+  })
+
+  // -------------------------------------------------------------------------
+  // Large commands — stepped commands, one atomic append each
+  // -------------------------------------------------------------------------
+
+  it.effect("an append over the item or size limit fails before anything is written", () =>
+    Effect.gen(function* () {
+      const key = { accountId: "large-1" }
+      const error = yield* EsPlain.append(key, esLatDeposits(250), 0).pipe(Effect.flip)
+      expect(error._tag).toBe("AppendTooLarge")
+      expect((error as AppendTooLarge).count).toBe(250)
+      expect((error as AppendTooLarge).limit).toBe(100)
+      expect(yield* EsPlain.currentVersion(key, { consistentRead: true })).toBe(0)
+
+      // 30 events of ~300 KB: ~9 MB, well under 100 items but over 4 MB.
+      const metadata = { note: "x".repeat(300_000) }
+      const events = Array.from({ length: 30 }, () => new EsCmdDeposited({ amount: 1 }))
+      const refused = yield* EsPlainMeta.append(key, events, 0, { metadata }).pipe(Effect.flip)
+      expect(refused._tag).toBe("ValidationError")
+      expect(yield* EsPlainMeta.currentVersion(key, { consistentRead: true })).toBe(0)
+      expect(
+        esLatLog.filter((r) => r.op === "transactWriteItems" && r.pk?.endsWith("#large-1")),
+      ).toEqual([])
+    }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "a large command runs as stepped commands chained by expectedVersion, each atomic",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "step-1"
+        const key = { accountId }
+        const handle = EventStore.commandHandler(esBulkDecider, EsBulk, { idempotency: {} })
+        const project = ({ state }: EventStore.Decision<EsCmdState, EsCmdEvent>) => [
+          EsLatTallies.put({ accountId, balance: state.balance, txCount: state.txCount }),
+        ]
+
+        // One decision of 250 events cannot be one atomic append.
+        const tooLarge = yield* handle(key, 250, {
+          commandId: "bulk-1",
+          additionalItems: project,
+        }).pipe(Effect.flip)
+        expect(tooLarge._tag).toBe("AppendTooLarge")
+        expect((tooLarge as AppendTooLarge).count).toBeGreaterThan(100)
+
+        // The application plans fixed-size steps; each is an ordinary command
+        // with its own commandId, appended after the version the last returned.
+        let version = 0
+        for (const [n, size] of [90, 90, 70].entries()) {
+          const step = yield* handle(key, size, {
+            commandId: `bulk-1#step-${n}`,
+            expectedVersion: version,
+            additionalItems: project,
+          })
+          version = step.version
+          // Every step leaves a real, consistent state: events, snapshot and
+          // projection all at the same version.
+          const snapshot = Option.getOrThrow(yield* EsBulk.readSnapshot(key))
+          expect(snapshot).toMatchObject({ asOfVersion: version, state: step.state })
+          const tally = yield* EsLatTallies.get({ accountId })
+          expect({ balance: tally.balance, txCount: tally.txCount }).toEqual(step.state)
+          expect(yield* esLatSentinel(accountId, `bulk-1#step-${n}`)).toMatchObject({ version })
+        }
+        expect(version).toBe(250)
+        const transacts = esLatRequests("bulk", accountId).filter(
+          (r) => r.op === "transactWriteItems",
+        )
+        expect(transacts.map((t) => t.items?.length)).toEqual([93, 94, 74])
+
+        // A redelivered step — its response lost — is a duplicate, not a conflict.
+        const replay = yield* handle(key, 70, {
+          commandId: "bulk-1#step-2",
+          expectedVersion: 180,
+          additionalItems: project,
+        }).pipe(Effect.flip)
+        expect(replay._tag).toBe("DuplicateCommand")
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(250)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "a stepped command that fails partway stops at a consistent state, and re-issuing continues",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "step-2"
+        const key = { accountId }
+        const handle = EventStore.commandHandler(esBulkDecider, EsBulk, { idempotency: {} })
+
+        const first = yield* handle(key, 90, { commandId: "bulk-2#step-0", expectedVersion: 0 })
+        expect(first.version).toBe(90)
+        // Another writer appends between the steps.
+        yield* EsBulk.append(key, [new EsCmdWithdrew({ amount: 7 })], 90)
+
+        const conflict = yield* handle(key, 90, {
+          commandId: "bulk-2#step-1",
+          expectedVersion: first.version,
+        }).pipe(Effect.flip)
+        expect(conflict._tag).toBe("VersionConflict")
+        expect((conflict as VersionConflict).actualVersion).toBe(91)
+        // Nothing of step 1 was written: the stream is at the other writer's
+        // event, and the snapshot is still step 0's, consistent at its version.
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(91)
+        expect(Option.getOrThrow(yield* EsBulk.readSnapshot(key))).toMatchObject({
+          asOfVersion: 90,
+          state: { balance: 90, txCount: 90 },
+        })
+        expect(yield* esLatSentinel(accountId, "bulk-2#step-1")).toBeUndefined()
+
+        // Re-issuing from the real state continues the plan.
+        const resumed = yield* handle(key, 90, {
+          commandId: "bulk-2#step-1",
+          expectedVersion: 91,
+        })
+        expect(resumed).toMatchObject({ version: 181, state: { balance: 173, txCount: 181 } })
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "a redelivered stepped command skips its committed steps and resumes at the first one not committed",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "step-3"
+        const key = { accountId }
+        // Step 1's decide fails once, after step 0 committed.
+        let failOnce = true
+        const flaky: typeof esBulkDecider = {
+          ...esBulkDecider,
+          decide: (count, state) =>
+            state.txCount === 40 && failOnce
+              ? Effect.sync(() => {
+                  failOnce = false
+                  throw new Error("boom")
+                })
+              : esBulkDecider.decide(count, state),
+        }
+        const handle = EventStore.commandHandler(flaky, EsBulk, { idempotency: {} })
+
+        // The tutorial's helper: a step committed by an earlier delivery is a
+        // DuplicateCommand (the stale If-Match makes the handler consult its
+        // sentinel before deciding), so it is skipped with the If-Match kept
+        // stale; the first step not committed is a VersionConflict carrying the
+        // head, and runs from there.
+        const stepped = (
+          sizes: ReadonlyArray<number>,
+          commandId: string,
+          expectedVersion: number,
+        ) =>
+          Effect.gen(function* () {
+            let version = expectedVersion
+            let skipping = false
+            for (const [n, size] of sizes.entries()) {
+              const run = (expected: number) =>
+                handle(key, size, {
+                  commandId: `${commandId}#step-${n}`,
+                  expectedVersion: expected,
+                })
+              const outcome = yield* run(version).pipe(
+                Effect.map((done) => done.version),
+                Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+                Effect.catchTag("VersionConflict", (conflict) =>
+                  skipping && conflict.actualVersion !== undefined
+                    ? run(conflict.actualVersion).pipe(Effect.map((done) => done.version))
+                    : Effect.fail(conflict),
+                ),
+              )
+              skipping = outcome === undefined
+              if (outcome !== undefined) version = outcome
+            }
+            return skipping ? yield* EsBulk.currentVersion(key, { consistentRead: true }) : version
+          })
+
+        const failed = yield* stepped([40, 40, 40], "bulk-3", 0).pipe(Effect.exit)
+        expect(failed._tag).toBe("Failure")
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(40)
+
+        // Redelivered with its original commandId and If-Match: step 0 is
+        // skipped, steps 1 and 2 run.
+        const before = esLatRequests("bulk", accountId).filter(
+          (r) => r.op === "transactWriteItems",
+        ).length
+        expect(yield* stepped([40, 40, 40], "bulk-3", 0)).toBe(120)
+        expect(
+          esLatRequests("bulk", accountId).filter((r) => r.op === "transactWriteItems").length -
+            before,
+        ).toBe(2)
+        for (const n of [0, 1, 2]) {
+          expect(yield* esLatSentinel(accountId, `bulk-3#step-${n}`)).toMatchObject({
+            version: 40 * (n + 1),
+          })
+        }
+
+        // Redelivered again: every step is skipped, nothing is written.
+        expect(yield* stepped([40, 40, 40], "bulk-3", 0)).toBe(120)
+        expect(
+          esLatRequests("bulk", accountId).filter((r) => r.op === "transactWriteItems").length -
+            before,
+        ).toBe(2)
+        expect(Option.getOrThrow(yield* EsBulk.readSnapshot(key))).toMatchObject({
+          asOfVersion: 120,
+          state: { balance: 120, txCount: 120 },
+        })
+      }).pipe(provideEsLat),
+  )
+})
+
+// ===========================================================================
+// EventStore stream indexes — sub-streams by derived key (#140)
+// ===========================================================================
+
+const esIdxSchema = DynamoSchema.make({ name: "es-idx", version: 1 })
+const esIdxTableName = `es-idx-${Date.now()}`
+const EsIdxTable = Table.make({ schema: esIdxSchema, entities: {} })
+
+class EsIdxRecorded extends Schema.TaggedClass<EsIdxRecorded>()("EsIdxRecorded", {
+  section: Schema.Number,
+  item: Schema.Number,
+}) {}
+
+class EsIdxNoted extends Schema.TaggedClass<EsIdxNoted>()("EsIdxNoted", {
+  day: Schema.String,
+}) {}
+
+type EsIdxEvent = EsIdxRecorded | EsIdxNoted
+
+const esIdxPad = (n: number) => String(n).padStart(4, "0")
+
+const esIdxEntryKey = (event: EsIdxEvent, version: number) =>
+  event._tag === "EsIdxRecorded"
+    ? `ENTRY#${event.section}-${esIdxPad(event.item)}-${esIdxPad(version)}`
+    : undefined
+
+/**
+ * Recorded entries on an LSI (`byEntry`), notes on a GSI (`byDay`) — each
+ * index sparse with respect to the other event type. Inline snapshots and
+ * idempotency sentinels share the partition and must stay out of both.
+ */
+const EsIdxLedger = EventStore.makeStream({
+  table: EsIdxTable,
+  streamName: "Ledger",
+  events: [EsIdxRecorded, EsIdxNoted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: Schema.Struct({ entries: Schema.Number }), mode: "inline" },
+  indexes: {
+    byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey },
+    byDay: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      key: (event) => (event._tag === "EsIdxNoted" ? `DAY#${event.day}` : undefined),
+    },
+  },
+})
+
+/** A second stream on the same LSI (an identical definition, deduplicated). */
+const EsIdxJournal = EventStore.makeStream({
+  table: EsIdxTable,
+  streamName: "Journal",
+  events: [EsIdxRecorded, EsIdxNoted],
+  streamId: { composite: ["ledgerId"] },
+  indexes: { byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey } },
+})
+
+const esIdxDecider: EventStore.Decider<{ readonly entries: number }, number, EsIdxEvent> = {
+  initialState: { entries: 0 },
+  decide: (count, state) =>
+    Effect.succeed(
+      Array.from(
+        { length: count },
+        (_, i) => new EsIdxRecorded({ section: 1, item: state.entries + i + 1 }),
+      ),
+    ),
+  evolve: (state, event) =>
+    event._tag === "EsIdxRecorded" ? { entries: state.entries + 1 } : state,
+}
+
+const EsIdxLayer = Layer.mergeAll(ClientLayer, EsIdxTable.layer({ name: esIdxTableName }))
+const provideEsIdx = Effect.provide(EsIdxLayer)
+
+/** Every item of one physical index for a stream partition, raw (no filter). */
+const esIdxRawIndex = (index: string, pkField: string, pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: esIdxTableName,
+      IndexName: index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": pkField },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+describeConnected("EventStore stream indexes (#140)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const fragments = EventStore.indexDefinitions(EsIdxLedger, EsIdxJournal)
+        yield* client.createTable({
+          TableName: esIdxTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            ...fragments.AttributeDefinitions,
+          ],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+          GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+        })
+      }).pipe(provideEsIdx, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esIdxTableName })
+      }).pipe(
+        provideEsIdx,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#140 indexDefinitions creates the LSI and GSI with projection ALL", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: esIdxTableName })
+      const lsis = described.Table?.LocalSecondaryIndexes ?? []
+      const gsis = described.Table?.GlobalSecondaryIndexes ?? []
+      expect(lsis.map((index) => index.IndexName)).toEqual(["lsi1"])
+      expect(gsis.map((index) => index.IndexName)).toEqual(["gsi1"])
+      expect(lsis[0]!.KeySchema).toEqual([
+        { AttributeName: "pk", KeyType: "HASH" },
+        { AttributeName: "lsi1sk", KeyType: "RANGE" },
+      ])
+      expect(gsis[0]!.KeySchema).toEqual([
+        { AttributeName: "gsi1pk", KeyType: "HASH" },
+        { AttributeName: "gsi1sk", KeyType: "RANGE" },
+      ])
+      expect(lsis[0]!.Projection?.ProjectionType).toBe("ALL")
+      expect(gsis[0]!.Projection?.ProjectionType).toBe("ALL")
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 a sparse LSI sub-stream reads in derived-key order", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "sparse-1" }
+      yield* EsIdxLedger.append(
+        key,
+        [
+          new EsIdxRecorded({ section: 2, item: 1 }),
+          new EsIdxNoted({ day: "2026-10-01" }),
+          new EsIdxRecorded({ section: 1, item: 2 }),
+          new EsIdxRecorded({ section: 1, item: 1 }),
+        ],
+        0,
+        { idempotency: { commandId: "cmd-1" }, snapshot: { entries: 3 } },
+      )
+
+      // Index order, not stream order; the note is not in the index.
+      const entries = yield* EsIdxLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => event.version)).toEqual([4, 3, 1])
+      expect(entries.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 1 }),
+        new EsIdxRecorded({ section: 1, item: 2 }),
+        new EsIdxRecorded({ section: 2, item: 1 }),
+      ])
+
+      // The physical index holds exactly the three entries: no note, no
+      // snapshot, no idempotency sentinel.
+      const pk = "$es-idx#v1#ledger#sparse-1"
+      const raw = yield* esIdxRawIndex("lsi1", "pk", pk)
+      expect(raw.map((item) => item.__edd_e__)).toEqual([
+        "ledger.event",
+        "ledger.event",
+        "ledger.event",
+      ])
+      expect(raw.map((item) => item.lsi1sk)).toEqual([
+        "ENTRY#1-0001-0004",
+        "ENTRY#1-0002-0003",
+        "ENTRY#2-0001-0001",
+      ])
+      // ...and the partition really holds a snapshot and a sentinel.
+      expect(Option.isSome(yield* EsIdxLedger.readSnapshot(key))).toBe(true)
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 beginsWith, between, reverse, limit and consistentRead on the LSI", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "range-1" }
+      const events = [1, 2, 3].flatMap((section) =>
+        [1, 2, 3].map((item) => new EsIdxRecorded({ section, item })),
+      )
+      yield* EsIdxLedger.append(key, events, 0)
+      const versionsOf = (read: ReadonlyArray<EventStore.StreamEvent<EsIdxEvent>>) =>
+        read.map((event) => event.version)
+
+      const section2 = yield* EsIdxLedger.readIndex("byEntry", key, {
+        beginsWith: "ENTRY#2-",
+        consistentRead: true,
+      })
+      expect(versionsOf(section2)).toEqual([4, 5, 6])
+
+      const between = yield* EsIdxLedger.readIndex("byEntry", key, {
+        between: ["ENTRY#1-0002", "ENTRY#2-0002~"],
+      })
+      expect(versionsOf(between)).toEqual([2, 3, 4, 5])
+
+      const newestTwo = yield* EsIdxLedger.readIndex("byEntry", key, { reverse: true, limit: 2 })
+      expect(versionsOf(newestTwo)).toEqual([9, 8])
+
+      // The same through the composable Query, with a cursor across pages.
+      const query = EsIdxLedger.query
+        .index("byEntry", key)
+        .pipe(Query.where({ beginsWith: "ENTRY#3-" }), Query.consistentRead(), Query.limit(2))
+      const first = yield* Query.execute(query)
+      expect(first.items.map((event) => event.version)).toEqual([7, 8])
+      expect(first.cursor).not.toBeNull()
+      const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+      expect(second.items.map((event) => event.version)).toEqual([9])
+
+      const pages = yield* Query.paginate(
+        EsIdxLedger.query.index("byEntry", key).pipe(Query.reverse),
+      ).pipe(Effect.flatMap((stream) => Stream.runCollect(stream)))
+      expect(pages.flat().map((event) => event.version)).toEqual([9, 8, 7, 6, 5, 4, 3, 2, 1])
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 a GSI sub-stream is scoped to its stream; consistentRead is refused", () =>
+    Effect.gen(function* () {
+      const a = { ledgerId: "gsi-a" }
+      const b = { ledgerId: "gsi-b" }
+      yield* EsIdxLedger.append(
+        a,
+        [
+          new EsIdxNoted({ day: "2026-10-03" }),
+          new EsIdxRecorded({ section: 1, item: 1 }),
+          new EsIdxNoted({ day: "2026-10-01" }),
+        ],
+        0,
+      )
+      yield* EsIdxLedger.append(b, [new EsIdxNoted({ day: "2026-10-02" })], 0)
+
+      const notes = yield* EsIdxLedger.readIndex("byDay", a)
+      expect(notes.map((event) => event.version)).toEqual([3, 1])
+      expect(notes.every((event) => event.streamId === "gsi-a")).toBe(true)
+      const early = yield* EsIdxLedger.readIndex("byDay", a, { beginsWith: "DAY#2026-10-01" })
+      expect(early.map((event) => event.version)).toEqual([3])
+
+      // The GSI's pk attribute carries the stream's partition key.
+      const raw = yield* esIdxRawIndex("gsi1", "gsi1pk", "$es-idx#v1#ledger#gsi-a")
+      expect(raw.map((item) => item.gsi1sk)).toEqual(["DAY#2026-10-01", "DAY#2026-10-03"])
+
+      const refused = yield* EsIdxLedger.readIndex("byDay", a, { consistentRead: true }).pipe(
+        Effect.flip,
+      )
+      expect(refused._tag).toBe("ValidationError")
+      const refusedQuery = yield* EsIdxLedger.query
+        .index("byDay", a)
+        .pipe(Query.consistentRead(), Query.collect, Effect.flip)
+      expect(refusedQuery._tag).toBe("ValidationError")
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 every step of a stepped command is indexed", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "stepped-1" }
+      const bound = yield* EventStore.bind(EsIdxLedger)
+      const handle = EventStore.commandHandler(esIdxDecider, bound)
+      let version = 0
+      for (const size of [90, 90, 50]) {
+        version = (yield* handle(key, size, { expectedVersion: version })).version
+      }
+      expect(version).toBe(230)
+
+      const indexed = yield* bound.readIndex("byEntry", key, { consistentRead: true })
+      expect(indexed.map((event) => event.version)).toEqual(
+        Array.from({ length: 230 }, (_, i) => i + 1),
+      )
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 streams sharing an LSI never see each other's events", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "shared-1" }
+      yield* EsIdxLedger.append(key, [new EsIdxRecorded({ section: 1, item: 1 })], 0)
+      yield* EsIdxJournal.append(key, [new EsIdxRecorded({ section: 1, item: 2 })], 0)
+      const ledger = yield* EsIdxLedger.readIndex("byEntry", key)
+      const journal = yield* EsIdxJournal.readIndex("byEntry", key)
+      expect(ledger.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 1 }),
+      ])
+      expect(journal.map((event) => event.data)).toEqual([
+        new EsIdxRecorded({ section: 1, item: 2 }),
+      ])
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 an empty derived key fails the append and writes nothing", () =>
+    Effect.gen(function* () {
+      const EmptyKey = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "EmptyKey",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: {
+          byEntry: { index: "lsi1", sk: "lsi1sk", key: (event) => (event.item > 1 ? "" : "k") },
+        },
+      })
+      const key = { ledgerId: "empty-1" }
+      const error = yield* EmptyKey.append(
+        key,
+        [new EsIdxRecorded({ section: 1, item: 1 }), new EsIdxRecorded({ section: 1, item: 2 })],
+        0,
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(yield* EmptyKey.currentVersion(key, { consistentRead: true })).toBe(0)
+    }).pipe(provideEsIdx),
+  )
+
+  it.effect(
+    "#140 readIndex refuses key bounds DynamoDB rejects, ordering them as DynamoDB does",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "bounds-1" }
+        yield* EsIdxLedger.append(key, [new EsIdxRecorded({ section: 1, item: 1 })], 0)
+
+        // Each of these is a DynamoValidationError if sent; readIndex refuses
+        // them with the library's ValidationError instead.
+        for (const options of [
+          { beginsWith: "" },
+          { between: ["", "ENTRY#9"] },
+          { between: ["ENTRY#9", "ENTRY#0"] },
+        ] as ReadonlyArray<EventStore.ReadIndexOptions>) {
+          const error = yield* EsIdxLedger.readIndex("byEntry", key, options).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+        }
+
+        // U+FFFF sorts after U+1F600 by UTF-16 code units but before it by
+        // UTF-8 bytes — DynamoDB's order — so DynamoDB accepts this range.
+        const accepted = yield* EsIdxLedger.readIndex("byEntry", key, {
+          between: ["￿", "\u{1F600}"],
+        })
+        expect(accepted).toEqual([])
+        const all = yield* EsIdxLedger.readIndex("byEntry", key, {
+          between: ["ENTRY#1-0001-0001", "ENTRY#1-0001-0001"],
+        })
+        expect(all.map((event) => event.version)).toEqual([1])
+      }).pipe(provideEsIdx),
+  )
+
+  it.effect("#140 events appended before an index is declared are not in it", () =>
+    Effect.gen(function* () {
+      // The documented contract: index attributes are written only at append
+      // time and the library does not backfill.
+      const Before = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "LateIndex",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+      })
+      const After = EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "LateIndex",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: { byEntry: { index: "lsi1", sk: "lsi1sk", key: esIdxEntryKey } },
+      })
+      const key = { ledgerId: "late-1" }
+      yield* Before.append(
+        key,
+        [new EsIdxRecorded({ section: 1, item: 1 }), new EsIdxRecorded({ section: 1, item: 2 })],
+        0,
+      )
+      yield* After.append(key, [new EsIdxRecorded({ section: 1, item: 3 })], 2)
+      expect(yield* After.read(key, { consistentRead: true })).toHaveLength(3)
+      const indexed = yield* After.readIndex("byEntry", key, { consistentRead: true })
+      expect(indexed.map((event) => event.version)).toEqual([3])
+    }).pipe(provideEsIdx),
+  )
+
+  it("#140 definition-time collisions are refused", () => {
+    const define = (indexes: unknown) => () =>
+      EventStore.makeStream({
+        table: EsIdxTable,
+        streamName: "Colliding",
+        events: [EsIdxRecorded],
+        streamId: { composite: ["ledgerId"] },
+        indexes: indexes as never,
+      })
+    const key = () => undefined
+    expect(define({ a: { index: "lsi1", sk: "version", key } })).toThrow(/EDD-9064/)
+    expect(define({ a: { type: "gsi", index: "gsi1", pk: "pk", sk: "s", key } })).toThrow(
+      /EDD-9064/,
+    )
+    expect(
+      define({ a: { index: "lsi1", sk: "s1", key }, b: { index: "lsi1", sk: "s2", key } }),
+    ).toThrow(/EDD-9065/)
+    expect(
+      define({ a: { index: "lsi1", sk: "s", key }, b: { index: "lsi2", sk: "s", key } }),
+    ).toThrow(/EDD-9065/)
+    expect(define({ a: { type: "gsi", index: "gsi1", sk: "s", key } })).toThrow(/EDD-9063/)
+    expect(define({ a: { index: "lsi1", pk: "p", sk: "s", key } })).toThrow(/EDD-9063/)
+
+    // Two streams defining one physical index differently cannot share a table.
+    const Other = EventStore.makeStream({
+      table: EsIdxTable,
+      streamName: "Other",
+      events: [EsIdxRecorded],
+      streamId: { composite: ["ledgerId"] },
+      indexes: { byEntry: { index: "lsi1", sk: "otherSk", key: () => undefined } },
+    })
+    expect(() => EventStore.indexDefinitions(EsIdxLedger, Other)).toThrow(/EDD-9067/)
+  })
 })
 
 // ===========================================================================

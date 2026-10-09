@@ -11,7 +11,7 @@
  *   npx tsx examples/cricket-api-test.ts
  */
 
-import { Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -173,7 +173,11 @@ const program = Effect.gen(function* () {
 })
 
 const AppLayer = Layer.merge(
-  DynamoClient.layer({ region: "us-east-1", endpoint: "http://localhost:8000", credentials: { accessKeyId: "local", secretAccessKey: "local" } }),
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
+  }),
   MainTable.layer({ name: "cricket-api-test" }),
 )
 const main = program.pipe(Effect.provide(AppLayer))

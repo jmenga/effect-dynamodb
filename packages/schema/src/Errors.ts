@@ -316,11 +316,25 @@ export class VectorIndexBackfilling extends Data.TaggedError("VectorIndexBackfil
   readonly cause: unknown
 }> {}
 
-/** Optimistic concurrency conflict — stream version did not match */
+/**
+ * Optimistic concurrency conflict — the stream was not at the version the
+ * writer expected.
+ *
+ * - `expectedVersion` is the version the write was conditioned on.
+ * - `actualVersion` is the stream's version when the library has read it.
+ *   `EventStore.commandHandler` sets it when a caller-supplied
+ *   `expectedVersion` does not match the loaded state (the check that runs
+ *   before `decide`), so an API can render a useful `412 Precondition Failed`
+ *   — including after a `verifySnapshot: false` load, whose If-Match answers
+ *   are checked against the head. Any other conflict detected by the append
+ *   transaction itself leaves it unset, because DynamoDB does not report the
+ *   stream's head.
+ */
 export class VersionConflict extends Data.TaggedError("VersionConflict")<{
   readonly streamName: string
   readonly streamId: string
   readonly expectedVersion: number
+  readonly actualVersion?: number | undefined
 }> {}
 
 /**
@@ -331,23 +345,32 @@ export const TRANSACT_WRITE_ITEMS_LIMIT = 100
 
 /**
  * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
- * (100 items per `TransactWriteItems`). Appends are atomic by design — the
- * batch is never chunked, because chunking would break append atomicity — so
- * an oversized batch is rejected before any request is issued.
+ * (100 items per `TransactWriteItems`). An append is always one atomic
+ * transaction — it is never split, because splitting would break append
+ * atomicity — so an oversized one is rejected before any request is issued.
  *
  * `count` is the total number of transact items the append requires: one Put
- * per event, plus one `ConditionCheck` (the version-contiguity guard) when
- * `expectedVersion > 0`. In practice a single append therefore holds up to
- * 100 events at `expectedVersion === 0` and up to 99 events otherwise.
+ * per event, one `ConditionCheck` (the version-contiguity guard) when
+ * `expectedVersion > 0`, every item the `additionalItems` compile to, and the
+ * idempotency sentinel and inline snapshot when present. In practice a single
+ * append of events alone therefore holds up to 100 events at
+ * `expectedVersion === 0` and up to 99 events otherwise.
  *
- * Note the 4MB aggregate payload cap on `TransactWriteItems` is NOT
- * pre-validated (marshalled size is not practical to pre-compute) — exceeding
- * it surfaces as a `DynamoClientError` from AWS.
+ * A command whose decision is legitimately larger is split by the application
+ * into stepped commands — each an ordinary, atomic `commandHandler` call
+ * covering a fixed number of entities, chained by `expectedVersion` — so a
+ * failure partway leaves the stream at a real, consistent intermediate state.
+ * `count` against `limit` then tells the caller its configured step size is
+ * too large.
+ *
+ * DynamoDB's 4 MB aggregate cap on one transaction is checked client-side too,
+ * by DynamoDB's item-size rules: exceeding it fails with `ValidationError`
+ * before anything is sent.
  */
 export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly streamName: string
   readonly streamId: string
-  /** Total transact items required (events + contiguity ConditionCheck). */
+  /** Total transact items required (see the class description). */
   readonly count: number
   /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
   readonly limit: number

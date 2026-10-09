@@ -675,10 +675,10 @@ The example wires dependencies via Effect Layers -- no global config or construc
 
 ```typescript title="main.ts" region="layer" example="task-manager.ts"
 const AppLayer = Layer.mergeAll(
-  DynamoClient.layer({
-    region: "us-east-1",
-    endpoint: "http://localhost:8000",
-    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   TmTable.layer({ name: "taskman-table" }),
 )

@@ -1,5 +1,113 @@
 # effect-dynamodb
 
+## 1.24.0
+
+### Minor Changes
+
+- [`4b8d210`](https://github.com/jmenga/effect-dynamodb/commit/4b8d210a4894e0a6be43906ffffa0098ee23628f) - EventStore command-path extensions: consistent reads, If-Match expected versions, inline projections, inline snapshots with single-request loads and stream indexes ([#136](https://github.com/jmenga/effect-dynamodb/issues/136), [#137](https://github.com/jmenga/effect-dynamodb/issues/137), [#138](https://github.com/jmenga/effect-dynamodb/issues/138), [#139](https://github.com/jmenga/effect-dynamodb/issues/139), [#140](https://github.com/jmenga/effect-dynamodb/issues/140))
+
+  Everything is additive. Two defaults of `commandHandler` change, and neither
+  changes a successful result: it now loads state with strongly consistent reads
+  ([#139](https://github.com/jmenga/effect-dynamodb/issues/139)), and it folds the new events into state **before** appending them ([#137](https://github.com/jmenga/effect-dynamodb/issues/137)).
+  - **Consistent reads ([#139](https://github.com/jmenga/effect-dynamodb/issues/139)).** `read`, `readFrom`, `currentVersion` and the new
+    `readLatest` take `{ consistentRead?: boolean }`, which sets `ConsistentRead`
+    on every `Query` page. `commandHandler` loads strongly consistently by
+    default, so `decide` no longer runs against state missing the newest events;
+    `commandHandler(decider, stream, { consistentRead: false })` opts out.
+  - **If-Match expected versions ([#136](https://github.com/jmenga/effect-dynamodb/issues/136)).** `handle(streamId, command, { expectedVersion })`
+    fails with `VersionConflict` **before `decide` runs** when the loaded version
+    differs, and otherwise conditions the append on it. Neither conflict is
+    retried, whatever the handler's `retry` says. `VersionConflict` gains an
+    optional `actualVersion`, set by the pre-decide check (the loaded version) for
+    a useful `412`. With `idempotency`, a redelivered command that already
+    committed is reported as `DuplicateCommand`, not `VersionConflict`. A value
+    that is not a non-negative integer fails with `ValidationError`.
+  - **Inline projections ([#137](https://github.com/jmenga/effect-dynamodb/issues/137)).** A command handler's `additionalItems` may be a
+    function of the `Decision` (`{ events, state, previous, version }`) returning
+    transact ops, or an `Effect` of them whose error and requirements join the
+    handler's. The items commit in the same transaction as the events, and the
+    function is re-run on every retry. The state the handler returns, snapshots
+    and projects is always the `evolve` fold of the stored and new events. `evolve`
+    may mutate state in place; when it does, `previous` and `state` are the same
+    object.
+  - **Inline snapshots and `readLatest` ([#138](https://github.com/jmenga/effect-dynamodb/issues/138)).** `snapshot: { schema, mode: "inline" }`
+    writes the snapshot in the append's own transaction (every append, or at an
+    `every` cadence), so it is current after every command; `append` also accepts
+    `{ snapshot: state }` directly. `stream.readLatest(streamId)` returns the
+    snapshot, the events after it and the head version in one `Query` when the
+    snapshot is current, and `commandHandler` now loads every snapshot-configured
+    stream this way. On an `"after-append"` stream with a large `every`, a load
+    reads up to `every + 1` items in exchange for fewer requests.
+  - **Snapshot-only loads.** On a `mode: "inline"` stream without `every`,
+    `commandHandler(decider, stream, { verifySnapshot: false })` and
+    `readLatest(streamId, { verifySnapshot: false })` read the snapshot item
+    alone with one `GetItem`, instead of a `Query` that also reads the newest
+    event. A `Query` is charged for every item it reads, so with large events
+    this roughly halves a command's read capacity. `readLatest` then returns the
+    snapshot's `asOfVersion` as an **unverified** `version`. The handler
+    returns nothing decided on an unverified snapshot until the head confirms
+    it: a successful append confirms it by itself, and a domain error, a no-op
+    or an append conflict is checked with one more read — a `Query` for events
+    after the snapshot's version, which reads no items while the snapshot is
+    current. It falls back to a
+    verified load at once when there is no snapshot, and before reporting an
+    If-Match mismatch, so `actualVersion` is the verified head; an If-Match at a
+    lagging snapshot's version answers as the verified load would. Without
+    `expectedVersion`, a decision found to be made on stale state is made again
+    on the verified state, so `decide` (and a function-form `additionalItems`,
+    when both decisions append) can run twice for one call; a snapshot at the
+    head after an append conflict is a genuine race, left to the `retry`
+    policy. Any other snapshot config is refused with `[EDD-9068]`; a stream
+    without a snapshot config ignores the option.
+  - **Stream indexes ([#140](https://github.com/jmenga/effect-dynamodb/issues/140)).** `makeStream({ indexes })` declares sub-streams of a
+    stream's events ordered by a key derived from each event, on an LSI (default,
+    strongly consistent) or a GSI (`type: "gsi"`, scoped to the same stream).
+    `readIndex(name, streamId, { beginsWith | between, reverse, limit, consistentRead })`
+    and `query.index(name, streamId)` read them, with index names type-checked.
+    `EventStore.indexDefinitions(...streams)` returns the `CreateTable` fragments
+    (projection `ALL`). An LSI must be created with the table, and a table with
+    any LSI caps every partition key value's item collection at 10 GB. Index
+    attributes are written only by `append`, so an index added later, or a
+    changed `key`, covers only events appended from then on.
+  - **Large commands are stepped commands.** An append stays one atomic
+    transaction: it is never split. A command that decides more than one
+    transaction holds fails with `AppendTooLarge` before anything is written,
+    and its `count` / `limit` show the step size is too large. The new guidance
+    (tutorial, `DESIGN.md`) runs such a command as stepped commands: fixed-size
+    steps planned by the application, each an ordinary atomic `commandHandler`
+    call chained by `expectedVersion`, with a `commandId` per step under
+    idempotency — so a failure partway leaves a real, consistent state, and a
+    redelivered command skips its committed steps (`DuplicateCommand`) and
+    resumes at the first one not committed. One
+    command → one decision → one atomic append. ([#141](https://github.com/jmenga/effect-dynamodb/issues/141)'s opt-in chunked append is
+    not implemented.)
+
+  New definition-time errors: `[EDD-9062]` invalid `snapshot.mode`, `[EDD-9063]`
+  malformed stream index, `[EDD-9064]` index attribute owned by the stream,
+  `[EDD-9065]` indexes sharing an index or attribute, `[EDD-9066]` undeclared
+  index name, `[EDD-9067]` conflicting physical index definitions, and
+  `[EDD-9068]` `verifySnapshot: false` on a stream that is not `mode: "inline"`
+  without `every` (thrown when the handler is created; a defect from
+  `readLatest`).
+
+  Fix: snapshot state is now encoded with the same `decode → encode` fallback as
+  events. A `Schema.Class` state folded by an immutable `evolve` that spreads
+  (`({ ...s, balance })`) is a plain object, which the state schema's encoder
+  alone refused; an after-append snapshot was then silently never written, and
+  an inline one would have failed every command on the stream.
+
+  Whether `decide` may mutate state ([#142](https://github.com/jmenga/effect-dynamodb/issues/142)) is left to the application: the
+  library adds no read-only types or runtime guard.
+
+  Docs: the event-sourcing tutorial gains a step for each feature, backed by the
+  runnable `examples/event-sourcing.ts`, and the API reference and `DESIGN.md`
+  cover the new options, types and errors.
+
+### Patch Changes
+
+- Updated dependencies [[`4b8d210`](https://github.com/jmenga/effect-dynamodb/commit/4b8d210a4894e0a6be43906ffffa0098ee23628f)]:
+  - @effect-dynamodb/schema@1.24.0
+
 ## 1.23.0
 
 ### Minor Changes
