@@ -321,12 +321,14 @@ export class VectorIndexBackfilling extends Data.TaggedError("VectorIndexBackfil
  * writer expected.
  *
  * - `expectedVersion` is the version the write was conditioned on.
- * - `actualVersion` is the stream's version when the library knows it without
- *   another read. `EventStore.commandHandler` sets it when a caller-supplied
+ * - `actualVersion` is the stream's version when the library has read it.
+ *   `EventStore.commandHandler` sets it when a caller-supplied
  *   `expectedVersion` does not match the loaded state (the check that runs
- *   before `decide`), so an API can render a useful `412 Precondition Failed`.
- *   A conflict detected by the append transaction itself leaves it unset,
- *   because DynamoDB does not report the stream's head.
+ *   before `decide`), so an API can render a useful `412 Precondition Failed`
+ *   — including after a `verifySnapshot: false` load, whose If-Match answers
+ *   are checked against the head. Any other conflict detected by the append
+ *   transaction itself leaves it unset, because DynamoDB does not report the
+ *   stream's head.
  */
 export class VersionConflict extends Data.TaggedError("VersionConflict")<{
   readonly streamName: string

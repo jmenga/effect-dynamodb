@@ -51,6 +51,7 @@ import {
   Function,
   Option,
   Pipeable,
+  Result,
   Schedule,
   Schema,
 } from "effect"
@@ -2742,27 +2743,47 @@ export interface CommandHandlerOptions {
    * ignored: state is replayed and verified as always.
    *
    * The snapshot can still lag the head — events appended without one (a raw
-   * `append`, data written before `mode: "inline"`). That staleness always
-   * surfaces before anything is written, and the handler then falls back to a
-   * verified load itself:
+   * `append`, data written before `mode: "inline"`). So no answer made on an
+   * unverified snapshot is returned until the head confirms it: a successful
+   * append confirms it by itself; anything else — a `decide` failure, a no-op
+   * decision, an append `VersionConflict` — is checked with one more read,
+   * and a stale load falls back to a verified one:
    *
    * - **No snapshot item** (a stream not yet snapshotted): the verified load
    *   runs at once, and `decide` runs once.
    * - **With {@link CommandOptions.expectedVersion}**: a snapshot whose
    *   `asOfVersion` differs from it is re-read verified before the If-Match
    *   check, so only a genuine mismatch is reported (its `actualVersion` is
-   *   the verified head). A snapshot at the expected version is decided and
-   *   appended on; an append-time conflict is reported, never retried.
-   * - **Without it**: an append that fails with `VersionConflict` triggers
-   *   one verified load. If that shows events after the current snapshot,
-   *   the first decision was made on stale state, so the handler decides
-   *   again on the verified state and appends once more — **`decide` (and a
-   *   function-form `additionalItems`) runs twice for that call**. Without
-   *   this, a lagging snapshot would fail every command on the stream, since
-   *   only a successful inline append rewrites it. If the snapshot is at the
-   *   head, another writer won a genuine race: the `VersionConflict` goes to
-   *   the {@link retry} policy as it always does. The re-decision happens at
-   *   most once per attempt, and its own conflict follows the policy too.
+   *   the verified head). A snapshot at the expected version holds exactly the
+   *   state the caller saw, so `decide` runs on it; if that decision does not
+   *   append, one `Query` of the newest event (as
+   *   {@link EventStream.currentVersion}) checks the head. A head past the
+   *   If-Match discards the decision and answers as a verified load would:
+   *   `DuplicateCommand` for a committed redelivery, else `VersionConflict`
+   *   with the head as `actualVersion` — never re-decided or retried.
+   * - **Without it**, a `decide` failure or a no-op is checked against the
+   *   head the same way and returned when the head is at the snapshot. An
+   *   append that fails with `VersionConflict` triggers one verified load:
+   *   a snapshot at the head means another writer won a genuine race, and
+   *   the `VersionConflict` goes to the {@link retry} policy as it always
+   *   does. Otherwise — the head past the snapshot, or past the version
+   *   decided on — the first decision was made on stale state and is
+   *   discarded: the handler loads verified (if it has not) and decides again
+   *   on that state, then appends — **`decide` (and a function-form
+   *   `additionalItems`, for a decision that appends) runs twice for that
+   *   call**. That is the optimistic-concurrency price of skipping the
+   *   verification read, the same one a `VersionConflict` retry pays: a
+   *   decision is only as current as the state it was made on, and a stale
+   *   one cannot be patched, only made again. Without the re-decision, a
+   *   lagging snapshot would fail or mis-answer every command on the stream,
+   *   since only a successful inline append rewrites it. It happens at most
+   *   once per attempt, and the second decision's outcome is final for the
+   *   attempt (its conflict follows the policy).
+   *
+   * A decision that appends nothing therefore costs the `GetItem` and one
+   * `Query` of the newest event — more than the verified load's single
+   * `Query` when events are small. `false` pays off for streams whose
+   * commands mostly append.
    */
   readonly verifySnapshot?: boolean | undefined
 }
@@ -3084,17 +3105,18 @@ const makeCommandHandlerImpl = <
         return loaded
       })
 
-    // 3–8. Decide, fold, derive items, append, snapshot. With
+    // 4–8. Commit one decision: fold, derive items, append, snapshot. With
     //    `returnAppendConflict`, an append that fails with `VersionConflict`
     //    returns the conflict instead of failing, so the caller can tell a
     //    stale unverified load from a lost race.
-    const decideAndAppend = (loaded: Loaded, returnAppendConflict: boolean) =>
+    const commit = (
+      loaded: Loaded,
+      newEvents: ReadonlyArray<TEvent>,
+      returnAppendConflict: boolean,
+    ) =>
       Effect.gen(function* () {
         const baseVersion = loaded.version
         const state = loaded.state
-
-        // 3. Decide
-        const newEvents = yield* decider.decide(command, state)
 
         // 4. No-op command — return current state
         if (newEvents.length === 0) {
@@ -3204,6 +3226,34 @@ const makeCommandHandlerImpl = <
         return done
       })
 
+    // The If-Match answer for a stream at `actualVersion` (#136). A
+    // redelivery of a command that already committed (its response was lost)
+    // arrives with its original If-Match, which the stream has since moved
+    // past. It is a duplicate, not a lost race — `append` ranks
+    // `DuplicateCommand` above `VersionConflict` for the same reason — so
+    // consult the sentinel before reporting the conflict. The extra read is
+    // paid on this conflict path only.
+    const ifMatchMismatch = (expected: number, actualVersion: number) =>
+      Effect.gen(function* () {
+        const probe = commandSentinelProbeOf(stream)
+        const commandId = callOptions?.commandId
+        if (options?.idempotency !== undefined && commandId !== undefined && probe !== undefined) {
+          if (yield* probe(streamId as Record<string, unknown>, commandId)) {
+            return yield* new DuplicateCommand({
+              streamName: stream.streamName,
+              streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
+              commandId,
+            })
+          }
+        }
+        return yield* new VersionConflict({
+          streamName: stream.streamName,
+          streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
+          expectedVersion: expected,
+          actualVersion,
+        })
+      })
+
     const attempt = Effect.gen(function* () {
       // Backstop for JS callers and `any`-shaped call sites: silently degrading
       // to at-least-once would look like success right up until the day a
@@ -3244,50 +3294,78 @@ const makeCommandHandlerImpl = <
       // 2. If-Match (#136): the caller saw a different version, so `decide`
       //    must not run against state the caller never saw.
       if (expectedVersion !== undefined && expectedVersion !== loaded.version) {
-        // A redelivery of a command that already committed (its response was
-        // lost) arrives with its original If-Match, which the stream has since
-        // moved past. It is a duplicate, not a lost race — `append` ranks
-        // `DuplicateCommand` above `VersionConflict` for the same reason — so
-        // consult the sentinel before reporting the conflict. The extra read is
-        // paid on this conflict path only.
-        const probe = commandSentinelProbeOf(stream)
-        const commandId = callOptions?.commandId
-        if (options?.idempotency !== undefined && commandId !== undefined && probe !== undefined) {
-          if (yield* probe(streamId as Record<string, unknown>, commandId)) {
-            return yield* new DuplicateCommand({
-              streamName: stream.streamName,
-              streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
-              commandId,
-            })
-          }
-        }
-        return yield* new VersionConflict({
-          streamName: stream.streamName,
-          streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
-          expectedVersion,
-          actualVersion: loaded.version,
-        })
+        return yield* ifMatchMismatch(expectedVersion, loaded.version)
       }
 
-      // An If-Match call's append-time conflict is its answer (never re-read
-      // or retried), and a verified load's conflict is a lost race.
-      if (expectedVersion !== undefined || loaded.verified) {
-        return (yield* decideAndAppend(loaded, false)) as CommandHandlerResult<State, TEvent>
+      // 3. Decide on a verified load, and commit. An If-Match call's
+      //    append-time conflict is its answer (never re-read or retried), and
+      //    a verified load's conflict is a lost race.
+      if (loaded.verified) {
+        const newEvents = yield* decider.decide(command, loaded.state)
+        return (yield* commit(loaded, newEvents, false)) as CommandHandlerResult<State, TEvent>
       }
 
-      // Unverified load, no If-Match: a conflict means either the snapshot
-      // lagged the head (events appended without one — the decision was made
-      // on stale state) or another writer won the race. One verified load
-      // tells them apart. A lagging snapshot is decided on again, once: only
-      // a successful inline append rewrites the snapshot, so surfacing the
-      // conflict would fail every command on the stream until something else
-      // repaired it. A snapshot at the head means a genuine race, which the
-      // retry policy handles as it always has.
-      const first = yield* decideAndAppend(loaded, true)
-      if (!(first instanceof VersionConflict)) return first
+      // 3'. Decide on an unverified snapshot. It is normally at the head, but
+      //    events appended without one (a raw `append`, data written before
+      //    inline mode) make it lag — and then every answer made on it is
+      //    stale, not only one that appends. So no answer is returned until
+      //    the head is confirmed: an append confirms it by succeeding; a
+      //    decision that appends nothing (a `decide` failure or a no-op) and
+      //    an append conflict are confirmed with one more read.
+      const decided = yield* Effect.result(decider.decide(command, loaded.state))
+      const first =
+        Result.isSuccess(decided) && decided.success.length > 0
+          ? yield* commit(loaded, decided.success, true)
+          : undefined
+      if (first !== undefined && !(first instanceof VersionConflict)) return first
+
+      // The answer the first decision gives when the snapshot proves current.
+      const firstAnswer: Effect.Effect<
+        CommandHandlerResult<State, TEvent>,
+        E | VersionConflict
+      > = first !== undefined
+        ? Effect.fail(first)
+        : Result.isFailure(decided)
+          ? Effect.fail(decided.failure)
+          : Effect.succeed({ state: loaded.state, version: loaded.version, events: [] })
+
+      // With an If-Match equal to the snapshot's `asOfVersion`, the snapshot
+      // state is exactly the state the caller saw, so `decide` ran on the
+      // right state — the only question is whether the stream is still at
+      // that version. A newer head answers exactly as a verified load would
+      // have (the pre-decide check above): `DuplicateCommand` for a committed
+      // redelivery, else `VersionConflict` with the head as `actualVersion`.
+      // The first decision is discarded. Never re-decided: an If-Match call's
+      // conflict is its answer.
+      if (expectedVersion !== undefined) {
+        const head = yield* stream.currentVersion(streamId, readOptions)
+        if (head !== expectedVersion) return yield* ifMatchMismatch(expectedVersion, head)
+        return yield* firstAnswer
+      }
+
+      // No If-Match, nothing appended: a head at the snapshot's version
+      // confirms the answer (one `Query` of the newest event).
+      if (first === undefined) {
+        const head = yield* stream.currentVersion(streamId, readOptions)
+        if (head === loaded.version) return yield* firstAnswer
+      }
+
+      // No If-Match, the append conflicted — the snapshot lagged the head, or
+      // another writer won the race; one verified load tells them apart. A
+      // snapshot at the head is a genuine race, which the retry policy
+      // handles as it always has (a retried attempt loads unverified again).
+      // A lagging snapshot is decided on again, once: only a successful inline
+      // append rewrites the snapshot, so surfacing the conflict would fail
+      // every command on the stream until something else repaired it.
       const verified = yield* load(true)
-      if (verified.eventsAfterSnapshot === 0) return yield* first
-      return (yield* decideAndAppend(verified, false)) as CommandHandlerResult<State, TEvent>
+      if (first !== undefined && verified.eventsAfterSnapshot === 0) return yield* first
+
+      // The first decision was made on stale state: decide again on the
+      // verified state — `decide` (and a function-form `additionalItems`)
+      // runs a second time in this attempt. Its own conflict follows the
+      // retry policy.
+      const newEvents = yield* decider.decide(command, verified.state)
+      return (yield* commit(verified, newEvents, false)) as CommandHandlerResult<State, TEvent>
     })
 
     // A caller-supplied `expectedVersion` is a conditional write: its
@@ -3357,8 +3435,9 @@ const makeCommandHandlerImpl = <
  *   state — and only those events are folded, instead of replaying the stream
  *   from the beginning. On a `mode: "inline"` stream without `every`,
  *   {@link CommandHandlerOptions.verifySnapshot}`: false` loads the snapshot
- *   item alone (one `GetItem`) and falls back to the verified load when that
- *   snapshot proves stale — in which case `decide` may run twice.
+ *   item alone (one `GetItem`); an answer that is not a successful append is
+ *   confirmed against the head first, and a snapshot that proves stale falls
+ *   back to the verified load — in which case `decide` may run twice.
  * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
  * - **Fold before append.** The new events are folded into state before the
  *   append, so the state returned, snapshotted and handed to a function-form

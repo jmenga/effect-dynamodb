@@ -871,13 +871,17 @@ const lean = yield* inlineMatchEvents.readLatest({ matchId: "m-6" }, { verifySna
 
 `readLatest({ verifySnapshot: false })` returns `{ snapshot, events: [], version: snapshot.asOfVersion }`. That version is **unverified**: events appended without a snapshot (a raw `append`, or data written before the stream switched to inline) may follow it. When there is no snapshot item, it falls back to the verified read.
 
-The handler checks for itself. A stale snapshot always shows up before anything is written, because the append's version condition fails. The handler then falls back to a verified load:
+The handler checks for itself. If the snapshot lags, **every** answer made on it is stale: a refusal or a no-op as much as an append. So the handler returns nothing it decided on an unverified snapshot until the head confirms it. A successful append confirms it by itself, because the append's version condition held. Anything else is checked with one more read, and a stale snapshot falls back to a verified load:
 
 - **No snapshot item** (a new stream, or data from before inline mode): it loads verified straight away, and `decide` runs once.
-- **With `expectedVersion`**: a snapshot at a different version is re-read verified before the If-Match check, so `VersionConflict` is reported only for a real mismatch, with the verified head as `actualVersion`. A snapshot at the expected version is decided on, and an append-time conflict is reported as usual.
-- **Without `expectedVersion`**: if the append conflicts, one verified load tells the two causes apart. If events follow the snapshot, the first decision was made on stale state, so the handler **decides again once** on the verified state and appends. If the snapshot is at the head, another writer won the race, and the `VersionConflict` goes to the `retry` policy as usual.
+- **With `expectedVersion`, at a different version than the snapshot**: the snapshot is re-read verified before the If-Match check, so `VersionConflict` is reported only for a real mismatch, with the verified head as `actualVersion`. `decide` does not run.
+- **With `expectedVersion`, at the snapshot's version**: the snapshot is exactly the state the caller saw, so `decide` runs on it. If the decision does not append (a domain error, a no-op, or an append conflict), one `Query` of the newest event checks the head. If the stream has moved past the caller's version, the decision is discarded and the answer is what a verified load gives: `DuplicateCommand` for a redelivery that already committed, otherwise `VersionConflict` with the head as `actualVersion`.
+- **Without `expectedVersion`, a domain error or a no-op**: one `Query` of the newest event. If the head is at the snapshot, the answer stands. If not, the decision was made on stale state, so the handler loads verified and **decides again once**.
+- **Without `expectedVersion`, an append conflict**: one verified load tells the two causes apart. If events follow the snapshot, the first decision was made on stale state, so the handler **decides again once** on the verified state and appends. If the snapshot is at the head, another writer won the race, and the `VersionConflict` goes to the `retry` policy as usual.
 
-So in that last case, `decide` (and a function-form `additionalItems`) **can run twice for one call**. The first decision is discarded because it was made on stale state. Without this re-read, a stale snapshot would make every command on the stream fail, because only a successful inline append rewrites the snapshot.
+So in the last two cases, `decide` **can run twice for one call**, and so can a function-form `additionalItems` when both decisions append. This is the price of skipping the verification read, the same one a `VersionConflict` retry pays: a decision is only as current as the state it was made on, and one made on stale state can't be patched, only made again. Without the second decision, a stale snapshot would make every command on the stream fail or give a stale answer, because only a successful inline append rewrites the snapshot. The second decision's append repairs it.
+
+A decision that appends nothing costs the `GetItem` plus a `Query` of the newest event. The option pays off on streams whose commands mostly append.
 
 The option is accepted only on a `mode: "inline"` stream without `every`, the only mode that keeps the snapshot at the head. On any other snapshot config, creating the handler throws `[EDD-9068]`, and `readLatest` dies with it. On a stream without a snapshot config the option is ignored.
 
@@ -955,7 +959,10 @@ const handleDeliveries = EventStore.commandHandler(deliveryDecider, deliveries, 
 // A fixed step size, not one computed from event sizes: event content varies.
 const STEP_SIZE = 50
 
-/** Run one large command as fixed-size steps, chained by `expectedVersion`. */
+/**
+ * Run one large command as fixed-size steps, chained by `expectedVersion`.
+ * Redelivered with the same `commandId` and `expectedVersion`, it resumes.
+ */
 const stepped = (
   matchId: string,
   balls: ReadonlyArray<number>,
@@ -965,17 +972,34 @@ const stepped = (
 ) =>
   Effect.gen(function* () {
     let version = expectedVersion
+    let skipping = false
     for (let n = 0; n * STEP_SIZE < balls.length; n++) {
       const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
       // An ordinary command: decide, fold, one atomic append with its own
       // snapshot and sentinel. Each step has its own commandId.
-      const result = yield* handleDeliveries({ matchId }, toCommand(step), {
-        commandId: `${commandId}#step-${n}`,
-        expectedVersion: version,
-      })
-      version = result.version
+      const run = (expected: number) =>
+        handleDeliveries({ matchId }, toCommand(step), {
+          commandId: `${commandId}#step-${n}`,
+          expectedVersion: expected,
+        }).pipe(Effect.map((result) => result.version))
+      const committed = yield* run(version).pipe(
+        // An earlier delivery committed this step. Keep the stale version, so
+        // the next step is checked against its sentinel too, before `decide`.
+        Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+        // After skipped steps: the first step not committed. Run it at the head.
+        Effect.catchTag("VersionConflict", (conflict) =>
+          skipping && conflict.actualVersion !== undefined
+            ? run(conflict.actualVersion)
+            : Effect.fail(conflict),
+        ),
+      )
+      skipping = committed === undefined
+      if (committed !== undefined) version = committed
     }
-    return version
+    // Every step was committed before: the stream's head.
+    return skipping
+      ? yield* deliveries.currentVersion({ matchId }, { consistentRead: true })
+      : version
   })
 
 const feed = Array.from({ length: 150 }, (_, i) => i + 1)
@@ -999,15 +1023,20 @@ const imported = yield* stepped("m-8", feed, record, "feed-1", 0)
 
 // The compensating undo: planned newest first, in the same fixed-size steps.
 const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
-// → version 300. A failure partway stops at the last step's real state;
-//   re-issuing the remaining steps continues from there.
+// → version 300. A failure partway stops at the last step's real state.
+
+// Redelivered (its response lost): every step is a duplicate, nothing is written.
+const redelivered = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+// → version 300
 ```
 
 1. **The application plans the steps** — newest first for an undo — each covering at most a configured number of entities. Prefer a fixed size to a size computed from the events: event content varies.
 2. **Each step is an ordinary `commandHandler` call** — decide, fold, one atomic append with its own snapshot, projections and sentinel — with `expectedVersion` set to the version the previous step returned.
-3. **A failure partway leaves the stream at a real, consistent state**: the last step that committed, with its snapshot and read models. Re-issuing the remaining steps continues from there; a step that conflicts (another writer got in) fails with `VersionConflict` before anything of it is written.
+3. **A failure partway leaves the stream at a real, consistent state**: the last step that committed, with its snapshot and read models. A step that conflicts (another writer got in) fails with `VersionConflict` before anything of it is written.
 
-With idempotency, each step needs **its own `commandId`** — `${commandId}#step-${n}` above — so a redelivered step is a `DuplicateCommand` while the other steps still run. And when a step fails with `AppendTooLarge`, its `count` against `limit` tells you the configured step size is too large for what each entity decides.
+With idempotency, each step needs **its own `commandId`**, `${commandId}#step-${n}` above. That is what lets a **redelivered** large command resume after a partial failure. A redelivery carries the same `commandId` and the original `expectedVersion`, which is now stale, so the handler checks the step's sentinel before deciding, and a committed step fails with `DuplicateCommand`. The helper skips it and **keeps the stale version**, so the next step is checked the same way, without `decide` running. The first step that was not committed fails with `VersionConflict`, whose `actualVersion` is the head, and the helper runs it from there. When every step was committed, nothing is written.
+
+`DuplicateCommand` carries no version, so don't chain the next step from the head after one: `decide` would run against steps already applied, and the undo above would fail with `NotRecorded`. And when a step fails with `AppendTooLarge`, its `count` against `limit` tells you the configured step size is too large for what each entity decides.
 
 The rule of thumb: **one command → one decision → one atomic append.**
 

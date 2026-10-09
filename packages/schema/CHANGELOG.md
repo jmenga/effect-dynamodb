@@ -44,15 +44,19 @@
     alone with one `GetItem`, instead of a `Query` that also reads the newest
     event. A `Query` is charged for every item it reads, so with large events
     this roughly halves a command's read capacity. `readLatest` then returns the
-    snapshot's `asOfVersion` as an **unverified** `version`. The handler falls
-    back to a verified load itself: at once when there is no snapshot; before
-    reporting an If-Match mismatch, so `actualVersion` is the verified head; and,
-    without `expectedVersion`, when the append conflicts. If that load shows
-    events after the snapshot, the decision was made on stale state, and
-    `decide` (with a function-form `additionalItems`) runs a second time on the
-    verified state; a snapshot at the head is a genuine race, left to the
-    `retry` policy. Any other snapshot config is refused with `[EDD-9068]`; a
-    stream without a snapshot config ignores the option.
+    snapshot's `asOfVersion` as an **unverified** `version`. The handler
+    returns nothing decided on an unverified snapshot until the head confirms
+    it: a successful append confirms it by itself, and a domain error, a no-op
+    or an append conflict is checked with one more read. It falls back to a
+    verified load at once when there is no snapshot, and before reporting an
+    If-Match mismatch, so `actualVersion` is the verified head; an If-Match at a
+    lagging snapshot's version answers as the verified load would. Without
+    `expectedVersion`, a decision found to be made on stale state is made again
+    on the verified state, so `decide` (and a function-form `additionalItems`,
+    when both decisions append) can run twice for one call; a snapshot at the
+    head after an append conflict is a genuine race, left to the `retry`
+    policy. Any other snapshot config is refused with `[EDD-9068]`; a stream
+    without a snapshot config ignores the option.
   - **Stream indexes ([#140](https://github.com/jmenga/effect-dynamodb/issues/140)).** `makeStream({ indexes })` declares sub-streams of a
     stream's events ordered by a key derived from each event, on an LSI (default,
     strongly consistent) or a GSI (`type: "gsi"`, scoped to the same stream).
@@ -70,7 +74,9 @@
     (tutorial, `DESIGN.md`) runs such a command as stepped commands: fixed-size
     steps planned by the application, each an ordinary atomic `commandHandler`
     call chained by `expectedVersion`, with a `commandId` per step under
-    idempotency — so a failure partway leaves a real, consistent state. One
+    idempotency — so a failure partway leaves a real, consistent state, and a
+    redelivered command skips its committed steps (`DuplicateCommand`) and
+    resumes at the first one not committed. One
     command → one decision → one atomic append. ([#141](https://github.com/jmenga/effect-dynamodb/issues/141)'s opt-in chunked append is
     not implemented.)
 

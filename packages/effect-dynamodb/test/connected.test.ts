@@ -9441,6 +9441,109 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
   )
 
   it.effect(
+    "verifySnapshot: false confirms a domain error or no-op against the head, re-deciding on a stale snapshot",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-noappend"
+        const key = { accountId }
+        const base = esCmdDecider(accountId)
+        // A withdrawal the balance cannot cover is refused by `base`, and a
+        // no-op by `lenient`.
+        const lenient: typeof base = {
+          ...base,
+          decide: (command, state) =>
+            command._tag === "Withdraw" && state.balance < command.amount
+              ? Effect.sync(() => {
+                  esCmdDecideLog.push(accountId)
+                  return []
+                })
+              : base.decide(command, state),
+        }
+        const handle = EventStore.commandHandler(base, EsLedger, { verifySnapshot: false })
+        const lenientHandle = EventStore.commandHandler(lenient, EsLedger, {
+          verifySnapshot: false,
+        })
+        yield* handle(key, { _tag: "Deposit", amount: 10 })
+
+        // The snapshot is at the head: the refusal and the no-op stand, each
+        // confirmed by one head check.
+        let mark = esLatRequests("ledger", accountId).length
+        const refused = yield* handle(key, { _tag: "Withdraw", amount: 100 }).pipe(Effect.flip)
+        expect(refused._tag).toBe("EsCmdInsufficientFunds")
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "query"])
+        const noop = yield* lenientHandle(key, { _tag: "Withdraw", amount: 100 })
+        expect(noop).toEqual({ state: { balance: 10, txCount: 1 }, version: 1, events: [] })
+
+        // 500 deposited raw, without a snapshot: snapshot v1 (balance 10), head v2.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 1)
+
+        // The refusal made on the stale snapshot is decided again, and applied.
+        let before = decisions(accountId)
+        mark = esLatRequests("ledger", accountId).length
+        const withdrawn = yield* handle(key, { _tag: "Withdraw", amount: 100 })
+        expect(withdrawn).toMatchObject({ version: 3, state: { balance: 410, txCount: 3 } })
+        expect(decisions(accountId) - before).toBe(2)
+        expect(ledgerOpsSince(accountId, mark)).toEqual([
+          "getItem",
+          "query",
+          "query",
+          "transactWriteItems",
+        ])
+
+        // The same for a no-op made on a stale snapshot.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 3)
+        before = decisions(accountId)
+        const applied = yield* lenientHandle(key, { _tag: "Withdraw", amount: 800 })
+        expect(applied).toMatchObject({ version: 5, state: { balance: 110, txCount: 5 } })
+        expect(decisions(accountId) - before).toBe(2)
+        expect(Option.getOrThrow(yield* EsLedger.readSnapshot(key)).asOfVersion).toBe(5)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "verifySnapshot: false answers an If-Match at a lagging snapshot as the verified load does",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "unverified-ifm-lag"
+        const key = { accountId }
+        const base = esCmdDecider(accountId)
+        const lenient: typeof base = {
+          ...base,
+          decide: (command, state) =>
+            command._tag === "Withdraw" && state.balance < command.amount
+              ? Effect.succeed([])
+              : base.decide(command, state),
+        }
+        const unverified = EventStore.commandHandler(base, EsLedger, { verifySnapshot: false })
+        const verified = EventStore.commandHandler(base, EsLedger)
+        const lenientUnverified = EventStore.commandHandler(lenient, EsLedger, {
+          verifySnapshot: false,
+        })
+        const lenientVerified = EventStore.commandHandler(lenient, EsLedger)
+        yield* unverified(key, { _tag: "Deposit", amount: 10 })
+        // Snapshot v1, head v2: the caller's If-Match is the snapshot's version.
+        yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 1)
+
+        const cases = [
+          [unverified, verified, { _tag: "Deposit", amount: 1 }],
+          [unverified, verified, { _tag: "Withdraw", amount: 100 }],
+          [lenientUnverified, lenientVerified, { _tag: "Withdraw", amount: 100 }],
+        ] as const
+        for (const [lean, full, command] of cases) {
+          const leanError = yield* lean(key, command, { expectedVersion: 1 }).pipe(Effect.flip)
+          const fullError = yield* full(key, command, { expectedVersion: 1 }).pipe(Effect.flip)
+          expect(leanError).toMatchObject({
+            _tag: "VersionConflict",
+            expectedVersion: 1,
+            actualVersion: 2,
+          })
+          expect(leanError).toEqual(fullError)
+        }
+        expect(yield* EsLedger.currentVersion(key, { consistentRead: true })).toBe(2)
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
     "verifySnapshot: false falls back to the verified load when the snapshot is missing",
     () =>
       Effect.gen(function* () {
@@ -9596,6 +9699,93 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
           expectedVersion: 91,
         })
         expect(resumed).toMatchObject({ version: 181, state: { balance: 173, txCount: 181 } })
+      }).pipe(provideEsLat),
+  )
+
+  it.effect(
+    "a redelivered stepped command skips its committed steps and resumes at the first one not committed",
+    () =>
+      Effect.gen(function* () {
+        const accountId = "step-3"
+        const key = { accountId }
+        // Step 1's decide fails once, after step 0 committed.
+        let failOnce = true
+        const flaky: typeof esBulkDecider = {
+          ...esBulkDecider,
+          decide: (count, state) =>
+            state.txCount === 40 && failOnce
+              ? Effect.sync(() => {
+                  failOnce = false
+                  throw new Error("boom")
+                })
+              : esBulkDecider.decide(count, state),
+        }
+        const handle = EventStore.commandHandler(flaky, EsBulk, { idempotency: {} })
+
+        // The tutorial's helper: a step committed by an earlier delivery is a
+        // DuplicateCommand (the stale If-Match makes the handler consult its
+        // sentinel before deciding), so it is skipped with the If-Match kept
+        // stale; the first step not committed is a VersionConflict carrying the
+        // head, and runs from there.
+        const stepped = (
+          sizes: ReadonlyArray<number>,
+          commandId: string,
+          expectedVersion: number,
+        ) =>
+          Effect.gen(function* () {
+            let version = expectedVersion
+            let skipping = false
+            for (const [n, size] of sizes.entries()) {
+              const run = (expected: number) =>
+                handle(key, size, {
+                  commandId: `${commandId}#step-${n}`,
+                  expectedVersion: expected,
+                })
+              const outcome = yield* run(version).pipe(
+                Effect.map((done) => done.version),
+                Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+                Effect.catchTag("VersionConflict", (conflict) =>
+                  skipping && conflict.actualVersion !== undefined
+                    ? run(conflict.actualVersion).pipe(Effect.map((done) => done.version))
+                    : Effect.fail(conflict),
+                ),
+              )
+              skipping = outcome === undefined
+              if (outcome !== undefined) version = outcome
+            }
+            return skipping ? yield* EsBulk.currentVersion(key, { consistentRead: true }) : version
+          })
+
+        const failed = yield* stepped([40, 40, 40], "bulk-3", 0).pipe(Effect.exit)
+        expect(failed._tag).toBe("Failure")
+        expect(yield* EsBulk.currentVersion(key, { consistentRead: true })).toBe(40)
+
+        // Redelivered with its original commandId and If-Match: step 0 is
+        // skipped, steps 1 and 2 run.
+        const before = esLatRequests("bulk", accountId).filter(
+          (r) => r.op === "transactWriteItems",
+        ).length
+        expect(yield* stepped([40, 40, 40], "bulk-3", 0)).toBe(120)
+        expect(
+          esLatRequests("bulk", accountId).filter((r) => r.op === "transactWriteItems").length -
+            before,
+        ).toBe(2)
+        for (const n of [0, 1, 2]) {
+          expect(yield* esLatSentinel(accountId, `bulk-3#step-${n}`)).toMatchObject({
+            version: 40 * (n + 1),
+          })
+        }
+
+        // Redelivered again: every step is skipped, nothing is written.
+        expect(yield* stepped([40, 40, 40], "bulk-3", 0)).toBe(120)
+        expect(
+          esLatRequests("bulk", accountId).filter((r) => r.op === "transactWriteItems").length -
+            before,
+        ).toBe(2)
+        expect(Option.getOrThrow(yield* EsBulk.readSnapshot(key))).toMatchObject({
+          asOfVersion: 120,
+          state: { balance: 120, txCount: 120 },
+        })
       }).pipe(provideEsLat),
   )
 })

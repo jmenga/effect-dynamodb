@@ -288,9 +288,12 @@ EventStore.commandHandler(decider, stream, { verifySnapshot: false })   // Comma
 written before `mode: "inline"`) may follow it. With no snapshot item it falls
 back to the verified read and returns its result.
 
-**Why it is safe in `commandHandler`.** A stale snapshot always surfaces
-before anything is written — the append's version condition fails — and the
-handler then falls back to a verified load itself:
+**Why it is safe in `commandHandler`.** A snapshot can still lag the head, and
+then *every* answer made on it is stale — a domain error and a no-op as much
+as an append. So no answer made on an unverified snapshot is returned until
+the head confirms it. A successful append confirms it by itself (its version
+condition held); anything else is checked with one more read, and a stale load
+falls back to a verified one:
 
 1. **Missing snapshot** (`GetItem` finds nothing — a new stream, or data
    predating inline mode): `readLatest` falls back to the verified read
@@ -299,13 +302,23 @@ handler then falls back to a verified load itself:
    verified `readLatest`, then the normal If-Match check (§2) — a
    `VersionConflict` carries the **verified** head as `actualVersion`, and the
    `DuplicateCommand` probe keeps its precedence. Only a genuine mismatch is
-   reported.
-3. **With `expectedVersion`**, snapshot `asOfVersion` = `expectedVersion`:
-   decide and append. An append-time `VersionConflict` is reported, never
-   retried (the If-Match rule, unchanged).
-4. **Without `expectedVersion`**, the append fails with `VersionConflict`
-   after an unverified load: one verified `readLatest` tells a stale load from
-   a lost race.
+   reported, and `decide` does not run.
+3. **With `expectedVersion`**, snapshot `asOfVersion` = `expectedVersion`: the
+   snapshot holds exactly the state the caller saw, so decide on it. A
+   successful append is the answer. A domain error, a no-op or an append-time
+   `VersionConflict` is checked with one `Query` of the newest event (as
+   `currentVersion`): a head at the If-Match returns the answer; a head past
+   it discards the decision and answers as the verified load (case 2) would —
+   `DuplicateCommand` for a committed redelivery, else `VersionConflict` with
+   the head as `actualVersion`. Never re-decided or retried (the If-Match
+   rule).
+4. **Without `expectedVersion`**, a domain error or a no-op: one `Query` of the
+   newest event. A head at the snapshot's version confirms the answer. A head
+   past it means the decision was made on stale state: a verified `readLatest`,
+   and the handler decides again **once** on that state; that outcome is final
+   for the attempt.
+5. **Without `expectedVersion`**, the append fails with `VersionConflict`: one
+   verified `readLatest` tells a stale load from a lost race.
    - **Events past the current snapshot** (its `asOfVersion` < the head):
      the load was stale. The handler decides again **once** on the verified
      state and appends — outside, and in addition to, the `retry` policy. A
@@ -314,18 +327,26 @@ handler then falls back to a verified load itself:
      race. The `VersionConflict` goes to the `retry` policy exactly as
      today; a retried attempt loads (unverified) again.
 
-**`decide` may run twice for one call** in case 4 — and so may a function-form
-`additionalItems`, including its `Effect` form. The first decision was made on
-stale state and discarded; the second is the one appended. Without the
-automatic re-read, a stale snapshot would make every command on the stream
-fail, since only a successful inline append rewrites it. The re-decision
-happens at most once per attempt.
+**`decide` may run twice for one call** in cases 4 and 5 — and so may a
+function-form `additionalItems`, including its `Effect` form, when both
+decisions append. That is inherent to skipping the verification read: it is
+optimistic concurrency on the snapshot, and pays the same price a
+`VersionConflict` retry pays. A decision is only as current as the state it
+was made on; one made on stale state cannot be patched, only made again, and
+the first is discarded. Without the re-decision a lagging snapshot would fail
+or mis-answer every command on the stream, since only a successful inline
+append rewrites it — the re-decision's append repairs it. It happens at most
+once per attempt. In case 3, `decide` may run on a snapshot the stream has
+moved past — on the state the caller saw, as a verified load that loses a race
+does — but that decision is never returned.
 
 Request counts with `verifySnapshot: false`: a current snapshot loads with one
-`GetItem` (one item read); a missing one costs the `GetItem` plus the verified
-read; a stale one costs the `GetItem`, the failed transaction, the verified
-read and a second transaction — once, after which the snapshot is current
-again.
+`GetItem` (one item read), and a decision that appends needs nothing more; a
+decision that does not append adds one `Query` of the newest event (so a
+stream whose commands mostly refuse or no-op is better served by the default);
+a missing snapshot costs the `GetItem` plus the verified read; a stale one
+costs the `GetItem`, the failed transaction or head check, the verified read
+and a second transaction — once, after which the snapshot is current again.
 
 ## 5. Large commands — stepped commands (#141, not implemented)
 
@@ -350,11 +371,20 @@ compensating undo) is run as stepped commands:
    atomic append with its own snapshot and projections), with
    `expectedVersion` = the version the previous step returned.
 3. A failure partway leaves the stream at a real, consistent intermediate
-   state — the last committed step. Re-issuing continues from there.
+   state — the last committed step.
 
 - **Idempotency.** Each step needs its own `commandId`, e.g.
-  `` `${commandId}#step-${n}` ``, so a redelivered step is a
-  `DuplicateCommand` without blocking the steps after it.
+  `` `${commandId}#step-${n}` ``. That is also what lets a **redelivered**
+  large command (same `commandId`, same original `expectedVersion`) resume
+  after a partial failure: its first step's If-Match is stale, so the handler
+  probes that step's sentinel before deciding, and a committed step is a
+  `DuplicateCommand`. The application skips it **keeping the stale
+  If-Match**, so every following step is checked the same way without
+  `decide` running; the first step not committed is a `VersionConflict` whose
+  `actualVersion` is the head, and runs from there. `DuplicateCommand` carries
+  no version, and chaining from the head instead would run `decide` against
+  steps already applied (a compensating undo would fail its own validation).
+  The tutorial's helper implements this.
 - **Over the limit.** An over-limit append keeps failing with `AppendTooLarge`
   (or `ValidationError` for 4 MB) before anything is written. Its
   `count` / `limit` tell the caller the configured step size is wrong.
@@ -535,7 +565,12 @@ Required connected scenarios:
     stale snapshot after a raw append → correct state, `decide` twice,
     success without a retry policy; a concurrent `commandHandler` race without
     a retry policy → `VersionConflict`; an If-Match mismatch via a stale
-    snapshot → the verified `actualVersion`; the missing-snapshot fallback.
+    snapshot → the verified `actualVersion`; the missing-snapshot fallback; a
+    domain error and a no-op on a stale snapshot → decided again on the
+    verified state (one head check when the snapshot is current); an If-Match
+    equal to a lagging snapshot → the same `VersionConflict` (with
+    `actualVersion`) as the verified handler, for an append, a domain error
+    and a no-op.
 - **Large commands (#141 guidance)**:
   - An append over 100 items → `AppendTooLarge` (`count`, `limit`), over
     4 MB → `ValidationError`; nothing written.
@@ -545,6 +580,9 @@ Required connected scenarios:
     `DuplicateCommand`.
   - A writer between two steps → the next step's `VersionConflict` writes
     nothing, the stream stays at a consistent state, and re-issuing continues.
+  - A large command that fails partway, redelivered with its original
+    `commandId` and `expectedVersion` → committed steps skipped
+    (`DuplicateCommand`), the rest run; redelivered again → nothing written.
 - **#140**:
   - An LSI table created via `indexDefinitions`.
   - Sparse indexing.

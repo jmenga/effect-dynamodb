@@ -5166,20 +5166,155 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("does not touch domain errors from decide", () =>
-      Effect.gen(function* () {
-        snapshotGetItem(snapshotAt(4, 2))
-        const error = yield* EventStore.commandHandler(matchDecider, Inline, {
-          verifySnapshot: false,
-        })(
-          { matchId: "m-1" },
-          { _tag: "StartMatch", venue: "x", homeTeam: "a", awayTeam: "b" },
-        ).pipe(Effect.flip)
-        expect(error._tag).toBe("AlreadyStarted")
-        expect(mockQuery).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
-      }).pipe(Effect.provide(TestLayer)),
-    )
+    describe("a decision that appends nothing is confirmed against the head", () => {
+      /** A snapshot of a match not yet started, and the start the snapshot missed. */
+      const pendingAt = (asOfVersion: number) =>
+        makeSnapshotItem(label, "m-1", asOfVersion, { status: "p", innings: [] })
+      const startedItem = (version: number) =>
+        makeStreamEventItem(label, "m-1", version, "MatchStarted", {
+          venue: "MCG",
+          homeTeam: "AUS",
+          awayTeam: "ENG",
+        })
+      /** `EndMatch` on a match that is not in progress is a no-op, not an error. */
+      const spiedNoop = () => {
+        const decide = vi.fn((command: MatchCommand, state: MatchState) =>
+          command._tag === "EndMatch" && state.status !== "in-progress"
+            ? Effect.succeed([] as ReadonlyArray<MatchEvent>)
+            : matchDecider.decide(command, state),
+        )
+        const decider: EventStore.Decider<
+          MatchState,
+          MatchCommand,
+          MatchEvent,
+          AlreadyStarted | NotStarted
+        > = { ...matchDecider, decide }
+        return { decide, decider }
+      }
+      const endMatch: MatchCommand = { _tag: "EndMatch", result: "drawn" }
+      /** The head check: one reverse `Query` of the newest event. */
+      const expectHeadCheck = (call: any) => {
+        expect(call.Limit).toBe(1)
+        expect(call.ScanIndexForward).toBe(false)
+        expect(call.ConsistentRead).toBe(true)
+      }
+
+      it.effect("a domain error is returned once the head is at the snapshot", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(snapshotAt(4, 2))
+          mockQuery.mockResolvedValue({ Items: [inningsItem(4)] })
+          const { decide, decider } = spied()
+          const error = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })(
+            { matchId: "m-1" },
+            { _tag: "StartMatch", venue: "x", homeTeam: "a", awayTeam: "b" },
+          ).pipe(Effect.flip)
+          expect(error._tag).toBe("AlreadyStarted")
+          expect(decide).toHaveBeenCalledOnce()
+          expect(mockQuery).toHaveBeenCalledOnce()
+          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a domain error on a lagging snapshot is decided again on the verified state", () =>
+        Effect.gen(function* () {
+          // The snapshot (v1) says not started; the start (v2) was appended raw.
+          snapshotGetItem(pendingAt(1))
+          mockQuery
+            .mockResolvedValueOnce({ Items: [startedItem(2)] })
+            .mockResolvedValueOnce(latestPage(pendingAt(1), [startedItem(2)]))
+          mockTransactWriteItems.mockResolvedValue({})
+          const { decide, decider } = spied()
+
+          const result = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command)
+
+          expect(decide).toHaveBeenCalledTimes(2)
+          expect(decide.mock.calls[0]![1].status).toBe("pending")
+          expect(decide.mock.calls[1]![1].status).toBe("in-progress")
+          // The head check, then the verified load.
+          expect(mockQuery).toHaveBeenCalledTimes(2)
+          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+          expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
+            "event@3",
+            "snapshot@3",
+          ])
+          expect(result.version).toBe(3)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a no-op is returned once the head is at the snapshot", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(pendingAt(1))
+          mockQuery.mockResolvedValue({ Items: [startedItem(1)] })
+          const { decide, decider } = spiedNoop()
+
+          const result = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, endMatch)
+
+          expect(result).toEqual({
+            state: { status: "pending", innings: [] },
+            version: 1,
+            events: [],
+          })
+          expect(decide).toHaveBeenCalledOnce()
+          expect(mockQuery).toHaveBeenCalledOnce()
+          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a no-op on a lagging snapshot is decided again on the verified state", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(pendingAt(1))
+          mockQuery
+            .mockResolvedValueOnce({ Items: [startedItem(2)] })
+            .mockResolvedValueOnce(latestPage(pendingAt(1), [startedItem(2)]))
+          mockTransactWriteItems.mockResolvedValue({})
+          const { decide, decider } = spiedNoop()
+
+          const result = yield* EventStore.commandHandler(decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, endMatch)
+
+          expect(decide).toHaveBeenCalledTimes(2)
+          expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
+            "event@3",
+            "snapshot@3",
+          ])
+          expect(result.version).toBe(3)
+          expect(result.state.status).toBe("completed")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a function-form additionalItems is not evaluated for a no-op", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(pendingAt(1))
+          mockQuery
+            .mockResolvedValueOnce({ Items: [startedItem(2)] })
+            .mockResolvedValueOnce(latestPage(pendingAt(1), [startedItem(2)]))
+          mockTransactWriteItems.mockResolvedValue({})
+          const versions: Array<number> = []
+
+          yield* EventStore.commandHandler(spiedNoop().decider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, endMatch, {
+            additionalItems: ({ version }) => {
+              versions.push(version)
+              return []
+            },
+          })
+
+          // Only the re-decision appended, so only it derived items.
+          expect(versions).toEqual([2])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
 
     describe("with expectedVersion", () => {
       it.effect("a snapshot at the expected version is decided on without a verified read", () =>
@@ -5194,22 +5329,113 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
         }).pipe(Effect.provide(TestLayer)),
       )
 
-      it.effect("its append-time conflict is reported, never re-read or retried", () =>
+      it.effect(
+        "its append-time conflict reports the head as actualVersion, never re-decided or retried",
+        () =>
+          Effect.gen(function* () {
+            // The If-Match equals the snapshot's v4, but v5 was appended raw.
+            snapshotGetItem(snapshotAt(4, 2))
+            mockTransactWriteItems.mockRejectedValue(conflict)
+            mockQuery.mockResolvedValue({ Items: [inningsItem(5)] })
+            const { decide, decider } = spied()
+
+            const error = yield* EventStore.commandHandler(decider, Inline, {
+              verifySnapshot: false,
+              retry: 5,
+            })({ matchId: "m-1" }, command, { expectedVersion: 4 }).pipe(Effect.flip)
+
+            expect(error._tag).toBe("VersionConflict")
+            expect((error as VersionConflict).actualVersion).toBe(5)
+            expect(decide).toHaveBeenCalledOnce()
+            expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+            // One head check, no verified load.
+            expect(mockQuery).toHaveBeenCalledOnce()
+            expect(mockQuery.mock.calls[0]![0].Limit).toBe(1)
+          }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a domain error or no-op at a lagging If-Match is a VersionConflict", () =>
         Effect.gen(function* () {
-          snapshotGetItem(snapshotAt(4, 2))
-          mockTransactWriteItems.mockRejectedValue(conflict)
-          const { decide, decider } = spied()
-
-          const error = yield* EventStore.commandHandler(decider, Inline, {
+          snapshotGetItem(makeSnapshotItem(label, "m-1", 1, { status: "p", innings: [] }))
+          mockQuery.mockResolvedValue({ Items: [inningsItem(2)] })
+          const handle = EventStore.commandHandler(matchDecider, Inline, {
             verifySnapshot: false,
-            retry: 5,
-          })({ matchId: "m-1" }, command, { expectedVersion: 4 }).pipe(Effect.flip)
+          })
+          const noopHandle = EventStore.commandHandler(
+            {
+              ...matchDecider,
+              decide: (c: MatchCommand, state: MatchState) =>
+                c._tag === "EndMatch" ? Effect.succeed([]) : matchDecider.decide(c, state),
+            },
+            Inline,
+            { verifySnapshot: false },
+          )
 
-          expect(error._tag).toBe("VersionConflict")
-          expect((error as VersionConflict).actualVersion).toBeUndefined()
-          expect(decide).toHaveBeenCalledOnce()
-          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-          expect(mockQuery).not.toHaveBeenCalled()
+          // `NotStarted` against the snapshot — but the stream has moved past v1.
+          const failed = yield* handle({ matchId: "m-1" }, command, { expectedVersion: 1 }).pipe(
+            Effect.flip,
+          )
+          expect(failed).toMatchObject({
+            _tag: "VersionConflict",
+            expectedVersion: 1,
+            actualVersion: 2,
+          })
+
+          const noop = yield* noopHandle(
+            { matchId: "m-1" },
+            { _tag: "EndMatch", result: "drawn" },
+            { expectedVersion: 1 },
+          ).pipe(Effect.flip)
+          expect(noop).toMatchObject({
+            _tag: "VersionConflict",
+            expectedVersion: 1,
+            actualVersion: 2,
+          })
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expect(mockQuery).toHaveBeenCalledTimes(2)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a domain error at an If-Match the head confirms is returned", () =>
+        Effect.gen(function* () {
+          snapshotGetItem(makeSnapshotItem(label, "m-1", 1, { status: "p", innings: [] }))
+          mockQuery.mockResolvedValue({ Items: [inningsItem(1)] })
+          const error = yield* EventStore.commandHandler(matchDecider, Inline, {
+            verifySnapshot: false,
+          })({ matchId: "m-1" }, command, { expectedVersion: 1 }).pipe(Effect.flip)
+          expect(error._tag).toBe("NotStarted")
+          expect(mockQuery).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a no-op redelivery at a lagging If-Match is a DuplicateCommand", () =>
+        Effect.gen(function* () {
+          mockGetItem.mockImplementation(async (input: any) => ({
+            Item:
+              fromAttributeMap(input.Key).sk === snapshotKey.sk
+                ? makeSnapshotItem(label, "m-1", 1, { status: "p", innings: [] })
+                : toAttributeMap({ pk: "x" }),
+          }))
+          mockQuery.mockResolvedValue({ Items: [inningsItem(2)] })
+
+          const error = yield* EventStore.commandHandler(
+            {
+              ...matchDecider,
+              decide: (c: MatchCommand, state: MatchState) =>
+                c._tag === "EndMatch" ? Effect.succeed([]) : matchDecider.decide(c, state),
+            },
+            Inline,
+            { verifySnapshot: false, idempotency: {} },
+          )(
+            { matchId: "m-1" },
+            { _tag: "EndMatch", result: "drawn" },
+            { commandId: "cmd-1", expectedVersion: 1 },
+          ).pipe(Effect.flip)
+
+          expect(error._tag).toBe("DuplicateCommand")
+          expect(fromAttributeMap(mockGetItem.mock.calls[1]![0].Key).sk).toBe(
+            "$cricket#v1#unverified.command#cmd-1",
+          )
         }).pipe(Effect.provide(TestLayer)),
       )
 

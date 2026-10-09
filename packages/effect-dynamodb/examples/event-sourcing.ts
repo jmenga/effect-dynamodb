@@ -725,7 +725,10 @@ const program = Effect.gen(function* () {
   // A fixed step size, not one computed from event sizes: event content varies.
   const STEP_SIZE = 50
 
-  /** Run one large command as fixed-size steps, chained by `expectedVersion`. */
+  /**
+   * Run one large command as fixed-size steps, chained by `expectedVersion`.
+   * Redelivered with the same `commandId` and `expectedVersion`, it resumes.
+   */
   const stepped = (
     matchId: string,
     balls: ReadonlyArray<number>,
@@ -735,17 +738,34 @@ const program = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       let version = expectedVersion
+      let skipping = false
       for (let n = 0; n * STEP_SIZE < balls.length; n++) {
         const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
         // An ordinary command: decide, fold, one atomic append with its own
         // snapshot and sentinel. Each step has its own commandId.
-        const result = yield* handleDeliveries({ matchId }, toCommand(step), {
-          commandId: `${commandId}#step-${n}`,
-          expectedVersion: version,
-        })
-        version = result.version
+        const run = (expected: number) =>
+          handleDeliveries({ matchId }, toCommand(step), {
+            commandId: `${commandId}#step-${n}`,
+            expectedVersion: expected,
+          }).pipe(Effect.map((result) => result.version))
+        const committed = yield* run(version).pipe(
+          // An earlier delivery committed this step. Keep the stale version, so
+          // the next step is checked against its sentinel too, before `decide`.
+          Effect.catchTag("DuplicateCommand", () => Effect.succeed(undefined)),
+          // After skipped steps: the first step not committed. Run it at the head.
+          Effect.catchTag("VersionConflict", (conflict) =>
+            skipping && conflict.actualVersion !== undefined
+              ? run(conflict.actualVersion)
+              : Effect.fail(conflict),
+          ),
+        )
+        skipping = committed === undefined
+        if (committed !== undefined) version = committed
       }
-      return version
+      // Every step was committed before: the stream's head.
+      return skipping
+      ? yield* deliveries.currentVersion({ matchId }, { consistentRead: true })
+      : version
     })
 
   const feed = Array.from({ length: 150 }, (_, i) => i + 1)
@@ -769,11 +789,14 @@ const program = Effect.gen(function* () {
 
   // The compensating undo: planned newest first, in the same fixed-size steps.
   const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
-  // → version 300. A failure partway stops at the last step's real state;
-  //   re-issuing the remaining steps continues from there.
+  // → version 300. A failure partway stops at the last step's real state.
+
+  // Redelivered (its response lost): every step is a duplicate, nothing is written.
+  const redelivered = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+  // → version 300
   // #endregion
   yield* Console.log(
-    `One command: ${tooLarge._tag}; stepped import: v${imported}; stepped undo: v${undone}`,
+    `One command: ${tooLarge._tag}; stepped import: v${imported}; stepped undo: v${undone}; redelivered undo: v${redelivered}`,
   )
 
   // --- Stream indexes ---

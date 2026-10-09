@@ -3015,21 +3015,32 @@ default):
   `[EDD-9026]`). On a stream without `snapshot` the option is ignored (the full verified
   read, as before).
 
-A stale snapshot (events appended raw, or data predating `mode: "inline"`) always
-surfaces before anything is written, and `commandHandler` falls back to a verified load
-itself:
+A snapshot can still lag the head (events appended raw, or data predating
+`mode: "inline"`), and then **every** answer made on it is stale — a domain error and a
+no-op as much as an append. So `commandHandler` returns no answer made on an unverified
+snapshot until the head confirms it. A successful append confirms it by itself (its
+version condition held); anything else is checked with one more read, and a stale load
+falls back to a verified one:
 
 | Situation | Behaviour |
 |---|---|
 | No snapshot item | `readLatest` falls back to the verified read at once; `decide` runs once |
-| `expectedVersion`, snapshot `asOfVersion` ≠ it | Verified `readLatest`, then the normal If-Match check: `VersionConflict.actualVersion` is the **verified** head; the `DuplicateCommand` probe keeps its precedence |
-| `expectedVersion`, snapshot `asOfVersion` = it | Decide and append; an append-time `VersionConflict` is reported, never retried (the If-Match rule) |
+| `expectedVersion`, snapshot `asOfVersion` ≠ it | Verified `readLatest`, then the normal If-Match check: `VersionConflict.actualVersion` is the **verified** head; the `DuplicateCommand` probe keeps its precedence. `decide` does not run |
+| `expectedVersion`, snapshot `asOfVersion` = it | The snapshot is exactly the state the caller saw: decide on it. An append confirms the head. A domain error, a no-op or an append `VersionConflict` is checked with one `Query` of the newest event (as `currentVersion`): a head at the If-Match returns the answer; a head past it discards the decision and answers as the verified load would — `DuplicateCommand` for a committed redelivery, else `VersionConflict` with the head as `actualVersion`. Never re-decided or retried (the If-Match rule) |
+| No `expectedVersion`, a domain error or a no-op | One `Query` of the newest event. Head at the snapshot → the answer stands. Head past it → the decision was made on stale state: a verified `readLatest` and **decide again once** on that state (its outcome is final for the attempt) |
 | No `expectedVersion`, the append fails with `VersionConflict` | One verified `readLatest`. Events past the current snapshot → the load was stale: **decide again once** on the verified state and append (outside, and in addition to, the `retry` policy; its own conflict follows the policy). Snapshot at the head → a genuine race: the `VersionConflict` goes to the `retry` policy as always, and a retried attempt loads unverified again |
 
-`decide` — and a function-form `additionalItems` — can therefore run **twice for one
-call** (the last row): the first decision was made on stale state. Without the automatic
-re-read, a lagging snapshot would fail every command on the stream, because only a
-successful inline append rewrites it.
+`decide` can therefore run **twice for one call** (the last two rows), and so can a
+function-form `additionalItems` when both decisions append. This is the price of skipping
+the verification read — the same price a `VersionConflict` retry pays: a decision is only
+as current as the state it was made on, and one made on stale state cannot be patched,
+only made again. Without the re-decision a lagging snapshot would fail or mis-answer every
+command on the stream, because only a successful inline append rewrites it; the
+re-decision's append repairs it. With an If-Match, `decide` may run on a snapshot whose
+version the stream has since moved past — on exactly the state the caller saw, as in a
+verified load that loses a race — but that decision is never returned. A decision that
+appends nothing costs the `GetItem` plus one `Query` of the newest event, so `false` pays
+off for streams whose commands mostly append.
 
 ### Large Commands — Stepped Commands
 
@@ -3050,10 +3061,19 @@ as **stepped commands**:
    with its own snapshot, projections and sentinel — with `expectedVersion` set to the
    version the previous step returned.
 3. A failure partway leaves the stream at a real, consistent intermediate state: the
-   last committed step. Re-issuing the remaining steps continues from there.
+   last committed step.
 
 With `idempotency`, each step needs its own `commandId` (e.g. `` `${commandId}#step-${n}` ``),
-so a redelivered step is a `DuplicateCommand` without blocking the steps after it. An
+which is also what lets a **redelivered** large command — same `commandId`, same original
+`expectedVersion` — resume after a partial failure. Its first step's If-Match is stale, so
+the handler consults that step's sentinel before deciding: a committed step is a
+`DuplicateCommand`. The application skips it **keeping the stale If-Match**, so each
+following step is checked the same way, without `decide` running; the first step not
+committed is a `VersionConflict` whose `actualVersion` is the head, and runs from there,
+chaining as usual. Every step committed → every step skipped, nothing written.
+(`DuplicateCommand` carries no version: chaining the next step from the head instead
+would make `decide` run against the steps already applied — a compensating undo would
+fail its own validation.) The tutorial's helper does exactly this. An
 `AppendTooLarge` on a step carries `count` and `limit`: the signal that the configured
 step size is too large. Rule of thumb: **one command → one decision → one atomic
 append.** The tutorial's `stepped-command` example region runs a 150-event import and
@@ -3501,7 +3521,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
-| `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and unset on an append-time conflict, where the actual version is unknown without another read |
+| `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and by an unverified-snapshot If-Match whose decision is confirmed against the head (the head read), and unset on any other append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
 | `AppendTooLarge` | An `EventStore` append exceeds 100 transact items; nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
