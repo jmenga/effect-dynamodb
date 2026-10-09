@@ -3026,8 +3026,8 @@ falls back to a verified one:
 |---|---|
 | No snapshot item | `readLatest` falls back to the verified read at once; `decide` runs once |
 | `expectedVersion`, snapshot `asOfVersion` ≠ it | Verified `readLatest`, then the normal If-Match check: `VersionConflict.actualVersion` is the **verified** head; the `DuplicateCommand` probe keeps its precedence. `decide` does not run |
-| `expectedVersion`, snapshot `asOfVersion` = it | The snapshot is exactly the state the caller saw: decide on it. An append confirms the head. A domain error, a no-op or an append `VersionConflict` is checked with one `Query` of the newest event (as `currentVersion`): a head at the If-Match returns the answer; a head past it discards the decision and answers as the verified load would — `DuplicateCommand` for a committed redelivery, else `VersionConflict` with the head as `actualVersion`. Never re-decided or retried (the If-Match rule) |
-| No `expectedVersion`, a domain error or a no-op | One `Query` of the newest event. Head at the snapshot → the answer stands. Head past it → the decision was made on stale state: a verified `readLatest` and **decide again once** on that state (its outcome is final for the attempt) |
+| `expectedVersion`, snapshot `asOfVersion` = it | The snapshot is exactly the state the caller saw: decide on it. An append confirms the head. A domain error, a no-op or an append `VersionConflict` is checked with one head `Query` above the If-Match (it reads no items while the stream is still there): a head at the If-Match returns the answer; a head past it discards the decision and answers as the verified load would — `DuplicateCommand` for a committed redelivery, else `VersionConflict` with the head as `actualVersion`. Never re-decided or retried (the If-Match rule) |
+| No `expectedVersion`, a domain error or a no-op | One head `Query` above the snapshot's version. Head at the snapshot → the answer stands. Head past it → the decision was made on stale state: a verified `readLatest` and **decide again once** on that state (its outcome is final for the attempt) |
 | No `expectedVersion`, the append fails with `VersionConflict` | One verified `readLatest`. Events past the current snapshot → the load was stale: **decide again once** on the verified state and append (outside, and in addition to, the `retry` policy; its own conflict follows the policy). Snapshot at the head → a genuine race: the `VersionConflict` goes to the `retry` policy as always, and a retried attempt loads unverified again |
 
 `decide` can therefore run **twice for one call** (the last two rows), and so can a
@@ -3039,8 +3039,11 @@ command on the stream, because only a successful inline append rewrites it; the
 re-decision's append repairs it. With an If-Match, `decide` may run on a snapshot whose
 version the stream has since moved past — on exactly the state the caller saw, as in a
 verified load that loses a race — but that decision is never returned. A decision that
-appends nothing costs the `GetItem` plus one `Query` of the newest event, so `false` pays
-off for streams whose commands mostly append.
+appends nothing adds one head `Query` bounded below by the snapshot's version (reverse,
+`Limit: 1`). While the snapshot is current that range is empty, so the `Query` reads no
+items and costs only DynamoDB's per-request minimum, however large the events are; only a
+lagging snapshot makes it read an event (the head). The trade-off for such decisions is
+one extra round trip, not extra item reads.
 
 ### Large Commands — Stepped Commands
 

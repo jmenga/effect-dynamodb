@@ -8966,6 +8966,8 @@ const esLatLog: Array<{
   readonly op: "query" | "transactWriteItems" | "putItem" | "getItem"
   readonly pk: string | undefined
   readonly items?: ReadonlyArray<Record<string, unknown>>
+  /** Items a `query` read (its `ScannedCount`), recorded when it returns. */
+  scanned?: number | undefined
 }> = []
 
 /** The stream partition a transact item touches. */
@@ -8981,8 +8983,18 @@ const EsLatClientLayer = Layer.effect(
     (client): DynamoClientService => ({
       ...client,
       query: (input) => {
-        esLatLog.push({ op: "query", pk: input.ExpressionAttributeValues?.[":pk"]?.S })
-        return client.query(input)
+        const entry: (typeof esLatLog)[number] = {
+          op: "query",
+          pk: input.ExpressionAttributeValues?.[":pk"]?.S,
+        }
+        esLatLog.push(entry)
+        return client.query(input).pipe(
+          Effect.tap((output) =>
+            Effect.sync(() => {
+              entry.scanned = output.ScannedCount
+            }),
+          ),
+        )
       },
       getItem: (input) => {
         esLatLog.push({ op: "getItem", pk: input.Key?.pk?.S })
@@ -9471,8 +9483,14 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
         const refused = yield* handle(key, { _tag: "Withdraw", amount: 100 }).pipe(Effect.flip)
         expect(refused._tag).toBe("EsCmdInsufficientFunds")
         expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "query"])
+        // The head check is bounded above the snapshot, so a current snapshot
+        // costs a Query that reads no items — never the newest event.
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(0)
+        mark = esLatRequests("ledger", accountId).length
         const noop = yield* lenientHandle(key, { _tag: "Withdraw", amount: 100 })
         expect(noop).toEqual({ state: { balance: 10, txCount: 1 }, version: 1, events: [] })
+        expect(ledgerOpsSince(accountId, mark)).toEqual(["getItem", "query"])
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(0)
 
         // 500 deposited raw, without a snapshot: snapshot v1 (balance 10), head v2.
         yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 1)
@@ -9489,6 +9507,8 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
           "query",
           "transactWriteItems",
         ])
+        // On a stale snapshot the head check reads exactly the head event.
+        expect(esLatRequests("ledger", accountId)[mark + 1]!.scanned).toBe(1)
 
         // The same for a no-op made on a stale snapshot.
         yield* EsLedger.append(key, [new EsCmdDeposited({ amount: 500 })], 3)

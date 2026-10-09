@@ -769,6 +769,30 @@ const commandSentinelProbeOf = (stream: object): CommandSentinelProbeFn | undefi
   (stream as { [CommandSentinelProbe]?: CommandSentinelProbeFn })[CommandSentinelProbe]
 
 /**
+ * @internal Carries a head probe bounded below by a known version: the newest
+ * event version above `floorVersion`, or `floorVersion` itself when there is
+ * none. {@link commandHandler} uses it to confirm an unverified snapshot is
+ * still the head. Unlike `currentVersion`, it never reads the newest event when
+ * the snapshot is current — the key range above `floorVersion` is empty, so the
+ * `Query` reads no items and costs only DynamoDB's per-request minimum, however
+ * large the events are. Attached by `makeStream` and `bind` like
+ * {@link CommandSentinelProbe}; a hand-built stream falls back to
+ * `currentVersion`.
+ */
+const HeadAboveProbe: unique symbol = Symbol.for("effect-dynamodb/EventStream/HeadAboveProbe")
+
+/** @internal */
+type HeadAboveProbeFn = (
+  streamId: Record<string, unknown>,
+  floorVersion: number,
+  options?: ReadOptions | undefined,
+) => Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+
+/** @internal */
+const headAboveProbeOf = (stream: object): HeadAboveProbeFn | undefined =>
+  (stream as { [HeadAboveProbe]?: HeadAboveProbeFn })[HeadAboveProbe]
+
+/**
  * @internal `[EDD-9068]`: `verifySnapshot: false` is accepted only by a stream
  * whose snapshot is written in every append (`mode: "inline"` without `every`),
  * the only mode in which the snapshot is normally at the head. Returns the
@@ -1940,6 +1964,29 @@ export const makeStream = <
       return newest.version
     })
 
+  // headAbove (internal — see HeadAboveProbe)
+  const headAbove = (
+    streamId: Record<string, unknown>,
+    floorVersion: number,
+    options?: ReadOptions | undefined,
+  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      // Reverse, `Limit: 1`, bounded below by `floorVersion + 1`: an empty range
+      // (the common case — nothing appended past the snapshot) reads no items;
+      // otherwise the single evaluated item is the head.
+      const query = withReadOptions(
+        buildEventsQuery(streamId as StreamIdInput<TStreamIdFields>).pipe(
+          Query.where({ between: [composeEventSk(floorVersion + 1), maxEventSk] }),
+          Query.reverse,
+          Query.limit(1),
+        ),
+        options,
+      )
+      const page = yield* Query.execute(query)
+      const newest = page.items[0]
+      return newest === undefined ? floorVersion : newest.version
+    })
+
   // ---------------------------------------------------------------------------
   // Snapshot primitives
   // ---------------------------------------------------------------------------
@@ -2346,6 +2393,7 @@ export const makeStream = <
     query: queryNamespace,
     [StreamIdFormatter]: composeStreamIdString,
     [CommandSentinelProbe]: hasCommandSentinel,
+    [HeadAboveProbe]: headAbove,
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,
@@ -2522,6 +2570,7 @@ export const bind = <
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
     const probe = commandSentinelProbeOf(stream)
+    const headProbe = headAboveProbeOf(stream)
 
     return {
       [EventStreamTypeId]: EventStreamTypeId,
@@ -2551,6 +2600,11 @@ export const bind = <
         probe === undefined
           ? undefined
           : (id: Record<string, unknown>, commandId: string) => provide(probe(id, commandId)),
+      [HeadAboveProbe]:
+        headProbe === undefined
+          ? undefined
+          : (id: Record<string, unknown>, floorVersion: number, options?: ReadOptions) =>
+              provide(headProbe(id, floorVersion, options)),
     } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>
   })
 
@@ -2756,8 +2810,8 @@ export interface CommandHandlerOptions {
    *   check, so only a genuine mismatch is reported (its `actualVersion` is
    *   the verified head). A snapshot at the expected version holds exactly the
    *   state the caller saw, so `decide` runs on it; if that decision does not
-   *   append, one `Query` of the newest event (as
-   *   {@link EventStream.currentVersion}) checks the head. A head past the
+   *   append, one head `Query` above the If-Match checks the head (see
+   *   below). A head past the
    *   If-Match discards the decision and answers as a verified load would:
    *   `DuplicateCommand` for a committed redelivery, else `VersionConflict`
    *   with the head as `actualVersion` — never re-decided or retried.
@@ -2780,10 +2834,12 @@ export interface CommandHandlerOptions {
    *   once per attempt, and the second decision's outcome is final for the
    *   attempt (its conflict follows the policy).
    *
-   * A decision that appends nothing therefore costs the `GetItem` and one
-   * `Query` of the newest event — more than the verified load's single
-   * `Query` when events are small. `false` pays off for streams whose
-   * commands mostly append.
+   * The head check is a reverse `Limit: 1` `Query` bounded below by the
+   * snapshot's version (or the If-Match), never a read of the newest event:
+   * while the snapshot is current the range is empty, so it reads no items
+   * and costs only DynamoDB's per-request minimum, however large the events
+   * are. A decision that appends nothing therefore costs one extra round trip,
+   * not extra item reads.
    */
   readonly verifySnapshot?: boolean | undefined
 }
@@ -3254,6 +3310,15 @@ const makeCommandHandlerImpl = <
         })
       })
 
+    // The head, known to be at least `floorVersion` (see HeadAboveProbe): one
+    // `Query` that reads no items while the snapshot is current.
+    const headAbove = (floorVersion: number) => {
+      const probe = headAboveProbeOf(stream)
+      return probe !== undefined
+        ? probe(streamId as Record<string, unknown>, floorVersion, readOptions)
+        : stream.currentVersion(streamId, readOptions)
+    }
+
     const attempt = Effect.gen(function* () {
       // Backstop for JS callers and `any`-shaped call sites: silently degrading
       // to at-least-once would look like success right up until the day a
@@ -3338,15 +3403,16 @@ const makeCommandHandlerImpl = <
       // The first decision is discarded. Never re-decided: an If-Match call's
       // conflict is its answer.
       if (expectedVersion !== undefined) {
-        const head = yield* stream.currentVersion(streamId, readOptions)
+        const head = yield* headAbove(expectedVersion)
         if (head !== expectedVersion) return yield* ifMatchMismatch(expectedVersion, head)
         return yield* firstAnswer
       }
 
       // No If-Match, nothing appended: a head at the snapshot's version
-      // confirms the answer (one `Query` of the newest event).
+      // confirms the answer (one `Query` above the snapshot's version, which
+      // reads no items while the snapshot is current).
       if (first === undefined) {
-        const head = yield* stream.currentVersion(streamId, readOptions)
+        const head = yield* headAbove(loaded.version)
         if (head === loaded.version) return yield* firstAnswer
       }
 

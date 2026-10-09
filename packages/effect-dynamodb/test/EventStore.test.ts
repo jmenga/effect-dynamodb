@@ -4816,6 +4816,27 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
   })
 
   const label = "unverified"
+  /**
+   * The head check of an unverified load: one reverse `Limit: 1` `Query`
+   * bounded below by the event after `floorVersion`, so a snapshot at the head
+   * reads no items at all.
+   */
+  const expectHeadAbove = (call: any, floorVersion: number) => {
+    expect(call.Limit).toBe(1)
+    expect(call.ScanIndexForward).toBe(false)
+    expect(call.ConsistentRead).toBe(true)
+    expect(call.KeyConditionExpression).toContain("#sk BETWEEN :sk1 AND :sk2")
+    expect(call.ExpressionAttributeValues[":sk1"].S).toBe(
+      DynamoSchema.composeEventVersionKey(AppSchema, `${label}.event`, floorVersion + 1),
+    )
+    expect(call.ExpressionAttributeValues[":sk2"].S).toBe(
+      DynamoSchema.composeEventVersionKey(
+        AppSchema,
+        `${label}.event`,
+        DynamoSchema.MAX_EVENT_VERSION,
+      ),
+    )
+  }
   const snapshotKey = {
     pk: "$cricket#v1#unverified#m-1",
     sk: DynamoSchema.composeKey(AppSchema, "unverified.snapshot", []),
@@ -5192,17 +5213,12 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
         return { decide, decider }
       }
       const endMatch: MatchCommand = { _tag: "EndMatch", result: "drawn" }
-      /** The head check: one reverse `Query` of the newest event. */
-      const expectHeadCheck = (call: any) => {
-        expect(call.Limit).toBe(1)
-        expect(call.ScanIndexForward).toBe(false)
-        expect(call.ConsistentRead).toBe(true)
-      }
 
       it.effect("a domain error is returned once the head is at the snapshot", () =>
         Effect.gen(function* () {
           snapshotGetItem(snapshotAt(4, 2))
-          mockQuery.mockResolvedValue({ Items: [inningsItem(4)] })
+          // Nothing above v4: the head check reads no items.
+          mockQuery.mockResolvedValue({ Items: [] })
           const { decide, decider } = spied()
           const error = yield* EventStore.commandHandler(decider, Inline, {
             verifySnapshot: false,
@@ -5213,7 +5229,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           expect(error._tag).toBe("AlreadyStarted")
           expect(decide).toHaveBeenCalledOnce()
           expect(mockQuery).toHaveBeenCalledOnce()
-          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expectHeadAbove(mockQuery.mock.calls[0]![0], 4)
           expect(mockTransactWriteItems).not.toHaveBeenCalled()
         }).pipe(Effect.provide(TestLayer)),
       )
@@ -5237,7 +5253,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           expect(decide.mock.calls[1]![1].status).toBe("in-progress")
           // The head check, then the verified load.
           expect(mockQuery).toHaveBeenCalledTimes(2)
-          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expectHeadAbove(mockQuery.mock.calls[0]![0], 1)
           expect(mockTransactWriteItems).toHaveBeenCalledOnce()
           expect(transactShape(mockTransactWriteItems.mock.calls[0]![0])).toEqual([
             "event@3",
@@ -5250,7 +5266,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
       it.effect("a no-op is returned once the head is at the snapshot", () =>
         Effect.gen(function* () {
           snapshotGetItem(pendingAt(1))
-          mockQuery.mockResolvedValue({ Items: [startedItem(1)] })
+          mockQuery.mockResolvedValue({ Items: [] })
           const { decide, decider } = spiedNoop()
 
           const result = yield* EventStore.commandHandler(decider, Inline, {
@@ -5264,7 +5280,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           })
           expect(decide).toHaveBeenCalledOnce()
           expect(mockQuery).toHaveBeenCalledOnce()
-          expectHeadCheck(mockQuery.mock.calls[0]![0])
+          expectHeadAbove(mockQuery.mock.calls[0]![0], 1)
           expect(mockTransactWriteItems).not.toHaveBeenCalled()
         }).pipe(Effect.provide(TestLayer)),
       )
@@ -5348,9 +5364,9 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
             expect((error as VersionConflict).actualVersion).toBe(5)
             expect(decide).toHaveBeenCalledOnce()
             expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-            // One head check, no verified load.
+            // One head check above the If-Match, no verified load.
             expect(mockQuery).toHaveBeenCalledOnce()
-            expect(mockQuery.mock.calls[0]![0].Limit).toBe(1)
+            expectHeadAbove(mockQuery.mock.calls[0]![0], 4)
           }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -5399,12 +5415,13 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
       it.effect("a domain error at an If-Match the head confirms is returned", () =>
         Effect.gen(function* () {
           snapshotGetItem(makeSnapshotItem(label, "m-1", 1, { status: "p", innings: [] }))
-          mockQuery.mockResolvedValue({ Items: [inningsItem(1)] })
+          mockQuery.mockResolvedValue({ Items: [] })
           const error = yield* EventStore.commandHandler(matchDecider, Inline, {
             verifySnapshot: false,
           })({ matchId: "m-1" }, command, { expectedVersion: 1 }).pipe(Effect.flip)
           expect(error._tag).toBe("NotStarted")
           expect(mockQuery).toHaveBeenCalledOnce()
+          expectHeadAbove(mockQuery.mock.calls[0]![0], 1)
         }).pipe(Effect.provide(TestLayer)),
       )
 

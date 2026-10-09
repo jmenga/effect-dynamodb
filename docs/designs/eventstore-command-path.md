@@ -306,14 +306,14 @@ falls back to a verified one:
 3. **With `expectedVersion`**, snapshot `asOfVersion` = `expectedVersion`: the
    snapshot holds exactly the state the caller saw, so decide on it. A
    successful append is the answer. A domain error, a no-op or an append-time
-   `VersionConflict` is checked with one `Query` of the newest event (as
-   `currentVersion`): a head at the If-Match returns the answer; a head past
+   `VersionConflict` is checked with one head `Query` above the If-Match
+   (below): a head at the If-Match returns the answer; a head past
    it discards the decision and answers as the verified load (case 2) would —
    `DuplicateCommand` for a committed redelivery, else `VersionConflict` with
    the head as `actualVersion`. Never re-decided or retried (the If-Match
    rule).
-4. **Without `expectedVersion`**, a domain error or a no-op: one `Query` of the
-   newest event. A head at the snapshot's version confirms the answer. A head
+4. **Without `expectedVersion`**, a domain error or a no-op: one head `Query`
+   above the snapshot's version (below). A head at the snapshot's version confirms the answer. A head
    past it means the decision was made on stale state: a verified `readLatest`,
    and the handler decides again **once** on that state; that outcome is final
    for the attempt.
@@ -342,11 +342,20 @@ does — but that decision is never returned.
 
 Request counts with `verifySnapshot: false`: a current snapshot loads with one
 `GetItem` (one item read), and a decision that appends needs nothing more; a
-decision that does not append adds one `Query` of the newest event (so a
-stream whose commands mostly refuse or no-op is better served by the default);
+decision that does not append adds one head `Query`;
 a missing snapshot costs the `GetItem` plus the verified read; a stale one
 costs the `GetItem`, the failed transaction or head check, the verified read
 and a second transaction — once, after which the snapshot is current again.
+
+**The head check.** The check never asks for the newest event (which would
+read it — exactly the item `verifySnapshot: false` exists to skip). It is a
+reverse `Limit: 1` `Query` over `[event at floor + 1 … last possible event]`,
+where the floor is the snapshot's `asOfVersion` (or the If-Match, which equals
+it in case 3). While the snapshot is current the range is empty: the `Query`
+reads no items and costs only DynamoDB's per-request minimum, whatever the
+event sizes. When the snapshot lags, the single item evaluated is the head
+event, whose version is the answer. A decision that appends nothing therefore
+costs one extra round trip, not extra item reads.
 
 ## 5. Large commands — stepped commands (#141, not implemented)
 

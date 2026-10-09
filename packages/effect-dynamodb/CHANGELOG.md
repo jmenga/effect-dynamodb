@@ -47,7 +47,9 @@
     snapshot's `asOfVersion` as an **unverified** `version`. The handler
     returns nothing decided on an unverified snapshot until the head confirms
     it: a successful append confirms it by itself, and a domain error, a no-op
-    or an append conflict is checked with one more read. It falls back to a
+    or an append conflict is checked with one more read — a `Query` for events
+    after the snapshot's version, which reads no items while the snapshot is
+    current. It falls back to a
     verified load at once when there is no snapshot, and before reporting an
     If-Match mismatch, so `actualVersion` is the verified head; an If-Match at a
     lagging snapshot's version answers as the verified load would. Without
