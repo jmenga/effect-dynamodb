@@ -5,7 +5,7 @@
  * append/read/readFrom/currentVersion operations, fold helpers, Query combinators,
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
- * chunked appends and stream indexes.
+ * large commands as stepped commands, and stream indexes.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -228,7 +228,66 @@ const InlineMatchEvents = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 6. Stream indexes — sub-streams ordered by a key derived from each event
+// 6. Stepped commands — a large command as fixed-size atomic steps
+// ---------------------------------------------------------------------------
+
+// #region stepped-decider
+// Ball-by-ball deliveries from a scoring feed, and their compensating undo.
+class DeliveryRecorded extends Schema.TaggedClass<DeliveryRecorded>()("DeliveryRecorded", {
+  ball: Schema.Number,
+}) {}
+
+class DeliveryReverted extends Schema.TaggedClass<DeliveryReverted>()("DeliveryReverted", {
+  ball: Schema.Number,
+}) {}
+
+type DeliveryEvent = DeliveryRecorded | DeliveryReverted
+
+const DeliveryState = Schema.Struct({ live: Schema.Array(Schema.Number) })
+type DeliveryState = typeof DeliveryState.Type
+
+const Deliveries = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Deliveries",
+  events: [DeliveryRecorded, DeliveryReverted],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: DeliveryState, mode: "inline" },
+})
+
+type DeliveryCommand =
+  | { readonly _tag: "RecordDeliveries"; readonly balls: ReadonlyArray<number> }
+  | { readonly _tag: "RevertDeliveries"; readonly balls: ReadonlyArray<number> }
+
+class NotRecorded extends Data.TaggedError("NotRecorded")<{ readonly ball: number }> {}
+
+const deliveryDecider: EventStore.Decider<
+  DeliveryState,
+  DeliveryCommand,
+  DeliveryEvent,
+  NotRecorded
+> = {
+  initialState: { live: [] },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "RecordDeliveries") {
+        return command.balls.map((ball) => new DeliveryRecorded({ ball }))
+      }
+      for (const ball of command.balls) {
+        if (!state.live.includes(ball)) return yield* new NotRecorded({ ball })
+      }
+      return command.balls.map((ball) => new DeliveryReverted({ ball }))
+    }),
+  evolve: (state, event) => ({
+    live:
+      event._tag === "DeliveryRecorded"
+        ? [...state.live, event.ball]
+        : state.live.filter((ball) => ball !== event.ball),
+  }),
+}
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 7. Stream indexes — sub-streams ordered by a key derived from each event
 // ---------------------------------------------------------------------------
 
 // #region index-stream
@@ -264,7 +323,7 @@ const Scorecards = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 7. Main program
+// 8. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
@@ -635,33 +694,67 @@ const program = Effect.gen(function* () {
     `readLatest: version ${loadedState.version}, ${loadedState.events.length} events after the snapshot, status=${current.status}`,
   )
 
-  // --- Chunked appends ---
-  yield* Console.log("\n=== Chunked append ===")
-  // #region chunked-append
-  // A historical scorecard import: 150 events cannot fit one transaction.
-  const imported = Array.from(
-    { length: 150 },
-    (_, i) => new InningsCompleted({ innings: i + 1, runs: 100 + i, wickets: 10 }),
+  // --- Large commands: stepped commands ---
+  yield* Console.log("\n=== Stepped commands ===")
+  // #region stepped-command
+  const deliveries = yield* EventStore.bind(Deliveries)
+  const handleDeliveries = EventStore.commandHandler(deliveryDecider, deliveries, {
+    idempotency: { ttl: Duration.days(1) },
+  })
+
+  // A fixed step size, not one computed from event sizes: event content varies.
+  const STEP_SIZE = 50
+
+  /** Run one large command as fixed-size steps, chained by `expectedVersion`. */
+  const stepped = (
+    matchId: string,
+    balls: ReadonlyArray<number>,
+    toCommand: (step: ReadonlyArray<number>) => DeliveryCommand,
+    commandId: string,
+    expectedVersion: number,
+  ) =>
+    Effect.gen(function* () {
+      let version = expectedVersion
+      for (let n = 0; n * STEP_SIZE < balls.length; n++) {
+        const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
+        // An ordinary command: decide, fold, one atomic append with its own
+        // snapshot and sentinel. Each step has its own commandId.
+        const result = yield* handleDeliveries({ matchId }, toCommand(step), {
+          commandId: `${commandId}#step-${n}`,
+          expectedVersion: version,
+        })
+        version = result.version
+      }
+      return version
+    })
+
+  const feed = Array.from({ length: 150 }, (_, i) => i + 1)
+  const record = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+    _tag: "RecordDeliveries",
+    balls,
+  })
+  const revert = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+    _tag: "RevertDeliveries",
+    balls,
+  })
+
+  // One decision of 150 events cannot be one atomic append.
+  const tooLarge = yield* handleDeliveries({ matchId: "m-8" }, record(feed), {
+    commandId: "feed-1",
+  }).pipe(Effect.flip)
+  // → AppendTooLarge (count 152, limit 100) — nothing written
+
+  const imported = yield* stepped("m-8", feed, record, "feed-1", 0)
+  // → version 150, in three atomic steps
+
+  // The compensating undo: planned newest first, in the same fixed-size steps.
+  const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+  // → version 300. A failure partway stops at the last step's real state;
+  //   re-issuing the remaining steps continues from there.
+  // #endregion
+  yield* Console.log(
+    `One command: ${tooLarge._tag}; stepped import: v${imported}; stepped undo: v${undone}`,
   )
-
-  const tooLarge = yield* matchEvents.append({ matchId: "m-8" }, imported, 0).pipe(Effect.flip)
-  // → AppendTooLarge — nothing written
-
-  const bulk = yield* matchEvents.append({ matchId: "m-8" }, imported, 0, { chunked: true })
-  // → version 150, written as two transactions — NOT atomic
-  // #endregion
-  yield* Console.log(`Without chunked: ${tooLarge._tag}; with chunked: version ${bulk.version}`)
-
-  // #region partial-append
-  const progress = yield* matchEvents
-    .append({ matchId: "m-9" }, imported, 0, { chunked: true })
-    .pipe(
-      Effect.map((result) => result.version),
-      // A failure after the first transaction: a prefix of the events is durable.
-      Effect.catchTag("PartialAppend", (partial) => Effect.succeed(partial.committedVersion)),
-    )
-  // #endregion
-  yield* Console.log(`Imported m-9 up to version ${progress}`)
 
   // --- Stream indexes ---
   yield* Console.log("\n=== Stream indexes ===")
@@ -735,7 +828,7 @@ const program = Effect.gen(function* () {
 })
 
 // ---------------------------------------------------------------------------
-// 8. Provide dependencies and run
+// 9. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region layer-setup

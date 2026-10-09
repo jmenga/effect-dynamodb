@@ -18,7 +18,7 @@ import type {
   OptimisticLockError,
   UniqueConstraintViolation,
 } from "@effect-dynamodb/schema/Errors.js"
-import { TRANSACT_WRITE_ITEMS_LIMIT, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
@@ -35,7 +35,7 @@ import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
-import { type SizeBound, TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
 import {
   composePrimaryKey,
   rejectUnsupportedOp,
@@ -139,59 +139,25 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
       }
 
 /**
- * What one transact entry contributes to its transaction's size by DynamoDB's
- * item-size rules ({@link transactItemBytes}), erring the way `bound` says:
- *
- * - `"lower"` (default) never counts more than DynamoDB does, so a refusal on
- *   it ({@link refuseOversizedTransaction}) never refuses a transaction
- *   DynamoDB would accept.
- * - `"upper"` never counts less, so a budget on it never overfills — what
- *   `EventStore.append`'s chunk planner fills its chunks by.
- *
- * Shared by both, so the refusal and the planner cannot drift apart.
- */
-export const transactEntryBytes = (item: TransactWriteItem, bound: SizeBound = "lower"): number =>
-  transactItemBytes(item, bound)
-
-/**
- * Whether `count` entries of `bytes` in total fit one `TransactWriteItems`
- * request: DynamoDB's 100-item cap and its 4 MB aggregate size limit.
- */
-export const fitsOneTransaction = (count: number, bytes: number): boolean =>
-  count <= TRANSACT_WRITE_ITEMS_LIMIT && bytes <= TRANSACT_WRITE_MAX_BYTES
-
-/** The total size of `items` and the largest of them, by {@link transactEntryBytes}. */
-export const measureTransaction = (
-  items: ReadonlyArray<TransactWriteItem>,
-  bound: SizeBound = "lower",
-): {
-  readonly total: number
-  readonly largest: { readonly index: number; readonly bytes: number }
-} => {
-  let total = 0
-  let largest = { index: 0, bytes: -1 }
-  for (const [index, item] of items.entries()) {
-    const bytes = transactEntryBytes(item, bound)
-    total += bytes
-    if (bytes > largest.bytes) largest = { index, bytes }
-  }
-  return { total, largest }
-}
-
-/**
  * Refuse a transaction whose items exceed DynamoDB's 4 MB aggregate limit —
  * BEFORE it is sent, with the entity that contributes most named, rather
- * than DynamoDB's bare `ValidationException`. Sizes are measured by
- * {@link measureTransaction} (a lower bound), so a transaction DynamoDB would
- * accept is never refused; a retain put counts twice — its item and its
- * snapshot carry the same attributes.
+ * than DynamoDB's bare `ValidationException`. Sizes are a LOWER bound by
+ * DynamoDB's item-size rules ({@link transactItemBytes}), so a transaction
+ * DynamoDB would accept is never refused; a retain put counts twice — its
+ * item and its snapshot carry the same attributes.
  */
 export const refuseOversizedTransaction = (
   items: ReadonlyArray<TransactWriteItem>,
   targets: ReadonlyArray<TransactItemTarget>,
   operation: string,
 ): Effect.Effect<void, ValidationError> => {
-  const { total, largest } = measureTransaction(items)
+  let total = 0
+  let largest = { index: 0, bytes: -1 }
+  for (const [index, item] of items.entries()) {
+    const bytes = transactItemBytes(item)
+    total += bytes
+    if (bytes > largest.bytes) largest = { index, bytes }
+  }
   if (total <= TRANSACT_WRITE_MAX_BYTES) return Effect.void
   const target = targets[largest.index]
   return Effect.fail(

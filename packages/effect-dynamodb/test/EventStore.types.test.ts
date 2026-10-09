@@ -9,8 +9,8 @@
  *   every `additionalItems` form, in all four call shapes.
  * - `readLatest` (#138) returns the stream's snapshot state type; an inline
  *   `AppendOptions.snapshot` is typed by it (and refused on a snapshot-less
- *   stream); `chunked` (#141) is accepted per call and per handler, and
- *   `PartialAppend` joins the append and handler error channels.
+ *   stream). An append is always one atomic transaction: there is no
+ *   `chunked` option on `append` or `commandHandler`.
  * - Stream indexes (#140): the index names are a trailing `TIndexName` type
  *   parameter, so `readIndex` / `query.index` refuse an undeclared name, the
  *   `key` callback is typed by the stream's events, and indexed streams still
@@ -21,11 +21,7 @@
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type {
-  PartialAppend,
-  ValidationError,
-  VersionConflict,
-} from "@effect-dynamodb/schema/Errors.js"
+import type { ValidationError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
 import { Context, Data, Effect, type Option, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
@@ -295,7 +291,7 @@ describe("EventStore.commandHandler types", () => {
     expect(true).toBe(true)
   })
 
-  it("readLatest, inline snapshots and chunked appends are typed (#138, #141)", () => {
+  it("readLatest and inline snapshots are typed, and appends stay atomic (#138)", () => {
     typeOnly(() => {
       const Snapshotted = EventStore.makeStream({
         table: AppTable,
@@ -316,21 +312,22 @@ describe("EventStore.commandHandler types", () => {
       // An inline snapshot is the stream's state type...
       const appended = Snapshotted.append(key, [new Incremented({ by: 1 })], 0, {
         snapshot: { total: 1 },
-        chunked: true,
       })
-      expectTypeOf<Effect.Error<typeof appended>>().toExtend<
-        EventStore.AppendError | PartialAppend
-      >()
-      expectTypeOf<PartialAppend>().toExtend<Effect.Error<typeof appended>>()
+      expectTypeOf<Effect.Error<typeof appended>>().toEqualTypeOf<EventStore.AppendError>()
       // @ts-expect-error — not the state type
       Snapshotted.append(key, [new Incremented({ by: 1 })], 0, { snapshot: { label: "x" } })
       // ...and there is none on a stream without a snapshot config.
       // @ts-expect-error — `never` on a snapshot-less stream
       Counter.append(key, [new Incremented({ by: 1 })], 0, { snapshot: { total: 1 } })
 
-      const handle = EventStore.commandHandler(decider, Counter, { chunked: true })
-      const handled = handle(key, command, { chunked: false })
-      expectTypeOf<PartialAppend>().toExtend<Effect.Error<typeof handled>>()
+      // No append is ever split across transactions: there is no `chunked`.
+      // @ts-expect-error — not an append option
+      Counter.append(key, [new Incremented({ by: 1 })], 0, { chunked: true })
+      // @ts-expect-error — not a handler option
+      EventStore.commandHandler(decider, Counter, { chunked: true })
+      const handle = EventStore.commandHandler(decider, Counter)
+      // @ts-expect-error — not a per-call option
+      handle(key, command, { chunked: true })
 
       Effect.gen(function* () {
         const bound = yield* EventStore.bind(Snapshotted)

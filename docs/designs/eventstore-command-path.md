@@ -1,9 +1,10 @@
-# EventStore — command-path extensions (#136–#141)
+# EventStore — command-path extensions (#136–#140)
 
-Status: accepted · Target: 1.24.0 (minor) · Issues: #136, #137, #138, #139, #140, #141
-(#142 — out of scope, see §8)
+Status: accepted · Target: 1.24.0 (minor) · Issues: #136, #137, #138, #139, #140
+(#141 — referenced, **not implemented**: large commands are stepped commands,
+see §5; #142 — out of scope, see §8)
 
-This document is the specification for six EventStore extensions delivered in
+This document is the specification for five EventStore extensions delivered in
 one PR. They converge on `append` and `commandHandler` in
 `packages/effect-dynamodb/src/EventStore.ts`, so they are built in dependency
 order on one branch:
@@ -11,7 +12,7 @@ order on one branch:
 | Stage | Issues | Theme |
 |---|---|---|
 | A | #139, #136, #137 | consistent reads, caller expected version, decision-derived items (fold-before-append) |
-| B | #138, #141 | inline snapshots + single-request load, opt-in chunked append |
+| B | #138 | inline snapshots + single-request load (and, for #141, the stepped-command guidance in §5) |
 | C | #140 | stream indexes (LSI / GSI sub-streams) |
 
 Everything is additive. Every default preserves today's behaviour, except that
@@ -69,7 +70,7 @@ Per-call `CommandOptions.expectedVersion?: number`. When it is supplied:
    `VersionConflict`: a redelivery whose response was lost carries its original
    If-Match, which the stream has since moved past, and it must be reported as
    already applied rather than as a lost race. This is the same precedence
-   `append` applies (and §5 keeps for chunked appends). An append-time conflict
+   `append` applies. An append-time conflict
    needs no probe — `append` already ranks the sentinel first.
 6. A value that is not a non-negative integer (`NaN` from a failed `If-Match`
    parse, a negative or fractional number) is a caller bug, not a conflict: it
@@ -250,112 +251,46 @@ page at two items.
 whatever the mode, consistent by default. Streams without a snapshot config
 keep `read` (consistent).
 
-## 5. Opt-in chunked append (#141)
+## 5. Large commands — stepped commands (#141, not implemented)
 
-```ts
-stream.append(streamId, events, expectedVersion, { chunked: true })
-yield* handle(streamId, command, { chunked: true })      // per call
-commandHandler(decider, stream, { chunked: true })       // handler default; per call overrides
-```
+#141 asked for an opt-in `chunked` append that split an append too large for
+one transaction across several. It was built and then removed in review, and
+`append` / `commandHandler` stay strictly atomic.
 
-The default (`chunked` absent or `false`) is unchanged: anything over the
-limits fails with `AppendTooLarge`.
+**Why not.** `append` receives one decision: many events and **one** state —
+the state after all of them. Split across transactions, it has no
+intermediate states to put at the chunk boundaries: the inline snapshot, the
+decision-derived projections and the idempotency sentinel are only true at the
+end, so every boundary is either missing them or wrong. Only the
+application's decider can produce a valid state for each boundary.
 
-With `chunked: true`:
+**The pattern.** A large command (an import, a bulk correction, a
+compensating undo) is run as stepped commands:
 
-1. **Fits in one transaction.** It is written exactly as non-chunked. It is
-   atomic, has one request and the same error mapping.
-2. **Splitting.** Otherwise events are split, in order, into chunks that each
-   fit 100 items and 4 MB, counting each chunk's guard items. Chunks are
-   written at successive versions, sequentially.
-   - "Fits in one" is the same lower-bound size measure the non-chunked
-     4 MB refusal uses (`measureTransaction` in `internal/TransactWriteOps.ts`),
-     so anything a non-chunked append would send is sent unchanged.
-   - Chunks are filled greedily by the **upper** bound of the same item-size
-     rules (`transactEntryBytes(item, "upper")`, shared with the refusal), so a
-     planned chunk never overfills, until the remaining events fit the final
-     chunk with its inline items.
-   - The whole append is checked for repeated items (`refuseRepeatedItems`)
-     before anything is written, exactly as a non-chunked one.
-3. **First chunk.** It carries the version-contiguity `ConditionCheck` on
-   `expectedVersion` (when > 0) and the event puts (`attribute_not_exists`).
-   With idempotency it also **claims the command**: a sentinel `Put` guarded by
-   `attribute_not_exists(pk)`, carrying `pending: true` and the intended
-   version. Every other delivery of the `commandId` from then on fails with
-   `DuplicateCommand` — a replay of a completed command, a redelivery that
-   arrives while this append is in flight (the at-least-once queue case: a
-   large command runs longest, which is when a visibility timeout redelivers),
-   and a redelivery after this append failed with `PartialAppend`. A
-   `ConditionCheck` on the sentinel key would only cover the first case: the
-   in-flight redelivery would pass it, decide on top of the prefix and apply
-   the command a second time.
-   - Concurrency is decided once, here. A failure of chunk 1 maps exactly as a
-     non-chunked append does (`VersionConflict`, `DuplicateCommand`,
-     `TransactionCancelled`, …). A cancellation writes nothing. A transport
-     error leaves chunk 1's outcome unknown, exactly as it leaves a non-chunked
-     append's, except that what may have committed is a prefix; it surfaces as
-     the raw `DynamoClientError`, which `commandHandler` does not retry. The AWS
-     SDK's own retries are idempotent: it fills in a `ClientRequestToken` once
-     per request and every retry reuses it, so a retry of a chunk that committed
-     succeeds rather than conflicting with itself.
-   - A command whose chunked append failed partway is never applied twice, but
-     nor is it completed by a redelivery: its prefix stays recorded under the
-     `pending` claim, and repairing it is the application's call.
-   - "Every other delivery" means every one that **appends**: the sentinel is
-     consulted only by `append`. Through `commandHandler`, a redelivery whose
-     `decide` returns `[]` against the loaded state (the completed state after
-     a replay, or the committed prefix after a `PartialAppend`) never appends,
-     so it succeeds as a no-op, as any no-op replay does (§2.4). After a
-     `PartialAppend` that success does not mean the command completed. The
-     library does not probe the sentinel on the no-op path: whether a no-op
-     redelivery must be told apart is the application's design decision.
-4. **Chunks 2..n.** Each carries a contiguity `ConditionCheck`
-   (`attribute_exists`) on the previous chunk's last event, plus its event
-   puts.
-5. **Final chunk.** It also carries the inline items: `additionalItems`, the
-   inline snapshot (§4), and the completed idempotency sentinel `Put`, which
-   overwrites the claim without `pending`. That `Put` is unconditional for the
-   same reason the inline snapshot's is: the chunk's event puts prove this
-   append still owns the stream. Read models therefore never show a partially
-   written command.
-   - The final chunk reserves room for these items. If they cannot fit
-     alongside at least one event, the call fails before anything is written:
-     with `AppendTooLarge` for the item count (`count` is the size of that
-     smallest final chunk), or with `ValidationError` for the 4 MB size, as a
-     non-chunked oversized append does (`AppendTooLarge` carries only a count).
-   - `additionalItems` expansion (guarded puts, #133) is accounted for. Its
-     cancellation mapping (`AdditionalItemConditionFailed`, guarded-put retry
-     and verdicts) runs on the final chunk. A guarded put that loses a race
-     rebuilds and resends the final chunk alone; earlier chunks are never
-     resent.
-6. **Failure after chunk 1.** Any failure of chunk k ≥ 2, whether a condition
-   (another writer slipped in), an item condition, a transport error or
-   anything else, surfaces as a new error:
+1. The application plans the steps — newest first for an undo — each covering
+   at most a configured number of entities. A fixed size is preferable to a
+   dynamic size calculation, because event content varies.
+2. Each step is an ordinary `commandHandler` call (decide → evolve → one
+   atomic append with its own snapshot and projections), with
+   `expectedVersion` = the version the previous step returned.
+3. A failure partway leaves the stream at a real, consistent intermediate
+   state — the last committed step. Re-issuing continues from there.
 
-   ```ts
-   class PartialAppend extends Data.TaggedError("PartialAppend")<{
-     streamName: string; streamId: string
-     expectedVersion: number    // the caller's expectedVersion
-     committedVersion: number   // last version durably written
-     intendedVersion: number    // expectedVersion + events.length
-     cause: unknown             // the error the failing chunk produced
-   }>
-   ```
+- **Idempotency.** Each step needs its own `commandId`, e.g.
+  `` `${commandId}#step-${n}` ``, so a redelivered step is a
+  `DuplicateCommand` without blocking the steps after it.
+- **Over the limit.** An over-limit append keeps failing with `AppendTooLarge`
+  (or `ValidationError` for 4 MB) before anything is written. Its
+  `count` / `limit` tell the caller the configured step size is wrong.
+- **No-op redelivery.** The sentinel is consulted only by an append: through
+  `commandHandler`, a redelivery whose `decide` returns no events against the
+  loaded state never appends, so it succeeds as a no-op instead of failing
+  with `DuplicateCommand`. Whether it must be told apart is the application's
+  call.
 
-   `PartialAppend` is never retried by `commandHandler`, and it is added to
-   `AppendError` and the handler's error channel.
-   - A `VersionConflict` in `cause` carries the failing chunk's base version
-     (`committedVersion`) as its `expectedVersion`.
-   - When `cause` is a transport error, the failing chunk's own outcome is
-     unknown (DynamoDB may have committed it), so `committedVersion` is the
-     last version *known* to be written. The JSDoc says so. On the final
-     chunk that also means its inline items may have committed; otherwise
-     none of them is written.
-7. **Not atomic.** This must be stated plainly in JSDoc and the docs:
-   - Between chunks another writer can append, which aborts the remainder with
-     `PartialAppend`.
-   - Readers can observe a prefix of the command's events.
-8. **Reading back.** `AppendResult.version` is the final version.
+Rule of thumb: **one command → one decision → one atomic append.** The
+tutorial (Step 18) and `examples/event-sourcing.ts` (`stepped-command`) run a
+150-event import and its compensating undo in fixed 50-entity steps.
 
 ## 6. Stream indexes — sub-streams by derived key (#140)
 
@@ -400,7 +335,7 @@ const Entries = EventStore.makeStream({
   - `[EDD-9064]` — an index attribute name collides with a stream-owned
     attribute (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`,
     `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`,
-    `pending`, and the default TTL attribute `_ttl`).
+    and the default TTL attribute `_ttl`).
   - `[EDD-9065]` — two indexes of the stream share a physical index name or
     an attribute name, or a GSI's `pk` and `sk` are the same attribute.
   - A custom `TableConfig.ttlAttributeName` is only known at runtime. An index
@@ -409,9 +344,8 @@ const Entries = EventStore.makeStream({
     string-typed index key).
 - **Item scope.** Index attributes are written on event items only. Snapshot
   and sentinel items never carry them, so those items are never in an index.
-  The attributes are part of the event item, so every transaction that
-  carries an event — a whole append or one chunk of a chunked append (§5) —
-  carries them, and they count towards the 4 MB check.
+  The attributes are part of the event item, so they count towards the 4 MB
+  check.
 - **Exposed settings.** `EventStream.indexes` / `BoundEventStream.indexes` map
   each index name to `StreamIndexSettings` (`{ type, index, pk, sk }`, where
   an LSI's `pk` is the table's `pk`). `indexDefinitions` reads them.
@@ -475,12 +409,10 @@ table's own `pk` / `sk` are not included, and empty index lists are omitted.
 | Change | Where |
 |---|---|
 | `VersionConflict.actualVersion?: number` | `packages/schema/src/Errors.ts` |
-| `PartialAppend` (new tagged error) | `packages/schema/src/Errors.ts`, re-exported |
 | `ReadOptions`, `Decision`, `readLatest` / `LatestState`, `SnapshotMode`, `readIndex`, `query.index`, `indexDefinitions` | `EventStore.ts` |
-| `CommandOptions.expectedVersion` / `chunked`, function form of `additionalItems` | `EventStore.ts` |
-| `CommandHandlerOptions.consistentRead` / `chunked` | `EventStore.ts` |
-| `AppendOptions.snapshot` / `chunked` (`AppendOptions` gains a `TState` parameter, default `never`), `SnapshotConfig.mode` | `EventStore.ts` |
-| `transactEntryBytes` / `measureTransaction` / `fitsOneTransaction` (shared size measure, lower or upper bound) | `internal/TransactWriteOps.ts` |
+| `CommandOptions.expectedVersion`, function form of `additionalItems` | `EventStore.ts` |
+| `CommandHandlerOptions.consistentRead` | `EventStore.ts` |
+| `AppendOptions.snapshot` (`AppendOptions` gains a `TState` parameter, default `never`), `SnapshotConfig.mode` | `EventStore.ts` |
 | `[EDD-9062]` — invalid `snapshot.mode` | `EventStore.ts` (`makeStream`) |
 | `StreamIndexConfig` / `StreamIndexKey` / `StreamIndexSettings` / `ReadIndexOptions` / `StreamIndexDefinitions`, `EventStream.indexes`, trailing `TIndexName` type parameter | `EventStore.ts` |
 | `[EDD-9063]` malformed index, `[EDD-9064]` index attribute owned by the stream, `[EDD-9065]` indexes sharing an index or attribute | `EventStore.ts` (`makeStream`) |
@@ -521,16 +453,15 @@ Required connected scenarios:
     with a counting client wrapper).
   - Fallback when the snapshot is missing or lagging.
   - Pre-existing streams switched to inline.
-- **#141**:
-  - 250 events with `chunked: true` → three transactions, with contiguous
-    versions.
-  - The final chunk carries the projection, snapshot and sentinel.
-  - A replay → `DuplicateCommand`.
-  - A redelivery while a chunked command is in flight, and one after its
-    `PartialAppend` → `DuplicateCommand`, with the command applied once.
-  - An injected chunk-2 conflict → `PartialAppend` with the correct
-    `committedVersion`.
-  - The default without `chunked` → `AppendTooLarge`.
+- **Large commands (#141 guidance)**:
+  - An append over 100 items → `AppendTooLarge` (`count`, `limit`), over
+    4 MB → `ValidationError`; nothing written.
+  - A 250-event command as fixed-size stepped commands chained by
+    `expectedVersion`: each step one atomic transaction with its own
+    snapshot, projection and per-step sentinel; a redelivered step →
+    `DuplicateCommand`.
+  - A writer between two steps → the next step's `VersionConflict` writes
+    nothing, the stream stays at a consistent state, and re-issuing continues.
 - **#140**:
   - An LSI table created via `indexDefinitions`.
   - Sparse indexing.

@@ -343,21 +343,23 @@ export const TRANSACT_WRITE_ITEMS_LIMIT = 100
 
 /**
  * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
- * (100 items per `TransactWriteItems`). An append is one atomic transaction by
- * default, so an oversized one is rejected before any request is issued. An
- * append made with `chunked: true` is split across transactions instead, and
- * fails with this error only when the items its final transaction must carry
- * (`additionalItems`, the idempotency sentinel, an inline snapshot) cannot fit
- * alongside one event.
+ * (100 items per `TransactWriteItems`). An append is always one atomic
+ * transaction — it is never split, because splitting would break append
+ * atomicity — so an oversized one is rejected before any request is issued.
  *
  * `count` is the total number of transact items the append requires: one Put
  * per event, one `ConditionCheck` (the version-contiguity guard) when
  * `expectedVersion > 0`, every item the `additionalItems` compile to, and the
  * idempotency sentinel and inline snapshot when present. In practice a single
  * append of events alone therefore holds up to 100 events at
- * `expectedVersion === 0` and up to 99 events otherwise. For a chunked append,
- * `count` is the size of its smallest possible final transaction: the inline
- * items, a contiguity check and one event.
+ * `expectedVersion === 0` and up to 99 events otherwise.
+ *
+ * A command whose decision is legitimately larger is split by the application
+ * into stepped commands — each an ordinary, atomic `commandHandler` call
+ * covering a fixed number of entities, chained by `expectedVersion` — so a
+ * failure partway leaves the stream at a real, consistent intermediate state.
+ * `count` against `limit` then tells the caller its configured step size is
+ * too large.
  *
  * DynamoDB's 4 MB aggregate cap on one transaction is checked client-side too,
  * by DynamoDB's item-size rules: exceeding it fails with `ValidationError`
@@ -408,11 +410,6 @@ export class AdditionalItemConditionFailed extends Data.TaggedError(
  * `idempotency`) finds an existing command-dedup sentinel for the supplied
  * `commandId`. Terminal — retrying the same `commandId` can never succeed.
  *
- * A chunked append claims its command in its first transaction, so this is
- * also the verdict for a delivery that arrives while another delivery's
- * chunked append is in flight, or after one failed partway with
- * {@link PartialAppend}.
- *
  * Precedence: reported ahead of {@link VersionConflict} when both the sentinel
  * guard and an event-put guard fail in the same transaction, because a duplicate
  * is terminal whereas a version conflict invites a retry.
@@ -421,50 +418,6 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
   readonly streamName: string
   readonly streamId: string
   readonly commandId: string
-}> {}
-
-/**
- * A chunked `EventStore.append` (`chunked: true`) failed after its first
- * transaction committed, so the stream holds a **prefix** of the append's
- * events: versions `expectedVersion + 1 … committedVersion`.
- *
- * A chunked append is not atomic. Concurrency is decided by its first
- * transaction — a failure there maps exactly as a non-chunked append's does
- * (a cancellation writes nothing). Any failure of a later transaction surfaces
- * as this error, whatever caused it: another writer appended between two
- * chunks (the usual case, a `VersionConflict` in `cause`), an
- * `additionalItems` condition failed on the final chunk, a transport error, or
- * anything else.
- *
- * - `expectedVersion` — the version the caller appended after.
- * - `committedVersion` — the last version known to be durably written by this
- *   append. When `cause` is a transport error, the failing chunk's own outcome
- *   is unknown (DynamoDB may have committed it), so the stream may be further
- *   along; re-read it before acting.
- * - `intendedVersion` — `expectedVersion + events.length`, the version the
- *   append would have reached.
- * - `cause` — the error the failing chunk produced.
- *
- * The `additionalItems`, the completed idempotency sentinel and an inline
- * snapshot ride on the final chunk. Unless `cause` is a transport error on
- * that final chunk (whose outcome is unknown), none of them is written, so
- * read models never show a partially written command. With idempotency, the
- * first chunk has already claimed the command with a `pending` sentinel: a
- * redelivery of the same `commandId` that appends fails with
- * {@link DuplicateCommand} rather than applying the command again on top of
- * the prefix, so repairing the prefix is the application's call. Through
- * `EventStore.commandHandler`, a redelivery whose `decide` returns no events
- * against the prefix never appends, so it succeeds as a no-op — not a sign
- * that the command completed. `EventStore.commandHandler` never retries this
- * error.
- */
-export class PartialAppend extends Data.TaggedError("PartialAppend")<{
-  readonly streamName: string
-  readonly streamId: string
-  readonly expectedVersion: number
-  readonly committedVersion: number
-  readonly intendedVersion: number
-  readonly cause: unknown
 }> {}
 
 /**

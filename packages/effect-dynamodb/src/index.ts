@@ -29,7 +29,6 @@ export {
   makeCompositeKeyHoleError,
   makeCompositeNullableError,
   OptimisticLockError,
-  PartialAppend,
   RefNotFound,
   ResourceNotFoundError,
   StaleAppend,

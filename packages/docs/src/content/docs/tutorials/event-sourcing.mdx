@@ -16,7 +16,7 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Consistent reads and If-Match expected versions
 - Inline projections derived from the decision
 - Inline snapshots and single-request state loads (`readLatest`)
-- Chunked appends for commands too large for one transaction
+- Large commands as stepped commands, each one atomic append
 - Stream indexes: sub-streams ordered by a key derived from each event
 
 ---
@@ -259,7 +259,7 @@ The handler returns `{ state, version, events }`, where `state` is the fold from
 - **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
 - **4 MB total payload per transaction.** An append whose items pass it fails with a `ValidationError`, also before anything is sent. Keep event payloads small; large blobs belong in S3 with a reference in the event.
 
-By default an append is **never split** across transactions, because splitting breaks its atomicity. If you hit a limit, split the work into smaller commands, or opt in to a [chunked append](#step-18-chunked-appends) and accept that it is not atomic.
+An append is **never split** across transactions, because splitting breaks its atomicity. If a command legitimately decides more than one transaction holds, split it into [stepped commands](#step-18-large-commands--stepped-commands): one command, one decision, one atomic append.
 
 `append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
 
@@ -661,6 +661,7 @@ What to know about the sentinel:
 - `ttl` is optional and written to the table's TTL attribute (honouring `TableConfig.ttlAttributeName`). Set it to the longest window over which your infrastructure can replay a command; omit it and sentinels are permanent.
 - A replay is **rejected**, not replayed — `DuplicateCommand` carries `streamName`, `streamId`, and `commandId`. If you need the original outcome, catch the error and re-read the stream.
 - A command that produces no events writes no sentinel, because there is no transaction to attach it to.
+- The sentinel is consulted only when events are appended. A redelivery whose `decide` returns no events against the loaded state never appends, so it succeeds as a no-op instead of failing with `DuplicateCommand`. Whether your application must tell a no-op redelivery apart is your call.
 
 ---
 
@@ -849,62 +850,133 @@ On a stream without a snapshot config, `readLatest` is `read` plus the head.
 
 ---
 
-## Step 18: Chunked Appends
+## Step 18: Large Commands — Stepped Commands
 
-Some commands produce more events than one transaction holds: an import, a bulk correction, a replay into a new stream. By default those fail with `AppendTooLarge` before anything is written. `chunked: true` opts in to splitting the append across transactions:
+Some commands decide more events than one transaction holds: an import, a bulk correction, a compensating undo. Such a command fails with `AppendTooLarge` before anything is written, and the library never splits it: an append receives **one decision** — many events and the one state after all of them — and has no valid intermediate states to put at transaction boundaries. Only your decider can produce a valid state for each boundary.
 
-```typescript region="chunked-append" example="event-sourcing.ts"
-// A historical scorecard import: 150 events cannot fit one transaction.
-const imported = Array.from(
-  { length: 150 },
-  (_, i) => new InningsCompleted({ innings: i + 1, runs: 100 + i, wickets: 10 }),
-)
+So a large command is run as **stepped commands**. Here the scoring feed records deliveries, and a compensating command reverts them:
 
-const tooLarge = yield* matchEvents.append({ matchId: "m-8" }, imported, 0).pipe(Effect.flip)
-// → AppendTooLarge — nothing written
+```typescript title="deliveries.ts" region="stepped-decider" example="event-sourcing.ts"
+// Ball-by-ball deliveries from a scoring feed, and their compensating undo.
+class DeliveryRecorded extends Schema.TaggedClass<DeliveryRecorded>()("DeliveryRecorded", {
+  ball: Schema.Number,
+}) {}
 
-const bulk = yield* matchEvents.append({ matchId: "m-8" }, imported, 0, { chunked: true })
-// → version 150, written as two transactions — NOT atomic
+class DeliveryReverted extends Schema.TaggedClass<DeliveryReverted>()("DeliveryReverted", {
+  ball: Schema.Number,
+}) {}
+
+type DeliveryEvent = DeliveryRecorded | DeliveryReverted
+
+const DeliveryState = Schema.Struct({ live: Schema.Array(Schema.Number) })
+type DeliveryState = typeof DeliveryState.Type
+
+const Deliveries = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Deliveries",
+  events: [DeliveryRecorded, DeliveryReverted],
+  streamId: { composite: ["matchId"] },
+  snapshot: { schema: DeliveryState, mode: "inline" },
+})
+
+type DeliveryCommand =
+  | { readonly _tag: "RecordDeliveries"; readonly balls: ReadonlyArray<number> }
+  | { readonly _tag: "RevertDeliveries"; readonly balls: ReadonlyArray<number> }
+
+class NotRecorded extends Data.TaggedError("NotRecorded")<{ readonly ball: number }> {}
+
+const deliveryDecider: EventStore.Decider<
+  DeliveryState,
+  DeliveryCommand,
+  DeliveryEvent,
+  NotRecorded
+> = {
+  initialState: { live: [] },
+  decide: (command, state) =>
+    Effect.gen(function* () {
+      if (command._tag === "RecordDeliveries") {
+        return command.balls.map((ball) => new DeliveryRecorded({ ball }))
+      }
+      for (const ball of command.balls) {
+        if (!state.live.includes(ball)) return yield* new NotRecorded({ ball })
+      }
+      return command.balls.map((ball) => new DeliveryReverted({ ball }))
+    }),
+  evolve: (state, event) => ({
+    live:
+      event._tag === "DeliveryRecorded"
+        ? [...state.live, event.ball]
+        : state.live.filter((ball) => ball !== event.ball),
+  }),
+}
 ```
 
-On a command handler, pass `chunked: true` per call, or as a handler default in `commandHandler(decider, stream, { chunked: true })`.
+The application plans the steps, and each step is an ordinary command:
 
-:::danger[A chunked append is not atomic]
-An append that fits one transaction is written exactly as without `chunked`: atomically, in one request. A larger one is not.
+```typescript region="stepped-command" example="event-sourcing.ts"
+const deliveries = yield* EventStore.bind(Deliveries)
+const handleDeliveries = EventStore.commandHandler(deliveryDecider, deliveries, {
+  idempotency: { ttl: Duration.days(1) },
+})
 
-- **Readers can observe a prefix** of the command's events while the later transactions are in flight.
-- **Another writer can append between two chunks.** That aborts the rest of the append, and the events already written stay written.
-:::
+// A fixed step size, not one computed from event sizes: event content varies.
+const STEP_SIZE = 50
 
-How the chunks are written:
+/** Run one large command as fixed-size steps, chained by `expectedVersion`. */
+const stepped = (
+  matchId: string,
+  balls: ReadonlyArray<number>,
+  toCommand: (step: ReadonlyArray<number>) => DeliveryCommand,
+  commandId: string,
+  expectedVersion: number,
+) =>
+  Effect.gen(function* () {
+    let version = expectedVersion
+    for (let n = 0; n * STEP_SIZE < balls.length; n++) {
+      const step = balls.slice(n * STEP_SIZE, (n + 1) * STEP_SIZE)
+      // An ordinary command: decide, fold, one atomic append with its own
+      // snapshot and sentinel. Each step has its own commandId.
+      const result = yield* handleDeliveries({ matchId }, toCommand(step), {
+        commandId: `${commandId}#step-${n}`,
+        expectedVersion: version,
+      })
+      version = result.version
+    }
+    return version
+  })
 
-- The events are split, in order, into transactions that each fit 100 items and 4 MB, written one after another at successive versions.
-- The **first** transaction carries the version check on `expectedVersion`. Concurrency is decided there: if it fails, nothing was written, and the error is the one a non-chunked append would report (`VersionConflict`, `DuplicateCommand`, …).
-- With idempotency, the first transaction also **claims the command** with a pending sentinel. From then on every other delivery of the `commandId` that appends fails with `DuplicateCommand`: a replay of the completed command, a redelivery that arrives while the append is still in flight, and a redelivery after the append failed partway. A chunked command is therefore never applied twice, but a redelivery does not complete one that failed partway either.
-- The sentinel is consulted only when events are appended. Through `commandHandler`, a redelivery whose `decide` returns no events against the loaded state succeeds as a no-op, as any no-op replay does. After a `PartialAppend` that state is the committed prefix, so a successful no-op redelivery does not mean the command completed. Whether your application must tell the two apart is your call.
-- Each **later** transaction checks that the previous chunk's last event exists.
-- The **final** transaction also carries `additionalItems`, the inline snapshot and the completed idempotency sentinel, so a read model never reflects a partially written command. If those items cannot fit next to at least one event, the append fails before anything is written.
+const feed = Array.from({ length: 150 }, (_, i) => i + 1)
+const record = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+  _tag: "RecordDeliveries",
+  balls,
+})
+const revert = (balls: ReadonlyArray<number>): DeliveryCommand => ({
+  _tag: "RevertDeliveries",
+  balls,
+})
 
-Any failure after the first transaction surfaces as `PartialAppend`:
+// One decision of 150 events cannot be one atomic append.
+const tooLarge = yield* handleDeliveries({ matchId: "m-8" }, record(feed), {
+  commandId: "feed-1",
+}).pipe(Effect.flip)
+// → AppendTooLarge (count 152, limit 100) — nothing written
 
-```typescript region="partial-append" example="event-sourcing.ts"
-const progress = yield* matchEvents
-  .append({ matchId: "m-9" }, imported, 0, { chunked: true })
-  .pipe(
-    Effect.map((result) => result.version),
-    // A failure after the first transaction: a prefix of the events is durable.
-    Effect.catchTag("PartialAppend", (partial) => Effect.succeed(partial.committedVersion)),
-  )
+const imported = yield* stepped("m-8", feed, record, "feed-1", 0)
+// → version 150, in three atomic steps
+
+// The compensating undo: planned newest first, in the same fixed-size steps.
+const undone = yield* stepped("m-8", [...feed].reverse(), revert, "undo-1", imported)
+// → version 300. A failure partway stops at the last step's real state;
+//   re-issuing the remaining steps continues from there.
 ```
 
-| Field | Meaning |
-|---|---|
-| `expectedVersion` | The version the append was made after |
-| `committedVersion` | The last version known to be written. Versions `expectedVersion + 1 … committedVersion` are in the stream |
-| `intendedVersion` | `expectedVersion + events.length`, the version a complete append would have reached |
-| `cause` | The failing transaction's error. Usually a `VersionConflict` (another writer got in), whose `expectedVersion` is the failing chunk's base version |
+1. **The application plans the steps** — newest first for an undo — each covering at most a configured number of entities. Prefer a fixed size to a size computed from the events: event content varies.
+2. **Each step is an ordinary `commandHandler` call** — decide, fold, one atomic append with its own snapshot, projections and sentinel — with `expectedVersion` set to the version the previous step returned.
+3. **A failure partway leaves the stream at a real, consistent state**: the last step that committed, with its snapshot and read models. Re-issuing the remaining steps continues from there; a step that conflicts (another writer got in) fails with `VersionConflict` before anything of it is written.
 
-When `cause` is a transport error, the failing transaction's own outcome is unknown, so the stream may be further along than `committedVersion`; re-read it before acting. `PartialAppend` is never retried by the command handler, because part of the decision is already written. Whether to complete, compensate or leave the prefix is the application's decision.
+With idempotency, each step needs **its own `commandId`** — `${commandId}#step-${n}` above — so a redelivered step is a `DuplicateCommand` while the other steps still run. And when a step fails with `AppendTooLarge`, its `count` against `limit` tells you the configured step size is too large for what each entity decides.
+
+The rule of thumb: **one command → one decision → one atomic append.**
 
 ---
 
@@ -1081,7 +1153,7 @@ Effect.runPromise(main).then(
 | **If-Match** | `handle(id, command, { expectedVersion })` fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs; never retried |
 | **Inline projections** | `additionalItems: (decision) => items` derives side writes from the post-fold state, in the same transaction |
 | **Inline snapshots** | `snapshot: { schema, mode: "inline" }` writes the snapshot in the append transaction; `readLatest` loads state in one `Query` |
-| **Chunked appends** | `{ chunked: true }` splits an oversized append across transactions — **not atomic**; a later failure is `PartialAppend` |
+| **Stepped commands** | A command too large for one transaction is split by the application into fixed-size commands chained by `expectedVersion` — each one atomic |
 | **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
 
 ## What's Next?

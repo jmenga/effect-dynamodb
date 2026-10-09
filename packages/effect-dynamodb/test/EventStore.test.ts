@@ -7,7 +7,6 @@ import {
   AppendTooLarge,
   type DuplicateCommand,
   DynamoError,
-  type PartialAppend,
   TRANSACT_WRITE_ITEMS_LIMIT,
   type UniqueConstraintViolation,
   type ValidationError,
@@ -33,12 +32,8 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { TRANSACT_WRITE_MAX_BYTES } from "../src/internal/ItemSize.js"
-import {
-  measureTransaction,
-  refuseRepeatedItems,
-  transactItemTarget,
-} from "../src/internal/TransactWriteOps.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "../src/internal/ItemSize.js"
+import { refuseRepeatedItems, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -1929,6 +1924,40 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("DuplicateCommand")
         expect((error as DuplicateCommand).commandId).toBe("cmd-7f3a")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // Documented, not probed: the sentinel is consulted only by `append`, so a
+    // redelivery whose `decide` returns no events against the loaded state
+    // succeeds as a no-op — whether it must be told apart is the
+    // application's call.
+    it.effect("a no-op redelivery succeeds without consulting the sentinel", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            makeEventItem("m-1", 1, "MatchStarted", {
+              venue: "MCG",
+              homeTeam: "AUS",
+              awayTeam: "ENG",
+            }),
+          ],
+        })
+        // The redelivered command decides nothing against the loaded state, so
+        // it never appends — and the sentinel is never consulted.
+        const noopDecider: EventStore.Decider<MatchState, MatchCommand, MatchEvent> = {
+          ...matchDecider,
+          decide: () => Effect.succeed([]),
+        }
+        const redeliver = EventStore.commandHandler(noopDecider, MatchEvents, { idempotency: {} })
+        const result = yield* redeliver(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { commandId: "cmd-7f3a" },
+        )
+        expect(result.version).toBe(1)
+        expect(result.events).toEqual([])
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4759,440 +4788,6 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Opt-in chunked append (#141)
-// ---------------------------------------------------------------------------
-
-describe("EventStore chunked append (#141)", () => {
-  const SnapStream = EventStore.makeStream({
-    table: EventsTable,
-    streamName: "ChunkMatch",
-    events: [MatchStarted, InningsCompleted, MatchEnded],
-    streamId: { composite: ["matchId"] },
-    snapshot: { schema: MatchStateSchema, mode: "inline" },
-  })
-
-  const manyEvents = (n: number): ReadonlyArray<InningsCompleted> =>
-    Array.from(
-      { length: n },
-      (_, i) => new InningsCompleted({ innings: i + 1, runs: 1, wickets: 1 }),
-    )
-
-  const cancelled = (reasons: ReadonlyArray<{ Code: string }>) => ({
-    name: "TransactionCanceledException",
-    CancellationReasons: reasons,
-  })
-
-  /** The versions of the event puts in one TransactWriteItems call. */
-  const versionsOf = (call: { TransactItems: ReadonlyArray<any> }) =>
-    call.TransactItems.filter(
-      (i) =>
-        i.Put !== undefined && String(fromAttributeMap(i.Put.Item).__edd_e__).endsWith(".event"),
-    ).map((i) => fromAttributeMap(i.Put.Item).version as number)
-
-  const calls = () => mockTransactWriteItems.mock.calls.map((c) => c[0])
-
-  it.effect("an append that fits one transaction is written exactly as without chunked", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems.mockResolvedValue({})
-      const options = {
-        idempotency: { commandId: "cmd-1" },
-        additionalItems: [Watermarks.put({ writerId: "w", lastSeq: 1 })],
-      }
-      yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(5), 3, options)
-      yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(5), 3, { ...options, chunked: true })
-      expect(calls()).toHaveLength(2)
-      expect(calls()[1]).toEqual(calls()[0])
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("splits 250 events into three contiguous transactions", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems.mockResolvedValue({})
-
-      const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(250), 0, {
-        chunked: true,
-      })
-
-      expect(result.version).toBe(250)
-      expect(result.events).toHaveLength(250)
-      const [first, second, third] = calls()
-      expect(calls()).toHaveLength(3)
-      // Chunk 1: 100 event puts (expectedVersion 0 needs no contiguity check).
-      expect(first.TransactItems).toHaveLength(100)
-      expect(versionsOf(first)).toEqual(Array.from({ length: 100 }, (_, i) => i + 1))
-      // Chunk 2: a check on v100, then 99 events.
-      expect(second.TransactItems).toHaveLength(100)
-      const check = second.TransactItems[0].ConditionCheck
-      expect(check.ConditionExpression).toBe("attribute_exists(pk)")
-      expect(fromAttributeMap(check.Key).sk).toBe(
-        DynamoSchema.composeEventVersionKey(AppSchema, "match.event", 100),
-      )
-      expect(versionsOf(second)).toEqual(Array.from({ length: 99 }, (_, i) => i + 101))
-      // Final: a check on v199, then the remaining 51.
-      expect(fromAttributeMap(third.TransactItems[0].ConditionCheck.Key).sk).toBe(
-        DynamoSchema.composeEventVersionKey(AppSchema, "match.event", 199),
-      )
-      expect(versionsOf(third)).toEqual(Array.from({ length: 51 }, (_, i) => i + 200))
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect(
-    "the first chunk claims the command; the final carries items, sentinel and snapshot",
-    () =>
-      Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
-        yield* SnapStream.append({ matchId: "m-1" }, manyEvents(150), 10, {
-          chunked: true,
-          idempotency: { commandId: "cmd-9", ttl: "1 hour" },
-          additionalItems: [Watermarks.put({ writerId: "w", lastSeq: 160 })],
-          snapshot: { status: "in-progress", innings: [] },
-        })
-
-        const [first, final] = calls()
-        expect(calls()).toHaveLength(2)
-        // Chunk 1: check on v10, 98 events, the sentinel's guarded pending claim.
-        expect(first.TransactItems).toHaveLength(100)
-        expect(fromAttributeMap(first.TransactItems[0].ConditionCheck.Key).sk).toBe(
-          DynamoSchema.composeEventVersionKey(AppSchema, "chunkmatch.event", 10),
-        )
-        const claim = first.TransactItems[99].Put
-        expect(claim.ConditionExpression).toBe("attribute_not_exists(pk)")
-        const claimed = fromAttributeMap(claim.Item)
-        expect(claimed).toMatchObject({
-          sk: DynamoSchema.composeKey(AppSchema, "chunkmatch.command", ["cmd-9"]),
-          __edd_e__: "chunkmatch.command",
-          commandId: "cmd-9",
-          version: 160,
-          pending: true,
-        })
-        expect(typeof claimed._ttl).toBe("number")
-        expect(versionsOf(first)).toEqual(Array.from({ length: 98 }, (_, i) => i + 11))
-        // Final: check on v108, 52 events, the projection, sentinel Put, snapshot.
-        expect(fromAttributeMap(final.TransactItems[0].ConditionCheck.Key).sk).toBe(
-          DynamoSchema.composeEventVersionKey(AppSchema, "chunkmatch.event", 108),
-        )
-        expect(versionsOf(final)).toEqual(Array.from({ length: 52 }, (_, i) => i + 109))
-        const tail = final.TransactItems.slice(-3).map((i: any) => fromAttributeMap(i.Put.Item))
-        expect(tail.map((i: any) => i.__edd_e__)).toEqual([
-          "Watermark",
-          "chunkmatch.command",
-          "chunkmatch.snapshot",
-        ])
-        expect(tail[1].version).toBe(160)
-        expect(tail[2].asOfVersion).toBe(160)
-        // The completed sentinel overwrites the claim unconditionally (the
-        // chunk's event puts prove ownership), with the same attributes but
-        // no `pending` marker.
-        const completed = final.TransactItems[final.TransactItems.length - 2].Put
-        expect(completed.ConditionExpression).toBeUndefined()
-        expect(tail[1]).toEqual(
-          Object.fromEntries(Object.entries(claimed).filter(([k]) => k !== "pending")),
-        )
-      }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a replay fails the first chunk with DuplicateCommand, writing nothing", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems.mockRejectedValue(
-        cancelled([
-          ...Array.from({ length: 99 }, () => ({ Code: "None" })),
-          { Code: "ConditionalCheckFailed" },
-        ]),
-      )
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 0, {
-        chunked: true,
-        idempotency: { commandId: "cmd-1" },
-      }).pipe(Effect.flip)
-      expect(error._tag).toBe("DuplicateCommand")
-      expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a conflict on the first chunk is a plain VersionConflict", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems.mockRejectedValue(cancelled([{ Code: "ConditionalCheckFailed" }]))
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 4, {
-        chunked: true,
-      }).pipe(Effect.flip)
-      expect(error._tag).toBe("VersionConflict")
-      expect((error as VersionConflict).expectedVersion).toBe(4)
-      expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a conflict on chunk 2 is a PartialAppend with the committed version", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems
-        .mockResolvedValueOnce({})
-        .mockRejectedValueOnce(cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]))
-
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(250), 0, {
-        chunked: true,
-      }).pipe(Effect.flip)
-
-      expect(error._tag).toBe("PartialAppend")
-      const partial = error as PartialAppend
-      expect(partial.streamName).toBe("Match")
-      expect(partial.streamId).toBe("m-1")
-      expect(partial.expectedVersion).toBe(0)
-      expect(partial.committedVersion).toBe(100)
-      expect(partial.intendedVersion).toBe(250)
-      expect((partial.cause as VersionConflict)._tag).toBe("VersionConflict")
-      expect((partial.cause as VersionConflict).expectedVersion).toBe(100)
-      // The final chunk is never attempted.
-      expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a transport error after the first chunk is a PartialAppend too", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems
-        .mockResolvedValueOnce({})
-        .mockResolvedValueOnce({})
-        .mockRejectedValueOnce({ name: "InternalServerError" })
-
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(250), 0, {
-        chunked: true,
-      }).pipe(Effect.flip)
-
-      expect(error._tag).toBe("PartialAppend")
-      expect((error as PartialAppend).committedVersion).toBe(199)
-      expect(((error as PartialAppend).cause as DynamoError)._tag).toBe("DynamoError")
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a projection condition failing on the final chunk is a PartialAppend", () =>
-    Effect.gen(function* () {
-      // Final chunk: check on v100, 50 events, then the projection.
-      mockTransactWriteItems
-        .mockResolvedValueOnce({})
-        .mockRejectedValueOnce(
-          cancelled([
-            ...Array.from({ length: 51 }, () => ({ Code: "None" })),
-            { Code: "ConditionalCheckFailed" },
-          ]),
-        )
-
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 0, {
-        chunked: true,
-        additionalItems: [
-          Transaction.check(
-            Watermarks.get({ writerId: "w" }),
-            Expression.condition({ lt: { lastSeq: 42 } }),
-          ),
-        ],
-      }).pipe(Effect.flip)
-
-      expect(error._tag).toBe("PartialAppend")
-      const cause = (error as PartialAppend).cause as AdditionalItemConditionFailed
-      expect(cause._tag).toBe("AdditionalItemConditionFailed")
-      expect(cause.indices).toEqual([0])
-      expect((error as PartialAppend).committedVersion).toBe(100)
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a guarded put that loses a race rewrites the final chunk alone", () =>
-    Effect.gen(function* () {
-      // Final chunk: check on v100, 50 events, then the registration's row,
-      // sentinel and snapshot. Its row losing a race (no caller condition) is
-      // retried — without re-sending the first chunk.
-      mockTransactWriteItems
-        .mockResolvedValueOnce({})
-        .mockRejectedValueOnce(
-          cancelled([
-            ...Array.from({ length: 51 }, () => ({ Code: "None" })),
-            { Code: "ConditionalCheckFailed" },
-            { Code: "None" },
-            { Code: "None" },
-          ]),
-        )
-        .mockResolvedValue({})
-
-      const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 0, {
-        chunked: true,
-        additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
-      })
-
-      expect(result.version).toBe(150)
-      expect(calls()).toHaveLength(3)
-      expect(versionsOf(calls()[1])).toEqual(versionsOf(calls()[2]))
-      expect(versionsOf(calls()[2])[0]).toBe(101)
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a final-chunk race lost on every attempt is a PartialAppend", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems
-        .mockResolvedValueOnce({})
-        .mockRejectedValue(
-          cancelled([
-            ...Array.from({ length: 51 }, () => ({ Code: "None" })),
-            { Code: "ConditionalCheckFailed" },
-            { Code: "None" },
-            { Code: "None" },
-          ]),
-        )
-
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 0, {
-        chunked: true,
-        additionalItems: [Registrations.put({ regId: "r-1", code: "C1" })],
-      }).pipe(Effect.flip)
-
-      expect(error._tag).toBe("PartialAppend")
-      expect((error as PartialAppend).committedVersion).toBe(100)
-      expect(["OptimisticLockError", "ConcurrentModification"]).toContain(
-        ((error as PartialAppend).cause as { _tag: string })._tag,
-      )
-      // One first chunk, then every attempt at the final one.
-      expect(calls()).toHaveLength(4)
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("fails before writing when the final chunk cannot hold its items and an event", () =>
-    Effect.gen(function* () {
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(150), 0, {
-        chunked: true,
-        idempotency: { commandId: "cmd-1" },
-        additionalItems: Array.from({ length: 98 }, (_, i) =>
-          Watermarks.put({ writerId: `w-${i}`, lastSeq: i }),
-        ),
-      }).pipe(Effect.flip)
-      expect(error._tag).toBe("AppendTooLarge")
-      // check + one event + 98 items + sentinel
-      expect((error as AppendTooLarge).count).toBe(101)
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("without chunked, the same append is AppendTooLarge", () =>
-    Effect.gen(function* () {
-      const error = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(250), 0).pipe(
-        Effect.flip,
-      )
-      expect(error._tag).toBe("AppendTooLarge")
-      expect((error as AppendTooLarge).count).toBe(250)
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("splits by size as well as count, within 4 MB per transaction", () =>
-    Effect.gen(function* () {
-      mockTransactWriteItems.mockResolvedValue({})
-      const big = "x".repeat(300_000)
-      const events = Array.from(
-        { length: 30 },
-        (_, i) => new MatchStarted({ venue: big, homeTeam: `h-${i}`, awayTeam: "a" }),
-      )
-
-      const unchunked = yield* MatchEvents.append({ matchId: "m-1" }, events, 0).pipe(Effect.flip)
-      expect(unchunked._tag).toBe("ValidationError")
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
-
-      const result = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, { chunked: true })
-      expect(result.version).toBe(30)
-      expect(calls().length).toBeGreaterThan(2)
-      const written: Array<number> = []
-      for (const call of calls()) {
-        const bytes = call.TransactItems.reduce(
-          (sum: number, item: any) =>
-            sum + (item.Put ? JSON.stringify(fromAttributeMap(item.Put.Item)).length : 0),
-          0,
-        )
-        expect(bytes).toBeLessThanOrEqual(4 * 1024 * 1024)
-        written.push(...versionsOf(call))
-      }
-      expect(written).toEqual(Array.from({ length: 30 }, (_, i) => i + 1))
-    }).pipe(Effect.provide(TestLayer)),
-  )
-
-  describe("commandHandler", () => {
-    const BulkDecider: EventStore.Decider<number, number, MatchEvent> = {
-      initialState: 0,
-      decide: (count) => Effect.succeed(manyEvents(count)),
-      evolve: (state) => state + 1,
-    }
-
-    it.effect("honours the handler default and the per-call override", () =>
-      Effect.gen(function* () {
-        mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockResolvedValue({})
-        const handle = EventStore.commandHandler(BulkDecider, MatchEvents, { chunked: true })
-
-        const result = yield* handle({ matchId: "m-1" }, 150)
-        expect(result.version).toBe(150)
-        expect(result.state).toBe(150)
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
-
-        const refused = yield* handle({ matchId: "m-2" }, 150, { chunked: false }).pipe(Effect.flip)
-        expect(refused._tag).toBe("AppendTooLarge")
-
-        const perCall = EventStore.commandHandler(BulkDecider, MatchEvents)
-        expect((yield* perCall({ matchId: "m-3" }, 150, { chunked: true })).version).toBe(150)
-      }).pipe(Effect.provide(TestLayer)),
-    )
-
-    it.effect("never retries a PartialAppend", () =>
-      Effect.gen(function* () {
-        mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems
-          .mockResolvedValueOnce({})
-          .mockRejectedValueOnce(cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]))
-        const handle = EventStore.commandHandler(BulkDecider, MatchEvents, {
-          chunked: true,
-          retry: 5,
-        })
-        const error = yield* handle({ matchId: "m-1" }, 150).pipe(Effect.flip)
-        expect(error._tag).toBe("PartialAppend")
-        expect(mockQuery).toHaveBeenCalledOnce()
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
-      }).pipe(Effect.provide(TestLayer)),
-    )
-
-    it.effect("a first-chunk VersionConflict is retried like any other", () =>
-      Effect.gen(function* () {
-        mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems
-          .mockRejectedValueOnce(cancelled([{ Code: "ConditionalCheckFailed" }]))
-          .mockResolvedValue({})
-        const handle = EventStore.commandHandler(BulkDecider, MatchEvents, {
-          chunked: true,
-          retry: 1,
-        })
-        expect((yield* handle({ matchId: "m-1" }, 150)).version).toBe(150)
-        expect(mockQuery).toHaveBeenCalledTimes(2)
-      }).pipe(Effect.provide(TestLayer)),
-    )
-
-    // Documented, not probed: the sentinel is consulted only by `append`, so a
-    // redelivery whose `decide` returns no events against the committed prefix
-    // of a `PartialAppend` succeeds as a no-op — whether it must be told apart
-    // is the application's call.
-    it.effect("a no-op redelivery after a PartialAppend succeeds without reading the claim", () =>
-      Effect.gen(function* () {
-        mockQuery.mockResolvedValue({
-          Items: Array.from({ length: 3 }, (_, i) =>
-            makeEventItem("m-1", i + 1, "InningsCompleted", {
-              innings: i + 1,
-              runs: 1,
-              wickets: 1,
-            }),
-          ),
-        })
-        const handle = EventStore.commandHandler(BulkDecider, MatchEvents, {
-          chunked: true,
-          idempotency: {},
-        })
-        const result = yield* handle({ matchId: "m-1" }, 0, { commandId: "big" })
-        expect(result).toEqual({ state: 3, version: 3, events: [] })
-        expect(mockGetItem).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
-      }).pipe(Effect.provide(TestLayer)),
-    )
-  })
-})
-
-// ---------------------------------------------------------------------------
 // Stream indexes — sub-streams by derived key (#140)
 // ---------------------------------------------------------------------------
 
@@ -5272,8 +4867,8 @@ describe("EventStore stream indexes (#140)", () => {
       expect(make({ a: { type: "gsi", index: "i", pk: "streamId", sk: "s", key } })).toThrow(
         /EDD-9064.*streamId/,
       )
-      expect(make({ a: { type: "gsi", index: "i", pk: "p", sk: "pending", key } })).toThrow(
-        /EDD-9064.*pending/,
+      expect(make({ a: { type: "gsi", index: "i", pk: "p", sk: "commandId", key } })).toThrow(
+        /EDD-9064.*commandId/,
       )
     })
 
@@ -5331,25 +4926,6 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("writes the derived keys in every chunk of a chunked append", () =>
-      Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-        const events = Array.from({ length: 250 }, (_, i) => innings(i + 1))
-        yield* IndexedMatch.append({ matchId: "m-1" }, events, 0, { chunked: true })
-        const calls = mockTransactWriteItems.mock.calls.map((c) => c[0])
-        expect(calls).toHaveLength(3)
-        for (const call of calls) {
-          const puts = eventPutsOf(call)
-          expect(puts.length).toBeGreaterThan(0)
-          for (const item of puts) {
-            expect(item.lsi1sk).toBe(
-              `INN#${pad(item.version as number)}#${pad(item.version as number)}`,
-            )
-          }
-        }
-      }).pipe(Effect.provide(TestLayer)),
-    )
-
     it.effect("counts the index attributes towards the 4 MB check", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValue({})
@@ -5374,8 +4950,12 @@ describe("EventStore stream indexes (#140)", () => {
         // Calibrate: size the events so the transaction without keys sits
         // 50 KB under the limit.
         yield* Light.append({ matchId: "m-1" }, events(40_000), 0)
-        const probe = measureTransaction(mockTransactWriteItems.mock.calls[0]![0].TransactItems)
-        const length = 40_000 + Math.floor((TRANSACT_WRITE_MAX_BYTES - 50_000 - probe.total) / 99)
+        const probe = mockTransactWriteItems.mock.calls[0]![0].TransactItems.reduce(
+          (sum: number, item: Parameters<typeof transactItemBytes>[0]) =>
+            sum + transactItemBytes(item),
+          0,
+        )
+        const length = 40_000 + Math.floor((TRANSACT_WRITE_MAX_BYTES - 50_000 - probe) / 99)
         yield* Light.append({ matchId: "m-1" }, events(length), 0)
         expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
         const error = yield* Heavy.append({ matchId: "m-1" }, events(length), 0).pipe(Effect.flip)

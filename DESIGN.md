@@ -2830,7 +2830,8 @@ const result = yield* handler({ matchId: "m-1" }, new StartMatch({ venue: "MCG" 
 ```
 
 Full design of the command path: [`docs/designs/eventstore-command-path.md`](docs/designs/eventstore-command-path.md)
-(#136–#141). Each invocation runs:
+(#136–#140; #141 was not implemented — see [Large Commands](#large-commands--stepped-commands)).
+Each invocation runs:
 
 ```
 load → [expectedVersion check] → decide → fold new events → derive items → append → [snapshot]
@@ -2858,9 +2859,10 @@ load → [expectedVersion check] → decide → fold new events → derive items
   static array or a function of the `Decision`
   (`{ events, state, previous, version }`) returning the ops or an `Effect` of
   them — an inline projection. See below.
-- **Chunked (#141).** `CommandOptions.chunked` (or the handler-level default
-  `CommandHandlerOptions.chunked`) splits an oversized append — see
-  [Chunked Append](#chunked-append-141).
+- **One atomic append.** One command → one decision → one atomic append. A
+  decision too large for one transaction fails with `AppendTooLarge` before
+  anything is written — see
+  [Large Commands — Stepped Commands](#large-commands--stepped-commands).
 
 #### Decision-derived `additionalItems` — inline projections (#137)
 
@@ -2982,40 +2984,33 @@ The first page is read whatever the lag, so an `"after-append"` stream with a la
 `every` reads up to `every + 1` items per load — the `SnapshotConfig.every` JSDoc says
 so. On a stream without `snapshot`, `readLatest` is `read` plus the head.
 
-### Chunked Append (#141)
+### Large Commands — Stepped Commands
 
-```typescript
-stream.append(streamId, events, expectedVersion, { chunked: true })
-yield* handle(streamId, command, { chunked: true })      // per call
-commandHandler(decider, stream, { chunked: true })       // handler default
-```
+An append is always one `TransactWriteItems`: it is never split. An append receives
+**one decision** — many events and the one state after all of them — so split across
+transactions it would have no valid intermediate states to put at the boundaries (no
+snapshot, projection or sentinel that is true there). Only the application's decider can
+produce a valid state for each boundary. An append over 100 items fails with
+`AppendTooLarge` (or over 4 MB with `ValidationError`) before anything is written.
 
-By default an append over 100 items or 4 MB fails before anything is written
-(`AppendTooLarge`, or `ValidationError` for size). With `chunked: true` an append that
-fits one transaction is written exactly as without it. A larger one is split, in order,
-into transactions that each fit both limits, written sequentially at successive
-versions. **A chunked append is not atomic**: readers can observe a prefix of the
-events, and another writer appending between two chunks aborts the rest.
+A large command — an import, a bulk correction, a compensating undo — is therefore run
+as **stepped commands**:
 
-- The **first** chunk carries the contiguity check on `expectedVersion`. Concurrency is
-  decided there, and its failure maps exactly as a non-chunked append's (a cancellation
-  writes nothing). With idempotency it also claims the command with a `pending`
-  sentinel guarded by `attribute_not_exists`, so every other delivery of the
-  `commandId` — a replay, a redelivery while the append is in flight, or one after a
-  `PartialAppend` — that appends fails with `DuplicateCommand`. A command is never
-  applied twice, but a redelivery does not complete a partial one either. The sentinel
-  is consulted only by `append`: through `commandHandler`, a redelivery whose `decide`
-  returns no events against the loaded state (after a `PartialAppend`, the committed
-  prefix) succeeds as a no-op, which does not mean the command completed.
-- Each **later** chunk checks that the previous chunk's last event exists.
-- The **final** chunk carries `additionalItems`, the inline snapshot and the completed
-  sentinel, so read models never show a partially written command. If they cannot fit
-  beside one event, the append fails before anything is written.
-- Any failure after the first chunk surfaces as **`PartialAppend`**
-  (`expectedVersion`, `committedVersion` — the last version known to be written —
-  `intendedVersion`, `cause`). When `cause` is a transport error the failing chunk's
-  outcome is unknown, so the stream may be further along. `commandHandler` never
-  retries it.
+1. The application plans the steps (newest first for an undo), each covering at most a
+   configured number of entities. A fixed size is preferable to one computed from the
+   events, because event content varies.
+2. Each step is an ordinary `commandHandler` call — decide → fold → one atomic append
+   with its own snapshot, projections and sentinel — with `expectedVersion` set to the
+   version the previous step returned.
+3. A failure partway leaves the stream at a real, consistent intermediate state: the
+   last committed step. Re-issuing the remaining steps continues from there.
+
+With `idempotency`, each step needs its own `commandId` (e.g. `` `${commandId}#step-${n}` ``),
+so a redelivered step is a `DuplicateCommand` without blocking the steps after it. An
+`AppendTooLarge` on a step carries `count` and `limit`: the signal that the configured
+step size is too large. Rule of thumb: **one command → one decision → one atomic
+append.** The tutorial's `stepped-command` example region runs a 150-event import and
+its compensating undo in fixed 50-entity steps.
 
 ### Stream Indexes (#140)
 
@@ -3075,7 +3070,7 @@ EventStore.commandHandler(matchDecider, matchEvents, {
 On `VersionConflict` the **full read–decide–append cycle re-runs** — never a blind
 re-append of stale events, and a function-form `additionalItems` is re-derived from
 the fresh decision. Only `VersionConflict` is retried; domain errors,
-`DuplicateCommand`, `PartialAppend` and infrastructure errors fail immediately. A call that
+`DuplicateCommand` and infrastructure errors fail immediately. A call that
 supplies `expectedVersion` is never retried — its `VersionConflict` is the answer
 to a conditional write. A number `n` is shorthand for
 `Schedule.recurs(n)` (n retries after the initial attempt). Default: no retry.
@@ -3460,10 +3455,9 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 | `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version) and unset on an append-time conflict, where the actual version is unknown without another read |
-| `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream (or, for a chunked append, already claimed) |
+| `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
-| `AppendTooLarge` | An `EventStore` append exceeds 100 transact items (without `chunked`), or a chunked append's final-chunk items cannot fit beside one event |
-| `PartialAppend` | A chunked `EventStore` append (#141) failed after its first transaction committed: versions `expectedVersion + 1 … committedVersion` are written, `intendedVersion` was not reached, `cause` is the failing chunk's error. Never retried by `commandHandler` |
+| `AppendTooLarge` | An `EventStore` append exceeds 100 transact items; nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
 
 ### Declared Errors per Operation
 
@@ -3485,7 +3479,7 @@ plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `PartialAppend`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
@@ -3607,7 +3601,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
 | `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
 | `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, or a `key` that is not a function |
-| `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `pending`, `_ttl`) |
+| `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`) |
 | `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
 | `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
 | `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently |

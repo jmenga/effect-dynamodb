@@ -4,7 +4,7 @@
 
 ### Minor Changes
 
-- [`4b8d210`](https://github.com/jmenga/effect-dynamodb/commit/4b8d210a4894e0a6be43906ffffa0098ee23628f) - EventStore command-path extensions: consistent reads, If-Match expected versions, inline projections, inline snapshots with single-request loads, opt-in chunked appends and stream indexes ([#136](https://github.com/jmenga/effect-dynamodb/issues/136), [#137](https://github.com/jmenga/effect-dynamodb/issues/137), [#138](https://github.com/jmenga/effect-dynamodb/issues/138), [#139](https://github.com/jmenga/effect-dynamodb/issues/139), [#140](https://github.com/jmenga/effect-dynamodb/issues/140), [#141](https://github.com/jmenga/effect-dynamodb/issues/141))
+- [`4b8d210`](https://github.com/jmenga/effect-dynamodb/commit/4b8d210a4894e0a6be43906ffffa0098ee23628f) - EventStore command-path extensions: consistent reads, If-Match expected versions, inline projections, inline snapshots with single-request loads and stream indexes ([#136](https://github.com/jmenga/effect-dynamodb/issues/136), [#137](https://github.com/jmenga/effect-dynamodb/issues/137), [#138](https://github.com/jmenga/effect-dynamodb/issues/138), [#139](https://github.com/jmenga/effect-dynamodb/issues/139), [#140](https://github.com/jmenga/effect-dynamodb/issues/140))
 
   Everything is additive. Two defaults of `commandHandler` change, and neither
   changes a successful result: it now loads state with strongly consistent reads
@@ -38,17 +38,6 @@
     snapshot is current, and `commandHandler` now loads every snapshot-configured
     stream this way. On an `"after-append"` stream with a large `every`, a load
     reads up to `every + 1` items in exchange for fewer requests.
-  - **Chunked appends ([#141](https://github.com/jmenga/effect-dynamodb/issues/141)).** `{ chunked: true }` on `append`, per handler call
-    or as a handler default splits an append too large for one transaction into
-    several, written in order at successive versions. **A chunked append is not
-    atomic**: readers can observe a prefix of its events, and a failure after the
-    first transaction surfaces as the new `PartialAppend` error
-    (`committedVersion`, `intendedVersion`, `cause`), which `commandHandler` never
-    retries. The first transaction decides concurrency and, with idempotency,
-    claims the command, so a redelivery is never applied twice; the final one
-    carries `additionalItems`, the inline snapshot and the completed sentinel. An
-    append that fits one transaction is written exactly as before. Without
-    `chunked`, an oversized append still fails with `AppendTooLarge`.
   - **Stream indexes ([#140](https://github.com/jmenga/effect-dynamodb/issues/140)).** `makeStream({ indexes })` declares sub-streams of a
     stream's events ordered by a key derived from each event, on an LSI (default,
     strongly consistent) or a GSI (`type: "gsi"`, scoped to the same stream).
@@ -59,6 +48,16 @@
     any LSI caps every partition key value's item collection at 10 GB. Index
     attributes are written only by `append`, so an index added later, or a
     changed `key`, covers only events appended from then on.
+  - **Large commands are stepped commands.** An append stays one atomic
+    transaction: it is never split. A command that decides more than one
+    transaction holds fails with `AppendTooLarge` before anything is written,
+    and its `count` / `limit` show the step size is too large. The new guidance
+    (tutorial, `DESIGN.md`) runs such a command as stepped commands: fixed-size
+    steps planned by the application, each an ordinary atomic `commandHandler`
+    call chained by `expectedVersion`, with a `commandId` per step under
+    idempotency — so a failure partway leaves a real, consistent state. One
+    command → one decision → one atomic append. ([#141](https://github.com/jmenga/effect-dynamodb/issues/141)'s opt-in chunked append is
+    not implemented.)
 
   New definition-time errors: `[EDD-9062]` invalid `snapshot.mode`, `[EDD-9063]`
   malformed stream index, `[EDD-9064]` index attribute owned by the stream,

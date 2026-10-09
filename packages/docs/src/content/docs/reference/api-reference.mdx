@@ -1142,7 +1142,7 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Method | Returns |
 |--------|---------|
-| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| PartialAppend \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Options: `metadata` (validated against the stream's metadata schema), `additionalItems`, `idempotency: { commandId, ttl? }`, `snapshot` (an inline snapshot `Put` in the same transaction; needs at least one event) and `chunked` (split an oversized append across transactions — **not atomic**; a failure after the first transaction is `PartialAppend`). |
+| `append(streamId, events, expectedVersion, options?)` | `Effect<AppendResult<TEvent>, AppendError, R>` — atomically append events with optimistic concurrency. `AppendError` is `VersionConflict \| DuplicateCommand \| AdditionalItemConditionFailed \| AppendTooLarge \| DynamoClientError \| ValidationError \| TransactionCancelled \| UniqueConstraintViolation \| OptimisticLockError \| ConcurrentModification`; the last three come from guarded puts in `additionalItems`. Each event becomes a `Put` with `attribute_not_exists(pk)` inside a single `TransactWriteItems`. Options: `metadata` (validated against the stream's metadata schema), `additionalItems`, `idempotency: { commandId, ttl? }` and `snapshot` (an inline snapshot `Put` in the same transaction; needs at least one event). An append over the transaction limits fails before anything is written; it is never split. |
 | `read(streamId, options?)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read all events for a stream in version order. `options` is `ReadOptions` (`{ consistentRead?: boolean }`). |
 | `readFrom(streamId, afterVersion, options?)` | `Effect<ReadonlyArray<StreamEvent<TEvent>>, DynamoClientError \| ValidationError, R>` — read events strictly after a given version. |
 | `currentVersion(streamId, options?)` | `Effect<number, DynamoClientError \| ValidationError, R>` — current head version (0 if the stream is empty). |
@@ -1168,7 +1168,6 @@ Handler options (`CommandHandlerOptions`):
 | `retry` | A number or `Schedule`; re-runs the whole load–decide–append cycle on `VersionConflict` only. Default: no retry |
 | `idempotency` | `{ ttl? }` — makes a per-call `commandId` required and writes a dedup sentinel with the events |
 | `consistentRead` | Load state with strongly consistent reads. Default `true` |
-| `chunked` | Default for the per-call `chunked`. Default `false` |
 
 Per-call options (`CommandOptions`):
 
@@ -1178,7 +1177,6 @@ Per-call options (`CommandOptions`):
 | `commandId` | The delivery's id; required with `idempotency` |
 | `expectedVersion` | If-Match: a loaded version other than this fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs. Never retried |
 | `additionalItems` | A static array of transact ops, or a function of the `Decision` (`{ events, state, previous, version }`) returning the ops or an `Effect` of them, committed in the same transaction as the events |
-| `chunked` | Split an oversized append across transactions (**not atomic**) |
 
 ### Fold helpers
 
@@ -1273,7 +1271,7 @@ import {
   RefNotFound, AggregateAssemblyError,
   AggregateDecompositionError, AggregateTransactionOverflow,
   CascadePartialFailure, VersionConflict, AppendTooLarge,
-  AdditionalItemConditionFailed, DuplicateCommand, PartialAppend,
+  AdditionalItemConditionFailed, DuplicateCommand,
 } from "effect-dynamodb"
 ```
 
@@ -1290,7 +1288,7 @@ import {
 | `DeleteAppliedButUnreadable` | `"DeleteAppliedButUnreadable"` | A delete with `returnValues("allOld")` was applied, but the item it removed (`item`, as stored) could not be decoded. Don't retry it |
 | `TransactionCancelled` | `"TransactionCancelled"` | Transaction rejected (includes cancellation `reasons`) |
 | `TransactionOverflow` | `"TransactionOverflow"` | A write's own transaction (the item, its sentinels and snapshot) would exceed DynamoDB's 100-item limit |
-| `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit, or a chunked append's final-transaction items cannot fit beside one event (`streamName`, `streamId`, `count`, `limit`) |
+| `AppendTooLarge` | `"AppendTooLarge"` | `EventStore.append` exceeds the 100-item transaction limit (`streamName`, `streamId`, `count`, `limit`). Never split: run a large command as stepped commands, and read `count` against `limit` as the step size being too large |
 | `UniqueConstraintViolation` | `"UniqueConstraintViolation"` | Unique constraint violated on put/create/upsert/update, or by a put in `transactWrite` / `append`'s `additionalItems` |
 | `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
 | `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
@@ -1305,7 +1303,6 @@ import {
 | `AggregateTransactionOverflow` | `"AggregateTransactionOverflow"` | Sub-aggregate exceeds 100-item transaction limit (`aggregate`, `subgraph`, `itemCount`, `limit`) |
 | `CascadePartialFailure` | `"CascadePartialFailure"` | Cascade update partially failed in eventual mode (`sourceEntity`, `sourceId`, `succeeded`, `failed`, `errors`) |
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch: an append's version guard failed, or a command handler call's `expectedVersion` did not match the loaded version (`streamName`, `streamId`, `expectedVersion`, `actualVersion?` — set by the pre-decide If-Match check, unset on an append-time conflict) |
-| `PartialAppend` | `"PartialAppend"` | A chunked `EventStore.append` failed after its first transaction committed; versions `expectedVersion + 1 … committedVersion` are written (`streamName`, `streamId`, `expectedVersion`, `committedVersion`, `intendedVersion`, `cause`). Never retried by `commandHandler` |
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
 
@@ -1326,7 +1323,7 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `PartialAppend`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage
 

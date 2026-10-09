@@ -72,14 +72,13 @@ export const itemBytes = (
   )
 
 /**
- * What one transact entry contributes to its transaction's size, as far as the
- * request shows it: a Put's whole item; a Delete's, ConditionCheck's or
- * Update's key. (An Update's values aren't counted: some may be its
- * condition's, and the item it writes is the stored one updated, which the
- * request does not carry.) The values err the way `bound` says — `"lower"` for
- * a refusal, `"upper"` for a budget (see {@link SizeBound}).
+ * A lower bound on what one transact entry contributes to its transaction's
+ * size, as far as the request shows it: a Put's whole item; a Delete's,
+ * ConditionCheck's or Update's key. (An Update's values aren't counted: some
+ * may be its condition's, and the item it writes is the stored one updated,
+ * which the request does not carry.)
  */
-export const transactItemBytes = (item: TransactWriteItem, bound: SizeBound = "lower"): number => {
-  if (item.Put !== undefined) return itemBytes(item.Put.Item ?? {}, bound)
-  return itemBytes(item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key ?? {}, bound)
+export const transactItemBytes = (item: TransactWriteItem): number => {
+  if (item.Put !== undefined) return itemBytes(item.Put.Item ?? {})
+  return itemBytes(item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key ?? {})
 }
