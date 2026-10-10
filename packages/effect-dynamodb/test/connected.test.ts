@@ -10321,6 +10321,13 @@ const provideEsMeta = Effect.provide(EsMetaLayer)
 
 const esMetaAt = (iso: string) => DateTime.makeUnsafe(iso)
 
+/**
+ * The append's `now` in the `eventTimestamps` tests: `it.effect` runs on a
+ * `TestClock` frozen at epoch 0, which each test advances to this instant.
+ */
+const esMetaClockIso = "2026-10-10T12:00:00.000Z"
+const esMetaClockMs = Date.parse(esMetaClockIso)
+
 /** Every base-table item of one stream partition, raw (no filter, no decode). */
 const esMetaRawItems = (pk: string) =>
   Effect.gen(function* () {
@@ -10609,6 +10616,207 @@ describeConnected("EventStore per-event metadata (#144)", () => {
       expect(near.version).toBe(1)
       const stored = yield* EsMetaImport.read(key, { consistentRead: true })
       expect(stored[0]!.metadata?.origins[0]?.payload).toHaveLength(380_000)
+    }).pipe(provideEsMeta),
+  )
+
+  // -------------------------------------------------------------------------
+  // eventTimestamps (#144 §7)
+  // -------------------------------------------------------------------------
+
+  it.effect("#144 an import with eventTimestamps reads back each event's own timestamp", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-import-1" }
+      // Entry numbers differ from stream order, so a positional mix-up on the
+      // index read would show. Times run backwards, repeat an instant (once as
+      // a Sydney-zoned value) and leave one event on the append's `now`.
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 4, amount: 40 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+        ],
+        0,
+        {
+          eventTimestamps: [
+            esMetaAt("2019-05-02T17:00:00Z"),
+            undefined,
+            esMetaAt("2019-05-01T09:30:00.250Z"),
+            DateTime.makeZonedUnsafe(new Date("2019-05-01T09:30:00.250Z"), {
+              timeZone: "Australia/Sydney",
+            }),
+          ],
+        },
+      )
+
+      // Each item stores its own timestamp, in the format `now` is written in.
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-import-1")
+      expect(raw.map((item) => [item.version, item.timestamp])).toEqual([
+        [1, "2019-05-02T17:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T09:30:00.250Z"],
+        [4, "2019-05-01T09:30:00.250Z"],
+      ])
+
+      // `read` returns each event's own timestamp, in version order.
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-02T17:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T09:30:00.250Z"],
+        [4, "2019-05-01T09:30:00.250Z"],
+      ])
+
+      // A stream index read carries each event's own timestamp too.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => [event.data.entry, event.version, event.timestamp])).toEqual([
+        [1, 3, "2019-05-01T09:30:00.250Z"],
+        [2, 2, esMetaClockIso],
+        [3, 4, "2019-05-01T09:30:00.250Z"],
+        [4, 1, "2019-05-02T17:00:00.000Z"],
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a malformed eventTimestamps is refused before anything is sent", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "ts-bad-1" }
+      const before = esMetaTransactWrites
+      const events = [
+        new EsMetaPosted({ entry: 1, amount: 10 }),
+        new EsMetaPosted({ entry: 2, amount: 20 }),
+      ]
+
+      const short = yield* EsMetaLedger.append(key, events, 0, {
+        eventTimestamps: [esMetaAt("2019-05-01T09:30:00Z")],
+      }).pipe(Effect.flip)
+      expect(short._tag).toBe("ValidationError")
+      expect((short as ValidationError).operation).toBe("EventStore.append.eventTimestamps")
+
+      const notDateTime = yield* EsMetaLedger.append(key, events, 0, {
+        eventTimestamps: [
+          esMetaAt("2019-05-01T09:30:00Z"),
+          new Date("2019-05-02T09:30:00Z") as unknown as DateTime.DateTime,
+        ],
+      }).pipe(Effect.flip)
+      expect(notDateTime._tag).toBe("ValidationError")
+      expect((notDateTime as ValidationError).operation).toBe("EventStore.append.eventTimestamps")
+
+      expect(esMetaTransactWrites).toBe(before)
+      expect(yield* EsMetaLedger.read(key, { consistentRead: true })).toHaveLength(0)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler derives one timestamp per event from the decision", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-cmd-1" }
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const seen: Array<EventStore.Decision<{ readonly entries: number }, EsMetaEvent>> = []
+      // An imported source's own times, keyed by entry number; entry 2 has none.
+      const sourceTimes: Record<number, DateTime.DateTime> = {
+        1: esMetaAt("2019-05-03T08:00:00.000Z"),
+        3: esMetaAt("2019-05-01T08:00:00.000Z"),
+      }
+      const eventTimestamps = (
+        decision: EventStore.Decision<{ readonly entries: number }, EsMetaEvent>,
+      ) => {
+        seen.push(decision)
+        return decision.events.map((event) => sourceTimes[event.entry])
+      }
+
+      const first = yield* handle(key, 3, { eventTimestamps })
+      expect(first.version).toBe(3)
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.version).toBe(0)
+      expect(seen[0]!.events.map((event) => event.entry)).toEqual([1, 2, 3])
+
+      // A no-op decision does not call it.
+      const noop = yield* handle(key, 0, { eventTimestamps })
+      expect(noop.version).toBe(3)
+      expect(seen).toHaveLength(1)
+
+      // Without the option, the handler's events keep the Clock time.
+      const second = yield* handle(key, 1)
+      expect(second.version).toBe(4)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, esMetaClockIso],
+      ])
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-cmd-1")
+      expect(raw.map((item) => item.timestamp)).toEqual(events.map((event) => event.timestamp))
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 eventTimestamps combines with eventMetadata, on append and the handler", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-meta-1" }
+      const occurred = [esMetaAt("2019-05-01T09:00:00.000Z"), esMetaAt("2019-04-30T09:00:00.000Z")]
+
+      // append: each event carries its own metadata entry and its own time.
+      yield* EsMetaLedger.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 10 }), new EsMetaPosted({ entry: 2, amount: 20 })],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "tm-1", occurredAt: occurred[0]! },
+            { eventId: "tm-2", occurredAt: occurred[1]! },
+          ],
+          eventTimestamps: occurred,
+        },
+      )
+
+      // commandHandler: both derived from the same decision; the Effect form
+      // of eventMetadata beside the plain eventTimestamps.
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const handled = yield* handle(key, 2, {
+        eventMetadata: ({ events }) =>
+          Effect.succeed(
+            events.map((event) => ({
+              eventId: `tm-${event.entry}`,
+              occurredAt: esMetaAt(`2019-05-0${event.entry}T10:00:00.000Z`),
+            })),
+          ),
+        eventTimestamps: ({ events }) =>
+          events.map((event, i) =>
+            i === 0 ? esMetaAt(`2019-05-0${event.entry}T10:00:00.000Z`) : undefined,
+          ),
+      })
+      expect(handled.version).toBe(4)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(
+        events.map((event) => [
+          event.version,
+          event.metadata?.eventId,
+          DateTime.formatIso(event.metadata!.occurredAt),
+          event.timestamp,
+        ]),
+      ).toEqual([
+        [1, "tm-1", "2019-05-01T09:00:00.000Z", "2019-05-01T09:00:00.000Z"],
+        [2, "tm-2", "2019-04-30T09:00:00.000Z", "2019-04-30T09:00:00.000Z"],
+        [3, "tm-3", "2019-05-03T10:00:00.000Z", "2019-05-03T10:00:00.000Z"],
+        [4, "tm-4", "2019-05-04T10:00:00.000Z", esMetaClockIso],
+      ])
+
+      // The index read pairs the same metadata and timestamp on each event.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(
+        entries.map((event) => [event.data.entry, event.metadata?.eventId, event.timestamp]),
+      ).toEqual([
+        [1, "tm-1", "2019-05-01T09:00:00.000Z"],
+        [2, "tm-2", "2019-04-30T09:00:00.000Z"],
+        [3, "tm-3", "2019-05-03T10:00:00.000Z"],
+        [4, "tm-4", esMetaClockIso],
+      ])
     }).pipe(provideEsMeta),
   )
 })
