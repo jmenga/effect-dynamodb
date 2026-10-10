@@ -284,7 +284,8 @@ yield* stream.append(streamId, [e1, e2, e3], expectedVersion, {
   `undefined` entry keeps the append's `now`.
 - Independent of `metadata` / `eventMetadata`: any combination is allowed.
 - Checked with the metadata checks, before the zero-event fast path: a length that differs
-  from `events.length`, or an entry that is neither a `DateTime` nor `undefined`, fails with
+  from `events.length`, or an entry that is neither a valid `DateTime` (finite epoch) nor
+  `undefined`, fails with
   `ValidationError` (`operation: "EventStore.append.eventTimestamps"`) before anything is
   written.
 - Only the event items change. The idempotency sentinel, its TTL and the inline snapshot

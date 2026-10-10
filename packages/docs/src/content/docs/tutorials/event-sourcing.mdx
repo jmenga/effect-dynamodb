@@ -1286,13 +1286,66 @@ yield* handleAudited(
 When it runs:
 
 ```text
-load → [expectedVersion check] → decide → fold new events → eventMetadata → additionalItems → append → [snapshot]
+load → [expectedVersion check] → decide → fold new events → eventMetadata → eventTimestamps → additionalItems → append → [snapshot]
 ```
 
 - It runs after the new events are folded and **before** `additionalItems`, so an effectful pair runs in a predictable order. It is not called when `decide` returns no events.
 - It runs again on every attempt: each `VersionConflict` retry, and the second decision a stale snapshot triggers under `verifySnapshot: false`. Only the committed attempt's entries are ever written, so minting fresh ids per attempt is safe.
 - A result whose length differs from the decision's events fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`) before anything is sent. A failure of the returned `Effect` surfaces in the handler's error channel. Neither is retried.
 - With `idempotency`, a redelivered command fails with `DuplicateCommand` and never commits a second set of ids. Without it, a redelivery decides and appends again, and random ids differ between the two commits; derive them from the delivery id, as the second call does, when they must match.
+
+### Original event times
+
+Every event item also has a `timestamp`, read back as `StreamEvent.timestamp`. By default it is the time of the append, from the `Clock`. An import usually wants each event's original time instead, and pinning the clock per chunk would stamp every event of a chunk with one time. `eventTimestamps` takes one `DateTime` per event, in the same order as `events`: entry `i` is written as event `i`'s `timestamp`, and an `undefined` entry keeps the append's own time:
+
+```typescript region="event-timestamps" example="event-sourcing.ts"
+// History from a previous store, each record with its own id and the time
+// it happened.
+const legacyRecords = [
+  {
+    sourceId: "legacy-204",
+    occurredAt: "2025-01-02T23:30:00Z",
+    event: new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" }),
+  },
+  {
+    sourceId: "legacy-205",
+    occurredAt: "2025-01-03T06:40:00Z",
+    event: new InningsCompleted({ innings: 1, runs: 185, wickets: 10 }),
+  },
+  {
+    sourceId: "legacy-206",
+    occurredAt: "2025-01-04T04:15:00Z",
+    event: new InningsCompleted({ innings: 2, runs: 181, wickets: 10 }),
+  },
+]
+
+// One append keeps every event's original time: entry `i` of
+// `eventTimestamps` is event `i`'s timestamp (`undefined` keeps the
+// append's own time). It combines with either metadata option.
+yield* audited.append(
+  { matchId: "m-23" },
+  legacyRecords.map((record) => record.event),
+  0,
+  {
+    eventMetadata: legacyRecords.map((record) => ({
+      correlationId: "import-18",
+      sourceId: record.sourceId,
+    })),
+    eventTimestamps: legacyRecords.map((record) => DateTime.makeUnsafe(record.occurredAt)),
+  },
+)
+
+// Each event reads back with its own time, in UTC.
+const history = yield* audited.read({ matchId: "m-23" })
+const occurred = history.map((event) => `${event.metadata?.sourceId} ${event.timestamp}`)
+// → ["legacy-204 2025-01-02T23:30:00.000Z", "legacy-205 2025-01-03T06:40:00.000Z", …]
+```
+
+- A stream is ordered by `version`, not by `timestamp`. The library never reads the value back for ordering, so timestamps may repeat, run backwards or lie in the future, as imported history can.
+- Only the event items take the given times. The idempotency sentinel, its TTL and an inline snapshot keep the append's own time, because they record when the append was written.
+- Each entry is written with `DateTime.formatIso`, the format of the append's own time, so a zoned `DateTime` is stored as its UTC instant.
+- `eventTimestamps` is independent of `metadata` and `eventMetadata`, so it combines with either. A length that differs from `events`, or an entry that is neither a valid `DateTime` nor `undefined` (a JS `Date`, say: convert it with `DateTime.fromDateUnsafe`; or a `DateTime` with a `NaN` epoch from a bad parse), fails with a `ValidationError` (`operation: "EventStore.append.eventTimestamps"`) before anything is sent, even when `events` is empty.
+- On a command handler, `eventTimestamps` is a function of the `Decision`, like `eventMetadata`, but it returns the array directly. It has no `Effect` form: the times come from the command or the events, and the effectful source of a time, the `Clock`, is already the default. It runs after `eventMetadata` and before `additionalItems`, is not called when `decide` returns no events, and runs again on every attempt. A result of the wrong length, or with an entry that is not a `DateTime` or `undefined`, fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`), never retried.
 
 :::note[Why not pack a list into `metadata`?]
 Before `eventMetadata`, the only place for per-event values was a list inside the shared `metadata`, with each reader picking its entry by position. Every event then stores the whole list, so an append of N events stores N² entries, and a stream index (always projecting `ALL`) copies all of them. That cost counts towards DynamoDB's 400 KB item and 4 MB transaction limits. `eventMetadata` stores each entry once, on its own event.
@@ -1361,6 +1414,7 @@ Effect.runPromise(main).then(
 | **Stepped commands** | A command too large for one transaction is split by the application into fixed-size commands chained by `expectedVersion` — each one atomic |
 | **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
 | **Event metadata** | `makeStream({ metadata })` declares the schema; `append(..., { metadata })` shares one value, `{ eventMetadata }` gives each event its own entry; on a handler, `eventMetadata: (decision) => entries` derives them after `decide` |
+| **Event timestamps** | `append(..., { eventTimestamps })` writes each event's own `DateTime` as its `timestamp` (`undefined` keeps the append time); on a handler, `eventTimestamps: (decision) => timestamps`. `version`, not `timestamp`, orders a stream |
 
 ## What's Next?
 

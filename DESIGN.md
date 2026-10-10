@@ -2872,6 +2872,11 @@ load → [expectedVersion check] → decide → fold new events → derive items
   takes a function of the same `Decision` returning one metadata entry per event
   (or an `Effect` of them), passed to `append` as `eventMetadata`. See
   [Event Metadata](#event-metadata-144).
+- **Decision-derived event timestamps (#144).** `CommandOptions.eventTimestamps`
+  takes a function of the same `Decision` returning one `DateTime` (or
+  `undefined`) per event — a plain array, no `Effect` form — evaluated after
+  `eventMetadata` and passed to `append` as `eventTimestamps`. See
+  [Per-event timestamps](#per-event-timestamps).
 - **One atomic append.** One command → one decision → one atomic append. A
   decision too large for one transaction fails with `AppendTooLarge` before
   anything is written — see
@@ -2955,6 +2960,44 @@ yield* stream.append(streamId, [e1, e2, e3], v, { eventMetadata: [m1, undefined,
 
 The read side is unchanged: `StreamEvent.metadata` decodes each item's own attribute,
 so `read`, `readFrom`, `readLatest` and stream-index queries return each event's entry.
+
+#### Per-event timestamps
+
+An event item's `timestamp` is the append's `DateTime.now` (from the `Clock`) unless the
+append sets it per event. Nothing in the library reads `timestamp` for ordering,
+snapshots or expiry, so an import can carry each event's original time instead of
+pinning the `Clock` per chunk (design doc §7):
+
+```typescript
+// Entry i is written as event i's timestamp; undefined keeps the append's `now`
+yield* stream.append(streamId, [e1, e2, e3], v, {
+  eventMetadata: [m1, m2, m3],
+  eventTimestamps: [t1, undefined, t3],
+})
+```
+
+- **`eventTimestamps` on `append`.** `ReadonlyArray<DateTime.DateTime | undefined>`, on
+  `AppendOptionsBase`, outside the exclusive metadata union: it combines with
+  `metadata`, `eventMetadata` or neither. Each entry is written with
+  `DateTime.formatIso` — the format `now` is written in — so a zoned `DateTime` is
+  stored as its UTC instant.
+- **Validation runs first**, with the metadata checks and ahead of the zero-event fast
+  path: a value that is not an array, a length other than `events.length`, or an entry
+  that is neither a valid `DateTime` (finite epoch) nor `undefined` is a `ValidationError`
+  (`operation: "EventStore.append.eventTimestamps"`) before anything is read or written.
+- **Event items only.** The idempotency sentinel, its TTL and the inline snapshot keep
+  `now`: they record when the append was written.
+- **No ordering constraint.** `version` orders a stream; timestamps may repeat, run
+  backwards or lie in the future, as imported history can.
+- **`eventTimestamps` on `commandHandler`.** A function of the `Decision` on
+  `CommandOptionsBase` returning the array directly — no `Effect` form and no new handler
+  type parameters, since the values come from the command or the events and the
+  effectful source of a time, the `Clock`, is already the default. Evaluated after
+  `eventMetadata` and before `additionalItems`; never for a no-op decision; re-run on
+  every attempt and on the unverified-snapshot re-decision. A wrong-length or malformed
+  result is a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`),
+  never retried; a non-function value is refused before anything is read. No error
+  union widens.
 
 ### Snapshots
 

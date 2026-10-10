@@ -5,7 +5,8 @@
  * append/read/readFrom/currentVersion operations, fold helpers, Query combinators,
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
- * large commands as stepped commands, stream indexes, and event metadata.
+ * large commands as stepped commands, stream indexes, and event metadata and
+ * timestamps.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -19,6 +20,7 @@ import {
   Config,
   Console,
   Data,
+  DateTime,
   Duration,
   Effect,
   Layer,
@@ -994,6 +996,50 @@ const program = Effect.gen(function* () {
   yield* Console.log(
     `Handler event ids: ${handled.map((e) => `v${e.version} ${e.metadata?.eventId}`).join(", ")}`,
   )
+
+  // #region event-timestamps
+  // History from a previous store, each record with its own id and the time
+  // it happened.
+  const legacyRecords = [
+    {
+      sourceId: "legacy-204",
+      occurredAt: "2025-01-02T23:30:00Z",
+      event: new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" }),
+    },
+    {
+      sourceId: "legacy-205",
+      occurredAt: "2025-01-03T06:40:00Z",
+      event: new InningsCompleted({ innings: 1, runs: 185, wickets: 10 }),
+    },
+    {
+      sourceId: "legacy-206",
+      occurredAt: "2025-01-04T04:15:00Z",
+      event: new InningsCompleted({ innings: 2, runs: 181, wickets: 10 }),
+    },
+  ]
+
+  // One append keeps every event's original time: entry `i` of
+  // `eventTimestamps` is event `i`'s timestamp (`undefined` keeps the
+  // append's own time). It combines with either metadata option.
+  yield* audited.append(
+    { matchId: "m-23" },
+    legacyRecords.map((record) => record.event),
+    0,
+    {
+      eventMetadata: legacyRecords.map((record) => ({
+        correlationId: "import-18",
+        sourceId: record.sourceId,
+      })),
+      eventTimestamps: legacyRecords.map((record) => DateTime.makeUnsafe(record.occurredAt)),
+    },
+  )
+
+  // Each event reads back with its own time, in UTC.
+  const history = yield* audited.read({ matchId: "m-23" })
+  const occurred = history.map((event) => `${event.metadata?.sourceId} ${event.timestamp}`)
+  // → ["legacy-204 2025-01-02T23:30:00.000Z", "legacy-205 2025-01-03T06:40:00.000Z", …]
+  // #endregion
+  yield* Console.log(`Imported history:\n  ${occurred.join("\n  ")}`)
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
