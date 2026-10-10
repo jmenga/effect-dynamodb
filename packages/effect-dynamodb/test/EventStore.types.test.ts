@@ -22,6 +22,9 @@
  *   `append` and the handler; entries are typed `M | undefined`; an effectful
  *   `eventMetadata` joins its own `E3` / `R3` to the handler's channels next to
  *   an `additionalItems`' `E2` / `R2`; idempotency still requires `commandId`.
+ *   `eventTimestamps` entries are `DateTime | undefined`, allowed next to either
+ *   metadata option; the handler's is a plain function (an `Effect` is refused)
+ *   and widens neither channel.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
@@ -29,7 +32,7 @@
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { ValidationError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
-import { Context, Data, Effect, type Option, Schema } from "effect"
+import { Context, Data, DateTime, Effect, type Option, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -703,6 +706,112 @@ describe("EventStore.commandHandler types", () => {
         })
       })
       expect(true).toBe(true)
+    })
+
+    describe("eventTimestamps", () => {
+      const t = DateTime.makeUnsafe("2019-05-01T00:00:00Z")
+
+      it("append: entries are DateTime | undefined, next to either metadata option", () => {
+        typeOnly(() => {
+          type Entries = NonNullable<EventStore.AppendOptions<Meta>["eventTimestamps"]>
+          expectTypeOf<Entries>().toEqualTypeOf<ReadonlyArray<DateTime.DateTime | undefined>>()
+
+          const appended = Audited.append(key, events, 0, { eventTimestamps: [t, undefined] })
+          expectTypeOf<Effect.Error<typeof appended>>().toEqualTypeOf<EventStore.AppendError>()
+          // A zoned DateTime is a DateTime.
+          Audited.append(key, events, 0, {
+            eventTimestamps: [DateTime.makeZonedUnsafe(0, { timeZone: "Europe/London" }), t],
+          })
+          Audited.append(key, events, 0, {
+            metadata: { eventId: "shared" },
+            eventTimestamps: [t, t],
+          })
+          Audited.append(key, events, 0, {
+            eventMetadata: [{ eventId: "a" }, undefined],
+            eventTimestamps: [undefined, t],
+          })
+
+          // @ts-expect-error — an entry is a DateTime, not a Date
+          Audited.append(key, events, 0, { eventTimestamps: [new Date(0), t] })
+          // @ts-expect-error — an entry is a DateTime, not an ISO string
+          Audited.append(key, events, 0, { eventTimestamps: ["2019-05-01T00:00:00Z", t] })
+          // @ts-expect-error — eventTimestamps is an array, not one value
+          Audited.append(key, events, 0, { eventTimestamps: t })
+
+          Effect.gen(function* () {
+            const bound = yield* EventStore.bind(Audited)
+            const boundAppended = bound.append(key, events, 0, {
+              eventMetadata: [{ eventId: "a" }, { eventId: "b" }],
+              eventTimestamps: [t, t],
+            })
+            expectTypeOf<Effect.Services<typeof boundAppended>>().toEqualTypeOf<never>()
+            // @ts-expect-error — an entry is a DateTime, not a Date
+            bound.append(key, events, 0, { eventTimestamps: [new Date(0), t] })
+          })
+        })
+        expect(true).toBe(true)
+      })
+
+      it("handler: a plain function of the Decision, widening neither channel", () => {
+        typeOnly(() => {
+          const handle = EventStore.commandHandler(decider, Audited)
+          const plain = handle(key, command)
+          const stamped = handle(key, command, {
+            eventTimestamps: (decision) => {
+              expectTypeOf(decision).toEqualTypeOf<EventStore.Decision<CounterState, Incremented>>()
+              return decision.events.map((_, i) => (i === 0 ? t : undefined))
+            },
+          })
+          expectTypeOf<Effect.Services<typeof stamped>>().toEqualTypeOf<Base>()
+          expectTypeOf<Effect.Error<typeof stamped>>().toEqualTypeOf<Effect.Error<typeof plain>>()
+
+          // Alongside either metadata option, and an effectful pair: only the
+          // pair's E2 / R2 and E3 / R3 join the channels.
+          handle(key, command, {
+            metadata: { eventId: "shared" },
+            eventTimestamps: ({ events }) => events.map(() => t),
+          })
+          const all = handle(key, command, {
+            eventMetadata: mintIds,
+            eventTimestamps: ({ events }) => events.map(() => t),
+            additionalItems: effectfulItems,
+          })
+          expectTypeOf<Effect.Services<typeof all>>().toEqualTypeOf<Base | IdMinter | Projector>()
+          expectTypeOf<MintFailed | ProjectionFailed>().toExtend<Effect.Error<typeof all>>()
+          expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof all>>()
+
+          handle(key, command, {
+            // @ts-expect-error — plain return only: an Effect is not an array
+            eventTimestamps: ({ events }) => Effect.succeed(events.map(() => t)),
+          })
+          // @ts-expect-error — function-only: a static array cannot know the event count
+          handle(key, command, { eventTimestamps: [t] })
+          handle(key, command, {
+            // @ts-expect-error — an entry is a DateTime, not a Date
+            eventTimestamps: ({ events }) => events.map(() => new Date(0)),
+          })
+
+          // Idempotency still requires commandId.
+          const idempotent = EventStore.commandHandler(decider, Audited, { idempotency: {} })
+          // @ts-expect-error — commandId is required
+          idempotent(key, command, { eventTimestamps: () => [t] })
+          idempotent(key, command, { commandId: "cmd-1", eventTimestamps: () => [t] })
+
+          Effect.gen(function* () {
+            const bound = yield* EventStore.bind(Audited)
+            const boundStamped = bound.pipe(EventStore.commandHandler(decider))(key, command, {
+              eventTimestamps: () => [t],
+            })
+            expectTypeOf<Effect.Services<typeof boundStamped>>().toEqualTypeOf<never>()
+            expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof boundStamped>>()
+            EventStore.commandHandler(decider, bound)(key, command, {
+              // @ts-expect-error — plain return only: an Effect is not an array
+              eventTimestamps: () => Effect.succeed([t]),
+            })
+          })
+        })
+        expect(true).toBe(true)
+      })
     })
   })
 })

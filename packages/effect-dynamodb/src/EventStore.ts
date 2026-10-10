@@ -116,6 +116,11 @@ export interface StreamEvent<A, M = Record<string, unknown> | undefined> {
   readonly eventType: string
   readonly data: A
   readonly metadata: M
+  /**
+   * ISO 8601 (UTC): when the event was appended, by the append's `Clock` — or
+   * the `eventTimestamps` entry it was appended with
+   * ({@link AppendOptionsBase.eventTimestamps}).
+   */
   readonly timestamp: string
 }
 
@@ -357,6 +362,24 @@ export interface AppendOptionsBase<TState = never> {
    * is `never`) it dies with `[EDD-9026]`, as `writeSnapshot` does.
    */
   readonly snapshot?: TState
+  /**
+   * Per-event timestamps: entry `i` is written as event `i`'s `timestamp` (and
+   * read back as that event's `StreamEvent.timestamp`), for history imported
+   * with its original occurrence times. An `undefined` entry keeps the
+   * append's `Clock` time. Independent of `metadata` / `eventMetadata`.
+   *
+   * Written with `DateTime.formatIso` — the format the append's own time is
+   * written in — so a zoned `DateTime` is stored as its UTC instant.
+   *
+   * - Must have exactly one entry per event, each a valid `DateTime` (finite
+   *   epoch) or `undefined` — anything else fails with `ValidationError` before anything is read or
+   *   written, also for an append of no events (where only `[]` is accepted).
+   * - Only the event items change: the idempotency sentinel, its TTL and the
+   *   inline snapshot record when the append was written.
+   * - No ordering is enforced. `version` orders a stream; timestamps may
+   *   repeat, run backwards or lie in the future, as imported history can.
+   */
+  readonly eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
 }
 
 /**
@@ -856,6 +879,46 @@ const unverifiedSnapshotRefusal = (
       `snapshot mode "inline" without "every" — the only mode that writes the snapshot in every ` +
       `append, so it is normally at the head. This stream's snapshot is mode "${settings.mode}"` +
       `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`
+
+/**
+ * @internal Why an `eventTimestamps` value cannot be written for `count`
+ * events — not an array, the wrong length, or an entry that is neither a
+ * valid `DateTime` (finite epoch) nor `undefined` — or `undefined` when it can. `label` opens the
+ * message (`"eventTimestamps has"` / `"eventTimestamps returned"`) and
+ * `events` names the events (`"2 events"` / `"the decision's 2 events"`).
+ */
+const eventTimestampsProblem = (
+  timestamps: unknown,
+  count: number,
+  label: string,
+  events: string,
+): string | undefined => {
+  if (!Array.isArray(timestamps) || timestamps.length !== count) {
+    return (
+      `${label} ${Array.isArray(timestamps) ? timestamps.length : "no"} entries for ${events}: ` +
+      "it needs exactly one entry (a DateTime, or undefined) per event, in order."
+    )
+  }
+  const malformed = timestamps.findIndex(
+    (t) =>
+      t !== undefined && (!DateTime.isDateTime(t) || !Number.isFinite(DateTime.toEpochMillis(t))),
+  )
+  if (malformed === -1) return undefined
+  const entry: unknown = timestamps[malformed]
+  // A DateTime with a NaN epoch (e.g. `setPartsUtc` from a bad parse) passes
+  // `isDateTime` but makes `formatIso` throw, so it is refused here instead.
+  if (DateTime.isDateTime(entry)) {
+    return (
+      `eventTimestamps[${malformed}] is an invalid DateTime (its epoch milliseconds are not a ` +
+      "finite number): each entry must be a valid DateTime, or undefined to keep the append's own time."
+    )
+  }
+  return (
+    `eventTimestamps[${malformed}] is not a DateTime (received ` +
+    `${entry instanceof Date ? "a Date — convert it with DateTime.fromDateUnsafe" : entry === null ? "null" : typeof entry}): ` +
+    "each entry must be a DateTime, or undefined to keep the append's own time."
+  )
+}
 
 // ---------------------------------------------------------------------------
 // EventStream interface
@@ -1634,6 +1697,25 @@ export const makeStream = <
         }
       }
 
+      // Per-event timestamps (#144), checked alongside the metadata and for
+      // the same reason: ahead of the no-op fast path.
+      const eventTimestamps = options?.eventTimestamps
+      if (eventTimestamps !== undefined) {
+        const problem = eventTimestampsProblem(
+          eventTimestamps,
+          events.length,
+          "eventTimestamps has",
+          `${events.length} events`,
+        )
+        if (problem !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventTimestamps",
+            cause: `${problem} Nothing was written.`,
+          })
+        }
+      }
+
       if (snapshotState !== undefined && snapshot === undefined) {
         return yield* snapshotUnavailable("append({ snapshot })")
       }
@@ -1776,6 +1858,11 @@ export const makeStream = <
                     : (entry as Record<string, unknown>)
             }
 
+            // This event's own timestamp (#144), or the append's `now`.
+            // `formatIso` renders the UTC instant, so a zoned DateTime is
+            // stored in the same format as `now`.
+            const eventTimestamp = eventTimestamps?.[i]
+
             const item: Record<string, unknown> = {
               pk,
               sk: composeEventSk(version),
@@ -1784,7 +1871,7 @@ export const makeStream = <
               version,
               eventType: evtType,
               data: eventData,
-              timestamp: now,
+              timestamp: eventTimestamp === undefined ? now : DateTime.formatIso(eventTimestamp),
             }
             if (itemMetadata !== undefined) {
               item.metadata = itemMetadata
@@ -2936,8 +3023,9 @@ export interface CommandHandlerOptions {
 
 /**
  * The outcome of one `decide` call, handed to a function-form
- * {@link CommandOptionsBase.additionalItems} and to `eventMetadata`
- * ({@link CommandMetadataOptions}).
+ * {@link CommandOptionsBase.additionalItems}, to `eventMetadata`
+ * ({@link CommandMetadataOptions}) and to
+ * {@link CommandOptionsBase.eventTimestamps}.
  *
  * - `events` — what `decide` returned (never empty: the function is not called
  *   for a no-op decision).
@@ -3088,6 +3176,32 @@ export interface CommandOptionsBase<State = unknown, Event = unknown, E2 = never
    * `AdditionalItemConditionFailed` refer to the array it returned.
    */
   readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
+  /**
+   * Per-event timestamps derived from the {@link Decision}: the function
+   * returns one entry per event, in order, and entry `i` is written as event
+   * `i`'s `timestamp` — `undefined` keeps the append's `Clock` time (see
+   * {@link AppendOptionsBase.eventTimestamps}). Independent of `metadata` /
+   * `eventMetadata`.
+   *
+   * - Returns the array directly — there is no `Effect` form: the times come
+   *   from the command or the events, and the effectful source of a time,
+   *   the `Clock`, is already the default.
+   * - Runs after `eventMetadata` and before `additionalItems`, receiving the
+   *   same `Decision`; not called when `decide` returns no events; re-run on
+   *   every attempt, as `eventMetadata` is.
+   * - A result of the wrong length, or with an entry that is neither a valid
+   *   `DateTime` (finite epoch) nor `undefined`, fails with `ValidationError`
+   *   (`operation: "EventStore.commandHandler.eventTimestamps"`), never
+   *   retried. A value that is not a function is refused before anything is
+   *   read.
+   *
+   * ```ts
+   * eventTimestamps: ({ events }) => events.map((event) => event.occurredAt)
+   * ```
+   */
+  readonly eventTimestamps?: (
+    decision: Decision<State, Event>,
+  ) => ReadonlyArray<DateTime.DateTime | undefined>
 }
 
 /**
@@ -3379,9 +3493,10 @@ const makeCommandHandlerImpl = <
           next = decider.evolve(next, event)
         }
 
-        // 6. Derive the caller's per-event metadata, then items, from the
-        //    decision — in that order (#144). Re-run on every attempt (and on
-        //    a re-decision), because the whole cycle is the retried unit.
+        // 6. Derive the caller's per-event metadata, then per-event
+        //    timestamps, then items, from the decision — in that order
+        //    (#144). Re-run on every attempt (and on a re-decision), because
+        //    the whole cycle is the retried unit.
         const decision: Decision<State, TEvent> = {
           events: newEvents,
           state: next,
@@ -3404,6 +3519,27 @@ const makeCommandHandlerImpl = <
               "one entry (or undefined) per event, in order. Nothing was written.",
           })
         }
+        // A plain function (checked before the load): its result is checked
+        // here, so the error names the handler's option rather than `append`'s.
+        const eventTimestamps =
+          callOptions?.eventTimestamps === undefined
+            ? undefined
+            : callOptions.eventTimestamps(decision)
+        if (callOptions?.eventTimestamps !== undefined) {
+          const problem = eventTimestampsProblem(
+            eventTimestamps,
+            newEvents.length,
+            "eventTimestamps returned",
+            `the decision's ${newEvents.length} events`,
+          )
+          if (problem !== undefined) {
+            return yield* new ValidationError({
+              entityType: stream.streamName,
+              operation: "EventStore.commandHandler.eventTimestamps",
+              cause: `${problem} Nothing was written.`,
+            })
+          }
+        }
         const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, decision)
 
         // 7. Append with optimistic concurrency, plus the caller's items, the
@@ -3413,12 +3549,14 @@ const makeCommandHandlerImpl = <
         const appendOptions: {
           metadata?: TMetadata
           eventMetadata?: ReadonlyArray<TMetadata | undefined>
+          eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
           additionalItems?: ReadonlyArray<TransactWriteOp>
           idempotency?: AppendIdempotency
           snapshot?: State
         } = {}
         if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
         if (eventMetadata !== undefined) appendOptions.eventMetadata = eventMetadata
+        if (eventTimestamps !== undefined) appendOptions.eventTimestamps = eventTimestamps
         if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
         if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
           appendOptions.idempotency =
@@ -3537,8 +3675,9 @@ const makeCommandHandlerImpl = <
       }
 
       // The same backstop for the exclusive metadata pair (#144), and for an
-      // `eventMetadata` that is not the function it must be — refused before
-      // anything is read, rather than by `append` after `decide`.
+      // `eventMetadata` or `eventTimestamps` that is not the function it must
+      // be — refused before anything is read, rather than by `append` after
+      // `decide`.
       if (callOptions?.eventMetadata !== undefined) {
         if (callOptions.metadata !== undefined) {
           return yield* new ValidationError({
@@ -3558,6 +3697,18 @@ const makeCommandHandlerImpl = <
               "known only once `decide` has run. Nothing was written.",
           })
         }
+      }
+      if (
+        callOptions?.eventTimestamps !== undefined &&
+        typeof callOptions.eventTimestamps !== "function"
+      ) {
+        return yield* new ValidationError({
+          entityType: stream.streamName,
+          operation: "EventStore.commandHandler.eventTimestamps",
+          cause:
+            "eventTimestamps must be a function of the decision: the number of events is " +
+            "known only once `decide` has run. Nothing was written.",
+        })
       }
 
       // A malformed If-Match (`NaN` from a failed parse, a negative or
@@ -3721,6 +3872,11 @@ const makeCommandHandlerImpl = <
  * // Per-event metadata derived from the decision: entry i is written onto event i
  * yield* handle({ matchId: "m-1" }, command, {
  *   eventMetadata: ({ events }) => events.map(() => ({ eventId: ulid() })),
+ * })
+ *
+ * // Per-event timestamps derived from the decision (undefined → the Clock time)
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventTimestamps: ({ events }) => events.map((event) => event.occurredAt),
  * })
  * ```
  *
