@@ -10230,6 +10230,390 @@ describeConnected("EventStore stream indexes (#140)", () => {
 })
 
 // ===========================================================================
+// EventStore per-event metadata — `eventMetadata` on append and
+// commandHandler (#144)
+// ===========================================================================
+
+const esMetaSchema = DynamoSchema.make({ name: "es-meta", version: 1 })
+const esMetaTableName = `es-meta-${Date.now()}`
+const EsMetaTable = Table.make({ schema: esMetaSchema, entities: {} })
+
+class EsMetaPosted extends Schema.TaggedClass<EsMetaPosted>()("EsMetaPosted", {
+  entry: Schema.Number,
+  amount: Schema.Number,
+}) {}
+
+type EsMetaEvent = EsMetaPosted
+
+/** Per-event metadata with a transforming field: stored as an ISO string. */
+const EsMetaMetadata = Schema.Struct({
+  eventId: Schema.String,
+  occurredAt: Schema.DateTimeUtcFromString,
+})
+
+/**
+ * Posted entries on an LSI (`byEntry`, projection `ALL`), so a stream-index
+ * read decodes the metadata each index item carries.
+ */
+const EsMetaLedger = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "Ledger",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsMetaMetadata,
+  indexes: {
+    byEntry: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      key: (event) => `ENTRY#${String(event.entry).padStart(4, "0")}`,
+    },
+  },
+})
+
+/**
+ * An import stream whose metadata carries the origin of each imported event.
+ * The same schema holds one origin per event (`eventMetadata`) or every
+ * origin of the append packed into one shared value (`metadata`), the
+ * workaround #144 replaces.
+ */
+const EsMetaOrigin = Schema.Struct({ sourceId: Schema.String, payload: Schema.String })
+
+const EsMetaImport = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "Import",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: Schema.Struct({ origins: Schema.Array(EsMetaOrigin) }),
+})
+
+/** A command posts `count` entries, numbered on from the current state. */
+const esMetaDecider: EventStore.Decider<{ readonly entries: number }, number, EsMetaEvent> = {
+  initialState: { entries: 0 },
+  decide: (count, state) =>
+    Effect.succeed(
+      Array.from(
+        { length: count },
+        (_, i) => new EsMetaPosted({ entry: state.entries + i + 1, amount: 10 * (i + 1) }),
+      ),
+    ),
+  evolve: (state) => ({ entries: state.entries + 1 }),
+}
+
+/** Every `transactWriteItems` this suite sends — proves a refused append sent nothing. */
+let esMetaTransactWrites = 0
+
+const EsMetaClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      transactWriteItems: (input) => {
+        esMetaTransactWrites++
+        return client.transactWriteItems(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsMetaLayer = Layer.mergeAll(EsMetaClientLayer, EsMetaTable.layer({ name: esMetaTableName }))
+const provideEsMeta = Effect.provide(EsMetaLayer)
+
+const esMetaAt = (iso: string) => DateTime.makeUnsafe(iso)
+
+/** Every base-table item of one stream partition, raw (no filter, no decode). */
+const esMetaRawItems = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: esMetaTableName,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": "pk" },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+      ConsistentRead: true,
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+describeConnected("EventStore per-event metadata (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const fragments = EventStore.indexDefinitions(EsMetaLedger)
+        yield* client.createTable({
+          TableName: esMetaTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            ...fragments.AttributeDefinitions,
+          ],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+        })
+      }).pipe(provideEsMeta, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esMetaTableName })
+      }).pipe(
+        provideEsMeta,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#144 three events with three entries: each item stores and reads its own", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "own-1" }
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+        ],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "ev-1", occurredAt: esMetaAt("2026-10-01T09:00:00.000Z") },
+            { eventId: "ev-2", occurredAt: esMetaAt("2026-10-02T09:00:00.000Z") },
+            { eventId: "ev-3", occurredAt: esMetaAt("2026-10-03T09:00:00.000Z") },
+          ],
+        },
+      )
+
+      // Each item stores its own entry, in its encoded (wire) form.
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#own-1")
+      expect(raw.map((item) => item.metadata)).toEqual([
+        { eventId: "ev-1", occurredAt: "2026-10-01T09:00:00.000Z" },
+        { eventId: "ev-2", occurredAt: "2026-10-02T09:00:00.000Z" },
+        { eventId: "ev-3", occurredAt: "2026-10-03T09:00:00.000Z" },
+      ])
+
+      // `read` decodes each event's own entry back to the domain type.
+      const events = yield* EsMetaLedger.read(key)
+      expect(events.map((event) => event.version)).toEqual([1, 2, 3])
+      expect(events.map((event) => event.metadata?.eventId)).toEqual(["ev-1", "ev-2", "ev-3"])
+      expect(events.map((event) => DateTime.formatIso(event.metadata!.occurredAt))).toEqual([
+        "2026-10-01T09:00:00.000Z",
+        "2026-10-02T09:00:00.000Z",
+        "2026-10-03T09:00:00.000Z",
+      ])
+
+      // An `undefined` entry writes no `metadata` attribute at all.
+      yield* EsMetaLedger.append(
+        key,
+        [new EsMetaPosted({ entry: 4, amount: 40 }), new EsMetaPosted({ entry: 5, amount: 50 })],
+        3,
+        {
+          eventMetadata: [
+            undefined,
+            { eventId: "ev-5", occurredAt: esMetaAt("2026-10-05T09:00:00.000Z") },
+          ],
+        },
+      )
+      const after = yield* esMetaRawItems("$es-meta#v1#ledger#own-1")
+      expect(after).toHaveLength(5)
+      expect("metadata" in after[3]!).toBe(false)
+      expect(after[4]!.metadata).toEqual({
+        eventId: "ev-5",
+        occurredAt: "2026-10-05T09:00:00.000Z",
+      })
+      const reread = yield* EsMetaLedger.readFrom(key, 3)
+      expect(reread.map((event) => event.metadata?.eventId)).toEqual([undefined, "ev-5"])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a stream index read returns each event's own entry", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "idx-1" }
+      // Stream order differs from index order, so a positional mix-up would show.
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+        ],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "idx-v1", occurredAt: esMetaAt("2026-10-01T10:00:00.000Z") },
+            { eventId: "idx-v2", occurredAt: esMetaAt("2026-10-01T11:00:00.000Z") },
+            { eventId: "idx-v3", occurredAt: esMetaAt("2026-10-01T12:00:00.000Z") },
+          ],
+        },
+      )
+
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => event.data.entry)).toEqual([1, 2, 3])
+      expect(entries.map((event) => event.version)).toEqual([2, 3, 1])
+      expect(entries.map((event) => event.metadata?.eventId)).toEqual([
+        "idx-v2",
+        "idx-v3",
+        "idx-v1",
+      ])
+      expect(DateTime.formatIso(entries[0]!.metadata!.occurredAt)).toBe("2026-10-01T11:00:00.000Z")
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler derives one entry per event from the decision", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "cmd-1" }
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const seen: Array<EventStore.Decision<{ readonly entries: number }, EsMetaEvent>> = []
+
+      // Plain form: ids derived from the version each event takes.
+      const first = yield* handle(key, 2, {
+        eventMetadata: (decision) => {
+          seen.push(decision)
+          return decision.events.map((_, i) => ({
+            eventId: `cmd-1:${decision.version + i + 1}`,
+            occurredAt: esMetaAt("2026-10-04T08:00:00.000Z"),
+          }))
+        },
+      })
+      expect(first.version).toBe(2)
+
+      // Effect form, against the advanced stream.
+      const second = yield* handle(key, 3, {
+        eventMetadata: ({ events, version }) =>
+          Effect.succeed(
+            events.map((_, i) => ({
+              eventId: `cmd-1:${version + i + 1}`,
+              occurredAt: esMetaAt("2026-10-04T09:00:00.000Z"),
+            })),
+          ),
+      })
+      expect(second.version).toBe(5)
+
+      // The function received the decision `additionalItems` would.
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.version).toBe(0)
+      expect(seen[0]!.events).toHaveLength(2)
+      expect(seen[0]!.state).toEqual({ entries: 2 })
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => event.metadata?.eventId)).toEqual([
+        "cmd-1:1",
+        "cmd-1:2",
+        "cmd-1:3",
+        "cmd-1:4",
+        "cmd-1:5",
+      ])
+      expect(events.map((event) => DateTime.formatIso(event.metadata!.occurredAt))).toEqual([
+        "2026-10-04T08:00:00.000Z",
+        "2026-10-04T08:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+      ])
+
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#cmd-1")
+      expect(raw.map((item) => (item.metadata as { eventId: string }).eventId)).toEqual([
+        "cmd-1:1",
+        "cmd-1:2",
+        "cmd-1:3",
+        "cmd-1:4",
+        "cmd-1:5",
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an import over 4 MB as a packed list commits with eventMetadata", () =>
+    Effect.gen(function* () {
+      // 30 events, each with a ~6 KB origin. Packed into one shared value, every
+      // item carries all 30 origins (~180 KB each, within 400 KB) and the
+      // transaction ~5.4 MB: over DynamoDB's 4 MB. One origin per event is
+      // ~186 KB in total.
+      const count = 30
+      const origins = Array.from({ length: count }, (_, i) => ({
+        sourceId: `legacy-${i + 1}`,
+        payload: String(i % 10).repeat(6_000),
+      }))
+      const events = origins.map((_, i) => new EsMetaPosted({ entry: i + 1, amount: i + 1 }))
+      const packedKey = { ledgerId: "import-packed" }
+      const key = { ledgerId: "import-1" }
+
+      // The packed workaround genuinely exceeds 4 MB: refused, nothing sent.
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(packedKey, events, 0, {
+        metadata: { origins },
+      }).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      expect(String(failure.cause)).toContain(`the transaction's ${count} items total at least`)
+      expect(String(failure.cause)).toContain("over its limit of 4194304 bytes (4 MB)")
+      expect(esMetaTransactWrites).toBe(before)
+      expect(yield* EsMetaImport.read(packedKey)).toHaveLength(0)
+
+      // The same import with one origin per event commits in one transaction.
+      const result = yield* EsMetaImport.append(key, events, 0, {
+        eventMetadata: origins.map((origin) => ({ origins: [origin] })),
+      })
+      expect(result.version).toBe(count)
+      expect(esMetaTransactWrites).toBe(before + 1)
+
+      const read = yield* EsMetaImport.read(key, { consistentRead: true })
+      expect(read).toHaveLength(count)
+      for (const [i, event] of read.entries()) {
+        expect(event.data.entry).toBe(i + 1)
+        expect(event.metadata?.origins).toEqual([origins[i]])
+      }
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an event item over 400 KB is refused before anything is sent", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "big-1" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 }), new EsMetaPosted({ entry: 2, amount: 2 })],
+        0,
+        {
+          eventMetadata: [
+            { origins: [{ sourceId: "small", payload: "s" }] },
+            { origins: [{ sourceId: "huge", payload: "x".repeat(410_000) }] },
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      expect(failure.entityType).toBe("import.event")
+      expect(String(failure.cause)).toContain(
+        "the item of the event at version 2, at pk=$es-meta#v1#import#big-1",
+      )
+      expect(String(failure.cause)).toContain("over its limit of 409600 bytes (400 KB)")
+      expect(esMetaTransactWrites).toBe(before)
+      expect(yield* EsMetaImport.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // An item under the limit is accepted by DynamoDB: the check is a lower
+      // bound and refuses nothing DynamoDB would take.
+      const near = yield* EsMetaImport.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0, {
+        eventMetadata: [{ origins: [{ sourceId: "near", payload: "y".repeat(380_000) }] }],
+      })
+      expect(near.version).toBe(1)
+      const stored = yield* EsMetaImport.read(key, { consistentRead: true })
+      expect(stored[0]!.metadata?.origins[0]?.payload).toHaveLength(380_000)
+    }).pipe(provideEsMeta),
+  )
+})
+
+// ===========================================================================
 // Aggregate assembly off the base table (#93)
 // ===========================================================================
 //
