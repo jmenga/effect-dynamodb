@@ -1041,6 +1041,27 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`Imported history:\n  ${occurred.join("\n  ")}`)
 
+  // #region handler-event-timestamps-effect
+  // Through the handler, the times can come from an effect — here a lookup in
+  // the import's source log, which fails if a record is missing. The effect's
+  // error and requirements join the handler's.
+  const sourceLog = new Map([["m-24:MatchStarted", "2025-02-01T09:00:00Z"]])
+  const originalTime = (key: string) =>
+    Effect.fromNullishOr(sourceLog.get(key)).pipe(Effect.map((iso) => DateTime.makeUnsafe(iso)))
+
+  yield* handleAudited(
+    { matchId: "m-24" },
+    { _tag: "StartMatch", venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SL" },
+    {
+      eventTimestamps: ({ events }) =>
+        Effect.forEach(events, (event) => originalTime(`m-24:${event._tag}`)),
+    },
+  )
+  // → v1 is stamped 2025-02-01T09:00:00.000Z
+  // #endregion
+  const sourced = yield* audited.read({ matchId: "m-24" })
+  yield* Console.log(`Handler-sourced time: ${sourced.map((e) => e.timestamp).join(", ")}`)
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })

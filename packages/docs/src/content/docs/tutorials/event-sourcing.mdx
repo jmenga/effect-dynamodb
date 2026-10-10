@@ -257,8 +257,8 @@ The handler returns `{ state, version, events }`, where `state` is the fold from
 
 `append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
 
-- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
-- **4 MB total payload per transaction, 400 KB per item.** An append whose items pass 4 MB, or with any one item over 400 KB, fails with a `ValidationError`, also before anything is sent; the per-item error names the item (`the event at version 2`, say) and its key. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append over the limit is rejected by DynamoDB and nothing is written; the library recognises the rejection, counts the items it sent, and fails with a typed `AppendTooLarge` error carrying that count, with DynamoDB's error as its `cause`. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
+- **4 MB total payload per transaction, 400 KB per item.** An append whose items pass 4 MB, or with any one item over 400 KB, is rejected by DynamoDB and nothing is written. The append fails with a `ValidationError` that names the culprit: the item (`the event at version 2`, the inline snapshot, the idempotency sentinel or `operation 0 (User)` among `additionalItems`) and its key, or for 4 MB the largest items. DynamoDB's own error is kept as the `cause`. Keep event payloads small; large blobs belong in S3 with a reference in the event.
 
 An append is **never split** across transactions, because splitting breaks its atomicity. If a command legitimately decides more than one transaction holds, split it into [stepped commands](#step-18-large-commands--stepped-commands): one command, one decision, one atomic append.
 
@@ -586,7 +586,7 @@ A **put** of a `versioned` or `unique`-constrained entity is written exactly as 
 
 The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
 
-DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. So does an append whose items pass DynamoDB's 4 MB limit, or that holds an item over its 400 KB limit; a `retain` put counts twice towards the 4 MB (its item and its snapshot).
+DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. An append whose items pass DynamoDB's 4 MB limit, or that holds an item over its 400 KB limit, is rejected by DynamoDB, so nothing is written, and fails with a `ValidationError` naming the culprit item; a `retain` put counts twice towards the 4 MB (its item and its snapshot).
 
 ### Telling the failures apart
 
@@ -614,7 +614,7 @@ const condError = yield* matchEvents
 | `OptimisticLockError` / `ConcurrentModification` | A put in `additionalItems` lost a race with another writer of its item on every attempt | Retry the command |
 | `DuplicateCommand` | The idempotency sentinel — this `commandId` already ran | Nothing; the command already took effect |
 | `TransactionCancelled` | Throttling, a concurrent transaction, or a validation error | Retry with backoff |
-| `AppendTooLarge` | `events + additionalItems + sentinel + contiguity check` exceeded DynamoDB's 100-item cap | Split the append |
+| `AppendTooLarge` | DynamoDB rejected the append: `events + additionalItems + sentinel + contiguity check` exceeded its 100-item cap | Split the append |
 
 Without position-aware mapping, a failed watermark condition would be reported as a `VersionConflict` — and the caller's natural response (re-read, re-decide, retry) would loop forever against a condition that can never pass.
 
@@ -890,7 +890,7 @@ The option is accepted only on a `mode: "inline"` stream without `every`, the on
 
 ## Step 18: Large Commands — Stepped Commands
 
-Some commands decide more events than one transaction holds: an import, a bulk correction, a compensating undo. Such a command fails with `AppendTooLarge` before anything is written, and the library never splits it: an append receives **one decision** — many events and the one state after all of them — and has no valid intermediate states to put at transaction boundaries. Only your decider can produce a valid state for each boundary.
+Some commands decide more events than one transaction holds: an import, a bulk correction, a compensating undo. DynamoDB rejects such an append, so nothing is written, and the command fails with `AppendTooLarge`. The library never splits it: an append receives **one decision** — many events and the one state after all of them — and has no valid intermediate states to put at transaction boundaries. Only your decider can produce a valid state for each boundary.
 
 So a large command is run as **stepped commands**. Here the scoring feed records deliveries, and a compensating command reverts them:
 
@@ -1079,7 +1079,7 @@ const Scorecards = EventStore.makeStream({
 })
 ```
 
-- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. An empty string, a non-string, a key over DynamoDB's 1024-byte limit or a `key` that throws fails the append with `ValidationError` before anything is written.
+- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. An empty string, a non-string or a `key` that throws fails the append with `ValidationError` before anything is written. A key over DynamoDB's 1024-byte sort-key limit is rejected by DynamoDB, so nothing is written, and the append fails with a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version.
 - Only event items carry index attributes. Snapshots and idempotency sentinels are never in an index.
 - `type: "lsi"` (the default) uses the table's partition key, so the index holds exactly this stream's indexed events and can be read with strongly consistent reads. `type: "gsi"` names a `pk` attribute too; `append` writes the stream's partition key value into it, so the index is scoped to the same stream, read eventually consistently.
 
@@ -1345,7 +1345,28 @@ const occurred = history.map((event) => `${event.metadata?.sourceId} ${event.tim
 - Only the event items take the given times. The idempotency sentinel, its TTL and an inline snapshot keep the append's own time, because they record when the append was written.
 - Each entry is written with `DateTime.formatIso`, the format of the append's own time, so a zoned `DateTime` is stored as its UTC instant.
 - `eventTimestamps` is independent of `metadata` and `eventMetadata`, so it combines with either. A length that differs from `events`, or an entry that is neither a valid `DateTime` nor `undefined` (a JS `Date`, say: convert it with `DateTime.fromDateUnsafe`; or a `DateTime` with a `NaN` epoch from a bad parse), fails with a `ValidationError` (`operation: "EventStore.append.eventTimestamps"`) before anything is sent, even when `events` is empty.
-- On a command handler, `eventTimestamps` is a function of the `Decision`, like `eventMetadata`, but it returns the array directly. It has no `Effect` form: the times come from the command or the events, and the effectful source of a time, the `Clock`, is already the default. It runs after `eventMetadata` and before `additionalItems`, is not called when `decide` returns no events, and runs again on every attempt. A result of the wrong length, or with an entry that is not a `DateTime` or `undefined`, fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`), never retried.
+- On a command handler, `eventTimestamps` is a function of the `Decision`, like `eventMetadata`. It returns the array directly or an `Effect` of it, whose error and requirements join the handler's. It runs after `eventMetadata` and before `additionalItems`, is not called when `decide` returns no events, and runs again on every attempt. A result of the wrong length, or with an entry that is not a `DateTime` or `undefined`, fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`); neither that nor a failure of the returned `Effect` is retried.
+
+The `Effect` form suits times that come from somewhere else, such as an import's source log:
+
+```typescript region="handler-event-timestamps-effect" example="event-sourcing.ts"
+// Through the handler, the times can come from an effect — here a lookup in
+// the import's source log, which fails if a record is missing. The effect's
+// error and requirements join the handler's.
+const sourceLog = new Map([["m-24:MatchStarted", "2025-02-01T09:00:00Z"]])
+const originalTime = (key: string) =>
+  Effect.fromNullishOr(sourceLog.get(key)).pipe(Effect.map((iso) => DateTime.makeUnsafe(iso)))
+
+yield* handleAudited(
+  { matchId: "m-24" },
+  { _tag: "StartMatch", venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SL" },
+  {
+    eventTimestamps: ({ events }) =>
+      Effect.forEach(events, (event) => originalTime(`m-24:${event._tag}`)),
+  },
+)
+// → v1 is stamped 2025-02-01T09:00:00.000Z
+```
 
 :::note[Why not pack a list into `metadata`?]
 Before `eventMetadata`, the only place for per-event values was a list inside the shared `metadata`, with each reader picking its entry by position. Every event then stores the whole list, so an append of N events stores N² entries, and a stream index (always projecting `ALL`) copies all of them. That cost counts towards DynamoDB's 400 KB item and 4 MB transaction limits. `eventMetadata` stores each entry once, on its own event.

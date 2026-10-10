@@ -330,7 +330,7 @@ When multiple features are enabled, entity operations compose into DynamoDB tran
 | **Restore** (free policy) | Delete deleted item + put restored item + version snapshot + put sentinels |
 | **Restore** (reserve policy) | Delete deleted item + put restored item + version snapshot |
 
-DynamoDB limits transactions to 100 items. Plan accordingly. Purge is not a transaction: it releases each owned sentinel with its own conditional `DeleteItem`, then batch-deletes the item, its soft-deleted copies and its version snapshots.
+DynamoDB limits transactions to 100 items. Plan accordingly: the limit is not checked before sending, so a lifecycle write over it is rejected by DynamoDB, writes nothing, and fails with `TransactionOverflow` (DynamoDB's error as its `cause`). Purge is not a transaction: it releases each owned sentinel with its own conditional `DeleteItem`, then batch-deletes the item, its soft-deleted copies and its version snapshots.
 
 ## Complete Example
 

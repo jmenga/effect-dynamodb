@@ -245,6 +245,7 @@ If the `Agent` tool's `isolation: "worktree"` parameter is available for the tas
 - **`run*` at the edge only** — never `runPromise`/`runSync` inside an Effect.
 - **Testing** — `@effect/vitest` with `it.effect` / `it.scoped`. Mock `DynamoClient` via `mockDynamoClientLayer({ putItem: mockPutItem, ... })` from `test/helpers/MockDynamoClient.ts` — it supplies a dying default for every operation, so a test declares only what it exercises and a new operation on `DynamoClientService` needs a default added in exactly one place. Never hand-roll a full `Layer.succeed(DynamoClient, { ... })` literal. Use `Effect.provide(layer, { local: true })` for test isolation.
 - **Packages** — There is no `effect/unstable/*` namespace in 4.0.0; import former unstable modules from their top-level paths (`effect/http`, `effect/http-api`). `Config` constructors are PascalCase (`Config.String`, `Config.Int`).
+- **Write limits are diagnosed, never pre-checked (#144)** — do not check a limit DynamoDB enforces itself (400 KB per item, 100 items / 4 MB per transaction, 1024-byte sort keys) before sending. Send the write; wrap the DynamoDB call with `diagnoseFailure` from `internal/WriteDiagnosis.ts`, placed after the site's own conditional-failure mapping. It recognises DynamoDB's rejection, confirms it by measuring the request that was sent, and rewrites it into the site's existing tagged error naming the culprit item, with DynamoDB's error kept as the `cause`; anything unrecognised or unconfirmed passes through unchanged, and nothing runs on success. New write sites supply the request (`SentWrite`), the sort-key attributes they write, and targets naming each item. Pre-checks stay only for the library's own invariants (option shapes, one op per item, empty condition parts), definition-time limits and batch chunking.
 
 ### Critical Anti-Patterns
 
@@ -260,6 +261,7 @@ Do NOT:
 - Use v3 Schema APIs (`Schema.filter`, `Schema.fromKey`, `Schema.Literal`) — use `.check()`, `.withKey()`, `Schema.Literals`
 - Use pre-GA names (`SchemaGetter.transformOrFail`, `Config.string`, `effect/unstable/*`) — use `SchemaGetter.transformEffect`, `Config.String`, top-level module paths
 - Put DynamoDB concepts in domain models — keep models pure, Entity handles DynamoDB binding
+- Pre-check a limit DynamoDB enforces (item size, transaction count/size, key length) — send the write and diagnose the rejection through `internal/WriteDiagnosis.ts`
 - Extract `A`/`E`/`R` from entity ops via `Effect.Effect<infer A>` — match against `EntityOp<infer A, ...>` instead
 
 ### TypeScript Conventions

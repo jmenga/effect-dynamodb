@@ -2185,7 +2185,7 @@ the transaction, which is built and written again
 (`GUARDED_TRANSACTION_ATTEMPTS` = 3, then `OptimisticLockError` /
 `ConcurrentModification`).
 
-Two checks run on the compiled transaction before it is sent, in
+One check runs on the compiled transaction before it is sent, in
 `transactWrite` and `EventStore.append`. **One op per item**
 (`refuseRepeatedItems`): DynamoDB allows one operation per item in a
 transaction, and for a guarded put the reasons it reports for a repeated item
@@ -2196,22 +2196,11 @@ its table and primary key, and the caller op it came from
 guarded put adds, so two puts that swap unique values (releasing and reserving
 the same sentinels) are caught too; `append` adds targets for its contiguity
 check, event puts and idempotency sentinel. A repeat is a `ValidationError`
-naming the entity and both sources. **Size** (`refuseOversizedTransaction`):
-a LOWER bound on the items' sizes by DynamoDB's item-size rules
-(`internal/ItemSize.ts`, `"lower"`: numbers a byte per two significant digits
-plus one, no list or map overhead; a `Put`'s item, a `Delete`'s or
-`ConditionCheck`'s or `Update`'s key — an Update's values may be its
-condition's; zero is one byte), so a transaction DynamoDB
-would accept is never refused, must not pass 4 MB =
-4,194,304 bytes, DynamoDB's documented aggregate limit for one transaction (in
-the binary megabytes of all its size limits). A retain put counts twice: its
-item and its snapshot. An oversized transaction is a `ValidationError` naming
-its largest item, not DynamoDB's bare `ValidationException`. In the same pass,
-any single item over 400 KB = 409,600 bytes (`ITEM_MAX_BYTES`), DynamoDB's
-per-item limit, measured by the same lower bound, is refused with a
-`ValidationError` naming that item's source and key (#144). The helper is shared,
-so `transactWrite` and `EventStore.append` both refuse it before anything is
-sent. Deletes of `unique` / retain / `softDelete`
+naming the entity and both sources. **Size and count are not checked before
+sending** (#144): a transaction over 100 items or 4 MB, or holding an item
+over 400 KB or a sort key over 1024 bytes, is sent, rejected whole by
+DynamoDB, and diagnosed from that rejection by the same targets — see
+[Write Limits](#write-limits--diagnosed-not-pre-checked-144). Deletes of `unique` / retain / `softDelete`
 entities are still refused (EDD-9048): a transaction builds a delete from its
 key alone.
 
@@ -2292,6 +2281,77 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 // Adds ConditionExpression: version = :expected
 // Fails with OptimisticLockError if version doesn't match
 ```
+
+#### Write Limits — Diagnosed, Not Pre-checked (#144)
+
+Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md) §6.
+**Library-wide rule: a limit DynamoDB enforces itself is never checked before sending.**
+That covers 400 KB per item, 100 items and 4 MB per transaction, and 1024 bytes per sort
+key. DynamoDB rejects an over-limit request whole, so a pre-check adds no safety; it only
+costs every passing write a sizing pass, and mirrors DynamoDB's approximate item-size
+rules imperfectly. What the library adds is **attribution**, needed only once the write
+has failed: DynamoDB's message names neither the item nor which of a transaction's items
+is at fault, and the library built the request.
+
+Every write site wraps its DynamoDB call with `diagnoseFailure`
+(`internal/WriteDiagnosis.ts`, the one module holding the logic), placed after the site's
+own conditional-failure mapping. On failure only, it:
+
+1. **Recognises** the rejection by a stable message fragment: a request-wide
+   `ValidationException` (`DynamoValidationError`), or a `TransactionCanceledException`
+   whose positional reason carries `Code: "ValidationError"`.
+2. **Confirms** it by measuring the request that was sent (`internal/ItemSize.ts`).
+   Exact measures confirm only when over the limit: an item count over 100, a sort key's
+   UTF-8 bytes over 1024 (both DynamoDB Local's "Size limit exceeded" and AWS's
+   "Aggregated size of all range keys …" wordings are recognised). For item size and
+   transaction payload, which DynamoDB itself counts approximately, the recognised message
+   is the evidence and the request must hold something it can apply to (a `Put` / `Update`,
+   a transaction); the measurement attributes.
+3. **Attributes** it to the culprit using the targets the site built (thunks, built only
+   on failure): the entity and key, or for `EventStore` the event (`the event at
+   version 4`), the inline snapshot, the idempotency sentinel or the additional item
+   (`operation 2 (User)`). A request-wide oversized-item rejection is attributed to the
+   `Put` over 409,600 bytes by the lower-bound count, or else the largest `Put`, named as
+   the *likely* culprit; a 4 MB rejection names the three largest items (a `retain` put
+   counts twice: its item and its snapshot) alongside DynamoDB's reported `Payload Size`.
+4. **Rewrites** a confirmed diagnosis into the site's existing tagged error, with
+   DynamoDB's error kept as the cause, or **passes through** anything unrecognised or
+   unconfirmed unchanged, as the bare `DynamoValidationError` / `DynamoError` it was.
+
+| Site | Count over 100 | Item size, 4 MB, sort key |
+|------|----------------|---------------------------|
+| `Entity` single-item writes (`PutItem` / `UpdateItem` / `DeleteItem`) | — | `ValidationError` |
+| `Entity` transactional writes (guarded put, retain/unique update, retain/soft delete, `restore`) | `TransactionOverflow` | `ValidationError` |
+| `Entity` transactional cascade | `CascadePartialFailure` (`succeeded: 0`) | `CascadePartialFailure` |
+| `Transaction.transactWrite` / `transactGet` | `DynamoError` (same message as before) | `ValidationError` |
+| `Batch.write` (versioned-put transactions and `BatchWriteItem`) | — | `ValidationError`; the message says earlier chunks may already be written |
+| `Aggregate` create / update (one transaction per group) | `AggregateTransactionOverflow` | `ValidationError` |
+| `EventStore.append` / `commandHandler` | `AppendTooLarge` (expanded `count`) | `ValidationError`; a stream-index key: `operation: "EventStore.append.indexes"` |
+| `EventStore` snapshot `PutItem` | — | `ValidationError` naming the snapshot |
+
+An eventual cascade's per-item diagnosed `ValidationError` lands in
+`CascadePartialFailure.errors`, as any per-item failure does. `Aggregate` delete's
+`BatchWriteItem` of stored keys is not wrapped: deleting keys that were stored cannot meet
+these limits, and its error union has no `ValidationError` to carry a diagnosis.
+
+A diagnosed `ValidationError` / `DynamoError` sets `cause` to an `Error` whose message is
+the explanation and whose own `cause` is DynamoDB's error; `AppendTooLarge`,
+`TransactionOverflow` and `AggregateTransactionOverflow` carry DynamoDB's error in an
+optional `cause`. No public error union widens. A diagnosed error is terminal: guarded-write
+retry loops do not retry it, and `EventStore`'s `sendAppendTransaction` still treats only
+`ConditionalCheckFailed` reasons as conflicts. Nothing is measured on success.
+
+**What stays a pre-check:** the library's own invariants that DynamoDB cannot see
+(`refuseRepeatedItems`; option shapes and lengths; a stream-index `key` result that is not
+a non-empty string; empty condition parts), definition-time limits (`Table.definition`'s
+vector-index limits), `Batch.write`'s chunking budgets (25 / 100 items, 3.5 MB), and
+`readIndex`'s bound validation. `Aggregate` also keeps its check of **every** group's count
+before writing the first: DynamoDB judges one group at a time, so only that check stops a
+multi-group write committing partially.
+
+**Trade-offs.** A rejected write now costs a round trip. AWS wording may differ from
+DynamoDB Local's; a missed wording degrades to pass-through, never to a wrong diagnosis,
+because exact measures must confirm.
 
 ### Entity Lifecycle
 
@@ -2874,12 +2934,12 @@ load → [expectedVersion check] → decide → fold new events → derive items
   [Event Metadata](#event-metadata-144).
 - **Decision-derived event timestamps (#144).** `CommandOptions.eventTimestamps`
   takes a function of the same `Decision` returning one `DateTime` (or
-  `undefined`) per event — a plain array, no `Effect` form — evaluated after
+  `undefined`) per event, or an `Effect` of them — evaluated after
   `eventMetadata` and passed to `append` as `eventTimestamps`. See
   [Per-event timestamps](#per-event-timestamps).
 - **One atomic append.** One command → one decision → one atomic append. A
-  decision too large for one transaction fails with `AppendTooLarge` before
-  anything is written — see
+  decision too large for one transaction is rejected by DynamoDB, so nothing is
+  written, and fails with `AppendTooLarge` — see
   [Large Commands — Stepped Commands](#large-commands--stepped-commands).
 
 #### Decision-derived `additionalItems` — inline projections (#137)
@@ -2900,7 +2960,8 @@ yield* handle({ matchId }, command, {
   `E2` / `R2` join the handler's error channel and requirements (both default to
   `never`, so the static and pure forms add nothing).
 - The items commit in the **same** `TransactWriteItems` as the events. They
-  count towards `AppendTooLarge` and the 4 MB check, and a failing item
+  count towards DynamoDB's 100-item and 4 MB transaction limits (`AppendTooLarge`
+  and a `ValidationError` naming the item when DynamoDB rejects the append), and a failing item
   condition is `AdditionalItemConditionFailed`, with `indices` into the
   returned array.
 - The function runs after `decide` and the fold, and is re-run on every retry
@@ -2940,8 +3001,10 @@ yield* stream.append(streamId, [e1, e2, e3], v, { eventMetadata: [m1, undefined,
   ahead of the zero-event fast path: `append(id, [], v, { eventMetadata: [m] })` fails,
   and `{ eventMetadata: [] }` keeps the no-op.
 - **Size.** Each item carries only its own entry, so a per-event id costs N entries,
-  not the N² of a list packed into `metadata`. Items count towards the 4 MB check as
-  built, and an item over 400 KB is refused before sending (see Transaction size).
+  not the N² of a list packed into `metadata`. Items count towards DynamoDB's 4 MB
+  transaction and 400 KB item limits as built; an append DynamoDB rejects for either fails
+  with a `ValidationError` naming the event (see
+  [Write Limits](#write-limits--diagnosed-not-pre-checked-144)).
 - **`eventMetadata` on `commandHandler`.** Function-only (`EventMetadataInput`): a
   static array cannot know the event count before `decide`. It takes the `Decision`
   (`{ events, state, previous, version }`) and returns the entries or an `Effect` of
@@ -2990,14 +3053,19 @@ yield* stream.append(streamId, [e1, e2, e3], v, {
 - **No ordering constraint.** `version` orders a stream; timestamps may repeat, run
   backwards or lie in the future, as imported history can.
 - **`eventTimestamps` on `commandHandler`.** A function of the `Decision` on
-  `CommandOptionsBase` returning the array directly — no `Effect` form and no new handler
-  type parameters, since the values come from the command or the events and the
-  effectful source of a time, the `Clock`, is already the default. Evaluated after
-  `eventMetadata` and before `additionalItems`; never for a no-op decision; re-run on
-  every attempt and on the unverified-snapshot re-decision. A wrong-length or malformed
-  result is a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`),
-  never retried; a non-function value is refused before anything is read. No error
-  union widens.
+  `CommandOptionsBase` (`EventTimestampsInput`) returning the array directly or an
+  `Effect` of it, mirroring `eventMetadata`, so times can come from a service (an
+  import's source log) or the `Clock`. The effect's error and requirements join the
+  handler's through their own trailing type parameters, `E4` / `R4`, not `eventMetadata`'s
+  `E3` / `R3`: with one shared pair, an `eventMetadata` effect and an `eventTimestamps`
+  effect with different error types fail to infer (TypeScript fixes the parameter from one
+  candidate and rejects the other instead of inferring a union); the separate pair infers
+  the union, as the type tests prove. Evaluated after `eventMetadata` and before
+  `additionalItems`; never for a no-op decision; re-run on every attempt and on the
+  unverified-snapshot re-decision. A wrong-length or malformed result, plain or from the
+  `Effect`, is a `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`);
+  neither that nor a failure of the returned `Effect` is retried; a non-function value is
+  refused before anything is read. No error union widens beyond the effect's own `E4`.
 
 ### Snapshots
 
@@ -3149,9 +3217,11 @@ An append is always one `TransactWriteItems`: it is never split. An append recei
 **one decision** — many events and the one state after all of them — so split across
 transactions it would have no valid intermediate states to put at the boundaries (no
 snapshot, projection or sentinel that is true there). Only the application's decider can
-produce a valid state for each boundary. An append over 100 items fails with
-`AppendTooLarge` (or over 4 MB, or with any item over 400 KB, with `ValidationError`)
-before anything is written.
+produce a valid state for each boundary. An append over 100 items is rejected by
+DynamoDB, so nothing is written, and fails with `AppendTooLarge` carrying the expanded
+`count` and DynamoDB's error as its `cause` (over 4 MB, or with any item over 400 KB, with
+a `ValidationError` naming the culprit item) — see
+[Write Limits](#write-limits--diagnosed-not-pre-checked-144).
 
 A large command — an import, a bulk correction, a compensating undo — is therefore run
 as **stepped commands**:
@@ -3199,9 +3269,12 @@ EventStore.indexDefinitions(...streams)             // CreateTable fragments
 
 A stream index is a sub-stream of the stream's events ordered by a key derived from
 each event. `key(event, version)` returns the sort key, stored **raw** (no casing, no
-prefix), or `undefined` to leave the event out (sparse); an empty or non-string key, a
-key over 1024 bytes or a throwing `key` fails the append with `ValidationError` before
-anything is written. Only event items carry index attributes — snapshots and sentinels
+prefix), or `undefined` to leave the event out (sparse); an empty or non-string key or a
+throwing `key` fails the append with `ValidationError` before anything is written. A key
+over DynamoDB's 1024-byte sort-key limit is not pre-checked: DynamoDB rejects the append,
+so nothing is written, and the rejection is confirmed by measuring the key's UTF-8 bytes and
+reported as a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index
+and the event's version. Only event items carry index attributes — snapshots and sentinels
 are never indexed. Index names are a type parameter (`TIndexName`) inferred from
 `indexes`; an undeclared name at runtime is a defect (`[EDD-9066]`). Definition errors:
 `[EDD-9063]` malformed entry, `[EDD-9064]` attribute owned by the stream, `[EDD-9065]`
@@ -3608,25 +3681,25 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
 | `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item (or aggregate), `patch()` or `deleteIfExists()` of a missing item |
-| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts, or an `isIn` with no values), `consistentRead` on a GSI, `expectedVersion` on an unversioned entity |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts, or an `isIn` with no values), `consistentRead` on a GSI, `expectedVersion` on an unversioned entity; or a write DynamoDB rejected for an item over 400 KB, a transaction over 4 MB or a sort key over 1024 bytes, diagnosed and naming the culprit (`cause`: DynamoDB's error) |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
 | `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |
 | `ConcurrentModification` | An unversioned read-then-write write found an attribute it read changed before its write landed (or lost a guarded put's race on every attempt), or a unique sentinel it was releasing changed hands; nothing written (`attributes`, `current`) |
-| `TransactionOverflow` | A write's own transaction (item, sentinels, snapshot) would exceed 100 items |
+| `TransactionOverflow` | DynamoDB rejected a write's own transaction (item, sentinels, snapshot) for exceeding 100 items; nothing written (`cause`: DynamoDB's error) |
 | `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
 | `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone |
 | `RefNotFound` | Referenced entity does not exist during hydration |
 | `AggregateAssemblyError` | Collection query returned unexpected/incomplete data |
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |
-| `AggregateTransactionOverflow` | Sub-aggregate exceeds 100-item transaction limit |
+| `AggregateTransactionOverflow` | Sub-aggregate exceeds 100-item transaction limit — checked for every group before the first is written (a cross-transaction invariant), or diagnosed from DynamoDB's rejection of a group (`cause`) |
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 | `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and by an unverified-snapshot If-Match whose decision is confirmed against the head (the head read), and unset on any other append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
-| `AppendTooLarge` | An `EventStore` append exceeds 100 transact items; nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
+| `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
 
 ### Declared Errors per Operation
 
