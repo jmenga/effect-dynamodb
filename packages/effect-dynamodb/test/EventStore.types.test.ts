@@ -18,6 +18,10 @@
  *   parameter, so `readIndex` / `query.index` refuse an undeclared name, the
  *   `key` callback is typed by the stream's events, and indexed streams still
  *   flow through `bind` and every `commandHandler` form.
+ * - Per-event metadata (#144): `metadata` and `eventMetadata` are exclusive on
+ *   `append` and the handler; entries are typed `M | undefined`; an effectful
+ *   `eventMetadata` joins its own `E3` / `R3` to the handler's channels next to
+ *   an `additionalItems`' `E2` / `R2`; idempotency still requires `commandId`.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
@@ -508,5 +512,197 @@ describe("EventStore.commandHandler types", () => {
       })
     })
     expect(true).toBe(true)
+  })
+
+  describe("per-event metadata (#144)", () => {
+    interface Meta {
+      readonly eventId: string
+    }
+    const Audited = EventStore.makeStream({
+      table: AppTable,
+      streamName: "Audited",
+      events: [Incremented],
+      streamId: { composite: ["counterId"] },
+      metadata: Schema.Struct({ eventId: Schema.String }),
+    })
+    const events = [new Incremented({ by: 1 }), new Incremented({ by: 2 })]
+
+    /** The `R3` of an effectful `eventMetadata`. */
+    class IdMinter extends Context.Service<IdMinter, { readonly next: Effect.Effect<string> }>()(
+      "test/IdMinter",
+    ) {}
+    /** The `E3` of an effectful `eventMetadata` — not `ProjectionFailed` (the `E2`). */
+    class MintFailed extends Data.TaggedError("MintFailed") {}
+    /** In no handler's error channel — catches a channel widened to `unknown` / `any`. */
+    type Unrelated = { readonly _tag: "Unrelated" }
+
+    const mintIds = (decision: EventStore.Decision<CounterState, Incremented>) =>
+      Effect.gen(function* () {
+        const minter = yield* IdMinter
+        const ids: Array<Meta> = []
+        for (const _ of decision.events) {
+          const id = yield* minter.next
+          if (id === "") return yield* new MintFailed()
+          ids.push({ eventId: id })
+        }
+        return ids
+      })
+
+    it("append: entries are typed M | undefined, exclusive with metadata", () => {
+      typeOnly(() => {
+        const appended = Audited.append(key, events, 0, {
+          eventMetadata: [{ eventId: "a" }, undefined],
+        })
+        expectTypeOf<Effect.Error<typeof appended>>().toEqualTypeOf<EventStore.AppendError>()
+        Audited.append(key, events, 0, { metadata: { eventId: "shared" } })
+        // `undefined` counts as absent, so this is not "both".
+        Audited.append(key, events, 0, { metadata: undefined, eventMetadata: [undefined] })
+
+        type Entries = NonNullable<
+          Extract<
+            EventStore.AppendOptions<Meta>,
+            { readonly eventMetadata?: ReadonlyArray<unknown> }
+          >["eventMetadata"]
+        >
+        expectTypeOf<Entries>().toEqualTypeOf<ReadonlyArray<Meta | undefined>>()
+
+        // @ts-expect-error — metadata and eventMetadata are exclusive
+        Audited.append(key, events, 0, { metadata: { eventId: "x" }, eventMetadata: [] })
+        // @ts-expect-error — an entry is the stream's metadata type
+        Audited.append(key, events, 0, { eventMetadata: [{ eventId: 1 }] })
+        // @ts-expect-error — eventMetadata is an array, not one value
+        Audited.append(key, events, 0, { eventMetadata: { eventId: "x" } })
+
+        Effect.gen(function* () {
+          const bound = yield* EventStore.bind(Audited)
+          const boundAppended = bound.append(key, events, 0, {
+            eventMetadata: [{ eventId: "a" }, { eventId: "b" }],
+          })
+          expectTypeOf<Effect.Services<typeof boundAppended>>().toEqualTypeOf<never>()
+          // @ts-expect-error — metadata and eventMetadata are exclusive
+          bound.append(key, events, 0, { metadata: { eventId: "x" }, eventMetadata: [] })
+        })
+      })
+      expect(true).toBe(true)
+    })
+
+    it("handler: eventMetadata receives the Decision and is exclusive with metadata", () => {
+      typeOnly(() => {
+        const handle = EventStore.commandHandler(decider, Audited)
+        const pure = handle(key, command, {
+          eventMetadata: (decision) => {
+            expectTypeOf(decision).toEqualTypeOf<EventStore.Decision<CounterState, Incremented>>()
+            return decision.events.map((_, i) => (i === 0 ? { eventId: "a" } : undefined))
+          },
+        })
+        const plain = handle(key, command)
+        expectTypeOf<Effect.Services<typeof pure>>().toEqualTypeOf<Base>()
+        expectTypeOf<Effect.Error<typeof pure>>().toEqualTypeOf<Effect.Error<typeof plain>>()
+        handle(key, command, { metadata: { eventId: "shared" } })
+
+        handle(key, command, {
+          metadata: { eventId: "x" },
+          // @ts-expect-error — metadata and eventMetadata are exclusive
+          eventMetadata: () => [],
+        })
+        // @ts-expect-error — function-only: a static array cannot know the event count
+        handle(key, command, { eventMetadata: [{ eventId: "x" }] })
+        // @ts-expect-error — an entry is the stream's metadata type
+        handle(key, command, { eventMetadata: () => [{ eventId: 1 }] })
+      })
+      expect(true).toBe(true)
+    })
+
+    it("an effectful eventMetadata joins E3 / R3 next to additionalItems' E2 / R2", () => {
+      typeOnly(() => {
+        const handle = EventStore.commandHandler(decider, Audited)
+        const onlyIds = handle(key, command, { eventMetadata: mintIds })
+        expectTypeOf<Effect.Services<typeof onlyIds>>().toEqualTypeOf<Base | IdMinter>()
+        expectTypeOf<MintFailed>().toExtend<Effect.Error<typeof onlyIds>>()
+        expectTypeOf<ProjectionFailed>().not.toExtend<Effect.Error<typeof onlyIds>>()
+
+        const both = handle(key, command, {
+          eventMetadata: mintIds,
+          additionalItems: effectfulItems,
+        })
+        expectTypeOf<Effect.Services<typeof both>>().toEqualTypeOf<Base | IdMinter | Projector>()
+        expectTypeOf<MintFailed>().toExtend<Effect.Error<typeof both>>()
+        expectTypeOf<ProjectionFailed>().toExtend<Effect.Error<typeof both>>()
+        expectTypeOf<Overflow>().toExtend<Effect.Error<typeof both>>()
+        expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof both>>()
+
+        // Data-last form.
+        const piped = Audited.pipe(EventStore.commandHandler(decider))
+        const pipedBoth = piped(key, command, {
+          additionalItems: effectfulItems,
+          eventMetadata: mintIds,
+        })
+        expectTypeOf<Effect.Services<typeof pipedBoth>>().toEqualTypeOf<
+          Base | IdMinter | Projector
+        >()
+        expectTypeOf<MintFailed | ProjectionFailed>().toExtend<Effect.Error<typeof pipedBoth>>()
+        expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof pipedBoth>>()
+
+        Effect.gen(function* () {
+          const bound = yield* EventStore.bind(Audited)
+          const dataFirst = EventStore.commandHandler(decider, bound)(key, command, {
+            eventMetadata: mintIds,
+            additionalItems: effectfulItems,
+          })
+          expectTypeOf<Effect.Services<typeof dataFirst>>().toEqualTypeOf<IdMinter | Projector>()
+          expectTypeOf<MintFailed | ProjectionFailed>().toExtend<Effect.Error<typeof dataFirst>>()
+          // Guards against the bound error channel widening to unknown / any.
+          expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof dataFirst>>()
+          const dataLast = bound.pipe(EventStore.commandHandler(decider))(key, command, {
+            eventMetadata: mintIds,
+          })
+          expectTypeOf<Effect.Services<typeof dataLast>>().toEqualTypeOf<IdMinter>()
+          expectTypeOf<MintFailed>().toExtend<Effect.Error<typeof dataLast>>()
+          expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof dataLast>>()
+          EventStore.commandHandler(decider, bound)(key, command, {
+            metadata: { eventId: "x" },
+            // @ts-expect-error — metadata and eventMetadata are exclusive
+            eventMetadata: mintIds,
+          })
+        })
+      })
+      expect(true).toBe(true)
+    })
+
+    it("idempotency still requires commandId with eventMetadata present", () => {
+      typeOnly(() => {
+        const dataFirst = EventStore.commandHandler(decider, Audited, { idempotency: {} })
+        // @ts-expect-error — commandId is required
+        dataFirst(key, command, { eventMetadata: mintIds })
+        const result = dataFirst(key, command, { commandId: "cmd-1", eventMetadata: mintIds })
+        expectTypeOf<Effect.Services<typeof result>>().toEqualTypeOf<Base | IdMinter>()
+        expectTypeOf<MintFailed>().toExtend<Effect.Error<typeof result>>()
+        expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof result>>()
+        // @ts-expect-error — metadata and eventMetadata are exclusive
+        dataFirst(key, command, {
+          commandId: "cmd-1",
+          metadata: { eventId: "x" },
+          eventMetadata: mintIds,
+        })
+
+        const dataLast = Audited.pipe(EventStore.commandHandler(decider, { idempotency: {} }))
+        // @ts-expect-error — commandId is required
+        dataLast(key, command, { eventMetadata: mintIds })
+        Effect.gen(function* () {
+          const bound = yield* EventStore.bind(Audited)
+          const boundFirst = EventStore.commandHandler(decider, bound, { idempotency: {} })
+          // @ts-expect-error — commandId is required
+          boundFirst(key, command, { eventMetadata: () => [] })
+          const boundResult = boundFirst(key, command, {
+            commandId: "cmd-1",
+            eventMetadata: mintIds,
+          })
+          expectTypeOf<Effect.Services<typeof boundResult>>().toEqualTypeOf<IdMinter>()
+          expectTypeOf<MintFailed>().toExtend<Effect.Error<typeof boundResult>>()
+          expectTypeOf<Unrelated>().not.toExtend<Effect.Error<typeof boundResult>>()
+        })
+      })
+      expect(true).toBe(true)
+    })
   })
 })

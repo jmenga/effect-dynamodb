@@ -1260,11 +1260,20 @@ describe("Transaction", () => {
         const put = (bytes: number) => ({
           Put: { TableName: "t", Item: { a: { S: "x".repeat(bytes - 1) } } },
         })
-        const target = transactItemTarget(put(2), "t", ["a"], "Doc", "operation 0 (Doc)")
-        yield* refuseOversizedTransaction([put(4 * 1024 * 1024)], [target], "transactWrite")
+        // Ten items at the 400 KB item limit plus one making up the rest: no
+        // item is over its own limit, so only the aggregate is judged.
+        const items = (last: number) => [
+          ...Array.from({ length: 10 }, () => put(409_600)),
+          put(last),
+        ]
+        const targets = Array.from({ length: 11 }, (_, i) =>
+          transactItemTarget(put(2), "t", ["a"], "Doc", `operation ${i} (Doc)`),
+        )
+        const rest = 4 * 1024 * 1024 - 10 * 409_600
+        yield* refuseOversizedTransaction(items(rest), targets, "transactWrite")
         const over = yield* refuseOversizedTransaction(
-          [put(4 * 1024 * 1024 + 1)],
-          [target],
+          items(rest + 1),
+          targets,
           "transactWrite",
         ).pipe(Effect.flip)
         expect(over._tag).toBe("ValidationError")
@@ -1325,6 +1334,48 @@ describe("Transaction", () => {
       expect(itemBytes({ b: { B: new Uint8Array(10) } })).toBe(11)
       expect(transactItemBytes({ Delete: { TableName: "t", Key: { pk: { S: "abc" } } } })).toBe(5)
     })
+  })
+
+  describe("an item over DynamoDB's 400 KB is refused before writing (#144)", () => {
+    it.effect("names the operation and key of the oversized item", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put({ userId: "u-0", email: "u0@x.io", name: "small", role: "member" }),
+          UserEntity.put({
+            userId: "u-1",
+            email: "u1@x.io",
+            name: "x".repeat(410_000),
+            role: "member",
+          }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(failure.operation).toBe("transactWrite")
+        expect(String(failure.cause)).toContain("the item of operation 1 (User), at pk=")
+        expect(String(failure.cause)).toContain("over its limit of 409600 bytes (400 KB)")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the limit is exactly 400 KB by DynamoDB's item-size rules", () =>
+      Effect.gen(function* () {
+        // An item of one attribute `a`: 1 byte of name plus its value.
+        const put = (bytes: number) => ({
+          Put: { TableName: "t", Item: { a: { S: "x".repeat(bytes - 1) } } },
+        })
+        const target = transactItemTarget(put(2), "t", ["a"], "Doc", "operation 0 (Doc)")
+        yield* refuseOversizedTransaction([put(400 * 1024)], [target], "transactWrite")
+        const over = yield* refuseOversizedTransaction(
+          [put(400 * 1024 + 1)],
+          [target],
+          "transactWrite",
+        ).pipe(Effect.flip)
+        expect(over._tag).toBe("ValidationError")
+        expect(String(over.cause)).toContain("is at least 409601 bytes")
+        expect(String(over.cause)).toContain("(400 KB)")
+      }),
+    )
   })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {

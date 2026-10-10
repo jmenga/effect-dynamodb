@@ -221,7 +221,7 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
  *   succeeds, at the `every` cadence. A failed snapshot write never fails the
  *   command; the snapshot simply lags until the next threshold crossing.
  * - `"inline"` — the snapshot `Put` rides in the append's own transaction (see
- *   {@link AppendOptions.snapshot}), on every append, or at the `every` cadence
+ *   {@link AppendOptionsBase.snapshot}), on every append, or at the `every` cadence
  *   when one is set. The snapshot is then current after every command that
  *   writes one, so {@link EventStream.readLatest} loads state in one request.
  *   The snapshot counts towards the transaction's item and size limits.
@@ -250,7 +250,7 @@ export interface SnapshotSettings {
  * redelivery whose `decide` returns no events against the loaded state never
  * appends, so it succeeds as a no-op instead of failing with
  * `DuplicateCommand`. Whether a no-op redelivery needs to be told apart is the
- * application's call (see {@link CommandOptions.commandId}).
+ * application's call (see {@link CommandOptionsBase.commandId}).
  *
  * The sentinel is co-located in the stream's own partition, so `commandId`
  * uniqueness is scoped to the stream (which is what "have I already applied this
@@ -276,14 +276,49 @@ export interface AppendIdempotency {
 }
 
 /**
- * Options accepted by {@link EventStream.append}.
+ * The metadata of an {@link EventStream.append}: one value shared by every
+ * event (`metadata`), or one entry per event (`eventMetadata`) — never both.
+ *
+ * Passing both is a compile error, and a `ValidationError` at runtime for an
+ * untyped caller. `undefined` counts as absent for either, so
+ * `{ metadata: undefined, eventMetadata: [...] }` is not "both".
+ */
+export type AppendMetadataOptions<TMetadata> =
+  | {
+      /**
+       * Metadata written onto **every** event of the append — a copy per item,
+       * encoded once through the stream's metadata schema when one is
+       * configured. For metadata that belongs to each event (an event id, the
+       * original occurrence time of an imported event) use `eventMetadata`:
+       * packing a list into `metadata` stores every entry on every item, so
+       * stored metadata grows with the square of the append size.
+       */
+      readonly metadata?: TMetadata
+      readonly eventMetadata?: undefined
+    }
+  | {
+      readonly metadata?: undefined
+      /**
+       * Per-event metadata: entry `i` is written onto event `i` (and read back
+       * as that event's `StreamEvent.metadata`). Each defined entry is encoded
+       * through the stream's metadata schema, as `metadata` is; an `undefined`
+       * entry writes its event without a `metadata` attribute.
+       *
+       * Must have exactly one entry per event — a length mismatch fails with
+       * `ValidationError` before anything is read or written, also for an
+       * append of no events (where only `[]` is accepted).
+       */
+      readonly eventMetadata?: ReadonlyArray<TMetadata | undefined>
+    }
+
+/**
+ * The options of {@link EventStream.append} other than its metadata (see
+ * {@link AppendMetadataOptions}).
  *
  * `TState` is the stream's snapshot state type (`never` for a stream without a
  * `snapshot` config, so `snapshot` cannot be supplied there).
  */
-export interface AppendOptions<TMetadata, TState = never> {
-  /** Per-append metadata, validated against the stream's metadata schema when configured. */
-  readonly metadata?: TMetadata
+export interface AppendOptionsBase<TState = never> {
   /**
    * Caller-owned transact items committed atomically with the events — the same
    * op union `Transaction.transactWrite` accepts (`EntityPut`, `EntityDelete`,
@@ -323,6 +358,17 @@ export interface AppendOptions<TMetadata, TState = never> {
    */
   readonly snapshot?: TState
 }
+
+/**
+ * Options accepted by {@link EventStream.append}: {@link AppendOptionsBase}
+ * plus the exclusive `metadata` / `eventMetadata` pair
+ * ({@link AppendMetadataOptions}).
+ *
+ * A type alias rather than an interface, since it is an intersection with a
+ * union: an interface cannot extend it.
+ */
+export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState> &
+  AppendMetadataOptions<TMetadata>
 
 /** Error channel of {@link EventStream.append}. */
 export type AppendError =
@@ -1561,6 +1607,32 @@ export const makeStream = <
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
       const snapshotState = options?.snapshot
+      const eventMetadata = options?.eventMetadata
+
+      // Per-event metadata (#144) is checked first — ahead of the no-op fast
+      // path below, which would otherwise accept `append(id, [], v,
+      // { eventMetadata: [m] })` without looking at it.
+      if (eventMetadata !== undefined) {
+        if (options?.metadata !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventMetadata",
+            cause:
+              "metadata and eventMetadata are mutually exclusive: pass one value shared by " +
+              "every event, or one entry per event. Nothing was written.",
+          })
+        }
+        if (!Array.isArray(eventMetadata) || eventMetadata.length !== events.length) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventMetadata",
+            cause:
+              `eventMetadata has ${Array.isArray(eventMetadata) ? eventMetadata.length : "no"} ` +
+              `entries for ${events.length} events: it needs exactly one entry (or undefined) ` +
+              "per event, in order. Nothing was written.",
+          })
+        }
+      }
 
       if (snapshotState !== undefined && snapshot === undefined) {
         return yield* snapshotUnavailable("append({ snapshot })")
@@ -1647,7 +1719,8 @@ export const makeStream = <
       const nowDateTime = yield* DateTime.now
       const now = DateTime.formatIso(nowDateTime)
 
-      // Validate and encode metadata to wire form if schema provided
+      // Validate and encode metadata to wire form if schema provided. Shared
+      // by every event; per-event `eventMetadata` is encoded in the loop below.
       let encodedMetadata: Record<string, unknown> | undefined
       if (options?.metadata !== undefined && metadataSchema) {
         const encoded = yield* encodeToWire(
@@ -1686,6 +1759,23 @@ export const makeStream = <
             // events already carry _tag in their encoded form, which wins.
             const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
 
+            // This event's own metadata entry (#144), encoded as `metadata`
+            // is; an `undefined` entry writes no metadata attribute.
+            let itemMetadata = encodedMetadata
+            if (eventMetadata !== undefined) {
+              const entry = eventMetadata[i]
+              itemMetadata =
+                entry === undefined
+                  ? undefined
+                  : metadataSchema
+                    ? ((yield* encodeToWire(
+                        metadataSchema as Schema.Codec<any>,
+                        entry,
+                        `EventStore.append.eventMetadata[${i}]`,
+                      )) as Record<string, unknown>)
+                    : (entry as Record<string, unknown>)
+            }
+
             const item: Record<string, unknown> = {
               pk,
               sk: composeEventSk(version),
@@ -1696,8 +1786,8 @@ export const makeStream = <
               data: eventData,
               timestamp: now,
             }
-            if (encodedMetadata !== undefined) {
-              item.metadata = encodedMetadata
+            if (itemMetadata !== undefined) {
+              item.metadata = itemMetadata
             }
 
             // Stream indexes (#140): the derived key, stored raw, and for a
@@ -2757,7 +2847,7 @@ export interface CommandHandlerOptions {
    * initial attempt). Omit for the default: no retry.
    *
    * `DuplicateCommand` is deliberately NOT retried — it is terminal. Nor is
-   * any call that supplies {@link CommandOptions.expectedVersion}: the caller asked
+   * any call that supplies {@link CommandOptionsBase.expectedVersion}: the caller asked
    * for a conditional write, so its `VersionConflict` is always surfaced.
    */
   readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
@@ -2805,7 +2895,7 @@ export interface CommandHandlerOptions {
    *
    * - **No snapshot item** (a stream not yet snapshotted): the verified load
    *   runs at once, and `decide` runs once.
-   * - **With {@link CommandOptions.expectedVersion}**: a snapshot whose
+   * - **With {@link CommandOptionsBase.expectedVersion}**: a snapshot whose
    *   `asOfVersion` differs from it is re-read verified before the If-Match
    *   check, so only a genuine mismatch is reported (its `actualVersion` is
    *   the verified head). A snapshot at the expected version holds exactly the
@@ -2846,7 +2936,8 @@ export interface CommandHandlerOptions {
 
 /**
  * The outcome of one `decide` call, handed to a function-form
- * {@link CommandOptions.additionalItems}.
+ * {@link CommandOptionsBase.additionalItems} and to `eventMetadata`
+ * ({@link CommandMetadataOptions}).
  *
  * - `events` — what `decide` returned (never empty: the function is not called
  *   for a no-op decision).
@@ -2868,7 +2959,7 @@ export interface Decision<State, Event> {
 }
 
 /**
- * The forms {@link CommandOptions.additionalItems} accepts: a static array of
+ * The forms {@link CommandOptionsBase.additionalItems} accepts: a static array of
  * transact ops, or a function of the {@link Decision} returning the array
  * directly (pure projection) or as an `Effect` (a projection that needs a read).
  * The effect's `E2` joins the handler's error channel and its `R2` the handler's
@@ -2881,21 +2972,76 @@ export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
     ) => ReadonlyArray<TransactWriteOp> | Effect.Effect<ReadonlyArray<TransactWriteOp>, E2, R2>)
 
 /**
- * Per-call options accepted by a handler produced by {@link commandHandler}.
+ * The form `eventMetadata` ({@link CommandMetadataOptions}) accepts: a
+ * function of the {@link Decision} returning one metadata entry per event
+ * (`undefined` for an event without metadata), directly or as an `Effect`. The
+ * effect's `E3` joins the handler's error channel and its `R3` the handler's
+ * requirements.
  *
- * `State` / `Event` type the {@link Decision} a function-form `additionalItems`
- * receives; `E2` / `R2` are the error and requirements of the `Effect` it may
- * return. The handler infers all four, so they only need naming when this type
- * is written out by hand.
+ * Function-only: the number of events is known only once `decide` has run.
+ * The `Effect` form lets ids be minted through `Clock` / `Random`, which keeps
+ * them deterministic under `TestClock` or a seeded `Random`.
  */
-export interface CommandOptions<
-  TMetadata,
-  State = unknown,
-  Event = unknown,
-  E2 = never,
-  R2 = never,
-> {
-  readonly metadata?: TMetadata
+export type EventMetadataInput<State, Event, TMetadata, E3 = never, R3 = never> = (
+  decision: Decision<State, Event>,
+) =>
+  | ReadonlyArray<TMetadata | undefined>
+  | Effect.Effect<ReadonlyArray<TMetadata | undefined>, E3, R3>
+
+/**
+ * The per-call metadata of a {@link commandHandler} handler: one value shared
+ * by every event (`metadata`), or a function deriving one entry per event from
+ * the decision (`eventMetadata`) — never both (see
+ * {@link AppendMetadataOptions}).
+ */
+export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = never> =
+  | {
+      /**
+       * Metadata written onto every event the decision appends (see
+       * {@link AppendMetadataOptions}). Fixed before `decide` runs; to give
+       * each event its own entry, use `eventMetadata`.
+       */
+      readonly metadata?: TMetadata
+      readonly eventMetadata?: undefined
+    }
+  | {
+      readonly metadata?: undefined
+      /**
+       * Per-event metadata derived from the {@link Decision}: the function
+       * returns one entry per event, in order, and entry `i` is written onto
+       * event `i` (see {@link AppendMetadataOptions}).
+       *
+       * - Runs after `decide` and after the new events are folded, receiving
+       *   the same `Decision` a function-form `additionalItems` does — and
+       *   **before** `additionalItems`, so an effectful pair runs in a
+       *   predictable order.
+       * - Not called when `decide` returns no events.
+       * - Re-run on every attempt: each `VersionConflict` retry, and the
+       *   re-decision a stale unverified snapshot triggers
+       *   ({@link CommandHandlerOptions.verifySnapshot}`: false`). Ids minted
+       *   per attempt are safe — a failed attempt writes nothing.
+       * - A result whose length differs from the decision's events fails with
+       *   `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`),
+       *   never retried. A failure of the returned `Effect` surfaces as is,
+       *   and is not retried either.
+       *
+       * Without `idempotency`, a redelivery after a lost response decides and
+       * appends again, minting new ids. For ids stable across redeliveries,
+       * derive them from the delivery id the caller holds:
+       *
+       * ```ts
+       * eventMetadata: ({ events, version }) =>
+       *   events.map((_, i) => ({ eventId: `${deliveryId}:${version + i + 1}` }))
+       * ```
+       */
+      readonly eventMetadata?: EventMetadataInput<State, Event, TMetadata, E3, R3>
+    }
+
+/**
+ * The options of a {@link commandHandler} handler other than its metadata
+ * (see {@link CommandMetadataOptions}).
+ */
+export interface CommandOptionsBase<State = unknown, Event = unknown, E2 = never, R2 = never> {
   /**
    * Identifier for this command delivery. Required when the handler was created
    * with `idempotency`; a replayed id fails with `DuplicateCommand` — also when
@@ -2932,7 +3078,7 @@ export interface CommandOptions<
   readonly expectedVersion?: number | undefined
   /**
    * Caller-owned transact items committed atomically with the produced events
-   * (see {@link AppendOptions.additionalItems}).
+   * (see {@link AppendOptionsBase.additionalItems}).
    *
    * Either a static array, or a function of the {@link Decision} — an inline
    * projection — returning the array or an `Effect` of it. The function runs
@@ -2944,16 +3090,39 @@ export interface CommandOptions<
   readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
 }
 
-/** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
-export interface IdempotentCommandOptions<
+/**
+ * Per-call options accepted by a handler produced by {@link commandHandler}:
+ * {@link CommandOptionsBase} plus the exclusive `metadata` / `eventMetadata`
+ * pair ({@link CommandMetadataOptions}).
+ *
+ * `State` / `Event` type the {@link Decision} a function-form `additionalItems`
+ * or `eventMetadata` receives; `E2` / `R2` are the error and requirements of
+ * the `Effect` `additionalItems` may return, `E3` / `R3` those of the `Effect`
+ * `eventMetadata` may return — separate, so two effects with different error
+ * types both join the handler's error channel. The handler infers all of
+ * them, so they only need naming when this type is written out by hand.
+ */
+export type CommandOptions<
   TMetadata,
   State = unknown,
   Event = unknown,
   E2 = never,
   R2 = never,
-> extends CommandOptions<TMetadata, State, Event, E2, R2> {
-  readonly commandId: string
-}
+  E3 = never,
+  R3 = never,
+> = CommandOptionsBase<State, Event, E2, R2> &
+  CommandMetadataOptions<TMetadata, State, Event, E3, R3>
+
+/** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
+export type IdempotentCommandOptions<
+  TMetadata,
+  State = unknown,
+  Event = unknown,
+  E2 = never,
+  R2 = never,
+  E3 = never,
+  R3 = never,
+> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3> & { readonly commandId: string }
 
 /**
  * Options arity: configuring `idempotency` makes the handler's options parameter
@@ -2967,9 +3136,11 @@ type CommandOptionsArgs<
   TEvent,
   E2,
   R2,
+  E3,
+  R3,
 > = TConfig extends { readonly idempotency: object }
-  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2>]
-  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2> | undefined]
+  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3>]
+  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3> | undefined]
 
 type CommandHandlerErrors<E> =
   | E
@@ -2987,7 +3158,8 @@ type CommandHandlerErrors<E> =
 /**
  * A handler over an {@link EventStream}. Generic per call over the error (`E2`)
  * and requirements (`R2`) of a function-form `additionalItems` that returns an
- * `Effect`; both are `never` otherwise.
+ * `Effect`, and those (`E3` / `R3`) of an `eventMetadata` that does; all are
+ * `never` otherwise.
  */
 type CommandHandler<
   State,
@@ -2997,19 +3169,20 @@ type CommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2,
-  DynamoClient | TableConfig | R2
+  CommandHandlerErrors<E> | E2 | E3,
+  DynamoClient | TableConfig | R2 | R3
 >
 
 /**
  * A handler over a {@link BoundEventStream}: the stream's services are already
- * provided, so a function-form `additionalItems`' `R2` is its only requirement.
+ * provided, so the `R2` / `R3` of a function-form `additionalItems` /
+ * `eventMetadata` are its only requirements.
  */
 type BoundCommandHandler<
   State,
@@ -3019,11 +3192,11 @@ type BoundCommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
-) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E> | E2, R2>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3>
+) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E> | E2 | E3, R2 | R3>
 
 /**
  * The handler the data-last {@link commandHandler} returns for stream `S`: a
@@ -3049,12 +3222,22 @@ type CommandHandlerFor<
 const hasEventStreamBrand = (u: unknown): boolean =>
   typeof u === "object" && u !== null && EventStreamTypeId in u
 
-/** @internal Resolve a {@link CommandOptions.additionalItems} against a decision. */
+/** @internal Resolve a {@link CommandOptionsBase.additionalItems} against a decision. */
 const deriveAdditionalItems = <State, Event>(
   input: AdditionalItemsInput<State, Event, unknown, unknown> | undefined,
   decision: Decision<State, Event>,
 ): Effect.Effect<ReadonlyArray<TransactWriteOp> | undefined, unknown, unknown> => {
   if (typeof input !== "function") return Effect.succeed(input)
+  const derived = input(decision)
+  return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
+}
+
+/** @internal Resolve an `eventMetadata` ({@link CommandMetadataOptions}) against a decision. */
+const deriveEventMetadata = <State, Event, TMetadata>(
+  input: EventMetadataInput<State, Event, TMetadata, unknown, unknown> | undefined,
+  decision: Decision<State, Event>,
+): Effect.Effect<ReadonlyArray<TMetadata | undefined> | undefined, unknown, unknown> => {
+  if (input === undefined) return Effect.succeed(undefined)
   const derived = input(decision)
   return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
 }
@@ -3100,7 +3283,9 @@ const makeCommandHandlerImpl = <
   return (
     streamId: StreamIdInput<TStreamIdFields>,
     command: Command,
-    callOptions?: CommandOptions<TMetadata, State, TEvent, unknown, unknown> | undefined,
+    callOptions?:
+      | CommandOptions<TMetadata, State, TEvent, unknown, unknown, unknown, unknown>
+      | undefined,
   ) => {
     const expectedVersion = callOptions?.expectedVersion
 
@@ -3194,15 +3379,32 @@ const makeCommandHandlerImpl = <
           next = decider.evolve(next, event)
         }
 
-        // 6. Derive the caller's items from the decision. Re-run on every
-        //    attempt (and on a re-decision), because the whole cycle is the
-        //    retried unit.
-        const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, {
+        // 6. Derive the caller's per-event metadata, then items, from the
+        //    decision — in that order (#144). Re-run on every attempt (and on
+        //    a re-decision), because the whole cycle is the retried unit.
+        const decision: Decision<State, TEvent> = {
           events: newEvents,
           state: next,
           previous,
           version: baseVersion,
-        })
+        }
+        const eventMetadata = yield* deriveEventMetadata(callOptions?.eventMetadata, decision)
+        // A supplied function must return the array — `undefined` (e.g. a
+        // block body with no `return`) is refused, not silently dropped.
+        if (
+          callOptions?.eventMetadata !== undefined &&
+          (!Array.isArray(eventMetadata) || eventMetadata.length !== newEvents.length)
+        ) {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              `eventMetadata returned ${Array.isArray(eventMetadata) ? eventMetadata.length : "no"} ` +
+              `entries for the decision's ${newEvents.length} events: it must return exactly ` +
+              "one entry (or undefined) per event, in order. Nothing was written.",
+          })
+        }
+        const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, decision)
 
         // 7. Append with optimistic concurrency, plus the caller's items, the
         //    dedup sentinel and an inline snapshot, all in one transaction.
@@ -3210,11 +3412,13 @@ const makeCommandHandlerImpl = <
         //    (checked in step 2).
         const appendOptions: {
           metadata?: TMetadata
+          eventMetadata?: ReadonlyArray<TMetadata | undefined>
           additionalItems?: ReadonlyArray<TransactWriteOp>
           idempotency?: AppendIdempotency
           snapshot?: State
         } = {}
         if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
+        if (eventMetadata !== undefined) appendOptions.eventMetadata = eventMetadata
         if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
         if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
           appendOptions.idempotency =
@@ -3330,6 +3534,30 @@ const makeCommandHandlerImpl = <
           operation: "EventStore.commandHandler",
           cause: "commandId is required when commandHandler is configured with `idempotency`.",
         })
+      }
+
+      // The same backstop for the exclusive metadata pair (#144), and for an
+      // `eventMetadata` that is not the function it must be — refused before
+      // anything is read, rather than by `append` after `decide`.
+      if (callOptions?.eventMetadata !== undefined) {
+        if (callOptions.metadata !== undefined) {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              "metadata and eventMetadata are mutually exclusive: pass one value shared by " +
+              "every event, or a function deriving one entry per event. Nothing was written.",
+          })
+        }
+        if (typeof callOptions.eventMetadata !== "function") {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              "eventMetadata must be a function of the decision: the number of events is " +
+              "known only once `decide` has run. Nothing was written.",
+          })
+        }
       }
 
       // A malformed If-Match (`NaN` from a failed parse, a negative or
@@ -3489,6 +3717,11 @@ const makeCommandHandlerImpl = <
  * yield* handle({ matchId: "m-1" }, command, {
  *   additionalItems: ({ state }) => [Scoreboard.put({ matchId: "m-1", runs: state.runs })],
  * })
+ *
+ * // Per-event metadata derived from the decision: entry i is written onto event i
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventMetadata: ({ events }) => events.map(() => ({ eventId: ulid() })),
+ * })
  * ```
  *
  * Each invocation runs
@@ -3504,7 +3737,7 @@ const makeCommandHandlerImpl = <
  *   item alone (one `GetItem`); an answer that is not a successful append is
  *   confirmed against the head first, and a snapshot that proves stale falls
  *   back to the verified load — in which case `decide` may run twice.
- * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
+ * - **expectedVersion.** See {@link CommandOptionsBase.expectedVersion}.
  * - **Fold before append.** The new events are folded into state before the
  *   append, so the state returned, snapshotted and handed to a function-form
  *   `additionalItems` (see {@link Decision}) is always the `evolve` fold.

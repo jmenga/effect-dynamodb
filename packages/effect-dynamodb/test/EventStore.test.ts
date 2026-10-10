@@ -6115,3 +6115,593 @@ describe("EventStore stream indexes (#140)", () => {
     })
   })
 })
+
+describe("EventStore per-event metadata (#144)", () => {
+  const epochMs = 1704067200000 // 2024-01-01T00:00:00.000Z
+  const isoString = "2024-01-01T00:00:00.000Z"
+
+  /** A transforming metadata schema: `recordedAt` is stored as an ISO string. */
+  const AuditMetadata = Schema.Struct({
+    eventId: Schema.String,
+    recordedAt: Schema.DateTimeUtcFromString,
+  })
+  const meta = (eventId: string) => ({ eventId, recordedAt: DateTime.makeUnsafe(epochMs) })
+  const wireMeta = (eventId: string) => ({ eventId, recordedAt: isoString })
+
+  const Audited = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "Audited",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    metadata: AuditMetadata,
+  })
+  const AuditedInline = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "AuditedInline",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    metadata: AuditMetadata,
+    snapshot: { schema: MatchStateSchema, mode: "inline" },
+  })
+
+  const started = () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })
+  const innings = (n: number) => new InningsCompleted({ innings: n, runs: 100 + n, wickets: n })
+  const ended = () => new MatchEnded({ result: "AUS won" })
+
+  /** The event items of one TransactWriteItems call, decoded, in order. */
+  const eventPutsOf = (call: { TransactItems: ReadonlyArray<any> }) =>
+    call.TransactItems.filter((i) => i.Put !== undefined)
+      .map((i) => fromAttributeMap(i.Put.Item))
+      .filter((item) => String(item.__edd_e__).endsWith(".event"))
+  const conflict = {
+    name: "TransactionCanceledException",
+    CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+  }
+
+  describe("append", () => {
+    it.effect("writes entry i onto event i, encoded through the metadata schema", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+          eventMetadata: [meta("e-1"), meta("e-2")],
+        })
+
+        expect(result.version).toBe(2)
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        const [first, second] = eventPutsOf(call)
+        expect(first!.version).toBe(1)
+        expect(first!.metadata).toEqual(wireMeta("e-1"))
+        expect(second!.version).toBe(2)
+        expect(second!.metadata).toEqual(wireMeta("e-2"))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an undefined entry writes no metadata attribute", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* Audited.append({ matchId: "m-1" }, [started(), innings(1), ended()], 0, {
+          eventMetadata: [undefined, meta("e-2"), undefined],
+        })
+
+        const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(items).toHaveLength(3)
+        expect("metadata" in items[0]!).toBe(false)
+        expect(items[1]!.metadata).toEqual(wireMeta("e-2"))
+        expect("metadata" in items[2]!).toBe(false)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("round-trips append → read decoded, each event with its own entry", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* Audited.append({ matchId: "m-1" }, [started(), innings(1), ended()], 0, {
+          eventMetadata: [meta("e-1"), undefined, meta("e-3")],
+        })
+
+        const stored = mockTransactWriteItems.mock.calls[0]![0].TransactItems.map(
+          (i: any) => i.Put.Item,
+        )
+        mockQuery.mockResolvedValue({ Items: stored })
+        const events = yield* Audited.read({ matchId: "m-1" })
+
+        expect(events.map((e) => e.metadata?.eventId)).toEqual(["e-1", undefined, "e-3"])
+        const first = events[0]!.metadata!
+        expect(DateTime.isDateTime(first.recordedAt)).toBe(true)
+        expect(DateTime.toEpochMillis(first.recordedAt)).toBe(epochMs)
+        expect(events[1]!.metadata).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an entry that does not encode names its event's index", () =>
+      Effect.gen(function* () {
+        const error = yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+          eventMetadata: [
+            meta("e-1"),
+            { eventId: 42, recordedAt: "bogus" } as unknown as ReturnType<typeof meta>,
+          ],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata[1]")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a length mismatch is refused before anything is sent", () =>
+      Effect.gen(function* () {
+        for (const entries of [[meta("e-1")], [meta("e-1"), meta("e-2"), meta("e-3")]]) {
+          const error = yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+            eventMetadata: entries,
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata")
+          expect(String((error as ValidationError).cause)).toContain(
+            `${entries.length} entries for 2 events`,
+          )
+        }
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("metadata and eventMetadata together are refused before anything is sent", () =>
+      Effect.gen(function* () {
+        const error = yield* Audited.append({ matchId: "m-1" }, [started()], 0, {
+          metadata: meta("shared"),
+          eventMetadata: [meta("e-1")],
+        } as never).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata")
+        expect(String((error as ValidationError).cause)).toContain("mutually exclusive")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+
+        // `undefined` is absent, so this is not "both".
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* Audited.append({ matchId: "m-1" }, [started()], 0, {
+          metadata: undefined,
+          eventMetadata: [meta("e-1")],
+        })
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("zero events: [m] is a mismatch the no-op fast path does not swallow", () =>
+      Effect.gen(function* () {
+        const error = yield* Audited.append({ matchId: "m-1" }, [], 3, {
+          eventMetadata: [meta("e-1")],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("zero events: [] keeps the no-op fast path", () =>
+      Effect.gen(function* () {
+        const result = yield* Audited.append({ matchId: "m-1" }, [], 3, { eventMetadata: [] })
+        expect(result).toEqual({ version: 3, events: [] })
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("shared metadata is still copied onto every event", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+          metadata: meta("shared"),
+        })
+
+        const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(items.map((item) => item.metadata)).toEqual([wireMeta("shared"), wireMeta("shared")])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "with additionalItems, idempotency and an inline snapshot the layout is unchanged",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValueOnce({})
+          const options = {
+            eventMetadata: [meta("e-4"), meta("e-5")],
+            additionalItems: [Watermarks.put({ writerId: "w", lastSeq: 1 })],
+            idempotency: { commandId: "cmd-1" },
+            snapshot: { status: "in-progress" as const, innings: [{ runs: 250, wickets: 10 }] },
+          }
+
+          yield* AuditedInline.append({ matchId: "m-1" }, [innings(4), innings(5)], 3, options)
+
+          const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          // check, 2 events, 1 additional, sentinel, snapshot
+          expect(items).toHaveLength(6)
+          expect(items[0].ConditionCheck).toBeDefined()
+          const decoded = items.slice(1).map((i: any) => fromAttributeMap(i.Put.Item))
+          expect(decoded.map((item: any) => item.__edd_e__)).toEqual([
+            "auditedinline.event",
+            "auditedinline.event",
+            "Watermark",
+            "auditedinline.command",
+            "auditedinline.snapshot",
+          ])
+          expect(decoded[0].metadata).toEqual(wireMeta("e-4"))
+          expect(decoded[1].metadata).toEqual(wireMeta("e-5"))
+          for (const other of decoded.slice(2)) expect(other.metadata).toBeUndefined()
+
+          // A cancellation at the additional item still maps to its index.
+          mockTransactWriteItems.mockRejectedValueOnce({
+            name: "TransactionCanceledException",
+            CancellationReasons: [
+              { Code: "None" },
+              { Code: "None" },
+              { Code: "None" },
+              { Code: "ConditionalCheckFailed" },
+              { Code: "None" },
+              { Code: "None" },
+            ],
+          })
+          const error = yield* AuditedInline.append(
+            { matchId: "m-1" },
+            [innings(4), innings(5)],
+            3,
+            options,
+          ).pipe(Effect.flip)
+          expect(error._tag).toBe("AdditionalItemConditionFailed")
+          expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound stream accepts eventMetadata", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const bound = yield* EventStore.bind(Audited)
+
+        yield* bound.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+          eventMetadata: [meta("e-1"), meta("e-2")],
+        })
+
+        const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(items.map((item) => item.metadata)).toEqual([wireMeta("e-1"), wireMeta("e-2")])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an event item over 400 KB is refused, naming it, before anything is sent", () =>
+      Effect.gen(function* () {
+        const big = "x".repeat(410_000)
+        const error = yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
+          eventMetadata: [meta("e-1"), meta(big)],
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("EventStore.append")
+        expect(failure.entityType).toBe("audited.event")
+        expect(String(failure.cause)).toContain("the item of the event at version 2, at pk=")
+        expect(String(failure.cause)).toContain("over its limit of 409600 bytes (400 KB)")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("commandHandler", () => {
+    const startedItem = () =>
+      makeStreamEventItem("audited", "m-1", 1, "MatchStarted", {
+        venue: "MCG",
+        homeTeam: "AUS",
+        awayTeam: "ENG",
+      })
+    const completeInnings: MatchCommand = {
+      _tag: "CompleteInnings",
+      innings: 1,
+      runs: 250,
+      wickets: 10,
+    }
+    /** Two events per command, so the per-event pairing is visible. */
+    const twoEvents: EventStore.Decider<
+      MatchState,
+      MatchCommand,
+      MatchEvent,
+      AlreadyStarted | NotStarted
+    > = {
+      ...matchDecider,
+      decide: (command, state) =>
+        Effect.map(matchDecider.decide(command, state), (events) =>
+          events.length === 0 ? events : [...events, ended()],
+        ),
+    }
+
+    class IdMinter extends Context.Service<IdMinter, { readonly next: Effect.Effect<string> }>()(
+      "test/IdMinter",
+    ) {}
+    class MintFailed extends Data.TaggedError("MintFailed") {}
+
+    it.effect("a plain function receives the Decision; entry i lands on event i", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        mockTransactWriteItems.mockResolvedValue({})
+        const seen: Array<EventStore.Decision<MatchState, MatchEvent>> = []
+
+        const result = yield* EventStore.commandHandler(twoEvents, Audited)(
+          { matchId: "m-1" },
+          completeInnings,
+          {
+            eventMetadata: (decision) => {
+              seen.push(decision)
+              // Evaluated before the append.
+              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+              return decision.events.map((_, i) => meta(`v${decision.version + i + 1}`))
+            },
+          },
+        )
+
+        expect(seen).toHaveLength(1)
+        const decision = seen[0]!
+        expect(decision.version).toBe(1)
+        expect(decision.events).toHaveLength(2)
+        expect(decision.previous).toEqual({ status: "in-progress", innings: [] })
+        expect(decision.state).toEqual({
+          status: "completed",
+          innings: [{ runs: 250, wickets: 10 }],
+        })
+        expect(result.version).toBe(3)
+        const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(items.map((item) => [item.version, item.metadata])).toEqual([
+          [2, wireMeta("v2")],
+          [3, wireMeta("v3")],
+        ])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an Effect-returning function may use services, before additionalItems", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        mockTransactWriteItems.mockResolvedValue({})
+        const order: Array<string> = []
+        let minted = 0
+
+        const program = EventStore.commandHandler(twoEvents, Audited)(
+          { matchId: "m-1" },
+          completeInnings,
+          {
+            additionalItems: () => {
+              order.push("additionalItems")
+              return [Watermarks.put({ writerId: "proj", lastSeq: 1 })]
+            },
+            eventMetadata: ({ events }) =>
+              Effect.gen(function* () {
+                order.push("eventMetadata")
+                const minter = yield* IdMinter
+                const entries: Array<ReturnType<typeof meta>> = []
+                for (const _ of events) entries.push(meta(yield* minter.next))
+                return entries
+              }),
+          },
+        )
+        yield* Effect.provideService(program, IdMinter, {
+          next: Effect.sync(() => `id-${++minted}`),
+        })
+
+        expect(order).toEqual(["eventMetadata", "additionalItems"])
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(eventPutsOf(call).map((item) => item.metadata)).toEqual([
+          wireMeta("id-1"),
+          wireMeta("id-2"),
+        ])
+        // The additional item carries no event metadata.
+        const watermark = fromAttributeMap(call.TransactItems.at(-1).Put.Item)
+        expect(watermark.__edd_e__).toBe("Watermark")
+        expect(watermark.metadata).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("is not called for a no-op decision", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const derive = vi.fn(() => [meta("never")])
+        const noop: EventStore.Decider<MatchState, MatchCommand, MatchEvent> = {
+          ...matchDecider,
+          decide: () => Effect.succeed([]),
+        }
+
+        const result = yield* EventStore.commandHandler(noop, Audited)(
+          { matchId: "m-1" },
+          completeInnings,
+          { eventMetadata: derive },
+        )
+
+        expect(result.events).toEqual([])
+        expect(derive).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("is re-run, minting again, on a VersionConflict retry", () =>
+      Effect.gen(function* () {
+        const firstInnings = makeStreamEventItem("audited", "m-1", 2, "InningsCompleted", {
+          innings: 1,
+          runs: 250,
+          wickets: 10,
+        })
+        mockQuery
+          .mockResolvedValueOnce({ Items: [startedItem()] })
+          .mockResolvedValue({ Items: [startedItem(), firstInnings] })
+        mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+        let minted = 0
+
+        yield* EventStore.commandHandler(matchDecider, Audited, { retry: 2 })(
+          { matchId: "m-1" },
+          { _tag: "CompleteInnings", innings: 2, runs: 180, wickets: 8 },
+          { eventMetadata: ({ events }) => events.map(() => meta(`id-${++minted}`)) },
+        )
+
+        expect(minted).toBe(2)
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        const [retried] = eventPutsOf(mockTransactWriteItems.mock.calls[1]![0])
+        expect(retried!.version).toBe(3)
+        expect(retried!.metadata).toEqual(wireMeta("id-2"))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("is re-run on the re-decision of a stale unverified snapshot", () =>
+      Effect.gen(function* () {
+        const label = "auditedinline"
+        const snapshot = makeSnapshotItem(label, "m-1", 4, { status: "i", innings: ["1/1", "2/2"] })
+        const snapshotSk = DynamoSchema.composeKey(AppSchema, `${label}.snapshot`, [])
+        mockGetItem.mockImplementation(async (input: any) =>
+          fromAttributeMap(input.Key).sk === snapshotSk ? { Item: snapshot } : {},
+        )
+        // Event 5 was appended without a snapshot: the first decision is stale.
+        mockQuery.mockResolvedValue(
+          latestPage(snapshot, [
+            makeStreamEventItem(label, "m-1", 5, "InningsCompleted", {
+              innings: 3,
+              runs: 3,
+              wickets: 3,
+            }),
+          ]),
+        )
+        mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+        const versions: Array<number> = []
+
+        const result = yield* EventStore.commandHandler(matchDecider, AuditedInline, {
+          verifySnapshot: false,
+        })({ matchId: "m-1" }, completeInnings, {
+          eventMetadata: ({ events, version }) => {
+            versions.push(version)
+            return events.map((_, i) => meta(`v${version + i + 1}`))
+          },
+        })
+
+        expect(versions).toEqual([4, 5])
+        expect(result.version).toBe(6)
+        const [event] = eventPutsOf(mockTransactWriteItems.mock.calls[1]![0])
+        expect(event!.version).toBe(6)
+        expect(event!.metadata).toEqual(wireMeta("v6"))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a length mismatch fails with ValidationError named for the handler", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        const derive = vi.fn(() => [meta("only-one")])
+
+        const error = yield* EventStore.commandHandler(twoEvents, Audited, { retry: 3 })(
+          { matchId: "m-1" },
+          completeInnings,
+          { eventMetadata: derive },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.commandHandler.eventMetadata")
+        expect(String((error as ValidationError).cause)).toContain(
+          "returned 1 entries for the decision's 2 events",
+        )
+        // Not retried, and nothing sent.
+        expect(derive).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a function returning undefined is refused, not written without metadata", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        // A block body with no `return` — only reachable from untyped code.
+        const derive = vi.fn(() => undefined)
+
+        const error = yield* EventStore.commandHandler(twoEvents, Audited, { retry: 3 })(
+          { matchId: "m-1" },
+          completeInnings,
+          { eventMetadata: derive as never },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.commandHandler.eventMetadata")
+        expect(String((error as ValidationError).cause)).toContain(
+          "returned no entries for the decision's 2 events",
+        )
+        expect(derive).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an E3 failure surfaces as is and is not retried", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        let calls = 0
+
+        const error = yield* EventStore.commandHandler(matchDecider, Audited, { retry: 3 })(
+          { matchId: "m-1" },
+          completeInnings,
+          {
+            eventMetadata: () => {
+              calls++
+              return Effect.fail(new MintFailed())
+            },
+          },
+        ).pipe(Effect.flip)
+
+        expect(error).toBeInstanceOf(MintFailed)
+        expect(calls).toBe(1)
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("metadata and eventMetadata together are refused before anything is read", () =>
+      Effect.gen(function* () {
+        const handle = EventStore.commandHandler(matchDecider, Audited)
+        const both = yield* handle({ matchId: "m-1" }, completeInnings, {
+          metadata: meta("shared"),
+          eventMetadata: () => [meta("e-1")],
+        } as never).pipe(Effect.flip)
+        expect(both._tag).toBe("ValidationError")
+        expect((both as ValidationError).operation).toBe("EventStore.commandHandler.eventMetadata")
+        expect(String((both as ValidationError).cause)).toContain("mutually exclusive")
+
+        // Function-only: an untyped static array is refused the same way.
+        const array = yield* handle({ matchId: "m-1" }, completeInnings, {
+          eventMetadata: [meta("e-1")],
+        } as never).pipe(Effect.flip)
+        expect(array._tag).toBe("ValidationError")
+        expect(String((array as ValidationError).cause)).toContain("must be a function")
+
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("per-call metadata is still copied onto every event", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* EventStore.commandHandler(twoEvents, Audited)({ matchId: "m-1" }, completeInnings, {
+          metadata: meta("shared"),
+        })
+
+        const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(items.map((item) => item.metadata)).toEqual([wireMeta("shared"), wireMeta("shared")])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("works through a BoundEventStream handler", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [startedItem()] })
+        mockTransactWriteItems.mockResolvedValue({})
+        const bound = yield* EventStore.bind(Audited)
+
+        yield* bound.pipe(EventStore.commandHandler(matchDecider))(
+          { matchId: "m-1" },
+          completeInnings,
+          { eventMetadata: ({ events }) => events.map(() => meta("bound")) },
+        )
+
+        const [event] = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+        expect(event!.metadata).toEqual(wireMeta("bound"))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+})

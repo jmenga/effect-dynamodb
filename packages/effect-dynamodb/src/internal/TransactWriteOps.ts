@@ -35,7 +35,7 @@ import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
-import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
+import { ITEM_MAX_BYTES, TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
 import {
   composePrimaryKey,
   rejectUnsupportedOp,
@@ -139,12 +139,19 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
       }
 
 /**
- * Refuse a transaction whose items exceed DynamoDB's 4 MB aggregate limit —
- * BEFORE it is sent, with the entity that contributes most named, rather
- * than DynamoDB's bare `ValidationException`. Sizes are a LOWER bound by
- * DynamoDB's item-size rules ({@link transactItemBytes}), so a transaction
- * DynamoDB would accept is never refused; a retain put counts twice — its
- * item and its snapshot carry the same attributes.
+ * Refuse a transaction that DynamoDB would reject for its size — BEFORE it is
+ * sent, naming the item at fault, rather than DynamoDB's bare
+ * `ValidationException`, which names neither the item nor the cause:
+ *
+ * - an item over DynamoDB's 400 KB per-item limit ({@link ITEM_MAX_BYTES}),
+ *   named by its source and key;
+ * - items over the 4 MB aggregate limit, with the entity that contributes most
+ *   named.
+ *
+ * Sizes are a LOWER bound by DynamoDB's item-size rules
+ * ({@link transactItemBytes}), so a transaction DynamoDB would accept is never
+ * refused; a retain put counts twice — its item and its snapshot carry the
+ * same attributes.
  */
 export const refuseOversizedTransaction = (
   items: ReadonlyArray<TransactWriteItem>,
@@ -155,6 +162,22 @@ export const refuseOversizedTransaction = (
   let largest = { index: 0, bytes: -1 }
   for (const [index, item] of items.entries()) {
     const bytes = transactItemBytes(item)
+    if (bytes > ITEM_MAX_BYTES) {
+      const target = targets[index]
+      return Effect.fail(
+        new ValidationError({
+          entityType: target?.entityType ?? "unknown",
+          operation,
+          cause:
+            `${operation}: ` +
+            (target === undefined
+              ? `item ${index}`
+              : `the item of ${target.source}, at ${target.key},`) +
+            ` is at least ${bytes} bytes by DynamoDB's item-size rules, over its limit of ` +
+            `${ITEM_MAX_BYTES} bytes (400 KB) for one item. Nothing was written.`,
+        }),
+      )
+    }
     total += bytes
     if (bytes > largest.bytes) largest = { index, bytes }
   }

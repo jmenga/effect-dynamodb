@@ -13,6 +13,9 @@ import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb
  */
 export const TRANSACT_WRITE_MAX_BYTES = 4 * 1024 * 1024
 
+/** DynamoDB's limit on the size of one item: 400 KB, which is 409,600 bytes. */
+export const ITEM_MAX_BYTES = 400 * 1024
+
 export const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
 
 /**
