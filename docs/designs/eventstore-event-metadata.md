@@ -1,4 +1,4 @@
-# Design: per-event metadata on `EventStore.append` and `commandHandler`
+# Design: per-event metadata and timestamps on `EventStore.append` and `commandHandler`
 
 **Issue:** [#144](https://github.com/jmenga/effect-dynamodb/issues/144)
 **Status:** Designed → implemented in the same PR (single-PR workflow — this doc is commit 1).
@@ -29,8 +29,8 @@ This design adds:
    `additionalItems` already takes, #137), evaluated after `decide` on every attempt and
    passed to `append` as `eventMetadata`.
 
-`metadata` and `eventMetadata` are mutually exclusive. When neither is given, behaviour is
-unchanged. The read side is unchanged: `StreamEvent.metadata` already decodes each item's
+`metadata` and `eventMetadata` are mutually exclusive. A third option, `eventTimestamps`
+(§7), sets each event's `timestamp`. When none is given, behaviour is unchanged. The read side is unchanged: `StreamEvent.metadata` already decodes each item's
 own `metadata` attribute.
 
 ```ts
@@ -261,15 +261,64 @@ rather keep this PR to #144, it splits cleanly into its own issue.
 
 ---
 
-## 7. Out of scope
+## 7. Per-event timestamps
 
-- **Per-event `timestamp` override.** With `eventMetadata` an import can already carry the
-  original occurrence time in its own entry. A first-class override (defaulting to `now`)
-  touches read semantics — `timestamp` stops meaning "when it was appended" — and deserves
-  its own issue.
-- **Returning metadata from `append` / the handler.** `AppendResult.events` and
-  `CommandHandlerResult.events` stay domain events; a caller that minted the metadata
-  already holds it.
+*Added after the first review of #145. The first version of this design left the override
+out, on the grounds that it would change what `timestamp` means. That reason does not hold:
+the library writes `timestamp` from `DateTime.now` and returns it on `StreamEvent`, and
+nothing in it reads the value for ordering, snapshots or expiry. Importers already override
+it by pinning the `Clock` per chunk, which stamps every event in a chunk with one time.*
+
+### 7.1 `append`
+
+```ts
+yield* stream.append(streamId, [e1, e2, e3], expectedVersion, {
+  eventMetadata: [m1, m2, m3],
+  eventTimestamps: [t1, undefined, t3], // DateTime; undefined → the append's `now`
+})
+```
+
+- `eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>`, one entry per event, in
+  order. Entry `i` is written as event `i`'s `timestamp`, formatted with
+  `DateTime.formatIso` (the format `now` is written in, so readers see one format). An
+  `undefined` entry keeps the append's `now`.
+- Independent of `metadata` / `eventMetadata`: any combination is allowed.
+- Checked with the metadata checks, before the zero-event fast path: a length that differs
+  from `events.length`, or an entry that is neither a `DateTime` nor `undefined`, fails with
+  `ValidationError` (`operation: "EventStore.append.eventTimestamps"`) before anything is
+  written.
+- Only the event items change. The idempotency sentinel, its TTL and the inline snapshot
+  keep `now`: they record when the append was written.
+- No ordering constraint. `version` orders a stream; timestamps may repeat, run backwards or
+  lie in the future, as imported history can.
+
+### 7.2 `commandHandler`
+
+```ts
+yield* handle(streamId, command, {
+  eventTimestamps: ({ events }) => events.map((event) => event.occurredAt),
+})
+```
+
+- A function of the `Decision`, returning the array. **Plain return only** — no `Effect`
+  form, so no third pair of handler type parameters. The values come from the command or
+  the events; the effectful source of a time, the `Clock`, is already the default.
+- Evaluated after `eventMetadata` and before `additionalItems`, with the same rules: not
+  called on a no-op, re-run on every attempt and on the unverified-snapshot re-decision.
+- A wrong-length or malformed result fails with `ValidationError`
+  (`operation: "EventStore.commandHandler.eventTimestamps"`), not retried. A non-function
+  value is refused before anything is read.
+
+### 7.3 Types
+
+`eventTimestamps` lives on `AppendOptionsBase` and `CommandOptionsBase`, outside the
+exclusive metadata union. No new type parameters; no error union widens.
+
+### 7.4 Out of scope
+
+- **Returning metadata or timestamps from `append` / the handler.** `AppendResult.events`
+  and `CommandHandlerResult.events` stay domain events; the caller already holds what it
+  passed.
 
 ---
 
@@ -295,6 +344,13 @@ rather keep this PR to #144, it splits cleanly into its own issue.
   handler; an `E3` failure surfaces and is not retried
 - §6: an item over 400 KB → `ValidationError` before send, for both `append` and
   `Transaction.transactWrite`
+- §7 `append`: entry `i` written as item `i`'s `timestamp` (ISO, UTC); `undefined` keeps
+  `now`; a zoned `DateTime` is stored as its UTC instant; length mismatch and a non-`DateTime`
+  entry → `ValidationError`, no AWS call, also on a zero-event append; combined with
+  `eventMetadata`; sentinel and inline snapshot keep `now`; out-of-order timestamps accepted
+- §7 `commandHandler`: receives the `Decision`; runs after `eventMetadata` and before
+  `additionalItems`; not called on a no-op; re-run on retry; bad result → `ValidationError`
+  named for the handler, not retried; non-function refused before read
 
 ### 8.2 Connected (`test/connected.test.ts`, mandatory per CLAUDE.md)
 
@@ -303,6 +359,8 @@ rather keep this PR to #144, it splits cleanly into its own issue.
 - `commandHandler` with a function-form `eventMetadata` against DynamoDB Local, read back
 - an append whose shared-list equivalent would exceed 4 MB succeeds with `eventMetadata`
   (the motivating size scenario, end to end)
+- §7: an imported append with `eventTimestamps` reads back each event's own `timestamp`;
+  the same through `commandHandler`
 
 ### 8.3 Types (`test/EventStore.types.test.ts`)
 
@@ -312,6 +370,9 @@ rather keep this PR to #144, it splits cleanly into its own issue.
   `additionalItems` with a *different* error type (`E2`) — both appear in the handler's
   error channel
 - idempotent handler still requires `commandId` with `eventMetadata` present
+- §7: `eventTimestamps` entries typed `DateTime.DateTime | undefined`; accepted alongside
+  either metadata option; the handler function must return an array (an `Effect` is a type
+  error)
 
 ---
 
@@ -346,6 +407,8 @@ otherwise `1.26.0`.
   - `handler-event-metadata` — `commandHandler` minting an id per event, plus the
     deterministic-id note from §4.3.
   The step ends with a short "why not pack a list into `metadata`" note (the N² cost).
+  A further region, `event-timestamps`, shows an import carrying each event's original
+  time with `eventTimestamps` (§7), in place of pinning the clock per chunk.
 - **API reference** (`reference/api-reference.mdx`): the `append` row and the
   `commandHandler` per-call options gain `eventMetadata`; mutual exclusivity stated.
 - **JSDoc**: `AppendOptions.metadata` loses "Per-append" as its only description and points
