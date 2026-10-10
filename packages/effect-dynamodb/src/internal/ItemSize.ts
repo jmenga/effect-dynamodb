@@ -1,7 +1,9 @@
 /**
  * @internal Item sizes by DynamoDB's item-size rules, shared by `Batch.write`'s
- * versioned transactions (chunked by size) and the client-side size check of
- * `Transaction.transactWrite` and `EventStore.append` (#133).
+ * versioned transactions (chunked by size) and the failure-time diagnosis of
+ * DynamoDB's write limits (`internal/WriteDiagnosis.ts`, #144) — which
+ * measures a rejected request to name the item at fault. Nothing here refuses
+ * a write: DynamoDB's own limits are never pre-checked.
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"

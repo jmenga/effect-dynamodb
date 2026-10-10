@@ -9610,7 +9610,7 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
   // Large commands — stepped commands, one atomic append each
   // -------------------------------------------------------------------------
 
-  it.effect("an append over the item or size limit fails before anything is written", () =>
+  it.effect("an append over the item or size limit is rejected whole: nothing is written", () =>
     Effect.gen(function* () {
       const key = { accountId: "large-1" }
       const error = yield* EsPlain.append(key, esLatDeposits(250), 0).pipe(Effect.flip)
@@ -9624,10 +9624,15 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
       const events = Array.from({ length: 30 }, () => new EsCmdDeposited({ amount: 1 }))
       const refused = yield* EsPlainMeta.append(key, events, 0, { metadata }).pipe(Effect.flip)
       expect(refused._tag).toBe("ValidationError")
+      expect(String((refused as ValidationError).cause)).toContain("4194304 bytes (4 MB)")
       expect(yield* EsPlainMeta.currentVersion(key, { consistentRead: true })).toBe(0)
+      // Not pre-checked (#144): each was sent once and rejected by DynamoDB —
+      // never retried — and nothing was written.
       expect(
-        esLatLog.filter((r) => r.op === "transactWriteItems" && r.pk?.endsWith("#large-1")),
-      ).toEqual([])
+        esLatLog
+          .filter((r) => r.op === "transactWriteItems" && r.pk?.endsWith("#large-1"))
+          .map((r) => r.items?.length),
+      ).toEqual([250, 30])
     }).pipe(provideEsLat),
   )
 
@@ -9672,7 +9677,8 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
         const transacts = esLatRequests("bulk", accountId).filter(
           (r) => r.op === "transactWriteItems",
         )
-        expect(transacts.map((t) => t.items?.length)).toEqual([93, 94, 74])
+        // The 253-item decision was sent and rejected whole by DynamoDB (#144).
+        expect(transacts.map((t) => t.items?.length)).toEqual([253, 93, 94, 74])
 
         // A redelivered step — its response lost — is a duplicate, not a conflict.
         const replay = yield* handle(key, 70, {
@@ -10299,6 +10305,51 @@ const esMetaDecider: EventStore.Decider<{ readonly entries: number }, number, Es
   evolve: (state) => ({ entries: state.entries + 1 }),
 }
 
+/**
+ * Streams for the write limits DynamoDB enforces (#144 §6): a free-text state
+ * snapshotted inline and after the append, and a stream index whose key runs
+ * past DynamoDB's 1024-byte sort-key limit. They share the suite's table (and
+ * its `lsi1`).
+ */
+const EsMetaNoteState = Schema.Struct({ note: Schema.String })
+
+const EsMetaInline = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "InlineNote",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: EsMetaNoteState, mode: "inline" },
+})
+
+const EsMetaSnapped = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "SnappedNote",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: EsMetaNoteState },
+})
+
+const EsMetaLongKey = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "LongKey",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  indexes: {
+    byEntry: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      // Entry 2's key is 1100 bytes: over DynamoDB's sort-key limit.
+      key: (event) => (event.entry === 2 ? "k".repeat(1100) : `ENTRY#${event.entry}`),
+    },
+  },
+})
+
+/** The source of an import's original times, for `eventTimestamps`' Effect form. */
+class EsMetaSourceClock extends Context.Service<
+  EsMetaSourceClock,
+  { readonly originalTime: (entry: number) => Effect.Effect<DateTime.DateTime | undefined> }
+>()("test/EsMetaSourceClock") {}
+
 /** Every `transactWriteItems` this suite sends — proves a refused append sent nothing. */
 let esMetaTransactWrites = 0
 
@@ -10552,7 +10603,8 @@ describeConnected("EventStore per-event metadata (#144)", () => {
       const packedKey = { ledgerId: "import-packed" }
       const key = { ledgerId: "import-1" }
 
-      // The packed workaround genuinely exceeds 4 MB: refused, nothing sent.
+      // The packed workaround genuinely exceeds 4 MB: rejected by DynamoDB
+      // (#144), diagnosed, and nothing written.
       const before = esMetaTransactWrites
       const error = yield* EsMetaImport.append(packedKey, events, 0, {
         metadata: { origins },
@@ -10560,17 +10612,17 @@ describeConnected("EventStore per-event metadata (#144)", () => {
       expect(error._tag).toBe("ValidationError")
       const failure = error as ValidationError
       expect(failure.operation).toBe("EventStore.append")
-      expect(String(failure.cause)).toContain(`the transaction's ${count} items total at least`)
-      expect(String(failure.cause)).toContain("over its limit of 4194304 bytes (4 MB)")
-      expect(esMetaTransactWrites).toBe(before)
-      expect(yield* EsMetaImport.read(packedKey)).toHaveLength(0)
+      expect(String(failure.cause)).toContain("its limit of 4194304 bytes (4 MB)")
+      expect(String(failure.cause)).toMatch(/The largest: the event at version \d+/)
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaImport.read(packedKey, { consistentRead: true })).toHaveLength(0)
 
       // The same import with one origin per event commits in one transaction.
       const result = yield* EsMetaImport.append(key, events, 0, {
         eventMetadata: origins.map((origin) => ({ origins: [origin] })),
       })
       expect(result.version).toBe(count)
-      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(esMetaTransactWrites).toBe(before + 2)
 
       const read = yield* EsMetaImport.read(key, { consistentRead: true })
       expect(read).toHaveLength(count)
@@ -10581,7 +10633,7 @@ describeConnected("EventStore per-event metadata (#144)", () => {
     }).pipe(provideEsMeta),
   )
 
-  it.effect("#144 an event item over 400 KB is refused before anything is sent", () =>
+  it.effect("#144 an event item over 400 KB is rejected by DynamoDB and named", () =>
     Effect.gen(function* () {
       const key = { ledgerId: "big-1" }
       const before = esMetaTransactWrites
@@ -10604,18 +10656,142 @@ describeConnected("EventStore per-event metadata (#144)", () => {
       expect(String(failure.cause)).toContain(
         "the item of the event at version 2, at pk=$es-meta#v1#import#big-1",
       )
-      expect(String(failure.cause)).toContain("over its limit of 409600 bytes (400 KB)")
-      expect(esMetaTransactWrites).toBe(before)
+      expect(String(failure.cause)).toContain("409600 bytes (400 KB)")
+      // Sent once (#144) and rejected whole: nothing written.
+      expect(esMetaTransactWrites).toBe(before + 1)
       expect(yield* EsMetaImport.read(key, { consistentRead: true })).toHaveLength(0)
 
-      // An item under the limit is accepted by DynamoDB: the check is a lower
-      // bound and refuses nothing DynamoDB would take.
+      // An item under the limit is accepted by DynamoDB.
       const near = yield* EsMetaImport.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0, {
         eventMetadata: [{ origins: [{ sourceId: "near", payload: "y".repeat(380_000) }] }],
       })
       expect(near.version).toBe(1)
       const stored = yield* EsMetaImport.read(key, { consistentRead: true })
       expect(stored[0]!.metadata?.origins[0]?.payload).toHaveLength(380_000)
+    }).pipe(provideEsMeta),
+  )
+
+  // -------------------------------------------------------------------------
+  // Write limits DynamoDB enforces (#144 §6): sent, rejected whole by
+  // DynamoDB, confirmed against the request and named. Nothing pre-checked.
+  // -------------------------------------------------------------------------
+
+  it.effect("#144 an append of 101 events is AppendTooLarge, from DynamoDB's rejection", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-101" }
+      const events = Array.from(
+        { length: 101 },
+        (_, i) => new EsMetaPosted({ entry: i + 1, amount: 1 }),
+      )
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(key, events, 0).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AppendTooLarge")
+      const overflow = error as AppendTooLarge
+      expect(overflow.streamName).toBe("Import")
+      expect(overflow.streamId).toBe("lim-101")
+      expect(overflow.count).toBe(101)
+      expect(overflow.limit).toBe(100)
+      // DynamoDB's own rejection is kept as the cause.
+      expect(String((overflow.cause as { cause: unknown }).cause)).toContain(
+        "length less than or equal to 100",
+      )
+      // Sent once and rejected whole: nothing written.
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaImport.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // 100 events are within DynamoDB's limit and commit.
+      const ok = yield* EsMetaImport.append(key, events.slice(0, 100), 0)
+      expect(ok.version).toBe(100)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a commandHandler decision of 101 events is AppendTooLarge, not retried", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-cmd-101" }
+      const before = esMetaTransactWrites
+      const error = yield* EventStore.commandHandler(esMetaDecider, EsMetaLedger)(key, 101).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("AppendTooLarge")
+      expect((error as AppendTooLarge).count).toBe(101)
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaLedger.currentVersion(key, { consistentRead: true })).toBe(0)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an oversized inline snapshot is named in the rejected append", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-inline" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaInline.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 })],
+        0,
+        { snapshot: { note: "x".repeat(410_000) } },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      const text = String(failure.cause)
+      expect(text).toContain(
+        "the item of the inline snapshot, at pk=$es-meta#v1#inlinenote#lim-inline",
+      )
+      expect(text).toContain("409600 bytes (400 KB)")
+      expect(text).toContain("Nothing was written.")
+      expect(esMetaTransactWrites).toBe(before + 1)
+      // The event was in the same transaction: not written either.
+      expect(yield* EsMetaInline.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // A snapshot within the limit commits with its event.
+      const ok = yield* EsMetaInline.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0, {
+        snapshot: { note: "y".repeat(1_000) },
+      })
+      expect(ok.version).toBe(1)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an oversized writeSnapshot is named from DynamoDB's PutItem rejection", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-snap" }
+      yield* EsMetaSnapped.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0)
+
+      const error = yield* EsMetaSnapped.writeSnapshot(key, { note: "x".repeat(410_000) }, 1).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.writeSnapshot")
+      expect(String(failure.cause)).toContain(
+        "the item of the snapshot, at pk=$es-meta#v1#snappednote#lim-snap",
+      )
+      expect(Option.isNone(yield* EsMetaSnapped.readSnapshot(key))).toBe(true)
+
+      // Within the limit, the snapshot is written.
+      yield* EsMetaSnapped.writeSnapshot(key, { note: "y".repeat(1_000) }, 1)
+      expect(Option.isSome(yield* EsMetaSnapped.readSnapshot(key))).toBe(true)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a stream-index key over 1024 bytes names the index and the event", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-key" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaLongKey.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 }), new EsMetaPosted({ entry: 2, amount: 2 })],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append.indexes")
+      const text = String(failure.cause)
+      expect(text).toContain('The key of index "byEntry" for the event at version 2 is 1100 bytes')
+      expect(text).toContain("1024-byte limit")
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaLongKey.read(key, { consistentRead: true })).toHaveLength(0)
     }).pipe(provideEsMeta),
   )
 
@@ -10816,6 +10992,78 @@ describeConnected("EventStore per-event metadata (#144)", () => {
         [2, "tm-2", "2019-04-30T09:00:00.000Z"],
         [3, "tm-3", "2019-05-03T10:00:00.000Z"],
         [4, "tm-4", esMetaClockIso],
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler's eventTimestamps Effect form uses a service end to end", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-effect-1" }
+      // The source's own times, by entry number; entry 2 has none.
+      const sourceTimes: Record<number, string> = {
+        1: "2019-05-03T08:00:00.000Z",
+        3: "2019-05-01T08:00:00.000Z",
+        4: "2019-04-30T08:00:00.000Z",
+      }
+      const sourceClock = Layer.succeed(EsMetaSourceClock, {
+        originalTime: (entry) =>
+          Effect.succeed(
+            sourceTimes[entry] === undefined ? undefined : esMetaAt(sourceTimes[entry]),
+          ),
+      })
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const decided: Array<number> = []
+      const eventTimestamps = (
+        decision: EventStore.Decision<{ readonly entries: number }, EsMetaEvent>,
+      ) =>
+        Effect.gen(function* () {
+          decided.push(decision.version)
+          const source = yield* EsMetaSourceClock
+          return yield* Effect.forEach(decision.events, (event) => source.originalTime(event.entry))
+        })
+
+      const first = yield* handle(key, 3, { eventTimestamps }).pipe(Effect.provide(sourceClock))
+      expect(first.version).toBe(3)
+      // Beside the Effect form of eventMetadata, on the same decision.
+      const second = yield* handle(key, 1, {
+        eventTimestamps,
+        eventMetadata: ({ events }) =>
+          Effect.succeed(
+            events.map((event) => ({
+              eventId: `fx-${event.entry}`,
+              occurredAt: esMetaAt("2020-01-01T00:00:00.000Z"),
+            })),
+          ),
+      }).pipe(Effect.provide(sourceClock))
+      expect(second.version).toBe(4)
+      expect(decided).toEqual([0, 3])
+
+      // A failure in the Effect surfaces as is, and nothing is written.
+      const before = esMetaTransactWrites
+      const failed = yield* handle(key, 1, {
+        eventTimestamps: () => Effect.fail("source unavailable" as const),
+      }).pipe(Effect.flip)
+      expect(failed).toBe("source unavailable")
+      expect(esMetaTransactWrites).toBe(before)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, "2019-04-30T08:00:00.000Z"],
+      ])
+      expect(events[3]!.metadata?.eventId).toBe("fx-4")
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-effect-1")
+      expect(raw.map((item) => item.timestamp)).toEqual(events.map((event) => event.timestamp))
+      // The index read carries the same per-event timestamps.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => [event.data.entry, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, "2019-04-30T08:00:00.000Z"],
       ])
     }).pipe(provideEsMeta),
   )
@@ -20590,5 +20838,220 @@ describeConnected("#133 — path operations on index composites and unique field
         expect((yield* rawItem(entityType, id)).label).toEqual({ S: "mine" })
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+})
+
+// ===========================================================================
+// Write limits diagnosed from DynamoDB's rejection (#144 §6) — one real
+// rejection per shape, pinning DynamoDB Local's wording.
+// ===========================================================================
+
+const limSchema = DynamoSchema.make({ name: "lim", version: 1 })
+const limTableName = `lim-${Date.now()}`
+
+class LimDoc extends Schema.Class<LimDoc>("LimDoc")({
+  docId: Schema.String,
+  tag: Schema.String,
+  body: Schema.String,
+  extra: Schema.optional(Schema.String),
+}) {}
+
+const LimDocs = Entity.make({
+  model: LimDoc,
+  entityType: "LimDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  indexes: {
+    byTag: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: [] },
+      sk: { field: "gsi1sk", composite: ["tag"] },
+    },
+  },
+})
+
+const LimRetainDocs = Entity.make({
+  model: LimDoc,
+  entityType: "LimRetainDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+
+const LimTable = Table.make({ schema: limSchema, entities: { LimDocs, LimRetainDocs } })
+const provideLim = Effect.provide(
+  Layer.mergeAll(ClientLayer, LimTable.layer({ name: limTableName })),
+)
+
+describeConnected("write limits diagnosed from DynamoDB's rejection (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: limTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            { AttributeName: "gsi1pk", AttributeType: "S" },
+            { AttributeName: "gsi1sk", AttributeType: "S" },
+          ],
+          GlobalSecondaryIndexes: [
+            {
+              IndexName: "gsi1",
+              KeySchema: [
+                { AttributeName: "gsi1pk", KeyType: "HASH" },
+                { AttributeName: "gsi1sk", KeyType: "RANGE" },
+              ],
+              Projection: { ProjectionType: "ALL" },
+            },
+          ],
+        })
+      }).pipe(provideLim, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: limTableName })
+      }).pipe(
+        provideLim,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  const big = (n: number) => "x".repeat(n)
+  const absent = (docId: string) =>
+    LimDocs.get({ docId })
+      .asEffect()
+      .pipe(
+        Effect.as(false),
+        Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
+      )
+
+  it.effect("#1 a put over 400 KB is a ValidationError naming entity and key", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "big-put", tag: "t", body: big(410_000) })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.entityType).toBe("LimDoc")
+      expect(String(failure.cause)).toContain("the item of the LimDoc put, at pk=$lim#v1#limdoc#")
+      expect(yield* absent("big-put")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#2 an update growing the item past 400 KB is a ValidationError", () =>
+    Effect.gen(function* () {
+      yield* LimDocs.put({ docId: "grow", tag: "t", body: big(300_000) }).asEffect()
+      const error = yield* LimDocs.update({ docId: "grow" })
+        .pipe(Entity.set({ extra: big(150_000) }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of the LimDoc update, at pk=$lim#v1#limdoc#",
+      )
+      const stored = yield* LimDocs.get({ docId: "grow" }).asEffect()
+      expect(stored.extra).toBeUndefined()
+    }).pipe(provideLim),
+  )
+
+  it.effect("#3 transactWrite with one oversized Put names that operation", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "tx-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: "tx-big", tag: "t", body: big(410_000) }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of operation 1 (LimDoc), at pk=",
+      )
+      expect(yield* absent("tx-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#4 an entity transaction whose Update grows too large is named by index", () =>
+    Effect.gen(function* () {
+      yield* LimRetainDocs.put({ docId: "retain-grow", tag: "t", body: big(300_000) }).asEffect()
+      const error = yield* LimRetainDocs.update({ docId: "retain-grow" })
+        .pipe(Entity.set({ extra: big(150_000) }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).entityType).toBe("LimRetainDoc")
+      expect(String((error as ValidationError).cause)).toContain("at pk=$lim#v1#limretaindoc#")
+      const stored = yield* LimRetainDocs.get({ docId: "retain-grow" }).asEffect()
+      expect(stored.extra).toBeUndefined()
+    }).pipe(provideLim),
+  )
+
+  it.effect("#5 Batch.write with an oversized item names the item", () =>
+    Effect.gen(function* () {
+      const error = yield* Batch.write([
+        LimDocs.put({ docId: "batch-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: "batch-big", tag: "t", body: big(410_000) }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of the put of LimDoc, at pk=$lim#v1#limdoc#",
+      )
+      expect(yield* absent("batch-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#6 transactWrite of 101 items is DynamoDB's rejection, confirmed by count", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite(
+        Array.from({ length: 101 }, (_, i) =>
+          LimDocs.put({ docId: `tx101-${i}`, tag: "t", body: "s" }),
+        ),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      const text = String((error as { cause: unknown }).cause)
+      expect(text).toContain("101 operation(s) expanded to 101 items")
+      expect(yield* absent("tx101-0")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#7 transactWrite over 4 MB names the largest items", () =>
+    Effect.gen(function* () {
+      // 12 items of ~380 KB: ~4.5 MB, each within 400 KB.
+      const error = yield* Transaction.transactWrite(
+        Array.from({ length: 12 }, (_, i) =>
+          LimDocs.put({ docId: `tx4mb-${i}`, tag: "t", body: big(380_000) }),
+        ),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("transactWrite")
+      expect(failure.entityType).toBe("LimDoc")
+      const text = String(failure.cause)
+      expect(text).toContain("4194304 bytes (4 MB)")
+      expect(text).toMatch(/\(it reported \d+ bytes\)/)
+      expect(text).toMatch(/The largest: operation \d+ \(LimDoc\), at pk=\$lim#v1#limdoc#/)
+      expect(yield* absent("tx4mb-0")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#8 a sort key over 1024 bytes names the attribute", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "long-key", tag: "k".repeat(1100), body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('the sort key "gsi1sk" of the LimDoc put')
+      expect(text).toContain("1024-byte limit")
+      expect(yield* absent("long-key")).toBe(true)
+    }).pipe(provideLim),
   )
 })

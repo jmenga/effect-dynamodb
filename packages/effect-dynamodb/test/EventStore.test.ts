@@ -27,18 +27,28 @@ import {
   Schema,
   SchemaGetter,
 } from "effect"
+import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "../src/internal/ItemSize.js"
 import { refuseRepeatedItems, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_ITEM_SIZE_UPDATE,
+  DDB_SORT_KEY_AWS,
+  DDB_SORT_KEY_LOCAL,
+  DDB_TOO_MANY_ITEMS,
+  ddbPayloadTooLarge,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test setup — Schema, Table, Event classes
@@ -111,9 +121,29 @@ const AuditRecords = Entity.make({
   generatedId: { field: "auditId" },
 })
 
+// #144 — an entity whose own GSI writes `gsi1sk`, the attribute a stream index
+// can also use (single-table designs share physical index attributes).
+class Label extends Schema.Class<Label>("Label")({
+  labelId: Schema.String,
+  text: Schema.String,
+}) {}
+
+const Labels = Entity.make({
+  model: Label,
+  entityType: "Label",
+  primaryKey: { pk: { field: "pk", composite: ["labelId"] }, sk: { field: "sk", composite: [] } },
+  indexes: {
+    byText: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["labelId"] },
+      sk: { field: "gsi1sk", composite: ["text"] },
+    },
+  },
+})
+
 const EventsTable = Table.make({
   schema: AppSchema,
-  entities: { Watermarks, StatusProjection, Registrations, AuditRecords },
+  entities: { Watermarks, StatusProjection, Registrations, AuditRecords, Labels },
 })
 
 class MatchStarted extends Schema.Class<MatchStarted>("MatchStarted")({
@@ -664,8 +694,9 @@ describe("EventStore", () => {
         (_, i) => new InningsCompleted({ innings: i + 1, runs: 100, wickets: 5 }),
       )
 
-    it.effect("fails with AppendTooLarge before any client call at > limit", () =>
+    it.effect("fails with AppendTooLarge when DynamoDB rejects over 100 items (#144)", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(101), 0).pipe(
           Effect.flip,
         )
@@ -676,7 +707,60 @@ describe("EventStore", () => {
         expect(err.streamId).toBe("m-1")
         expect(err.count).toBe(101)
         expect(err.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        // DynamoDB's error, as the client reported it, is the cause.
+        expect((err.cause as { _tag: string })._tag).toBe("DynamoError")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a count rejection the request does not confirm passes through (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(3), 0).pipe(
+          Effect.flip,
+        )
+        expect(result._tag).toBe("DynamoError")
+        expect((result as { cause: unknown }).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognised ValidationException passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Some other validation problem")
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(3), 0).pipe(
+          Effect.flip,
+        )
+        expect(result._tag).toBe("DynamoError")
+        expect((result as { cause: unknown }).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an oversized event is named from DynamoDB's request-wide rejection (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const big = new MatchStarted({
+          venue: "x".repeat(410_000),
+          homeTeam: "AUS",
+          awayTeam: "ENG",
+        })
+        const result = yield* MatchEvents.append(
+          { matchId: "m-1" },
+          [...manyEvents(2), big],
+          0,
+        ).pipe(Effect.flip)
+
+        expect(result._tag).toBe("ValidationError")
+        const failure = result as ValidationError
+        expect(failure.operation).toBe("EventStore.append")
+        const text = String(failure.cause)
+        expect(text).toContain("the item of the event at version 3, at pk=$cricket#v1#match#m-1")
+        expect(text).toContain("409600 bytes (400 KB)")
+        expect(text).toContain("Nothing was written.")
+        expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -697,6 +781,7 @@ describe("EventStore", () => {
       "ConditionCheck counts toward the limit: 100 events at expectedVersion > 0 fails",
       () =>
         Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
           const result = yield* MatchEvents.append({ matchId: "m-1" }, manyEvents(100), 3).pipe(
             Effect.flip,
           )
@@ -705,7 +790,7 @@ describe("EventStore", () => {
           const err = result as AppendTooLarge
           expect(err.count).toBe(101)
           expect(err.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
         }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -724,6 +809,7 @@ describe("EventStore", () => {
 
     it.effect("joins composite stream ids in the AppendTooLarge error", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const CompoundStream = EventStore.makeStream({
           table: EventsTable,
           streamName: "Team",
@@ -1054,8 +1140,10 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("refuses an append whose items exceed DynamoDB's 4 MB, before writing (#133)", () =>
+    it.effect("an append over DynamoDB's 4 MB is diagnosed, naming the largest items (#144)", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(ddbPayloadTooLarge(4_400_000))
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
         const big = "x".repeat(380_000)
         const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
           additionalItems: Array.from({ length: 6 }, (_, i) =>
@@ -1063,9 +1151,46 @@ describe("EventStore", () => {
           ),
         }).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
-        expect((error as ValidationError).entityType).toBe("Registration")
-        expect(String((error as ValidationError).cause)).toContain("4194304 bytes (4 MB)")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("Registration")
+        expect(failure.operation).toBe("EventStore.append")
+        expect(String(failure.cause)).toContain("4194304 bytes (4 MB)")
+        expect(String(failure.cause)).toMatch(/The largest: operation \d \(Registration/)
+        expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an additional item's cancellation reason for its size is named (#144)", () =>
+      Effect.gen(function* () {
+        // [event put, additional put]: the additional item's reason is a
+        // ValidationError — never read as a conflict or a condition failure.
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE_UPDATE },
+          ]),
+        )
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 1 })],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("operation 0 (")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a conflict beside a size reason is still the conflict (#144)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+          ]),
+        )
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Watermarks.put({ writerId: "ingest-1", lastSeq: 1 })],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("VersionConflict")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1265,28 +1390,32 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("fails with AppendTooLarge past the 100-item cap, without calling AWS", () =>
-      Effect.gen(function* () {
-        const events = Array.from({ length: 99 }, () => startMatch())
+    it.effect(
+      "fails with AppendTooLarge past the 100-item cap, from DynamoDB's rejection (#144)",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
+          const events = Array.from({ length: 99 }, () => startMatch())
 
-        const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, {
-          additionalItems: [
-            Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
-            Watermarks.put({ writerId: "ingest-2", lastSeq: 2 }),
-          ],
-        }).pipe(Effect.flip)
+          const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, {
+            additionalItems: [
+              Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
+              Watermarks.put({ writerId: "ingest-2", lastSeq: 2 }),
+            ],
+          }).pipe(Effect.flip)
 
-        expect(error._tag).toBe("AppendTooLarge")
-        const overflow = error as AppendTooLarge
-        expect(overflow.streamName).toBe("Match")
-        expect(overflow.count).toBe(101)
-        expect(overflow.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
-      }).pipe(Effect.provide(TestLayer)),
+          expect(error._tag).toBe("AppendTooLarge")
+          const overflow = error as AppendTooLarge
+          expect(overflow.streamName).toBe("Match")
+          expect(overflow.count).toBe(101)
+          expect(overflow.limit).toBe(TRANSACT_WRITE_ITEMS_LIMIT)
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("counts the idempotency sentinel against the cap", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const events = Array.from({ length: 100 }, () => startMatch())
 
         const error = yield* MatchEvents.append({ matchId: "m-1" }, events, 0, {
@@ -1300,6 +1429,7 @@ describe("EventStore", () => {
 
     it.effect("counts the version-contiguity ConditionCheck against the cap", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         // 99 events + 1 additional item = 100, which fits at expectedVersion 0.
         // At expectedVersion > 0 the contiguity ConditionCheck is the 101st item.
         const events = Array.from({ length: 99 }, () => startMatch())
@@ -1311,7 +1441,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("AppendTooLarge")
         expect((error as AppendTooLarge).count).toBe(101)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1540,6 +1670,7 @@ describe("EventStore", () => {
 
     it.effect("AppendTooLarge counts the EXPANDED item total", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         // 34 registration ops expand to 102 items; unexpanded they would pass.
         const additionalItems = Array.from({ length: 34 }, (_, i) =>
           Registrations.put({ regId: `r-${i}`, code: `C${i}` }),
@@ -1551,7 +1682,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("AppendTooLarge")
         expect((error as AppendTooLarge).count).toBe(102)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1786,6 +1917,72 @@ describe("EventStore", () => {
         expect(result.version).toBe(1)
         expect(result.events).toHaveLength(1)
         expect(result.events[0]).toBeInstanceOf(MatchStarted)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "an oversized decided event is named from DynamoDB's rejection, not retried (#144)",
+      () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValueOnce({ Items: [] })
+          const rejection = awsValidationException(DDB_ITEM_SIZE)
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+
+          const error = yield* handleMatch(
+            { matchId: "m-1" },
+            { _tag: "StartMatch", venue: "x".repeat(410_000), homeTeam: "AUS", awayTeam: "ENG" },
+          ).pipe(Effect.flip)
+
+          expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.operation).toBe("EventStore.append")
+          expect(String(failure.cause)).toContain(
+            "the item of the event at version 1, at pk=$cricket#v1#match#m-1",
+          )
+          expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("DynamoDB's 101-item rejection of a decision is AppendTooLarge (#144)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
+        const flood: EventStore.Decider<MatchState, MatchCommand, MatchEvent> = {
+          ...matchDecider,
+          decide: () =>
+            Effect.succeed(
+              Array.from(
+                { length: 101 },
+                (_, i) => new InningsCompleted({ innings: i + 1, runs: 1, wickets: 1 }),
+              ),
+            ),
+        }
+        const error = yield* EventStore.commandHandler(flood, MatchEvents)(
+          { matchId: "m-1" },
+          { _tag: "CompleteInnings", innings: 1, runs: 1, wickets: 1 },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AppendTooLarge")
+        expect((error as AppendTooLarge).count).toBe(101)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognised rejection of a decision passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [] })
+        const rejection = awsValidationException("Some other validation problem")
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+
+        const error = yield* handleMatch(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DynamoError")
+        expect((error as { cause: unknown }).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2638,6 +2835,41 @@ describe("EventStore", () => {
         ).pipe(Effect.flip)
 
         expect(error._tag).toBe("DynamoError")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an oversized snapshot is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockPutItem.mockRejectedValueOnce(rejection)
+
+        const error = yield* SnapshotMatchEvents.writeSnapshot(
+          { matchId: "m-1" },
+          { status: "pending", innings: [] },
+          1,
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("EventStore.writeSnapshot")
+        expect(String(failure.cause)).toContain("the item of the snapshot, at pk=")
+        expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognised snapshot rejection passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Some other validation problem")
+        mockPutItem.mockRejectedValueOnce(rejection)
+
+        const error = yield* SnapshotMatchEvents.writeSnapshot(
+          { matchId: "m-1" },
+          { status: "pending", innings: [] },
+          1,
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DynamoError")
+        expect((error as { cause: unknown }).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4548,6 +4780,7 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
 
     it.effect("counts the snapshot towards the item limit", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const error = yield* InlineMatchEvents.append(
           { matchId: "m-1" },
           Array.from({ length: 99 }, (_, i) => innings(i + 1)),
@@ -4559,7 +4792,26 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         ).pipe(Effect.flip)
         expect(error._tag).toBe("AppendTooLarge")
         expect((error as AppendTooLarge).count).toBe(101)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a size reason at the snapshot's position names the inline snapshot (#144)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+          ]),
+        )
+        const error = yield* InlineMatchEvents.append({ matchId: "m-1" }, [started()], 0, {
+          snapshot: { status: "in-progress", innings: [] },
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          "the item of the inline snapshot, at pk=$cricket#v1#inlinematch#m-1",
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5720,11 +5972,11 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("counts the index attributes towards the 4 MB check", () =>
+    it.effect("the index attributes count in a diagnosed 4 MB rejection", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-        // A 1000-byte key on each of 100 events: alone it adds ~100 KB, which
-        // tips a transaction sized just under 4 MB without the keys over it.
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsValidationException(ddbPayloadTooLarge(4_300_000)),
+        )
         const big = (version: number) => `K${pad(version)}${"x".repeat(995)}`
         const Heavy = EventStore.makeStream({
           table: EventsTable,
@@ -5733,29 +5985,20 @@ describe("EventStore stream indexes (#140)", () => {
           streamId: { composite: ["matchId"] },
           indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: (_, version) => big(version) } },
         })
-        const Light = EventStore.makeStream({
-          table: EventsTable,
-          streamName: "Heavy",
-          events: [MatchEnded],
-          streamId: { composite: ["matchId"] },
-        })
-        const events = (length: number) =>
-          Array.from({ length: 99 }, () => new MatchEnded({ result: "r".repeat(length) }))
-        // Calibrate: size the events so the transaction without keys sits
-        // 50 KB under the limit.
-        yield* Light.append({ matchId: "m-1" }, events(40_000), 0)
-        const probe = mockTransactWriteItems.mock.calls[0]![0].TransactItems.reduce(
-          (sum: number, item: Parameters<typeof transactItemBytes>[0]) =>
-            sum + transactItemBytes(item),
+        const error = yield* Heavy.append(
+          { matchId: "m-1" },
+          Array.from({ length: 3 }, () => new MatchEnded({ result: "r" })),
           0,
-        )
-        const length = 40_000 + Math.floor((TRANSACT_WRITE_MAX_BYTES - 50_000 - probe) / 99)
-        yield* Light.append({ matchId: "m-1" }, events(length), 0)
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
-        const error = yield* Heavy.append({ matchId: "m-1" }, events(length), 0).pipe(Effect.flip)
+        ).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("4 MB")
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain("4 MB")
+        // Each event carries its 1000-byte index key: over 1000 bytes each.
+        const sizes = [...text.matchAll(/the event at version \d, at [^(]*\((\d+) bytes\)/g)].map(
+          (match) => Number(match[1]),
+        )
+        expect(sizes).toHaveLength(3)
+        for (const size of sizes) expect(size).toBeGreaterThan(1000)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5772,7 +6015,6 @@ describe("EventStore stream indexes (#140)", () => {
         const cases: ReadonlyArray<[(event: unknown) => unknown, RegExp]> = [
           [() => "", /empty string/],
           [() => 42, /non-empty string/],
-          [() => "x".repeat(1025), /1024-byte/],
           [
             () => {
               throw new Error("boom")
@@ -5787,10 +6029,85 @@ describe("EventStore stream indexes (#140)", () => {
           expect(error._tag).toBe("ValidationError")
           expect(String((error as ValidationError).cause)).toMatch(pattern)
         }
-        // Exactly 1024 bytes is accepted.
+        // Nothing is sent for any of these: the caller's own invariant.
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        // Length is DynamoDB's to judge (#144): a long key is sent.
         mockTransactWriteItems.mockResolvedValue({})
-        yield* withKey(() => "é".repeat(512)).append({ matchId: "m-1" }, [started()], 0)
+        yield* withKey(() => "x".repeat(1025)).append({ matchId: "m-1" }, [started()], 0)
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a key over 1024 bytes is diagnosed from DynamoDB's rejection, naming index and event",
+      () =>
+        Effect.gen(function* () {
+          const Keyed = EventStore.makeStream({
+            table: EventsTable,
+            streamName: "KeyCheck",
+            events: [MatchStarted],
+            streamId: { composite: ["matchId"] },
+            indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: () => "é".repeat(513) } },
+          })
+          for (const message of [DDB_SORT_KEY_LOCAL, DDB_SORT_KEY_AWS]) {
+            const rejection = awsValidationException(message)
+            mockTransactWriteItems.mockRejectedValueOnce(rejection)
+            const error = yield* Keyed.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
+            expect(error._tag).toBe("ValidationError")
+            const failure = error as ValidationError
+            expect(failure.operation).toBe("EventStore.append.indexes")
+            expect(String(failure.cause)).toContain(
+              'The key of index "byKey" for the event at version 1 is 1026 bytes',
+            )
+            expect(String(failure.cause)).toContain("1024-byte limit")
+            expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+          }
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "an additional item's over-long key on a stream index's attribute names the item, not the index",
+      () =>
+        Effect.gen(function* () {
+          const Indexed = EventStore.makeStream({
+            table: EventsTable,
+            streamName: "KeyCheck",
+            events: [MatchStarted],
+            streamId: { composite: ["matchId"] },
+            indexes: {
+              byKey: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", key: () => "k" },
+            },
+          })
+          const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const error = yield* Indexed.append({ matchId: "m-1" }, [started()], 0, {
+            additionalItems: [Labels.put({ labelId: "l-1", text: "t".repeat(1100) })],
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.operation).toBe("EventStore.append")
+          expect(failure.entityType).toBe("Label")
+          const text = String(failure.cause)
+          expect(text).not.toContain('index "byKey"')
+          expect(text).toContain('the sort key "gsi1sk" of operation 0 (Label)')
+          expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a sort-key rejection with every key within 1024 bytes passes through", () =>
+      Effect.gen(function* () {
+        const Keyed = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "KeyCheck",
+          events: [MatchStarted],
+          streamId: { composite: ["matchId"] },
+          indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: () => "é".repeat(512) } },
+        })
+        const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* Keyed.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as { cause: unknown }).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -6368,8 +6685,10 @@ describe("EventStore per-event metadata (#144)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("an event item over 400 KB is refused, naming it, before anything is sent", () =>
+    it.effect("an event item over 400 KB is diagnosed from DynamoDB's rejection, naming it", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
         const big = "x".repeat(410_000)
         const error = yield* Audited.append({ matchId: "m-1" }, [started(), innings(1)], 0, {
           eventMetadata: [meta("e-1"), meta(big)],
@@ -6380,8 +6699,28 @@ describe("EventStore per-event metadata (#144)", () => {
         expect(failure.operation).toBe("EventStore.append")
         expect(failure.entityType).toBe("audited.event")
         expect(String(failure.cause)).toContain("the item of the event at version 2, at pk=")
-        expect(String(failure.cause)).toContain("over its limit of 409600 bytes (400 KB)")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(String(failure.cause)).toContain("409600 bytes (400 KB)")
+        expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the idempotency sentinel and inline snapshot are named by their role", () =>
+      Effect.gen(function* () {
+        // [event, sentinel]: the sentinel's reason is the size failure.
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+          ]),
+        )
+        const error = yield* Audited.append({ matchId: "m-1" }, [started()], 0, {
+          idempotency: { commandId: "cmd-1" },
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          "the idempotency sentinel, at pk=",
+        )
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -7217,6 +7556,350 @@ describe("EventStore per-event metadata (#144)", () => {
           expect(mockTransactWriteItems).not.toHaveBeenCalled()
         }).pipe(Effect.provide(TestLayer)),
       )
+
+      describe("Effect form", () => {
+        /** A service the times come from: the import's source log. */
+        class SourceLog extends Context.Service<
+          SourceLog,
+          { readonly originalTime: (version: number) => Effect.Effect<DateTime.DateTime> }
+        >()("test/SourceLog") {}
+        class LookupFailed extends Data.TaggedError("LookupFailed") {}
+        const sourceLog = Layer.succeed(SourceLog, {
+          originalTime: (version) => Effect.succeed(forVersion(version)),
+        })
+
+        it.effect("may use services; receives the Decision; entry i lands on event i", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [startedItem()] })
+            mockTransactWriteItems.mockResolvedValue({})
+            const seen: Array<EventStore.Decision<MatchState, MatchEvent>> = []
+
+            const result = yield* EventStore.commandHandler(twoEvents, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              {
+                eventTimestamps: (decision) =>
+                  Effect.gen(function* () {
+                    seen.push(decision)
+                    // Evaluated before the append.
+                    expect(mockTransactWriteItems).not.toHaveBeenCalled()
+                    const log = yield* SourceLog
+                    return [yield* log.originalTime(decision.version + 1), undefined]
+                  }),
+              },
+            ).pipe(Effect.provide(sourceLog))
+
+            expect(seen).toHaveLength(1)
+            expect(seen[0]!.version).toBe(1)
+            expect(seen[0]!.events).toHaveLength(2)
+            expect(result.version).toBe(3)
+            const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+            expect(items.map((item) => [item.version, item.timestamp])).toEqual([
+              [2, "2019-05-02T00:00:00.000Z"],
+              [3, clockNow],
+            ])
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("reads the Clock deterministically under TestClock", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [startedItem()] })
+            mockTransactWriteItems.mockResolvedValue({})
+            const frozenMs = Date.UTC(2024, 0, 1)
+            yield* TestClock.setTime(frozenMs)
+            const dayMs = 86_400_000
+
+            yield* EventStore.commandHandler(twoEvents, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              {
+                // Imported history: each event one day further back than the next.
+                eventTimestamps: ({ events }) =>
+                  Effect.map(DateTime.now, (now) =>
+                    events.map((_, i) =>
+                      DateTime.makeUnsafe(
+                        DateTime.toEpochMillis(now) - (events.length - i) * dayMs,
+                      ),
+                    ),
+                  ),
+              },
+            )
+
+            const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+            expect(items.map((item) => item.timestamp)).toEqual([
+              "2023-12-30T00:00:00.000Z",
+              "2023-12-31T00:00:00.000Z",
+            ])
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("runs after eventMetadata and before additionalItems, each to completion", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [startedItem()] })
+            mockTransactWriteItems.mockResolvedValue({})
+            const order: Array<string> = []
+            const step = (name: string) =>
+              Effect.gen(function* () {
+                order.push(`${name}:start`)
+                yield* Effect.yieldNow
+                order.push(`${name}:end`)
+              })
+
+            yield* EventStore.commandHandler(twoEvents, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              {
+                additionalItems: () =>
+                  Effect.as(step("additionalItems"), [
+                    Watermarks.put({ writerId: "proj", lastSeq: 1 }),
+                  ]),
+                eventTimestamps: ({ events }) =>
+                  Effect.as(
+                    step("eventTimestamps"),
+                    events.map(() => forVersion(9)),
+                  ),
+                eventMetadata: ({ events }) =>
+                  Effect.as(
+                    step("eventMetadata"),
+                    events.map((_, i) => meta(`e-${i + 1}`)),
+                  ),
+              },
+            )
+
+            expect(order).toEqual([
+              "eventMetadata:start",
+              "eventMetadata:end",
+              "eventTimestamps:start",
+              "eventTimestamps:end",
+              "additionalItems:start",
+              "additionalItems:end",
+            ])
+            const items = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+            expect(items.map((item) => [item.metadata, item.timestamp])).toEqual([
+              [wireMeta("e-1"), "2019-05-09T00:00:00.000Z"],
+              [wireMeta("e-2"), "2019-05-09T00:00:00.000Z"],
+            ])
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect(
+          "an E4 failure surfaces as is, is not retried, and additionalItems is not run",
+          () =>
+            Effect.gen(function* () {
+              mockQuery.mockResolvedValue({ Items: [startedItem()] })
+              let calls = 0
+              const additionalItems = vi.fn(() => [
+                Watermarks.put({ writerId: "proj", lastSeq: 1 }),
+              ])
+
+              const error = yield* EventStore.commandHandler(matchDecider, Audited, { retry: 3 })(
+                { matchId: "m-1" },
+                completeInnings,
+                {
+                  additionalItems,
+                  eventTimestamps: () => {
+                    calls++
+                    return Effect.fail(new LookupFailed())
+                  },
+                },
+              ).pipe(Effect.flip)
+
+              expect(error).toBeInstanceOf(LookupFailed)
+              expect(calls).toBe(1)
+              expect(additionalItems).not.toHaveBeenCalled()
+              expect(mockQuery).toHaveBeenCalledOnce()
+              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+            }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("is not run when eventMetadata's effect fails", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [startedItem()] })
+            let ran = false
+
+            const error = yield* EventStore.commandHandler(matchDecider, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              {
+                eventMetadata: () => Effect.fail(new LookupFailed()),
+                eventTimestamps: ({ events }) =>
+                  Effect.sync(() => {
+                    ran = true
+                    return events.map(() => forVersion(2))
+                  }),
+              },
+            ).pipe(Effect.flip)
+
+            expect(error).toBeInstanceOf(LookupFailed)
+            expect(ran).toBe(false)
+            expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect(
+          "a bad result fails with ValidationError named for the handler, not retried",
+          () =>
+            Effect.gen(function* () {
+              mockQuery.mockResolvedValue({ Items: [startedItem()] })
+              for (const [returned, cause] of [
+                [[forVersion(2)], "returned 1 entries for the decision's 2 events"],
+                [undefined, "returned no entries for the decision's 2 events"],
+                [
+                  [forVersion(2), new Date(0)],
+                  "eventTimestamps[1] is not a DateTime (received a Date",
+                ],
+              ] as const) {
+                let runs = 0
+                const derive = () =>
+                  Effect.sync(() => {
+                    runs++
+                    return returned
+                  })
+
+                const error = yield* EventStore.commandHandler(twoEvents, Audited, { retry: 3 })(
+                  { matchId: "m-1" },
+                  completeInnings,
+                  { eventTimestamps: derive as never },
+                ).pipe(Effect.flip)
+
+                expect(error._tag).toBe("ValidationError")
+                expect((error as ValidationError).operation).toBe(
+                  "EventStore.commandHandler.eventTimestamps",
+                )
+                expect(String((error as ValidationError).cause)).toContain(cause)
+                // Not retried.
+                expect(runs).toBe(1)
+              }
+              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+            }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("is not run for a no-op decision", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [] })
+            let ran = false
+            const derive = vi.fn(() =>
+              Effect.sync(() => {
+                ran = true
+                return [forVersion(1)]
+              }),
+            )
+            const noop: EventStore.Decider<MatchState, MatchCommand, MatchEvent> = {
+              ...matchDecider,
+              decide: () => Effect.succeed([]),
+            }
+
+            const result = yield* EventStore.commandHandler(noop, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              { eventTimestamps: derive },
+            )
+
+            expect(result.events).toEqual([])
+            expect(derive).not.toHaveBeenCalled()
+            expect(ran).toBe(false)
+            expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("is re-run on a VersionConflict retry", () =>
+          Effect.gen(function* () {
+            const firstInnings = makeStreamEventItem("audited", "m-1", 2, "InningsCompleted", {
+              innings: 1,
+              runs: 250,
+              wickets: 10,
+            })
+            mockQuery
+              .mockResolvedValueOnce({ Items: [startedItem()] })
+              .mockResolvedValue({ Items: [startedItem(), firstInnings] })
+            mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+            const versions: Array<number> = []
+
+            yield* EventStore.commandHandler(matchDecider, Audited, { retry: 2 })(
+              { matchId: "m-1" },
+              { _tag: "CompleteInnings", innings: 2, runs: 180, wickets: 8 },
+              {
+                eventTimestamps: ({ events, version }) =>
+                  Effect.sync(() => {
+                    versions.push(version)
+                    return events.map((_, i) => forVersion(version + i + 1))
+                  }),
+              },
+            )
+
+            expect(versions).toEqual([1, 2])
+            expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+            const [retried] = eventPutsOf(mockTransactWriteItems.mock.calls[1]![0])
+            expect(retried!.version).toBe(3)
+            expect(retried!.timestamp).toBe("2019-05-03T00:00:00.000Z")
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("is re-run on the re-decision of a stale unverified snapshot", () =>
+          Effect.gen(function* () {
+            const label = "auditedinline"
+            const snapshot = makeSnapshotItem(label, "m-1", 4, {
+              status: "i",
+              innings: ["1/1", "2/2"],
+            })
+            const snapshotSk = DynamoSchema.composeKey(AppSchema, `${label}.snapshot`, [])
+            mockGetItem.mockImplementation(async (input: any) =>
+              fromAttributeMap(input.Key).sk === snapshotSk ? { Item: snapshot } : {},
+            )
+            // Event 5 was appended without a snapshot: the first decision is stale.
+            mockQuery.mockResolvedValue(
+              latestPage(snapshot, [
+                makeStreamEventItem(label, "m-1", 5, "InningsCompleted", {
+                  innings: 3,
+                  runs: 3,
+                  wickets: 3,
+                }),
+              ]),
+            )
+            mockTransactWriteItems.mockRejectedValueOnce(conflict).mockResolvedValue({})
+            const versions: Array<number> = []
+
+            const result = yield* EventStore.commandHandler(matchDecider, AuditedInline, {
+              verifySnapshot: false,
+            })({ matchId: "m-1" }, completeInnings, {
+              eventTimestamps: ({ events, version }) =>
+                Effect.sync(() => {
+                  versions.push(version)
+                  return events.map((_, i) => forVersion(version + i + 1))
+                }),
+            })
+
+            expect(versions).toEqual([4, 5])
+            expect(result.version).toBe(6)
+            const [event] = eventPutsOf(mockTransactWriteItems.mock.calls[1]![0])
+            expect(event!.version).toBe(6)
+            expect(event!.timestamp).toBe("2019-05-06T00:00:00.000Z")
+          }).pipe(Effect.provide(TestLayer)),
+        )
+
+        it.effect("works through a BoundEventStream handler", () =>
+          Effect.gen(function* () {
+            mockQuery.mockResolvedValue({ Items: [startedItem()] })
+            mockTransactWriteItems.mockResolvedValue({})
+            const bound = yield* EventStore.bind(Audited)
+
+            yield* bound
+              .pipe(EventStore.commandHandler(matchDecider))({ matchId: "m-1" }, completeInnings, {
+                eventTimestamps: ({ events, version }) =>
+                  Effect.gen(function* () {
+                    const log = yield* SourceLog
+                    return yield* Effect.forEach(events, (_, i) =>
+                      log.originalTime(version + i + 1),
+                    )
+                  }),
+              })
+              .pipe(Effect.provide(sourceLog))
+
+            const [event] = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+            expect(event!.timestamp).toBe("2019-05-02T00:00:00.000Z")
+          }).pipe(Effect.provide(TestLayer)),
+        )
+      })
 
       it.effect("works through a BoundEventStream handler", () =>
         Effect.gen(function* () {

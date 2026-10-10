@@ -11,6 +11,7 @@ import type {
   AttributeValue,
   DeleteItemCommandInput,
   TransactWriteItem,
+  UpdateItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import {
   type ConfiguredModel,
@@ -102,6 +103,13 @@ import {
   INCARNATION_TOKEN,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
+import {
+  batchEntries,
+  diagnosedValidationError,
+  diagnoseFailure,
+  rangeKeysOf,
+  targetsFor,
+} from "./internal/WriteDiagnosis.js"
 import {
   decodeSparseFields,
   encodeSparseFields,
@@ -1640,10 +1648,6 @@ export interface BoundEntity<
   ) => Effect.Effect<Query.Page<ModelType<TModel>>, DynamoClientError | ValidationError, never>
 }
 
-// ---------------------------------------------------------------------------
-// Transaction limit pre-check (100-item DynamoDB limit)
-// ---------------------------------------------------------------------------
-
 /**
  * Compile a condition that may be either an Expr ADT node or a ConditionInput object.
  * Routes both paths through the Expr ADT compiler for a single compilation backend.
@@ -1663,24 +1667,6 @@ const compileCondition = (
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
   return compileExpr(expr, resolveDbNameFn)
 }
-
-const TRANSACTION_LIMIT = 100
-
-const checkTransactionLimit = (
-  entityType: string,
-  operation: string,
-  items: ReadonlyArray<unknown>,
-): Effect.Effect<void, TransactionOverflow> =>
-  items.length > TRANSACTION_LIMIT
-    ? Effect.fail(
-        new TransactionOverflow({
-          entityType,
-          operation,
-          itemCount: items.length,
-          limit: TRANSACTION_LIMIT,
-        }),
-      )
-    : Effect.void
 
 /** Attempts a guarded put makes before it reports a lost race (#133). */
 const GUARDED_PUT_ATTEMPTS = 3
@@ -2558,6 +2544,68 @@ const makeImpl = <
    */
   const keyForm = (record: globalThis.Record<string, unknown>) =>
     toCompositeKeyRecord(compositeKeyForm, record)
+
+  // -------------------------------------------------------------------------
+  // Write-limit diagnosis (#144)
+  //
+  // DynamoDB's limits — 400 KB per item, 100 items and 4 MB per transaction,
+  // 1024-byte sort keys — are not pre-checked. Every write is sent; when
+  // DynamoDB rejects it, `internal/WriteDiagnosis.ts` recognises the
+  // rejection, confirms it against the request and names the item. Applied
+  // after each site's conditional-failure mapping; nothing runs on success.
+  // -------------------------------------------------------------------------
+
+  const entityKeyFields = (): ReadonlyArray<string> => [
+    config.indexes.primary.pk.field,
+    config.indexes.primary.sk.field,
+  ]
+  const entityRangeKeys = (): ReadonlyArray<string> => rangeKeysOf(config.indexes)
+
+  /** Diagnose a rejected single-item write (`PutItem` / `UpdateItem` / `DeleteItem`). */
+  const diagnoseItemWrite = (operation: string, item: TransactWriteItem) =>
+    diagnoseFailure({
+      sent: () => ({
+        _tag: "Item",
+        item,
+        target: () =>
+          targetsFor(
+            [item],
+            entityKeyFields(),
+            entityType,
+            () => `the ${entityType} ${operation}`,
+          )[0]!,
+      }),
+      rangeKeys: entityRangeKeys,
+      rewrite: (diagnosis, original) =>
+        diagnosedValidationError(diagnosis, original, { operation, entityType }),
+    })
+
+  /**
+   * Diagnose a rejected `TransactWriteItems` of this entity's write: over 100
+   * items is `TransactionOverflow`, every other limit `ValidationError`.
+   */
+  const diagnoseTransactionWrite = (operation: string, items: ReadonlyArray<TransactWriteItem>) =>
+    diagnoseFailure({
+      sent: () => ({
+        _tag: "Transaction",
+        items,
+        targets: () =>
+          targetsFor(items, entityKeyFields(), entityType, (index) =>
+            index === 0 ? "the item" : `item ${index} of the ${operation} transaction`,
+          ),
+      }),
+      rangeKeys: entityRangeKeys,
+      rewrite: (diagnosis, original): TransactionOverflow | ValidationError =>
+        diagnosis._tag === "TooManyItems"
+          ? new TransactionOverflow({
+              entityType,
+              operation,
+              itemCount: diagnosis.count,
+              limit: diagnosis.limit,
+              cause: original,
+            })
+          : diagnosedValidationError(diagnosis, original, { operation, entityType }),
+    })
 
   const composePrimaryKey = (record: globalThis.Record<string, unknown>) => {
     const primary = config.indexes.primary
@@ -4538,7 +4586,6 @@ const makeImpl = <
       let lost: Extract<PutVerdict, { readonly _tag: "Retry" }> | undefined
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
         const plan = yield* planPut(args)
-        yield* checkTransactionLimit(entityType, args.operation, plan.items)
         const write: Effect.Effect<unknown, DynamoClientError> =
           plan.items.length === 1
             ? client.putItem(plan.items[0]!.Put!)
@@ -4554,6 +4601,10 @@ const makeImpl = <
             const read = reasons !== undefined ? plan.verdict(reasons) : undefined
             return read !== undefined ? Effect.succeed(read) : Effect.fail(err)
           }),
+          // Terminal: a diagnosed limit is never retried as a lost race.
+          plan.items.length === 1
+            ? diagnoseItemWrite(args.operation, plan.items[0]!)
+            : diagnoseTransactionWrite(args.operation, plan.items),
         )
         if (verdict === undefined) return plan
         switch (verdict._tag) {
@@ -4706,6 +4757,7 @@ const makeImpl = <
       if (!sourceIdentifierField) return undefined as undefined
 
       const allUpdateOps: Array<{
+        readonly entityType: string
         readonly tableName: string
         readonly key: globalThis.Record<string, AttributeValue>
         readonly refFieldName: string
@@ -4799,6 +4851,7 @@ const makeImpl = <
 
           for (const item of queryResult.Items ?? []) {
             allUpdateOps.push({
+              entityType: target.entityType,
               tableName: targetTableName,
               key: { pk: item.pk!, sk: item.sk! },
               refFieldName: matchingRef.fieldName,
@@ -4815,55 +4868,94 @@ const makeImpl = <
       if (allUpdateOps.length === 0) return
 
       if (mode === "transactional") {
-        // Transactional mode — fail if >100 items
-        if (allUpdateOps.length > 100) {
-          return yield* new CascadePartialFailure({
-            sourceEntity: sourceEntityType,
-            sourceId: sourceIdValue,
-            succeeded: 0,
-            failed: allUpdateOps.length,
-            errors: [`Transactional cascade exceeded 100-item limit: ${allUpdateOps.length} items`],
-          })
-        }
-
-        yield* client.transactWriteItems({
-          TransactItems: allUpdateOps.map((op) => ({
-            Update: {
-              TableName: op.tableName,
-              Key: op.key,
-              UpdateExpression: "SET #ref = :refData",
-              ExpressionAttributeNames: { "#ref": op.refFieldName },
-              ExpressionAttributeValues: { ":refData": op.refData },
-            },
-          })),
-        })
+        // Transactional mode — one atomic transaction. DynamoDB's limits (100
+        // items, 4 MB, item size, sort keys) are not pre-checked (#144): a
+        // rejection is diagnosed and reported as a cascade that wrote nothing.
+        const cascadeItems: ReadonlyArray<TransactWriteItem> = allUpdateOps.map((op) => ({
+          Update: {
+            TableName: op.tableName,
+            Key: op.key,
+            UpdateExpression: "SET #ref = :refData",
+            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeValues: { ":refData": op.refData },
+          },
+        }))
+        yield* client.transactWriteItems({ TransactItems: [...cascadeItems] }).pipe(
+          diagnoseFailure({
+            sent: () => ({
+              _tag: "Transaction",
+              items: cascadeItems,
+              targets: () =>
+                targetsFor(
+                  cascadeItems,
+                  ["pk", "sk"],
+                  (index) => allUpdateOps[index]!.entityType,
+                  (index) =>
+                    `the cascade update of ${allUpdateOps[index]!.entityType} (item ${index})`,
+                ),
+            }),
+            rangeKeys: () => ["sk"],
+            rewrite: (diagnosis, original) =>
+              new CascadePartialFailure({
+                sourceEntity: sourceEntityType,
+                sourceId: sourceIdValue,
+                succeeded: 0,
+                failed: allUpdateOps.length,
+                errors: [
+                  diagnosedValidationError(diagnosis, original, {
+                    operation: "cascade",
+                    entityType: sourceEntityType,
+                  }),
+                ],
+              }),
+          }),
+        )
       } else {
         // Eventual mode — concurrent updates with partial failure tracking
         let succeeded = 0
         const errors: Array<unknown> = []
 
-        const updateEffects = allUpdateOps.map((op) =>
-          client
-            .updateItem({
-              TableName: op.tableName,
-              Key: op.key,
-              UpdateExpression: "SET #ref = :refData",
-              ExpressionAttributeNames: { "#ref": op.refFieldName },
-              ExpressionAttributeValues: { ":refData": op.refData },
-            })
-            .pipe(
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  succeeded++
+        const updateEffects = allUpdateOps.map((op) => {
+          const update = {
+            TableName: op.tableName,
+            Key: op.key,
+            UpdateExpression: "SET #ref = :refData",
+            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeValues: { ":refData": op.refData },
+          }
+          return client.updateItem(update).pipe(
+            // An item the cascade grows past 400 KB is named in `errors`.
+            diagnoseFailure({
+              sent: () => ({
+                _tag: "Item",
+                item: { Update: update },
+                target: () =>
+                  targetsFor(
+                    [{ Update: update }],
+                    ["pk", "sk"],
+                    op.entityType,
+                    () => `the cascade update of ${op.entityType}`,
+                  )[0]!,
+              }),
+              rangeKeys: () => ["sk"],
+              rewrite: (diagnosis, original) =>
+                diagnosedValidationError(diagnosis, original, {
+                  operation: "cascade",
+                  entityType: op.entityType,
                 }),
-              ),
-              Effect.catch((err: DynamoClientError) =>
-                Effect.sync(() => {
-                  errors.push(err)
-                }),
-              ),
+            }),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                succeeded++
+              }),
             ),
-        )
+            Effect.catch((err) =>
+              Effect.sync(() => {
+                errors.push(err)
+              }),
+            ),
+          )
+        })
 
         yield* Effect.all(updateEffects, { concurrency: 10 })
 
@@ -5074,6 +5166,7 @@ const makeImpl = <
                 }
                 return err
               }),
+              diagnoseItemWrite("put", { Put: putInput }),
             )
           }
 
@@ -5963,6 +6056,7 @@ const makeImpl = <
               Effect.mapError((err) =>
                 isAwsConditionalCheckFailed(err.cause) ? recordRejected(err.cause.Item) : err,
               ),
+              diagnoseItemWrite("update", wide ? { Put: mainPut } : { Update: mainUpdate }),
             ),
           )
           oldImage = result.Attributes ?? currentItem
@@ -6049,7 +6143,6 @@ const makeImpl = <
             }
           }
 
-          yield* checkTransactionLimit(entityType, "update", transactItems)
           yield* withCurrent(
             client.transactWriteItems({ TransactItems: transactItems }).pipe(
               Effect.mapError(
@@ -6099,6 +6192,7 @@ const makeImpl = <
                   return err
                 },
               ),
+              diagnoseTransactionWrite("update", transactItems),
             ),
           )
         }
@@ -6813,7 +6907,6 @@ const makeImpl = <
           },
           { Put: snapshotPut(tableName, snapshot.item) },
         ]
-        yield* checkTransactionLimit(entityType, "update", transactItems)
         yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.mapError(
             (
@@ -6847,6 +6940,7 @@ const makeImpl = <
               return err
             },
           ),
+          diagnoseTransactionWrite("update", transactItems),
         )
         // A transacted Update returns no attributes. The old item is exact:
         // the version condition proves `snapshot.raw` is what it replaced.
@@ -6887,66 +6981,68 @@ const makeImpl = <
       // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
       // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
       // combinators), `values` may be empty — omit the property entirely.
-      const result = yield* client
-        .updateItem({
-          TableName: tableName,
-          Key: marshalledKey,
-          UpdateExpression: updateExpression,
-          ExpressionAttributeNames: names,
-          ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
-          ConditionExpression: conditionExpression,
-          ...(conditionExpression !== undefined && {
-            ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
-          }),
-          ReturnValues: returned,
-        })
-        .pipe(
-          Effect.mapError(
-            (
-              err,
-            ):
-              | DynamoClientError
-              | OptimisticLockError
-              | ConditionalCheckFailed
-              | ItemNotFound
-              | MissingForCreate
-              | ValidationError => {
-              // The stored item (ALL_OLD) says what rejected the update: no
-              // item (it must exist), a restated immutable value, the
-              // version CAS, or the user's condition.
-              if (isAwsConditionalCheckFailed(err.cause)) {
-                const stored = err.cause.Item
-                if (stored === undefined && !uState.patch) {
-                  return createsOnMissing
-                    ? new MissingForCreate({ input: uState.updates })
-                    : new ItemNotFound({ entityType, key: encodedKey })
-                }
-                const corrupt = versionCorruption(stored, "update")
-                if (corrupt !== undefined) return corrupt
-                const immutableChange =
-                  stored !== undefined ? immutableMismatch(immutables, stored) : undefined
-                if (immutableChange !== undefined) {
-                  return new ValidationError({
-                    entityType,
-                    operation: "update",
-                    cause: immutableChange,
-                  })
-                }
-                return conditionRejection(
-                  encodedKey as globalThis.Record<string, unknown>,
-                  stored,
-                  casRead !== undefined
-                    ? { version: casRead.version, read: casRead.raw }
-                    : systemFields.version && evExpected !== undefined
-                      ? { version: evExpected }
-                      : undefined,
-                  userCond !== undefined,
-                )
+      const updateInput: UpdateItemCommandInput = {
+        TableName: tableName,
+        Key: marshalledKey,
+        UpdateExpression: updateExpression,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
+        ConditionExpression: conditionExpression,
+        ...(conditionExpression !== undefined && {
+          ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+        }),
+        ReturnValues: returned,
+      }
+      const result = yield* client.updateItem(updateInput).pipe(
+        Effect.mapError(
+          (
+            err,
+          ):
+            | DynamoClientError
+            | OptimisticLockError
+            | ConditionalCheckFailed
+            | ItemNotFound
+            | MissingForCreate
+            | ValidationError => {
+            // The stored item (ALL_OLD) says what rejected the update: no
+            // item (it must exist), a restated immutable value, the
+            // version CAS, or the user's condition.
+            if (isAwsConditionalCheckFailed(err.cause)) {
+              const stored = err.cause.Item
+              if (stored === undefined && !uState.patch) {
+                return createsOnMissing
+                  ? new MissingForCreate({ input: uState.updates })
+                  : new ItemNotFound({ entityType, key: encodedKey })
               }
-              return err
-            },
-          ),
-        )
+              const corrupt = versionCorruption(stored, "update")
+              if (corrupt !== undefined) return corrupt
+              const immutableChange =
+                stored !== undefined ? immutableMismatch(immutables, stored) : undefined
+              if (immutableChange !== undefined) {
+                return new ValidationError({
+                  entityType,
+                  operation: "update",
+                  cause: immutableChange,
+                })
+              }
+              return conditionRejection(
+                encodedKey as globalThis.Record<string, unknown>,
+                stored,
+                casRead !== undefined
+                  ? { version: casRead.version, read: casRead.raw }
+                  : systemFields.version && evExpected !== undefined
+                    ? { version: evExpected }
+                    : undefined,
+                userCond !== undefined,
+              )
+            }
+            return err
+          },
+        ),
+        diagnoseItemWrite("update", {
+          Update: updateInput as NonNullable<TransactWriteItem["Update"]>,
+        }),
+      )
 
       // A cascade never meets an old-image mode here: that combination is
       // routed to the read-then-write branch, or read first (`casRead`).
@@ -7368,14 +7464,13 @@ const makeImpl = <
                     ? yield* ownedReleases(tableName, raw, transactItems)
                     : []
 
-                yield* checkTransactionLimit(entityType, "delete", transactItems)
                 yield* guardedDelete(
                   client.transactWriteItems({ TransactItems: transactItems }),
                   result.Item,
                   softGuard.inputs,
                   snapshotAt,
                   releases,
-                )
+                ).pipe(diagnoseTransactionWrite("delete", transactItems))
                 return result.Item
               } else {
                 // --- Hard delete with unique constraints and/or retained history ---
@@ -7397,30 +7492,32 @@ const makeImpl = <
                   // since the read, which would leave its final state unsnapshotted.
                   if (!userCondition) return undefined
                   const values = userCondition.values
-                  yield* client
-                    .deleteItem({
-                      TableName: tableName,
-                      Key: marshalledKey,
-                      ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
-                      ExpressionAttributeNames: {
-                        ...userCondition.names,
-                        "#dpk": primary.pk.field,
-                      },
-                      ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
-                      ReturnValuesOnConditionCheckFailure: "ALL_OLD",
-                    })
-                    .pipe(
-                      Effect.mapError((err) =>
-                        isAwsConditionalCheckFailed(err.cause)
-                          ? conditionRejection(
-                              encodedKey as globalThis.Record<string, unknown>,
-                              err.cause.Item,
-                              err.cause.Item === undefined ? undefined : { version: 0 },
-                              true,
-                            )
-                          : err,
-                      ),
-                    )
+                  const missingDelete: DeleteItemCommandInput = {
+                    TableName: tableName,
+                    Key: marshalledKey,
+                    ConditionExpression: `attribute_not_exists(#dpk) AND (${userCondition.expression})`,
+                    ExpressionAttributeNames: {
+                      ...userCondition.names,
+                      "#dpk": primary.pk.field,
+                    },
+                    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+                    ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                  }
+                  yield* client.deleteItem(missingDelete).pipe(
+                    Effect.mapError((err) =>
+                      isAwsConditionalCheckFailed(err.cause)
+                        ? conditionRejection(
+                            encodedKey as globalThis.Record<string, unknown>,
+                            err.cause.Item,
+                            err.cause.Item === undefined ? undefined : { version: 0 },
+                            true,
+                          )
+                        : err,
+                    ),
+                    diagnoseItemWrite("delete", {
+                      Delete: missingDelete as NonNullable<TransactWriteItem["Delete"]>,
+                    }),
+                  )
                   return undefined
                 }
                 // The sentinel deletes are keyed by the unique values read, and the
@@ -7487,14 +7584,13 @@ const makeImpl = <
                   ? yield* ownedReleases(tableName, raw, transactItems)
                   : []
 
-                yield* checkTransactionLimit(entityType, "delete", transactItems)
                 yield* guardedDelete(
                   client.transactWriteItems({ TransactItems: transactItems }),
                   result.Item,
                   hardGuard.inputs,
                   snapshotAt,
                   releases,
-                )
+                ).pipe(diagnoseTransactionWrite("delete", transactItems))
                 return result.Item
               }
             })
@@ -7543,9 +7639,12 @@ const makeImpl = <
             if (opts.returnValues !== undefined) {
               deleteInput.ReturnValues = opts.returnValues === "allOld" ? "ALL_OLD" : "NONE"
             }
-            const output = yield* client
-              .deleteItem(deleteInput)
-              .pipe(Effect.mapError(mapDeleteConditionFailure))
+            const output = yield* client.deleteItem(deleteInput).pipe(
+              Effect.mapError(mapDeleteConditionFailure),
+              diagnoseItemWrite("delete", {
+                Delete: deleteInput as NonNullable<TransactWriteItem["Delete"]>,
+              }),
+            )
             return yield* deletedResult(
               output.Attributes as globalThis.Record<string, AttributeValue> | undefined,
             )
@@ -7945,32 +8044,32 @@ const makeImpl = <
             Object.assign(values, uc.values)
           }
 
-          const result = yield* client
-            .updateItem({
-              TableName: tableName,
-              Key: marshalledKey,
-              UpdateExpression: updateExpression,
-              ExpressionAttributeNames: names,
-              ExpressionAttributeValues: values,
-              ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
-              // Only the corruption guard needs the stored item.
-              ...(systemFields.version && {
-                ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
-              }),
-              ReturnValues: "ALL_NEW",
-            })
-            .pipe(
-              Effect.mapError(
-                (err): DynamoClientError | ConditionalCheckFailed | ValidationError => {
-                  if (isAwsConditionalCheckFailed(err.cause)) {
-                    const corrupt = versionCorruption(err.cause.Item, "upsert")
-                    if (corrupt !== undefined) return corrupt
-                    if (opts.condition) return new ConditionalCheckFailed({ entityType, key: item })
-                  }
-                  return err
-                },
-              ),
-            )
+          const upsertInput: UpdateItemCommandInput = {
+            TableName: tableName,
+            Key: marshalledKey,
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: values,
+            ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
+            // Only the corruption guard needs the stored item.
+            ...(systemFields.version && {
+              ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+            }),
+            ReturnValues: "ALL_NEW",
+          }
+          const result = yield* client.updateItem(upsertInput).pipe(
+            Effect.mapError((err): DynamoClientError | ConditionalCheckFailed | ValidationError => {
+              if (isAwsConditionalCheckFailed(err.cause)) {
+                const corrupt = versionCorruption(err.cause.Item, "upsert")
+                if (corrupt !== undefined) return corrupt
+                if (opts.condition) return new ConditionalCheckFailed({ entityType, key: item })
+              }
+              return err
+            }),
+            diagnoseItemWrite("upsert", {
+              Update: upsertInput as NonNullable<TransactWriteItem["Update"]>,
+            }),
+          )
 
           if (!result.Attributes) {
             return yield* new ItemNotFound({ entityType, key: item })
@@ -8366,41 +8465,58 @@ const makeImpl = <
       const marshalledEventItem = toAttributeMap(eventItem)
 
       // ---------- Execute TransactWriteItems ----------
-      const transactResult = yield* client
-        .transactWriteItems({
-          TransactItems: [
-            {
-              Update: {
-                TableName: tableName,
-                Key: marshalledKey,
-                UpdateExpression: updateExpression,
-                ConditionExpression: finalCondition,
-                ExpressionAttributeNames: names,
-                ExpressionAttributeValues: values,
-              },
-            },
-            {
-              Put: {
-                TableName: tableName,
-                Item: marshalledEventItem,
-              },
-            },
-          ],
-        })
-        .pipe(
-          Effect.matchEffect({
-            onSuccess: () => Effect.succeed({ stale: false as const }),
-            onFailure: (err) => {
-              // TransactionCancelled or ConditionalCheckFailed at the transaction
-              // level both surface here. Disambiguation between CAS and
-              // user-condition happens after the follow-up GetItem (when run).
-              if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
-                return Effect.succeed({ stale: true as const })
-              }
-              return Effect.fail(err)
-            },
+      const appendItems: Array<TransactWriteItem> = [
+        {
+          Update: {
+            TableName: tableName,
+            Key: marshalledKey,
+            UpdateExpression: updateExpression,
+            ConditionExpression: finalCondition,
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: values,
+          },
+        },
+        {
+          Put: {
+            TableName: tableName,
+            Item: marshalledEventItem,
+          },
+        },
+      ]
+      const transactResult = yield* client.transactWriteItems({ TransactItems: appendItems }).pipe(
+        // A limit DynamoDB enforced (#144) — the current item grown past
+        // 400 KB, an oversized event item, an over-long sort key — is
+        // diagnosed first: such a cancellation carries no conditional
+        // failure, so it is never a stale append.
+        diagnoseFailure({
+          sent: () => ({
+            _tag: "Transaction",
+            items: appendItems,
+            targets: () =>
+              targetsFor(appendItems, entityKeyFields(), entityType, (index) =>
+                index === 0 ? "the current item" : "the event item",
+              ),
           }),
-        )
+          rangeKeys: entityRangeKeys,
+          rewrite: (diagnosis, original) =>
+            diagnosedValidationError(diagnosis, original, { operation: "append", entityType }),
+        }),
+        Effect.matchEffect({
+          onSuccess: () => Effect.succeed({ stale: false as const }),
+          onFailure: (
+            err: DynamoClientError | ValidationError,
+          ): Effect.Effect<{ readonly stale: true }, DynamoClientError | ValidationError> => {
+            if (err._tag === "ValidationError") return Effect.fail(err)
+            // TransactionCancelled or ConditionalCheckFailed at the transaction
+            // level both surface here. Disambiguation between CAS and
+            // user-condition happens after the follow-up GetItem (when run).
+            if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
+              return Effect.succeed({ stale: true as const })
+            }
+            return Effect.fail(err)
+          },
+        }),
+      )
 
       // -----------------------------------------------------------------
       // skipFollowUp branch — no GetItem, cannot decode current, cannot
@@ -9030,7 +9146,6 @@ const makeImpl = <
             }
           }
 
-          yield* checkTransactionLimit(entityType, "restore", transactItems)
           yield* client
             .transactWriteItems({
               TransactItems: transactItems,
@@ -9088,6 +9203,7 @@ const makeImpl = <
                   return err
                 },
               ),
+              diagnoseTransactionWrite("restore", transactItems),
             )
 
           return yield* decodeAs(restoredItem, marshalledRestoredItem, mode)
@@ -9267,11 +9383,15 @@ const makeImpl = <
             // Released one by one, each only while still this item's: a batch
             // delete cannot carry the ownership condition.
             for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
-              yield* client.deleteItem(sentinelRelease(tableName, sentinel, owner).Delete).pipe(
+              const release = sentinelRelease(tableName, sentinel, owner)
+              yield* client.deleteItem(release.Delete).pipe(
                 Effect.catchIf(
                   (err) => isAwsConditionalCheckFailed(err.cause),
                   () => Effect.void,
                 ),
+                // A delete of a stored key cannot meet a size limit; wrapped
+                // for uniformity (#144), so it passes through in practice.
+                diagnoseItemWrite("purge", release),
               )
             }
           }
@@ -9279,18 +9399,42 @@ const makeImpl = <
           // Batch delete in chunks of 25
           for (let i = 0; i < allItems.length; i += 25) {
             const chunk = allItems.slice(i, i + 25)
-            yield* client.batchWriteItem({
-              RequestItems: {
-                [tableName]: chunk.map((item) => ({
-                  DeleteRequest: {
-                    Key: {
-                      [primary.pk.field]: item[primary.pk.field]!,
-                      [primary.sk.field]: item[primary.sk.field]!,
-                    },
+            const requestItems = {
+              [tableName]: chunk.map((item) => ({
+                DeleteRequest: {
+                  Key: {
+                    [primary.pk.field]: item[primary.pk.field]!,
+                    [primary.sk.field]: item[primary.sk.field]!,
                   },
-                })),
-              },
-            })
+                },
+              })),
+            }
+            yield* client.batchWriteItem({ RequestItems: requestItems }).pipe(
+              // Deletes of stored keys: wrapped for uniformity (#144).
+              diagnoseFailure({
+                sent: () => {
+                  const items = batchEntries(requestItems)
+                  return {
+                    _tag: "Batch",
+                    items,
+                    targets: () =>
+                      targetsFor(
+                        items,
+                        entityKeyFields(),
+                        entityType,
+                        (index) => `purged item ${i + index}`,
+                      ),
+                  }
+                },
+                rangeKeys: entityRangeKeys,
+                rewrite: (diagnosis, original) =>
+                  diagnosedValidationError(diagnosis, original, {
+                    operation: "purge",
+                    entityType,
+                    partial: true,
+                  }),
+              }),
+            )
           }
         }),
       self,
@@ -9690,25 +9834,44 @@ export const bind = <
               // UpdateItem would resurrect it as a key-plus-vector fragment that
               // decodes to nothing but still answers searches. Guard on the item
               // still existing and treat the rejection as "skipped".
-              return yield* client
-                .updateItem({
-                  TableName: tableName,
-                  Key: {
-                    [primary.pk.field]: marshalled[primary.pk.field]!,
-                    [primary.sk.field]: marshalled[primary.sk.field]!,
-                  },
-                  UpdateExpression: `SET ${sets.join(", ")}`,
-                  ConditionExpression: "attribute_exists(#pk)",
-                  ExpressionAttributeNames: names,
-                  ExpressionAttributeValues: values,
-                })
-                .pipe(
-                  Effect.as(true),
-                  Effect.catchIf(
-                    (err: DynamoClientError) => isAwsConditionalCheckFailed(err.cause),
-                    () => Effect.succeed(false),
-                  ),
-                )
+              const update = {
+                TableName: tableName,
+                Key: {
+                  [primary.pk.field]: marshalled[primary.pk.field]!,
+                  [primary.sk.field]: marshalled[primary.sk.field]!,
+                },
+                UpdateExpression: `SET ${sets.join(", ")}`,
+                ConditionExpression: "attribute_exists(#pk)",
+                ExpressionAttributeNames: names,
+                ExpressionAttributeValues: values,
+              }
+              return yield* client.updateItem(update).pipe(
+                Effect.as(true),
+                Effect.catchIf(
+                  (err: DynamoClientError) => isAwsConditionalCheckFailed(err.cause),
+                  () => Effect.succeed(false),
+                ),
+                // An embedding that grows the item past 400 KB, named (#144).
+                diagnoseFailure({
+                  sent: () => ({
+                    _tag: "Item",
+                    item: { Update: update },
+                    target: () =>
+                      targetsFor(
+                        [{ Update: update }],
+                        [primary.pk.field, primary.sk.field],
+                        entity.entityType,
+                        () => "the re-embedded item",
+                      )[0]!,
+                  }),
+                  rangeKeys: () => rangeKeysOf(entity.indexes as never),
+                  rewrite: (diagnosis, original) =>
+                    diagnosedValidationError(diagnosis, original, {
+                      operation: "reembed",
+                      entityType: entity.entityType,
+                    }),
+                }),
+              )
             })
 
           let updated = 0

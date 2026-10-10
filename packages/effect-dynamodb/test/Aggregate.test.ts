@@ -6,6 +6,7 @@ import {
   type AggregateDecompositionError,
   DynamoError,
   type RefNotFound,
+  type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -14,7 +15,14 @@ import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_SORT_KEY_LOCAL,
+  ddbPayloadTooLarge,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures: Domain models
@@ -1178,6 +1186,120 @@ describe("Aggregate write path", () => {
         expect(call.TransactItems).toHaveLength(1)
         expect(call.TransactItems[0].Put).toBeDefined()
         expect(call.TransactItems[0].Put.TableName).toBe("test-table")
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an oversized item is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "x".repeat(410_000),
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("ArticleItem")
+        expect(String(failure.cause)).toContain(
+          'the item of the ArticleItem item of sub-aggregate "',
+        )
+        expect(String(failure.cause)).toContain("Nothing was written.")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a size reason in a cancelled group is named by its index (#144)", () =>
+      Effect.gen(function* () {
+        mockTransactWrite.mockRejectedValueOnce(
+          awsTransactionCanceled([{ Code: "ValidationError", Message: DDB_ITEM_SIZE }]),
+        )
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("Aggregate.write(ArticleItem)")
+        expect(String(failure.cause)).toContain("the item of the ArticleItem item of sub-aggregate")
+        expect(String(failure.cause)).toContain("at pk=")
+        expect(mockTransactWrite).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("DynamoDB's 4 MB rejection of a group names its largest items (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(ddbPayloadTooLarge(4_300_000))
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain("4194304 bytes (4 MB)")
+        expect(text).toContain("(it reported 4300000 bytes)")
+        expect(text).toContain("The largest: the ArticleItem item of sub-aggregate")
+        expect(text).toContain("Nothing was written.")
+        expect(((error as ValidationError).cause as Error).cause).toBeInstanceOf(DynamoError)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an unrecognised rejection passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Some other validation problem")
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an over-long list-index sort key is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const ListedArticles = Aggregate.make(Article, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["articleId"] },
+          collection: {
+            index: "lsi1",
+            name: "article",
+            sk: { field: "lsi1sk", composite: [] },
+          },
+          list: {
+            index: "gsi1",
+            name: "articlelist",
+            pk: { field: "gsi1pk", composite: [] },
+            sk: { field: "gsi1sk", composite: ["title"] },
+          },
+          root: { entityType: "ArticleItem" },
+          edges: {},
+        })
+        const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ListedArticles.create({
+          articleId: "a-1",
+          title: "t".repeat(1100),
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("ArticleItem")
+        const text = String(failure.cause)
+        expect(text).toContain('the sort key "gsi1sk" of the ArticleItem item of sub-aggregate')
+        expect(text).toContain("longer than DynamoDB's 1024-byte limit")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(WriteLayer)),
     )
   })

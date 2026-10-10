@@ -227,12 +227,18 @@ export const isAwsResourceNotFound = (cause: unknown): boolean =>
   "name" in cause &&
   (cause as { name: string }).name === "ResourceNotFoundException"
 
-/** Entity-level transactWriteItems would exceed DynamoDB's 100-item limit */
+/**
+ * An entity's `TransactWriteItems` was rejected by DynamoDB for exceeding its
+ * 100-item limit. Not pre-checked: DynamoDB's rejection is confirmed by
+ * counting the request, and kept as `cause`. Nothing was written.
+ */
 export class TransactionOverflow extends Data.TaggedError("TransactionOverflow")<{
   readonly entityType: string
   readonly operation: string
   readonly itemCount: number
   readonly limit: number
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
 }> {}
 
 /** Referenced entity not found during ref hydration */
@@ -276,6 +282,8 @@ export class AggregateTransactionOverflow extends Data.TaggedError("AggregateTra
   readonly subgraph: string
   readonly itemCount: number
   readonly limit: number
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
 }> {}
 
 /** Cascade update partially failed (eventual mode) */
@@ -344,10 +352,13 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 export const TRANSACT_WRITE_ITEMS_LIMIT = 100
 
 /**
- * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
+ * `EventStore.append` exceeded DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
  * (100 items per `TransactWriteItems`). An append is always one atomic
  * transaction — it is never split, because splitting would break append
- * atomicity — so an oversized one is rejected before any request is issued.
+ * atomicity — so DynamoDB rejects an oversized one whole and nothing is
+ * written. The limit is not pre-checked: DynamoDB's rejection is confirmed by
+ * counting the request and reported as this error, with DynamoDB's error as
+ * `cause`.
  *
  * `count` is the total number of transact items the append requires: one Put
  * per event, one `ConditionCheck` (the version-contiguity guard) when
@@ -363,9 +374,9 @@ export const TRANSACT_WRITE_ITEMS_LIMIT = 100
  * `count` against `limit` then tells the caller its configured step size is
  * too large.
  *
- * DynamoDB's 4 MB aggregate cap on one transaction is checked client-side too,
- * by DynamoDB's item-size rules: exceeding it fails with `ValidationError`
- * before anything is sent.
+ * DynamoDB's 4 MB aggregate cap on one transaction and its 400 KB item limit
+ * are diagnosed the same way, from DynamoDB's rejection: a `ValidationError`
+ * naming the item(s) at fault.
  */
 export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly streamName: string
@@ -374,6 +385,8 @@ export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly count: number
   /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
   readonly limit: number
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
 }> {}
 
 /**

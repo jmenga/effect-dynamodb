@@ -9,7 +9,11 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // --- Test Models ---
 
@@ -1100,6 +1104,58 @@ describe("Batch", () => {
         expect(duplicated._tag).toBe("ValidationError")
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
         expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an oversized plain item is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockBatchWriteItem.mockRejectedValueOnce(rejection)
+        const error = yield* Batch.write([
+          UserEntity.put({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+          OrderEntity.put({
+            orderId: "ord-1",
+            userId: "u-1",
+            product: "x".repeat(410_000),
+            quantity: 1,
+            status: "pending",
+          }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("Order")
+        expect(failure.operation).toBe("batchWrite")
+        const text = String(failure.cause)
+        expect(text).toContain("the item of the put of Order, at pk=")
+        expect(text).toContain("earlier requests of the operation may already have been written")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an oversized versioned put is named from its transaction's rejection (#144)", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+        const error = yield* Batch.write([
+          VersionedNotes.put({ noteId: "n-1", body: "small" }),
+          VersionedNotes.put({ noteId: "n-2", body: "x".repeat(410_000) }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          "the item of the versioned put of VersionedNote",
+        )
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognised rejection of a batch passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Provided list of item keys contains duplicates")
+        mockBatchWriteItem.mockRejectedValueOnce(rejection)
+        const error = yield* Batch.write([
+          UserEntity.put({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
 

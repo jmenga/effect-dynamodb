@@ -9,7 +9,7 @@
  * Created via {@link make}. Sub-aggregates compose recursively via `.with()`.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { TypeId as SchemaAggregateTypeId } from "@effect-dynamodb/schema/Aggregate.js"
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -73,6 +73,11 @@ import {
 } from "./internal/Expr.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
+import {
+  diagnosedValidationError,
+  diagnoseFailure,
+  transactItemTarget,
+} from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
@@ -1113,6 +1118,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
   config: AggregateConfig<TSchema>,
 ): Aggregate<TSchema, Record<string, unknown>> => {
   const aggregateName = config.root.entityType
+  const groupKeys: GroupKeys = {
+    pkField: config.pk.field,
+    // Every sort-key attribute an aggregate item can carry: `sk`, the
+    // collection index's SK mirror, and the list index's SK (root items).
+    rangeKeys: [
+      "sk",
+      ...(config.collection.sk === undefined ? [] : [config.collection.sk.field]),
+      ...(config.list === undefined ? [] : [config.list.sk.field]),
+    ],
+  }
   const contextFields = config.context ?? []
 
   // Policy: aggregate fields that already carry a date transform schema
@@ -1476,7 +1491,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             puts: [...g.items].sort((a, b) => Number(isRoot(b)) - Number(isRoot(a))),
             deletes: [],
           }))
-        yield* writeTransactionGroups(client, tableConfig.name, ordered, aggregateName, {
+        yield* writeTransactionGroups(client, tableConfig.name, ordered, aggregateName, groupKeys, {
           pkField: config.pk.field,
           entityType: config.root.entityType,
           key: { [config.pk.field]: pkValue, sk: rootSk },
@@ -1645,7 +1660,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
 
         if (groupWrites.length > 0) {
-          yield* writeTransactionGroups(client, tableConfig.name, groupWrites, aggregateName)
+          yield* writeTransactionGroups(
+            client,
+            tableConfig.name,
+            groupWrites,
+            aggregateName,
+            groupKeys,
+          )
         }
 
         return decoded as Schema.Schema.Type<TSchema>
@@ -3206,19 +3227,32 @@ interface RootGuard {
   readonly key: Record<string, unknown>
 }
 
-type WriteGroupsError = AggregateTransactionOverflow | DynamoClientError | TransactionCancelled
+type WriteGroupsError =
+  | AggregateTransactionOverflow
+  | DynamoClientError
+  | TransactionCancelled
+  | ValidationError
+
+/** The aggregate's item keys, to name an item in a diagnosed rejection (#144). */
+interface GroupKeys {
+  readonly pkField: string
+  /** Sort-key attributes the items carry: `sk`, the collection index's and the list index's. */
+  readonly rangeKeys: ReadonlyArray<string>
+}
 
 function writeTransactionGroups(
   client: DynamoClientService,
   tableName: string,
   groups: WriteGroups,
   aggregateName: string,
+  keys: GroupKeys,
 ): Effect.Effect<void, WriteGroupsError>
 function writeTransactionGroups(
   client: DynamoClientService,
   tableName: string,
   groups: WriteGroups,
   aggregateName: string,
+  keys: GroupKeys,
   rootGuard: RootGuard,
 ): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed>
 function writeTransactionGroups(
@@ -3226,6 +3260,7 @@ function writeTransactionGroups(
   tableName: string,
   groups: WriteGroups,
   aggregateName: string,
+  keys: GroupKeys,
   rootGuard?: RootGuard,
 ): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed> {
   return Effect.gen(function* () {
@@ -3234,6 +3269,12 @@ function writeTransactionGroups(
     // count now spans Puts AND Deletes together — so an `update` that both adds and
     // removes many edges roughly doubles the count. Checking up front means an
     // oversized later group fails fast instead of partially committing earlier ones.
+    //
+    // Kept under the #144 standard (no pre-checks of limits DynamoDB enforces):
+    // DynamoDB judges one group at a time, so only this check can stop earlier
+    // groups committing when a later one is too large — an invariant across
+    // transactions, not a mirror of DynamoDB's. Each group's own rejection (its
+    // size, its sort keys) is diagnosed below.
     for (const group of groups) {
       const itemCount = group.puts.length + group.deletes.length
       if (itemCount > 100) {
@@ -3258,7 +3299,7 @@ function writeTransactionGroups(
           : -1
 
       // Build TransactWriteItems request — Puts first, then Deletes for orphans.
-      const transactItems = [
+      const transactItems: Array<TransactWriteItem> = [
         ...group.puts.map((item, i) => ({
           Put: {
             TableName: tableName,
@@ -3306,6 +3347,42 @@ function writeTransactionGroups(
           }
           return error
         }),
+        // A limit DynamoDB enforced (#144), named — after the root guard's
+        // mapping, which a conditional failure always takes.
+        diagnoseFailure({
+          sent: () => ({
+            _tag: "Transaction",
+            items: transactItems,
+            targets: () =>
+              transactItems.map((item) => {
+                const entityType = item.Put?.Item?.__edd_e__?.S ?? aggregateName
+                return transactItemTarget(
+                  item,
+                  tableName,
+                  [keys.pkField, "sk"],
+                  entityType,
+                  `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
+                    `sub-aggregate "${group.group}"`,
+                )
+              }),
+          }),
+          rangeKeys: () => keys.rangeKeys,
+          rewrite: (diagnosis, original): AggregateTransactionOverflow | ValidationError =>
+            diagnosis._tag === "TooManyItems"
+              ? new AggregateTransactionOverflow({
+                  aggregate: aggregateName,
+                  subgraph: group.group,
+                  itemCount: diagnosis.count,
+                  limit: diagnosis.limit,
+                  cause: original,
+                })
+              : diagnosedValidationError(diagnosis, original, {
+                  operation: `Aggregate.write(${aggregateName})`,
+                  entityType: aggregateName,
+                  // Each group commits on its own: earlier ones may be written.
+                  partial: groupIndex > 0,
+                }),
+        }),
       )
     }
   })
@@ -3340,6 +3417,9 @@ const deleteAllItems = (
       let pending: ReadonlyArray<unknown> = deleteRequests.slice(i, i + 25)
       let retries = 0
       while (pending.length > 0) {
+        // Not diagnosed (#144): these are deletes of keys that were stored, so
+        // they cannot meet a size or sort-key limit, and `delete`'s error
+        // channel has no `ValidationError` to carry one.
         const response = yield* client.batchWriteItem({
           RequestItems: { [tableName]: pending as Array<never> },
         })

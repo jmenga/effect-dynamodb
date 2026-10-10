@@ -12,7 +12,7 @@
  * drift, and support added here (e.g. `EntityUpdate`) lands for both at once.
  */
 
-import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import type {
   ConcurrentModification,
   OptimisticLockError,
@@ -35,13 +35,13 @@ import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
 import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
-import { ITEM_MAX_BYTES, TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./ItemSize.js"
 import {
   composePrimaryKey,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
+import { rangeKeysOf, type TransactItemTarget, transactItemTarget } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
 // ConditionCheck — composable from EntityGet + condition expression
@@ -65,6 +65,8 @@ export interface ConditionCheckOp {
 
 /** A single marshalled entry of a `TransactWriteItems` call. */
 export type { TransactWriteItem }
+
+export { type TransactItemTarget, transactItemTarget }
 
 /**
  * Union of operations accepted by `transactWrite` and by `append`'s
@@ -138,66 +140,6 @@ const conditionFields = (condition: ExpressionResult | undefined) =>
           : {}),
       }
 
-/**
- * Refuse a transaction that DynamoDB would reject for its size — BEFORE it is
- * sent, naming the item at fault, rather than DynamoDB's bare
- * `ValidationException`, which names neither the item nor the cause:
- *
- * - an item over DynamoDB's 400 KB per-item limit ({@link ITEM_MAX_BYTES}),
- *   named by its source and key;
- * - items over the 4 MB aggregate limit, with the entity that contributes most
- *   named.
- *
- * Sizes are a LOWER bound by DynamoDB's item-size rules
- * ({@link transactItemBytes}), so a transaction DynamoDB would accept is never
- * refused; a retain put counts twice — its item and its snapshot carry the
- * same attributes.
- */
-export const refuseOversizedTransaction = (
-  items: ReadonlyArray<TransactWriteItem>,
-  targets: ReadonlyArray<TransactItemTarget>,
-  operation: string,
-): Effect.Effect<void, ValidationError> => {
-  let total = 0
-  let largest = { index: 0, bytes: -1 }
-  for (const [index, item] of items.entries()) {
-    const bytes = transactItemBytes(item)
-    if (bytes > ITEM_MAX_BYTES) {
-      const target = targets[index]
-      return Effect.fail(
-        new ValidationError({
-          entityType: target?.entityType ?? "unknown",
-          operation,
-          cause:
-            `${operation}: ` +
-            (target === undefined
-              ? `item ${index}`
-              : `the item of ${target.source}, at ${target.key},`) +
-            ` is at least ${bytes} bytes by DynamoDB's item-size rules, over its limit of ` +
-            `${ITEM_MAX_BYTES} bytes (400 KB) for one item. Nothing was written.`,
-        }),
-      )
-    }
-    total += bytes
-    if (bytes > largest.bytes) largest = { index, bytes }
-  }
-  if (total <= TRANSACT_WRITE_MAX_BYTES) return Effect.void
-  const target = targets[largest.index]
-  return Effect.fail(
-    new ValidationError({
-      entityType: target?.entityType ?? "unknown",
-      operation,
-      cause:
-        `${operation}: the transaction's ${items.length} items total at least ${total} bytes ` +
-        `by DynamoDB's item-size rules, over its limit of ${TRANSACT_WRITE_MAX_BYTES} bytes (4 MB) for one ` +
-        "transaction. The largest is " +
-        (target === undefined ? "" : `${target.source}'s, at ${target.key}, `) +
-        `${largest.bytes} bytes. A put of a retain entity counts twice: its item and its ` +
-        "version snapshot. Split the operations into smaller transactions. Nothing was written.",
-    }),
-  )
-}
-
 // ---------------------------------------------------------------------------
 // buildTransactWriteItems
 // ---------------------------------------------------------------------------
@@ -245,52 +187,16 @@ export interface BuiltTransactWriteItems {
   /** Parallel to `items`: the item each one writes, for {@link refuseRepeatedItems}. */
   readonly targets: Array<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
+  /**
+   * The sort-key attributes the ops' entities write (primary and index), for
+   * diagnosing a rejected sort key. A thunk: needed only on failure.
+   */
+  readonly rangeKeys: () => ReadonlyArray<string>
 }
 
 // ---------------------------------------------------------------------------
 // One op per item (#133)
 // ---------------------------------------------------------------------------
-
-/** The item a transact entry writes or checks, and how to name it in an error. */
-export interface TransactItemTarget {
-  /** Its table and primary key, as one comparable string. */
-  readonly identity: string
-  /** The entity (or stream) it belongs to. */
-  readonly entityType: string
-  /** What put it in the transaction: `operation 2 (User)`, `the event at version 4`. */
-  readonly source: string
-  /** The key, readable: `pk=…, sk=…`. */
-  readonly key: string
-}
-
-/**
- * The target of a transact entry in `tableName`, keyed by `keyFields` (the
- * table's primary key attributes): read from a Put's item, or any other
- * entry's `Key`.
- */
-export const transactItemTarget = (
-  item: TransactWriteItem,
-  tableName: string,
-  keyFields: ReadonlyArray<string>,
-  entityType: string,
-  source: string,
-): TransactItemTarget => {
-  const attributes: Record<string, AttributeValue> | undefined =
-    item.Put?.Item ?? item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key
-  const parts = keyFields.map((field) => {
-    const value = attributes?.[field]
-    return { field, value, text: value?.S ?? value?.N ?? JSON.stringify(value ?? null) }
-  })
-  return {
-    identity: [
-      tableName,
-      ...parts.map((p) => `${p.field}=${JSON.stringify(p.value ?? null)}`),
-    ].join("\u0000"),
-    entityType,
-    source,
-    key: parts.map((p) => `${p.field}=${p.text}`).join(", "),
-  }
-}
 
 /**
  * Refuse a transaction that writes (or checks) one item more than once —
@@ -344,9 +250,10 @@ export const refuseRepeatedItems = (
  * Refuses items that repeat one item ({@link refuseRepeatedItems}) among those
  * it builds; a caller adding items of its own checks them against `targets`.
  *
- * Does NOT enforce `TRANSACT_WRITE_ITEMS_LIMIT` — the caller counts, because the
- * total may include items this builder never sees (event puts, dedup sentinels).
- * Callers must count the EXPANDED `items.length`, not `operations.length`.
+ * DynamoDB's limits (100 items, 4 MB, 400 KB per item, 1024-byte sort keys)
+ * are not pre-checked: the caller sends the transaction and diagnoses
+ * DynamoDB's rejection through `internal/WriteDiagnosis.ts`, which counts the
+ * EXPANDED items and names the culprit through `targets` (and `rangeKeys`).
  */
 export const buildTransactWriteItems = (
   operations: ReadonlyArray<TransactWriteOp>,
@@ -357,7 +264,9 @@ export const buildTransactWriteItems = (
   TableConfig | DynamoClient
 > =>
   Effect.gen(function* () {
-    if (operations.length === 0) return { items: [], provenance: [], targets: [], guarded: [] }
+    if (operations.length === 0) {
+      return { items: [], provenance: [], targets: [], guarded: [], rangeKeys: () => [] }
+    }
 
     const opInfos: Array<{
       type: "put" | "delete" | "conditionCheck"
@@ -523,7 +432,10 @@ export const buildTransactWriteItems = (
     }
 
     yield* refuseRepeatedItems(targets, operation)
-    return { items, provenance, targets, guarded }
+    const rangeKeys = () => [
+      ...new Set(opInfos.flatMap((op) => rangeKeysOf(op.entity.indexes as never))),
+    ]
+    return { items, provenance, targets, guarded, rangeKeys }
   })
 
 // ---------------------------------------------------------------------------

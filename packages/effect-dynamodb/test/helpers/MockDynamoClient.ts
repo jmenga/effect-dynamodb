@@ -136,3 +136,40 @@ export const applyUpdate = (
   for (const clause of removes) delete next[names[clause]!]
   return next
 }
+
+/**
+ * DynamoDB's request-wide `ValidationException`, as the AWS SDK throws it —
+ * for mocks reproducing a rejection the library diagnoses (#144). Wordings
+ * observed on DynamoDB Local:
+ *
+ * - `"Item size has exceeded the maximum allowed size"` (PutItem, a transaction
+ *   or batch holding an oversized Put)
+ * - `"Item size to update has exceeded the maximum allowed size"` (UpdateItem)
+ * - `"… Member must have length less than or equal to 100"` (101+ transact items)
+ * - `"Transaction payload size cannot exceed 4MB. Payload Size: N"`
+ * - `"One or more parameter values were invalid: Size limit exceeded"` (sort key)
+ */
+export const awsValidationException = (message: string): Error =>
+  Object.assign(new Error(message), { name: "ValidationException" })
+
+/** DynamoDB's `TransactionCanceledException`, with positional reasons. */
+export const awsTransactionCanceled = (
+  reasons: ReadonlyArray<{ readonly Code?: string; readonly Message?: string } | undefined>,
+): Error =>
+  Object.assign(new Error("Transaction cancelled"), {
+    name: "TransactionCanceledException",
+    CancellationReasons: reasons,
+  })
+
+/** Messages of DynamoDB's limit rejections, as DynamoDB Local words them. */
+export const DDB_ITEM_SIZE = "Item size has exceeded the maximum allowed size"
+export const DDB_ITEM_SIZE_UPDATE = "Item size to update has exceeded the maximum allowed size"
+export const DDB_TOO_MANY_ITEMS =
+  "1 validation error detected: Value '[...]' at 'transactItems' failed to satisfy constraint: " +
+  "Member must have length less than or equal to 100"
+export const ddbPayloadTooLarge = (bytes: number): string =>
+  `Transaction payload size cannot exceed 4MB. Payload Size: ${bytes}`
+export const DDB_SORT_KEY_LOCAL = "One or more parameter values were invalid: Size limit exceeded"
+export const DDB_SORT_KEY_AWS =
+  "One or more parameter values were invalid: Aggregated size of all range keys has exceeded " +
+  "the size limit of 1024 bytes"

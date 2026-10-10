@@ -37,7 +37,6 @@ import {
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   type OptimisticLockError,
-  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   type UniqueConstraintViolation,
   ValidationError,
@@ -61,13 +60,18 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
-  refuseOversizedTransaction,
   refuseRepeatedItems,
   type TransactItemTarget,
   type TransactWriteItem,
   type TransactWriteOp,
   transactItemTarget,
 } from "./internal/TransactWriteOps.js"
+import {
+  type Diagnosis,
+  diagnosedValidationError,
+  diagnoseFailure,
+  withCause,
+} from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import {
@@ -488,8 +492,10 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
  * - `undefined` leaves the event out of the index (a sparse index).
  * - An empty string (or any other value) fails the append with
  *   `ValidationError` before anything is written — DynamoDB rejects empty key
- *   values. So do a key over DynamoDB's 1024-byte sort-key limit and a `key`
- *   that throws.
+ *   values — as does a `key` that throws. A key over DynamoDB's 1024-byte
+ *   sort-key limit is sent and rejected by DynamoDB; the append then fails
+ *   with `ValidationError` naming the index and the event (#144), and nothing
+ *   is written.
  *
  * The key is derived only when an event is appended. Events are never
  * rewritten, so changing `key` later leaves events already stored under their
@@ -594,9 +600,6 @@ export type ReadIndexOptions = {
   | { readonly beginsWith?: string | undefined; readonly between?: undefined }
   | { readonly between?: readonly [string, string] | undefined; readonly beginsWith?: undefined }
 )
-
-/** @internal DynamoDB's limit on a sort key value, which an index key is. */
-const MAX_INDEX_SORT_KEY_BYTES = 1024
 
 /** @internal */
 const utf8 = new TextEncoder()
@@ -1140,7 +1143,7 @@ export interface EventStream<
  */
 interface AppendTransaction {
   readonly items: Array<TransactWriteItem>
-  /** Parallel to `items`, for `refuseRepeatedItems` / `refuseOversizedTransaction`. */
+  /** Parallel to `items`, for `refuseRepeatedItems` and the failure-time write diagnosis. */
   readonly targets: Array<TransactItemTarget>
   readonly guardCount: number
   readonly eventCount: number
@@ -1513,7 +1516,10 @@ export const makeStream = <
    * An event's key in a stream index (#140): a non-empty string, or
    * `undefined` to leave the event out. Anything else — an empty string
    * (DynamoDB rejects empty key values), another type, a `key` that throws —
-   * is a `ValidationError`, raised before anything is written.
+   * is a `ValidationError`, raised before anything is written. A key over
+   * DynamoDB's 1024-byte sort-key limit is not pre-checked: DynamoDB rejects
+   * the append and the rejection is diagnosed, naming the index and event
+   * (see `sendAppendTransaction`).
    */
   const deriveIndexKey = (
     idx: ResolvedStreamIndex,
@@ -1541,11 +1547,6 @@ export const makeStream = <
           return refuse(
             "must be a non-empty string or undefined; received " +
               (typeof derived === "string" ? "an empty string" : String(derived)),
-          )
-        }
-        if (utf8.encode(derived).length > MAX_INDEX_SORT_KEY_BYTES) {
-          return refuse(
-            `is longer than DynamoDB's ${MAX_INDEX_SORT_KEY_BYTES}-byte limit for a sort key`,
           )
         }
         return Effect.succeed(derived)
@@ -1658,7 +1659,68 @@ export const makeStream = <
           )
         },
       ),
+      // DynamoDB's limits are not pre-checked (#144): a rejection the
+      // conditional mapping above could not explain is diagnosed against the
+      // transaction sent, naming the event, sentinel, snapshot or additional
+      // item at fault. Over 100 items is `AppendTooLarge`, with the EXPANDED
+      // count.
+      diagnoseFailure({
+        sent: () => ({ _tag: "Transaction", items: tx.items, targets: () => tx.targets }),
+        rangeKeys: () => [
+          "sk",
+          ...streamIndexes.map((idx) => idx.sk),
+          ...tx.additional.rangeKeys(),
+        ],
+        rewrite: (diagnosis, original): AppendTooLarge | ValidationError =>
+          diagnosis._tag === "TooManyItems"
+            ? new AppendTooLarge({
+                streamName: config.streamName,
+                streamId: streamIdStr,
+                count: diagnosis.count,
+                limit: diagnosis.limit,
+                cause: original,
+              })
+            : appendLimitError(diagnosis, original, tx),
+      }),
     )
+
+  /**
+   * A diagnosed rejection of an append (#144) other than its item count. An
+   * over-long stream-index key OF AN EVENT is named by its index and event, as
+   * the `indexes` option reports its other key problems. Only the event puts
+   * carry stream-index keys: an additional item writing the same physical
+   * attribute (single-table designs share `gsi1sk` and the like) is its own
+   * entity's key, and is named as any other item.
+   */
+  const appendLimitError = (
+    diagnosis: Diagnosis,
+    original: unknown,
+    tx: AppendTransaction,
+  ): ValidationError => {
+    if (diagnosis._tag === "SortKeyTooLong") {
+      const position = tx.targets.indexOf(diagnosis.target)
+      const isEvent = position >= tx.guardCount && position < tx.guardCount + tx.eventCount
+      const idx = isEvent
+        ? streamIndexes.find((candidate) => candidate.sk === diagnosis.attribute)
+        : undefined
+      if (idx !== undefined) {
+        return new ValidationError({
+          entityType,
+          operation: "EventStore.append.indexes",
+          cause: withCause(
+            `The key of index "${idx.name}" for ${diagnosis.target.source} is ` +
+              `${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a sort key. ` +
+              "Nothing was written.",
+            original,
+          ),
+        })
+      }
+    }
+    return diagnosedValidationError(diagnosis, original, {
+      operation: "EventStore.append",
+      entityType,
+    })
+  }
 
   const append = (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -1749,33 +1811,11 @@ export const makeStream = <
         })
       }
 
-      // Guard: every item the transaction will carry — one Put per event, the
-      // items each caller-supplied additional op compiles to, the idempotency
-      // sentinel, the inline snapshot, and the version-contiguity
-      // ConditionCheck when expectedVersion > 0 — must fit DynamoDB's
-      // TransactWriteItems limit. Never split: splitting would break append
-      // atomicity (a large command is stepped by the application instead — one
-      // command, one decision, one atomic append).
-      //
-      // This first check is a LOWER BOUND, counting one item per additional op.
-      // Expansion (uniqueness sentinels, version snapshots — #113) only ever
-      // adds items, so an append that already fails here can never fit, and
-      // failing now keeps an oversized append free. The authoritative check runs
-      // once the ops are compiled, below.
+      // DynamoDB's 100-item limit on one transaction is not pre-checked
+      // (#144): an append is never split — splitting would break its
+      // atomicity — so one over the limit is rejected whole by DynamoDB and
+      // reported as `AppendTooLarge`, with the expanded item count.
       const needsContiguityCheck = expectedVersion > 0 && events.length > 0
-      const fixedItems =
-        events.length +
-        (idempotency !== undefined ? 1 : 0) +
-        (snapshotState !== undefined ? 1 : 0) +
-        (needsContiguityCheck ? 1 : 0)
-      if (fixedItems + additionalOps.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-        return yield* new AppendTooLarge({
-          streamName: config.streamName,
-          streamId: streamIdStr,
-          count: fixedItems + additionalOps.length,
-          limit: TRANSACT_WRITE_ITEMS_LIMIT,
-        })
-      }
 
       const client = yield* DynamoClient
       const tableConfig = yield* config.table.Tag
@@ -2034,26 +2074,13 @@ export const makeStream = <
         )
         const tx = layout(additional)
 
-        // Authoritative cap check: one additional op can compile to several
-        // items (#113), so the pre-flight lower bound above is not sufficient.
-        // Reporting the EXPANDED count is the point — "you passed 40 items"
-        // when the caller passed 30 ops is baffling without it.
-        if (tx.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-          return yield* new AppendTooLarge({
-            streamName: config.streamName,
-            streamId: streamIdStr,
-            count: tx.items.length,
-            limit: TRANSACT_WRITE_ITEMS_LIMIT,
-          })
-        }
-
         // Checked before anything is sent: one op per item — an additional
         // item repeating an event, the contiguity check, the idempotency
         // sentinel or the inline snapshot is refused, as additional items
-        // repeating each other are — and the transaction within DynamoDB's
-        // 4 MB (#133).
+        // repeating each other are (#133). DynamoDB's own limits — 100 items,
+        // 4 MB, 400 KB per item, 1024-byte sort keys — are diagnosed from its
+        // rejection instead (#144).
         yield* refuseRepeatedItems(tx.targets, "EventStore.append")
-        yield* refuseOversizedTransaction(tx.items, tx.targets, "EventStore.append")
 
         const outcome = yield* sendAppendTransaction(
           client,
@@ -2200,22 +2227,42 @@ export const makeStream = <
         timestamp: now,
       }
 
-      yield* client
-        .putItem({
-          TableName: tableName,
-          Item: toAttributeMap(item),
-          // Monotonic: never regress the cache. Losing this race is a no-op,
-          // not an error — the events it summarises are already durable.
-          ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
-          ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
-          ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
-        })
-        .pipe(
-          Effect.catchIf(
-            (error) => isAwsConditionalCheckFailed(error.cause),
-            () => Effect.void,
-          ),
-        )
+      const put = {
+        TableName: tableName,
+        Item: toAttributeMap(item),
+        // Monotonic: never regress the cache. Losing this race is a no-op,
+        // not an error — the events it summarises are already durable.
+        ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
+        ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
+        ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
+      }
+      yield* client.putItem(put).pipe(
+        Effect.catchIf(
+          (error) => isAwsConditionalCheckFailed(error.cause),
+          () => Effect.void,
+        ),
+        // An oversized snapshot is DynamoDB's to reject (#144); named here.
+        diagnoseFailure({
+          sent: () => ({
+            _tag: "Item",
+            item: { Put: put },
+            target: () =>
+              transactItemTarget(
+                { Put: put },
+                tableName,
+                ["pk", "sk"],
+                snapshotEntityType,
+                "the snapshot",
+              ),
+          }),
+          rangeKeys: () => ["sk"],
+          rewrite: (diagnosis, original) =>
+            diagnosedValidationError(diagnosis, original, {
+              operation: "EventStore.writeSnapshot",
+              entityType: snapshotEntityType,
+            }),
+        }),
+      )
     }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
@@ -3077,6 +3124,29 @@ export type EventMetadataInput<State, Event, TMetadata, E3 = never, R3 = never> 
   | Effect.Effect<ReadonlyArray<TMetadata | undefined>, E3, R3>
 
 /**
+ * The form {@link CommandOptionsBase.eventTimestamps} accepts: a function of
+ * the {@link Decision} returning one timestamp per event (`undefined` keeps
+ * the append's `Clock` time), directly or as an `Effect` — exactly as
+ * {@link EventMetadataInput}. The effect's `E4` joins the handler's error
+ * channel and its `R4` the handler's requirements.
+ *
+ * Function-only: the number of events is known only once `decide` has run.
+ * The `Effect` form lets times come from a service (a source log, a
+ * per-tenant clock) or from `Clock`, which keeps them deterministic under
+ * `TestClock`.
+ *
+ * `E4` / `R4` are separate from `eventMetadata`'s `E3` / `R3`: with one shared
+ * pair, an `eventMetadata` effect and an `eventTimestamps` effect with
+ * different error types would not compile — TypeScript fixes the parameter
+ * from one candidate and rejects the other instead of inferring a union.
+ */
+export type EventTimestampsInput<State, Event, E4 = never, R4 = never> = (
+  decision: Decision<State, Event>,
+) =>
+  | ReadonlyArray<DateTime.DateTime | undefined>
+  | Effect.Effect<ReadonlyArray<DateTime.DateTime | undefined>, E4, R4>
+
+/**
  * The per-call metadata of a {@link commandHandler} handler: one value shared
  * by every event (`metadata`), or a function deriving one entry per event from
  * the decision (`eventMetadata`) — never both (see
@@ -3129,7 +3199,14 @@ export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = nev
  * The options of a {@link commandHandler} handler other than its metadata
  * (see {@link CommandMetadataOptions}).
  */
-export interface CommandOptionsBase<State = unknown, Event = unknown, E2 = never, R2 = never> {
+export interface CommandOptionsBase<
+  State = unknown,
+  Event = unknown,
+  E2 = never,
+  R2 = never,
+  E4 = never,
+  R4 = never,
+> {
   /**
    * Identifier for this command delivery. Required when the handler was created
    * with `idempotency`; a replayed id fails with `DuplicateCommand` — also when
@@ -3178,30 +3255,37 @@ export interface CommandOptionsBase<State = unknown, Event = unknown, E2 = never
   readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
   /**
    * Per-event timestamps derived from the {@link Decision}: the function
-   * returns one entry per event, in order, and entry `i` is written as event
-   * `i`'s `timestamp` — `undefined` keeps the append's `Clock` time (see
+   * returns one entry per event, in order, directly or as an `Effect` (see
+   * {@link EventTimestampsInput}), and entry `i` is written as event `i`'s
+   * `timestamp` — `undefined` keeps the append's `Clock` time (see
    * {@link AppendOptionsBase.eventTimestamps}). Independent of `metadata` /
-   * `eventMetadata`.
+   * `eventMetadata`. The idempotency sentinel, its TTL and an inline snapshot
+   * keep the append's `Clock` time; timestamps carry no ordering check.
    *
-   * - Returns the array directly — there is no `Effect` form: the times come
-   *   from the command or the events, and the effectful source of a time,
-   *   the `Clock`, is already the default.
-   * - Runs after `eventMetadata` and before `additionalItems`, receiving the
-   *   same `Decision`; not called when `decide` returns no events; re-run on
-   *   every attempt, as `eventMetadata` is.
-   * - A result of the wrong length, or with an entry that is neither a valid
-   *   `DateTime` (finite epoch) nor `undefined`, fails with `ValidationError`
+   * - Runs after `eventMetadata` and before `additionalItems`, each to
+   *   completion before the next, all receiving the same `Decision`; not
+   *   called when `decide` returns no events; re-run on every attempt — each
+   *   `VersionConflict` retry and the re-decision a stale unverified snapshot
+   *   triggers — as `eventMetadata` is.
+   * - A failure of the returned `Effect` surfaces as is, is not retried, and
+   *   `additionalItems` is not run.
+   * - A result — plain or produced by the `Effect` — of the wrong length, or
+   *   with an entry that is neither a valid `DateTime` (finite epoch) nor
+   *   `undefined`, fails with `ValidationError`
    *   (`operation: "EventStore.commandHandler.eventTimestamps"`), never
    *   retried. A value that is not a function is refused before anything is
    *   read.
    *
    * ```ts
+   * // plain: the times are in the events
    * eventTimestamps: ({ events }) => events.map((event) => event.occurredAt)
+   *
+   * // Effect: the times come from a service
+   * eventTimestamps: ({ events }) =>
+   *   Effect.forEach(events, (event) => SourceLog.originalTime(event.sourceId))
    * ```
    */
-  readonly eventTimestamps?: (
-    decision: Decision<State, Event>,
-  ) => ReadonlyArray<DateTime.DateTime | undefined>
+  readonly eventTimestamps?: EventTimestampsInput<State, Event, E4, R4>
 }
 
 /**
@@ -3209,11 +3293,12 @@ export interface CommandOptionsBase<State = unknown, Event = unknown, E2 = never
  * {@link CommandOptionsBase} plus the exclusive `metadata` / `eventMetadata`
  * pair ({@link CommandMetadataOptions}).
  *
- * `State` / `Event` type the {@link Decision} a function-form `additionalItems`
- * or `eventMetadata` receives; `E2` / `R2` are the error and requirements of
- * the `Effect` `additionalItems` may return, `E3` / `R3` those of the `Effect`
- * `eventMetadata` may return — separate, so two effects with different error
- * types both join the handler's error channel. The handler infers all of
+ * `State` / `Event` type the {@link Decision} a function-form `additionalItems`,
+ * `eventMetadata` or `eventTimestamps` receives; `E2` / `R2` are the error and
+ * requirements of the `Effect` `additionalItems` may return, `E3` / `R3` those
+ * of the `Effect` `eventMetadata` may return, `E4` / `R4` those of the
+ * `Effect` `eventTimestamps` may return — separate, so effects with different
+ * error types all join the handler's error channel. The handler infers all of
  * them, so they only need naming when this type is written out by hand.
  */
 export type CommandOptions<
@@ -3224,7 +3309,9 @@ export type CommandOptions<
   R2 = never,
   E3 = never,
   R3 = never,
-> = CommandOptionsBase<State, Event, E2, R2> &
+  E4 = never,
+  R4 = never,
+> = CommandOptionsBase<State, Event, E2, R2, E4, R4> &
   CommandMetadataOptions<TMetadata, State, Event, E3, R3>
 
 /** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
@@ -3236,7 +3323,11 @@ export type IdempotentCommandOptions<
   R2 = never,
   E3 = never,
   R3 = never,
-> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3> & { readonly commandId: string }
+  E4 = never,
+  R4 = never,
+> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3, E4, R4> & {
+  readonly commandId: string
+}
 
 /**
  * Options arity: configuring `idempotency` makes the handler's options parameter
@@ -3252,9 +3343,11 @@ type CommandOptionsArgs<
   R2,
   E3,
   R3,
+  E4,
+  R4,
 > = TConfig extends { readonly idempotency: object }
-  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3>]
-  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3> | undefined]
+  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4>]
+  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4> | undefined]
 
 type CommandHandlerErrors<E> =
   | E
@@ -3272,8 +3365,8 @@ type CommandHandlerErrors<E> =
 /**
  * A handler over an {@link EventStream}. Generic per call over the error (`E2`)
  * and requirements (`R2`) of a function-form `additionalItems` that returns an
- * `Effect`, and those (`E3` / `R3`) of an `eventMetadata` that does; all are
- * `never` otherwise.
+ * `Effect`, those (`E3` / `R3`) of an `eventMetadata` that does, and those
+ * (`E4` / `R4`) of an `eventTimestamps` that does; all are `never` otherwise.
  */
 type CommandHandler<
   State,
@@ -3283,20 +3376,20 @@ type CommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never, E3 = never, R3 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2 | E3,
-  DynamoClient | TableConfig | R2 | R3
+  CommandHandlerErrors<E> | E2 | E3 | E4,
+  DynamoClient | TableConfig | R2 | R3 | R4
 >
 
 /**
  * A handler over a {@link BoundEventStream}: the stream's services are already
- * provided, so the `R2` / `R3` of a function-form `additionalItems` /
- * `eventMetadata` are its only requirements.
+ * provided, so the `R2` / `R3` / `R4` of a function-form `additionalItems` /
+ * `eventMetadata` / `eventTimestamps` are its only requirements.
  */
 type BoundCommandHandler<
   State,
@@ -3306,11 +3399,15 @@ type BoundCommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never, E3 = never, R3 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3>
-) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E> | E2 | E3, R2 | R3>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
+) => Effect.Effect<
+  CommandHandlerResult<State, TEvent>,
+  CommandHandlerErrors<E> | E2 | E3 | E4,
+  R2 | R3 | R4
+>
 
 /**
  * The handler the data-last {@link commandHandler} returns for stream `S`: a
@@ -3351,6 +3448,16 @@ const deriveEventMetadata = <State, Event, TMetadata>(
   input: EventMetadataInput<State, Event, TMetadata, unknown, unknown> | undefined,
   decision: Decision<State, Event>,
 ): Effect.Effect<ReadonlyArray<TMetadata | undefined> | undefined, unknown, unknown> => {
+  if (input === undefined) return Effect.succeed(undefined)
+  const derived = input(decision)
+  return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
+}
+
+/** @internal Resolve a {@link CommandOptionsBase.eventTimestamps} against a decision. */
+const deriveEventTimestamps = <State, Event>(
+  input: EventTimestampsInput<State, Event, unknown, unknown> | undefined,
+  decision: Decision<State, Event>,
+): Effect.Effect<ReadonlyArray<DateTime.DateTime | undefined> | undefined, unknown, unknown> => {
   if (input === undefined) return Effect.succeed(undefined)
   const derived = input(decision)
   return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
@@ -3398,7 +3505,17 @@ const makeCommandHandlerImpl = <
     streamId: StreamIdInput<TStreamIdFields>,
     command: Command,
     callOptions?:
-      | CommandOptions<TMetadata, State, TEvent, unknown, unknown, unknown, unknown>
+      | CommandOptions<
+          TMetadata,
+          State,
+          TEvent,
+          unknown,
+          unknown,
+          unknown,
+          unknown,
+          unknown,
+          unknown
+        >
       | undefined,
   ) => {
     const expectedVersion = callOptions?.expectedVersion
@@ -3519,12 +3636,10 @@ const makeCommandHandlerImpl = <
               "one entry (or undefined) per event, in order. Nothing was written.",
           })
         }
-        // A plain function (checked before the load): its result is checked
-        // here, so the error names the handler's option rather than `append`'s.
-        const eventTimestamps =
-          callOptions?.eventTimestamps === undefined
-            ? undefined
-            : callOptions.eventTimestamps(decision)
+        // A function (checked before the load), returning the array or an
+        // `Effect` of it; the result of either form is checked here, so the
+        // error names the handler's option rather than `append`'s.
+        const eventTimestamps = yield* deriveEventTimestamps(callOptions?.eventTimestamps, decision)
         if (callOptions?.eventTimestamps !== undefined) {
           const problem = eventTimestampsProblem(
             eventTimestamps,
@@ -3878,6 +3993,12 @@ const makeCommandHandlerImpl = <
  * yield* handle({ matchId: "m-1" }, command, {
  *   eventTimestamps: ({ events }) => events.map((event) => event.occurredAt),
  * })
+ *
+ * // ...or from a service, as an Effect (its errors / requirements join the handler's)
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventTimestamps: ({ events }) =>
+ *     Effect.forEach(events, (event) => SourceLog.originalTime(event.sourceId)),
+ * })
  * ```
  *
  * Each invocation runs
@@ -3903,8 +4024,8 @@ const makeCommandHandlerImpl = <
  *   fresh snapshot is written (best-effort) after a successful append once the
  *   cadence threshold is crossed. See {@link SnapshotMode}.
  * - **One atomic append.** One command, one decision, one append: a decision
- *   too large for one transaction fails with `AppendTooLarge` before anything
- *   is written. A large command is split by the application into stepped
+ *   too large for one transaction is rejected whole by DynamoDB and fails with
+ *   `AppendTooLarge` — nothing is written. A large command is split by the application into stepped
  *   commands — each an ordinary call, chained by `expectedVersion` — so a
  *   failure partway leaves the stream at a real intermediate state.
  *
