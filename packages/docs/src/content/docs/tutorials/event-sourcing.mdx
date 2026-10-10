@@ -18,6 +18,7 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Inline snapshots and single-request state loads (`readLatest`)
 - Large commands as stepped commands, each one atomic append
 - Stream indexes: sub-streams ordered by a key derived from each event
+- Event metadata: one value per append, or one entry per event
 
 ---
 
@@ -257,7 +258,7 @@ The handler returns `{ state, version, events }`, where `state` is the fold from
 `append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
 
 - **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append that would exceed the limit fails upfront with a typed `AppendTooLarge` error — before any request is issued. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
-- **4 MB total payload per transaction.** An append whose items pass it fails with a `ValidationError`, also before anything is sent. Keep event payloads small; large blobs belong in S3 with a reference in the event.
+- **4 MB total payload per transaction, 400 KB per item.** An append whose items pass 4 MB, or with any one item over 400 KB, fails with a `ValidationError`, also before anything is sent; the per-item error names the item (`the event at version 2`, say) and its key. Keep event payloads small; large blobs belong in S3 with a reference in the event.
 
 An append is **never split** across transactions, because splitting breaks its atomicity. If a command legitimately decides more than one transaction holds, split it into [stepped commands](#step-18-large-commands--stepped-commands): one command, one decision, one atomic append.
 
@@ -585,7 +586,7 @@ A **put** of a `versioned` or `unique`-constrained entity is written exactly as 
 
 The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
 
-DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. So does an append whose items pass DynamoDB's 4 MB limit; a `retain` put counts twice (its item and its snapshot).
+DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. So does an append whose items pass DynamoDB's 4 MB limit, or that holds an item over its 400 KB limit; a `retain` put counts twice towards the 4 MB (its item and its snapshot).
 
 ### Telling the failures apart
 
@@ -1157,6 +1158,148 @@ const firstInnings = yield* scorecards.provide(
 
 ---
 
+## Step 20: Event Metadata
+
+An event records what happened in the domain. Facts *about* the event, such as the request that caused it, an id a publisher sends it under, or its id in the store it was imported from, are metadata. Declare a metadata schema on the stream and every event item can carry a `metadata` attribute, encoded through that schema on the way in and decoded into `StreamEvent.metadata` on the way out:
+
+```typescript title="stream.ts" region="metadata-stream" example="event-sourcing.ts"
+// Facts about an event that are not part of the domain event itself.
+const AuditMetadata = Schema.Struct({
+  // The request that produced the event: shared by every event it appends.
+  correlationId: Schema.String,
+  // An id of the event's own, e.g. a publisher's message id.
+  eventId: Schema.optionalKey(Schema.String),
+  // For an imported event: its id in the store it came from.
+  sourceId: Schema.optionalKey(Schema.String),
+})
+
+const AuditedMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "AuditedMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  metadata: AuditMetadata,
+})
+```
+
+### Metadata shared by the append
+
+`metadata` takes one value for the whole append and writes a copy onto every event. It suits facts about the command, like a correlation id:
+
+```typescript region="append-metadata" example="event-sourcing.ts"
+const audited = yield* EventStore.bind(AuditedMatchEvents)
+
+// One value for the whole append: every event carries a copy.
+yield* audited.append(
+  { matchId: "m-20" },
+  [
+    new MatchStarted({ venue: "WACA", homeTeam: "AUS", awayTeam: "SL" }),
+    new InningsCompleted({ innings: 1, runs: 301, wickets: 9 }),
+  ],
+  0,
+  { metadata: { correlationId: "req-81c2" } },
+)
+// → v1 and v2 both carry { correlationId: "req-81c2" }
+```
+
+### Metadata per event
+
+Some metadata belongs to one event, not to the append. `eventMetadata` takes one entry per event, in the same order as `events`: entry `i` is written onto event `i` and read back as that event's `metadata`. An `undefined` entry writes its event without a `metadata` attribute, exactly as an append without metadata does:
+
+```typescript region="event-metadata" example="event-sourcing.ts"
+// An import from a previous store: each event keeps its original id.
+yield* audited.append(
+  { matchId: "m-21" },
+  [
+    new MatchStarted({ venue: "Kensington Oval", homeTeam: "WI", awayTeam: "ENG" }),
+    new InningsCompleted({ innings: 1, runs: 202, wickets: 10 }),
+    new InningsCompleted({ innings: 2, runs: 205, wickets: 4 }),
+  ],
+  0,
+  {
+    eventMetadata: [
+      { correlationId: "import-17", sourceId: "legacy-118" },
+      // `undefined`: this event is written without metadata.
+      undefined,
+      { correlationId: "import-17", sourceId: "legacy-121" },
+    ],
+  },
+)
+
+// Each event reads back with its own entry.
+const importedEvents = yield* audited.read({ matchId: "m-21" })
+const sourceIds = importedEvents.map((event) => event.metadata?.sourceId)
+// → ["legacy-118", undefined, "legacy-121"]
+```
+
+- Each defined entry is encoded through the metadata schema, as `metadata` is. An entry that fails fails the append with a `ValidationError` whose `operation` names its index (`EventStore.append.eventMetadata[1]`).
+- `metadata` and `eventMetadata` are **mutually exclusive**. Passing both is a type error, and a `ValidationError` for callers the types do not reach. For shared and per-event fields together, spread the shared ones into each entry: `events.map(() => ({ ...shared, eventId }))`.
+- An `eventMetadata` whose length differs from `events` fails with a `ValidationError` before anything is sent, even when `events` is empty.
+- The read side needs nothing new. `read`, `readFrom`, `readLatest` and `readIndex` already decode each item's own `metadata`.
+
+### Metadata from the command handler
+
+A handler's per-call `metadata` is fixed before `decide` runs, so it cannot know how many events it must cover. Its `eventMetadata` is a function of the [`Decision`](#step-16-inline-projections), the same one a function-form `additionalItems` receives, returning one entry per event directly or as an `Effect`:
+
+```typescript region="handler-event-metadata" example="event-sourcing.ts"
+const handleAudited = EventStore.commandHandler(matchDecider, audited)
+
+// Minted through Clock and Random, so a TestClock and a seeded Random make
+// the ids deterministic in tests.
+const mintEventId = Effect.gen(function* () {
+  const millis = yield* Clock.currentTimeMillis
+  const entropy = yield* Random.nextIntBetween(0, 2 ** 31)
+  return `evt-${millis.toString(36)}-${entropy.toString(36)}`
+})
+
+// A function of the decision: one entry per event `decide` returned.
+yield* handleAudited(
+  { matchId: "m-22" },
+  { _tag: "StartMatch", venue: "Adelaide Oval", homeTeam: "AUS", awayTeam: "WI" },
+  {
+    eventMetadata: ({ events }) =>
+      Effect.forEach(events, () =>
+        Effect.map(mintEventId, (eventId) => ({ correlationId: "req-5d0e", eventId })),
+      ),
+  },
+)
+
+// Ids minted per attempt are safe: a failed attempt writes nothing. But
+// without `idempotency`, a redelivery after a lost response appends again
+// with new ids. For ids stable across redeliveries, derive them from the
+// delivery id the caller holds.
+const deliveryId = "msg-4471"
+yield* handleAudited(
+  { matchId: "m-22" },
+  { _tag: "CompleteInnings", innings: 1, runs: 289, wickets: 10 },
+  {
+    eventMetadata: ({ events, version }) =>
+      events.map((_, i) => ({
+        correlationId: deliveryId,
+        eventId: `${deliveryId}:${version + i + 1}`,
+      })),
+  },
+)
+// → v2 carries eventId "msg-4471:2"
+```
+
+When it runs:
+
+```text
+load → [expectedVersion check] → decide → fold new events → eventMetadata → additionalItems → append → [snapshot]
+```
+
+- It runs after the new events are folded and **before** `additionalItems`, so an effectful pair runs in a predictable order. It is not called when `decide` returns no events.
+- It runs again on every attempt: each `VersionConflict` retry, and the second decision a stale snapshot triggers under `verifySnapshot: false`. Only the committed attempt's entries are ever written, so minting fresh ids per attempt is safe.
+- A result whose length differs from the decision's events fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`) before anything is sent. A failure of the returned `Effect` surfaces in the handler's error channel. Neither is retried.
+- With `idempotency`, a redelivered command fails with `DuplicateCommand` and never commits a second set of ids. Without it, a redelivery decides and appends again, and random ids differ between the two commits; derive them from the delivery id, as the second call does, when they must match.
+
+:::note[Why not pack a list into `metadata`?]
+Before `eventMetadata`, the only place for per-event values was a list inside the shared `metadata`, with each reader picking its entry by position. Every event then stores the whole list, so an append of N events stores N² entries, and a stream index (always projecting `ALL`) copies all of them. That cost counts towards DynamoDB's 400 KB item and 4 MB transaction limits. `eventMetadata` stores each entry once, on its own event.
+:::
+
+---
+
 ## Running the Example
 
 The complete runnable example is at [`examples/event-sourcing.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/event-sourcing.ts) in the repository.
@@ -1217,6 +1360,7 @@ Effect.runPromise(main).then(
 | **Inline snapshots** | `snapshot: { schema, mode: "inline" }` writes the snapshot in the append transaction; `readLatest` loads state in one `Query`, or, with `verifySnapshot: false` (inline without `every`), one `GetItem` of the snapshot with verified fallbacks |
 | **Stepped commands** | A command too large for one transaction is split by the application into fixed-size commands chained by `expectedVersion` — each one atomic |
 | **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
+| **Event metadata** | `makeStream({ metadata })` declares the schema; `append(..., { metadata })` shares one value, `{ eventMetadata }` gives each event its own entry; on a handler, `eventMetadata: (decision) => entries` derives them after `decide` |
 
 ## What's Next?
 

@@ -2206,7 +2206,12 @@ would accept is never refused, must not pass 4 MB =
 4,194,304 bytes, DynamoDB's documented aggregate limit for one transaction (in
 the binary megabytes of all its size limits). A retain put counts twice: its
 item and its snapshot. An oversized transaction is a `ValidationError` naming
-its largest item, not DynamoDB's bare `ValidationException`. Deletes of `unique` / retain / `softDelete`
+its largest item, not DynamoDB's bare `ValidationException`. In the same pass,
+any single item over 400 KB = 409,600 bytes (`ITEM_MAX_BYTES`), DynamoDB's
+per-item limit, measured by the same lower bound, is refused with a
+`ValidationError` naming that item's source and key (#144). The helper is shared,
+so `transactWrite` and `EventStore.append` both refuse it before anything is
+sent. Deletes of `unique` / retain / `softDelete`
 entities are still refused (EDD-9048): a transaction builds a delete from its
 key alone.
 
@@ -2863,6 +2868,10 @@ load → [expectedVersion check] → decide → fold new events → derive items
   static array or a function of the `Decision`
   (`{ events, state, previous, version }`) returning the ops or an `Effect` of
   them — an inline projection. See below.
+- **Decision-derived event metadata (#144).** `CommandOptions.eventMetadata`
+  takes a function of the same `Decision` returning one metadata entry per event
+  (or an `Effect` of them), passed to `append` as `eventMetadata`. See
+  [Event Metadata](#event-metadata-144).
 - **One atomic append.** One command → one decision → one atomic append. A
   decision too large for one transaction fails with `AppendTooLarge` before
   anything is written — see
@@ -2900,6 +2909,52 @@ decision left to the application; see the design doc §8). When `evolve` mutates
 and returns the same object, `previous` and `state` are the same reference and
 `previous` already reflects the new events; a projection that needs a pristine
 `previous` needs an `evolve` that returns new state.
+
+### Event Metadata (#144)
+
+Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md).
+An event item's `metadata` attribute holds metadata decoded and encoded through the
+stream's `metadata` schema (raw without one). `append` takes it in one of two forms,
+mutually exclusive (`AppendMetadataOptions`, a two-branch union, so both together is a
+compile error):
+
+```typescript
+// One value per append, copied onto every event
+yield* stream.append(streamId, [e1, e2], v, { metadata: { requestId } })
+// One entry per event, in order: item i stores entry i
+yield* stream.append(streamId, [e1, e2, e3], v, { eventMetadata: [m1, undefined, m3] })
+```
+
+- **`eventMetadata` on `append`.** `ReadonlyArray<M | undefined>`, paired with
+  `events` by position. An `undefined` entry writes no `metadata` attribute on that
+  event. Each defined entry is encoded like `metadata`; an encode failure is a
+  `ValidationError` with `operation: "EventStore.append.eventMetadata[<i>]"`.
+- **Validation runs first.** Both options given (`undefined` counts as absent) or a
+  length other than `events.length` is a `ValidationError`
+  (`operation: "EventStore.append.eventMetadata"`) before anything is read or written,
+  ahead of the zero-event fast path: `append(id, [], v, { eventMetadata: [m] })` fails,
+  and `{ eventMetadata: [] }` keeps the no-op.
+- **Size.** Each item carries only its own entry, so a per-event id costs N entries,
+  not the N² of a list packed into `metadata`. Items count towards the 4 MB check as
+  built, and an item over 400 KB is refused before sending (see Transaction size).
+- **`eventMetadata` on `commandHandler`.** Function-only (`EventMetadataInput`): a
+  static array cannot know the event count before `decide`. It takes the `Decision`
+  (`{ events, state, previous, version }`) and returns the entries or an `Effect` of
+  them, whose `E3` / `R3` join the handler's error channel and requirements (separate
+  from `additionalItems`' `E2` / `R2`, so the two may fail differently). It is
+  exclusive with per-call `metadata` (a compile error; a `ValidationError` before
+  anything is read for untyped callers, as is a non-function).
+- **When it runs.** After `decide` and the fold, **before** `additionalItems`; never
+  for a no-op decision; re-run on every `VersionConflict` retry and on the
+  re-decision a stale unverified snapshot triggers under `verifySnapshot: false`.
+  Ids minted per attempt are safe: a failed attempt writes nothing.
+- **Length mismatch.** A returned array whose length differs from `events.length`, or
+  a result that is not an array, is a `ValidationError`
+  (`operation: "EventStore.commandHandler.eventMetadata"`), never retried; nothing is
+  written.
+
+The read side is unchanged: `StreamEvent.metadata` decodes each item's own attribute,
+so `read`, `readFrom`, `readLatest` and stream-index queries return each event's entry.
 
 ### Snapshots
 
@@ -3052,7 +3107,8 @@ An append is always one `TransactWriteItems`: it is never split. An append recei
 transactions it would have no valid intermediate states to put at the boundaries (no
 snapshot, projection or sentinel that is true there). Only the application's decider can
 produce a valid state for each boundary. An append over 100 items fails with
-`AppendTooLarge` (or over 4 MB with `ValidationError`) before anything is written.
+`AppendTooLarge` (or over 4 MB, or with any item over 400 KB, with `ValidationError`)
+before anything is written.
 
 A large command — an import, a bulk correction, a compensating undo — is therefore run
 as **stepped commands**:

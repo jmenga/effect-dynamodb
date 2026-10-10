@@ -5,7 +5,7 @@
  * append/read/readFrom/currentVersion operations, fold helpers, Query combinators,
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
- * large commands as stepped commands, and stream indexes.
+ * large commands as stepped commands, stream indexes, and event metadata.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -14,7 +14,18 @@
  *   npx tsx examples/event-sourcing.ts
  */
 
-import { Config, Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
+import {
+  Clock,
+  Config,
+  Console,
+  Data,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  Random,
+  Schema,
+} from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -323,7 +334,31 @@ const Scorecards = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 8. Main program
+// 8. Event metadata — a metadata schema on the stream
+// ---------------------------------------------------------------------------
+
+// #region metadata-stream
+// Facts about an event that are not part of the domain event itself.
+const AuditMetadata = Schema.Struct({
+  // The request that produced the event: shared by every event it appends.
+  correlationId: Schema.String,
+  // An id of the event's own, e.g. a publisher's message id.
+  eventId: Schema.optionalKey(Schema.String),
+  // For an imported event: its id in the store it came from.
+  sourceId: Schema.optionalKey(Schema.String),
+})
+
+const AuditedMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "AuditedMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  metadata: AuditMetadata,
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 9. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
@@ -863,6 +898,103 @@ const program = Effect.gen(function* () {
   }
   yield* Console.log(`First innings: ${firstInnings.length} event`)
 
+  // --- Event metadata ---
+  yield* Console.log("\n=== Event metadata ===")
+  // #region append-metadata
+  const audited = yield* EventStore.bind(AuditedMatchEvents)
+
+  // One value for the whole append: every event carries a copy.
+  yield* audited.append(
+    { matchId: "m-20" },
+    [
+      new MatchStarted({ venue: "WACA", homeTeam: "AUS", awayTeam: "SL" }),
+      new InningsCompleted({ innings: 1, runs: 301, wickets: 9 }),
+    ],
+    0,
+    { metadata: { correlationId: "req-81c2" } },
+  )
+  // → v1 and v2 both carry { correlationId: "req-81c2" }
+  // #endregion
+  const shared = yield* audited.read({ matchId: "m-20" })
+  yield* Console.log(
+    `Shared: ${shared.map((e) => `v${e.version} ${e.metadata?.correlationId}`).join(", ")}`,
+  )
+
+  // #region event-metadata
+  // An import from a previous store: each event keeps its original id.
+  yield* audited.append(
+    { matchId: "m-21" },
+    [
+      new MatchStarted({ venue: "Kensington Oval", homeTeam: "WI", awayTeam: "ENG" }),
+      new InningsCompleted({ innings: 1, runs: 202, wickets: 10 }),
+      new InningsCompleted({ innings: 2, runs: 205, wickets: 4 }),
+    ],
+    0,
+    {
+      eventMetadata: [
+        { correlationId: "import-17", sourceId: "legacy-118" },
+        // `undefined`: this event is written without metadata.
+        undefined,
+        { correlationId: "import-17", sourceId: "legacy-121" },
+      ],
+    },
+  )
+
+  // Each event reads back with its own entry.
+  const importedEvents = yield* audited.read({ matchId: "m-21" })
+  const sourceIds = importedEvents.map((event) => event.metadata?.sourceId)
+  // → ["legacy-118", undefined, "legacy-121"]
+  // #endregion
+  yield* Console.log(
+    `Imported source ids: ${sourceIds.map((id) => id ?? "(none)").join(", ")}`,
+  )
+
+  // #region handler-event-metadata
+  const handleAudited = EventStore.commandHandler(matchDecider, audited)
+
+  // Minted through Clock and Random, so a TestClock and a seeded Random make
+  // the ids deterministic in tests.
+  const mintEventId = Effect.gen(function* () {
+    const millis = yield* Clock.currentTimeMillis
+    const entropy = yield* Random.nextIntBetween(0, 2 ** 31)
+    return `evt-${millis.toString(36)}-${entropy.toString(36)}`
+  })
+
+  // A function of the decision: one entry per event `decide` returned.
+  yield* handleAudited(
+    { matchId: "m-22" },
+    { _tag: "StartMatch", venue: "Adelaide Oval", homeTeam: "AUS", awayTeam: "WI" },
+    {
+      eventMetadata: ({ events }) =>
+        Effect.forEach(events, () =>
+          Effect.map(mintEventId, (eventId) => ({ correlationId: "req-5d0e", eventId })),
+        ),
+    },
+  )
+
+  // Ids minted per attempt are safe: a failed attempt writes nothing. But
+  // without `idempotency`, a redelivery after a lost response appends again
+  // with new ids. For ids stable across redeliveries, derive them from the
+  // delivery id the caller holds.
+  const deliveryId = "msg-4471"
+  yield* handleAudited(
+    { matchId: "m-22" },
+    { _tag: "CompleteInnings", innings: 1, runs: 289, wickets: 10 },
+    {
+      eventMetadata: ({ events, version }) =>
+        events.map((_, i) => ({
+          correlationId: deliveryId,
+          eventId: `${deliveryId}:${version + i + 1}`,
+        })),
+    },
+  )
+  // → v2 carries eventId "msg-4471:2"
+  // #endregion
+  const handled = yield* audited.read({ matchId: "m-22" })
+  yield* Console.log(
+    `Handler event ids: ${handled.map((e) => `v${e.version} ${e.metadata?.eventId}`).join(", ")}`,
+  )
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
@@ -871,7 +1003,7 @@ const program = Effect.gen(function* () {
 })
 
 // ---------------------------------------------------------------------------
-// 9. Provide dependencies and run
+// 10. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region layer-setup
