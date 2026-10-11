@@ -19,6 +19,7 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Large commands as stepped commands, each one atomic append
 - Stream indexes: sub-streams ordered by a key derived from each event
 - Event metadata: one value per append, or one entry per event
+- Stream index projection: keeping metadata, or everything but the keys, out of an index
 
 ---
 
@@ -1085,7 +1086,7 @@ const Scorecards = EventStore.makeStream({
 
 ### Creating the table
 
-`Table.definition` does not derive event tables. `EventStore.indexDefinitions(...streams)` returns the `CreateTable` fragments for the streams' indexes, each projecting `ALL`, to merge into your own `CreateTable` input:
+`Table.definition` does not derive event tables. `EventStore.indexDefinitions(...streams)` returns the `CreateTable` fragments for the streams' indexes, each with the `Projection` its index declares (`ALL` unless the index sets a [`projection`](#index-projection)), to merge into your own `CreateTable` input:
 
 ```typescript region="index-table" example="event-sourcing.ts"
 const fragments = EventStore.indexDefinitions(Scorecards)
@@ -1109,7 +1110,7 @@ yield* client.createTable({
 :::caution[LSIs have table-wide consequences]
 - **An LSI must be created with the table.** It cannot be added later.
 - **A table with any LSI caps the item collection of every partition key value at 10 GB**: every stream's partitions, indexed or not, and every entity partition that shares the table. A write that would pass the cap fails. If a stream can outgrow that, use a GSI.
-- **The projection must be `ALL`**, because events are decoded from the index item. `indexDefinitions` emits `ALL`; keep it if you write the definition yourself.
+- **An LSI's projection is fixed when the table is created.** `indexDefinitions` emits the `Projection` each index declares (`ALL` by default; see [Index projection](#index-projection)). If you write the definition yourself, copy it exactly: the reads depend on what the index holds.
 :::
 
 A GSI can be added to an existing table, but that does not index the events already in it. Index attributes are written only by `append`, and events are never rewritten, so an index declared on a stream that already holds events contains only the events appended from then on, and changing a `key` leaves earlier events under their old keys. Reads then return only what was indexed, without an error. The library does not backfill; whether and how to re-index existing events is the application's decision.
@@ -1167,8 +1168,8 @@ An event records what happened in the domain. Facts *about* the event, such as t
 const AuditMetadata = Schema.Struct({
   // The request that produced the event: shared by every event it appends.
   correlationId: Schema.String,
-  // An id of the event's own, e.g. a publisher's message id.
-  eventId: Schema.optionalKey(Schema.String),
+  // An id of the event's own: a ULID, minted when the event is decided.
+  eventId: Schema.optionalKey(Schema.String.check(Schema.isULID())),
   // For an imported event: its id in the store it came from.
   sourceId: Schema.optionalKey(Schema.String),
 })
@@ -1239,48 +1240,42 @@ const sourceIds = importedEvents.map((event) => event.metadata?.sourceId)
 
 ### Metadata from the command handler
 
-A handler's per-call `metadata` is fixed before `decide` runs, so it cannot know how many events it must cover. Its `eventMetadata` is a function of the [`Decision`](#step-16-inline-projections), the same one a function-form `additionalItems` receives, returning one entry per event directly or as an `Effect`:
+A handler's per-call `metadata` is fixed before `decide` runs, so it cannot know how many events it must cover. Its `eventMetadata` is a function of the [`Decision`](#step-16-inline-projections), the same one a function-form `additionalItems` receives, returning one entry per event directly or as an `Effect`.
+
+The example mints each event's id as a [ULID](https://github.com/ulid/spec) with Effect's `Crypto` service, and the metadata schema checks it with `Schema.isULID()`. `crypto.randomULID` takes the id's time from the `Clock` and its 80 random bits from `Crypto`, so ids sort by when they were minted, and a test that provides a `TestClock` and a `Crypto` whose `randomBytes` returns fixed bytes gets the same ids on every run. When a standard UUID is needed, `crypto.randomUUIDv7` works the same way. Effect provides no default `Crypto` service; the example builds one on the Web Crypto API (see [Layer Setup](#layer-setup)).
 
 ```typescript region="handler-event-metadata" example="event-sourcing.ts"
-const handleAudited = EventStore.commandHandler(matchDecider, audited)
+// One ULID per event: its time comes from the Clock, its random bits from
+// the Crypto service.
+const crypto = yield* Crypto.Crypto
+const mintEventIds = (correlationId: string, events: ReadonlyArray<MatchEvent>) =>
+  Effect.forEach(events, () =>
+    Effect.map(crypto.randomULID, (eventId) => ({ correlationId, eventId })),
+  )
 
-// Minted through Clock and Random, so a TestClock and a seeded Random make
-// the ids deterministic in tests.
-const mintEventId = Effect.gen(function* () {
-  const millis = yield* Clock.currentTimeMillis
-  const entropy = yield* Random.nextIntBetween(0, 2 ** 31)
-  return `evt-${millis.toString(36)}-${entropy.toString(36)}`
+// Idempotent: a redelivered command fails with DuplicateCommand, so the ids
+// of its first commit are the only ones ever written.
+const handleAudited = EventStore.commandHandler(matchDecider, audited, {
+  idempotency: { ttl: Duration.days(1) },
 })
 
 // A function of the decision: one entry per event `decide` returned.
 yield* handleAudited(
   { matchId: "m-22" },
   { _tag: "StartMatch", venue: "Adelaide Oval", homeTeam: "AUS", awayTeam: "WI" },
-  {
-    eventMetadata: ({ events }) =>
-      Effect.forEach(events, () =>
-        Effect.map(mintEventId, (eventId) => ({ correlationId: "req-5d0e", eventId })),
-      ),
-  },
+  { commandId: "msg-4470", eventMetadata: ({ events }) => mintEventIds("msg-4470", events) },
 )
+// → v1 carries an eventId such as "01M4M3EK1SVFC94QZ8SC9H0ZPW"
 
-// Ids minted per attempt are safe: a failed attempt writes nothing. But
-// without `idempotency`, a redelivery after a lost response appends again
-// with new ids. For ids stable across redeliveries, derive them from the
-// delivery id the caller holds.
-const deliveryId = "msg-4471"
-yield* handleAudited(
+// A message delivered twice, its first response lost.
+const completeInnings = handleAudited(
   { matchId: "m-22" },
   { _tag: "CompleteInnings", innings: 1, runs: 289, wickets: 10 },
-  {
-    eventMetadata: ({ events, version }) =>
-      events.map((_, i) => ({
-        correlationId: deliveryId,
-        eventId: `${deliveryId}:${version + i + 1}`,
-      })),
-  },
+  { commandId: "msg-4471", eventMetadata: ({ events }) => mintEventIds("msg-4471", events) },
 )
-// → v2 carries eventId "msg-4471:2"
+yield* completeInnings
+const duplicate = yield* Effect.flip(completeInnings)
+// → DuplicateCommand: v2 keeps the eventId of the first delivery
 ```
 
 When it runs:
@@ -1292,7 +1287,7 @@ load → [expectedVersion check] → decide → fold new events → eventMetadat
 - It runs after the new events are folded and **before** `additionalItems`, so an effectful pair runs in a predictable order. It is not called when `decide` returns no events.
 - It runs again on every attempt: each `VersionConflict` retry, and the second decision a stale snapshot triggers under `verifySnapshot: false`. Only the committed attempt's entries are ever written, so minting fresh ids per attempt is safe.
 - A result whose length differs from the decision's events fails with a `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`) before anything is sent. A failure of the returned `Effect` surfaces in the handler's error channel. Neither is retried.
-- With `idempotency`, a redelivered command fails with `DuplicateCommand` and never commits a second set of ids. Without it, a redelivery decides and appends again, and random ids differ between the two commits; derive them from the delivery id, as the second call does, when they must match.
+- With `idempotency`, a redelivered command fails with `DuplicateCommand` and never commits a second set of ids. Without it, a redelivery after a lost response decides and appends again, with new ids. That is why the example's handler is idempotent and takes the delivery id as `commandId`: the second delivery of `msg-4471` fails with `DuplicateCommand`, and v2 keeps the id of the first.
 
 ### Original event times
 
@@ -1357,7 +1352,8 @@ const sourceLog = new Map([["m-24:MatchStarted", "2025-02-01T09:00:00Z"]])
 const originalTime = (key: string) =>
   Effect.fromNullishOr(sourceLog.get(key)).pipe(Effect.map((iso) => DateTime.makeUnsafe(iso)))
 
-yield* handleAudited(
+const handleImport = EventStore.commandHandler(matchDecider, audited)
+yield* handleImport(
   { matchId: "m-24" },
   { _tag: "StartMatch", venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SL" },
   {
@@ -1369,7 +1365,135 @@ yield* handleAudited(
 ```
 
 :::note[Why not pack a list into `metadata`?]
-Before `eventMetadata`, the only place for per-event values was a list inside the shared `metadata`, with each reader picking its entry by position. Every event then stores the whole list, so an append of N events stores N² entries, and a stream index (always projecting `ALL`) copies all of them. That cost counts towards DynamoDB's 400 KB item and 4 MB transaction limits. `eventMetadata` stores each entry once, on its own event.
+Before `eventMetadata`, the only place for per-event values was a list inside the shared `metadata`, with each reader picking its entry by position. Every event then stores the whole list, so an append of N events stores N² entries, and a stream index projecting `ALL` (the default; see [Index projection](#index-projection)) copies all of them. That cost counts towards DynamoDB's 400 KB item and 4 MB transaction limits. `eventMetadata` stores each entry once, on its own event.
+:::
+
+### Index projection
+
+A stream index projects `ALL` by default, so each entry is a full copy of its event, `metadata` included. Metadata is often an event's largest attribute, and the sub-stream an index serves rarely needs it. `projection` on an index entry chooses what the index copies:
+
+:::note[Not an inline projection]
+This is DynamoDB's index projection: which event attributes a secondary index stores. It is unrelated to the [inline projections](#step-16-inline-projections) of Step 16, which are read-model items a command handler commits in the same transaction as its events.
+:::
+
+```typescript title="stream.ts" region="index-projection" example="event-sourcing.ts"
+// Metadata is often an event's largest attribute, and an index projecting ALL
+// copies it into every entry. `projection` keeps it out.
+const AuditedScorecardTable = Table.make({ schema: AppSchema, entities: {} })
+
+const AuditedScorecards = EventStore.makeStream({
+  table: AuditedScorecardTable,
+  streamName: "AuditedScorecard",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  metadata: AuditMetadata,
+  indexes: {
+    // Every event attribute except `metadata`: read with one query, and
+    // `metadata` is typed (and read as) undefined.
+    byInnings: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      projection: "withoutMetadata",
+      key: (event) =>
+        event._tag === "InningsCompleted" ? `INNINGS#${pad(event.innings)}` : undefined,
+    },
+    // Keys only: the smallest entries. A read queries the index, then fetches
+    // the full events from the table with BatchGetItem, in index order.
+    byRuns: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      projection: "keys",
+      key: (event, version) =>
+        event._tag === "InningsCompleted" ? `RUNS#${pad(event.runs)}#${pad(version)}` : undefined,
+    },
+  },
+})
+```
+
+| `projection` | Emitted `Projection` | Index write per event | Read |
+|---|---|---|---|
+| `"all"` (default) | `ALL` | the full event, 1 WCU per KB | one query |
+| `"withoutMetadata"` | `INCLUDE` of `__edd_e__`, `data`, `eventType`, `streamId`, `timestamp`, `version` | the event without `metadata` | one query; `metadata` is `undefined`, and typed so |
+| `"keys"` | `INCLUDE ["__edd_e__"]` | the keys and `__edd_e__`: 1 WCU | **LSI:** one query with `Select: ALL_ATTRIBUTES`, and DynamoDB fetches each event from the table. **GSI:** the query, then `BatchGetItem` for each page's events, returned in index order |
+
+For an event with 2 KB of data and 6 KB of metadata, the table write costs about 8 WCU. Each `all` index adds 8 WCU more, each `withoutMetadata` index 2 to 3, each `keys` index 1. A `keys` index pays on the read side instead: each event read through it costs a table read, rounded up to 4 KB. On an LSI, smaller entries also leave more of each partition's 10 GB item-collection cap for the events themselves.
+
+`indexDefinitions` emits the matching `Projection`:
+
+```typescript region="index-projection-table" example="event-sourcing.ts"
+const projected = EventStore.indexDefinitions(AuditedScorecards)
+// byInnings (LSI) → Projection: { ProjectionType: "INCLUDE", NonKeyAttributes:
+//   ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }
+// byRuns (GSI)    → Projection: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }
+yield* client.createTable({
+  TableName: auditedScorecardConfig.name,
+  BillingMode: "PAY_PER_REQUEST",
+  KeySchema: [
+    { AttributeName: "pk", KeyType: "HASH" },
+    { AttributeName: "sk", KeyType: "RANGE" },
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "pk", AttributeType: "S" },
+    { AttributeName: "sk", AttributeType: "S" },
+    ...projected.AttributeDefinitions,
+  ],
+  LocalSecondaryIndexes: projected.LocalSecondaryIndexes,
+  GlobalSecondaryIndexes: projected.GlobalSecondaryIndexes,
+})
+```
+
+The reads choose their path from the projection:
+
+```typescript region="index-projection-read" example="event-sourcing.ts"
+const auditedScorecards = yield* EventStore.bind(AuditedScorecards)
+yield* auditedScorecards.append(
+  { matchId: "m-30" },
+  [
+    new MatchStarted({ venue: "Eden Park", homeTeam: "NZL", awayTeam: "ENG" }),
+    new InningsCompleted({ innings: 1, runs: 278, wickets: 10 }),
+    new InningsCompleted({ innings: 2, runs: 301, wickets: 8 }),
+  ],
+  0,
+  { metadata: { correlationId: "req-9a41" } },
+)
+
+// "withoutMetadata": the index does not hold metadata, so it reads as
+// undefined — and its type is `undefined`, so it cannot be read by mistake.
+const innings = yield* auditedScorecards.readIndex(
+  "byInnings",
+  { matchId: "m-30" },
+  { consistentRead: true },
+)
+// → [v2, v3], each with metadata: undefined
+
+// "keys": the query finds the entries, then the events are fetched from the
+// table, so metadata is there.
+const byRuns = yield* auditedScorecards.readIndex(
+  "byRuns",
+  { matchId: "m-30" },
+  { reverse: true },
+)
+// → [v3, v2], each with metadata { correlationId: "req-9a41" }
+```
+
+- `readIndex` and `query.index` type `metadata` per index name: `undefined` through a `withoutMetadata` index, the stream's metadata type otherwise. A `withoutMetadata` read drops `metadata` even when the deployed index holds it, so the value always matches the type.
+- A `keys` GSI read fetches only the events a page keeps (after `limit`), 100 keys per `BatchGetItem`. Unprocessed keys are retried with backoff, and the read fails with `DynamoError` after 5 retries. The fetch is eventually consistent; a key missing from the response is read once more with `ConsistentRead`. `consistentRead` on a GSI is still refused, while on a `keys` LSI it applies to the fetch too.
+- `Query.count` counts index entries and never fetches. `Query.select` works on every projection: a `keys` LSI fetches the named attributes, and a `keys` GSI moves the selection onto `BatchGetItem`.
+- A `Query.filter` on a `withoutMetadata` or `keys` index may only name attributes the index projects; DynamoDB rejects any other. Filter on the client with `Query.filterBy` instead.
+- Streams that share a physical index must declare the same projection; `indexDefinitions` refuses a mismatch with `[EDD-9067]`.
+- An unknown `projection`, or a misspelled member such as `projecton`, is a type error, and `makeStream` refuses it with `[EDD-9063]`.
+- `withoutMetadata` lists 6 `NonKeyAttributes` and `keys` lists 1. DynamoDB allows at most 100 across all of a table's indexes, so `CreateTable` rejects the 17th `withoutMetadata` index on one table.
+
+:::caution[The declared projection must match the deployed index]
+The library migrates nothing. An LSI's projection is fixed when the table is created. A GSI's projection cannot be updated: the index must be deleted and created again, and it is unavailable while it backfills. `indexDefinitions` describes a **new** index.
+
+With CDK or Terraform, copy each `Projection` from `indexDefinitions` exactly. In particular, **`keys` is `INCLUDE ["__edd_e__"]`, not `KEYS_ONLY`**: every read filters on `__edd_e__`, and DynamoDB refuses a filter on an attribute the index does not project. If the deployment differs:
+
+- **Without `__edd_e__`** (a `KEYS_ONLY` index declared `keys`, say): every read, `count` included, fails with DynamoDB's `ValidationException`, `Secondary index gsi1 does not project one or more filter attributes: [__edd_e__]`, as a `DynamoValidationError`.
+- **Narrower than declared** (an `INCLUDE ["__edd_e__"]` index declared `all` or `withoutMetadata`): rows lack event attributes, and the read fails with a `ValidationError` (`operation: "EventStore.index.decode"`) naming the index and the attributes its rows lack, with the decode error as its cause.
+- **Wider than declared** works and costs more. One drift fails nothing: an index declared `all` but deployed `withoutMetadata` reads `metadata` as `undefined`.
 :::
 
 ---
@@ -1390,6 +1514,26 @@ The client reads its endpoint from the `DYNAMODB_ENDPOINT` config value, default
 
 ### Layer Setup
 
+The command handler in [Step 20](#metadata-from-the-command-handler) mints ids through Effect's `Crypto` service, which Effect does not provide by default. The example backs it with the Web Crypto API. (`DynamoClient.make` bundles a `Crypto` for its own bound operations only, such as `generatedId`; your own effects need one in their layer.)
+
+```typescript title="main.ts" region="crypto-layer" example="event-sourcing.ts"
+// Effect core ships no default Crypto service. This one is backed by the Web
+// Crypto API (`globalThis.crypto`): Node 19+ (Node 18 only with
+// --experimental-global-webcrypto), browsers and edge runtimes.
+const WebCrypto = Layer.succeed(
+  Crypto.Crypto,
+  Crypto.make({
+    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
+    digest: (algorithm, data) =>
+      Effect.tryPromise({
+        try: () => globalThis.crypto.subtle.digest(algorithm, new Uint8Array(data)),
+        catch: (cause) =>
+          PlatformError.badArgument({ module: "Crypto", method: "digest", cause }),
+      }).pipe(Effect.map((digest) => new Uint8Array(digest))),
+  }),
+)
+```
+
 ```typescript title="main.ts" region="layer-setup" example="event-sourcing.ts"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layerConfig({
@@ -1399,6 +1543,8 @@ const AppLayer = Layer.mergeAll(
   }),
   EventsTable.layer({ name: "event-sourcing-example" }),
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
+  AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
+  WebCrypto,
 )
 
 const main = program.pipe(Effect.provide(AppLayer))
@@ -1436,6 +1582,7 @@ Effect.runPromise(main).then(
 | **Stream indexes** | `makeStream({ indexes })` + `readIndex` / `query.index` read sub-streams by a derived key; `indexDefinitions` builds the LSI/GSI definitions |
 | **Event metadata** | `makeStream({ metadata })` declares the schema; `append(..., { metadata })` shares one value, `{ eventMetadata }` gives each event its own entry; on a handler, `eventMetadata: (decision) => entries` derives them after `decide` |
 | **Event timestamps** | `append(..., { eventTimestamps })` writes each event's own `DateTime` as its `timestamp` (`undefined` keeps the append time); on a handler, `eventTimestamps: (decision) => timestamps`. `version`, not `timestamp`, orders a stream |
+| **Index projection** | `projection: "withoutMetadata"` (`INCLUDE` without `metadata`, read in one query) or `"keys"` (`INCLUDE ["__edd_e__"]`, events fetched from the table) on a stream index; the deployed `Projection` must match `indexDefinitions` |
 
 ## What's Next?
 

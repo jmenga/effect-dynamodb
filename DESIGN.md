@@ -356,6 +356,20 @@ The named record keys (`Users`, `Tasks`, `Matches`) become the property names on
 | `entities` | `Record<string, Entity>` | No | Named entity definitions |
 | `aggregates` | `Record<string, Aggregate>` | No | Named aggregate definitions |
 
+**Members must agree on shared physical indexes (`[EDD-9069]`).** Several members may declare one
+physical secondary index (index overloading), but one physical index has one key schema. `Table.make`
+and `Table.definition` merge every declaration — each entity index, each auto-generated
+`_cascade_<field>` index, an aggregate's collection index (an LSI when its `pk` is the table's
+primary `pk`, a GSI otherwise) and list index (a GSI) — and throw `[EDD-9069]`, naming both
+declarers and both shapes, when two declarations of one name differ in key attributes or in
+GSI/LSI classification. Entities must also declare the same primary-key fields. Before 1.25.0 both
+functions silently kept the first declaration: the table was created keyed the first declarer's
+way, and the other declarer's items never reached the index (its queries returned nothing), or
+its writes lacked the table's key attributes. The check is definition-time, so tables deployed
+with CDK or Terraform get it from `Table.make` alone; a conflict introduced only by an aggregate
+passed to `DynamoClient.make` but not registered on `Table.make` surfaces when `DynamoClient.make`
+derives the table definition, as a vector-index conflict does.
+
 ### Runtime Configuration
 
 The physical table name is injected at runtime via Effect Layers, keeping definitions pure and environment-independent:
@@ -453,9 +467,9 @@ The entity definition still provides type derivation (`Entity.Record<typeof User
 | `pk.composite` | `string[]` | Yes | Ordered list of model attributes |
 | `sk.field` | `string` | Yes | Physical DynamoDB attribute name |
 | `sk.composite` | `string[]` | Yes | Ordered list of model attributes |
-| `index` | `string` | No (primary only) | Physical GSI/LSI name from Table definition |
+| `index` | `string` | No (primary only) | Physical GSI name. Entity indexes are always GSIs; only aggregate collection indexes and stream indexes can be LSIs |
 | `collection` | `string \| string[]` | No | Collection name(s) for cross-entity queries |
-| `type` | `"isolated" \| "clustered"` | No | Collection type (default: `"clustered"`) |
+| `type` | `"isolated" \| "clustered"` | No | Collection type (default: `"isolated"`) |
 | `casing` | `"lowercase" \| "uppercase" \| "preserve"` | No | Casing override for this index |
 
 ### System Fields
@@ -544,7 +558,7 @@ Entity.make({ …, generatedId?: { field: string; version?: "v4" | "v7" } })  //
 
 The chosen solution (Option 1, the issue's recommendation): **bundle a default `Crypto` service into the context the typed client already captures, and widen the `provide` helpers to admit `Crypto.Crypto`.** Concretely:
 
-- A thin default service (`internal/DefaultCrypto.ts`) is built from `Crypto.make({ randomBytes, digest })` over `globalThis.crypto.getRandomValues` / `crypto.subtle.digest` — **no new dependency** (Web Crypto is available on Node 18+, browsers, and edge runtimes).
+- A thin default service (`internal/DefaultCrypto.ts`) is built from `Crypto.make({ randomBytes, digest })` over `globalThis.crypto.getRandomValues` / `crypto.subtle.digest` — **no new dependency** (the global Web Crypto API is available on Node 19+ — Node 18 only with `--experimental-global-webcrypto` — browsers, and edge runtimes).
 - `Entity.bind` (where bound `put` actually runs) and `DynamoClient.makeFromConfig` each add the default via `Context.add(ctx, Crypto.Crypto, makeDefaultCrypto())` and widen their `provide` helper's input type from `Effect<A, E, DynamoClient | TableConfig>` to `… | Crypto.Crypto`. `Entity.bind` only fills the default when Crypto is absent (`Context.getOption`), so an override is respected.
 - Bound `put` stays `R = never`; the public method signatures are unchanged. Entities **without** `generatedId` never yield `Crypto` (the fill helper returns early), so their unbound ops keep `R = DynamoClient | TableConfig` exactly as before.
 - **Optional platform override:** `DynamoClient.make({ …, crypto?: Crypto.Crypto })` accepts a platform implementation (e.g. from `@effect/platform-node`) which takes precedence over the default. Crypto is **never** surfaced in the public `R` (the rejected Option 2).
@@ -2343,8 +2357,8 @@ retry loops do not retry it, and `EventStore`'s `sendAppendTransaction` still tr
 
 **What stays a pre-check:** the library's own invariants that DynamoDB cannot see
 (`refuseRepeatedItems`; option shapes and lengths; a stream-index `key` result that is not
-a non-empty string; empty condition parts), definition-time limits (`Table.definition`'s
-vector-index limits), `Batch.write`'s chunking budgets (25 / 100 items, 3.5 MB), and
+a non-empty string; empty condition parts), definition-time checks (`Table.definition`'s
+vector-index limits; `[EDD-9069]` member agreement on secondary-index key schemas), `Batch.write`'s chunking budgets (25 / 100 items, 3.5 MB), and
 `readIndex`'s bound validation. `Aggregate` also keeps its check of **every** group's count
 before writing the first: DynamoDB judges one group at a time, so only that check stops a
 multi-group write committing partially.
@@ -2798,6 +2812,8 @@ yield* Players.provide(
 ```
 
 **Explicit targets required.** No implicit discovery. Default mode is eventual consistency (batch writes). Transactional mode available for small datasets.
+
+Each target item found through the target's `_cascade_<field>` GSI is updated under the **target entity's own primary-key fields** (`primaryKey.pk.field` / `sk.field`), and a rejected update is diagnosed under those fields, so one transactional cascade may span targets keyed differently. Before 1.25.0 the cascade read the hard-coded `pk` / `sk` attributes, so on a table keyed otherwise (e.g. `PK` / `SK`) every eventual-mode update failed (`CascadePartialFailure` with `succeeded: 0`) and a transactional cascade was rejected whole.
 
 ### Aggregate vs Collection
 
@@ -3276,9 +3292,11 @@ so nothing is written, and the rejection is confirmed by measuring the key's UTF
 reported as a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index
 and the event's version. Only event items carry index attributes — snapshots and sentinels
 are never indexed. Index names are a type parameter (`TIndexName`) inferred from
-`indexes`; an undeclared name at runtime is a defect (`[EDD-9066]`). Definition errors:
-`[EDD-9063]` malformed entry, `[EDD-9064]` attribute owned by the stream, `[EDD-9065]`
-indexes sharing a physical index or attribute.
+`indexes`, with each index's `projection` alongside (`TIndexProjections`); an undeclared
+name at runtime is a defect (`[EDD-9066]`). Definition errors: `[EDD-9063]` malformed
+entry (including an unknown `projection` and a member an entry does not declare, such
+as a misspelled `projection`, which is also a type error), `[EDD-9064]` attribute owned
+by the stream, `[EDD-9065]` indexes sharing a physical index or attribute.
 
 - **LSI** (`type: "lsi"`, default) uses the table's `pk`, so it holds exactly the
   stream's indexed events and supports strongly consistent reads. An LSI **must be
@@ -3288,12 +3306,30 @@ indexes sharing a physical index or attribute.
 - **GSI** (`type: "gsi"`) names a `pk` attribute that `append` fills with the stream's
   partition key value, so it is the eventually consistent, uncapped equivalent scoped
   to the same stream. `consistentRead` on it is refused.
-- **Projection `ALL`** — events are decoded from the index item.
+- **Projection** — `projection: "all" | "withoutMetadata" | "keys"` per index,
+  default `"all"` (design: `docs/designs/index-projection.md`).
   `EventStore.indexDefinitions(...streams)` returns `AttributeDefinitions`,
-  `LocalSecondaryIndexes` and `GlobalSecondaryIndexes` (projection `ALL`) to merge
-  into the caller's `CreateTable` input; event tables are not derived by
-  `Table.definition`. Conflicting definitions of one physical index throw
-  `[EDD-9067]`.
+  `LocalSecondaryIndexes` and `GlobalSecondaryIndexes` to merge into the caller's
+  `CreateTable` input; event tables are not derived by `Table.definition`. Each index's
+  `Projection` follows its declaration:
+
+  | `projection` | Emitted `Projection` | Read |
+  |---|---|---|
+  | `"all"` | `ALL` | one query |
+  | `"withoutMetadata"` | `INCLUDE ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"]` | one query; `metadata` dropped, typed `undefined` per index name |
+  | `"keys"` | `INCLUDE ["__edd_e__"]` (not `KEYS_ONLY`) | LSI: `Select: ALL_ATTRIBUTES`. GSI: query, then `BatchGetItem` per page (chunks of 100, `UnprocessedKeys` retried, missing keys re-read once consistently, index order kept) |
+
+  `__edd_e__` is always projected: every read filters on it, and DynamoDB refuses a
+  filter on an attribute an index does not project (even on an LSI read with
+  `Select: ALL_ATTRIBUTES`). `query.index` reads a `"keys"` index the same way through
+  an internal `Query` hydration hook; `Query.count` never fetches. Conflicting
+  definitions of one physical index, including different projections, throw
+  `[EDD-9067]`. The library migrates nothing: the declared projection must match the
+  deployed index (CDK / Terraform copy `indexDefinitions`' `Projection`). A decode
+  failure on an `"all"` / `"withoutMetadata"` index row lacking an envelope attribute is
+  diagnosed as a `ValidationError` (`operation: "EventStore.index.decode"`) naming the
+  index; DynamoDB's own "does not project one or more filter attributes" rejection passes
+  through.
 - Index attributes are written only by `append` and events are never rewritten, so an
   index added to a stream that already holds events (a GSI added by `UpdateTable`), or
   a changed `key`, covers only events appended from then on. The library does not
@@ -3842,14 +3878,15 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
 | `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
 | `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
-| `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, or a `key` that is not a function |
+| `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, a `key` that is not a function, a `projection` other than `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does not declare |
 | `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`) |
 | `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
 | `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
-| `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently |
+| `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently (type, key attributes or projection) |
 | `EDD-9068` | `EventStore.ts` | `verifySnapshot: false` on a stream whose snapshot config is not `mode: "inline"` without `every` — thrown by `commandHandler` at handler construction, a defect from `readLatest` |
+| `EDD-9069` | `Table.ts` | Table members disagree on one physical secondary index's key attributes or GSI/LSI classification (entity indexes, `_cascade_<field>` indexes, aggregate collection and list indexes), or entities declare different primary-key fields — thrown by `Table.make` and `Table.definition` |
 
-Next free code: **`EDD-9069`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9070`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
