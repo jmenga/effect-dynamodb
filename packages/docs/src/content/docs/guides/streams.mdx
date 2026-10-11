@@ -85,7 +85,7 @@ const TaskEntity = Entity.make({
   timestamps: true,
 })
 
-const _MainTable = Table.make({
+const MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
 })
@@ -119,7 +119,7 @@ const employeeFromItem = Entity.itemSchema(EmployeeEntity)
 
 const decodeUnmarshalledEmployee = (marshalledImage: Record<string, AttributeValue>) => {
   const unmarshalled = Marshaller.fromAttributeMap(marshalledImage)
-  return Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
+  return Schema.decodeUnknownEffect(employeeFromItem)(unmarshalled)
 }
 ```
 

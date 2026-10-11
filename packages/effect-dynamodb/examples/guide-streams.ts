@@ -1,5 +1,5 @@
 /**
- * DynamoDB Streams guide example — effect-dynamodb v2
+ * DynamoDB Streams guide example — effect-dynamodb
  *
  * Demonstrates:
  *   - Entity.decodeMarshalledItem() for decoding AttributeValue format
@@ -7,19 +7,25 @@
  *   - Entity.Marshalled<E> type helper
  *   - Processing multiple entity types via __edd_e__ discriminator
  *
- * Note: This example is not runnable against DynamoDB Local — it demonstrates
- * the type-safe decoding APIs for use in Lambda functions consuming DynamoDB Streams.
+ * The handlers are written for a Lambda consuming DynamoDB Streams. DynamoDB
+ * Local has no stream trigger, so the demo writes items through the typed
+ * client, reads their stored images back with a raw scan, wraps them in a
+ * stream event and feeds that event to the handlers.
  *
- * Type-check:
- *   npx tsc -p tsconfig.examples.json --noEmit
+ * Prerequisites:
+ *   docker run -p 8000:8000 amazon/dynamodb-local
+ *
+ * Run:
+ *   npx tsx examples/guide-streams.ts
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Console, Effect, Schema } from "effect"
+import { Config, Console, Effect, Layer, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Marshaller from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
@@ -90,7 +96,7 @@ const TaskEntity = Entity.make({
   timestamps: true,
 })
 
-const _MainTable = Table.make({
+const MainTable = Table.make({
   schema: AppSchema,
   entities: { EmployeeEntity, TaskEntity },
 })
@@ -140,7 +146,7 @@ const employeeFromItem = Entity.itemSchema(EmployeeEntity)
 
 const decodeUnmarshalledEmployee = (marshalledImage: Record<string, AttributeValue>) => {
   const unmarshalled = Marshaller.fromAttributeMap(marshalledImage)
-  return Schema.decodeUnknownSync(employeeFromItem)(unmarshalled)
+  return Schema.decodeUnknownEffect(employeeFromItem)(unmarshalled)
 }
 // #endregion
 
@@ -197,44 +203,75 @@ const handleTaskChange = (task: Entity.Record<typeof TaskEntity>) =>
 // #endregion
 
 // ---------------------------------------------------------------------------
-// Demo: exercise the APIs with a synthetic stream event
+// Demo: feed the handlers a stream event built from real stored images
 // ---------------------------------------------------------------------------
 
-const _demo = Effect.gen(function* () {
-  // Simulate a marshalled DynamoDB Stream record
-  const syntheticEvent: DynamoDBStreamEvent = {
-    Records: [
-      {
-        eventName: "INSERT",
-        dynamodb: {
-          NewImage: {
-            pk: { S: "$myapp#v1#employee#emp-alice" },
-            sk: { S: "$myapp#v1#employee" },
-            gsi1pk: { S: "$myapp#v1#employee#engineering" },
-            gsi1sk: { S: "$myapp#v1#employee#alice" },
-            __edd_e__: { S: "Employee" },
-            employeeId: { S: "emp-alice" },
-            email: { S: "alice@acme.com" },
-            displayName: { S: "Alice" },
-            department: { S: "Engineering" },
-            version: { N: "1" },
-            createdAt: { S: "2026-03-22T00:00:00.000Z" },
-            updatedAt: { S: "2026-03-22T00:00:00.000Z" },
-          },
-        },
-      },
-    ],
-  }
+const assertEq = <T>(actual: T, expected: T, label: string): void => {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a !== e) throw new Error(`Assertion failed [${label}]: expected ${e}, got ${a}`)
+}
 
-  yield* handleEmployeeStream(syntheticEvent)
-  yield* handleStreamEvent(syntheticEvent)
+const program = Effect.gen(function* () {
+  const db = yield* DynamoClient.make({
+    entities: { EmployeeEntity, TaskEntity },
+    tables: { MainTable },
+  })
+  const client = yield* DynamoClient
+  const { name: tableName } = yield* MainTable.Tag
 
-  // Demonstrate unmarshalled path
-  const image = syntheticEvent.Records[0]!.dynamodb!.NewImage!
-  const decoded = decodeUnmarshalledEmployee(image)
-  yield* Console.log(`Unmarshalled decode: ${(decoded as Employee).displayName}`)
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables.MainTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* db.tables.MainTable.create()
 
-  // Type-level usage (no runtime effect)
-  const _typeCheck: EmployeeMarshalled = image
-  void _typeCheck
+  yield* db.entities.EmployeeEntity.put({
+    employeeId: "emp-alice",
+    email: "alice@acme.com",
+    displayName: "Alice",
+    department: "Engineering",
+  })
+  yield* db.entities.TaskEntity.put({
+    taskId: "t-1",
+    employeeId: "emp-alice",
+    title: "Write the stream handler",
+    status: "open",
+  })
+
+  // The NewImage of an INSERT record is the item exactly as stored
+  const { Items: images = [] } = yield* client.scan({ TableName: tableName })
+  const toInsert = (NewImage: Record<string, AttributeValue>) => ({
+    eventName: "INSERT" as const,
+    dynamodb: { NewImage },
+  })
+  const employeeImages = images.filter((image) => image["__edd_e__"]?.S === "Employee")
+  assertEq(employeeImages.length, 1, "one employee image")
+  assertEq(images.length, 2, "one employee and one task image")
+
+  yield* handleEmployeeStream({ Records: employeeImages.map(toInsert) })
+  yield* handleStreamEvent({ Records: images.map(toInsert) })
+
+  // Unmarshalled path
+  const employeeImage = employeeImages[0]!
+  const decoded = yield* decodeUnmarshalledEmployee(employeeImage)
+
+  // Type-level usage: a stored image fits Entity.Marshalled
+  const _typed: EmployeeMarshalled = employeeImage
+  void _typed
+  assertEq(decoded.displayName, "Alice", "unmarshalled decode")
+  yield* Console.log(`Unmarshalled decode: ${decoded.displayName}`)
+
+  yield* db.tables.MainTable.delete()
 })
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layerConfig({
+    region: Config.succeed("us-east-1"),
+    endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+    credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
+  }),
+  MainTable.layer({ name: "streams-demo-table" }),
+)
+
+Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(() => console.log("\nDone."))
