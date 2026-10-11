@@ -55,7 +55,8 @@ yield* stream.append(streamId, [e1, e2, e3], expectedVersion, {
 
 // 2. commandHandler — derived after decide
 yield* handle(streamId, command, {
-  eventMetadata: ({ events }) => events.map(() => ({ eventId: ulid() })),
+  eventMetadata: ({ events }) =>
+    Effect.forEach(events, () => Effect.map(crypto.randomULID, (eventId) => ({ eventId }))),
 })
 ```
 
@@ -70,7 +71,7 @@ yield* handle(streamId, command, {
 | **A. New `eventMetadata: ReadonlyArray<M \| undefined>`**, exclusive with `metadata` | **Chosen.** Matches the issue; a positional array mirrors `events`, so the pairing is obvious at the call site and trivially validated by length. |
 | **B. Let `metadata` also accept an array** | Rejected. Ambiguous whenever the metadata schema is itself an array (or a union containing one): the library cannot tell "one value that is a list" from "one value per event". |
 | **C. Let `metadata` accept `(event, index) => M`** | Rejected. One option with two meanings, and it buys nothing over A — the caller can `events.map(...)` themselves. It would also be the only function-valued option on `append`, which is otherwise plain data. |
-| **D. Allow both, shallow-merging `metadata` into each entry** | Rejected. Merging presumes `M` is a plain object; the schema may be anything, and merging through a transforming schema has no well-defined meaning (merge Type-side, then encode? encode both, then merge wire objects?). A caller who wants shared + per-event fields writes `events.map(() => ({ ...shared, eventId: ulid() }))`, which is explicit and type-checked. |
+| **D. Allow both, shallow-merging `metadata` into each entry** | Rejected. Merging presumes `M` is a plain object; the schema may be anything, and merging through a transforming schema has no well-defined meaning (merge Type-side, then encode? encode both, then merge wire objects?). A caller who wants shared + per-event fields writes `events.map((_, i) => ({ ...shared, eventId: ids[i] }))`, which is explicit and type-checked. |
 
 ### 2.2 Entries may be `undefined`
 
@@ -189,9 +190,9 @@ Function-only. A static array cannot be right before `decide` has chosen the eve
 and a static per-append value is what `metadata` already is.
 
 The `Effect` form exists for the same reason `additionalItems` has one, plus one specific
-to this feature: minting ids through Effect's `Clock` / `Random` keeps them deterministic
-under `TestClock` / a seeded `Random`, which a `ulid()` call inside a plain function
-cannot be.
+to this feature: minting ids through Effect's `Crypto` service (`crypto.randomULID`, or
+`randomUUIDv7`) keeps them deterministic under `TestClock` and a test `Crypto` layer with
+fixed bytes, which a `ulid()` call from a library inside a plain function cannot be.
 
 `CommandOptions` gets the same exclusive pair as `append` (§2.3), with `eventMetadata`
 typed as `EventMetadataInput`. Its own error/requirement parameters are **`E3` / `R3`**,
@@ -248,13 +249,20 @@ attempt's ids ever exist. With `idempotency`, a redelivered command fails with
 
 Without `idempotency`, a redelivery after a lost response re-decides and appends again —
 the documented at-least-once default — and random ids differ between the two commits.
-The docs show the deterministic alternative for callers who need stable ids across
-redeliveries:
+The docs answer redelivery with the library's own mechanism rather than ids derived from
+a delivery id (which would not be ULIDs): an idempotent handler called with the delivery
+id as `commandId`, so the redelivery fails with `DuplicateCommand` and the first commit's
+ULIDs stand (`index-projection.md` §7):
 
 ```ts
-// `commandId` is the caller's delivery id, in scope at the call site
-eventMetadata: ({ events, version }) =>
-  events.map((_, i) => ({ eventId: `${commandId}:${version + i + 1}` }))
+const handle = EventStore.commandHandler(decider, stream, {
+  idempotency: { ttl: Duration.days(1) },
+})
+yield* handle(streamId, command, {
+  commandId: deliveryId,
+  eventMetadata: ({ events }) =>
+    Effect.forEach(events, () => Effect.map(crypto.randomULID, (eventId) => ({ eventId }))),
+})
 ```
 
 ---
@@ -775,8 +783,8 @@ otherwise `1.26.0`.
   - `metadata-stream` — declaring a metadata schema;
   - `append-metadata` — per-append `metadata` (shared by every event);
   - `event-metadata` — per-event `eventMetadata` on `append`, read back per event;
-  - `handler-event-metadata` — `commandHandler` minting an id per event, plus the
-    deterministic-id note from §4.3.
+  - `handler-event-metadata` — `commandHandler` minting a ULID per event through the
+    `Crypto` service, idempotent against redelivery (§4.3).
   The step ends with a short "why not pack a list into `metadata`" note (the N² cost).
   A further region, `event-timestamps`, shows an import carrying each event's original
   time with `eventTimestamps` (§7), in place of pinning the clock per chunk; a sibling
