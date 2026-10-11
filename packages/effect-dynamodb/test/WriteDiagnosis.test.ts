@@ -26,6 +26,7 @@ import {
 import {
   awsTransactionCanceled,
   awsValidationException,
+  DDB_CONSISTENT_GSI_AWS,
   DDB_CONSISTENT_READ_GSI,
   DDB_CONSISTENT_SCAN_GSI,
   DDB_ITEM_SIZE,
@@ -808,6 +809,13 @@ describe("WriteDiagnosis (#144)", () => {
         diagnoseRejection(
           queryRejected(DDB_CONSISTENT_SCAN_GSI),
           read({ IndexName: "gsi1", ConsistentRead: true }, true),
+        ),
+        "ConsistentReadOnGsi",
+      )
+      expectTag(
+        diagnoseRejection(
+          queryRejected(DDB_CONSISTENT_GSI_AWS),
+          read({ IndexName: "gsi1", ConsistentRead: true }),
         ),
         "ConsistentReadOnGsi",
       )

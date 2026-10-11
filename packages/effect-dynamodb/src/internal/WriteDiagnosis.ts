@@ -411,7 +411,11 @@ const EMPTY_KEY = /cannot contain an empty string value/i
 const EMPTY_KEY_INDEX = /IndexName:\s*([^,\s]+),\s*IndexKey:\s*([^,\s]+)/i
 const EMPTY_KEY_TABLE = /(?<!Index)Key:\s*([^,\s]+)/
 const BETWEEN_REVERSED = /BETWEEN operator requires upper bound to be greater than or equal to/i
-const CONSISTENT_GSI = /Consistent read cannot be true when (querying|scanning) a GSI/i
+// DynamoDB Local 3.1.0 says "Consistent read cannot be true when querying a GSI";
+// AWS and later Local releases say "Consistent reads are not supported on global
+// secondary indexes".
+const CONSISTENT_GSI =
+  /Consistent read cannot be true when (querying|scanning) a GSI|Consistent reads are not supported on global secondary indexes/i
 // `IN ()` — an `isIn()` with no values — is a syntax error to DynamoDB
 // (Local: 'Invalid ConditionExpression: Syntax error; token: ")", near: "()"',
 // the `near` running on to the next token — `"())"`, `"() AND"` — when one

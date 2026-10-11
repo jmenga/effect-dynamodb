@@ -205,6 +205,9 @@ export const ddbBetweenReversed = (low: string, high: string): string =>
 /** A consistent read of a GSI. */
 export const DDB_CONSISTENT_READ_GSI = "Consistent read cannot be true when querying a GSI"
 export const DDB_CONSISTENT_SCAN_GSI = "Consistent read cannot be true when scanning a GSI"
+/** The same rejection in AWS's (and later DynamoDB Local releases') wording. */
+export const DDB_CONSISTENT_GSI_AWS =
+  "Consistent reads are not supported on global secondary indexes"
 export const DDB_SORT_KEY_AWS =
   "One or more parameter values were invalid: Aggregated size of all range keys has exceeded " +
   "the size limit of 1024 bytes"
