@@ -343,6 +343,10 @@ const program = Effect.gen(function* () {
   const basic = yield* DynamoClient.make({
     entities: { Tasks },
   })
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* basic.tables["guide-indexes-basic"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* basic.tables["guide-indexes-basic"]!.create()
   // #endregion
 
@@ -400,6 +404,10 @@ const program = Effect.gen(function* () {
   const isolated = yield* DynamoClient.make({
     entities: { IsolatedEmployees, Equipments },
   })
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* isolated.tables["guide-indexes-isolated"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* isolated.tables["guide-indexes-isolated"]!.create()
 
   yield* isolated.entities.IsolatedEmployees.put({
@@ -459,6 +467,10 @@ const program = Effect.gen(function* () {
   const clustered = yield* DynamoClient.make({
     entities: { ClusteredEmployees, ClusteredTasks },
   })
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* clustered.tables["guide-indexes-clustered"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* clustered.tables["guide-indexes-clustered"]!.create()
 
   yield* clustered.entities.ClusteredEmployees.put({
@@ -522,6 +534,10 @@ const program = Effect.gen(function* () {
   const sub = yield* DynamoClient.make({
     entities: { SubEmployee, SubTasks, SubProjectMembers },
   })
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* sub.tables["guide-indexes-subcollection"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* sub.tables["guide-indexes-subcollection"]!.create()
 
   yield* sub.entities.SubEmployee.put({
@@ -625,6 +641,10 @@ const program = Effect.gen(function* () {
     entities: { Integrations },
     tables: { CasingTable },
   })
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* casing.tables.CasingTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* casing.tables.CasingTable.create()
 
   // #region index-casing-queries

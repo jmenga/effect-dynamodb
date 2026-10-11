@@ -292,6 +292,10 @@ const program = Effect.gen(function* () {
 
   // --- Create table (with LSI for aggregate collection queries) ---
   yield* Console.log("Creating table:", tableConfig.name)
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: tableConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
     BillingMode: "PAY_PER_REQUEST",

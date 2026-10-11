@@ -105,6 +105,10 @@ const program = Effect.gen(function* () {
   // The SAME pure definitions feed the runtime gateway.
   const db = yield* DynamoClient.make({ entities: { Users, Teams }, tables: { MainTable } })
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables.MainTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables.MainTable.create()
   yield* Console.log("Table created.")
 

@@ -69,7 +69,9 @@ const program = Effect.gen(function* () {
   const tableConfig = yield* MainTable.Tag
 
   // Create table with LSI (delete first if exists)
-  yield* client.deleteTable({ TableName: tableConfig.name }).pipe(Effect.ignore)
+  yield* client
+    .deleteTable({ TableName: tableConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
     BillingMode: "PAY_PER_REQUEST",

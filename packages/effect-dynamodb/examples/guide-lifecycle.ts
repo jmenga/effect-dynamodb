@@ -133,6 +133,10 @@ const program = Effect.gen(function* () {
     entities: { Employees, EmployeesReserve },
   })
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["lifecycle-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["lifecycle-table"]!.create()
   yield* Console.log("=== Setup Complete ===\n")
 

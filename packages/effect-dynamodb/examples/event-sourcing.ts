@@ -413,6 +413,16 @@ const program = Effect.gen(function* () {
 
   // --- Create table ---
   yield* Console.log("Creating table:", tableConfig.name)
+  // Start clean: drop the tables a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: tableConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client
+    .deleteTable({ TableName: scorecardConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client
+    .deleteTable({ TableName: auditedScorecardConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
     BillingMode: "PAY_PER_REQUEST",

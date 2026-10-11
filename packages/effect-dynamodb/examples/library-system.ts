@@ -346,6 +346,12 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
+  // Start clean: drop the table a failed earlier run may have left behind
+  const dynamo = yield* DynamoClient
+  const { name: tableName } = yield* LibTable.Tag
+  yield* dynamo
+    .deleteTable({ TableName: tableName })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   // #region seed-insert
   // Typed execution gateway — binds all entities and collections
   const db = yield* DynamoClient.make({

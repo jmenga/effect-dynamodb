@@ -129,6 +129,10 @@ const program = Effect.gen(function* () {
   })
 
   // --- Setup ---
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["modeling-guide-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["modeling-guide-table"]!.create()
   yield* Console.log("Table created\n")
 

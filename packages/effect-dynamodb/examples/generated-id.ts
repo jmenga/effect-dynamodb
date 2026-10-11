@@ -78,6 +78,10 @@ const program = Effect.gen(function* () {
     tables: { WidgetsTable },
   })
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables.WidgetsTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables.WidgetsTable.create()
   yield* Console.log("Table created: generated-id-demo\n")
 

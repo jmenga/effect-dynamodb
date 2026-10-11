@@ -363,6 +363,10 @@ const program = Effect.gen(function* () {
   })
 
   // --- Setup: create table ---
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["taskman-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["taskman-table"]!.create()
 
   // --- Seed data ---

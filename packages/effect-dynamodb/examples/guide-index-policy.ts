@@ -320,6 +320,10 @@ const main = Effect.gen(function* () {
       entities: { Devices },
       tables: { AppTable },
     })
+    // Start clean: drop the table a failed earlier run may have left behind
+    yield* db.tables.AppTable.delete().pipe(
+      Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+    )
     yield* db.tables.AppTable.create()
   }).pipe(Effect.provide(AppLayer))
   const setupHier = Effect.gen(function* () {
@@ -327,6 +331,10 @@ const main = Effect.gen(function* () {
       entities: { Assets },
       tables: { HierTable },
     })
+    // Start clean: drop the table a failed earlier run may have left behind
+    yield* db.tables.HierTable.delete().pipe(
+      Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+    )
     yield* db.tables.HierTable.create()
   }).pipe(Effect.provide(HierLayer))
 

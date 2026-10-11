@@ -101,6 +101,10 @@ const program = Effect.gen(function* () {
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["scan-demo-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["scan-demo-table"]!.create()
   yield* Console.log("Table created\n")
 

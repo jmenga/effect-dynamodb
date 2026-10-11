@@ -139,6 +139,12 @@ const BlogTable = Table.make({
 // =============================================================================
 
 const program = Effect.gen(function* () {
+  // Start clean: drop the table a failed earlier run may have left behind
+  const dynamo = yield* DynamoClient
+  const { name: tableName } = yield* BlogTable.Tag
+  yield* dynamo
+    .deleteTable({ TableName: tableName })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   // #region seed-data
   // Typed execution gateway
   const db = yield* DynamoClient.make({
