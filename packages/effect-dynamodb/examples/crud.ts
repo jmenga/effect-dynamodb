@@ -601,8 +601,5 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("Done."))
 // #endregion

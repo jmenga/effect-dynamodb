@@ -181,7 +181,4 @@ const AppLayer = Layer.merge(
   MainTable.layer({ name: "cricket-api-test" }),
 )
 const main = program.pipe(Effect.provide(AppLayer))
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))

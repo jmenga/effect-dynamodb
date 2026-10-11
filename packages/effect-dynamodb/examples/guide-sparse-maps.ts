@@ -205,7 +205,4 @@ const program = Effect.gen(function* () {
 // 5. Run
 // =============================================================================
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(
-  () => console.log("Done."),
-  (error: unknown) => console.error("Failed:", error),
-)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(() => console.log("Done."))

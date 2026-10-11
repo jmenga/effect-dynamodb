@@ -331,8 +331,5 @@ const program = Effect.gen(function* () {
   yield* Console.log("\nAll tests passed.")
 })
 
-Effect.runPromise(program).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(program).then(() => console.log("\nDone."))
 // #endregion

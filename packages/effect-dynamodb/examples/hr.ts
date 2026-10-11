@@ -458,8 +458,8 @@ const program = Effect.gen(function* () {
   assertEq(cbaskinReportIds, ["cbaskin", "hschreibvogel"], "cbaskin report IDs")
   yield* Console.log("  Direct reports: jlowe (2), cbaskin (2) — OK")
 
-  // Pattern 8: Employee Transfer (All-or-None)
-  yield* Console.log("Pattern 8: Employee Transfer (All-or-None)")
+  // Pattern 8: Employee Transfer (GSI key recomposition)
+  yield* Console.log("Pattern 8: Employee Transfer (GSI key recomposition)")
 
   // #region transfer
   const transferred = yield* db.entities.Employees.update({ employee: "dfinlay" }).set({
@@ -488,19 +488,23 @@ const program = Effect.gen(function* () {
   assertEq(jloweReportsAfter.length, 1, "jlowe has 1 report after transfer")
   assertEq(jloweReportsAfter[0]!.employee, "jlowe", "jlowe's only report is self")
 
-  // Partial GSI update fails at runtime
-  // #region partial-gsi-error
-  const partialError = yield* db.entities.Employees.update({ employee: "dfinlay" })
-    .set({ office: "gw-zoo" } as any)
-    .asEffect()
-    .pipe(Effect.flip)
+  // A partial update recomposes only the GSI key halves it touches
+  // #region partial-gsi-update
+  const moved = yield* db.entities.Employees.update({ employee: "dfinlay" }).set({
+    office: "gw-zoo",
+  })
+
+  const { Employees: gwZooAfter } = yield* db.collections.workplaces!({
+    office: "gw-zoo",
+  }).collect()
   // #endregion
-  assertEq(partialError._tag, "ValidationError", "partial GSI update fails with ValidationError")
+  assertEq(moved.office, "gw-zoo", "partial update moves the office")
+  assertEq(moved.team, "saturn", "partial update keeps the other composites")
   assert(
-    String((partialError as any).cause).includes("workplaces"),
-    "error references the violating index",
+    gwZooAfter.some((e: any) => e.employee === "dfinlay"),
+    "dfinlay is listed under gw-zoo's workplaces partition",
   )
-  yield* Console.log("  Transfer + all-or-none runtime guard — OK")
+  yield* Console.log("  Transfer + partial GSI recomposition — OK")
 
   // Pattern 9: Atomic Onboarding (Transaction)
   yield* Console.log("Pattern 9: Atomic Onboarding (Transaction)")
@@ -597,10 +601,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
 
 export { program, HrTable, HrSchema, Employees, Tasks, Offices, Employee, Task, Office }

@@ -772,10 +772,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
 
 export { program, TmTable, TmSchema, Employees, Tasks, Offices, Employee, Task, Office }

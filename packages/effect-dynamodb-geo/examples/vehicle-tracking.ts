@@ -142,4 +142,4 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "vehicle-tracking" }),
 )
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).catch(console.error)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer)))

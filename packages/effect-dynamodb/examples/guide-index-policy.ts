@@ -360,8 +360,5 @@ const main = Effect.gen(function* () {
   yield* Console.log("\nAll v1.7.1 indexPolicy scenarios passed.")
 })
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
