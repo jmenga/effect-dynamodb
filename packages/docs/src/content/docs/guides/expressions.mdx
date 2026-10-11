@@ -160,6 +160,8 @@ Products.condition({ status: "active", role: "admin" })
 | Attribute type | `attributeType(t.field, "S")` | `attribute_type(#field, :type)` |
 | Size | `gt(t.field.size(), 5)` | `size(#field) > :val` |
 
+An `isIn` with no values compiles to `#field IN ()`, which DynamoDB rejects as a syntax error. The library sends it rather than refusing it, and fails with a `ValidationError` naming the `isIn()` and its attribute, with DynamoDB's error as its `cause` — in a condition (nothing is written) and in a filter (`operation: "query.filter"`) alike. Give `isIn` at least one value, or leave the condition out.
+
 ### Logical Composition
 
 | Combinator | Callback | DynamoDB |

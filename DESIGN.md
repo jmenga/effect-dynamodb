@@ -1828,7 +1828,9 @@ no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
 with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
 `Delete` when they run, per op in `transactWrite`, in `append`, for filters
 when a query runs, and for aggregate `list` filters. An `isIn` with no values
-(`IN ()`, which DynamoDB rejects) is refused the same way, and a
+is not refused (#144): it compiles to `IN ()`, DynamoDB rejects it as a syntax
+error, and the rejection is diagnosed into a `ValidationError` naming the
+`isIn()` and its attribute (filters: `operation: "query.filter"`). A
 `Transaction.check()` with an empty condition is refused before sending.
 `compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
 caller can compile one by skipping the check — reaching it is a library bug.
@@ -2163,7 +2165,11 @@ upsert as it fails an update.) Each sentinel a write would release costs one con
 `GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
 one by one with a conditional `DeleteItem`, since a batch delete cannot carry
 the condition, collects them from the live item and every tombstone, and skips
-a release whose reservation changed hands in between. A sentinel an update
+a release whose reservation changed hands in between. It then batch-deletes the
+item's rows in `BatchWriteItem` chunks of 25, resending `UnprocessedItems` with
+`Batch.write`'s backoff (5 retries); when they run out it fails with a
+`DynamoError` stating how many rows remain and exactly how many it had deleted
+(#144). A sentinel an update
 writes for a changed value carries its constraint's `ttl`, as a put's does.
 
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
@@ -2216,7 +2222,7 @@ diagnosed **before** the conditional mapping, and any cancellation of a
 request that repeats an item is read as the repeat: never as a lost race,
 never retried. **Size and count are not checked before
 sending** either: a transaction over 100 items or 4 MB, or holding an item
-over 400 KB or a sort key over 1024 bytes, is sent, rejected whole by
+over 400 KB or a key over its size limit, is sent, rejected whole by
 DynamoDB, and diagnosed from that rejection by the same targets — see
 [Write Limits](#write-limits-and-request-rules--diagnosed-not-pre-checked-144). Deletes of `unique` / retain / `softDelete`
 entities are still refused (EDD-9048): a transaction builds a delete from its
@@ -2309,12 +2315,14 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 
 Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md) §6 and §6A.
 **Library-wide rule: a limit or request rule DynamoDB enforces itself is never checked
-before sending.** That covers 400 KB per item, 100 items and 4 MB per transaction, 1024
-bytes per sort key, one operation per item (transactions and batch requests), 4,096
-characters / 300 operators per expression and 100 operands per `IN`, empty key values (a
-write's, or a query's key bound), a `BETWEEN` whose lower bound sorts after its upper
-bound, a consistent read of a GSI, and a table's vector-index quotas (18 inline filters
-per index, vector indexes per table). DynamoDB rejects an over-limit request whole, so a pre-check adds no safety; it only
+before sending.** That covers 400 KB per item, 100 items and 4 MB per transaction, 2048
+bytes per partition key and 1024 bytes per sort key, one operation per item (transactions
+and batch requests, `BatchGetItem` included), 4,096 characters / 300 operators per
+expression and 100 operands per `IN`, an `IN ()` with no operands (an `isIn` with no
+values), empty key values (a write's, or a query's key bound), a `BETWEEN` whose lower
+bound sorts after its upper bound, a consistent read of a GSI (an aggregate's assembly
+read included), a table's vector-index limits (dimensions in 1..4096, 18 inline filters
+per index, vector indexes per table) and a vector search's `TopK` (1..100). DynamoDB rejects an over-limit request whole, so a pre-check adds no safety; it only
 costs every passing write a sizing pass, and mirrors DynamoDB's approximate item-size
 rules imperfectly. What the library adds is **attribution**, needed only once the write
 has failed: DynamoDB's message names neither the item nor which of a transaction's items
@@ -2332,14 +2340,19 @@ conditional failure, which would read as a lost race. On failure only, it:
    `TransactionCanceledException` whose positional reason carries
    `Code: "ValidationError"` (or, for a request that repeats an item, any reason).
 2. **Confirms** it by measuring the request that was sent (`internal/ItemSize.ts`).
-   Exact measures confirm only when over the limit: an item count over 100, a sort key's
-   UTF-8 bytes over 1024 (DynamoDB Local's "Size limit exceeded" and "… range primary key
-   values must be under 1024 bytes" and AWS's "Aggregated size of all range keys …"
-   wordings are recognised), two entries naming one item, an expression's length,
-   operators or `IN` operands over the limit, an empty value written to (or compared with)
-   the key attribute DynamoDB named, a `BETWEEN` out of DynamoDB's UTF-8 order, a
-   consistent read naming an index, a vector index with over 18 inline filters, or a
-   `CreateTable` with more vector indexes than DynamoDB stated (else 5). For item size and
+   Exact measures confirm only when over the limit: an item count over 100, a key's
+   UTF-8 bytes over its limit — 2048 for a partition key, 1024 for a sort key, measured on
+   the table's and the indexes' key attributes the request writes (DynamoDB Local's "Size
+   limit exceeded" and "Hash primary key values must be under 2048 bytes, and range
+   primary key values must be under 1024 bytes" are confirmed against both kinds; AWS's
+   "Aggregated size of all range keys …" against sort keys and "Size of hashkey has
+   exceeded …" — unverified — against partition keys), two entries naming one item, an
+   expression's length, operators or `IN` operands over the limit, an `IN ()` in the
+   condition or filter DynamoDB named, an empty value written to (or compared with) the
+   key attribute DynamoDB named, a `BETWEEN` out of DynamoDB's UTF-8 order, a consistent
+   read naming an index, a vector index with dimensions outside 1..4096 or over 18 inline
+   filters, a `CreateTable` with more vector indexes than DynamoDB stated (else 5), or a
+   search whose `TopK` is not an integer in 1..100. For item size and
    transaction payload, which DynamoDB itself counts approximately, the recognised message
    is the evidence and the request must hold something it can apply to (a `Put` / `Update`,
    a transaction); the measurement attributes.
@@ -2354,7 +2367,7 @@ conditional failure, which would read as a lost race. On failure only, it:
    DynamoDB's error kept as the cause, or **passes through** anything unrecognised or
    unconfirmed unchanged, as the bare `DynamoValidationError` / `DynamoError` it was.
 
-| Site | Count over 100 | Item size, 4 MB, sort key |
+| Site | Count over 100 | Item size, 4 MB, key size |
 |------|----------------|---------------------------|
 | `Entity` single-item writes (`PutItem` / `UpdateItem` / `DeleteItem`) | — | `ValidationError` |
 | `Entity` transactional writes (guarded put, retain/unique update, retain/soft delete, `restore`) | `TransactionOverflow` | `ValidationError` |
@@ -2369,12 +2382,21 @@ The request rules map to the same sites' errors: a repeated item is a `Validatio
 (`transactGet`: `DynamoError`; `Batch.write`: saying exactly what the batch had already written); an
 expression over its limits is a `ValidationError` naming the caller's share of it; an
 empty key is a `ValidationError` (a stream-index key: `operation:
-"EventStore.append.indexes"`); a read's rejection is a `ValidationError`
-(`operation: "query.consistentRead"`, or `"EventStore.readIndex"` for `readIndex`'s key
-bounds); a vector-index quota rejection keeps DynamoDB's tag (`DynamoValidationError` /
-`DynamoError`), its message naming the index and the entities sharing it.
-`Aggregate` names the groups already committed (`AggregateTransactionOverflow.committed`,
-or the `ValidationError`'s text), since each group is its own transaction.
+"EventStore.append.indexes"`); an `isIn` with no values is a `ValidationError` naming
+it; a read's rejection is a `ValidationError` (`operation: "query.consistentRead"`;
+`"query.filter"` for an `IN ()`; for a key bound, `"query"` named by the accessor —
+`User.byTenant`, `collection "assignments"` — or `"EventStore.readIndex"` for
+`readIndex`); an aggregate's assembly read rejected for a consistent read of a GSI is a
+`ValidationError` (`"<op>.consistentRead"`) naming the aggregate and index, or for
+`delete`, whose union has no `ValidationError`, DynamoDB's own `DynamoValidationError`,
+explained; a `BatchGetItem` repeating a key (`Batch.get`) is a `DynamoError` naming both
+positions; a vector-index rejection keeps DynamoDB's tag (`DynamoValidationError` /
+`DynamoError`), its message naming the index and the entities sharing it; a search's
+`TopK` is a `ValidationError` (`operation: "vectorSearch.<index>.topK"`).
+`Aggregate` names the groups already committed (`AggregateTransactionOverflow.committed`
+and its `message`, or the `ValidationError`'s text), since each group is its own
+transaction; a failed `create` says the root may be committed, so a retried create fails
+its root guard: update or delete the partial aggregate.
 
 An eventual cascade's per-item diagnosed `ValidationError` lands in
 `CascadePartialFailure.errors`, as any per-item failure does. `Aggregate` delete's
@@ -2391,7 +2413,9 @@ retry loops do not retry it, and `EventStore`'s `sendAppendTransaction` still tr
 **What stays a pre-check** (design §6A.8): only what DynamoDB cannot see, or would accept
 with another meaning — the library's own invariants (option shapes and lengths; a
 stream-index `key` result that is not a string; `readIndex`'s one-of and string bounds and
-its `limit`; empty condition parts; a versioned put's item touched again in `Batch.write`;
+its `limit`; empty condition parts under `or` / `not` and an `or()` with no parts; a vector
+index's non-integer `dimensions` (`[EDD-9070]`: DynamoDB reads integers leniently, so it
+could accept another, immutable dimensionality); a versioned put's item touched again in `Batch.write`;
 the aggregate sort-key collision check), configuration and definition checks (EDD-90xx,
 including `[EDD-9069]` and `[EDD-9063]`), and strategies that measure to choose, refusing
 nothing (`expressionFits`; `Batch.write`'s chunking at 25 / 100 items and exactly
@@ -3639,7 +3663,7 @@ const hits = yield* db.entities.Products
   .byDescription("waterproof hiking boots")   // string ⇒ Embedder; number[] accepted directly
   .partition({ tenantId })                     // required by the types iff partition composites declared
   .filter({ category: "footwear" })            // equality-only shorthand
-  .topK(25)                                    // clamped to 1..100; default 10
+  .topK(25)                                    // 1..100, sent as given; default 10
   .select(["name", "price"])
   .collect()
 // Array<{ item: Product; similarity: Similarity; rawScore: number }>
@@ -3739,11 +3763,11 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 
 | Limit | Value | Enforced at |
 |---|---|---|
-| Dimensions | 1 … 4096 | `Entity.make` |
+| Dimensions | 1 … 4096 | DynamoDB; the rejection is diagnosed by `db.tables.*.create()` / `addVectorIndex`, naming the index and its sharers (#144). A non-integer is refused at `Entity.make` (`[EDD-9070]`) |
 | Vector indexes per table | 5 by default, adjustable through AWS Support | DynamoDB; the rejection is diagnosed by `db.tables.*.create()` / `addVectorIndex`, naming the index and the entities sharing it (#144) |
 | INLINE_FILTER attributes per index (after the union across sharers) | 18 | DynamoDB; diagnosed as above (#144). Unverified on DynamoDB Local, which supports no vector indexes |
 | HASH attributes per index | 1 (library-composed) | by construction |
-| `TopK` | 1 … 100 (default 10) | `.topK()` clamp |
+| `TopK` | 1 … 100 (default 10) | DynamoDB; sent as given, never clamped, and the rejection diagnosed as a `ValidationError` naming the topK (#144). `VectorSearchEmulation` rejects it likewise |
 | Capacity mode | on-demand only | documented |
 
 ---
@@ -3757,7 +3781,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `DynamoError` | AWS SDK error wrapper |
 | `ItemNotFound` | No item: `get`, `update` of a missing item (unless a plain `.set()` of a complete item, which is created), `restore` without a tombstone |
 | `ConditionalCheckFailed` | A user `.condition()` failed, or an op's own guard did: `create()` of an existing item (or aggregate), `patch()` or `deleteIfExists()` of a missing item |
-| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts, or an `isIn` with no values), `expectedVersion` on an unversioned entity; or a request DynamoDB rejected — an item over 400 KB, a transaction over 4 MB, a sort key over 1024 bytes, one item touched twice, a condition over its expression limits, an empty key value, a consistent read of a GSI, a reversed `readIndex` `between` — diagnosed and naming the culprit (`cause`: DynamoDB's error) |
+| `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts), `expectedVersion` on an unversioned entity; or a request DynamoDB rejected — an item over 400 KB, a transaction over 4 MB, a partition key over 2048 or a sort key over 1024 bytes, one item touched twice, a condition over its expression limits, an `isIn` with no values, an empty key value, a consistent read of a GSI, a reversed `between`, a vector search's `TopK` outside 1..100 — diagnosed and naming the culprit (`cause`: DynamoDB's error) |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
 | `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |
@@ -3768,7 +3792,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `RefNotFound` | Referenced entity does not exist during hydration |
 | `AggregateAssemblyError` | Collection query returned unexpected/incomplete data |
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |
-| `AggregateTransactionOverflow` | Sub-aggregate exceeds 100-item transaction limit — diagnosed from DynamoDB's rejection of that group (`cause`), never pre-checked (#144); `committed` names the sub-aggregates earlier groups of the write already committed |
+| `AggregateTransactionOverflow` | Sub-aggregate exceeds 100-item transaction limit — diagnosed from DynamoDB's rejection of that group (`cause`), never pre-checked (#144); `committed` names the sub-aggregates earlier groups of the write already committed, and `message` says so (for a failed `create`, `operation: "create"`, that the root may be committed: update or delete the partial aggregate) |
 | `CascadePartialFailure` | Cascade update partially failed (eventual mode) |
 | `EmbeddingError` | `Embedder.embed` failed, or no `Embedder` was provided for an entity with vector indexes |
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
@@ -3887,7 +3911,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9025` | `Errors.ts` | Composite attribute schema admits `null` |
 | `EDD-9026` | `EventStore.ts` | Snapshot operation on a stream with no snapshot config |
 | `EDD-9027` | `EventStore.ts` | `snapshot.every` is not a positive integer |
-| `EDD-9030` | `VectorIndex.ts` | Vector index `dimensions` invalid |
+| `EDD-9030` | — | **Retired** in #144 (vector index `dimensions` outside 1..4096): DynamoDB's rejection is diagnosed by `db.tables.*.create()` / `addVectorIndex` instead; a non-integer is `EDD-9070`. Do not reuse |
 | `EDD-9031` | `VectorIndex.ts` | Vector index declares no `source.fields`, or references an unknown field |
 | `EDD-9032` | `VectorIndex.ts` | Vector index lists a filter more than once. (Until #144 also: more INLINE_FILTER entries than DynamoDB allows — no longer pre-checked; DynamoDB's rejection is diagnosed by `db.tables.*.create()` / `addVectorIndex`) |
 | `EDD-9033` | `VectorIndex.ts` | Two vector indexes on one entity resolve to the same physical index |
@@ -3899,7 +3923,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9039` | `VectorIndex.ts` | Vector filter field's encoded type is not derivable from the model |
 | `EDD-9040` | `Table.ts` | Vector index filter attribute is not a stored attribute |
 | `EDD-9041` | `Aggregate.ts` | Aggregate collection PK field conflicts with the table's |
-| `EDD-9042` | `Aggregate.ts` | `consistentRead` requested against a GSI-backed aggregate collection |
+| `EDD-9042` | — | **Retired** in #144 (`consistentRead` against a GSI-backed aggregate collection): the assembly read is sent, and DynamoDB's rejection diagnosed, naming the aggregate and the index. Do not reuse |
 | `EDD-9043` | `Aggregate.ts` | `collection.index` and `collection.sk` must be supplied together |
 | `EDD-9044` | `internal/EntitySchemas.ts` | Timestamp `schema` carries no `DynamoEncoding` annotation |
 | `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites — unreachable from well-typed code since the `ResolveSkFields` repair (#121); retained for untyped and cast call sites |
@@ -3925,8 +3949,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently (type, key attributes or projection) |
 | `EDD-9068` | `EventStore.ts` | `verifySnapshot: false` on a stream whose snapshot config is not `mode: "inline"` without `every` — thrown by `commandHandler` at handler construction, a defect from `readLatest` |
 | `EDD-9069` | `Table.ts` | Table members disagree on one physical secondary index's key attributes or GSI/LSI classification (entity indexes, `_cascade_<field>` indexes, aggregate collection and list indexes), or entities declare different primary-key fields — thrown by `Table.make` and `Table.definition` |
+| `EDD-9070` | `VectorIndex.ts` | Vector index `dimensions` is not an integer — DynamoDB reads an integer member leniently, so it could create the index with another, immutable dimensionality |
 
-Next free code: **`EDD-9070`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9071`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

@@ -61,7 +61,7 @@ const Products = Entity.make({
 
 `source.fields` is a declared field list rather than an opaque function — that is what lets `update` decide whether a write actually touched the embedding source. Add `source.compose` to control how the picked values are joined; the default joins them with a space in declaration order.
 
-`dimensions` and `distance` are immutable at the DynamoDB level. `Entity.make` validates them (1–4096 dimensions, all named fields exist on the model), and `Table.make` validates that entities *sharing* a physical vector index agree — sharing is the norm in single-table designs, since the default quota is 5 vector indexes per table. DynamoDB's own limits — 18 `INLINE_FILTER` attributes per index (after the union across sharers), and the per-table quota, which AWS Support can raise — are not checked by the library: `db.tables.*.create()` and `addVectorIndex` send the request, and a rejection fails with the error DynamoDB returned, its message naming the index and the entities sharing it.
+`dimensions` and `distance` are immutable at the DynamoDB level. `Entity.make` validates what DynamoDB cannot see — every named field exists on the model, and `dimensions` is an integer (`[EDD-9070]`: DynamoDB reads an integer leniently, so `1536.5` could create an index of another dimensionality) — and `Table.make` validates that entities *sharing* a physical vector index agree — sharing is the norm in single-table designs, since the default quota is 5 vector indexes per table. DynamoDB's own limits — dimensions in 1–4096, 18 `INLINE_FILTER` attributes per index (after the union across sharers), and the per-table quota, which AWS Support can raise — are not checked by the library: `db.tables.*.create()` and `addVectorIndex` send the request, and a rejection fails with the error DynamoDB returned, its message naming the index and the entities sharing it. DynamoDB Local has no vector indexes, so this recognition follows AWS's documented limits and is unverified against AWS's wording.
 
 `filters` are not a shared physical property, though: they are per-entity access patterns, so entities sharing an index may each declare their own and the emitted `SearchSchema` carries the **union**. The 18-filter limit applies to that union.
 
@@ -213,6 +213,8 @@ Each hit is `{ item, similarity, rawScore }`:
 `.collect()` is the **only** terminal. `SearchVectors` has no cursor and no pagination, so `.fetch()`, `.paginate()`, `.startFrom()`, `.maxPages()` and `.reverse()` are structurally absent from the type rather than present and failing. The builder cannot express an operation the API does not have.
 
 The query argument accepts a `string` (embedded for you) or a `number[]` (used verbatim — useful for reranking, cached queries, or benchmarking).
+
+`.topK(k)` defaults to 10 and is sent as given. DynamoDB accepts an integer in 1–100 — a search returns at most 100 results, with no further pages — and rejects anything else; `.collect()` then fails with a `ValidationError` (`operation: "vectorSearch.<index>.topK"`) naming the `topK` and the accepted range, with DynamoDB's error as its `cause`. Earlier releases silently clamped `topK` into 1–100, so a `.topK(500)` that used to return at most 100 hits now fails: ask for at most 100. `VectorSearchEmulation` rejects an out-of-range `TopK` the same way.
 
 ## Filtering and projection
 
