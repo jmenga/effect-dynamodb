@@ -76,7 +76,7 @@ yield* Console.log("Soft-deleted alice")
 
 The soft delete, and a hard delete of an entity with unique constraints or `retain`, are guarded against a concurrent update: if the item changed after it was read, the delete never removes the newer item. With no `.condition()` (or only `deleteIfExists`'s), it reads the item again and is retried (up to three attempts), so the tombstone or snapshot holds the newer state; if the item was deleted in between, it reports what a delete of a missing item does. With any other `.condition()`, it fails, since the condition was judged against the older read. `deleteIfExists` of a missing item fails with `ConditionalCheckFailed`. `delete(key).returnValues("allOld")` returns the item the delete removed. A versioned entity checks its version. An unversioned one checks every attribute it read.
 
-**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`, the way DynamoDB counts them), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size.
+**Wide items.** An unversioned delete is never refused for width. When the full guard can't fit DynamoDB's condition limits (4 KB and 300 operators, counted on the actual condition including your `.condition()`, the way DynamoDB counts them), it falls back to the strongest guard that fits: the item exists, `updatedAt` is unchanged (with timestamps), then as many attributes as fit, unique-constraint fields first. With timestamps, that detects any concurrent library update except one in the same millisecond with an identical `updatedAt`. A writer outside the library that leaves `updatedAt` alone can change unguarded attributes undetected. Without timestamps, only the guarded attributes are protected. A `.condition()` too large to fit beside the guard is sent as built: DynamoDB rejects it, nothing is written, and the write fails with a `ValidationError` stating the expression's size and how much of it is your `.condition()`.
 
 ### Visibility After Deletion
 
@@ -409,10 +409,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ## What's Next?

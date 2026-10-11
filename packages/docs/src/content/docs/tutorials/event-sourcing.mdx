@@ -587,7 +587,7 @@ A **put** of a `versioned` or `unique`-constrained entity is written exactly as 
 
 The 100-item cap counts the **expanded** total, so `events + expanded additional items + sentinel + contiguity check` must fit. `AppendTooLarge.count` reports the expanded number.
 
-DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, fail with a `ValidationError` naming the entity, before anything is sent. An append whose items pass DynamoDB's 4 MB limit, or that holds an item over its 400 KB limit, is rejected by DynamoDB, so nothing is written, and fails with a `ValidationError` naming the culprit item; a `retain` put counts twice towards the 4 MB (its item and its snapshot).
+DynamoDB allows one operation per item in a transaction. Two `additionalItems` that touch the same item, such as two puts that swap unique values (each releases the sentinel the other reserves), or one that repeats an event or the idempotency sentinel, are rejected by DynamoDB and fail with a `ValidationError` naming both items; nothing is written, and the rejection is never read as a version conflict or retried. An append whose items pass DynamoDB's 4 MB limit, or that holds an item over its 400 KB limit, is rejected by DynamoDB, so nothing is written, and fails with a `ValidationError` naming the culprit item; a `retain` put counts twice towards the 4 MB (its item and its snapshot).
 
 ### Telling the failures apart
 
@@ -1080,7 +1080,7 @@ const Scorecards = EventStore.makeStream({
 })
 ```
 
-- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. An empty string, a non-string or a `key` that throws fails the append with `ValidationError` before anything is written. A key over DynamoDB's 1024-byte sort-key limit is rejected by DynamoDB, so nothing is written, and the append fails with a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version.
+- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. A non-string or a `key` that throws fails the append with `ValidationError` before anything is written. An empty string, or a key over DynamoDB's 1024-byte sort-key limit, is rejected by DynamoDB, so nothing is written, and the append fails with a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version.
 - Only event items carry index attributes. Snapshots and idempotency sentinels are never in an index.
 - `type: "lsi"` (the default) uses the table's partition key, so the index holds exactly this stream's indexed events and can be read with strongly consistent reads. `type: "gsi"` names a `pk` attribute too; `append` writes the stream's partition key value into it, so the index is scoped to the same stream, read eventually consistently.
 
@@ -1155,7 +1155,7 @@ const firstInnings = yield* scorecards.provide(
 )
 ```
 
-`readIndex(name, streamId, options?)` returns decoded `StreamEvent`s in index order. Its options are `beginsWith` or `between` (at most one; omit both to read the whole sub-stream), `reverse`, `limit` and `consistentRead`. Index names are type-checked against the stream's `indexes`. `consistentRead` on a GSI-backed index is refused with `ValidationError`, as is an empty key bound or a `between` whose lower bound sorts after its upper bound. `query.index(name, streamId)` returns a plain `Query` for the full set of combinators.
+`readIndex(name, streamId, options?)` returns decoded `StreamEvent`s in index order. Its options are `beginsWith` or `between` (at most one; omit both to read the whole sub-stream), `reverse`, `limit` and `consistentRead`. Index names are type-checked against the stream's `indexes`. DynamoDB rejects `consistentRead` on a GSI-backed index, an empty key bound, and a `between` whose lower bound sorts (by UTF-8 bytes) after its upper bound; each fails with a `ValidationError` naming the index (`operation: "EventStore.readIndex"`, or `"query.consistentRead"`), with DynamoDB's error as its `cause`. `query.index(name, streamId)` returns a plain `Query` for the full set of combinators.
 
 ---
 
@@ -1479,7 +1479,7 @@ const byRuns = yield* auditedScorecards.readIndex(
 ```
 
 - `readIndex` and `query.index` type `metadata` per index name: `undefined` through a `withoutMetadata` index, the stream's metadata type otherwise. A `withoutMetadata` read drops `metadata` even when the deployed index holds it, so the value always matches the type.
-- A `keys` GSI read fetches only the events a page keeps (after `limit`), 100 keys per `BatchGetItem`. Unprocessed keys are retried with backoff, and the read fails with `DynamoError` after 5 retries. The fetch is eventually consistent; a key missing from the response is read once more with `ConsistentRead`. `consistentRead` on a GSI is still refused, while on a `keys` LSI it applies to the fetch too.
+- A `keys` GSI read fetches only the events a page keeps (after `limit`), 100 keys per `BatchGetItem`. Unprocessed keys are retried with backoff, and the read fails with `DynamoError` after 5 retries. The fetch is eventually consistent; a key missing from the response is read once more with `ConsistentRead`. `consistentRead` on a GSI is still rejected (by DynamoDB, diagnosed as a `ValidationError` naming the index), while on a `keys` LSI it applies to the fetch too.
 - `Query.count` counts index entries and never fetches. `Query.select` works on every projection: a `keys` LSI fetches the named attributes, and a `keys` GSI moves the selection onto `BatchGetItem`.
 - A `Query.filter` on a `withoutMetadata` or `keys` index may only name attributes the index projects; DynamoDB rejects any other. Filter on the client with `Query.filterBy` instead.
 - Streams that share a physical index must declare the same projection; `indexDefinitions` refuses a mismatch with `[EDD-9067]`.
@@ -1549,10 +1549,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---

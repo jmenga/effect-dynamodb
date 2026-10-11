@@ -68,7 +68,7 @@ All update combinators compose as arguments — they are merged into one `Update
     .subtract({ stock: 5 })
     .append({ tags: ["premium"] })
     .remove(["description"])
-    .expectedVersion(5)
+    .expectedVersion(6)
 ```
 
 ## Working in Bulk
@@ -154,7 +154,7 @@ When using `condition()` on an update that also has `Entity.expectedVersion()`, 
   // #region optimistic-condition
   yield* db.entities.Products.update({ productId: "p-1" })
     .set({ price: 24.99 })
-    .expectedVersion(6)
+    .expectedVersion(7)
     .condition((t, { gt }) => gt(t.stock, 0))
   // ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
 ```

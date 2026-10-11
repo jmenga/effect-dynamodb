@@ -539,7 +539,7 @@ The create operation:
 
 Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`. These are kept intact while ref IDs are replaced with hydrated data.
 
-Returns `RefNotFound` if a ref ID doesn't resolve. Returns `AggregateTransactionOverflow` if a sub-aggregate group exceeds 100 items (DynamoDB transaction limit). Every group is counted before the first is written, because each group is its own transaction and a later group's rejection could not undo an earlier one. An item over DynamoDB's 400 KB limit, a group over 4 MB or a sort key over 1024 bytes is not checked before sending: DynamoDB rejects that group, nothing from it is written, and the write fails with a `ValidationError` naming the item and its key, with DynamoDB's error as its `cause`.
+Returns `RefNotFound` if a ref ID doesn't resolve. Each sub-aggregate group is its own transaction, written in turn, so a multi-group write is not atomic. DynamoDB's limits are not checked before sending: a group over 100 items (DynamoDB's transaction limit) is rejected by DynamoDB and fails with `AggregateTransactionOverflow`; an item over 400 KB, a group over 4 MB or a sort key over 1024 bytes fails with a `ValidationError` naming the item and its key. Nothing from the rejected group is written, DynamoDB's error is the `cause`, and the error says which groups were already committed (`AggregateTransactionOverflow.committed`, or the `ValidationError`'s message). A `create` whose root group committed fails on the existing root if retried: `update` or `delete` the partial aggregate instead.
 
 Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
 
@@ -722,7 +722,7 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 | `AggregateAssemblyError` | Read path: no items for the key, a missing root item, or duplicate root / sub-aggregate items | `aggregate`, `reason`, `key` |
 | `ValidationError` | Read path: the assembled items fail schema decode (`operation: "aggregate.assemble"`) | `entityType`, `operation`, `cause` |
 | `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
-| `AggregateTransactionOverflow` | Write path: sub-aggregate exceeds 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit` |
+| `AggregateTransactionOverflow` | Write path: DynamoDB rejected a sub-aggregate group over its 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit`, `committed` (sub-aggregates already written), `cause` |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
 
 ```typescript region="aggregate-error-handling" example="guide-aggregates.ts"

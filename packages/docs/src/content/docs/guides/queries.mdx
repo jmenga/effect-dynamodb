@@ -387,7 +387,7 @@ const consistentTask = yield* TaskEntity.get({ taskId: "t-001" }).pipe(Entity.co
 const consistentScan = yield* tasks.scan().consistentRead().collect()
 ```
 
-Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update). **An entity's consistent reads come from the base table** — `get`, a primary-key query or a scan. DynamoDB reads a GSI only eventually consistently, and an entity's indexes are always GSIs (`db.tables.*.create()` creates them as GSIs), so `.consistentRead()` on an entity index accessor, or on a collection over one, fails with a `ValidationError` before anything is sent — even for an index you pointed at an LSI of a table you created yourself.
+Consistent reads cost 2x the read capacity of eventually-consistent reads. Use them when you need read-after-write consistency (e.g., immediately after a put or update). **An entity's consistent reads come from the base table** — `get`, a primary-key query or a scan. DynamoDB reads a GSI only eventually consistently, and an entity's indexes are always GSIs (`db.tables.*.create()` creates them as GSIs), so `.consistentRead()` on an entity index accessor, or on a collection over one, is sent as asked and DynamoDB rejects it: the query fails with a `ValidationError` (`operation: "query.consistentRead"`) naming the index, with DynamoDB's error as its `cause`. An index you pointed at an LSI of a table you created yourself reads consistently, as DynamoDB allows.
 
 ## Ordering
 

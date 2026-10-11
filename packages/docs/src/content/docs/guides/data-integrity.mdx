@@ -246,7 +246,7 @@ A `put` of a versioned entity reads the item first, so a put over an existing it
 
 With `retain`, a deleted item's version history outlives it, and the key can be used again without `purge`. A delete, hard or soft, snapshots the item's final state at its own version in the same transaction. A `put`, `create`, `upsert` or transaction put of the missing item reads the highest version retained for its key and continues after it (a retain `create` makes no other read: one `Limit 1` query of its history, plus, when the primary sort key has composites, a keys-only `Limit 1` query for history an earlier release wrote, which it reads in full only if that finds some): an item deleted at version 3 comes back at version 4, with a new incarnation token and its own `v#0000004` snapshot. The earlier history is never overwritten, and a writer still holding version 3 fails with `OptimisticLockError`. A `restore` of the old tombstone while the new item is live fails with `ItemNotDeleted`.
 
-`Transaction.transactWrite` and `EventStore` `additionalItems` write a `put` of a versioned or unique-constrained entity exactly as its own `put` does: they read the item, continue or create it, snapshot it and rotate its sentinels, all in the one transaction. A race between that read and the transaction is retried. A taken unique value fails with `UniqueConstraintViolation`; only an op's own `.condition()` fails as a condition (`TransactionCancelled`, or `AdditionalItemConditionFailed` from `append`). DynamoDB allows one operation per item in a transaction, so a transaction that touches one item twice fails with a `ValidationError` naming the entity, before anything is sent; that includes two puts that swap unique values, which touch the same sentinels. One whose items pass DynamoDB's 4 MB limit, where a `retain` put counts twice (its item and its snapshot), or that holds an item over DynamoDB's 400 KB per-item limit, is rejected by DynamoDB, so nothing is written; it fails with a `ValidationError` naming the item and its key (for 4 MB, the largest items), with DynamoDB's error as its `cause`. A transaction still can't delete an entity with `unique`, `retain` or `softDelete` (EDD-9048). `Batch.write` still sends puts of a `versioned` entity as create-only transactions (see [Batch Operations](/effect-dynamodb/tutorials/batch/)).
+`Transaction.transactWrite` and `EventStore` `additionalItems` write a `put` of a versioned or unique-constrained entity exactly as its own `put` does: they read the item, continue or create it, snapshot it and rotate its sentinels, all in the one transaction. A race between that read and the transaction is retried. A taken unique value fails with `UniqueConstraintViolation`; only an op's own `.condition()` fails as a condition (`TransactionCancelled`, or `AdditionalItemConditionFailed` from `append`). DynamoDB allows one operation per item in a transaction, so it rejects a transaction that touches one item twice, and the write fails with a `ValidationError` naming both operations and the item; that includes two puts that swap unique values, which touch the same sentinels. Nothing is written, and the rejection is never mistaken for a lost race and retried, even when DynamoDB reports it as a failed condition. One whose items pass DynamoDB's 4 MB limit, where a `retain` put counts twice (its item and its snapshot), or that holds an item over DynamoDB's 400 KB per-item limit, is rejected by DynamoDB, so nothing is written; it fails with a `ValidationError` naming the item and its key (for 4 MB, the largest items), with DynamoDB's error as its `cause`. A transaction still can't delete an entity with `unique`, `retain` or `softDelete` (EDD-9048). `Batch.write` still sends puts of a `versioned` entity as create-only transactions (see [Batch Operations](/effect-dynamodb/tutorials/batch/)).
 
 ### Querying Versions
 
@@ -343,7 +343,7 @@ Some updates read the item before writing: a unique-field change, a computed cha
 
 Versioned entities carry a hidden `__edd_i__` attribute, a token set when the item is created and added to existing items on their next guarded write. It never appears in decoded models, only in `asNative` output and raw items. Version-checked writes require it to match, so an item deleted and recreated at the same version is never mistaken for the original.
 
-An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard fails before writing with a `ValidationError` stating its size. Operators are counted as DynamoDB counts them: `BETWEEN` counts once, and in an update expression each `+`, `-` and function counts, but a `SET` clause's `=` doesn't.
+An update too wide for one DynamoDB expression (4 KB, 300 operators) writes the whole item instead. A versioned entity writes it under its version condition. An unversioned one writes it under the fallback guard soft delete uses (see [Lifecycle](/effect-dynamodb/guides/lifecycle/)). A concurrent write from outside the library to an attribute that guard doesn't cover is lost, which 1.22.0 also did for every such update. A `.condition()` too large to fit beside the guard is sent as built: DynamoDB rejects it, nothing is written, and the write fails with a `ValidationError` stating the expression's size and how much of it is your `.condition()`. Operators are counted as DynamoDB counts them: `BETWEEN` counts once, and in an update expression each `+`, `-` and function counts, but a `SET` clause's `=` doesn't.
 
 Items written before an entity was `versioned` read as version 0, and `expectedVersion(0)` addresses them; their first versioned write produces version 1. An item that has the `__edd_i__` token but no version is different: its version was removed outside the library. Reads and the writes that check the version refuse it with a `ValidationError` instead of reading it as version 0, and a query over a partition holding one fails as a whole. Restore the version attribute to read it again, or remove the item: `purge` removes it on any entity, and on an entity without unique constraints or `retain` a plain hard delete does too, since it reads nothing and writes no history.
 
@@ -440,6 +440,35 @@ DynamoDB limits transactions to 100 items. When multiple features are enabled, e
 Plan your entity design accordingly. For entities with many unique constraints, ensure the total transaction items stay well under 100.
 
 The budget is not checked before sending. A write whose transaction passes 100 items is sent, rejected whole by DynamoDB, so nothing is written, and fails with `TransactionOverflow` (`entityType`, `operation`, `itemCount`, `limit`), with DynamoDB's error as its `cause`. The same applies to DynamoDB's other write limits (an item over 400 KB, a transaction over 4 MB, a sort key over 1024 bytes), which fail with a `ValidationError` naming the item and its key. See [Guarded puts expand](/effect-dynamodb/reference/api-reference/#guarded-puts-expand) in the API reference.
+
+## How DynamoDB Sizes Items
+
+The library never checks a DynamoDB limit before sending. It measures a request only after DynamoDB has rejected it, to name the item at fault, and to choose where `Batch.write` splits its transactions of versioned puts. Both use one measure: DynamoDB's own size accounting, measured against DynamoDB Local and confirmed at the boundaries. An item of 409,600 bytes is accepted and 409,601 is rejected. A transaction of 4,194,304 bytes is accepted and 4,194,305 is rejected. "400 KB" and "4 MB" are binary units.
+
+**An item** is the sum, over its attributes, of the attribute name's UTF-8 bytes plus the value's size. There is no per-item or per-attribute overhead.
+
+| Type | Size |
+|------|------|
+| `S` (string) | its UTF-8 bytes |
+| `B` (binary) | its byte length |
+| `BOOL`, `NULL` | 1 |
+| `N` (number) | `0` is 1. Otherwise 1, plus one byte per base-100 digit pair of the magnitude, plus 1 if negative (see below) |
+| `SS`, `NS`, `BS` (sets) | the sum of the elements' sizes, with no overhead |
+| `L` (list) | 3, plus each element's size + 1 |
+| `M` (map) | 3, plus each entry's name (UTF-8) + value size + 1 |
+
+**Numbers** are counted in pairs of digits. The pairs are aligned to the decimal point, and pairs that are all zeros are dropped from both ends. So `1`, `10`, `99`, `100`, `1000000`, `0.5` and `1E-10` are 2 bytes. `101`, `120`, `1.5` and `12.34` are 3. `12345` and `1.234` are 4. A negative number adds 1 (`-1` is 3, `-123` is 4), except at the maximum precision of 38 digits, so no number takes more than 21 bytes.
+
+**A transaction** counts each action and adds them up:
+
+- A `Put` counts its item. An `Update`, `Delete` or `ConditionCheck` counts only its key, never the stored item or the item an update produces.
+- Each action's `ConditionExpression` and `UpdateExpression` count as well, at their written length, plus every placeholder **occurrence** they contain: a `#name` adds the attribute name's UTF-8 bytes, and a `:value` adds the value's size. A placeholder used twice counts twice.
+
+Expressions count towards the 4 MB transaction limit but not towards an item's 400 KB. A 409,600-byte item with a condition is accepted, alone or in a transaction.
+
+`Batch.write` splits its create-only versioned-put transactions at exactly 100 actions and 4,194,304 bytes by this count. Each put includes its `attribute_not_exists` condition and the key attribute name it substitutes. The application's own transactions (`Transaction.transactWrite`, `EventStore.append` and `commandHandler`, entity writes) are never split: they are sent whole, and a size rejection comes back diagnosed.
+
+AWS documents only "the aggregate size of the items", so production DynamoDB might count a request differently. When DynamoDB rejects a transaction for size that the library measured as fitting, the `ValidationError` gives both numbers: the library's measure, and the `Payload Size` DynamoDB reported. On DynamoDB Local that figure is a running total, taken at the action where it stopped counting. The library does not re-split or retry that request.
 
 ## What's Next?
 
