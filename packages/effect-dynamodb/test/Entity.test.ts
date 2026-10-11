@@ -8916,6 +8916,188 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    // --- Targets keyed by other attribute names (C2: cascade read `item.pk` /
+    // `item.sk` regardless of the target's primary key) ---
+    class CascadeRoster extends Schema.Class<CascadeRoster>("CascadeRoster")({
+      rosterId: Schema.String,
+      player: CascadePlayer.pipe(DynamoModel.ref),
+    }) {}
+
+    const CascadeRosterEntity = withConfig(
+      Entity.make({
+        model: CascadeRoster,
+        entityType: "CascadeRoster",
+        primaryKey: {
+          pk: { field: "PK", composite: ["rosterId"] },
+          sk: { field: "SK", composite: [] },
+        },
+        refs: {
+          player: {
+            entity: CascadePlayerEntity,
+            cascade: { index: "GSI4", pk: { field: "GSI4PK" }, sk: { field: "GSI4SK" } },
+          },
+        },
+      }),
+    )
+
+    const sourcePlayerUpdate = () =>
+      mockUpdateItem.mockResolvedValueOnce({
+        Attributes: toAttributeMap({
+          pk: "$myapp#v1#CascadePlayer#p-1",
+          sk: "$myapp#v1#CascadePlayer",
+          playerId: "p-1",
+          displayName: "Steven Smith",
+          position: "Batter",
+          __edd_e__: "CascadePlayer",
+        }),
+      })
+
+    const rosterRow = (rosterId: string) =>
+      toAttributeMap({
+        PK: `$myapp#v1#CascadeRoster#${rosterId}`,
+        SK: "$myapp#v1#CascadeRoster",
+        rosterId,
+        player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+        __edd_e__: "CascadeRoster",
+        GSI4PK: "$myapp#v1#CascadeRoster#p-1",
+        GSI4SK: `$myapp#v1#CascadeRoster#${rosterId}`,
+      })
+
+    const selectionRow = (selectionId: string) =>
+      toAttributeMap({
+        pk: `$myapp#v1#CascadeSelection#${selectionId}`,
+        sk: "$myapp#v1#CascadeSelection",
+        selectionId,
+        player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+        role: "Captain",
+        __edd_e__: "CascadeSelection",
+        gsi2pk: "$myapp#v1#CascadeSelection#p-1",
+        gsi2sk: `$myapp#v1#CascadeSelection#${selectionId}`,
+      })
+
+    it.effect(
+      "eventual cascade keys each update by the target's primary-key fields (PK / SK)",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery.mockResolvedValueOnce({
+            Items: [rosterRow("r-1")],
+            LastEvaluatedKey: undefined,
+          })
+          mockUpdateItem.mockResolvedValueOnce({})
+
+          yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({ targets: [CascadeRosterEntity], mode: "eventual" }),
+            Entity.asModel,
+          )
+
+          expect(mockQuery.mock.calls[0]![0].IndexName).toBe("GSI4")
+          expect(mockUpdateItem).toHaveBeenCalledTimes(2)
+          expect(mockUpdateItem.mock.calls[1]![0].Key).toEqual({
+            PK: { S: "$myapp#v1#CascadeRoster#r-1" },
+            SK: { S: "$myapp#v1#CascadeRoster" },
+          })
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "transactional cascade keys each entry by its own target's primary-key fields (mixed targets)",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery
+            .mockResolvedValueOnce({ Items: [selectionRow("sel-1")], LastEvaluatedKey: undefined })
+            .mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+
+          yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({
+              targets: [CascadeSelectionEntity, CascadeRosterEntity],
+              mode: "transactional",
+            }),
+            Entity.asModel,
+          )
+
+          const txCall = mockTransactWriteItems.mock.calls[0]![0]
+          expect(txCall.TransactItems.map((item: any) => item.Update.Key)).toEqual([
+            {
+              pk: { S: "$myapp#v1#CascadeSelection#sel-1" },
+              sk: { S: "$myapp#v1#CascadeSelection" },
+            },
+            {
+              PK: { S: "$myapp#v1#CascadeRoster#r-1" },
+              SK: { S: "$myapp#v1#CascadeRoster" },
+            },
+          ])
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "transactional cascade diagnosis names each entry by its own target's key fields",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery
+            .mockResolvedValueOnce({ Items: [selectionRow("sel-1")], LastEvaluatedKey: undefined })
+            .mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+          mockTransactWriteItems.mockRejectedValueOnce(
+            awsTransactionCanceled([
+              { Code: "None" },
+              { Code: "ValidationError", Message: DDB_ITEM_SIZE_UPDATE },
+            ]),
+          )
+
+          const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+            .pipe(
+              Entity.set({ displayName: "Steven Smith" }),
+              Entity.cascade({
+                targets: [CascadeSelectionEntity, CascadeRosterEntity],
+                mode: "transactional",
+              }),
+            )
+            .asEffect()
+            .pipe(Effect.flip)
+
+          expect(error._tag).toBe("CascadePartialFailure")
+          if (error._tag === "CascadePartialFailure") {
+            const diagnosed = error.errors[0] as ValidationError
+            expect(diagnosed._tag).toBe("ValidationError")
+            expect(String(diagnosed.cause)).toContain(
+              "the cascade update of CascadeRoster (item 1), at " +
+                "PK=$myapp#v1#CascadeRoster#r-1, SK=$myapp#v1#CascadeRoster",
+            )
+          }
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("eventual cascade diagnosis names the update by the target's key fields", () =>
+      Effect.gen(function* () {
+        sourcePlayerUpdate()
+        mockUpdateItem.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE_UPDATE))
+        mockQuery.mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+
+        const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+          .pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({ targets: [CascadeRosterEntity], mode: "eventual" }),
+          )
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(error._tag).toBe("CascadePartialFailure")
+        if (error._tag === "CascadePartialFailure") {
+          const diagnosed = error.errors[0] as ValidationError
+          expect(diagnosed._tag).toBe("ValidationError")
+          expect(String(diagnosed.cause)).toContain(
+            "the cascade update of CascadeRoster, at " +
+              "PK=$myapp#v1#CascadeRoster#r-1, SK=$myapp#v1#CascadeRoster",
+          )
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("cascade skips targets with no matching ref", () =>
       Effect.gen(function* () {
         // Target entity has no ref pointing to source — should be skipped

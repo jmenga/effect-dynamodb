@@ -239,6 +239,59 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect("matches responses answered out of order back to their positions", () =>
+      Effect.gen(function* () {
+        const user = (id: string, name: string) =>
+          toAttributeMap({
+            userId: id,
+            email: `${id}@example.com`,
+            name,
+            role: "member",
+            pk: `$myapp#v1#user#userid_${id}`,
+            sk: "$myapp#v1#user",
+            __edd_e__: "User",
+          })
+        // DynamoDB does not preserve order: answer in reverse, one key missing.
+        mockBatchGetItem.mockResolvedValueOnce({
+          Responses: { "test-table": [user("u-3", "Carol"), user("u-1", "Alice")] },
+        })
+
+        const [first, second, third] = yield* Batch.get([
+          UserEntity.get({ userId: "u-1" }),
+          UserEntity.get({ userId: "u-2" }),
+          UserEntity.get({ userId: "u-3" }),
+        ])
+
+        expect(first?.name).toBe("Alice")
+        expect(second).toBeUndefined()
+        expect(third?.name).toBe("Carol")
+        expect(mockBatchGetItem).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "sends a repeated key as given, so DynamoDB's duplicate-key rejection passes through",
+      () =>
+        Effect.gen(function* () {
+          mockBatchGetItem.mockRejectedValueOnce(
+            new Error("Provided list of item keys contains duplicates"),
+          )
+
+          const error = yield* Batch.get([
+            UserEntity.get({ userId: "u-1" }),
+            UserEntity.get({ userId: "u-1" }),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("DynamoError")
+          expect(mockBatchGetItem).toHaveBeenCalledOnce()
+          const request = mockBatchGetItem.mock.calls[0]![0] as {
+            RequestItems: Record<string, { Keys: ReadonlyArray<unknown> }>
+          }
+          // Both keys are sent: the library does not quietly de-duplicate.
+          expect(request.RequestItems["test-table"]!.Keys).toHaveLength(2)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("returns empty array for empty input", () =>
       Effect.gen(function* () {
         const results = yield* Batch.get([])

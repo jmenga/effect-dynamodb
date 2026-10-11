@@ -13,8 +13,9 @@
  *   `VersionConflict` retry policy, caller-supplied `expectedVersion`,
  *   decision-derived `additionalItems`, inline snapshots)
  * - Stream indexes (`makeStream({ indexes })`): sub-streams ordered by a key
- *   derived from each event, on an LSI or GSI — `readIndex`, `query.index`,
- *   and `indexDefinitions` for the `CreateTable` fragments
+ *   derived from each event, on an LSI or GSI, each projecting all of the
+ *   event, all but its metadata, or only its keys — `readIndex`,
+ *   `query.index`, and `indexDefinitions` for the `CreateTable` fragments
  * - `fold` / `foldFrom` helpers for state reconstruction
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
@@ -26,6 +27,7 @@ import type {
   AttributeValue,
   GlobalSecondaryIndex,
   LocalSecondaryIndex,
+  Projection,
 } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
@@ -519,9 +521,9 @@ export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string 
  * An LSI must be created with the table. A table with any LSI caps the item
  * collection of **every** partition key value in it at 10 GB — not only the
  * indexed stream's partitions, but every stream's (indexed or not) and every
- * entity partition sharing the table; a write that would exceed it fails. Its
- * projection must be `ALL`, because events are decoded from the index item —
- * see {@link indexDefinitions}.
+ * entity partition sharing the table; a write that would exceed it fails. What
+ * the index copies from each event is its `projection` — see
+ * {@link StreamIndexProjection}.
  */
 export interface LocalStreamIndexConfig<TEvent> {
   readonly type?: "lsi" | undefined
@@ -530,6 +532,11 @@ export interface LocalStreamIndexConfig<TEvent> {
   /** An LSI uses the table partition key; supplying `pk` is refused (`[EDD-9063]`). */
   readonly pk?: undefined
   readonly key: StreamIndexKey<TEvent>
+  /**
+   * What the index copies from each event — see {@link StreamIndexProjection}.
+   * Default `"all"`. Must match the deployed index.
+   */
+  readonly projection?: StreamIndexProjection | undefined
 }
 
 /**
@@ -548,6 +555,7 @@ export interface LocalStreamIndexConfig<TEvent> {
  * - `pk` — the attribute carrying the stream's partition key (the GSI's HASH key).
  * - `sk` — the attribute carrying the derived key (the GSI's RANGE key).
  * - `key` — see {@link StreamIndexKey}.
+ * - `projection` — see {@link StreamIndexProjection}.
  */
 export interface GlobalStreamIndexConfig<TEvent> {
   readonly type: "gsi"
@@ -555,6 +563,11 @@ export interface GlobalStreamIndexConfig<TEvent> {
   readonly pk: string
   readonly sk: string
   readonly key: StreamIndexKey<TEvent>
+  /**
+   * What the index copies from each event — see {@link StreamIndexProjection}.
+   * Default `"all"`. Must match the deployed index.
+   */
+  readonly projection?: StreamIndexProjection | undefined
 }
 
 /**
@@ -567,15 +580,89 @@ export type StreamIndexConfig<TEvent> =
   | GlobalStreamIndexConfig<TEvent>
 
 /**
+ * What a stream index copies from each event (`projection` on an entry of
+ * `makeStream({ indexes })`). {@link indexDefinitions} emits the matching
+ * `Projection`, and the reads choose their path from it.
+ *
+ * | Value | Emitted `Projection` | Read |
+ * |---|---|---|
+ * | `"all"` (default) | `ALL` | one query |
+ * | `"withoutMetadata"` | `INCLUDE` of every event attribute except `metadata` | one query; `metadata` is `undefined` (and typed so) |
+ * | `"keys"` | `INCLUDE ["__edd_e__"]` — **not** `KEYS_ONLY` | LSI: one query with `Select: ALL_ATTRIBUTES` (DynamoDB fetches each event from the table). GSI: the query, then `BatchGetItem` for the events of each page, in index order |
+ *
+ * `__edd_e__` is always projected because every read filters on it, and
+ * DynamoDB refuses a filter on an attribute an index does not project.
+ *
+ * `metadata` is often an event's largest attribute; `"withoutMetadata"` keeps
+ * it out of the index, and `"keys"` keeps the index entries minimal at the cost
+ * of a table read per event read (rounded up to 4 KB each).
+ *
+ * **The declared projection must match the deployed index.** The library does
+ * not migrate: an LSI's projection is fixed when the table is created, and a
+ * GSI's cannot be updated (it must be deleted and created again). Tables
+ * deployed with CDK or Terraform copy `Projection` from
+ * {@link indexDefinitions}' output. An index deployed narrower than declared
+ * fails reads: DynamoDB refuses the `__edd_e__` filter ("does not project one
+ * or more filter attributes"), or rows lack event attributes, which the read
+ * reports as a `ValidationError` (`operation: "EventStore.index.decode"`)
+ * naming the index.
+ */
+export type StreamIndexProjection = "all" | "withoutMetadata" | "keys"
+
+/**
  * The runtime settings of one stream index, as exposed on
  * {@link EventStream.indexes}. `pk` is the index's partition key attribute:
  * the table's `pk` for an LSI, the configured attribute for a GSI.
+ * `projection` is resolved: `"all"` when the index declares none.
  */
 export interface StreamIndexSettings {
   readonly type: "lsi" | "gsi"
   readonly index: string
   readonly pk: string
   readonly sk: string
+  readonly projection: StreamIndexProjection
+}
+
+/**
+ * The `metadata` type of an event read through a stream index of projection
+ * `P`: `undefined` for a `"withoutMetadata"` index, which does not hold it,
+ * the stream's {@link StreamMetadata} otherwise.
+ */
+export type IndexEventMetadata<TMetadata, P extends StreamIndexProjection> = [P] extends [
+  "withoutMetadata",
+]
+  ? undefined
+  : StreamMetadata<TMetadata>
+
+/** @internal The `projection` an index config declares (`"all"` when none). */
+type ProjectionOf<C> = C extends { readonly projection: infer P extends StreamIndexProjection }
+  ? P
+  : "all"
+
+/**
+ * The projection of each index of a `makeStream({ indexes })` config, by name.
+ * `"all"` for an index that declares none.
+ */
+export type IndexProjectionsOf<TIndexes> = {
+  readonly [K in keyof TIndexes & string]: ProjectionOf<TIndexes[K]>
+}
+
+/** @internal The members a stream index entry may declare. */
+type StreamIndexConfigKey =
+  | keyof LocalStreamIndexConfig<unknown>
+  | keyof GlobalStreamIndexConfig<unknown>
+
+/**
+ * The `indexes` parameter of {@link makeStream}: each entry is a
+ * {@link StreamIndexConfig}, and a member it does not declare (a misspelled
+ * `projection`, say) is typed `never`, so it is a compile error. Inferring
+ * `TIndexes` from the entries turns off TypeScript's own excess-property check,
+ * which would otherwise catch it.
+ */
+export type StreamIndexesConfig<TIndexes, TEvent> = {
+  readonly [K in keyof TIndexes]: StreamIndexConfig<TEvent> & {
+    readonly [P in Exclude<keyof TIndexes[K], StreamIndexConfigKey>]: never
+  }
 }
 
 /**
@@ -665,6 +752,37 @@ interface ResolvedStreamIndex extends StreamIndexSettings {
 }
 
 /**
+ * @internal The attributes `append` writes on every event item besides the
+ * table key (`pk`, `sk`), the optional `metadata` and the index attributes:
+ * the envelope, `data` and the `__edd_e__` discriminator. Sorted. A
+ * `"withoutMetadata"` stream index projects exactly these.
+ */
+const EVENT_ITEM_ATTRIBUTES = [
+  "__edd_e__",
+  "data",
+  "eventType",
+  "streamId",
+  "timestamp",
+  "version",
+] as const
+
+/** @internal One of {@link EVENT_ITEM_ATTRIBUTES}. */
+type EventItemAttribute = (typeof EVENT_ITEM_ATTRIBUTES)[number]
+
+/**
+ * @internal The event attributes an `"all"` or `"withoutMetadata"` stream index
+ * guarantees on its rows and a decode needs: a row lacking one was read
+ * through an index deployed narrower than declared.
+ */
+const PROJECTED_ENVELOPE_ATTRIBUTES: ReadonlyArray<EventItemAttribute> = [
+  "data",
+  "eventType",
+  "streamId",
+  "timestamp",
+  "version",
+]
+
+/**
  * @internal Attributes a stream writes on its own items — events, snapshot,
  * idempotency sentinel — plus the default TTL attribute. An index attribute
  * may not reuse any of them.
@@ -685,11 +803,23 @@ const STREAM_OWNED_ATTRIBUTES: ReadonlyArray<string> = [
   DEFAULT_TTL_ATTRIBUTE_NAME,
 ]
 
+/** @internal Every member a stream index entry may declare (`StreamIndexConfigKey`). */
+const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
+  "type",
+  "index",
+  "pk",
+  "sk",
+  "key",
+  "projection",
+] satisfies ReadonlyArray<StreamIndexConfigKey>
+
 /**
  * @internal Validate `makeStream({ indexes })` at definition time.
  *
  * @throws `[EDD-9063]` for a malformed entry (unknown `type`, a `gsi` without
- *   `pk`, an `lsi` with `pk`, an empty name, a `key` that is not a function).
+ *   `pk`, an `lsi` with `pk`, an empty name, a `key` that is not a function,
+ *   an unknown `projection`, a member the entry type does not declare — a
+ *   misspelled `projection` would otherwise silently mean `"all"`).
  * @throws `[EDD-9064]` for an index attribute that collides with a
  *   stream-owned attribute.
  * @throws `[EDD-9065]` for two indexes sharing a physical index name or an
@@ -710,6 +840,14 @@ const resolveStreamIndexes = (
       fail("EDD-9063", `index "${name}" must be an object; received ${String(raw)}.`)
     }
     const entry = raw as Record<string, unknown>
+    const unknownKey = Object.keys(entry).find((key) => !STREAM_INDEX_CONFIG_KEYS.includes(key))
+    if (unknownKey !== undefined) {
+      fail(
+        "EDD-9063",
+        `index "${name}": unknown member "${unknownKey}"; an index declares ` +
+          `${STREAM_INDEX_CONFIG_KEYS.join(", ")}.`,
+      )
+    }
     const type = (entry.type ?? "lsi") as "lsi" | "gsi"
     if (type !== "lsi" && type !== "gsi") {
       fail(
@@ -741,6 +879,14 @@ const resolveStreamIndexes = (
       fail(
         "EDD-9063",
         `index "${name}": key must be a function (event, version) => string | undefined.`,
+      )
+    }
+    const projection = (entry.projection ?? "all") as StreamIndexProjection
+    if (projection !== "all" && projection !== "withoutMetadata" && projection !== "keys") {
+      fail(
+        "EDD-9063",
+        `index "${name}": projection must be "all", "withoutMetadata" or "keys"; received ` +
+          `${JSON.stringify(entry.projection)}.`,
       )
     }
     const index = entry.index as string
@@ -781,6 +927,7 @@ const resolveStreamIndexes = (
       index,
       pk,
       sk,
+      projection,
       key: entry.key as StreamIndexKey<unknown>,
     })
   }
@@ -935,7 +1082,9 @@ const eventTimestampsProblem = (
  *
  * `TIndexName` is the union of the stream's index names (`makeStream({ indexes })`),
  * `never` for a stream without indexes, so {@link EventStream.readIndex} and
- * `query.index` only accept a declared name.
+ * `query.index` only accept a declared name. `TIndexProjections` is each
+ * index's {@link StreamIndexProjection} by name, so an event read through a
+ * `"withoutMetadata"` index has `metadata: undefined`.
  */
 export interface EventStream<
   TEvent,
@@ -943,6 +1092,9 @@ export interface EventStream<
   TMetadata,
   TState = never,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -1093,13 +1245,19 @@ export interface EventStream<
    * convenience over `query.index`; pass `beginsWith` or `between` to narrow
    * the key range, `reverse`, `limit` and `consistentRead` (refused on a GSI)
    * — see {@link ReadIndexOptions}.
+   *
+   * How the events are read follows the index's {@link StreamIndexProjection}:
+   * one query for `"all"` and `"withoutMetadata"` (whose events have
+   * `metadata: undefined`, as the type says); for `"keys"`, one query with
+   * `Select: ALL_ATTRIBUTES` on an LSI, or the query followed by `BatchGetItem`
+   * (unprocessed keys retried, index order kept) on a GSI.
    */
-  readIndex(
-    name: TIndexName,
+  readIndex<N extends TIndexName>(
+    name: N,
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
@@ -1116,11 +1274,18 @@ export interface EventStream<
      * `ValidationError` on a GSI-backed index) — and terminals
      * (`Query.collect`, `Query.execute`, `Query.paginate`). The
      * `__edd_e__ = <stream>.event` filter still applies.
+     *
+     * It reads as {@link EventStream.readIndex} does for the index's
+     * projection: a `"keys"` GSI fetches each page's events with
+     * `BatchGetItem` (`Query.select` moves onto that fetch); `Query.count`
+     * counts index entries and fetches nothing. On a `"keys"` or
+     * `"withoutMetadata"` index, a `Query.filter` on an attribute the index
+     * does not project is refused by DynamoDB — use `Query.filterBy`.
      */
-    index(
-      name: TIndexName,
+    index<N extends TIndexName>(
+      name: N,
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 }
 
@@ -1217,7 +1382,9 @@ interface AppendTransaction {
  * event's derived key (and, for a GSI, the stream's partition key) on the
  * event item; snapshots and idempotency sentinels never carry them, so they
  * are never in an index. Read with {@link EventStream.readIndex} or
- * `query.index`, and create the indexes with {@link indexDefinitions}.
+ * `query.index`, and create the indexes with {@link indexDefinitions}. Each
+ * index's `projection` (default `"all"`) sets what it copies from each event
+ * and how it is read — see {@link StreamIndexProjection}.
  *
  * Index attributes are written only at append time and events are never
  * rewritten. Declaring an index on a stream that already holds events, or
@@ -1254,7 +1421,9 @@ interface AppendTransaction {
  *   `"inline"`.
  * @throws `[EDD-9063]` for a malformed index: a `type` other than `"lsi"` /
  *   `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk`
- *   / `pk`, or a `key` that is not a function.
+ *   / `pk`, a `key` that is not a function, a `projection` other than
+ *   `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does
+ *   not declare (such as a misspelled `projection`, also a type error).
  * @throws `[EDD-9064]` when an index attribute is one the stream writes itself
  *   (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
  *   `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, or the
@@ -1271,7 +1440,9 @@ export const makeStream = <
   const TStreamId extends { readonly composite: ReadonlyArray<string> },
   TMetadata extends Schema.Top | undefined = undefined,
   TSnapshot extends SnapshotConfig | undefined = undefined,
-  const TIndexName extends string = never,
+  const TIndexes extends {
+    readonly [K in keyof TIndexes]: StreamIndexConfig<Schema.Schema.Type<TEvents[number]>>
+  } = {},
 >(config: {
   readonly table: TTable
   readonly streamName: TStreamName
@@ -1280,15 +1451,14 @@ export const makeStream = <
   readonly metadata?: TMetadata
   readonly snapshot?: TSnapshot
   readonly casing?: DynamoSchema.Casing | undefined
-  readonly indexes?: {
-    readonly [K in TIndexName]: StreamIndexConfig<Schema.Schema.Type<TEvents[number]>>
-  }
+  readonly indexes?: TIndexes & StreamIndexesConfig<TIndexes, Schema.Schema.Type<TEvents[number]>>
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
   TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
   TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
-  TIndexName
+  keyof TIndexes & string,
+  IndexProjectionsOf<TIndexes>
 > => {
   type TEvent = Schema.Schema.Type<TEvents[number]>
   type TStreamIdFields = TStreamId["composite"]
@@ -1359,7 +1529,13 @@ export const makeStream = <
   )
   const indexSettings: Record<string, StreamIndexSettings> = {}
   for (const idx of streamIndexes) {
-    indexSettings[idx.name] = { type: idx.type, index: idx.index, pk: idx.pk, sk: idx.sk }
+    indexSettings[idx.name] = {
+      type: idx.type,
+      index: idx.index,
+      pk: idx.pk,
+      sk: idx.sk,
+      projection: idx.projection,
+    }
   }
   /** Every attribute the indexes write on an event item. */
   const indexAttributes = streamIndexes.flatMap((idx) =>
@@ -1903,7 +2079,9 @@ export const makeStream = <
             // stored in the same format as `now`.
             const eventTimestamp = eventTimestamps?.[i]
 
-            const item: Record<string, unknown> = {
+            // Exactly the table key and EVENT_ITEM_ATTRIBUTES — what a
+            // "withoutMetadata" stream index projects — checked by the type.
+            const envelope: { readonly [K in "pk" | "sk" | EventItemAttribute]: unknown } = {
               pk,
               sk: composeEventSk(version),
               __edd_e__: entityType,
@@ -1913,6 +2091,7 @@ export const makeStream = <
               data: eventData,
               timestamp: eventTimestamp === undefined ? now : DateTime.formatIso(eventTimestamp),
             }
+            const item: Record<string, unknown> = { ...envelope }
             if (itemMetadata !== undefined) {
               item.metadata = itemMetadata
             }
@@ -2534,14 +2713,66 @@ export const makeStream = <
       pkValue: composeStreamPk(streamId as Record<string, unknown>),
       skField: idx.sk,
       entityTypes: [entityType],
-      decoder: (raw) => decodeStreamEvent(raw),
+      decoder: indexDecoder(idx),
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
       // A GSI is read only eventually consistently: `Query.consistentRead`
       // on it is refused before anything is sent.
       globalIndex: idx.type === "gsi",
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
+      // A "keys" index holds no events: an LSI has DynamoDB fetch them
+      // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with
+      // `BatchGetItem` on the table key.
+      ...(idx.projection === "keys"
+        ? {
+            hydration:
+              idx.type === "lsi"
+                ? ({ _tag: "Fetch" } as const)
+                : ({ _tag: "BatchGet", tableKey: ["pk", "sk"] } as const),
+          }
+        : {}),
     })
   }
+
+  /**
+   * @internal The decoder of events read through `idx`.
+   *
+   * - `"withoutMetadata"` ignores any `metadata` on the row (an index deployed
+   *   wider than declared still carries it), so the value matches the type.
+   * - `"all"` / `"withoutMetadata"`: a decode failure on a row that lacks an
+   *   attribute the declared projection guarantees is diagnosed as the
+   *   deployed index projecting less than declared — a `ValidationError`
+   *   (`operation: "EventStore.index.decode"`) naming the index, the original
+   *   error kept as its cause. Anything else passes through unchanged.
+   * - `"keys"` decodes items fetched from the table, so a missing attribute
+   *   there is not a projection problem: failures pass through.
+   */
+  const indexDecoder =
+    (idx: ResolvedStreamIndex) =>
+    (raw: Record<string, unknown>): Effect.Effect<StreamEvent<TEvent>, ValidationError> => {
+      if (idx.projection === "keys") return decodeStreamEvent(raw)
+      let row = raw
+      if (idx.projection === "withoutMetadata" && raw.metadata !== undefined) {
+        row = { ...raw }
+        delete row.metadata
+      }
+      return decodeStreamEvent(row).pipe(
+        Effect.mapError((error) => {
+          const missing = PROJECTED_ENVELOPE_ATTRIBUTES.filter((name) => row[name] === undefined)
+          if (missing.length === 0) return error
+          return new ValidationError({
+            entityType,
+            operation: "EventStore.index.decode",
+            cause: withCause(
+              `Stream index "${idx.name}" (physical "${idx.index}") is declared ` +
+                `projection: "${idx.projection}", but its rows lack ${missing.join(", ")}: the ` +
+                "deployed index likely projects less than declared. Deploy the Projection " +
+                "EventStore.indexDefinitions emits for it.",
+              error,
+            ),
+          })
+        }),
+      )
+    }
 
   const readIndex = (
     name: string,
@@ -2623,7 +2854,8 @@ export const makeStream = <
     TStreamIdFields,
     TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
     TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
-    TIndexName
+    keyof TIndexes & string,
+    IndexProjectionsOf<TIndexes>
   >
 }
 
@@ -2657,6 +2889,9 @@ export interface BoundEventStream<
   TMetadata,
   TState = never,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -2726,12 +2961,12 @@ export interface BoundEventStream<
   >
 
   /** See {@link EventStream.readIndex}. */
-  readIndex(
-    name: TIndexName,
+  readIndex<N extends TIndexName>(
+    name: N,
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
     never
   >
@@ -2745,10 +2980,10 @@ export interface BoundEventStream<
       streamId: StreamIdInput<TStreamIdFields>,
     ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
     /** See `EventStream.query.index`. */
-    index(
-      name: TIndexName,
+    index<N extends TIndexName>(
+      name: N,
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 
   /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */
@@ -2781,10 +3016,13 @@ export const bind = <
   TMetadata,
   TState,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 >(
-  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
 ): Effect.Effect<
-  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
   never,
   DynamoClient | TableConfig
 > =>
@@ -2829,12 +3067,25 @@ export const bind = <
           ? undefined
           : (id: Record<string, unknown>, floorVersion: number, options?: ReadOptions) =>
               provide(headProbe(id, floorVersion, options)),
-    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>
+    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>
   })
 
 // ---------------------------------------------------------------------------
 // EventStore.indexDefinitions — CreateTable fragments for stream indexes (#140)
 // ---------------------------------------------------------------------------
+
+/**
+ * @internal The `Projection` a stream index of `projection` is created with.
+ * Neither list names a key attribute: table and index keys are always
+ * projected.
+ */
+const projectionDefinition = (projection: StreamIndexProjection): Projection =>
+  projection === "all"
+    ? { ProjectionType: "ALL" }
+    : {
+        ProjectionType: "INCLUDE",
+        NonKeyAttributes: projection === "keys" ? ["__edd_e__"] : [...EVENT_ITEM_ATTRIBUTES],
+      }
 
 /**
  * `CreateTable` fragments for the stream indexes of one or more streams — see
@@ -2851,11 +3102,26 @@ export interface StreamIndexDefinitions {
 /**
  * Derive the `CreateTable` fragments for the stream indexes (#140) of the given
  * streams (`EventStream` or `BoundEventStream`) — `AttributeDefinitions`,
- * `LocalSecondaryIndexes` and `GlobalSecondaryIndexes`, each index projecting
- * `ALL` — to merge into the caller's `CreateTable` input. Event tables are not
- * derived by `Table.definition`, and the table's own `pk` / `sk` are not
- * included: add them (and, on a provisioned table, each GSI's
- * `ProvisionedThroughput`) yourself.
+ * `LocalSecondaryIndexes` and `GlobalSecondaryIndexes` — to merge into the
+ * caller's `CreateTable` input. Event tables are not derived by
+ * `Table.definition`, and the table's own `pk` / `sk` are not included: add
+ * them (and, on a provisioned table, each GSI's `ProvisionedThroughput`)
+ * yourself.
+ *
+ * Each index's `Projection` follows its {@link StreamIndexProjection}:
+ *
+ * | `projection` | `Projection` |
+ * |---|---|
+ * | `"all"` (default) | `{ ProjectionType: "ALL" }` |
+ * | `"withoutMetadata"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }` |
+ * | `"keys"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }` — not `KEYS_ONLY`: every read filters on `__edd_e__` |
+ *
+ * The deployed index must project what is declared — copy `Projection` from
+ * this output into CDK or Terraform definitions. Neither an LSI's nor a GSI's
+ * projection can be changed in place, and the library migrates nothing. A
+ * table projects at most 100 `NonKeyAttributes` across all its indexes;
+ * `"withoutMetadata"` spends 6 of them and `"keys"` 1 (DynamoDB refuses a
+ * table over the limit).
  *
  * An index shared by several streams with the same definition is emitted
  * once. Lists are sorted by index name, attributes by attribute name.
@@ -2863,7 +3129,6 @@ export interface StreamIndexDefinitions {
  * - An LSI can only be created with the table, and caps the item collection
  *   of every partition key value in the table at 10 GB — entity partitions
  *   and streams without indexes included.
- * - The projection must stay `ALL`: events are decoded from the index item.
  *
  * @example
  * ```typescript
@@ -2886,17 +3151,23 @@ export interface StreamIndexDefinitions {
  * ```
  *
  * @throws `[EDD-9067]` when two streams define the same physical index
- *   differently (another type, or other key attributes).
+ *   differently (another type, other key attributes, or another projection).
  */
 export const indexDefinitions = (
   ...streams: ReadonlyArray<{
     readonly streamName: string
-    readonly indexes: { readonly [name: string]: StreamIndexSettings }
+    readonly indexes: {
+      readonly [name: string]: Omit<StreamIndexSettings, "projection"> & {
+        /** Read as `"all"` when absent (a hand-built settings object). */
+        readonly projection?: StreamIndexProjection | undefined
+      }
+    }
   }>
 ): StreamIndexDefinitions => {
   const byIndex = new Map<string, StreamIndexSettings & { readonly owner: string }>()
   for (const stream of streams) {
-    for (const [name, settings] of Object.entries(stream.indexes)) {
+    for (const [name, raw] of Object.entries(stream.indexes)) {
+      const settings: StreamIndexSettings = { ...raw, projection: raw.projection ?? "all" }
       const owner = `index "${name}" of stream "${stream.streamName}"`
       const existing = byIndex.get(settings.index)
       if (existing === undefined) {
@@ -2905,6 +3176,7 @@ export const indexDefinitions = (
           index: settings.index,
           pk: settings.pk,
           sk: settings.sk,
+          projection: settings.projection,
           owner,
         })
         continue
@@ -2912,9 +3184,11 @@ export const indexDefinitions = (
       if (
         existing.type !== settings.type ||
         existing.pk !== settings.pk ||
-        existing.sk !== settings.sk
+        existing.sk !== settings.sk ||
+        existing.projection !== settings.projection
       ) {
-        const describe = (s: StreamIndexSettings) => `${s.type} (pk "${s.pk}", sk "${s.sk}")`
+        const describe = (s: StreamIndexSettings) =>
+          `${s.type} (pk "${s.pk}", sk "${s.sk}", projection "${s.projection}")`
         throw new Error(
           `[EDD-9067] EventStore.indexDefinitions: the physical index "${settings.index}" is ` +
             `defined as ${describe(existing)} by ${existing.owner} and as ${describe(settings)} ` +
@@ -2935,7 +3209,7 @@ export const indexDefinitions = (
         { AttributeName: settings.pk, KeyType: "HASH" as const },
         { AttributeName: settings.sk, KeyType: "RANGE" as const },
       ],
-      Projection: { ProjectionType: "ALL" as const },
+      Projection: projectionDefinition(settings.projection),
     }
     attributes.add(settings.sk)
     if (settings.type === "gsi") {
@@ -3114,8 +3388,9 @@ export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
  * requirements.
  *
  * Function-only: the number of events is known only once `decide` has run.
- * The `Effect` form lets ids be minted through `Clock` / `Random`, which keeps
- * them deterministic under `TestClock` or a seeded `Random`.
+ * The `Effect` form lets ids be minted through the `Crypto` service
+ * (`crypto.randomULID`, or `randomUUIDv7`), which keeps them deterministic
+ * under `TestClock` and a test `Crypto` layer with fixed bytes.
  */
 export type EventMetadataInput<State, Event, TMetadata, E3 = never, R3 = never> = (
   decision: Decision<State, Event>,
@@ -3184,12 +3459,22 @@ export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = nev
        *   and is not retried either.
        *
        * Without `idempotency`, a redelivery after a lost response decides and
-       * appends again, minting new ids. For ids stable across redeliveries,
-       * derive them from the delivery id the caller holds:
+       * appends again, minting new ids. With it, the redelivery fails with
+       * `DuplicateCommand`, so the first commit's ids are the only ones written:
        *
        * ```ts
-       * eventMetadata: ({ events, version }) =>
-       *   events.map((_, i) => ({ eventId: `${deliveryId}:${version + i + 1}` }))
+       * // `crypto` is the `Crypto.Crypto` service; a ULID takes its time from the
+       * // `Clock`, so `TestClock` plus a fixed-bytes `Crypto` make it deterministic
+       * const handle = EventStore.commandHandler(decider, stream, {
+       *   idempotency: { ttl: Duration.days(1) },
+       * })
+       * yield* handle(streamId, command, {
+       *   commandId: deliveryId,
+       *   eventMetadata: ({ events }) =>
+       *     Effect.forEach(events, () =>
+       *       Effect.map(crypto.randomULID, (eventId) => ({ eventId })),
+       *     ),
+       * })
        * ```
        */
       readonly eventMetadata?: EventMetadataInput<State, Event, TMetadata, E3, R3>
@@ -3985,8 +4270,10 @@ const makeCommandHandlerImpl = <
  * })
  *
  * // Per-event metadata derived from the decision: entry i is written onto event i
+ * // (`crypto` is the `Crypto.Crypto` service; `randomUUIDv7` works the same way)
  * yield* handle({ matchId: "m-1" }, command, {
- *   eventMetadata: ({ events }) => events.map(() => ({ eventId: ulid() })),
+ *   eventMetadata: ({ events }) =>
+ *     Effect.forEach(events, () => Effect.map(crypto.randomULID, (eventId) => ({ eventId }))),
  * })
  *
  * // Per-event timestamps derived from the decision (undefined → the Clock time)
@@ -4053,8 +4340,8 @@ export const commandHandler: {
     options?: TConfig,
   ): <
     S extends
-      | BoundEventStream<TEvent, any, any, State, any>
-      | EventStream<TEvent, ReadonlyArray<string>, any, State, any>,
+      | BoundEventStream<TEvent, any, any, State, any, any>
+      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any>,
   >(
     stream: S,
   ) => CommandHandlerFor<S, State, Command, TEvent, E, TConfig>
@@ -4069,10 +4356,18 @@ export const commandHandler: {
     TMetadata,
     TState extends State,
     TIndexName extends string,
+    TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+    stream: BoundEventStream<
+      TEvent,
+      TStreamIdFields,
+      TMetadata,
+      TState,
+      TIndexName,
+      TIndexProjections
+    >,
     options?: TConfig,
   ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 
@@ -4086,10 +4381,11 @@ export const commandHandler: {
     TMetadata,
     TState extends State,
     TIndexName extends string,
+    TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
     options?: TConfig,
   ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 } = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {

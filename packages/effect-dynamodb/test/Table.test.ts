@@ -401,4 +401,242 @@ describe("Table", () => {
       )
     })
   })
+
+  // C1: a physical secondary index declared twice with different key schemas
+  // used to keep the first declaration silently; the loser's items never
+  // appeared in the index.
+  describe("secondary index agreement (EDD-9069)", () => {
+    const entityWith = (
+      entityType: string,
+      indexes: Record<
+        string,
+        {
+          readonly index?: string
+          readonly pk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+          readonly sk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+        }
+      >,
+      primary: { readonly pk: string; readonly sk: string } = { pk: "pk", sk: "sk" },
+    ) => ({
+      _tag: "Entity" as const,
+      entityType,
+      _configure: () => {},
+      indexes: {
+        primary: {
+          pk: { field: primary.pk, composite: ["id"] },
+          sk: { field: primary.sk, composite: [] },
+        },
+        ...indexes,
+      },
+    })
+
+    const aggregateWith = (config: {
+      readonly pkField?: string
+      readonly collection?: { readonly index: string; readonly sk: string }
+      readonly listIndex?: { readonly index: string; readonly pk: string; readonly sk: string }
+    }) => ({
+      _tag: "Aggregate" as const,
+      pkField: config.pkField ?? "pk",
+      collection: config.collection
+        ? { index: config.collection.index, sk: { field: config.collection.sk } }
+        : { index: undefined, sk: undefined },
+      listIndex: config.listIndex
+        ? {
+            index: config.listIndex.index,
+            pk: { field: config.listIndex.pk },
+            sk: { field: config.listIndex.sk },
+          }
+        : undefined,
+    })
+
+    /** Both `Table.make` and `Table.definition` refuse it; `make` throws first. */
+    const expectRefused = (
+      members: {
+        readonly entities?: Record<string, ReturnType<typeof entityWith>>
+        readonly aggregates?: Record<string, ReturnType<typeof aggregateWith>>
+      },
+      message: RegExp,
+    ) => {
+      expect(() => Table.make({ schema, ...members })).toThrow(message)
+      // `Table.definition` re-validates a table assembled without `make` — as
+      // `DynamoClient.make` does when it merges in runtime-registered aggregates.
+      const table = {
+        ...Table.make({ schema }),
+        entities: members.entities ?? {},
+        aggregates: members.aggregates ?? {},
+      } as unknown as Table.Table
+      expect(() => Table.definition(table)).toThrow(message)
+    }
+
+    it("refuses two entities declaring one GSI with different sk fields", () => {
+      expectRefused(
+        {
+          entities: {
+            Task: entityWith("Task", {
+              byProject: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["project"] },
+                sk: { field: "gsi1sk", composite: [] },
+              },
+            }),
+            Note: entityWith("Note", {
+              byAuthor: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["author"] },
+                sk: { field: "gsi2sk", composite: [] },
+              },
+            }),
+          },
+        },
+        /\[EDD-9069\] Secondary index "gsi1" is declared as a GSI keyed \(gsi1pk, gsi1sk\) by entity "Task" and as a GSI keyed \(gsi1pk, gsi2sk\) by entity "Note"\. One physical index has one key schema/,
+      )
+    })
+
+    it("refuses an entity GSI against an aggregate list index keyed differently", () => {
+      expectRefused(
+        {
+          entities: {
+            Task: entityWith("Task", {
+              byProject: {
+                index: "gsi1",
+                pk: { field: "gsi1pk", composite: ["project"] },
+                sk: { field: "gsi1sk", composite: [] },
+              },
+            }),
+          },
+          aggregates: {
+            Match: aggregateWith({ listIndex: { index: "gsi1", pk: "gsi2pk", sk: "gsi2sk" } }),
+          },
+        },
+        /\[EDD-9069\] Secondary index "gsi1" is declared as a GSI keyed \(gsi1pk, gsi1sk\) by entity "Task" and as a GSI keyed \(gsi2pk, gsi2sk\) by aggregate "Match" \(list index\)/,
+      )
+    })
+
+    it("refuses an entity GSI against an aggregate collection LSI of the same name", () => {
+      // Same key attributes, different classification: the aggregate's
+      // collection shares the table's partition key, so it is an LSI.
+      expectRefused(
+        {
+          entities: {
+            Task: entityWith("Task", {
+              byOwner: {
+                index: "lsi1",
+                pk: { field: "pk", composite: ["id"] },
+                sk: { field: "lsi1sk", composite: [] },
+              },
+            }),
+          },
+          aggregates: { Match: aggregateWith({ collection: { index: "lsi1", sk: "lsi1sk" } }) },
+        },
+        /\[EDD-9069\] Secondary index "lsi1" is declared as a GSI keyed \(pk, lsi1sk\) by entity "Task" and as an LSI keyed \(pk, lsi1sk\) by aggregate "Match" \(collection index\)/,
+      )
+    })
+
+    it("refuses an auto-generated cascade index against an entity index", () => {
+      expectRefused(
+        {
+          entities: {
+            Task: entityWith("Task", {
+              byProject: {
+                index: "gsi2",
+                pk: { field: "gsi2pk", composite: ["project"] },
+                sk: { field: "gsi2sk", composite: [] },
+              },
+            }),
+            Selection: entityWith("Selection", {
+              _cascade_player: {
+                index: "gsi2",
+                pk: { field: "playerGsiPk", composite: ["playerId"] },
+                sk: { field: "playerGsiSk", composite: ["id"] },
+              },
+            }),
+          },
+        },
+        /\[EDD-9069\] Secondary index "gsi2" is declared as a GSI keyed \(gsi2pk, gsi2sk\) by entity "Task" and as a GSI keyed \(playerGsiPk, playerGsiSk\) by entity "Selection"/,
+      )
+    })
+
+    it("refuses entities that disagree on the primary-key fields", () => {
+      expectRefused(
+        {
+          entities: {
+            User: entityWith("User", {}),
+            Order: entityWith("Order", {}, { pk: "PK", sk: "SK" }),
+          },
+        },
+        /\[EDD-9069\] The table's primary key is declared as \(pk, sk\) by entity "User" and as \(PK, SK\) by entity "Order"\. One table has one key schema/,
+      )
+    })
+
+    it("compares only key attributes when an aggregates-only table leaves classification unknown", () => {
+      expect(() =>
+        Table.make({
+          schema,
+          aggregates: {
+            A: aggregateWith({ collection: { index: "gsi1", sk: "gsi1sk" } }),
+            B: aggregateWith({ listIndex: { index: "gsi1", pk: "gsi2pk", sk: "gsi1sk" } }),
+          },
+        }),
+      ).toThrow(/\[EDD-9069\] Secondary index "gsi1" is declared as an index keyed \(pk, gsi1sk\)/)
+      // Same keys, unknown vs GSI classification: accepted.
+      expect(() =>
+        Table.make({
+          schema,
+          aggregates: {
+            A: aggregateWith({ pkField: "gsi1pk", collection: { index: "gsi1", sk: "gsi1sk" } }),
+            B: aggregateWith({ listIndex: { index: "gsi1", pk: "gsi1pk", sk: "gsi1sk" } }),
+          },
+        }),
+      ).not.toThrow()
+    })
+
+    it("keeps agreeing sharers of one physical index unchanged", () => {
+      const table = Table.make({
+        schema,
+        entities: {
+          Task: entityWith("Task", {
+            byProject: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
+          }),
+          Note: entityWith("Note", {
+            byAuthor: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["author"] },
+              sk: { field: "gsi1sk", composite: ["createdAt"] },
+            },
+          }),
+        },
+        aggregates: {
+          Match: aggregateWith({
+            collection: { index: "lsi1", sk: "lsi1sk" },
+            listIndex: { index: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+          }),
+        },
+      })
+      const result = Table.definition(table)
+      expect(result.GlobalSecondaryIndexes).toEqual([
+        {
+          IndexName: "gsi1",
+          KeySchema: [
+            { AttributeName: "gsi1pk", KeyType: "HASH" },
+            { AttributeName: "gsi1sk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ])
+      expect(result.LocalSecondaryIndexes).toEqual([
+        {
+          IndexName: "lsi1",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "lsi1sk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ])
+    })
+  })
 })

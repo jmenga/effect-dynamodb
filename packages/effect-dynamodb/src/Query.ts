@@ -14,6 +14,7 @@ import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
+import { batchGetRaw } from "./internal/Hydrate.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -101,7 +102,29 @@ interface QueryState {
   readonly prepare: QueryPrepare | undefined
   /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */
   readonly keepRow: ((row: Record<string, AttributeValue>) => boolean) | undefined
+  /**
+   * How a terminal obtains full items when the queried index does not project
+   * them — see {@link QueryHydration}. Only a stream index declared
+   * `projection: "keys"` sets it.
+   */
+  readonly hydration: QueryHydration | undefined
 }
+
+/**
+ * @internal How a terminal obtains full items for an index that does not
+ * project them (a stream index declared `projection: "keys"`).
+ *
+ * - `Fetch` — an LSI: the query sends `Select: "ALL_ATTRIBUTES"` (when it sends
+ *   no `ProjectionExpression`), and DynamoDB fetches each item from the table.
+ * - `BatchGet` — a GSI: the index query returns keys; each page's rows are
+ *   then fetched from the table with `BatchGetItem` on `tableKey` and kept in
+ *   index order. A `select` projection moves onto the `BatchGetItem`.
+ *
+ * `count` never fetches: it counts index rows with `Select: "COUNT"`.
+ */
+export type QueryHydration =
+  | { readonly _tag: "Fetch" }
+  | { readonly _tag: "BatchGet"; readonly tableKey: readonly [string, string] }
 
 /** @internal See {@link QueryState.prepare}. */
 export type QueryPrepare = (tableName: string) => Effect.Effect<
@@ -192,11 +215,14 @@ export const make = <A>(config: {
   readonly liveRows?: LiveRows | undefined
   /** See {@link QueryState.prepare}. */
   readonly prepare?: QueryPrepare | undefined
+  /** See {@link QueryState.hydration}. */
+  readonly hydration?: QueryHydration | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
+    hydration: config.hydration,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -248,6 +274,7 @@ export const makeScan = <A>(config: {
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
+    hydration: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -768,8 +795,106 @@ const buildDynamoCommand = (
     ConsistentRead: input.ConsistentRead,
     Limit: computeRequestLimit(state, state.limitValue),
     ScanIndexForward: state.isScan ? undefined : state.scanForward,
+    // An LSI that does not project the items: DynamoDB fetches them from the
+    // table. Not with a ProjectionExpression, which DynamoDB rejects beside
+    // `Select: ALL_ATTRIBUTES` (and which fetches the named attributes itself).
+    ...(state.hydration?._tag === "Fetch" && input.ProjectionExpression === undefined
+      ? { Select: "ALL_ATTRIBUTES" as const }
+      : {}),
     ...overrides,
   }
+}
+
+/**
+ * @internal The state the index request is built from. A `BatchGet`-hydrated
+ * query sends its projection on the `BatchGetItem`, not on the index query
+ * (whose rows only carry keys).
+ */
+const indexQueryState = (state: QueryState): QueryState =>
+  state.hydration?._tag === "BatchGet"
+    ? { ...state, projection: undefined, projectionPaths: undefined }
+    : state
+
+/**
+ * @internal Replace index rows with the table items they refer to, for a
+ * `BatchGet`-hydrated query (see {@link QueryHydration}); any other query's
+ * rows are returned as they are. The result is in `rows` order, `undefined`
+ * for an item that no longer exists (it is dropped like an excluded row).
+ */
+const hydrateRows = (
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  rows: ReadonlyArray<Record<string, AttributeValue>>,
+): Effect.Effect<ReadonlyArray<Record<string, AttributeValue> | undefined>, DynamoClientError> => {
+  const hydration = state.hydration
+  if (hydration?._tag !== "BatchGet" || rows.length === 0) return Effect.succeed(rows)
+  return Effect.gen(function* () {
+    const [pkName, skName] = hydration.tableKey
+    const requests: Array<{ tableName: string; key: Record<string, AttributeValue> }> = []
+    for (const row of rows) {
+      const pk = row[pkName]
+      const sk = row[skName]
+      if (pk === undefined || sk === undefined) {
+        // Table keys are always projected into a secondary index.
+        return yield* Effect.die(
+          new Error(
+            `Query hydration: an index row of "${state.indexName}" lacks the table key ` +
+              `attribute "${pk === undefined ? pkName : skName}".`,
+          ),
+        )
+      }
+      requests.push({ tableName, key: { [pkName]: pk, [skName]: sk } })
+    }
+    const ownership = !state.ignoreOwnershipFlag && state.entityTypes.length > 0
+    // A `select` moves here: the projection, plus what matching (the table
+    // key) and the ownership check read — stripped again unless selected.
+    const names: Record<string, string> = {}
+    const projected = new Set<string>([
+      ...(state.projection ?? []),
+      ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
+    ])
+    const borrowed =
+      projected.size === 0
+        ? []
+        : [pkName, skName, ...(ownership ? ["__edd_e__"] : [])].filter(
+            (field) => !projected.has(field),
+          )
+    const expression = buildProjection(state, names, borrowed)
+    const fetched = yield* batchGetRaw(client, requests, {
+      projection: expression === undefined ? undefined : { expression, names },
+      rereadMissing: true,
+    })
+    const hydrated: Array<Record<string, AttributeValue> | undefined> = []
+    for (const item of fetched) {
+      if (item === undefined) {
+        hydrated.push(undefined)
+        continue
+      }
+      if (ownership) {
+        const owner = item.__edd_e__?.S
+        if (owner === undefined || !state.entityTypes.includes(owner)) {
+          // The index row passed the same `__edd_e__` filter: a defect.
+          return yield* Effect.die(
+            new Error(
+              `Query hydration: an item fetched through index "${state.indexName}" has ` +
+                `__edd_e__ ${JSON.stringify(owner)}, not ` +
+                `${state.entityTypes.map((t) => JSON.stringify(t)).join(" or ")}, although ` +
+                "its index row passed the same filter.",
+            ),
+          )
+        }
+      }
+      if (borrowed.length === 0) {
+        hydrated.push(item)
+        continue
+      }
+      const stripped = { ...item }
+      for (const field of borrowed) delete stripped[field]
+      hydrated.push(stripped)
+    }
+    return hydrated
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1082,64 @@ const cursorProjectionFields = (
   return [...borrowed].filter((field) => !projected.has(field))
 }
 
+/**
+ * @internal Examine one response's rows in order, as `execute` and `paginate`
+ * both do: drop excluded rows, hydrate (see {@link QueryHydration}), decode,
+ * apply the client predicates, and stop once `budget` items are accepted.
+ *
+ * Without a client predicate every row is accepted, so only the rows the
+ * budget can still take are hydrated and decoded; a row dropped after
+ * hydration (its item gone) widens the window by one. With a predicate,
+ * acceptance is only known after decode, so the whole response is examined
+ * (#122). `stoppedAt` is the index of the row that filled the budget, or -1.
+ */
+const examinePage = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  returned: ReadonlyArray<Record<string, AttributeValue>>,
+  budget: number | undefined,
+  borrowedFields: ReadonlyArray<string>,
+): Effect.Effect<
+  { readonly items: Array<A>; readonly stoppedAt: number },
+  DynamoClientError | ValidationError
+> =>
+  Effect.gen(function* () {
+    const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+    const items: Array<A> = []
+    let next = 0
+    while (next < returned.length) {
+      const end =
+        budget === undefined || hasPredicate
+          ? returned.length
+          : Math.min(returned.length, next + (budget - items.length))
+      const positions: Array<number> = []
+      for (let i = next; i < end; i++) {
+        if (!isExcludedRow(state, returned[i]!)) positions.push(i)
+      }
+      const sources = yield* hydrateRows(
+        client,
+        tableName,
+        state,
+        positions.map((i) => returned[i]!),
+      )
+      for (let k = 0; k < positions.length; k++) {
+        const source = sources[k]
+        if (source === undefined) continue
+        const raw = fromAttributeMap(source)
+        for (const field of borrowedFields) delete raw[field]
+        const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
+        if (hasPredicate && !accepts(state, item)) continue
+        items.push(item)
+        if (budget !== undefined && items.length >= budget) {
+          return { items, stoppedAt: positions[k]! }
+        }
+      }
+      next = end
+    }
+    return { items, stoppedAt: -1 }
+  })
+
 // ---------------------------------------------------------------------------
 // Page result type
 // ---------------------------------------------------------------------------
@@ -1015,6 +1198,7 @@ export const execute = <A>(
       ? yield* self._state.resolveTableName
       : self._state.tableName
     const state = yield* prepared(self._state, tableName)
+    const indexState = indexQueryState(state)
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) {
@@ -1023,8 +1207,7 @@ export const execute = <A>(
 
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
-    const borrowedFields = cursorProjectionFields(state, true)
-    const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+    const borrowedFields = cursorProjectionFields(indexState, true)
 
     const items: Array<A> = []
     let startKey = state.exclusiveStartKey
@@ -1035,7 +1218,7 @@ export const execute = <A>(
       pageCount++
       const remaining = limitValue === undefined ? undefined : limitValue - items.length
       const cmd = buildDynamoCommand(
-        state,
+        indexState,
         tableName,
         { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining, pageCount) },
         borrowedFields,
@@ -1044,29 +1227,17 @@ export const execute = <A>(
 
       const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
       const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
-      // Without a client predicate every returned row is accepted, so the take
-      // window is known before decoding and the budget can bound it directly.
-      // With one, acceptance is only known AFTER decode, so every returned row
-      // is examined and the loop stops once the budget fills (#122).
-      const take =
-        remaining === undefined || hasPredicate
-          ? returned.length
-          : Math.min(remaining, returned.length)
-
-      /** Index of the last row examined when the limit was reached, else -1. */
-      let stoppedAt = -1
-      for (let i = 0; i < take; i++) {
-        if (isExcludedRow(state, returned[i]!)) continue
-        const raw = fromAttributeMap(returned[i]!)
-        for (const field of borrowedFields) delete raw[field]
-        const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
-        if (hasPredicate && !accepts(state, item)) continue
-        items.push(item)
-        if (limitValue !== undefined && items.length >= limitValue) {
-          stoppedAt = i
-          break
-        }
-      }
+      // Index of the last row examined when the limit was reached, else -1.
+      const page = yield* examinePage<A>(
+        client,
+        tableName,
+        state,
+        returned,
+        remaining,
+        borrowedFields,
+      )
+      items.push(...page.items)
+      const stoppedAt = page.stoppedAt
 
       // Stopped inside the page: the surplus was discarded, so the cursor has
       // to be rebuilt from the last item handed back rather than from
@@ -1159,9 +1330,10 @@ const pageStream = <A>(
       Effect.gen(function* () {
         const pageCount = pageState.pageCount + 1
         const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
-        const borrowedFields = cursorProjectionFields(state, false)
+        const indexState = indexQueryState(state)
+        const borrowedFields = cursorProjectionFields(indexState, false)
         const cmd = buildDynamoCommand(
-          state,
+          indexState,
           tableName,
           {
             ExclusiveStartKey: pageState.key,
@@ -1172,26 +1344,14 @@ const pageStream = <A>(
         const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
 
         const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
-        // See `execute` — a client predicate rejects rows after decode, so
-        // the budget cannot bound the examine window, only the accepted one.
-        const hasPredicate = state.predicates.length > 0 || dropsRows(state)
-        const take =
-          remaining === undefined || hasPredicate
-            ? returned.length
-            : Math.min(remaining, returned.length)
-        const examined = yield* Effect.forEach(
-          returned
-            .slice(0, take)
-            .filter((item) => !isExcludedRow(state, item))
-            .map((item) => {
-              const raw = fromAttributeMap(item)
-              for (const field of borrowedFields) delete raw[field]
-              return raw
-            }),
-          (raw) => state.decoder(raw) as Effect.Effect<A, ValidationError>,
+        const { items: decoded } = yield* examinePage<A>(
+          client,
+          tableName,
+          state,
+          returned,
+          remaining,
+          borrowedFields,
         )
-        const kept = hasPredicate ? examined.filter((item) => accepts(state, item)) : examined
-        const decoded = remaining === undefined ? kept : kept.slice(0, remaining)
 
         const emitted = pageState.emitted + decoded.length
         const hasMorePages = result.LastEvaluatedKey != null
@@ -1229,7 +1389,9 @@ export const count = <A>(
     const tableName = self._state.resolveTableName
       ? yield* self._state.resolveTableName
       : self._state.tableName
-    const state = yield* prepared(self._state, tableName)
+    // A hydrated query counts index rows: nothing is fetched (and a `select`
+    // projection, which hydration would send on the fetch, is not sent).
+    const state = indexQueryState(yield* prepared(self._state, tableName))
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) return 0
@@ -1315,7 +1477,9 @@ export const asParams = <A>(
     const refusal = refuseEmptyFilterParts(state)
     if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
-    return buildDynamoCommand(state, tableName)
+    // A `BatchGet`-hydrated query shows its index query; the `BatchGetItem`
+    // that follows each page is not part of these parameters.
+    return buildDynamoCommand(indexQueryState(state), tableName)
   })
 
 // ---------------------------------------------------------------------------

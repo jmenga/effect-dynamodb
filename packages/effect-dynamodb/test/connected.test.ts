@@ -12,6 +12,7 @@
  * batch unprocessed-item retry, transaction atomicity, and GSI propagation.
  */
 
+import type { Projection } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import {
   Cause,
@@ -4266,6 +4267,108 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       }).pipe(provideAgg),
     )
   })
+})
+
+// ---------------------------------------------------------------------------
+// Ref cascade on a table keyed `PK` / `SK` (#144, C2). The cascade used to
+// build each update's key from `item.pk` / `item.sk` whatever the target's
+// primary key was: on a table keyed `PK` / `SK` every update failed with
+// "The number of conditions on the keys is invalid".
+// ---------------------------------------------------------------------------
+
+class UpperComposer extends Schema.Class<UpperComposer>("UpperComposer")({
+  composerId: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+class UpperScore extends Schema.Class<UpperScore>("UpperScore")({
+  scoreId: Schema.String,
+  title: Schema.String,
+  composer: UpperComposer.pipe(DynamoModel.ref),
+}) {}
+
+const upperSchema = DynamoSchema.make({ name: "upper-keys", version: 1 })
+const upperTableName = `upper-keys-${Date.now()}`
+
+const UpperComposers = Entity.make({
+  model: UpperComposer,
+  entityType: "UpperComposer",
+  primaryKey: {
+    pk: { field: "PK", composite: ["composerId"] },
+    sk: { field: "SK", composite: [] },
+  },
+})
+
+const UpperScores = Entity.make({
+  model: UpperScore,
+  entityType: "UpperScore",
+  primaryKey: {
+    pk: { field: "PK", composite: ["scoreId"] },
+    sk: { field: "SK", composite: [] },
+  },
+  refs: {
+    composer: {
+      entity: UpperComposers,
+      cascade: { index: "GSI1", pk: { field: "GSI1PK" }, sk: { field: "GSI1SK" } },
+    },
+  },
+})
+
+const UpperTable = Table.make({
+  schema: upperSchema,
+  entities: { UpperComposers, UpperScores },
+})
+const provideUpper = Effect.provide(
+  Layer.mergeAll(ClientLayer, UpperTable.layer({ name: upperTableName })),
+)
+
+describeConnected("Ref cascade on a table keyed PK / SK (#144, C2)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: upperTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(UpperTable),
+        })
+      }).pipe(provideUpper),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: upperTableName })
+      }).pipe(
+        provideUpper,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  for (const mode of ["eventual", "transactional"] as const) {
+    it.effect(`${mode} cascade updates the embedded ref on every target item`, () =>
+      Effect.gen(function* () {
+        const composerId = `c-${mode}`
+        yield* UpperComposers.put({ composerId, name: "Clara" }).asEffect()
+        yield* UpperScores.put({ scoreId: `${mode}-1`, title: "Romance", composerId }).asEffect()
+        yield* UpperScores.put({ scoreId: `${mode}-2`, title: "Trio", composerId }).asEffect()
+
+        yield* UpperComposers.update({ composerId }).pipe(
+          Entity.set({ name: "Clara Schumann" }),
+          Entity.cascade({ targets: [UpperScores], mode }),
+          Entity.asModel,
+        )
+
+        const first = yield* UpperScores.get({ scoreId: `${mode}-1` }).asEffect()
+        const second = yield* UpperScores.get({ scoreId: `${mode}-2` }).asEffect()
+        expect(first.composer.name).toBe("Clara Schumann")
+        expect(second.composer.name).toBe("Clara Schumann")
+      }).pipe(provideUpper),
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -11066,6 +11169,541 @@ describeConnected("EventStore per-event metadata (#144)", () => {
         [4, "2019-04-30T08:00:00.000Z"],
       ])
     }).pipe(provideEsMeta),
+  )
+})
+
+// ===========================================================================
+// EventStore stream index projection — "all" / "withoutMetadata" / "keys" (#144)
+// ===========================================================================
+
+const esProjSchema = DynamoSchema.make({ name: "es-proj", version: 1 })
+const esProjTableName = `es-proj-${Date.now()}`
+const esProjDriftTableName = `es-proj-drift-${Date.now()}`
+const EsProjTable = Table.make({ schema: esProjSchema, entities: {} })
+
+class EsProjPosted extends Schema.TaggedClass<EsProjPosted>()("EsProjPosted", {
+  section: Schema.Number,
+  item: Schema.Number,
+}) {}
+
+const EsProjMetadata = Schema.Struct({ eventId: Schema.String })
+
+const esProjKey = (event: EsProjPosted) =>
+  `E#${event.section}-${String(event.item).padStart(4, "0")}`
+
+/** One stream index per index type x projection, all keyed the same way. */
+const EsProjLedger = EventStore.makeStream({
+  table: EsProjTable,
+  streamName: "Ledger",
+  events: [EsProjPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsProjMetadata,
+  indexes: {
+    allLsi: { index: "lsi1", sk: "lsi1sk", key: esProjKey },
+    slimLsi: { index: "lsi2", sk: "lsi2sk", projection: "withoutMetadata", key: esProjKey },
+    keysLsi: { index: "lsi3", sk: "lsi3sk", projection: "keys", key: esProjKey },
+    allGsi: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", key: esProjKey },
+    slimGsi: {
+      type: "gsi",
+      index: "gsi2",
+      pk: "gsi2pk",
+      sk: "gsi2sk",
+      projection: "withoutMetadata",
+      key: esProjKey,
+    },
+    keysGsi: {
+      type: "gsi",
+      index: "gsi3",
+      pk: "gsi3pk",
+      sk: "gsi3sk",
+      projection: "keys",
+      key: esProjKey,
+    },
+  },
+})
+
+/**
+ * Drift: a stream declaring narrow projections on a table whose indexes were
+ * deployed narrower still — `withoutMetadata` deployed `INCLUDE ["__edd_e__"]`,
+ * `keys` deployed `KEYS_ONLY`.
+ */
+const EsProjDrift = EventStore.makeStream({
+  table: EsProjTable,
+  streamName: "Drift",
+  events: [EsProjPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsProjMetadata,
+  indexes: {
+    slimLsi: { index: "lsi1", sk: "lsi1sk", projection: "withoutMetadata", key: esProjKey },
+    keysLsi: { index: "lsi2", sk: "lsi2sk", projection: "keys", key: esProjKey },
+    slimGsi: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      projection: "withoutMetadata",
+      key: esProjKey,
+    },
+    keysGsi: {
+      type: "gsi",
+      index: "gsi2",
+      pk: "gsi2pk",
+      sk: "gsi2sk",
+      projection: "keys",
+      key: esProjKey,
+    },
+  },
+})
+
+/** Every `query` / `batchGetItem` this suite sends: proves how each mode reads. */
+const esProjCalls = { query: 0, batchGetKeys: [] as Array<number> }
+
+const EsProjClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        esProjCalls.query++
+        return client.query(input)
+      },
+      batchGetItem: (input) => {
+        esProjCalls.batchGetKeys.push(
+          Object.values(input.RequestItems ?? {}).reduce(
+            (sum, request) => sum + (request.Keys?.length ?? 0),
+            0,
+          ),
+        )
+        return client.batchGetItem(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const esProjResetCalls = () => {
+  esProjCalls.query = 0
+  esProjCalls.batchGetKeys = []
+}
+
+const EsProjLayer = Layer.mergeAll(EsProjClientLayer, EsProjTable.layer({ name: esProjTableName }))
+const provideEsProj = Effect.provide(EsProjLayer)
+const provideEsProjDrift = Effect.provide(
+  Layer.mergeAll(EsProjClientLayer, EsProjTable.layer({ name: esProjDriftTableName })),
+)
+
+/** Every item of one physical index for a stream partition, raw (no filter). */
+const esProjRawIndex = (tableName: string, index: string, pkField: string, pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: tableName,
+      IndexName: index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": pkField },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+/** Append `events` with one `{ eventId: "ev-<section>-<item>" }` entry each. */
+const esProjAppend = (
+  stream: typeof EsProjLedger | typeof EsProjDrift,
+  ledgerId: string,
+  events: ReadonlyArray<EsProjPosted>,
+  expectedVersion: number,
+) =>
+  stream.append({ ledgerId }, events, expectedVersion, {
+    eventMetadata: events.map((event) => ({ eventId: `ev-${event.section}-${event.item}` })),
+  })
+
+const esProjNames = ["allLsi", "slimLsi", "keysLsi", "allGsi", "slimGsi", "keysGsi"] as const
+
+describeConnected("EventStore stream index projection (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const tableKey = {
+          BillingMode: "PAY_PER_REQUEST" as const,
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" as const },
+            { AttributeName: "sk", KeyType: "RANGE" as const },
+          ],
+        }
+        const tableKeyAttributes = [
+          { AttributeName: "pk", AttributeType: "S" as const },
+          { AttributeName: "sk", AttributeType: "S" as const },
+        ]
+
+        // The projected table: exactly what indexDefinitions emits.
+        const fragments = EventStore.indexDefinitions(EsProjLedger)
+        yield* client.createTable({
+          TableName: esProjTableName,
+          ...tableKey,
+          AttributeDefinitions: [...tableKeyAttributes, ...fragments.AttributeDefinitions],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+          GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+        })
+
+        // The drift table: the same keys, each index deployed narrower than declared.
+        const drift = EventStore.indexDefinitions(EsProjDrift)
+        const deployed: Record<string, Projection> = {
+          lsi1: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] },
+          lsi2: { ProjectionType: "KEYS_ONLY" },
+          gsi1: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] },
+          gsi2: { ProjectionType: "KEYS_ONLY" },
+        }
+        yield* client.createTable({
+          TableName: esProjDriftTableName,
+          ...tableKey,
+          AttributeDefinitions: [...tableKeyAttributes, ...drift.AttributeDefinitions],
+          LocalSecondaryIndexes: (drift.LocalSecondaryIndexes ?? []).map((index) => ({
+            ...index,
+            Projection: deployed[index.IndexName!],
+          })),
+          GlobalSecondaryIndexes: (drift.GlobalSecondaryIndexes ?? []).map((index) => ({
+            ...index,
+            Projection: deployed[index.IndexName!],
+          })),
+        })
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        for (const TableName of [esProjTableName, esProjDriftTableName]) {
+          yield* client
+            .deleteTable({ TableName })
+            .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+        }
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped),
+    )
+  }, 15000)
+
+  it.effect("#144 DescribeTable shows the Projection indexDefinitions emits for each mode", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: esProjTableName })
+      const projections = Object.fromEntries(
+        [
+          ...(described.Table?.LocalSecondaryIndexes ?? []),
+          ...(described.Table?.GlobalSecondaryIndexes ?? []),
+        ].map((index) => [
+          index.IndexName,
+          {
+            type: index.Projection?.ProjectionType,
+            attributes: [...(index.Projection?.NonKeyAttributes ?? [])].sort(),
+          },
+        ]),
+      )
+      const withoutMetadata = ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"]
+      expect(projections).toEqual({
+        lsi1: { type: "ALL", attributes: [] },
+        lsi2: { type: "INCLUDE", attributes: withoutMetadata },
+        lsi3: { type: "INCLUDE", attributes: ["__edd_e__"] },
+        gsi1: { type: "ALL", attributes: [] },
+        gsi2: { type: "INCLUDE", attributes: withoutMetadata },
+        gsi3: { type: "INCLUDE", attributes: ["__edd_e__"] },
+      })
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 each physical index holds only what its projection declares", () =>
+    Effect.gen(function* () {
+      const ledgerId = "raw-1"
+      yield* esProjAppend(EsProjLedger, ledgerId, [new EsProjPosted({ section: 1, item: 1 })], 0)
+      const pk = "$es-proj#v1#ledger#raw-1"
+      const keysOf = (index: string, pkField: string) =>
+        esProjRawIndex(esProjTableName, index, pkField, pk).pipe(
+          Effect.map((items) => items.map((item) => Object.keys(item).sort())),
+        )
+      const envelope = ["__edd_e__", "data", "eventType", "pk", "sk", "streamId", "timestamp"]
+
+      // "all": everything, metadata included.
+      const all = yield* keysOf("lsi1", "pk")
+      expect(all[0]).toContain("metadata")
+      // "withoutMetadata": the envelope and the keys, no metadata.
+      for (const [index, pkField, sk] of [
+        ["lsi2", "pk", "lsi2sk"],
+        ["gsi2", "gsi2pk", "gsi2sk"],
+      ] as const) {
+        const slim = yield* keysOf(index, pkField)
+        expect(slim).toEqual([
+          [...envelope, "version", sk, ...(pkField === "pk" ? [] : [pkField])].sort(),
+        ])
+      }
+      // "keys": the table key, the index key and __edd_e__ — no event attributes.
+      expect(yield* keysOf("lsi3", "pk")).toEqual([["__edd_e__", "lsi3sk", "pk", "sk"]])
+      expect(yield* keysOf("gsi3", "gsi3pk")).toEqual([
+        ["__edd_e__", "gsi3pk", "gsi3sk", "pk", "sk"],
+      ])
+    }).pipe(provideEsProj),
+  )
+
+  it.effect(
+    "#144 readIndex and query.index: withoutMetadata drops metadata, keys returns full events",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "modes-1" }
+        // Appended out of key order, so index order differs from stream order.
+        const events = [
+          new EsProjPosted({ section: 2, item: 1 }),
+          new EsProjPosted({ section: 1, item: 2 }),
+          new EsProjPosted({ section: 1, item: 1 }),
+          new EsProjPosted({ section: 3, item: 1 }),
+        ]
+        yield* esProjAppend(EsProjLedger, key.ledgerId, events, 0)
+
+        const full = (yield* EsProjLedger.read(key, { consistentRead: true })).filter(
+          (event) => event.version > 0,
+        )
+        // Index order: 1-1 (v3), 1-2 (v2), 2-1 (v1), 3-1 (v4).
+        const expected = [3, 2, 1, 4].map((version) => full[version - 1]!)
+        expect(expected.map((event) => event.metadata)).toEqual([
+          { eventId: "ev-1-1" },
+          { eventId: "ev-1-2" },
+          { eventId: "ev-2-1" },
+          { eventId: "ev-3-1" },
+        ])
+        const withoutMetadata = expected.map(({ metadata: _, ...event }) => event)
+
+        for (const name of esProjNames) {
+          esProjResetCalls()
+          const read = yield* EsProjLedger.readIndex(name, key)
+          const queried = yield* EsProjLedger.query.index(name, key).pipe(Query.collect)
+          if (name === "slimLsi" || name === "slimGsi") {
+            for (const result of [read, queried]) {
+              expect(result.map((event) => event.metadata)).toEqual([
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+              ])
+              expect(result.map(({ metadata: _, ...event }) => event)).toEqual(withoutMetadata)
+            }
+            // One query each, nothing fetched.
+            expect(esProjCalls.query).toBe(2)
+            expect(esProjCalls.batchGetKeys).toEqual([])
+          } else {
+            expect(read).toEqual(expected)
+            expect(queried).toEqual(expected)
+            // Only a "keys" GSI fetches; an LSI has DynamoDB fetch.
+            expect(esProjCalls.batchGetKeys).toEqual(name === "keysGsi" ? [4, 4] : [])
+          }
+        }
+
+        // The type follows the projection: metadata is undefined on a slim index.
+        const slim = yield* EsProjLedger.readIndex("slimGsi", key)
+        const slimMetadata: undefined = slim[0]!.metadata
+        expect(slimMetadata).toBeUndefined()
+        const keys = yield* EsProjLedger.readIndex("keysGsi", key)
+        const keysMetadata: { readonly eventId: string } | undefined = keys[0]!.metadata
+        expect(keysMetadata).toEqual({ eventId: "ev-1-1" })
+
+        // A bound stream reads the same way.
+        const bound = yield* EventStore.bind(EsProjLedger)
+        expect(yield* bound.readIndex("keysGsi", key)).toEqual(expected)
+        expect(
+          (yield* bound.readIndex("slimLsi", key)).map(({ metadata: _, ...event }) => event),
+        ).toEqual(withoutMetadata)
+      }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 beginsWith, between, reverse, limit, cursor and count in every mode", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "range-1" }
+      const events = [1, 2, 3].flatMap((section) =>
+        [1, 2, 3].map((item) => new EsProjPosted({ section, item })),
+      )
+      yield* esProjAppend(EsProjLedger, key.ledgerId, events, 0)
+      const versionsOf = (read: ReadonlyArray<{ readonly version: number }>) =>
+        read.map((event) => event.version)
+
+      for (const name of esProjNames) {
+        const section2 = yield* EsProjLedger.readIndex(name, key, { beginsWith: "E#2-" })
+        expect(versionsOf(section2), name).toEqual([4, 5, 6])
+        expect(
+          section2.map((event) => event.data),
+          name,
+        ).toEqual(events.slice(3, 6))
+
+        const between = yield* EsProjLedger.readIndex(name, key, {
+          between: ["E#1-0002", "E#2-0002~"],
+        })
+        expect(versionsOf(between), name).toEqual([2, 3, 4, 5])
+
+        const newestTwo = yield* EsProjLedger.readIndex(name, key, { reverse: true, limit: 2 })
+        expect(versionsOf(newestTwo), name).toEqual([9, 8])
+        expect(
+          newestTwo.map((event) => event.metadata),
+          name,
+        ).toEqual(
+          name.startsWith("slim")
+            ? [undefined, undefined]
+            : [{ eventId: "ev-3-3" }, { eventId: "ev-3-2" }],
+        )
+
+        // The composable Query, with a cursor across pages.
+        const query = EsProjLedger.query
+          .index(name, key)
+          .pipe(Query.where({ beginsWith: "E#3-" }), Query.limit(2))
+        const first = yield* Query.execute(query)
+        expect(versionsOf(first.items), name).toEqual([7, 8])
+        expect(first.cursor, name).not.toBeNull()
+        const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+        expect(versionsOf(second.items), name).toEqual([9])
+
+        const pages = yield* Query.paginate(
+          EsProjLedger.query.index(name, key).pipe(Query.reverse),
+        ).pipe(Effect.flatMap((stream) => Stream.runCollect(stream)))
+        expect(versionsOf(pages.flat()), name).toEqual([9, 8, 7, 6, 5, 4, 3, 2, 1])
+
+        esProjResetCalls()
+        const count = yield* EsProjLedger.query.index(name, key).pipe(Query.count)
+        expect(count, name).toBe(9)
+        expect(esProjCalls.batchGetKeys, name).toEqual([])
+      }
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 select on a keys index returns the selected event attributes", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "select-1" }
+      yield* esProjAppend(
+        EsProjLedger,
+        key.ledgerId,
+        [new EsProjPosted({ section: 1, item: 2 }), new EsProjPosted({ section: 1, item: 1 })],
+        0,
+      )
+      for (const name of ["keysLsi", "keysGsi"] as const) {
+        const rows = yield* EsProjLedger.query
+          .index(name, key)
+          .pipe(Query.select(["version", "metadata"]), Query.collect)
+        expect(rows, name).toEqual([
+          { version: 2, metadata: { eventId: "ev-1-1" } },
+          { version: 1, metadata: { eventId: "ev-1-2" } },
+        ])
+      }
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 a keys GSI read over 100 events fetches in BatchGetItem chunks of 100", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "many-1" }
+      // Three appends of 50 (one transaction each), keyed in reverse of stream order.
+      const events = Array.from(
+        { length: 150 },
+        (_, i) => new EsProjPosted({ section: 1, item: 150 - i }),
+      )
+      for (const start of [0, 50, 100]) {
+        yield* esProjAppend(EsProjLedger, key.ledgerId, events.slice(start, start + 50), start)
+      }
+
+      esProjResetCalls()
+      const read = yield* EsProjLedger.readIndex("keysGsi", key)
+      expect(esProjCalls.batchGetKeys).toEqual([100, 50])
+      expect(read.map((event) => event.version)).toEqual(
+        Array.from({ length: 150 }, (_, i) => 150 - i),
+      )
+      expect(read.map((event) => event.metadata)).toEqual(
+        Array.from({ length: 150 }, (_, i) => ({ eventId: `ev-1-${i + 1}` })),
+      )
+      // The same events as the "all" GSI, attribute for attribute.
+      expect(read).toEqual(yield* EsProjLedger.readIndex("allGsi", key))
+
+      // A limit fetches only its window.
+      esProjResetCalls()
+      const limited = yield* EsProjLedger.readIndex("keysGsi", key, { limit: 3 })
+      expect(limited.map((event) => event.version)).toEqual([150, 149, 148])
+      expect(esProjCalls.batchGetKeys).toEqual([3])
+    }).pipe(provideEsProj),
+  )
+
+  it("#144 streams that share a physical index with different projections are refused", () => {
+    const Other = EventStore.makeStream({
+      table: EsProjTable,
+      streamName: "Other",
+      events: [EsProjPosted],
+      streamId: { composite: ["ledgerId"] },
+      indexes: { slimLsi: { index: "lsi2", sk: "lsi2sk", key: esProjKey } },
+    })
+    expect(() => EventStore.indexDefinitions(EsProjLedger, Other)).toThrow(/EDD-9067/)
+    expect(() => EventStore.indexDefinitions(EsProjLedger, Other)).toThrow(
+      /projection "withoutMetadata".*projection "all"/,
+    )
+    // The same projection on the shared index is accepted.
+    const Same = EventStore.makeStream({
+      table: EsProjTable,
+      streamName: "Same",
+      events: [EsProjPosted],
+      streamId: { composite: ["ledgerId"] },
+      indexes: {
+        slimLsi: { index: "lsi2", sk: "lsi2sk", projection: "withoutMetadata", key: esProjKey },
+      },
+    })
+    expect(EventStore.indexDefinitions(EsProjLedger, Same)).toEqual(
+      EventStore.indexDefinitions(EsProjLedger),
+    )
+  })
+
+  it.effect(
+    "#144 drift: withoutMetadata deployed as INCLUDE [__edd_e__] is diagnosed on the read",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "drift-slim-1" }
+        yield* esProjAppend(
+          EsProjDrift,
+          key.ledgerId,
+          [new EsProjPosted({ section: 1, item: 1 })],
+          0,
+        )
+        for (const [name, physical] of [
+          ["slimLsi", "lsi1"],
+          ["slimGsi", "gsi1"],
+        ] as const) {
+          const error = (yield* EsProjDrift.readIndex(name, key).pipe(
+            Effect.flip,
+          )) as ValidationError
+          expect(error._tag, name).toBe("ValidationError")
+          expect(error.operation, name).toBe("EventStore.index.decode")
+          const cause = error.cause as Error
+          expect(cause.message).toContain(`Stream index "${name}" (physical "${physical}")`)
+          expect(cause.message).toContain('projection: "withoutMetadata"')
+          expect(cause.message).toContain("the deployed index likely projects less than declared")
+          // The original decode failure is kept.
+          expect((cause.cause as ValidationError).operation).toBe("EventStore.decode")
+        }
+      }).pipe(provideEsProjDrift),
+  )
+
+  it.effect("#144 drift: keys deployed KEYS_ONLY passes DynamoDB's filter rejection through", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "drift-keys-1" }
+      yield* esProjAppend(EsProjDrift, key.ledgerId, [new EsProjPosted({ section: 1, item: 1 })], 0)
+      for (const [name, physical] of [
+        ["keysLsi", "lsi2"],
+        ["keysGsi", "gsi2"],
+      ] as const) {
+        // DynamoDB refuses the ownership filter on an index that does not
+        // project __edd_e__, even on an LSI read with Select ALL_ATTRIBUTES.
+        // Its message already names the index and the attribute; the library
+        // does not rewrite it.
+        for (const read of [
+          EsProjDrift.readIndex(name, key),
+          EsProjDrift.query.index(name, key).pipe(Query.collect),
+        ]) {
+          const error = yield* read.pipe(Effect.flip)
+          expect(error._tag, name).toBe("DynamoValidationError")
+          expect(String((error as { readonly cause?: unknown }).cause), name).toContain(
+            `Secondary index ${physical} does not project one or more filter attributes: [__edd_e__]`,
+          )
+        }
+      }
+    }).pipe(provideEsProjDrift),
   )
 })
 

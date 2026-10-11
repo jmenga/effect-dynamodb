@@ -109,6 +109,7 @@ import {
   diagnoseFailure,
   rangeKeysOf,
   targetsFor,
+  transactItemTarget,
 } from "./internal/WriteDiagnosis.js"
 import {
   decodeSparseFields,
@@ -4760,6 +4761,8 @@ const makeImpl = <
         readonly entityType: string
         readonly tableName: string
         readonly key: globalThis.Record<string, AttributeValue>
+        /** The target table's primary-key attributes, `[pk.field, sk.field]`. */
+        readonly keyFields: readonly [string, string]
         readonly refFieldName: string
         readonly refData: AttributeValue
       }> = []
@@ -4800,6 +4803,12 @@ const makeImpl = <
 
         // Resolve target table name
         const { name: targetTableName } = yield* target._tableTag
+
+        // The target's primary-key attributes. A target need not be keyed `pk` /
+        // `sk`, and one cascade can span targets keyed differently, so each
+        // update reads its key — and is diagnosed — by its own target's fields.
+        const targetPrimary = target.indexes.primary!
+        const keyFields = [targetPrimary.pk.field, targetPrimary.sk.field] as const
 
         // Compose GSI PK for the source entity's ID
         const targetSchema = target._schema
@@ -4853,7 +4862,8 @@ const makeImpl = <
             allUpdateOps.push({
               entityType: target.entityType,
               tableName: targetTableName,
-              key: { pk: item.pk!, sk: item.sk! },
+              key: { [keyFields[0]]: item[keyFields[0]]!, [keyFields[1]]: item[keyFields[1]]! },
+              keyFields,
               refFieldName: matchingRef.fieldName,
               refData: toAttributeValue(sourceDomainData),
             })
@@ -4886,15 +4896,18 @@ const makeImpl = <
               _tag: "Transaction",
               items: cascadeItems,
               targets: () =>
-                targetsFor(
-                  cascadeItems,
-                  ["pk", "sk"],
-                  (index) => allUpdateOps[index]!.entityType,
-                  (index) =>
-                    `the cascade update of ${allUpdateOps[index]!.entityType} (item ${index})`,
-                ),
+                cascadeItems.map((item, index) => {
+                  const op = allUpdateOps[index]!
+                  return transactItemTarget(
+                    item,
+                    op.tableName,
+                    op.keyFields,
+                    op.entityType,
+                    `the cascade update of ${op.entityType} (item ${index})`,
+                  )
+                }),
             }),
-            rangeKeys: () => ["sk"],
+            rangeKeys: () => [...new Set(allUpdateOps.map((op) => op.keyFields[1]))],
             rewrite: (diagnosis, original) =>
               new CascadePartialFailure({
                 sourceEntity: sourceEntityType,
@@ -4930,14 +4943,15 @@ const makeImpl = <
                 _tag: "Item",
                 item: { Update: update },
                 target: () =>
-                  targetsFor(
-                    [{ Update: update }],
-                    ["pk", "sk"],
+                  transactItemTarget(
+                    { Update: update },
+                    op.tableName,
+                    op.keyFields,
                     op.entityType,
-                    () => `the cascade update of ${op.entityType}`,
-                  )[0]!,
+                    `the cascade update of ${op.entityType}`,
+                  ),
               }),
-              rangeKeys: () => ["sk"],
+              rangeKeys: () => [op.keyFields[1]],
               rewrite: (diagnosis, original) =>
                 diagnosedValidationError(diagnosis, original, {
                   operation: "cascade",

@@ -15,11 +15,13 @@ import {
 import {
   Cause,
   Context,
+  Crypto,
   Data,
   DateTime,
   Duration,
   Effect,
   Exit,
+  Fiber,
   Layer,
   Option,
   pipe,
@@ -313,6 +315,7 @@ const mockQuery = vi.fn()
 const mockTransactWriteItems = vi.fn()
 const mockPutItem = vi.fn()
 const mockGetItem = vi.fn()
+const mockBatchGetItem = vi.fn()
 
 const TestDynamoClient = mockDynamoClientLayer({
   // Unanswered, a query finds nothing — a guarded additional put of a missing
@@ -337,6 +340,11 @@ const TestDynamoClient = mockDynamoClientLayer({
     Effect.tryPromise({
       try: async () => (await mockGetItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "GetItem", cause: e }),
+    }),
+  batchGetItem: (input) =>
+    Effect.tryPromise({
+      try: async () => (await mockBatchGetItem(input)) ?? {},
+      catch: (e) => new DynamoError({ operation: "BatchGetItem", cause: e }),
     }),
 })
 
@@ -5890,8 +5898,8 @@ describe("EventStore stream indexes (#140)", () => {
 
     it("exposes each index's settings", () => {
       expect(IndexedMatch.indexes).toEqual({
-        byInnings: { type: "lsi", index: "lsi1", pk: "pk", sk: "lsi1sk" },
-        byResult: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk" },
+        byInnings: { type: "lsi", index: "lsi1", pk: "pk", sk: "lsi1sk", projection: "all" },
+        byResult: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", projection: "all" },
       })
       expect(MatchEvents.indexes).toEqual({})
     })
@@ -6433,6 +6441,611 @@ describe("EventStore stream indexes (#140)", () => {
   })
 })
 
+describe("EventStore stream index projection", () => {
+  const pad = (n: number) => String(n).padStart(4, "0")
+  const pk = "$cricket#v1#projmatch#m-1"
+  const entityType = "projmatch.event"
+  const vkey = (_event: unknown, version: number) => `V#${pad(version)}`
+
+  const ProjMeta = Schema.Struct({ eventId: Schema.String })
+
+  /** One index per index type x projection. */
+  const ProjMatch = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "ProjMatch",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    metadata: ProjMeta,
+    indexes: {
+      fullLsi: { index: "lsi1", sk: "lsi1sk", key: vkey },
+      slimLsi: { index: "lsi2", sk: "lsi2sk", projection: "withoutMetadata", key: vkey },
+      keysLsi: { index: "lsi3", sk: "lsi3sk", projection: "keys", key: vkey },
+      slimGsi: {
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        projection: "withoutMetadata",
+        key: vkey,
+      },
+      keysGsi: {
+        type: "gsi",
+        index: "gsi2",
+        pk: "gsi2pk",
+        sk: "gsi2sk",
+        projection: "keys",
+        key: vkey,
+      },
+    },
+  })
+
+  const sk = (version: number) =>
+    DynamoSchema.composeEventVersionKey(AppSchema, "projmatch.event", version)
+
+  /** A full event item, as the table holds it. */
+  const fullItem = (version: number, extra: Record<string, unknown> = {}) => ({
+    pk,
+    sk: sk(version),
+    __edd_e__: entityType,
+    streamId: "m-1",
+    version,
+    eventType: "InningsCompleted",
+    data: { _tag: "InningsCompleted", innings: version, runs: 100 + version, wickets: 1 },
+    timestamp: "2026-03-08T12:00:00.000Z",
+    metadata: { eventId: `evt-${version}` },
+    gsi2pk: pk,
+    gsi2sk: `V#${pad(version)}`,
+    ...extra,
+  })
+
+  /** What a "keys" GSI row carries: table key, index key, `__edd_e__`. */
+  const keysRow = (version: number) =>
+    toAttributeMap({
+      pk,
+      sk: sk(version),
+      gsi2pk: pk,
+      gsi2sk: `V#${pad(version)}`,
+      __edd_e__: entityType,
+    })
+
+  /**
+   * Answer `BatchGetItem` from `store` (by `sk`), in reverse order of the
+   * request — DynamoDB does not preserve order. Keys whose `sk` is in
+   * `unprocessed` are returned as `UnprocessedKeys` (once each).
+   */
+  const answerFrom =
+    (store: Map<string, Record<string, unknown>>, unprocessed: Set<string> = new Set()) =>
+    async (input: { RequestItems: Record<string, { Keys: Array<any> }> }) => {
+      const Responses: Record<string, Array<any>> = {}
+      const UnprocessedKeys: Record<string, { Keys: Array<any> }> = {}
+      for (const [table, request] of Object.entries(input.RequestItems)) {
+        Responses[table] = []
+        for (const key of request.Keys) {
+          const keySk = fromAttributeMap(key).sk as string
+          if (unprocessed.delete(keySk)) {
+            UnprocessedKeys[table] ??= { Keys: [] }
+            UnprocessedKeys[table]!.Keys.push(key)
+            continue
+          }
+          const item = store.get(keySk)
+          if (item !== undefined) Responses[table]!.push(toAttributeMap(item))
+        }
+        Responses[table]!.reverse()
+      }
+      return { Responses, UnprocessedKeys }
+    }
+
+  const storeOf = (versions: ReadonlyArray<number>) =>
+    new Map(versions.map((v) => [sk(v), fullItem(v)] as const))
+
+  const batchKeys = (call: number) =>
+    Object.values(
+      mockBatchGetItem.mock.calls[call]![0].RequestItems as Record<string, { Keys: Array<any> }>,
+    ).flatMap((entry) => entry.Keys.map((k) => fromAttributeMap(k)))
+
+  describe("definition", () => {
+    it("exposes the resolved projection, defaulting to all", () => {
+      expect(ProjMatch.indexes.fullLsi.projection).toBe("all")
+      expect(ProjMatch.indexes.slimLsi.projection).toBe("withoutMetadata")
+      expect(ProjMatch.indexes.keysGsi.projection).toBe("keys")
+    })
+
+    it("throws EDD-9063 for an unknown projection", () => {
+      expect(() =>
+        EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Bad",
+          events: [MatchStarted],
+          streamId: { composite: ["matchId"] },
+          indexes: {
+            a: { index: "i", sk: "s", projection: "include", key: () => undefined },
+          } as never,
+        }),
+      ).toThrow(
+        /EDD-9063.*projection must be "all", "withoutMetadata" or "keys"; received "include"/,
+      )
+    })
+
+    it("throws EDD-9063 for a member an index entry does not declare", () => {
+      // A misspelled `projection` must not silently resolve to "all".
+      expect(() =>
+        EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Typo",
+          events: [MatchStarted],
+          streamId: { composite: ["matchId"] },
+          indexes: {
+            a: { index: "i", sk: "s", projecton: "keys", key: () => undefined },
+          } as never,
+        }),
+      ).toThrow(/EDD-9063.*index "a": unknown member "projecton"/)
+    })
+  })
+
+  describe("indexDefinitions", () => {
+    const withoutMetadata = {
+      ProjectionType: "INCLUDE",
+      NonKeyAttributes: ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"],
+    }
+    const keys = { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }
+
+    it("emits each projection on an LSI and a GSI", () => {
+      const fragments = EventStore.indexDefinitions(ProjMatch)
+      expect(fragments.LocalSecondaryIndexes!.map((i) => [i.IndexName, i.Projection])).toEqual([
+        ["lsi1", { ProjectionType: "ALL" }],
+        ["lsi2", withoutMetadata],
+        ["lsi3", keys],
+      ])
+      expect(fragments.GlobalSecondaryIndexes!.map((i) => [i.IndexName, i.Projection])).toEqual([
+        ["gsi1", withoutMetadata],
+        ["gsi2", keys],
+      ])
+    })
+
+    it.effect(
+      "an appended event carries exactly pk, sk, the withoutMetadata list, metadata and its index attributes",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* ProjMatch.append({ matchId: "m-1" }, [new MatchEnded({ result: "won" })], 0, {
+            metadata: { eventId: "evt-1" },
+          })
+          const item = fromAttributeMap(
+            mockTransactWriteItems.mock.calls[0]![0].TransactItems.find(
+              (i: any) => i.Put !== undefined,
+            ).Put.Item,
+          )
+          const indexAttributes = [
+            "lsi1sk",
+            "lsi2sk",
+            "lsi3sk",
+            "gsi1pk",
+            "gsi1sk",
+            "gsi2pk",
+            "gsi2sk",
+          ]
+          expect(Object.keys(item).sort()).toEqual(
+            [
+              "pk",
+              "sk",
+              "metadata",
+              ...withoutMetadata.NonKeyAttributes,
+              ...indexAttributes,
+            ].sort(),
+          )
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it("throws EDD-9067 when two streams share a physical index with different projections", () => {
+      const Other = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "OtherProj",
+        events: [MatchStarted],
+        streamId: { composite: ["matchId"] },
+        indexes: { byVenue: { index: "lsi2", sk: "lsi2sk", key: (e) => e.venue } },
+      })
+      expect(() => EventStore.indexDefinitions(ProjMatch, Other)).toThrow(
+        /EDD-9067.*"lsi2".*projection "withoutMetadata".*projection "all"/,
+      )
+      // The same projection is shared, emitted once.
+      const Same = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "SameProj",
+        events: [MatchStarted],
+        streamId: { composite: ["matchId"] },
+        indexes: {
+          byVenue: {
+            index: "lsi2",
+            sk: "lsi2sk",
+            projection: "withoutMetadata",
+            key: (e) => e.venue,
+          },
+        },
+      })
+      expect(EventStore.indexDefinitions(ProjMatch, Same).LocalSecondaryIndexes).toHaveLength(3)
+    })
+
+    it("reads a hand-built settings object without projection as all", () => {
+      expect(
+        EventStore.indexDefinitions({
+          streamName: "Manual",
+          indexes: { byX: { type: "gsi", index: "gsi9", pk: "gsi9pk", sk: "gsi9sk" } },
+        }).GlobalSecondaryIndexes![0]!.Projection,
+      ).toEqual({ ProjectionType: "ALL" })
+    })
+  })
+
+  describe("withoutMetadata", () => {
+    it.effect("reads with one query, sends the ownership filter and drops metadata", () =>
+      Effect.gen(function* () {
+        // The row carries metadata (an index deployed wider than declared).
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap(fullItem(2, { lsi2sk: "V#0002" }))] })
+        const events = yield* ProjMatch.readIndex("slimLsi", { matchId: "m-1" })
+        expect(events).toHaveLength(1)
+        expect(events[0]!.data).toBeInstanceOf(InningsCompleted)
+        expect(events[0]!.metadata).toBeUndefined()
+        expect(mockQuery).toHaveBeenCalledOnce()
+        expect(mockBatchGetItem).not.toHaveBeenCalled()
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.IndexName).toBe("lsi2")
+        expect(call.Select).toBeUndefined()
+        expect(call.FilterExpression).toContain("#eddE IN")
+        expect(Object.values(fromAttributeMap(call.ExpressionAttributeValues))).toContain(
+          entityType,
+        )
+
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap(fullItem(3))] })
+        const viaGsi = yield* ProjMatch.query
+          .index("slimGsi", { matchId: "m-1" })
+          .pipe(Query.collect)
+        expect(viaGsi[0]!.metadata).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("the all index keeps metadata", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap(fullItem(2))] })
+        const events = yield* ProjMatch.readIndex("fullLsi", { matchId: "m-1" })
+        expect(events[0]!.metadata).toEqual({ eventId: "evt-2" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("keys on an LSI", () => {
+    it.effect("queries with Select ALL_ATTRIBUTES and the ownership filter", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap(fullItem(4))] })
+        const events = yield* ProjMatch.readIndex(
+          "keysLsi",
+          { matchId: "m-1" },
+          { consistentRead: true },
+        )
+        expect(events[0]!.metadata).toEqual({ eventId: "evt-4" })
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.IndexName).toBe("lsi3")
+        expect(call.Select).toBe("ALL_ATTRIBUTES")
+        expect(call.ConsistentRead).toBe(true)
+        expect(call.ProjectionExpression).toBeUndefined()
+        expect(call.FilterExpression).toContain("#eddE IN")
+        expect(mockBatchGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("select sends a ProjectionExpression and no Select; count sends Select COUNT", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [toAttributeMap({ data: { _tag: "X" } })] })
+        yield* ProjMatch.query
+          .index("keysLsi", { matchId: "m-1" })
+          .pipe(Query.select(["data"]), Query.collect)
+        const selected = mockQuery.mock.calls[0]![0]
+        expect(selected.ProjectionExpression).toBeDefined()
+        expect(selected.Select).toBeUndefined()
+
+        mockQuery.mockResolvedValue({ Count: 7 })
+        const count = yield* ProjMatch.query.index("keysLsi", { matchId: "m-1" }).pipe(Query.count)
+        expect(count).toBe(7)
+        expect(mockQuery.mock.calls[1]![0].Select).toBe("COUNT")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("keys on a GSI", () => {
+    it.effect("hydrates each page with BatchGetItem, in index order", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [3, 1, 2].map(keysRow) })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 2, 3])))
+        const events = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" })
+        // Index order, although the mock answers in reverse.
+        expect(events.map((e) => e.version)).toEqual([3, 1, 2])
+        expect(events[0]!.data).toBeInstanceOf(InningsCompleted)
+        expect(events[0]!.metadata).toEqual({ eventId: "evt-3" })
+
+        const query = mockQuery.mock.calls[0]![0]
+        expect(query.IndexName).toBe("gsi2")
+        expect(query.Select).toBeUndefined()
+        expect(query.FilterExpression).toContain("#eddE IN")
+        expect(mockBatchGetItem).toHaveBeenCalledOnce()
+        const request = mockBatchGetItem.mock.calls[0]![0].RequestItems["events-table"]
+        expect(request.ConsistentRead).toBeUndefined()
+        expect(request.ProjectionExpression).toBeUndefined()
+        expect(batchKeys(0)).toEqual([3, 1, 2].map((v) => ({ pk, sk: sk(v) })))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("query.index hydrates the same way", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2].map(keysRow) })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 2])))
+        const events = yield* ProjMatch.query
+          .index("keysGsi", { matchId: "m-1" })
+          .pipe(Query.reverse, Query.collect)
+        expect(events.map((e) => e.version)).toEqual([1, 2])
+        expect(mockQuery.mock.calls[0]![0].ScanIndexForward).toBe(false)
+        const page = yield* ProjMatch.query.index("keysGsi", { matchId: "m-1" }).pipe(Query.execute)
+        expect(page.items.map((e) => e.version)).toEqual([1, 2])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("chunks BatchGetItem at 100 keys", () =>
+      Effect.gen(function* () {
+        const versions = Array.from({ length: 250 }, (_, i) => i + 1)
+        mockQuery.mockResolvedValue({ Items: versions.map(keysRow) })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf(versions)))
+        const events = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" })
+        expect(events.map((e) => e.version)).toEqual(versions)
+        expect(mockBatchGetItem).toHaveBeenCalledTimes(3)
+        expect([0, 1, 2].map((call) => batchKeys(call).length)).toEqual([100, 100, 50])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("retries unprocessed keys with backoff", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2, 3].map(keysRow) })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 2, 3]), new Set([sk(2)])))
+        const fiber = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" }).pipe(
+          Effect.forkChild,
+        )
+        yield* TestClock.adjust("1 second")
+        const events = yield* Fiber.join(fiber)
+        expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+        expect(mockBatchGetItem).toHaveBeenCalledTimes(2)
+        expect(batchKeys(1)).toEqual([{ pk, sk: sk(2) }])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("fails with DynamoError after 5 retries", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [keysRow(1)] })
+        mockBatchGetItem.mockImplementation(async (input: any) => ({
+          Responses: {},
+          UnprocessedKeys: input.RequestItems,
+        }))
+        const fiber = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" }).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        )
+        yield* TestClock.adjust("10 seconds")
+        const error = yield* Fiber.join(fiber)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).operation).toBe("BatchGetItem")
+        expect(String((error as DynamoError).cause)).toContain(
+          "Unprocessed keys remain after 5 retries",
+        )
+        expect(mockBatchGetItem).toHaveBeenCalledTimes(6)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("re-reads a missing key consistently, then drops it", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2, 3].map(keysRow) })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 3])))
+        const events = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" })
+        expect(events.map((e) => e.version)).toEqual([1, 3])
+        expect(mockBatchGetItem).toHaveBeenCalledTimes(2)
+        expect(batchKeys(1)).toEqual([{ pk, sk: sk(2) }])
+        expect(mockBatchGetItem.mock.calls[1]![0].RequestItems["events-table"].ConsistentRead).toBe(
+          true,
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("re-reads more than 100 missing keys consistently, in chunks of 100", () =>
+      Effect.gen(function* () {
+        const versions = Array.from({ length: 150 }, (_, i) => i + 1)
+        mockQuery.mockResolvedValue({ Items: versions.map(keysRow) })
+        // Only version 150 exists: 149 keys go missing on the first read.
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([150])))
+        const events = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" })
+        expect(events.map((e) => e.version)).toEqual([150])
+        expect(mockBatchGetItem).toHaveBeenCalledTimes(4)
+        expect([0, 1, 2, 3].map((call) => batchKeys(call).length)).toEqual([100, 50, 100, 49])
+        const consistent = [0, 1, 2, 3].map(
+          (call) =>
+            mockBatchGetItem.mock.calls[call]![0].RequestItems["events-table"].ConsistentRead,
+        )
+        expect(consistent).toEqual([undefined, undefined, true, true])
+        expect([...batchKeys(2), ...batchKeys(3)].map((key) => key.sk)).toEqual(
+          versions.slice(0, 149).map(sk),
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a consistent re-read that finds the item keeps it in order", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2].map(keysRow) })
+        mockBatchGetItem
+          .mockImplementationOnce(answerFrom(storeOf([2])))
+          .mockImplementationOnce(answerFrom(storeOf([1])))
+        const events = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" })
+        expect(events.map((e) => e.version)).toEqual([1, 2])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("limit hydrates only the window and the cursor resumes after the last row kept", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [1, 2, 3].map(keysRow),
+          LastEvaluatedKey: toAttributeMap({ pk, sk: sk(3), gsi2pk: pk, gsi2sk: "V#0003" }),
+        })
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 2, 3])))
+        const page = yield* ProjMatch.query
+          .index("keysGsi", { matchId: "m-1" })
+          .pipe(Query.limit(2), Query.execute)
+        expect(page.items.map((e) => e.version)).toEqual([1, 2])
+        expect(batchKeys(0)).toEqual([1, 2].map((v) => ({ pk, sk: sk(v) })))
+        expect(JSON.parse(atob(page.cursor!))).toEqual(
+          toAttributeMap({ gsi2pk: pk, gsi2sk: "V#0002", pk, sk: sk(2) }),
+        )
+
+        // readIndex's limit also bounds what is fetched.
+        mockBatchGetItem.mockClear()
+        const limited = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" }, { limit: 1 })
+        expect(limited.map((e) => e.version)).toEqual([1])
+        expect(batchKeys(0)).toEqual([{ pk, sk: sk(1) }])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a dropped row widens the window so limit still fills from the page", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2, 3, 4].map(keysRow) })
+        // Version 2 is gone from the table (never in the store).
+        mockBatchGetItem.mockImplementation(answerFrom(storeOf([1, 3, 4])))
+        const page = yield* ProjMatch.query
+          .index("keysGsi", { matchId: "m-1" })
+          .pipe(Query.limit(2), Query.execute)
+        expect(page.items.map((e) => e.version)).toEqual([1, 3])
+        expect(JSON.parse(atob(page.cursor!))).toMatchObject(toAttributeMap({ sk: sk(3) }))
+        expect(mockQuery).toHaveBeenCalledOnce()
+
+        const streamed = yield* ProjMatch.query
+          .index("keysGsi", { matchId: "m-1" })
+          .pipe(Query.limit(2), Query.collect)
+        expect(streamed.map((e) => e.version)).toEqual([1, 3])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("count counts index rows and fetches nothing", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Count: 3 })
+        const count = yield* ProjMatch.query.index("keysGsi", { matchId: "m-1" }).pipe(Query.count)
+        expect(count).toBe(3)
+        expect(mockQuery.mock.calls[0]![0].Select).toBe("COUNT")
+        expect(mockBatchGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("select moves the projection onto BatchGetItem and strips the borrowed keys", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [1, 2].map(keysRow) })
+        mockBatchGetItem.mockImplementation(async (input: any) => {
+          const request = input.RequestItems["events-table"]
+          const projected = (version: number) => ({
+            pk,
+            sk: sk(version),
+            __edd_e__: entityType,
+            version,
+          })
+          return {
+            Responses: {
+              "events-table": request.Keys.map((k: any) =>
+                toAttributeMap(projected(Number(String(fromAttributeMap(k).sk).split("#").pop()))),
+              ),
+            },
+          }
+        })
+        const rows = yield* ProjMatch.query
+          .index("keysGsi", { matchId: "m-1" })
+          .pipe(Query.select(["version"]), Query.collect)
+        expect(rows).toEqual([{ version: 1 }, { version: 2 }])
+        expect(mockQuery.mock.calls[0]![0].ProjectionExpression).toBeUndefined()
+        const request = mockBatchGetItem.mock.calls[0]![0].RequestItems["events-table"]
+        expect(Object.values(request.ExpressionAttributeNames).sort()).toEqual(
+          ["__edd_e__", "pk", "sk", "version"].sort(),
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a fetched item owned by another entity is a defect", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [keysRow(1)] })
+        mockBatchGetItem.mockImplementation(
+          answerFrom(new Map([[sk(1), fullItem(1, { __edd_e__: "other.event" })]])),
+        )
+        const exit = yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" }).pipe(Effect.exit)
+        expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause)).toContain(
+          '"other.event"',
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("decode diagnosis", () => {
+    const lacking = (version: number, attribute: string, extra: Record<string, unknown> = {}) => {
+      const item: Record<string, unknown> = fullItem(version, extra)
+      delete item[attribute]
+      return toAttributeMap(item)
+    }
+
+    it.effect(
+      "a row lacking an event attribute names the index and the likely projection mismatch",
+      () =>
+        Effect.gen(function* () {
+          for (const [name, physical, projection] of [
+            ["fullLsi", "lsi1", "all"],
+            ["slimGsi", "gsi1", "withoutMetadata"],
+          ] as const) {
+            mockQuery.mockResolvedValue({ Items: [lacking(1, "data")] })
+            const error = (yield* ProjMatch.readIndex(name, { matchId: "m-1" }).pipe(
+              Effect.flip,
+            )) as ValidationError
+            expect(error._tag).toBe("ValidationError")
+            expect(error.operation).toBe("EventStore.index.decode")
+            expect(error.entityType).toBe(entityType)
+            const cause = error.cause as Error
+            expect(cause.message).toContain(`Stream index "${name}" (physical "${physical}")`)
+            expect(cause.message).toContain(`projection: "${projection}"`)
+            expect(cause.message).toContain("lack data")
+            expect((cause.cause as ValidationError).operation).toBe("EventStore.decode")
+          }
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an invalid but present attribute passes through unchanged", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [
+            toAttributeMap(fullItem(1, { data: { _tag: "InningsCompleted", innings: "x" } })),
+          ],
+        })
+        const error = (yield* ProjMatch.readIndex("slimLsi", { matchId: "m-1" }).pipe(
+          Effect.flip,
+        )) as ValidationError
+        expect(error.operation).toBe("EventStore.decode")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a keys read's decode failure passes through", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [lacking(1, "data")] })
+        const lsi = (yield* ProjMatch.readIndex("keysLsi", { matchId: "m-1" }).pipe(
+          Effect.flip,
+        )) as ValidationError
+        expect(lsi.operation).toBe("EventStore.decode")
+
+        mockQuery.mockResolvedValue({ Items: [keysRow(1)] })
+        mockBatchGetItem.mockImplementation(async () => ({
+          Responses: { "events-table": [lacking(1, "data")] },
+        }))
+        const gsi = (yield* ProjMatch.readIndex("keysGsi", { matchId: "m-1" }).pipe(
+          Effect.flip,
+        )) as ValidationError
+        expect(gsi.operation).toBe("EventStore.decode")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+})
+
 describe("EventStore per-event metadata (#144)", () => {
   const epochMs = 1704067200000 // 2024-01-01T00:00:00.000Z
   const isoString = "2024-01-01T00:00:00.000Z"
@@ -6834,6 +7447,46 @@ describe("EventStore per-event metadata (#144)", () => {
         expect(watermark.__edd_e__).toBe("Watermark")
         expect(watermark.metadata).toBeUndefined()
       }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "ids minted with Crypto.randomULID are deterministic under TestClock and a fixed Crypto",
+      () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValue({ Items: [startedItem()] })
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* TestClock.setTime(epochMs)
+
+          // The documented pattern (tutorials/event-sourcing.mdx, Step 20): one
+          // ULID per event from the Crypto service.
+          const program = Effect.gen(function* () {
+            const crypto = yield* Crypto.Crypto
+            return yield* EventStore.commandHandler(twoEvents, Audited)(
+              { matchId: "m-1" },
+              completeInnings,
+              {
+                eventMetadata: ({ events }) =>
+                  Effect.forEach(events, () =>
+                    Effect.map(crypto.randomULID, (eventId) => meta(eventId)),
+                  ),
+              },
+            )
+          })
+          // A test Crypto: call n returns n-filled bytes; the time is the TestClock's.
+          let calls = 0
+          const fixedCrypto = Crypto.make({
+            randomBytes: (size) => new Uint8Array(size).fill(++calls),
+            digest: () => Effect.succeed(new Uint8Array(0)),
+          })
+          yield* Effect.provideService(program, Crypto.Crypto, fixedCrypto)
+
+          const ids = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0]).map(
+            (item) => (item.metadata as { eventId: string }).eventId,
+          )
+          expect(ids).toEqual(["01HK153X00040G2081040G2081", "01HK153X00081040G2081040G2"])
+          const isUlid = Schema.is(Schema.String.check(Schema.isULID()))
+          expect(ids.every((id) => isUlid(id))).toBe(true)
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("is not called for a no-op decision", () =>

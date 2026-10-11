@@ -18,6 +18,11 @@
  *   parameter, so `readIndex` / `query.index` refuse an undeclared name, the
  *   `key` callback is typed by the stream's events, and indexed streams still
  *   flow through `bind` and every `commandHandler` form.
+ * - Stream index projection: each index's `projection` literal is inferred per
+ *   name (`"all"` when omitted), so `readIndex` / `query.index` type `metadata`
+ *   as `undefined` through a `"withoutMetadata"` index only, `key` stays
+ *   contextually typed, and projected streams flow through `bind`,
+ *   `commandHandler` and `indexDefinitions`.
  * - Per-event metadata (#144): `metadata` and `eventMetadata` are exclusive on
  *   `append` and the handler; entries are typed `M | undefined`; an effectful
  *   `eventMetadata` joins its own `E3` / `R3` to the handler's channels next to
@@ -515,6 +520,196 @@ describe("EventStore.commandHandler types", () => {
         const fragments = EventStore.indexDefinitions(IndexedCounter, bound, Counter, Indexed)
         expectTypeOf(fragments).toEqualTypeOf<EventStore.StreamIndexDefinitions>()
       })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("stream index projection types metadata per index name", () => {
+    typeOnly(() => {
+      class Reset extends Schema.TaggedClass<Reset>()("Reset", { reason: Schema.String }) {}
+      interface Meta {
+        readonly eventId: string
+      }
+      const Projected = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Projected",
+        events: [Incremented, Reset],
+        streamId: { composite: ["counterId"] },
+        metadata: Schema.Struct({ eventId: Schema.String }),
+        indexes: {
+          slim: {
+            index: "lsi1",
+            sk: "lsi1sk",
+            projection: "withoutMetadata",
+            key: (event, version) => {
+              // `key` stays contextually typed with `projection` present...
+              expectTypeOf(event).toEqualTypeOf<Incremented | Reset>()
+              expectTypeOf(version).toEqualTypeOf<number>()
+              return event._tag === "Incremented" ? `by#${event.by}` : undefined
+            },
+          },
+          lean: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            projection: "keys",
+            key: (event) => (event._tag === "Reset" ? event.reason : undefined),
+          },
+          // ...and absent.
+          full: {
+            index: "lsi2",
+            sk: "lsi2sk",
+            key: (event) => {
+              expectTypeOf(event).toEqualTypeOf<Incremented | Reset>()
+              return undefined
+            },
+          },
+          declared: { index: "lsi3", sk: "lsi3sk", projection: "all", key: () => undefined },
+        },
+      })
+      // An omitted projection infers "all".
+      expectTypeOf(Projected).toEqualTypeOf<
+        EventStore.EventStream<
+          Incremented | Reset,
+          readonly ["counterId"],
+          Meta,
+          never,
+          "slim" | "lean" | "full" | "declared",
+          {
+            readonly slim: "withoutMetadata"
+            readonly lean: "keys"
+            readonly full: "all"
+            readonly declared: "all"
+          }
+        >
+      >()
+
+      type MetadataOf<T> =
+        T extends Effect.Effect<infer A, infer _E, infer _R>
+          ? A extends ReadonlyArray<EventStore.StreamEvent<unknown, infer M>>
+            ? M
+            : never
+          : never
+      type QueryMetadataOf<T> =
+        T extends Query.Query<EventStore.StreamEvent<unknown, infer M>> ? M : never
+
+      const slim = Projected.readIndex("slim", key)
+      expectTypeOf<MetadataOf<typeof slim>>().toEqualTypeOf<undefined>()
+      expectTypeOf<Effect.Success<typeof slim>[number]["data"]>().toEqualTypeOf<
+        Incremented | Reset
+      >()
+      const lean = Projected.readIndex("lean", key)
+      expectTypeOf<MetadataOf<typeof lean>>().toEqualTypeOf<Meta | undefined>()
+      const full = Projected.readIndex("full", key)
+      expectTypeOf<MetadataOf<typeof full>>().toEqualTypeOf<Meta | undefined>()
+      // A union name yields the union of the metadata types.
+      const either = Projected.readIndex("slim" as "slim" | "lean", key)
+      expectTypeOf<MetadataOf<typeof either>>().toEqualTypeOf<Meta | undefined>()
+
+      // query.index mirrors readIndex.
+      expectTypeOf<
+        QueryMetadataOf<ReturnType<typeof Projected.query.index<"slim">>>
+      >().toEqualTypeOf<undefined>()
+      const leanQuery = Projected.query.index("lean", key)
+      expectTypeOf<QueryMetadataOf<typeof leanQuery>>().toEqualTypeOf<Meta | undefined>()
+      const slimQuery = Projected.query.index("slim", key)
+      expectTypeOf(slimQuery).toEqualTypeOf<
+        Query.Query<EventStore.StreamEvent<Incremented | Reset, undefined>>
+      >()
+
+      // @ts-expect-error — not a declared index name
+      Projected.readIndex("byNothing", key)
+      // @ts-expect-error — not a declared index name
+      Projected.query.index("byNothing", key)
+
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadProjection",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — not a stream index projection
+          bad: { index: "lsi1", sk: "lsi1sk", projection: "include", key: () => undefined },
+        },
+      })
+
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "TypoProjection",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — a misspelled `projection` is not an index member
+          lsi: { index: "lsi1", sk: "lsi1sk", projecton: "keys", key: () => undefined },
+          gsi: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            // @ts-expect-error — a misspelled `projection` is not an index member
+            projecton: "keys",
+            key: () => undefined,
+          },
+        },
+      })
+
+      // BoundEventStream mirrors the stream.
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Projected)
+        expectTypeOf(bound).toEqualTypeOf<
+          EventStore.BoundEventStream<
+            Incremented | Reset,
+            readonly ["counterId"],
+            Meta,
+            never,
+            "slim" | "lean" | "full" | "declared",
+            {
+              readonly slim: "withoutMetadata"
+              readonly lean: "keys"
+              readonly full: "all"
+              readonly declared: "all"
+            }
+          >
+        >()
+        const boundSlim = bound.readIndex("slim", key)
+        expectTypeOf<MetadataOf<typeof boundSlim>>().toEqualTypeOf<undefined>()
+        expectTypeOf<Effect.Services<typeof boundSlim>>().toEqualTypeOf<never>()
+        const boundLean = bound.readIndex("lean", key)
+        expectTypeOf<MetadataOf<typeof boundLean>>().toEqualTypeOf<Meta | undefined>()
+        const boundQuery = bound.query.index("slim", key)
+        expectTypeOf<QueryMetadataOf<typeof boundQuery>>().toEqualTypeOf<undefined>()
+        // @ts-expect-error — not a declared index name
+        bound.readIndex("byNothing", key)
+
+        // Projected streams flow through commandHandler and indexDefinitions.
+        const tallyDecider: EventStore.Decider<
+          CounterState,
+          { readonly by: number },
+          Incremented | Reset,
+          Overflow
+        > = {
+          initialState: { total: 0 },
+          decide: (c) => Effect.succeed([new Incremented({ by: c.by })]),
+          evolve: (state) => state,
+        }
+        const dataFirst = EventStore.commandHandler(tallyDecider, Projected)(key, command)
+        expectTypeOf<Effect.Services<typeof dataFirst>>().toEqualTypeOf<Base>()
+        const dataLast = Projected.pipe(EventStore.commandHandler(tallyDecider))(key, command)
+        expectTypeOf<Effect.Services<typeof dataLast>>().toEqualTypeOf<Base>()
+        const boundFirst = EventStore.commandHandler(tallyDecider, bound)(key, command)
+        expectTypeOf<Effect.Services<typeof boundFirst>>().toEqualTypeOf<never>()
+        EventStore.indexDefinitions(Projected, bound)
+        // A hand-built settings object without `projection` is accepted.
+        EventStore.indexDefinitions({
+          streamName: "Manual",
+          indexes: { byX: { type: "lsi", index: "lsi9", pk: "pk", sk: "lsi9sk" } },
+        })
+      })
+
+      // A stream without indexes accepts no name.
+      // @ts-expect-error — the stream declares no indexes
+      Counter.readIndex("slim", key)
     })
     expect(true).toBe(true)
   })

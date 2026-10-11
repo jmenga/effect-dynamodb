@@ -16,9 +16,10 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { Entity, EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
+import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
+import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import { itemBytes } from "./internal/ItemSize.js"
 import {
   batchRejectReason,
@@ -38,13 +39,10 @@ import {
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
-const MAX_BATCH_GET = 100
 const MAX_BATCH_WRITE = 25
 const MAX_TRANSACT_WRITE = 100
 /** DynamoDB caps a transaction's payload at 4 MB of item data; leave headroom. */
 const MAX_TRANSACT_BYTES = 3_500_000
-const MAX_RETRIES = 5
-const BASE_DELAY_MS = 100
 
 /**
  * Optional retry configuration for batch operations.
@@ -124,98 +122,19 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
 
     const tableNames = yield* resolveTableNames(infos)
 
-    // Build composed keys for each item and track the mapping
-    const itemKeys: Array<{
-      tableName: string
-      composedKey: Record<string, unknown>
-      marshalledKey: Record<string, AttributeValue>
-      entity: Entity
-      index: number
-    }> = []
+    // Compose each position's primary key. `BatchGetItem` does not preserve
+    // order, so `batchGetRaw` matches responses back to positions by key.
+    const requests = infos.map((info) => ({
+      tableName: tableNames.get(info.entity)!,
+      key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
+    }))
+    const fetched = yield* batchGetRaw(client, requests, { maxRetries, baseDelayMs })
 
-    for (let i = 0; i < infos.length; i++) {
-      const info = infos[i]!
-      const tableName = tableNames.get(info.entity)!
-      const composed = composePrimaryKey(info.entity, info.key!)
-
-      itemKeys.push({
-        tableName,
-        composedKey: composed,
-        marshalledKey: toAttributeMap(composed),
-        entity: info.entity,
-        index: i,
-      })
-    }
-
-    // Collect all responses by original index
     const results: Array<unknown> = new Array(items.length).fill(undefined)
-
-    // Process in chunks of MAX_BATCH_GET
-    for (let chunkStart = 0; chunkStart < itemKeys.length; chunkStart += MAX_BATCH_GET) {
-      const chunk = itemKeys.slice(chunkStart, chunkStart + MAX_BATCH_GET)
-
-      // Build request grouped by table
-      let requestItems: Record<string, { Keys: Array<Record<string, AttributeValue>> }> = {}
-      for (const item of chunk) {
-        if (!requestItems[item.tableName]) {
-          requestItems[item.tableName] = { Keys: [] }
-        }
-        requestItems[item.tableName]!.Keys.push(item.marshalledKey)
-      }
-
-      // Retry loop for unprocessed keys
-      let retries = 0
-      while (Object.keys(requestItems).length > 0) {
-        const response = yield* client.batchGetItem({ RequestItems: requestItems })
-
-        // Process responses
-        if (response.Responses) {
-          for (const [tableName, tableItems] of Object.entries(response.Responses)) {
-            for (const responseItem of tableItems) {
-              const raw = fromAttributeMap(responseItem)
-
-              // Match to original position by primary key
-              const matched = chunk.find((item) => {
-                if (item.tableName !== tableName) return false
-                const primary = item.entity.indexes.primary!
-                return (
-                  raw[primary.pk.field] === item.composedKey[primary.pk.field] &&
-                  raw[primary.sk.field] === item.composedKey[primary.sk.field]
-                )
-              })
-
-              if (matched) {
-                const decoded = yield* matched.entity._decodeRecord(raw)
-                results[matched.index] = decoded
-              }
-            }
-          }
-        }
-
-        // Check for unprocessed keys
-        const unprocessed: Record<string, { Keys: Array<Record<string, AttributeValue>> }> = {}
-        if (response.UnprocessedKeys) {
-          for (const [tableName, tableKeys] of Object.entries(response.UnprocessedKeys)) {
-            if (tableKeys.Keys && tableKeys.Keys.length > 0) {
-              unprocessed[tableName] = { Keys: tableKeys.Keys }
-            }
-          }
-        }
-
-        if (Object.keys(unprocessed).length === 0) break
-
-        retries++
-        if (retries > maxRetries) {
-          return yield* new DynamoError({
-            operation: "BatchGetItem",
-            cause: new Error(`Unprocessed keys remain after ${maxRetries} retries`),
-          })
-        }
-
-        // Exponential backoff
-        yield* Effect.sleep(`${baseDelayMs * 2 ** (retries - 1)} millis`)
-        requestItems = unprocessed
-      }
+    for (let i = 0; i < fetched.length; i++) {
+      const item = fetched[i]
+      if (item === undefined) continue
+      results[i] = yield* infos[i]!.entity._decodeRecord(fromAttributeMap(item))
     }
 
     // Cast rationale: results is built as Array<A | undefined> by matching DynamoDB
