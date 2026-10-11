@@ -153,8 +153,8 @@ const program = Effect.gen(function* () {
   const updated = yield* db.entities.Employees.update({ employeeId: "emp-alice" as any }).set({
     displayName: "Alice C.",
     department: "Platform",
-    // Must provide all GSI composites for ByTenant:
-    tenantId: "tenant-acme" as any,
+    // department leads byTenant's sort key [department, hireDate]: pass hireDate
+    // too, or the sort key is truncated to the department alone
     hireDate: DateTime.makeUnsafe("2024-01-15T00:00:00.000Z"),
   })
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)

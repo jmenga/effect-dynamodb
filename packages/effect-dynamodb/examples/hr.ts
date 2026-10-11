@@ -9,7 +9,7 @@
  * - 5 GSIs with index overloading
  * - Cross-entity collection patterns via shared GSI indexes
  * - 10 access patterns including sort key range queries
- * - Entity-scoped set() with all-or-none GSI constraints
+ * - Entity-scoped set() recomposing only the GSI key halves it touches
  * - Atomic onboarding via Transaction.transactWrite
  * - Employee termination via soft delete + rehire via restore
  *

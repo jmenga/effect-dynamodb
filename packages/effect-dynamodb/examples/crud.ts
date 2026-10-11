@@ -6,7 +6,7 @@
  *   - DynamoClient.make({ entities }) returns typed gateway
  *   - Terminal-selected return types: yield* returns clean model (User),
  *     pipe to asRecord/asItem/asNative for richer decode modes
- *   - Simplified updates: db.entities.Users.update(key, fields) with pipeable combinators
+ *   - Fluent updates: db.entities.Users.update(key).set(...) with chained combinators
  *   - Collection queries with fluent combinators
  *   - Atomic transactions
  *   - Version history: versioned: { retain: true } creates snapshots on every mutation
@@ -180,6 +180,12 @@ const ProjectTable = Table.make({
 // ---------------------------------------------------------------------------
 // 5. Main program
 // ---------------------------------------------------------------------------
+
+const assertEq = <T>(actual: T, expected: T, label: string): void => {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a !== e) throw new Error(`Assertion failed [${label}]: expected ${e}, got ${a}`)
+}
 
 const program = Effect.gen(function* () {
   // #region client
@@ -445,9 +451,9 @@ const program = Effect.gen(function* () {
   yield* Console.log("")
 
   // -------------------------------------------------------------------------
-  // Update all-or-none constraint
+  // Updating GSI composites — per-half recomposition
   // -------------------------------------------------------------------------
-  yield* Console.log("=== Sparse GSI — Update All-or-None ===\n")
+  yield* Console.log("=== Sparse GSI — Updating Composites ===\n")
 
   yield* db.entities.Employees.put({
     employeeId: "e-1",
@@ -457,27 +463,35 @@ const program = Effect.gen(function* () {
   })
 
   // #region sparse-update
-  // GOOD: Update without touching GSI composites
+  // Touches no byTenant composite — its keys are left as stored
   yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ name: "Alice W." })
 
-  // GOOD: Update ALL composites of a GSI
+  // Touches both halves of byTenant — gsi1pk and gsi1sk are recomposed
   yield* db.entities.Employees.update({ employeeId: "e-1" }).set({
     tenantId: "t-2",
     region: "eu-west-1",
   })
 
-  // BAD: Partial GSI composites — runtime ValidationError
-  yield* db.entities.Employees.update({ employeeId: "e-1" })
-    .set({ tenantId: "t-3" }) // missing region!
-    .asEffect()
-    .pipe(
-      Effect.catchTag("ValidationError", (e) =>
-        Effect.succeed(`Must provide both tenantId AND region, or neither`),
-      ),
-    )
+  // Touches only the partition half — gsi1pk moves to t-3, gsi1sk keeps eu-west-1
+  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ tenantId: "t-3" })
+  const inT3 = yield* db.entities.Employees.byTenant({ tenantId: "t-3" }).collect()
+  // → [{ employeeId: "e-1", tenantId: "t-3", region: "eu-west-1", ... }]
+
+  // Removing the only partition composite removes gsi1pk — Alpha leaves byOwner
+  yield* db.entities.Projects.update({ projectId: "p-1" }).remove(["ownerId"])
+  const aliceProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }).collect()
+  // → []
   // #endregion
+  assertEq(
+    inT3.map((e) => [e.employeeId, e.region]),
+    [["e-1", "eu-west-1"]],
+    "partial update moves e-1 to t-3 and keeps its region",
+  )
+  assertEq(aliceProjects.length, 0, "removing ownerId drops Alpha out of byOwner")
   yield* Console.log(`Updated name only (GSI keys unchanged)`)
-  yield* Console.log(`Transferred to t-2/eu-west-1 (GSI keys recomposed)\n`)
+  yield* Console.log(`Transferred to t-2/eu-west-1 (both key halves recomposed)`)
+  yield* Console.log(`Moved to t-3 (partition half recomposed, region kept)`)
+  yield* Console.log(`Removed ownerId on Alpha (dropped out of byOwner)\n`)
 
   // --- Entity.delete (hard delete — returns void) ---
   yield* Console.log("=== Entity.delete (Hard Delete) ===\n")

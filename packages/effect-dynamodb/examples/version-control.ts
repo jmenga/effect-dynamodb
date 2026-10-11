@@ -421,7 +421,7 @@ const program = Effect.gen(function* () {
     repoOwner: "octocat",
     repoName: "hello-world",
     issueNumber: "3",
-  }).set({ status: "Closed", username: "torvalds" })
+  }).set({ status: "Closed" })
   assertEq(closedIssue.status, "Closed", "closed issue status")
   assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
   // #endregion
@@ -449,7 +449,7 @@ const program = Effect.gen(function* () {
     repoOwner: "octocat",
     repoName: "hello-world",
     pullRequestNumber: "2",
-  }).set({ status: "Closed", username: "octocat" })
+  }).set({ status: "Closed" })
   assertEq(closedPR.status, "Closed", "closed PR status")
   assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
   // #endregion

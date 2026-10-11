@@ -516,11 +516,6 @@ Updating a book's `memberId` and `loanEndDate` populates the GSI1 composites, ca
   yield* db.entities.Books.update({ isbn: "978-0-547-928227", bookId: "b-hobbit" }).set({
     memberId: "m-alice",
     loanEndDate: "2025-04-01",
-    // Must provide all GSI composites for affected indexes
-    authorLastName: "Tolkien",
-    authorFirstName: "J.R.R.",
-    bookTitle: "The Hobbit",
-    releaseDate: "1937-09-21",
   })
 
   // Now the book appears in Alice's loans
@@ -618,7 +613,7 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Index overloading** | GSI1 serves book loans, genre categories, and member accounts |
 | **Collections** | `Works` (GSI2), `Account` (GSI1), and `Titles` (GSI3) enable cross-entity queries |
 | **Sparse index** | Book loans collection only populated when `memberId` + `loanEndDate` are present |
-| **All-or-none GSI updates** | Loaning a book requires all composites for every affected GSI |
+| **Per-half GSI updates** | Loaning a book sets both GSI1 composites; the other GSIs' keys are left as stored |
 | **Transactions** | Atomic book returns via `Transaction.transactWrite` |
 | **Optional fields drive visibility** | `Schema.optional` fields control sparse index membership |
 

@@ -399,7 +399,8 @@ const program = Effect.gen(function* () {
   assertEq(buildApi.status, "open", "get task status")
   assertEq(buildApi.points, 8, "get task points")
 
-  // Update employee title — must provide all GSI composites for affected indexes
+  // Update employee title — title is in several GSI key halves, so pass the other
+  // composites of those halves too and each one recomposes in full
   const promoted = yield* db.entities.Employees.update({ employee: "tyler" }).set({
     office: "portland",
     team: "development",
