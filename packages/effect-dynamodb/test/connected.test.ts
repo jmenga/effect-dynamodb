@@ -12,6 +12,7 @@
  * batch unprocessed-item retry, transaction atomicity, and GSI propagation.
  */
 
+import type { AttributeValue, Projection, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import {
   Cause,
@@ -48,6 +49,7 @@ import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import type {
   AdditionalItemConditionFailed,
+  AggregateTransactionOverflow,
   AppendTooLarge,
   DuplicateCommand,
   UniqueConstraintViolation,
@@ -61,6 +63,14 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
+import {
+  attributeBytes,
+  ITEM_MAX_BYTES,
+  itemBytes,
+  TRANSACT_WRITE_MAX_BYTES,
+  transactItemBytes,
+  transactionBytes,
+} from "../src/internal/ItemSize.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -4169,6 +4179,106 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
     const coachSks = (sks: ReadonlyArray<string>) =>
       sks.filter((s) => s.toLowerCase().includes("squadcoach"))
 
+    it.effect(
+      "#144 a group over 100 items is DynamoDB's rejection; earlier groups stay, named",
+      () =>
+        Effect.gen(function* () {
+          // Not pre-checked: each group is its own transaction, sent in turn.
+          // team2's 105 players are rejected by DynamoDB; the root and team1
+          // groups were already committed, and the error says so.
+          const error = yield* MatchCardAggregate.create({
+            id: "mc-over",
+            title: "Overflow",
+            team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+            team2: {
+              coach: { name: "C2" },
+              players: Array.from({ length: 105 }, (_, i) => ({ id: `q${i}`, name: `Q${i}` })),
+            },
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("AggregateTransactionOverflow")
+          const overflow = error as AggregateTransactionOverflow
+          expect(overflow.itemCount).toBeGreaterThan(100)
+          expect(overflow.limit).toBe(100)
+          expect(overflow.subgraph).toBe("team2")
+          expect(overflow.committed).toEqual(["root", "team1"])
+          expect(overflow.message).toContain('sub-aggregate "team2" holds')
+          expect(overflow.message).toContain('already committed: "root", "team1"')
+          expect(overflow.message).toContain("a retried create fails its root guard")
+
+          // Exactly what it names was written: the root and team1, not team2.
+          const sks = yield* rawSks(matchPk("mc-over"))
+          expect(playerSks(sks)).toHaveLength(1)
+          expect(coachSks(sks)).toHaveLength(1)
+        }).pipe(provideAgg),
+    )
+
+    it.effect(
+      "#144 a later group rejected for size: the error names the groups already committed",
+      () =>
+        Effect.gen(function* () {
+          // team2's one player is over 400 KB: DynamoDB rejects that group
+          // after the root and team1 were committed.
+          const error = yield* MatchCardAggregate.create({
+            id: "mc-big",
+            title: "Big",
+            team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+            team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "x".repeat(410_000) }] },
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const text = String((error as ValidationError).cause)
+          expect(text).toContain('sub-aggregate "team2"')
+          expect(text).toContain(
+            'earlier transactions of this write already committed sub-aggregates "root", "team1"',
+          )
+          expect(text).toContain(
+            "a retried create fails on the existing root: update or delete the partial aggregate",
+          )
+
+          const sks = yield* rawSks(matchPk("mc-big"))
+          expect(playerSks(sks)).toHaveLength(1)
+          expect(coachSks(sks)).toHaveLength(1)
+          // As the error says: the partial aggregate is updated, not created again.
+          const retried = yield* MatchCardAggregate.create({
+            id: "mc-big",
+            title: "Big",
+            team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+            team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "Q" }] },
+          }).pipe(Effect.flip)
+          expect(retried._tag).toBe("ConditionalCheckFailed")
+        }).pipe(provideAgg),
+    )
+
+    it.effect("#144 an update whose later group DynamoDB rejects: earlier groups stay, named", () =>
+      Effect.gen(function* () {
+        yield* MatchCardAggregate.create({
+          id: "mc-upd-over",
+          title: "Before",
+          team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+          team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "Q" }] },
+        })
+        const error = yield* MatchCardAggregate.update({ id: "mc-upd-over" }, ({ state }) => ({
+          ...state,
+          team1: { ...state.team1, players: [{ id: "p2", name: "B" }] },
+          team2: {
+            ...state.team2,
+            players: Array.from({ length: 105 }, (_, i) => ({ id: `q${i}`, name: `Q${i}` })),
+          },
+        })).pipe(Effect.flip)
+        expect(error._tag).toBe("AggregateTransactionOverflow")
+        const overflow = error as AggregateTransactionOverflow
+        expect(overflow.subgraph).toBe("team2")
+        expect(overflow.committed).toContain("team1")
+        expect(overflow.committed).not.toContain("team2")
+        expect(overflow.message).toContain('"team1"')
+        expect(overflow.message).not.toContain("retried create")
+
+        // team1's change is committed; team2 is as it was.
+        const fetched = yield* MatchCardAggregate.get({ id: "mc-upd-over" })
+        expect(fetched.team1.players.map((p) => p.id)).toEqual(["p2"])
+        expect(fetched.team2.players.map((p) => p.id)).toEqual(["q1"])
+      }).pipe(provideAgg),
+    )
+
     it.effect("removes one player from team1.players — team2 untouched", () =>
       Effect.gen(function* () {
         yield* MatchCardAggregate.create({
@@ -4266,6 +4376,108 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
       }).pipe(provideAgg),
     )
   })
+})
+
+// ---------------------------------------------------------------------------
+// Ref cascade on a table keyed `PK` / `SK` (#144, C2). The cascade used to
+// build each update's key from `item.pk` / `item.sk` whatever the target's
+// primary key was: on a table keyed `PK` / `SK` every update failed with
+// "The number of conditions on the keys is invalid".
+// ---------------------------------------------------------------------------
+
+class UpperComposer extends Schema.Class<UpperComposer>("UpperComposer")({
+  composerId: Schema.String.pipe(DynamoModel.identifier),
+  name: Schema.String,
+}) {}
+
+class UpperScore extends Schema.Class<UpperScore>("UpperScore")({
+  scoreId: Schema.String,
+  title: Schema.String,
+  composer: UpperComposer.pipe(DynamoModel.ref),
+}) {}
+
+const upperSchema = DynamoSchema.make({ name: "upper-keys", version: 1 })
+const upperTableName = `upper-keys-${Date.now()}`
+
+const UpperComposers = Entity.make({
+  model: UpperComposer,
+  entityType: "UpperComposer",
+  primaryKey: {
+    pk: { field: "PK", composite: ["composerId"] },
+    sk: { field: "SK", composite: [] },
+  },
+})
+
+const UpperScores = Entity.make({
+  model: UpperScore,
+  entityType: "UpperScore",
+  primaryKey: {
+    pk: { field: "PK", composite: ["scoreId"] },
+    sk: { field: "SK", composite: [] },
+  },
+  refs: {
+    composer: {
+      entity: UpperComposers,
+      cascade: { index: "GSI1", pk: { field: "GSI1PK" }, sk: { field: "GSI1SK" } },
+    },
+  },
+})
+
+const UpperTable = Table.make({
+  schema: upperSchema,
+  entities: { UpperComposers, UpperScores },
+})
+const provideUpper = Effect.provide(
+  Layer.mergeAll(ClientLayer, UpperTable.layer({ name: upperTableName })),
+)
+
+describeConnected("Ref cascade on a table keyed PK / SK (#144, C2)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: upperTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(UpperTable),
+        })
+      }).pipe(provideUpper),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: upperTableName })
+      }).pipe(
+        provideUpper,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  for (const mode of ["eventual", "transactional"] as const) {
+    it.effect(`${mode} cascade updates the embedded ref on every target item`, () =>
+      Effect.gen(function* () {
+        const composerId = `c-${mode}`
+        yield* UpperComposers.put({ composerId, name: "Clara" }).asEffect()
+        yield* UpperScores.put({ scoreId: `${mode}-1`, title: "Romance", composerId }).asEffect()
+        yield* UpperScores.put({ scoreId: `${mode}-2`, title: "Trio", composerId }).asEffect()
+
+        yield* UpperComposers.update({ composerId }).pipe(
+          Entity.set({ name: "Clara Schumann" }),
+          Entity.cascade({ targets: [UpperScores], mode }),
+          Entity.asModel,
+        )
+
+        const first = yield* UpperScores.get({ scoreId: `${mode}-1` }).asEffect()
+        const second = yield* UpperScores.get({ scoreId: `${mode}-2` }).asEffect()
+        expect(first.composer.name).toBe("Clara Schumann")
+        expect(second.composer.name).toBe("Clara Schumann")
+      }).pipe(provideUpper),
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -9610,7 +9822,7 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
   // Large commands — stepped commands, one atomic append each
   // -------------------------------------------------------------------------
 
-  it.effect("an append over the item or size limit fails before anything is written", () =>
+  it.effect("an append over the item or size limit is rejected whole: nothing is written", () =>
     Effect.gen(function* () {
       const key = { accountId: "large-1" }
       const error = yield* EsPlain.append(key, esLatDeposits(250), 0).pipe(Effect.flip)
@@ -9624,10 +9836,15 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
       const events = Array.from({ length: 30 }, () => new EsCmdDeposited({ amount: 1 }))
       const refused = yield* EsPlainMeta.append(key, events, 0, { metadata }).pipe(Effect.flip)
       expect(refused._tag).toBe("ValidationError")
+      expect(String((refused as ValidationError).cause)).toContain("4194304 bytes (4 MB)")
       expect(yield* EsPlainMeta.currentVersion(key, { consistentRead: true })).toBe(0)
+      // Not pre-checked (#144): each was sent once and rejected by DynamoDB —
+      // never retried — and nothing was written.
       expect(
-        esLatLog.filter((r) => r.op === "transactWriteItems" && r.pk?.endsWith("#large-1")),
-      ).toEqual([])
+        esLatLog
+          .filter((r) => r.op === "transactWriteItems" && r.pk?.endsWith("#large-1"))
+          .map((r) => r.items?.length),
+      ).toEqual([250, 30])
     }).pipe(provideEsLat),
   )
 
@@ -9672,7 +9889,8 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
         const transacts = esLatRequests("bulk", accountId).filter(
           (r) => r.op === "transactWriteItems",
         )
-        expect(transacts.map((t) => t.items?.length)).toEqual([93, 94, 74])
+        // The 253-item decision was sent and rejected whole by DynamoDB (#144).
+        expect(transacts.map((t) => t.items?.length)).toEqual([253, 93, 94, 74])
 
         // A redelivered step — its response lost — is a duplicate, not a conflict.
         const replay = yield* handle(key, 70, {
@@ -9855,6 +10073,23 @@ const EsIdxLedger = EventStore.makeStream({
       pk: "gsi1pk",
       sk: "gsi1sk",
       key: (event) => (event._tag === "EsIdxNoted" ? `DAY#${event.day}` : undefined),
+    },
+  },
+})
+
+/** A stream whose key function derives an empty key: DynamoDB's to reject (#144). */
+const EsIdxEmptyKey = EventStore.makeStream({
+  table: EsIdxTable,
+  streamName: "EmptyKey",
+  events: [EsIdxRecorded, EsIdxNoted],
+  streamId: { composite: ["ledgerId"] },
+  indexes: {
+    byDay: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      key: (event) => (event._tag === "EsIdxNoted" ? "" : undefined),
     },
   },
 })
@@ -10066,15 +10301,41 @@ describeConnected("EventStore stream indexes (#140)", () => {
       const raw = yield* esIdxRawIndex("gsi1", "gsi1pk", "$es-idx#v1#ledger#gsi-a")
       expect(raw.map((item) => item.gsi1sk)).toEqual(["DAY#2026-10-01", "DAY#2026-10-03"])
 
+      // A consistent read of the GSI is sent; DynamoDB rejects it, and the
+      // rejection is named (#144).
       const refused = yield* EsIdxLedger.readIndex("byDay", a, { consistentRead: true }).pipe(
         Effect.flip,
       )
       expect(refused._tag).toBe("ValidationError")
+      expect(String((refused as ValidationError).cause)).toContain(
+        'index "gsi1" is a global secondary index',
+      )
       const refusedQuery = yield* EsIdxLedger.query
         .index("byDay", a)
         .pipe(Query.consistentRead(), Query.collect, Effect.flip)
       expect(refusedQuery._tag).toBe("ValidationError")
     }).pipe(provideEsIdx),
+  )
+
+  it.effect(
+    "#144 an empty stream-index key is sent; DynamoDB's rejection names index and event",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "empty-key-1" }
+        const error = yield* EsIdxEmptyKey.append(
+          key,
+          [new EsIdxRecorded({ section: 1, item: 1 }), new EsIdxNoted({ day: "2026-10-10" })],
+          0,
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("EventStore.append.indexes")
+        expect(String(failure.cause)).toContain(
+          'The key of index "byDay" for the event at version 2 is an empty string',
+        )
+        // Rejected whole: nothing was written.
+        expect(yield* EsIdxEmptyKey.read(key, { consistentRead: true })).toHaveLength(0)
+      }).pipe(provideEsIdx),
   )
 
   it.effect("#140 every step of a stepped command is indexed", () =>
@@ -10134,21 +10395,36 @@ describeConnected("EventStore stream indexes (#140)", () => {
   )
 
   it.effect(
-    "#140 readIndex refuses key bounds DynamoDB rejects, ordering them as DynamoDB does",
+    "#140 #144 key bounds DynamoDB rejects are sent, and its rejection named, in its order",
     () =>
       Effect.gen(function* () {
         const key = { ledgerId: "bounds-1" }
         yield* EsIdxLedger.append(key, [new EsIdxRecorded({ section: 1, item: 1 })], 0)
 
-        // Each of these is a DynamoValidationError if sent; readIndex refuses
-        // them with the library's ValidationError instead.
-        for (const options of [
-          { beginsWith: "" },
-          { between: ["", "ENTRY#9"] },
-          { between: ["ENTRY#9", "ENTRY#0"] },
-        ] as ReadonlyArray<EventStore.ReadIndexOptions>) {
-          const error = yield* EsIdxLedger.readIndex("byEntry", key, options).pipe(Effect.flip)
+        // Sent as given (#144): DynamoDB rejects each, and readIndex names the
+        // stream index and the bound, DynamoDB's error kept as the cause.
+        const lsi = 'compares the key attribute "lsi1sk" of index "lsi1"'
+        const cases: ReadonlyArray<readonly [EventStore.ReadIndexOptions, string, string]> = [
+          [{ beginsWith: "" }, "byEntry", lsi],
+          [{ between: ["", "ENTRY#9"] }, "byEntry", lsi],
+          [{ beginsWith: "" }, "byDay", 'compares the key attribute "gsi1sk" of index "gsi1"'],
+          [
+            { between: ["ENTRY#9", "ENTRY#0"] },
+            "byEntry",
+            `between's lower bound "ENTRY#9" sorts after its upper bound "ENTRY#0" on "lsi1sk"`,
+          ],
+          // UTF-8 order, as DynamoDB sorts: U+1F600 after U+FFFF.
+          [{ between: ["\u{1F600}", "\uFFFF"] }, "byEntry", "sorts after its upper bound"],
+        ]
+        for (const [options, index, named] of cases) {
+          const error = yield* EsIdxLedger.readIndex(index as "byEntry", key, options).pipe(
+            Effect.flip,
+          )
           expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.operation).toBe("EventStore.readIndex")
+          expect(String(failure.cause)).toContain(`EventStream "Ledger" index "${index}"`)
+          expect(String(failure.cause)).toContain(named)
         }
 
         // U+FFFF sorts after U+1F600 by UTF-16 code units but before it by
@@ -10227,6 +10503,1375 @@ describeConnected("EventStore stream indexes (#140)", () => {
     })
     expect(() => EventStore.indexDefinitions(EsIdxLedger, Other)).toThrow(/EDD-9067/)
   })
+})
+
+// ===========================================================================
+// EventStore per-event metadata — `eventMetadata` on append and
+// commandHandler (#144)
+// ===========================================================================
+
+const esMetaSchema = DynamoSchema.make({ name: "es-meta", version: 1 })
+const esMetaTableName = `es-meta-${Date.now()}`
+const EsMetaTable = Table.make({ schema: esMetaSchema, entities: {} })
+
+class EsMetaPosted extends Schema.TaggedClass<EsMetaPosted>()("EsMetaPosted", {
+  entry: Schema.Number,
+  amount: Schema.Number,
+}) {}
+
+type EsMetaEvent = EsMetaPosted
+
+/** Per-event metadata with a transforming field: stored as an ISO string. */
+const EsMetaMetadata = Schema.Struct({
+  eventId: Schema.String,
+  occurredAt: Schema.DateTimeUtcFromString,
+})
+
+/**
+ * Posted entries on an LSI (`byEntry`, projection `ALL`), so a stream-index
+ * read decodes the metadata each index item carries.
+ */
+const EsMetaLedger = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "Ledger",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsMetaMetadata,
+  indexes: {
+    byEntry: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      key: (event) => `ENTRY#${String(event.entry).padStart(4, "0")}`,
+    },
+  },
+})
+
+/**
+ * An import stream whose metadata carries the origin of each imported event.
+ * The same schema holds one origin per event (`eventMetadata`) or every
+ * origin of the append packed into one shared value (`metadata`), the
+ * workaround #144 replaces.
+ */
+const EsMetaOrigin = Schema.Struct({ sourceId: Schema.String, payload: Schema.String })
+
+const EsMetaImport = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "Import",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: Schema.Struct({ origins: Schema.Array(EsMetaOrigin) }),
+})
+
+/** A command posts `count` entries, numbered on from the current state. */
+const esMetaDecider: EventStore.Decider<{ readonly entries: number }, number, EsMetaEvent> = {
+  initialState: { entries: 0 },
+  decide: (count, state) =>
+    Effect.succeed(
+      Array.from(
+        { length: count },
+        (_, i) => new EsMetaPosted({ entry: state.entries + i + 1, amount: 10 * (i + 1) }),
+      ),
+    ),
+  evolve: (state) => ({ entries: state.entries + 1 }),
+}
+
+/**
+ * Streams for the write limits DynamoDB enforces (#144 §6): a free-text state
+ * snapshotted inline and after the append, and a stream index whose key runs
+ * past DynamoDB's 1024-byte sort-key limit. They share the suite's table (and
+ * its `lsi1`).
+ */
+const EsMetaNoteState = Schema.Struct({ note: Schema.String })
+
+const EsMetaInline = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "InlineNote",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: EsMetaNoteState, mode: "inline" },
+})
+
+const EsMetaSnapped = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "SnappedNote",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  snapshot: { schema: EsMetaNoteState },
+})
+
+const EsMetaLongKey = EventStore.makeStream({
+  table: EsMetaTable,
+  streamName: "LongKey",
+  events: [EsMetaPosted],
+  streamId: { composite: ["ledgerId"] },
+  indexes: {
+    byEntry: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      // Entry 2's key is 1100 bytes: over DynamoDB's sort-key limit.
+      key: (event) => (event.entry === 2 ? "k".repeat(1100) : `ENTRY#${event.entry}`),
+    },
+  },
+})
+
+/** The source of an import's original times, for `eventTimestamps`' Effect form. */
+class EsMetaSourceClock extends Context.Service<
+  EsMetaSourceClock,
+  { readonly originalTime: (entry: number) => Effect.Effect<DateTime.DateTime | undefined> }
+>()("test/EsMetaSourceClock") {}
+
+/** Every `transactWriteItems` this suite sends — proves a refused append sent nothing. */
+let esMetaTransactWrites = 0
+
+const EsMetaClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      transactWriteItems: (input) => {
+        esMetaTransactWrites++
+        return client.transactWriteItems(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const EsMetaLayer = Layer.mergeAll(EsMetaClientLayer, EsMetaTable.layer({ name: esMetaTableName }))
+const provideEsMeta = Effect.provide(EsMetaLayer)
+
+const esMetaAt = (iso: string) => DateTime.makeUnsafe(iso)
+
+/**
+ * The append's `now` in the `eventTimestamps` tests: `it.effect` runs on a
+ * `TestClock` frozen at epoch 0, which each test advances to this instant.
+ */
+const esMetaClockIso = "2026-10-10T12:00:00.000Z"
+const esMetaClockMs = Date.parse(esMetaClockIso)
+
+/** Every base-table item of one stream partition, raw (no filter, no decode). */
+const esMetaRawItems = (pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: esMetaTableName,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": "pk" },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+      ConsistentRead: true,
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+describeConnected("EventStore per-event metadata (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const fragments = EventStore.indexDefinitions(EsMetaLedger)
+        yield* client.createTable({
+          TableName: esMetaTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            ...fragments.AttributeDefinitions,
+          ],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+        })
+      }).pipe(provideEsMeta, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esMetaTableName })
+      }).pipe(
+        provideEsMeta,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#144 three events with three entries: each item stores and reads its own", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "own-1" }
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+        ],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "ev-1", occurredAt: esMetaAt("2026-10-01T09:00:00.000Z") },
+            { eventId: "ev-2", occurredAt: esMetaAt("2026-10-02T09:00:00.000Z") },
+            { eventId: "ev-3", occurredAt: esMetaAt("2026-10-03T09:00:00.000Z") },
+          ],
+        },
+      )
+
+      // Each item stores its own entry, in its encoded (wire) form.
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#own-1")
+      expect(raw.map((item) => item.metadata)).toEqual([
+        { eventId: "ev-1", occurredAt: "2026-10-01T09:00:00.000Z" },
+        { eventId: "ev-2", occurredAt: "2026-10-02T09:00:00.000Z" },
+        { eventId: "ev-3", occurredAt: "2026-10-03T09:00:00.000Z" },
+      ])
+
+      // `read` decodes each event's own entry back to the domain type.
+      const events = yield* EsMetaLedger.read(key)
+      expect(events.map((event) => event.version)).toEqual([1, 2, 3])
+      expect(events.map((event) => event.metadata?.eventId)).toEqual(["ev-1", "ev-2", "ev-3"])
+      expect(events.map((event) => DateTime.formatIso(event.metadata!.occurredAt))).toEqual([
+        "2026-10-01T09:00:00.000Z",
+        "2026-10-02T09:00:00.000Z",
+        "2026-10-03T09:00:00.000Z",
+      ])
+
+      // An `undefined` entry writes no `metadata` attribute at all.
+      yield* EsMetaLedger.append(
+        key,
+        [new EsMetaPosted({ entry: 4, amount: 40 }), new EsMetaPosted({ entry: 5, amount: 50 })],
+        3,
+        {
+          eventMetadata: [
+            undefined,
+            { eventId: "ev-5", occurredAt: esMetaAt("2026-10-05T09:00:00.000Z") },
+          ],
+        },
+      )
+      const after = yield* esMetaRawItems("$es-meta#v1#ledger#own-1")
+      expect(after).toHaveLength(5)
+      expect("metadata" in after[3]!).toBe(false)
+      expect(after[4]!.metadata).toEqual({
+        eventId: "ev-5",
+        occurredAt: "2026-10-05T09:00:00.000Z",
+      })
+      const reread = yield* EsMetaLedger.readFrom(key, 3)
+      expect(reread.map((event) => event.metadata?.eventId)).toEqual([undefined, "ev-5"])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a stream index read returns each event's own entry", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "idx-1" }
+      // Stream order differs from index order, so a positional mix-up would show.
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+        ],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "idx-v1", occurredAt: esMetaAt("2026-10-01T10:00:00.000Z") },
+            { eventId: "idx-v2", occurredAt: esMetaAt("2026-10-01T11:00:00.000Z") },
+            { eventId: "idx-v3", occurredAt: esMetaAt("2026-10-01T12:00:00.000Z") },
+          ],
+        },
+      )
+
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => event.data.entry)).toEqual([1, 2, 3])
+      expect(entries.map((event) => event.version)).toEqual([2, 3, 1])
+      expect(entries.map((event) => event.metadata?.eventId)).toEqual([
+        "idx-v2",
+        "idx-v3",
+        "idx-v1",
+      ])
+      expect(DateTime.formatIso(entries[0]!.metadata!.occurredAt)).toBe("2026-10-01T11:00:00.000Z")
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler derives one entry per event from the decision", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "cmd-1" }
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const seen: Array<EventStore.Decision<{ readonly entries: number }, EsMetaEvent>> = []
+
+      // Plain form: ids derived from the version each event takes.
+      const first = yield* handle(key, 2, {
+        eventMetadata: (decision) => {
+          seen.push(decision)
+          return decision.events.map((_, i) => ({
+            eventId: `cmd-1:${decision.version + i + 1}`,
+            occurredAt: esMetaAt("2026-10-04T08:00:00.000Z"),
+          }))
+        },
+      })
+      expect(first.version).toBe(2)
+
+      // Effect form, against the advanced stream.
+      const second = yield* handle(key, 3, {
+        eventMetadata: ({ events, version }) =>
+          Effect.succeed(
+            events.map((_, i) => ({
+              eventId: `cmd-1:${version + i + 1}`,
+              occurredAt: esMetaAt("2026-10-04T09:00:00.000Z"),
+            })),
+          ),
+      })
+      expect(second.version).toBe(5)
+
+      // The function received the decision `additionalItems` would.
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.version).toBe(0)
+      expect(seen[0]!.events).toHaveLength(2)
+      expect(seen[0]!.state).toEqual({ entries: 2 })
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => event.metadata?.eventId)).toEqual([
+        "cmd-1:1",
+        "cmd-1:2",
+        "cmd-1:3",
+        "cmd-1:4",
+        "cmd-1:5",
+      ])
+      expect(events.map((event) => DateTime.formatIso(event.metadata!.occurredAt))).toEqual([
+        "2026-10-04T08:00:00.000Z",
+        "2026-10-04T08:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+        "2026-10-04T09:00:00.000Z",
+      ])
+
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#cmd-1")
+      expect(raw.map((item) => (item.metadata as { eventId: string }).eventId)).toEqual([
+        "cmd-1:1",
+        "cmd-1:2",
+        "cmd-1:3",
+        "cmd-1:4",
+        "cmd-1:5",
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an import over 4 MB as a packed list commits with eventMetadata", () =>
+    Effect.gen(function* () {
+      // 30 events, each with a ~6 KB origin. Packed into one shared value, every
+      // item carries all 30 origins (~180 KB each, within 400 KB) and the
+      // transaction ~5.4 MB: over DynamoDB's 4 MB. One origin per event is
+      // ~186 KB in total.
+      const count = 30
+      const origins = Array.from({ length: count }, (_, i) => ({
+        sourceId: `legacy-${i + 1}`,
+        payload: String(i % 10).repeat(6_000),
+      }))
+      const events = origins.map((_, i) => new EsMetaPosted({ entry: i + 1, amount: i + 1 }))
+      const packedKey = { ledgerId: "import-packed" }
+      const key = { ledgerId: "import-1" }
+
+      // The packed workaround genuinely exceeds 4 MB: rejected by DynamoDB
+      // (#144), diagnosed, and nothing written.
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(packedKey, events, 0, {
+        metadata: { origins },
+      }).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      expect(String(failure.cause)).toContain("its limit of 4194304 bytes (4 MB)")
+      expect(String(failure.cause)).toMatch(/The largest: the event at version \d+/)
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaImport.read(packedKey, { consistentRead: true })).toHaveLength(0)
+
+      // The same import with one origin per event commits in one transaction.
+      const result = yield* EsMetaImport.append(key, events, 0, {
+        eventMetadata: origins.map((origin) => ({ origins: [origin] })),
+      })
+      expect(result.version).toBe(count)
+      expect(esMetaTransactWrites).toBe(before + 2)
+
+      const read = yield* EsMetaImport.read(key, { consistentRead: true })
+      expect(read).toHaveLength(count)
+      for (const [i, event] of read.entries()) {
+        expect(event.data.entry).toBe(i + 1)
+        expect(event.metadata?.origins).toEqual([origins[i]])
+      }
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an event item over 400 KB is rejected by DynamoDB and named", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "big-1" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 }), new EsMetaPosted({ entry: 2, amount: 2 })],
+        0,
+        {
+          eventMetadata: [
+            { origins: [{ sourceId: "small", payload: "s" }] },
+            { origins: [{ sourceId: "huge", payload: "x".repeat(410_000) }] },
+          ],
+        },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      expect(failure.entityType).toBe("import.event")
+      expect(String(failure.cause)).toContain(
+        "the item of the event at version 2, at pk=$es-meta#v1#import#big-1",
+      )
+      expect(String(failure.cause)).toContain("409600 bytes (400 KB)")
+      // Sent once (#144) and rejected whole: nothing written.
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaImport.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // An item under the limit is accepted by DynamoDB.
+      const near = yield* EsMetaImport.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0, {
+        eventMetadata: [{ origins: [{ sourceId: "near", payload: "y".repeat(380_000) }] }],
+      })
+      expect(near.version).toBe(1)
+      const stored = yield* EsMetaImport.read(key, { consistentRead: true })
+      expect(stored[0]!.metadata?.origins[0]?.payload).toHaveLength(380_000)
+    }).pipe(provideEsMeta),
+  )
+
+  // -------------------------------------------------------------------------
+  // Write limits DynamoDB enforces (#144 §6): sent, rejected whole by
+  // DynamoDB, confirmed against the request and named. Nothing pre-checked.
+  // -------------------------------------------------------------------------
+
+  it.effect("#144 an append of 101 events is AppendTooLarge, from DynamoDB's rejection", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-101" }
+      const events = Array.from(
+        { length: 101 },
+        (_, i) => new EsMetaPosted({ entry: i + 1, amount: 1 }),
+      )
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaImport.append(key, events, 0).pipe(Effect.flip)
+
+      expect(error._tag).toBe("AppendTooLarge")
+      const overflow = error as AppendTooLarge
+      expect(overflow.streamName).toBe("Import")
+      expect(overflow.streamId).toBe("lim-101")
+      expect(overflow.count).toBe(101)
+      expect(overflow.limit).toBe(100)
+      // DynamoDB's own rejection is kept as the cause.
+      expect(String((overflow.cause as { cause: unknown }).cause)).toContain(
+        "length less than or equal to 100",
+      )
+      // Sent once and rejected whole: nothing written.
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaImport.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // 100 events are within DynamoDB's limit and commit.
+      const ok = yield* EsMetaImport.append(key, events.slice(0, 100), 0)
+      expect(ok.version).toBe(100)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a commandHandler decision of 101 events is AppendTooLarge, not retried", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-cmd-101" }
+      const before = esMetaTransactWrites
+      const error = yield* EventStore.commandHandler(esMetaDecider, EsMetaLedger)(key, 101).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("AppendTooLarge")
+      expect((error as AppendTooLarge).count).toBe(101)
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaLedger.currentVersion(key, { consistentRead: true })).toBe(0)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an oversized inline snapshot is named in the rejected append", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-inline" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaInline.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 })],
+        0,
+        { snapshot: { note: "x".repeat(410_000) } },
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append")
+      const text = String(failure.cause)
+      expect(text).toContain(
+        "the item of the inline snapshot, at pk=$es-meta#v1#inlinenote#lim-inline",
+      )
+      expect(text).toContain("409600 bytes (400 KB)")
+      expect(text).toContain("Nothing was written.")
+      expect(esMetaTransactWrites).toBe(before + 1)
+      // The event was in the same transaction: not written either.
+      expect(yield* EsMetaInline.read(key, { consistentRead: true })).toHaveLength(0)
+
+      // A snapshot within the limit commits with its event.
+      const ok = yield* EsMetaInline.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0, {
+        snapshot: { note: "y".repeat(1_000) },
+      })
+      expect(ok.version).toBe(1)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 an oversized writeSnapshot is named from DynamoDB's PutItem rejection", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-snap" }
+      yield* EsMetaSnapped.append(key, [new EsMetaPosted({ entry: 1, amount: 1 })], 0)
+
+      const error = yield* EsMetaSnapped.writeSnapshot(key, { note: "x".repeat(410_000) }, 1).pipe(
+        Effect.flip,
+      )
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.writeSnapshot")
+      expect(String(failure.cause)).toContain(
+        "the item of the snapshot, at pk=$es-meta#v1#snappednote#lim-snap",
+      )
+      expect(Option.isNone(yield* EsMetaSnapped.readSnapshot(key))).toBe(true)
+
+      // Within the limit, the snapshot is written.
+      yield* EsMetaSnapped.writeSnapshot(key, { note: "y".repeat(1_000) }, 1)
+      expect(Option.isSome(yield* EsMetaSnapped.readSnapshot(key))).toBe(true)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a stream-index key over 1024 bytes names the index and the event", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "lim-key" }
+      const before = esMetaTransactWrites
+      const error = yield* EsMetaLongKey.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 1 }), new EsMetaPosted({ entry: 2, amount: 2 })],
+        0,
+      ).pipe(Effect.flip)
+
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("EventStore.append.indexes")
+      const text = String(failure.cause)
+      expect(text).toContain('The key of index "byEntry" for the event at version 2 is 1100 bytes')
+      expect(text).toContain("1024-byte limit")
+      expect(esMetaTransactWrites).toBe(before + 1)
+      expect(yield* EsMetaLongKey.read(key, { consistentRead: true })).toHaveLength(0)
+    }).pipe(provideEsMeta),
+  )
+
+  // -------------------------------------------------------------------------
+  // eventTimestamps (#144 §7)
+  // -------------------------------------------------------------------------
+
+  it.effect("#144 an import with eventTimestamps reads back each event's own timestamp", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-import-1" }
+      // Entry numbers differ from stream order, so a positional mix-up on the
+      // index read would show. Times run backwards, repeat an instant (once as
+      // a Sydney-zoned value) and leave one event on the append's `now`.
+      yield* EsMetaLedger.append(
+        key,
+        [
+          new EsMetaPosted({ entry: 4, amount: 40 }),
+          new EsMetaPosted({ entry: 2, amount: 20 }),
+          new EsMetaPosted({ entry: 1, amount: 10 }),
+          new EsMetaPosted({ entry: 3, amount: 30 }),
+        ],
+        0,
+        {
+          eventTimestamps: [
+            esMetaAt("2019-05-02T17:00:00Z"),
+            undefined,
+            esMetaAt("2019-05-01T09:30:00.250Z"),
+            DateTime.makeZonedUnsafe(new Date("2019-05-01T09:30:00.250Z"), {
+              timeZone: "Australia/Sydney",
+            }),
+          ],
+        },
+      )
+
+      // Each item stores its own timestamp, in the format `now` is written in.
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-import-1")
+      expect(raw.map((item) => [item.version, item.timestamp])).toEqual([
+        [1, "2019-05-02T17:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T09:30:00.250Z"],
+        [4, "2019-05-01T09:30:00.250Z"],
+      ])
+
+      // `read` returns each event's own timestamp, in version order.
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-02T17:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T09:30:00.250Z"],
+        [4, "2019-05-01T09:30:00.250Z"],
+      ])
+
+      // A stream index read carries each event's own timestamp too.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => [event.data.entry, event.version, event.timestamp])).toEqual([
+        [1, 3, "2019-05-01T09:30:00.250Z"],
+        [2, 2, esMetaClockIso],
+        [3, 4, "2019-05-01T09:30:00.250Z"],
+        [4, 1, "2019-05-02T17:00:00.000Z"],
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 a malformed eventTimestamps is refused before anything is sent", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "ts-bad-1" }
+      const before = esMetaTransactWrites
+      const events = [
+        new EsMetaPosted({ entry: 1, amount: 10 }),
+        new EsMetaPosted({ entry: 2, amount: 20 }),
+      ]
+
+      const short = yield* EsMetaLedger.append(key, events, 0, {
+        eventTimestamps: [esMetaAt("2019-05-01T09:30:00Z")],
+      }).pipe(Effect.flip)
+      expect(short._tag).toBe("ValidationError")
+      expect((short as ValidationError).operation).toBe("EventStore.append.eventTimestamps")
+
+      const notDateTime = yield* EsMetaLedger.append(key, events, 0, {
+        eventTimestamps: [
+          esMetaAt("2019-05-01T09:30:00Z"),
+          new Date("2019-05-02T09:30:00Z") as unknown as DateTime.DateTime,
+        ],
+      }).pipe(Effect.flip)
+      expect(notDateTime._tag).toBe("ValidationError")
+      expect((notDateTime as ValidationError).operation).toBe("EventStore.append.eventTimestamps")
+
+      expect(esMetaTransactWrites).toBe(before)
+      expect(yield* EsMetaLedger.read(key, { consistentRead: true })).toHaveLength(0)
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler derives one timestamp per event from the decision", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-cmd-1" }
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const seen: Array<EventStore.Decision<{ readonly entries: number }, EsMetaEvent>> = []
+      // An imported source's own times, keyed by entry number; entry 2 has none.
+      const sourceTimes: Record<number, DateTime.DateTime> = {
+        1: esMetaAt("2019-05-03T08:00:00.000Z"),
+        3: esMetaAt("2019-05-01T08:00:00.000Z"),
+      }
+      const eventTimestamps = (
+        decision: EventStore.Decision<{ readonly entries: number }, EsMetaEvent>,
+      ) => {
+        seen.push(decision)
+        return decision.events.map((event) => sourceTimes[event.entry])
+      }
+
+      const first = yield* handle(key, 3, { eventTimestamps })
+      expect(first.version).toBe(3)
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.version).toBe(0)
+      expect(seen[0]!.events.map((event) => event.entry)).toEqual([1, 2, 3])
+
+      // A no-op decision does not call it.
+      const noop = yield* handle(key, 0, { eventTimestamps })
+      expect(noop.version).toBe(3)
+      expect(seen).toHaveLength(1)
+
+      // Without the option, the handler's events keep the Clock time.
+      const second = yield* handle(key, 1)
+      expect(second.version).toBe(4)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, esMetaClockIso],
+      ])
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-cmd-1")
+      expect(raw.map((item) => item.timestamp)).toEqual(events.map((event) => event.timestamp))
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 eventTimestamps combines with eventMetadata, on append and the handler", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-meta-1" }
+      const occurred = [esMetaAt("2019-05-01T09:00:00.000Z"), esMetaAt("2019-04-30T09:00:00.000Z")]
+
+      // append: each event carries its own metadata entry and its own time.
+      yield* EsMetaLedger.append(
+        key,
+        [new EsMetaPosted({ entry: 1, amount: 10 }), new EsMetaPosted({ entry: 2, amount: 20 })],
+        0,
+        {
+          eventMetadata: [
+            { eventId: "tm-1", occurredAt: occurred[0]! },
+            { eventId: "tm-2", occurredAt: occurred[1]! },
+          ],
+          eventTimestamps: occurred,
+        },
+      )
+
+      // commandHandler: both derived from the same decision; the Effect form
+      // of eventMetadata beside the plain eventTimestamps.
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const handled = yield* handle(key, 2, {
+        eventMetadata: ({ events }) =>
+          Effect.succeed(
+            events.map((event) => ({
+              eventId: `tm-${event.entry}`,
+              occurredAt: esMetaAt(`2019-05-0${event.entry}T10:00:00.000Z`),
+            })),
+          ),
+        eventTimestamps: ({ events }) =>
+          events.map((event, i) =>
+            i === 0 ? esMetaAt(`2019-05-0${event.entry}T10:00:00.000Z`) : undefined,
+          ),
+      })
+      expect(handled.version).toBe(4)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(
+        events.map((event) => [
+          event.version,
+          event.metadata?.eventId,
+          DateTime.formatIso(event.metadata!.occurredAt),
+          event.timestamp,
+        ]),
+      ).toEqual([
+        [1, "tm-1", "2019-05-01T09:00:00.000Z", "2019-05-01T09:00:00.000Z"],
+        [2, "tm-2", "2019-04-30T09:00:00.000Z", "2019-04-30T09:00:00.000Z"],
+        [3, "tm-3", "2019-05-03T10:00:00.000Z", "2019-05-03T10:00:00.000Z"],
+        [4, "tm-4", "2019-05-04T10:00:00.000Z", esMetaClockIso],
+      ])
+
+      // The index read pairs the same metadata and timestamp on each event.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(
+        entries.map((event) => [event.data.entry, event.metadata?.eventId, event.timestamp]),
+      ).toEqual([
+        [1, "tm-1", "2019-05-01T09:00:00.000Z"],
+        [2, "tm-2", "2019-04-30T09:00:00.000Z"],
+        [3, "tm-3", "2019-05-03T10:00:00.000Z"],
+        [4, "tm-4", esMetaClockIso],
+      ])
+    }).pipe(provideEsMeta),
+  )
+
+  it.effect("#144 commandHandler's eventTimestamps Effect form uses a service end to end", () =>
+    Effect.gen(function* () {
+      yield* TestClock.adjust(Duration.millis(esMetaClockMs))
+      const key = { ledgerId: "ts-effect-1" }
+      // The source's own times, by entry number; entry 2 has none.
+      const sourceTimes: Record<number, string> = {
+        1: "2019-05-03T08:00:00.000Z",
+        3: "2019-05-01T08:00:00.000Z",
+        4: "2019-04-30T08:00:00.000Z",
+      }
+      const sourceClock = Layer.succeed(EsMetaSourceClock, {
+        originalTime: (entry) =>
+          Effect.succeed(
+            sourceTimes[entry] === undefined ? undefined : esMetaAt(sourceTimes[entry]),
+          ),
+      })
+      const handle = EventStore.commandHandler(esMetaDecider, EsMetaLedger)
+      const decided: Array<number> = []
+      const eventTimestamps = (
+        decision: EventStore.Decision<{ readonly entries: number }, EsMetaEvent>,
+      ) =>
+        Effect.gen(function* () {
+          decided.push(decision.version)
+          const source = yield* EsMetaSourceClock
+          return yield* Effect.forEach(decision.events, (event) => source.originalTime(event.entry))
+        })
+
+      const first = yield* handle(key, 3, { eventTimestamps }).pipe(Effect.provide(sourceClock))
+      expect(first.version).toBe(3)
+      // Beside the Effect form of eventMetadata, on the same decision.
+      const second = yield* handle(key, 1, {
+        eventTimestamps,
+        eventMetadata: ({ events }) =>
+          Effect.succeed(
+            events.map((event) => ({
+              eventId: `fx-${event.entry}`,
+              occurredAt: esMetaAt("2020-01-01T00:00:00.000Z"),
+            })),
+          ),
+      }).pipe(Effect.provide(sourceClock))
+      expect(second.version).toBe(4)
+      expect(decided).toEqual([0, 3])
+
+      // A failure in the Effect surfaces as is, and nothing is written.
+      const before = esMetaTransactWrites
+      const failed = yield* handle(key, 1, {
+        eventTimestamps: () => Effect.fail("source unavailable" as const),
+      }).pipe(Effect.flip)
+      expect(failed).toBe("source unavailable")
+      expect(esMetaTransactWrites).toBe(before)
+
+      const events = yield* EsMetaLedger.read(key, { consistentRead: true })
+      expect(events.map((event) => [event.version, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, "2019-04-30T08:00:00.000Z"],
+      ])
+      expect(events[3]!.metadata?.eventId).toBe("fx-4")
+      const raw = yield* esMetaRawItems("$es-meta#v1#ledger#ts-effect-1")
+      expect(raw.map((item) => item.timestamp)).toEqual(events.map((event) => event.timestamp))
+      // The index read carries the same per-event timestamps.
+      const entries = yield* EsMetaLedger.readIndex("byEntry", key)
+      expect(entries.map((event) => [event.data.entry, event.timestamp])).toEqual([
+        [1, "2019-05-03T08:00:00.000Z"],
+        [2, esMetaClockIso],
+        [3, "2019-05-01T08:00:00.000Z"],
+        [4, "2019-04-30T08:00:00.000Z"],
+      ])
+    }).pipe(provideEsMeta),
+  )
+})
+
+// ===========================================================================
+// EventStore stream index projection — "all" / "withoutMetadata" / "keys" (#144)
+// ===========================================================================
+
+const esProjSchema = DynamoSchema.make({ name: "es-proj", version: 1 })
+const esProjTableName = `es-proj-${Date.now()}`
+const esProjDriftTableName = `es-proj-drift-${Date.now()}`
+const EsProjTable = Table.make({ schema: esProjSchema, entities: {} })
+
+class EsProjPosted extends Schema.TaggedClass<EsProjPosted>()("EsProjPosted", {
+  section: Schema.Number,
+  item: Schema.Number,
+}) {}
+
+const EsProjMetadata = Schema.Struct({ eventId: Schema.String })
+
+const esProjKey = (event: EsProjPosted) =>
+  `E#${event.section}-${String(event.item).padStart(4, "0")}`
+
+/** One stream index per index type x projection, all keyed the same way. */
+const EsProjLedger = EventStore.makeStream({
+  table: EsProjTable,
+  streamName: "Ledger",
+  events: [EsProjPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsProjMetadata,
+  indexes: {
+    allLsi: { index: "lsi1", sk: "lsi1sk", key: esProjKey },
+    slimLsi: { index: "lsi2", sk: "lsi2sk", projection: "withoutMetadata", key: esProjKey },
+    keysLsi: { index: "lsi3", sk: "lsi3sk", projection: "keys", key: esProjKey },
+    allGsi: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", key: esProjKey },
+    slimGsi: {
+      type: "gsi",
+      index: "gsi2",
+      pk: "gsi2pk",
+      sk: "gsi2sk",
+      projection: "withoutMetadata",
+      key: esProjKey,
+    },
+    keysGsi: {
+      type: "gsi",
+      index: "gsi3",
+      pk: "gsi3pk",
+      sk: "gsi3sk",
+      projection: "keys",
+      key: esProjKey,
+    },
+  },
+})
+
+/**
+ * Drift: a stream declaring narrow projections on a table whose indexes were
+ * deployed narrower still — `withoutMetadata` deployed `INCLUDE ["__edd_e__"]`,
+ * `keys` deployed `KEYS_ONLY`.
+ */
+const EsProjDrift = EventStore.makeStream({
+  table: EsProjTable,
+  streamName: "Drift",
+  events: [EsProjPosted],
+  streamId: { composite: ["ledgerId"] },
+  metadata: EsProjMetadata,
+  indexes: {
+    slimLsi: { index: "lsi1", sk: "lsi1sk", projection: "withoutMetadata", key: esProjKey },
+    keysLsi: { index: "lsi2", sk: "lsi2sk", projection: "keys", key: esProjKey },
+    slimGsi: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      projection: "withoutMetadata",
+      key: esProjKey,
+    },
+    keysGsi: {
+      type: "gsi",
+      index: "gsi2",
+      pk: "gsi2pk",
+      sk: "gsi2sk",
+      projection: "keys",
+      key: esProjKey,
+    },
+  },
+})
+
+/** Every `query` / `batchGetItem` this suite sends: proves how each mode reads. */
+const esProjCalls = { query: 0, batchGetKeys: [] as Array<number> }
+
+const EsProjClientLayer = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      query: (input) => {
+        esProjCalls.query++
+        return client.query(input)
+      },
+      batchGetItem: (input) => {
+        esProjCalls.batchGetKeys.push(
+          Object.values(input.RequestItems ?? {}).reduce(
+            (sum, request) => sum + (request.Keys?.length ?? 0),
+            0,
+          ),
+        )
+        return client.batchGetItem(input)
+      },
+    }),
+  ),
+).pipe(Layer.provide(ClientLayer))
+
+const esProjResetCalls = () => {
+  esProjCalls.query = 0
+  esProjCalls.batchGetKeys = []
+}
+
+const EsProjLayer = Layer.mergeAll(EsProjClientLayer, EsProjTable.layer({ name: esProjTableName }))
+const provideEsProj = Effect.provide(EsProjLayer)
+const provideEsProjDrift = Effect.provide(
+  Layer.mergeAll(EsProjClientLayer, EsProjTable.layer({ name: esProjDriftTableName })),
+)
+
+/** Every item of one physical index for a stream partition, raw (no filter). */
+const esProjRawIndex = (tableName: string, index: string, pkField: string, pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: tableName,
+      IndexName: index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": pkField },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+/** Append `events` with one `{ eventId: "ev-<section>-<item>" }` entry each. */
+const esProjAppend = (
+  stream: typeof EsProjLedger | typeof EsProjDrift,
+  ledgerId: string,
+  events: ReadonlyArray<EsProjPosted>,
+  expectedVersion: number,
+) =>
+  stream.append({ ledgerId }, events, expectedVersion, {
+    eventMetadata: events.map((event) => ({ eventId: `ev-${event.section}-${event.item}` })),
+  })
+
+const esProjNames = ["allLsi", "slimLsi", "keysLsi", "allGsi", "slimGsi", "keysGsi"] as const
+
+describeConnected("EventStore stream index projection (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const tableKey = {
+          BillingMode: "PAY_PER_REQUEST" as const,
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" as const },
+            { AttributeName: "sk", KeyType: "RANGE" as const },
+          ],
+        }
+        const tableKeyAttributes = [
+          { AttributeName: "pk", AttributeType: "S" as const },
+          { AttributeName: "sk", AttributeType: "S" as const },
+        ]
+
+        // The projected table: exactly what indexDefinitions emits.
+        const fragments = EventStore.indexDefinitions(EsProjLedger)
+        yield* client.createTable({
+          TableName: esProjTableName,
+          ...tableKey,
+          AttributeDefinitions: [...tableKeyAttributes, ...fragments.AttributeDefinitions],
+          LocalSecondaryIndexes: fragments.LocalSecondaryIndexes,
+          GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+        })
+
+        // The drift table: the same keys, each index deployed narrower than declared.
+        const drift = EventStore.indexDefinitions(EsProjDrift)
+        const deployed: Record<string, Projection> = {
+          lsi1: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] },
+          lsi2: { ProjectionType: "KEYS_ONLY" },
+          gsi1: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] },
+          gsi2: { ProjectionType: "KEYS_ONLY" },
+        }
+        yield* client.createTable({
+          TableName: esProjDriftTableName,
+          ...tableKey,
+          AttributeDefinitions: [...tableKeyAttributes, ...drift.AttributeDefinitions],
+          LocalSecondaryIndexes: (drift.LocalSecondaryIndexes ?? []).map((index) => ({
+            ...index,
+            Projection: deployed[index.IndexName!],
+          })),
+          GlobalSecondaryIndexes: (drift.GlobalSecondaryIndexes ?? []).map((index) => ({
+            ...index,
+            Projection: deployed[index.IndexName!],
+          })),
+        })
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        for (const TableName of [esProjTableName, esProjDriftTableName]) {
+          yield* client
+            .deleteTable({ TableName })
+            .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+        }
+      }).pipe(Effect.provide(ClientLayer), Effect.scoped),
+    )
+  }, 15000)
+
+  it.effect("#144 DescribeTable shows the Projection indexDefinitions emits for each mode", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: esProjTableName })
+      const projections = Object.fromEntries(
+        [
+          ...(described.Table?.LocalSecondaryIndexes ?? []),
+          ...(described.Table?.GlobalSecondaryIndexes ?? []),
+        ].map((index) => [
+          index.IndexName,
+          {
+            type: index.Projection?.ProjectionType,
+            attributes: [...(index.Projection?.NonKeyAttributes ?? [])].sort(),
+          },
+        ]),
+      )
+      const withoutMetadata = ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"]
+      expect(projections).toEqual({
+        lsi1: { type: "ALL", attributes: [] },
+        lsi2: { type: "INCLUDE", attributes: withoutMetadata },
+        lsi3: { type: "INCLUDE", attributes: ["__edd_e__"] },
+        gsi1: { type: "ALL", attributes: [] },
+        gsi2: { type: "INCLUDE", attributes: withoutMetadata },
+        gsi3: { type: "INCLUDE", attributes: ["__edd_e__"] },
+      })
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 each physical index holds only what its projection declares", () =>
+    Effect.gen(function* () {
+      const ledgerId = "raw-1"
+      yield* esProjAppend(EsProjLedger, ledgerId, [new EsProjPosted({ section: 1, item: 1 })], 0)
+      const pk = "$es-proj#v1#ledger#raw-1"
+      const keysOf = (index: string, pkField: string) =>
+        esProjRawIndex(esProjTableName, index, pkField, pk).pipe(
+          Effect.map((items) => items.map((item) => Object.keys(item).sort())),
+        )
+      const envelope = ["__edd_e__", "data", "eventType", "pk", "sk", "streamId", "timestamp"]
+
+      // "all": everything, metadata included.
+      const all = yield* keysOf("lsi1", "pk")
+      expect(all[0]).toContain("metadata")
+      // "withoutMetadata": the envelope and the keys, no metadata.
+      for (const [index, pkField, sk] of [
+        ["lsi2", "pk", "lsi2sk"],
+        ["gsi2", "gsi2pk", "gsi2sk"],
+      ] as const) {
+        const slim = yield* keysOf(index, pkField)
+        expect(slim).toEqual([
+          [...envelope, "version", sk, ...(pkField === "pk" ? [] : [pkField])].sort(),
+        ])
+      }
+      // "keys": the table key, the index key and __edd_e__ — no event attributes.
+      expect(yield* keysOf("lsi3", "pk")).toEqual([["__edd_e__", "lsi3sk", "pk", "sk"]])
+      expect(yield* keysOf("gsi3", "gsi3pk")).toEqual([
+        ["__edd_e__", "gsi3pk", "gsi3sk", "pk", "sk"],
+      ])
+    }).pipe(provideEsProj),
+  )
+
+  it.effect(
+    "#144 readIndex and query.index: withoutMetadata drops metadata, keys returns full events",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "modes-1" }
+        // Appended out of key order, so index order differs from stream order.
+        const events = [
+          new EsProjPosted({ section: 2, item: 1 }),
+          new EsProjPosted({ section: 1, item: 2 }),
+          new EsProjPosted({ section: 1, item: 1 }),
+          new EsProjPosted({ section: 3, item: 1 }),
+        ]
+        yield* esProjAppend(EsProjLedger, key.ledgerId, events, 0)
+
+        const full = (yield* EsProjLedger.read(key, { consistentRead: true })).filter(
+          (event) => event.version > 0,
+        )
+        // Index order: 1-1 (v3), 1-2 (v2), 2-1 (v1), 3-1 (v4).
+        const expected = [3, 2, 1, 4].map((version) => full[version - 1]!)
+        expect(expected.map((event) => event.metadata)).toEqual([
+          { eventId: "ev-1-1" },
+          { eventId: "ev-1-2" },
+          { eventId: "ev-2-1" },
+          { eventId: "ev-3-1" },
+        ])
+        const withoutMetadata = expected.map(({ metadata: _, ...event }) => event)
+
+        for (const name of esProjNames) {
+          esProjResetCalls()
+          const read = yield* EsProjLedger.readIndex(name, key)
+          const queried = yield* EsProjLedger.query.index(name, key).pipe(Query.collect)
+          if (name === "slimLsi" || name === "slimGsi") {
+            for (const result of [read, queried]) {
+              expect(result.map((event) => event.metadata)).toEqual([
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+              ])
+              expect(result.map(({ metadata: _, ...event }) => event)).toEqual(withoutMetadata)
+            }
+            // One query each, nothing fetched.
+            expect(esProjCalls.query).toBe(2)
+            expect(esProjCalls.batchGetKeys).toEqual([])
+          } else {
+            expect(read).toEqual(expected)
+            expect(queried).toEqual(expected)
+            // Only a "keys" GSI fetches; an LSI has DynamoDB fetch.
+            expect(esProjCalls.batchGetKeys).toEqual(name === "keysGsi" ? [4, 4] : [])
+          }
+        }
+
+        // The type follows the projection: metadata is undefined on a slim index.
+        const slim = yield* EsProjLedger.readIndex("slimGsi", key)
+        const slimMetadata: undefined = slim[0]!.metadata
+        expect(slimMetadata).toBeUndefined()
+        const keys = yield* EsProjLedger.readIndex("keysGsi", key)
+        const keysMetadata: { readonly eventId: string } | undefined = keys[0]!.metadata
+        expect(keysMetadata).toEqual({ eventId: "ev-1-1" })
+
+        // A bound stream reads the same way.
+        const bound = yield* EventStore.bind(EsProjLedger)
+        expect(yield* bound.readIndex("keysGsi", key)).toEqual(expected)
+        expect(
+          (yield* bound.readIndex("slimLsi", key)).map(({ metadata: _, ...event }) => event),
+        ).toEqual(withoutMetadata)
+      }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 beginsWith, between, reverse, limit, cursor and count in every mode", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "range-1" }
+      const events = [1, 2, 3].flatMap((section) =>
+        [1, 2, 3].map((item) => new EsProjPosted({ section, item })),
+      )
+      yield* esProjAppend(EsProjLedger, key.ledgerId, events, 0)
+      const versionsOf = (read: ReadonlyArray<{ readonly version: number }>) =>
+        read.map((event) => event.version)
+
+      for (const name of esProjNames) {
+        const section2 = yield* EsProjLedger.readIndex(name, key, { beginsWith: "E#2-" })
+        expect(versionsOf(section2), name).toEqual([4, 5, 6])
+        expect(
+          section2.map((event) => event.data),
+          name,
+        ).toEqual(events.slice(3, 6))
+
+        const between = yield* EsProjLedger.readIndex(name, key, {
+          between: ["E#1-0002", "E#2-0002~"],
+        })
+        expect(versionsOf(between), name).toEqual([2, 3, 4, 5])
+
+        const newestTwo = yield* EsProjLedger.readIndex(name, key, { reverse: true, limit: 2 })
+        expect(versionsOf(newestTwo), name).toEqual([9, 8])
+        expect(
+          newestTwo.map((event) => event.metadata),
+          name,
+        ).toEqual(
+          name.startsWith("slim")
+            ? [undefined, undefined]
+            : [{ eventId: "ev-3-3" }, { eventId: "ev-3-2" }],
+        )
+
+        // The composable Query, with a cursor across pages.
+        const query = EsProjLedger.query
+          .index(name, key)
+          .pipe(Query.where({ beginsWith: "E#3-" }), Query.limit(2))
+        const first = yield* Query.execute(query)
+        expect(versionsOf(first.items), name).toEqual([7, 8])
+        expect(first.cursor, name).not.toBeNull()
+        const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+        expect(versionsOf(second.items), name).toEqual([9])
+
+        const pages = yield* Query.paginate(
+          EsProjLedger.query.index(name, key).pipe(Query.reverse),
+        ).pipe(Effect.flatMap((stream) => Stream.runCollect(stream)))
+        expect(versionsOf(pages.flat()), name).toEqual([9, 8, 7, 6, 5, 4, 3, 2, 1])
+
+        esProjResetCalls()
+        const count = yield* EsProjLedger.query.index(name, key).pipe(Query.count)
+        expect(count, name).toBe(9)
+        expect(esProjCalls.batchGetKeys, name).toEqual([])
+      }
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 select on a keys index returns the selected event attributes", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "select-1" }
+      yield* esProjAppend(
+        EsProjLedger,
+        key.ledgerId,
+        [new EsProjPosted({ section: 1, item: 2 }), new EsProjPosted({ section: 1, item: 1 })],
+        0,
+      )
+      for (const name of ["keysLsi", "keysGsi"] as const) {
+        const rows = yield* EsProjLedger.query
+          .index(name, key)
+          .pipe(Query.select(["version", "metadata"]), Query.collect)
+        expect(rows, name).toEqual([
+          { version: 2, metadata: { eventId: "ev-1-1" } },
+          { version: 1, metadata: { eventId: "ev-1-2" } },
+        ])
+      }
+    }).pipe(provideEsProj),
+  )
+
+  it.effect("#144 a keys GSI read over 100 events fetches in BatchGetItem chunks of 100", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "many-1" }
+      // Three appends of 50 (one transaction each), keyed in reverse of stream order.
+      const events = Array.from(
+        { length: 150 },
+        (_, i) => new EsProjPosted({ section: 1, item: 150 - i }),
+      )
+      for (const start of [0, 50, 100]) {
+        yield* esProjAppend(EsProjLedger, key.ledgerId, events.slice(start, start + 50), start)
+      }
+
+      esProjResetCalls()
+      const read = yield* EsProjLedger.readIndex("keysGsi", key)
+      expect(esProjCalls.batchGetKeys).toEqual([100, 50])
+      expect(read.map((event) => event.version)).toEqual(
+        Array.from({ length: 150 }, (_, i) => 150 - i),
+      )
+      expect(read.map((event) => event.metadata)).toEqual(
+        Array.from({ length: 150 }, (_, i) => ({ eventId: `ev-1-${i + 1}` })),
+      )
+      // The same events as the "all" GSI, attribute for attribute.
+      expect(read).toEqual(yield* EsProjLedger.readIndex("allGsi", key))
+
+      // A limit fetches only its window.
+      esProjResetCalls()
+      const limited = yield* EsProjLedger.readIndex("keysGsi", key, { limit: 3 })
+      expect(limited.map((event) => event.version)).toEqual([150, 149, 148])
+      expect(esProjCalls.batchGetKeys).toEqual([3])
+    }).pipe(provideEsProj),
+  )
+
+  it("#144 streams that share a physical index with different projections are refused", () => {
+    const Other = EventStore.makeStream({
+      table: EsProjTable,
+      streamName: "Other",
+      events: [EsProjPosted],
+      streamId: { composite: ["ledgerId"] },
+      indexes: { slimLsi: { index: "lsi2", sk: "lsi2sk", key: esProjKey } },
+    })
+    expect(() => EventStore.indexDefinitions(EsProjLedger, Other)).toThrow(/EDD-9067/)
+    expect(() => EventStore.indexDefinitions(EsProjLedger, Other)).toThrow(
+      /projection "withoutMetadata".*projection "all"/,
+    )
+    // The same projection on the shared index is accepted.
+    const Same = EventStore.makeStream({
+      table: EsProjTable,
+      streamName: "Same",
+      events: [EsProjPosted],
+      streamId: { composite: ["ledgerId"] },
+      indexes: {
+        slimLsi: { index: "lsi2", sk: "lsi2sk", projection: "withoutMetadata", key: esProjKey },
+      },
+    })
+    expect(EventStore.indexDefinitions(EsProjLedger, Same)).toEqual(
+      EventStore.indexDefinitions(EsProjLedger),
+    )
+  })
+
+  it.effect(
+    "#144 drift: withoutMetadata deployed as INCLUDE [__edd_e__] is diagnosed on the read",
+    () =>
+      Effect.gen(function* () {
+        const key = { ledgerId: "drift-slim-1" }
+        yield* esProjAppend(
+          EsProjDrift,
+          key.ledgerId,
+          [new EsProjPosted({ section: 1, item: 1 })],
+          0,
+        )
+        for (const [name, physical] of [
+          ["slimLsi", "lsi1"],
+          ["slimGsi", "gsi1"],
+        ] as const) {
+          const error = (yield* EsProjDrift.readIndex(name, key).pipe(
+            Effect.flip,
+          )) as ValidationError
+          expect(error._tag, name).toBe("ValidationError")
+          expect(error.operation, name).toBe("EventStore.index.decode")
+          const cause = error.cause as Error
+          expect(cause.message).toContain(`Stream index "${name}" (physical "${physical}")`)
+          expect(cause.message).toContain('projection: "withoutMetadata"')
+          expect(cause.message).toContain("the deployed index likely projects less than declared")
+          // The original decode failure is kept.
+          expect((cause.cause as ValidationError).operation).toBe("EventStore.decode")
+        }
+      }).pipe(provideEsProjDrift),
+  )
+
+  it.effect("#144 drift: keys deployed KEYS_ONLY passes DynamoDB's filter rejection through", () =>
+    Effect.gen(function* () {
+      const key = { ledgerId: "drift-keys-1" }
+      yield* esProjAppend(EsProjDrift, key.ledgerId, [new EsProjPosted({ section: 1, item: 1 })], 0)
+      for (const [name, physical] of [
+        ["keysLsi", "lsi2"],
+        ["keysGsi", "gsi2"],
+      ] as const) {
+        // DynamoDB refuses the ownership filter on an index that does not
+        // project __edd_e__, even on an LSI read with Select ALL_ATTRIBUTES.
+        // Its message already names the index and the attribute; the library
+        // does not rewrite it.
+        for (const read of [
+          EsProjDrift.readIndex(name, key),
+          EsProjDrift.query.index(name, key).pipe(Query.collect),
+        ]) {
+          const error = yield* read.pipe(Effect.flip)
+          expect(error._tag, name).toBe("DynamoValidationError")
+          expect(String((error as { readonly cause?: unknown }).cause), name).toContain(
+            `Secondary index ${physical} does not project one or more filter attributes: [__edd_e__]`,
+          )
+        }
+      }
+    }).pipe(provideEsProjDrift),
+  )
 })
 
 // ===========================================================================
@@ -18108,7 +19753,7 @@ describeConnected("#133 — path operations on index composites and unique field
 
   // ---- a condition too large to share with the library's guard ----
 
-  it.effect("a pathological .condition() is refused before writing, naming its size", () =>
+  it.effect("a pathological .condition() is DynamoDB's rejection, named with its size", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
       const huge = (t: any, { or, eq }: any) =>
@@ -18344,38 +19989,44 @@ describeConnected("#133 — path operations on index composites and unique field
 
   // ---- operator counting against DynamoDB's own ----
 
-  it.effect("a condition at DynamoDB's operator limit is sent; one over is refused first", () =>
-    Effect.gen(function* () {
-      const db = yield* g133Client
-      const counters = db.entities.Counters as any
-      yield* counters.put({ id: "ops", owner: "o", label: "l0" })
-      // The plain update adds `AND attribute_exists(#exists)`: 2 operators.
-      const equals =
-        (k: number) =>
-        (t: any, { or, eq }: any) =>
-          or(...Array.from({ length: k }, (_, i) => eq(t.label, i === 0 ? "l0" : `x${i}`)))
-      const betweens =
-        (k: number) =>
-        (t: any, { or, between }: any) =>
-          or(...Array.from({ length: k }, (_, i) => between(t.label, i === 0 ? "a" : `x${i}`, "z")))
-      // 149 comparisons → 149 + 148 OR + 2 = 299: within the limit.
-      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(equals(149))
-      // BETWEEN's own AND is part of it: 101 BETWEEN → 101 + 100 OR + 2 = 203,
-      // sent and accepted (counting that AND would make it 304, refused).
-      yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(betweens(101))
-      // 150 comparisons → 301: refused before anything is sent.
-      for (const cond of [equals(150)]) {
-        const error = yield* counters
-          .update({ id: "ops" })
-          .set({ label: "changed" })
-          .condition(cond)
-          .asEffect()
-          .pipe(Effect.flip)
-        expect(error._tag).toBe("ValidationError")
-        expect(String(error.cause)).toContain("301 operators")
-      }
-      expect((yield* rawItem("G133Counter", "ops")).label).toEqual({ S: "l0" })
-    }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  it.effect(
+    "a condition at DynamoDB's operator limit is accepted; one over is rejected and named",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* g133Client
+        const counters = db.entities.Counters as any
+        yield* counters.put({ id: "ops", owner: "o", label: "l0" })
+        // The plain update adds `AND attribute_exists(#exists)`: 2 operators.
+        const equals =
+          (k: number) =>
+          (t: any, { or, eq }: any) =>
+            or(...Array.from({ length: k }, (_, i) => eq(t.label, i === 0 ? "l0" : `x${i}`)))
+        const betweens =
+          (k: number) =>
+          (t: any, { or, between }: any) =>
+            or(
+              ...Array.from({ length: k }, (_, i) =>
+                between(t.label, i === 0 ? "a" : `x${i}`, "z"),
+              ),
+            )
+        // 149 comparisons → 149 + 148 OR + 2 = 299: within the limit.
+        yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(equals(149))
+        // BETWEEN's own AND is part of it: 101 BETWEEN → 101 + 100 OR + 2 = 203,
+        // sent and accepted (counting that AND would make it 304, rejected).
+        yield* counters.update({ id: "ops" }).set({ label: "l0" }).condition(betweens(101))
+        // 150 comparisons → 301: sent, rejected by DynamoDB, and named (#144).
+        for (const cond of [equals(150)]) {
+          const error = yield* counters
+            .update({ id: "ops" })
+            .set({ label: "changed" })
+            .condition(cond)
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String(error.cause)).toContain("301 operators")
+        }
+        expect((yield* rawItem("G133Counter", "ops")).label).toEqual({ S: "l0" })
+      }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
   // ---- upsert of a unique-constrained entity: guarded read-then-write ----
@@ -18530,6 +20181,60 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(reordered._tag).toBe("ValidationError")
       expect((yield* rawItem("G133DevicePlain", "tx2")).label).toEqual({ S: "b" })
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+
+  it.effect(
+    "Batch.write's versioned-put chunk at exactly 4,194,304 bytes is accepted (#144)",
+    () => {
+      // Every TransactWriteItems the batch sends, as sent.
+      const sent: Array<ReadonlyArray<TransactWriteItem>> = []
+      const recording = Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const real = yield* DynamoClient
+          return {
+            ...real,
+            transactWriteItems: (input) => {
+              sent.push(input.TransactItems ?? [])
+              return real.transactWriteItems(input)
+            },
+          } satisfies DynamoClientService
+        }),
+      ).pipe(Layer.provide(ClientLayer))
+      const layer = Layer.mergeAll(recording, G133Table.layer({ name: g133Tables.record }))
+      const devices = g133Entities.DevicesPlain
+      return Effect.gen(function* () {
+        // One put's size with a one-byte label (and a same-length id), from the request itself.
+        yield* Batch.write([devices.put({ id: "bz00", owner: "o", label: "x" } as any)])
+        const base = transactItemBytes(sent[0]![0]!) - 1
+        sent.length = 0
+
+        /** Eleven puts (same-length ids, fresh per round) totalling `total` bytes. */
+        const puts = (round: string, total: number) => {
+          const each = Math.floor(total / 11)
+          const sizes = [...Array.from({ length: 10 }, () => each), total - each * 10]
+          return sizes.map((size, i) =>
+            devices.put({
+              id: `b${round}${String(i).padStart(2, "0")}`,
+              owner: "o",
+              label: "x".repeat(size - base),
+            } as any),
+          )
+        }
+
+        // Exactly DynamoDB's limit: one transaction, and DynamoDB accepts it.
+        yield* Batch.write(puts("a", TRANSACT_WRITE_MAX_BYTES))
+        expect(sent.map((chunk) => chunk.length)).toEqual([11])
+        expect(transactionBytes(sent[0]!)).toBe(4_194_304)
+        expect((yield* rawItem("G133DevicePlain", "ba10")).version).toEqual({ N: "1" })
+        sent.length = 0
+
+        // One byte more: the crossing put goes in a second transaction.
+        yield* Batch.write(puts("c", TRANSACT_WRITE_MAX_BYTES + 1))
+        expect(sent.map((chunk) => chunk.length)).toEqual([10, 1])
+        expect((yield* rawItem("G133DevicePlain", "bc10")).version).toEqual({ N: "1" })
+      }).pipe(Effect.provide(layer), g133Closed)
+    },
   )
 
   it.effect(".remove() of a defaulted index composite re-materialises its default", () =>
@@ -18776,7 +20481,7 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
-  it.effect("transactWrite refuses two ops on one item, including swapped unique values", () =>
+  it.effect("transactWrite names DynamoDB's rejection of two ops on one item, swaps included", () =>
     Effect.gen(function* () {
       const db = yield* g133Client
       const bare = db.entities.AccountsBare as any
@@ -18788,7 +20493,7 @@ describeConnected("#133 — path operations on index composites and unique field
         g133Entities.AccountsBare.put({ id: "sw1", email: "sw2@x.io", name: "a" } as any),
         g133Entities.AccountsBare.put({ id: "sw2", email: "sw1@x.io", name: "b" } as any),
       ]).pipe(Effect.flip)
-      // Refused before anything is sent, naming the entity.
+      // Sent, rejected whole by DynamoDB, and named (#144).
       expect(swapped._tag).toBe("ValidationError")
       expect((swapped as ValidationError).entityType).toBe("G133AccountBare")
       expect(String(swapped.cause)).toContain("touches one item more than once")
@@ -18801,7 +20506,7 @@ describeConnected("#133 — path operations on index composites and unique field
       expect(twice._tag).toBe("ValidationError")
       expect(String(twice.cause)).toContain("touches one item more than once")
 
-      // Two puts of one versioned retain item: refused too — not judged a lost
+      // Two puts of one versioned retain item: named too — never judged a lost
       // race, retried and reported as `OptimisticLockError`.
       const retained = db.entities.DevicesRetained as any
       yield* retained.put({ id: "sw3", owner: "o", label: "v1" })
@@ -18828,7 +20533,7 @@ describeConnected("#133 — path operations on index composites and unique field
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
   )
 
-  it.effect("a transaction over 4 MB is refused before it is sent", () =>
+  it.effect("a transaction over 4 MB is DynamoDB's rejection, named", () =>
     Effect.gen(function* () {
       // Six 380 KB retain puts: 2.3 MB of items, 4.6 MB with their snapshots.
       const big = "x".repeat(380_000)
@@ -19384,7 +21089,8 @@ describeConnected("#133 — path operations on index composites and unique field
         expect(ids(yield* q().filter(noSecret).collect())).toEqual([["a1", "a2"], []])
         // A field no member has matches nothing.
         expect(ids(yield* q().filter({ nope: "x" }).collect())).toEqual([[], []])
-        // A GSI is read only eventually consistently: refused before sending.
+        // A GSI is read only eventually consistently: DynamoDB rejects the
+        // consistent read, and the rejection is named (#144).
         expect((yield* q().consistentRead().collect().pipe(Effect.flip))._tag).toBe(
           "ValidationError",
         )
@@ -19549,7 +21255,6 @@ describeConnected("#133 — path operations on index composites and unique field
         (t: any, { or, eq, and }: any) => or(eq(t.label, "first"), and()),
         (_: any, { not, and }: any) => not(and()),
         (_: any, { or }: any) => or(),
-        (t: any, { isIn }: any) => isIn(t.label, []),
       ]
       yield* devices.put({ id: "ep-1", owner: "ep", label: "first" })
       for (const cond of refused) {
@@ -19570,6 +21275,20 @@ describeConnected("#133 — path operations on index composites and unique field
         const filtered = yield* devices.scan().filter(cond).collect().pipe(Effect.flip)
         expect(filtered._tag).toBe("ValidationError")
       }
+      // An isIn() with no values is sent (#144): DynamoDB rejects its `IN ()`,
+      // and the rejection is named — on the bound put and in a filter.
+      const emptyIn = (t: any, { isIn }: any) => isIn(t.label, [])
+      const put = yield* devices
+        .put({ id: "ep-2", owner: "ep", label: "x" })
+        .condition(emptyIn)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(put._tag).toBe("ValidationError")
+      expect(String(put.cause)).toContain('isIn() on "label" in its condition has no values')
+      expect(yield* rawItem("G133DevicePlain", "ep-2")).toBeUndefined()
+      const scanned = yield* devices.scan().filter(emptyIn).collect().pipe(Effect.flip)
+      expect(scanned._tag).toBe("ValidationError")
+      expect(scanned.operation).toBe("query.filter")
       // Directly under and, or as the whole filter, an empty part is none.
       const kept = (t: any, { and, eq }: any) => and(eq(t.owner, "ep"), and())
       expect((yield* devices.scan().filter(kept).collect()).map((d: any) => d.id)).toEqual(["ep-1"])
@@ -19998,5 +21717,931 @@ describeConnected("#133 — path operations on index composites and unique field
         expect((yield* rawItem(entityType, id)).label).toEqual({ S: "mine" })
       }
     }).pipe(Effect.provide(g133RaceLayer), g133Closed),
+  )
+})
+
+// ===========================================================================
+// Write limits diagnosed from DynamoDB's rejection (#144 §6) — one real
+// rejection per shape, pinning DynamoDB Local's wording.
+// ===========================================================================
+
+const limSchema = DynamoSchema.make({ name: "lim", version: 1 })
+const limTableName = `lim-${Date.now()}`
+
+class LimDoc extends Schema.Class<LimDoc>("LimDoc")({
+  docId: Schema.String,
+  tag: Schema.String,
+  body: Schema.String,
+  extra: Schema.optional(Schema.String),
+}) {}
+
+const LimDocs = Entity.make({
+  model: LimDoc,
+  entityType: "LimDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  indexes: {
+    byTag: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: [] },
+      sk: { field: "gsi1sk", composite: ["tag"] },
+    },
+  },
+})
+
+const LimRetainDocs = Entity.make({
+  model: LimDoc,
+  entityType: "LimRetainDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  versioned: { retain: true },
+})
+
+/** A table sort key composed from a model field: long enough, over 1024 bytes. */
+const LimLongSks = Entity.make({
+  model: LimDoc,
+  entityType: "LimLongSk",
+  primaryKey: {
+    pk: { field: "pk", composite: ["docId"] },
+    sk: { field: "sk", composite: ["tag"] },
+  },
+})
+
+/** A versioned entity: `Batch.write` sends its puts as create-only transactions. */
+const LimVersionedDocs = Entity.make({
+  model: LimDoc,
+  entityType: "LimVersionedDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  versioned: true,
+})
+
+/** An index partition key composed from a model field: long enough, over 2048 bytes. */
+const LimGsiPks = Entity.make({
+  model: LimDoc,
+  entityType: "LimGsiPk",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  indexes: {
+    byTagPk: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tag"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+
+const LimTable = Table.make({
+  schema: limSchema,
+  entities: { LimDocs, LimRetainDocs, LimLongSks, LimVersionedDocs, LimGsiPks },
+})
+const provideLim = Effect.provide(
+  Layer.mergeAll(ClientLayer, LimTable.layer({ name: limTableName })),
+)
+
+describeConnected("write limits diagnosed from DynamoDB's rejection (#144)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: limTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            { AttributeName: "gsi1pk", AttributeType: "S" },
+            { AttributeName: "gsi1sk", AttributeType: "S" },
+          ],
+          GlobalSecondaryIndexes: [
+            {
+              IndexName: "gsi1",
+              KeySchema: [
+                { AttributeName: "gsi1pk", KeyType: "HASH" },
+                { AttributeName: "gsi1sk", KeyType: "RANGE" },
+              ],
+              Projection: { ProjectionType: "ALL" },
+            },
+          ],
+        })
+      }).pipe(provideLim, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: limTableName })
+      }).pipe(
+        provideLim,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  const big = (n: number) => "x".repeat(n)
+  const absent = (docId: string) =>
+    LimDocs.get({ docId })
+      .asEffect()
+      .pipe(
+        Effect.as(false),
+        Effect.catchTag("ItemNotFound", () => Effect.succeed(true)),
+      )
+
+  it.effect("#1 a put over 400 KB is a ValidationError naming entity and key", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "big-put", tag: "t", body: big(410_000) })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.entityType).toBe("LimDoc")
+      expect(String(failure.cause)).toContain("the item of the LimDoc put, at pk=$lim#v1#limdoc#")
+      expect(yield* absent("big-put")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#2 an update growing the item past 400 KB is a ValidationError", () =>
+    Effect.gen(function* () {
+      yield* LimDocs.put({ docId: "grow", tag: "t", body: big(300_000) }).asEffect()
+      const error = yield* LimDocs.update({ docId: "grow" })
+        .pipe(Entity.set({ extra: big(150_000) }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of the LimDoc update, at pk=$lim#v1#limdoc#",
+      )
+      const stored = yield* LimDocs.get({ docId: "grow" }).asEffect()
+      expect(stored.extra).toBeUndefined()
+    }).pipe(provideLim),
+  )
+
+  it.effect("#3 transactWrite with one oversized Put names that operation", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "tx-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: "tx-big", tag: "t", body: big(410_000) }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of operation 1 (LimDoc), at pk=",
+      )
+      expect(yield* absent("tx-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#4 an entity transaction whose Update grows too large is named by index", () =>
+    Effect.gen(function* () {
+      yield* LimRetainDocs.put({ docId: "retain-grow", tag: "t", body: big(300_000) }).asEffect()
+      const error = yield* LimRetainDocs.update({ docId: "retain-grow" })
+        .pipe(Entity.set({ extra: big(150_000) }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).entityType).toBe("LimRetainDoc")
+      expect(String((error as ValidationError).cause)).toContain("at pk=$lim#v1#limretaindoc#")
+      const stored = yield* LimRetainDocs.get({ docId: "retain-grow" }).asEffect()
+      expect(stored.extra).toBeUndefined()
+    }).pipe(provideLim),
+  )
+
+  it.effect("#5 Batch.write with an oversized item names the item", () =>
+    Effect.gen(function* () {
+      const error = yield* Batch.write([
+        LimDocs.put({ docId: "batch-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: "batch-big", tag: "t", body: big(410_000) }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "the item of the put of LimDoc, at pk=$lim#v1#limdoc#",
+      )
+      expect(yield* absent("batch-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#6 transactWrite of 101 items is DynamoDB's rejection, confirmed by count", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite(
+        Array.from({ length: 101 }, (_, i) =>
+          LimDocs.put({ docId: `tx101-${i}`, tag: "t", body: "s" }),
+        ),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      const text = String((error as { cause: unknown }).cause)
+      expect(text).toContain("101 operation(s) expanded to 101 items")
+      expect(yield* absent("tx101-0")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#7 transactWrite over 4 MB names the largest items", () =>
+    Effect.gen(function* () {
+      // 12 items of ~380 KB: ~4.5 MB, each within 400 KB.
+      const error = yield* Transaction.transactWrite(
+        Array.from({ length: 12 }, (_, i) =>
+          LimDocs.put({ docId: `tx4mb-${i}`, tag: "t", body: big(380_000) }),
+        ),
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const failure = error as ValidationError
+      expect(failure.operation).toBe("transactWrite")
+      expect(failure.entityType).toBe("LimDoc")
+      const text = String(failure.cause)
+      expect(text).toContain("4194304 bytes (4 MB)")
+      expect(text).toMatch(/\(it reported \d+ bytes\)/)
+      expect(text).toMatch(/The largest: operation \d+ \(LimDoc\), at pk=\$lim#v1#limdoc#/)
+      expect(yield* absent("tx4mb-0")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#8 a sort key over 1024 bytes names the attribute", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "long-key", tag: "k".repeat(1100), body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('the sort key "gsi1sk" of the LimDoc put')
+      expect(text).toContain("1024-byte limit")
+      expect(yield* absent("long-key")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // Request rules DynamoDB enforces (#144 §6A): sent as built, rejected by
+  // DynamoDB, recognised, confirmed against the request, and named.
+  // -------------------------------------------------------------------------
+
+  it.effect("#9 a table sort key over 1024 bytes: DynamoDB Local's own wording, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimLongSks.put({ docId: "long-sk", tag: "k".repeat(1100), body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('the sort key "sk" of the LimLongSk put')
+      expect(text).toContain("1024-byte limit")
+    }).pipe(provideLim),
+  )
+
+  it.effect("#10 transactWrite touching one item twice: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "rep-1", tag: "t", body: "a" }),
+        LimDocs.delete({ docId: "rep-1" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain(
+        "touches one item more than once — operation 0 (LimDoc) and operation 1 (LimDoc)",
+      )
+      expect(text).toContain("Nothing was written.")
+      expect(yield* absent("rep-1")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#11 a repeat DynamoDB reports as a conditional failure is still named a repeat", () =>
+    Effect.gen(function* () {
+      // DynamoDB applies the put, then the check fails against it: the
+      // request comes back as `[None, ConditionalCheckFailed]` — what a
+      // caller's failed condition (or a lost race) looks like.
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "rep-2", tag: "t", body: "a" }),
+        Transaction.check(
+          LimDocs.get({ docId: "rep-2" }),
+          Expression.condition({ attributeNotExists: "pk" }),
+        ),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain("touches one item more than once")
+      expect(yield* absent("rep-2")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#12 transactGet reading one item twice: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactGet([
+        LimDocs.get({ docId: "rep-3" }),
+        LimDocs.get({ docId: "rep-3" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      expect(String((error as { cause: unknown }).cause)).toContain(
+        "TransactGetItems reads one item more than once",
+      )
+    }).pipe(provideLim),
+  )
+
+  it.effect("#13 Batch.write naming one item twice in a request: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* Batch.write([
+        LimDocs.put({ docId: "rep-4", tag: "t", body: "a" }),
+        LimDocs.delete({ docId: "rep-4" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain("the batch request touches one item more than once")
+      expect(text).toContain("the put of LimDoc and the delete of LimDoc")
+      expect(yield* absent("rep-4")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#14 a condition over 300 operators: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "ops", tag: "t", body: "b" })
+        .pipe(
+          LimDocs.condition((t: any, { or, eq }: any) =>
+            or(...Array.from({ length: 160 }, (_, i) => eq(t.body, `v${i}`))),
+          ),
+        )
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain("the ConditionExpression of the LimDoc put")
+      expect(text).toContain("it holds 319 operators and functions, over DynamoDB's limit of 300")
+      expect(yield* absent("ops")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#15 an IN over 100 operands: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      yield* LimDocs.put({ docId: "in-101", tag: "t", body: "b" }).asEffect()
+      const error = yield* LimDocs.delete({ docId: "in-101" })
+        .pipe(
+          LimDocs.condition((t: any, { isIn }: any) =>
+            isIn(
+              t.body,
+              Array.from({ length: 101 }, (_, i) => `v${i}`),
+            ),
+          ),
+        )
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        "an IN in it holds 101 operands, over DynamoDB's limit of 100",
+      )
+      expect(yield* absent("in-101")).toBe(false)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#16 a consistent read of a GSI: sent, and DynamoDB's rejection named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.query.byTag!({}).pipe(
+        Query.consistentRead(),
+        Query.collect,
+        Effect.flip,
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).operation).toBe("query.consistentRead")
+      expect(String((error as ValidationError).cause)).toContain(
+        'index "gsi1" is a global secondary index',
+      )
+      // The same query, eventually consistent, is answered.
+      yield* LimDocs.put({ docId: "cr", tag: "cr-tag", body: "b" }).asEffect()
+      const read = yield* LimDocs.query.byTag!({}).pipe(Query.collect)
+      expect(read.some((doc) => doc.docId === "cr")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect("#17 a condition over 4,096 characters: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      // Seven INs of 100 operands each: within the operator and IN limits,
+      // over the length limit only.
+      const error = yield* LimDocs.put({ docId: "long-cond", tag: "t", body: "b" })
+        .pipe(
+          LimDocs.condition((t: any, { or, isIn }: any) =>
+            or(
+              ...Array.from({ length: 7 }, (_, k) =>
+                isIn(
+                  t.body,
+                  Array.from({ length: 100 }, (_, i) => `v${k}-${i}`),
+                ),
+              ),
+            ),
+          ),
+        )
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain("the ConditionExpression of the LimDoc put")
+      expect(text).toMatch(/it is \d{4} characters, over DynamoDB's limit of 4096 characters/)
+      expect(yield* absent("long-cond")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // Partition keys over 2048 bytes (#144): DynamoDB Local words a table key's
+  // ("Hash primary key values must be under 2048 bytes, …") and an index
+  // key's ("Size limit exceeded") alike for both kinds; confirmed by measuring
+  // the request's key attributes.
+  // -------------------------------------------------------------------------
+
+  const longId = "d".repeat(2100)
+
+  it.effect("#18 a table partition key over 2048 bytes: put, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: longId, tag: "t", body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('the partition key "pk" of the LimDoc put')
+      expect(text).toContain("2048-byte limit for a partition key")
+      expect(text).toContain("Nothing was written.")
+    }).pipe(provideLim),
+  )
+
+  it.effect("#19 an index partition key over 2048 bytes: put, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimGsiPks.put({ docId: "gsi-pk", tag: "g".repeat(2100), body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "gsi1pk" of the LimGsiPk put',
+      )
+    }).pipe(provideLim),
+  )
+
+  it.effect("#20 a table partition key over 2048 bytes: update's key, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.update({ docId: longId })
+        .pipe(Entity.set({ body: "c" }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "pk" of the LimDoc update',
+      )
+    }).pipe(provideLim),
+  )
+
+  it.effect("#21 a partition key over 2048 bytes in a transaction (a cancellation reason)", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "tx-pk-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: longId, tag: "t", body: "s" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "pk" of operation 1 (LimDoc)',
+      )
+      expect(yield* absent("tx-pk-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect(
+    "#22 a partition key over 2048 bytes in Batch.write: named, with what was written",
+    () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          LimDocs.put({ docId: "batch-pk-small", tag: "t", body: "s" }),
+          LimGsiPks.put({ docId: "batch-pk-big", tag: "g".repeat(2100), body: "s" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('the partition key "gsi1pk" of the put of LimGsiPk')
+        expect(yield* absent("batch-pk-small")).toBe(true)
+      }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // An isIn() with no values (#144 S17): sent as `IN ()`, which DynamoDB
+  // rejects as a syntax error naming nothing; confirmed and named.
+  // -------------------------------------------------------------------------
+
+  it.effect("#23 isIn() with no values in a condition: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "empty-in", tag: "t", body: "b" })
+        .pipe(LimDocs.condition((t: any, { isIn }: any) => isIn(t.body, [])))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('isIn() on "body" in its condition has no values')
+      expect(yield* absent("empty-in")).toBe(true)
+      // In a transaction, the rejection is request-wide: the entry is named.
+      const tx = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "empty-in-a", tag: "t", body: "b" }),
+        LimDocs.put({ docId: "empty-in-b", tag: "t", body: "b" }).pipe(
+          LimDocs.condition((t: any, { isIn }: any) => isIn(t.body, [])),
+        ),
+      ]).pipe(Effect.flip)
+      expect(tx._tag).toBe("ValidationError")
+      expect(String((tx as ValidationError).cause)).toContain("operation 1 (LimDoc)")
+    }).pipe(provideLim),
+  )
+
+  it.effect("#24 isIn() with no values in a filter: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { LimDocs }, tables: { LimTable } })
+      const error = yield* db.entities.LimDocs.byTag({})
+        .filter((t, { isIn }) => isIn(t.body, []))
+        .collect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).operation).toBe("query.filter")
+      expect(String((error as ValidationError).cause)).toContain(
+        'LimDoc.byTag: DynamoDB rejected the filter: isIn() on "body" has no values',
+      )
+    }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // Key-condition rejections on every query (#144 S29), and a BatchGetItem
+  // repeating a key.
+  // -------------------------------------------------------------------------
+
+  it.effect("#25 an entity accessor's reversed between: the accessor, index and bounds named", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { LimDocs }, tables: { LimTable } })
+      const error = yield* db.entities.LimDocs.byTag({})
+        .where((t, { between }) => between(t.tag, "zeta", "alpha"))
+        .collect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain("LimDoc.byTag: DynamoDB rejected the query: between's lower bound")
+      expect(text).toContain('on "gsi1sk" of index "gsi1"')
+    }).pipe(provideLim),
+  )
+
+  it.effect("#26 Batch.get reading one key twice: DynamoDB's rejection, both gets named", () =>
+    Effect.gen(function* () {
+      const error = yield* Batch.get([
+        LimDocs.get({ docId: "bg-1" }),
+        LimDocs.get({ docId: "bg-2" }),
+        LimDocs.get({ docId: "bg-1" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      expect(String((error as { cause: unknown }).cause)).toContain(
+        "BatchGetItem reads one item more than once — get 0 (LimDoc) and get 2 (LimDoc)",
+      )
+    }).pipe(provideLim),
+  )
+
+  // Vector-index limits (#144 1e) have no connected test: DynamoDB Local
+  // 3.1.0 has no vector indexes (CreateTable drops them, UpdateTable reports
+  // "Nothing to update"), so the recognition is covered by unit tests only.
+
+  // -------------------------------------------------------------------------
+  // Exact size accounting (#144 §6A.2), against DynamoDB's own: the
+  // `Payload Size` its 4 MB rejection reports, and the exact boundaries.
+  // -------------------------------------------------------------------------
+
+  /** DynamoDB's rejection of a raw request, as its message. */
+  const rejectionOf = <A, E>(request: Effect.Effect<A, E>) =>
+    request.pipe(
+      Effect.flip,
+      Effect.map((error) => {
+        const cause = (error as { cause?: unknown }).cause
+        return cause instanceof Error ? cause.message : String(cause)
+      }),
+    )
+  const payloadSize = (message: string): number => {
+    const match = /Payload Size:\s*(\d+)/.exec(message)
+    expect(match, message).not.toBeNull()
+    return Number(match![1])
+  }
+  const putOf = (item: Record<string, AttributeValue>): TransactWriteItem => ({
+    Put: { TableName: limTableName, Item: item },
+  })
+  const bytes = (...values: ReadonlyArray<number>) => new Uint8Array(values)
+
+  it.effect(
+    "each type's size is exactly DynamoDB's: its share of a rejected transaction's Payload Size",
+    () =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        // Twelve ~380 KB fillers: the twelfth carries the request past 4 MB.
+        // DynamoDB's reported size is a running total that stops at the
+        // action crossing the limit, so a small probe placed FIRST is always
+        // counted, and its share is the difference from the fillers alone.
+        const fillers = Array.from({ length: 12 }, (_, i) =>
+          putOf({
+            pk: { S: `fill-${String(i).padStart(2, "0")}` },
+            sk: { S: "s" },
+            body: { S: "f".repeat(380_000) },
+          }),
+        )
+        const send = (items: ReadonlyArray<TransactWriteItem>) =>
+          client.transactWriteItems({ TransactItems: [...items] })
+        const fillersAlone = payloadSize(yield* rejectionOf(send(fillers)))
+        expect(fillersAlone).toBe(transactionBytes(fillers))
+
+        const key = { pk: { S: "probe" }, sk: { S: "s" } }
+        const probeOf = (value: AttributeValue) => putOf({ ...key, v: value })
+        /** [label, value, its size as measured on DynamoDB Local] */
+        const values: ReadonlyArray<readonly [string, AttributeValue, number]> = [
+          ...(
+            [
+              ["0", 1],
+              ...["1", "9", "10", "12", "99", "100", "1000", "1200", "1000000", "1e10"].map(
+                (n) => [n, 2] as const,
+              ),
+              ...["0.5", "0.05", "0.001", "0.0012", "1E-10", "9.9E+125"].map(
+                (n) => [n, 2] as const,
+              ),
+              ...["101", "120", "123", "1001", "1234", "1.5", "12.34", "10.01"].map(
+                (n) => [n, 3] as const,
+              ),
+              ...["12345", "123456", "1.234", "-123"].map((n) => [n, 4] as const),
+              ["-1", 3],
+              ["-0.000001", 3],
+              ["1234567890123456789012345678901234567", 20],
+              ["12345678901234567890123456789012345678", 20],
+              ["-123456789012345678901234567890123456.78", 21],
+              ["9.9999999999999999999999999999999999999", 21],
+              ["-9.9999999999999999999999999999999999999", 21],
+              ["-1.2345678901234567890123456789012345678", 21],
+              ["-12345678901234567890123456789012345.678", 21],
+            ] as const
+          ).map(([n, size]) => [`N ${n}`, { N: n }, size] as const),
+          ["S ascii", { S: "hello" }, 5],
+          ["S multi-byte", { S: "é😀" }, 6],
+          ["S empty", { S: "" }, 0],
+          ["B", { B: bytes(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) }, 10],
+          ["B empty", { B: bytes() }, 0],
+          ["BOOL", { BOOL: true }, 1],
+          ["NULL", { NULL: true }, 1],
+          ["SS", { SS: ["a", "bé"] }, 4],
+          ["NS", { NS: ["1", "123", "-1"] }, 8],
+          ["BS", { BS: [bytes(1, 2, 3), bytes(4, 5, 6, 7, 8)] }, 8],
+          ["L empty", { L: [] }, 3],
+          ["L", { L: [{ S: "a" }, { N: "1" }] }, 8],
+          ["M empty", { M: {} }, 3],
+          ["M", { M: { a: { S: "xy" } } }, 7],
+          ["M of L of M", { M: { l: { L: [{ M: { k: { BOOL: false } } }] } } }, 15],
+        ]
+        for (const [label, value, measured] of values) {
+          const probe = probeOf(value)
+          const reported = payloadSize(yield* rejectionOf(send([probe, ...fillers])))
+          // DynamoDB's share for the probe is our exact measure of it…
+          expect([label, reported - fillersAlone]).toEqual([label, transactItemBytes(probe)])
+          // …whose value part is the size measured on DynamoDB Local.
+          expect([label, attributeBytes(value)]).toEqual([label, measured])
+        }
+
+        // Every action type: a Put's item, any other action's key, plus each
+        // expression with its substitutions counted per occurrence.
+        const actions: ReadonlyArray<readonly [string, TransactWriteItem]> = [
+          [
+            "Put with a condition",
+            {
+              Put: {
+                TableName: limTableName,
+                Item: { ...key, v: { S: "value" } },
+                ConditionExpression: "attribute_not_exists(#pk)",
+                ExpressionAttributeNames: { "#pk": "pk" },
+              },
+            },
+          ],
+          [
+            "Update with a map value and a condition",
+            {
+              Update: {
+                TableName: limTableName,
+                Key: key,
+                UpdateExpression: "SET #a = :a, #m = :m",
+                ConditionExpression: "attribute_not_exists(#pk) OR #a <> :a",
+                ExpressionAttributeNames: { "#a": "attr", "#m": "map", "#pk": "pk" },
+                ExpressionAttributeValues: {
+                  ":a": { S: "value" },
+                  ":m": { M: { n: { N: "12345" }, l: { L: [{ BOOL: true }] } } },
+                },
+              },
+            },
+          ],
+          [
+            "Delete with a condition",
+            {
+              Delete: {
+                TableName: limTableName,
+                Key: key,
+                ConditionExpression: "#n = :n",
+                ExpressionAttributeNames: { "#n": "count" },
+                ExpressionAttributeValues: { ":n": { N: "-0.5" } },
+              },
+            },
+          ],
+          [
+            "ConditionCheck naming a placeholder twice",
+            {
+              ConditionCheck: {
+                TableName: limTableName,
+                Key: key,
+                ConditionExpression: "attribute_exists(#pk) AND #pk = :p",
+                ExpressionAttributeNames: { "#pk": "pk" },
+                ExpressionAttributeValues: { ":p": { S: "probe" } },
+              },
+            },
+          ],
+        ]
+        for (const [label, action] of actions) {
+          const reported = payloadSize(yield* rejectionOf(send([action, ...fillers])))
+          expect([label, reported - fillersAlone]).toEqual([label, transactItemBytes(action)])
+        }
+      }).pipe(provideLim),
+    120_000,
+  )
+
+  /** An item mixing every attribute type, padded by `pad` characters. */
+  const mixedItem = (pk: string, pad: number): Record<string, AttributeValue> => ({
+    pk: { S: pk },
+    sk: { S: "s" },
+    n: { N: "-12345.678" },
+    zero: { N: "0" },
+    huge: { N: "9.9E+125" },
+    l: {
+      L: [{ S: "é" }, { N: "100" }, { BOOL: true }, { NULL: true }, { L: [] }, { M: {} }],
+    },
+    m: {
+      M: {
+        a: { S: "😀" },
+        b: { NS: ["1", "-0.5"] },
+        c: { M: { d: { B: bytes(1, 2, 3) }, e: { L: [{ N: "12.34" }] } } },
+      },
+    },
+    ss: { SS: ["a", "bé"] },
+    ns: { NS: ["1", "123456"] },
+    bs: { BS: [bytes(0, 0, 0, 0), bytes(9)] },
+    b: { B: bytes(1, 2, 3, 4, 5, 6, 7) },
+    t: { BOOL: false },
+    nu: { NULL: true },
+    pad: { S: "p".repeat(pad) },
+  })
+  /** The item of `mixedItem` whose size by our measure is exactly `size`. */
+  const mixedItemOf = (pk: string, size: number) =>
+    mixedItem(pk, size - itemBytes(mixedItem(pk, 0)))
+
+  it.effect("an item of exactly 409,600 bytes by our measure is accepted; 409,601 rejected", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const fits = mixedItemOf("mixed-item-a", ITEM_MAX_BYTES)
+      expect(itemBytes(fits)).toBe(409_600)
+      yield* client.putItem({ TableName: limTableName, Item: fits })
+      const { Item } = yield* client.getItem({
+        TableName: limTableName,
+        Key: { pk: { S: "mixed-item-a" }, sk: { S: "s" } },
+        ConsistentRead: true,
+      })
+      expect(itemBytes(Item!)).toBe(409_600)
+
+      const over = mixedItemOf("mixed-item-b", ITEM_MAX_BYTES + 1)
+      expect(itemBytes(over)).toBe(409_601)
+      const message = yield* rejectionOf(client.putItem({ TableName: limTableName, Item: over }))
+      expect(message).toContain("Item size has exceeded the maximum allowed size")
+    }).pipe(provideLim),
+  )
+
+  it.effect(
+    "a transaction of exactly 4,194,304 bytes by our measure is accepted; 4,194,305 rejected",
+    () =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        /**
+         * Eleven mixed-type Puts (one conditioned), an Update with map values
+         * and a condition, a ConditionCheck and a Delete — totalling `total`,
+         * the last Put taking the remainder.
+         */
+        const request = (round: string, total: number): Array<TransactWriteItem> => {
+          const others: Array<TransactWriteItem> = [
+            {
+              Update: {
+                TableName: limTableName,
+                Key: { pk: { S: `${round}-upd` }, sk: { S: "s" } },
+                UpdateExpression: "SET #m = :m, #n = :n",
+                ConditionExpression: "attribute_not_exists(#pk)",
+                ExpressionAttributeNames: { "#m": "m", "#n": "n", "#pk": "pk" },
+                ExpressionAttributeValues: {
+                  ":m": { M: { l: { L: [{ N: "-1" }, { SS: ["x"] }] }, b: { B: bytes(1) } } },
+                  ":n": { N: "1.5" },
+                },
+              },
+            },
+            {
+              ConditionCheck: {
+                TableName: limTableName,
+                Key: { pk: { S: `${round}-chk` }, sk: { S: "s" } },
+                ConditionExpression: "attribute_not_exists(#pk)",
+                ExpressionAttributeNames: { "#pk": "pk" },
+              },
+            },
+            {
+              Delete: {
+                TableName: limTableName,
+                Key: { pk: { S: `${round}-del` }, sk: { S: "s" } },
+              },
+            },
+          ]
+          const putFor = (i: number, size: number): TransactWriteItem => {
+            const item = mixedItemOf(`${round}-put-${String(i).padStart(2, "0")}`, size)
+            return i === 0
+              ? {
+                  Put: {
+                    TableName: limTableName,
+                    Item: item,
+                    ConditionExpression: "attribute_not_exists(#pk)",
+                    ExpressionAttributeNames: { "#pk": "pk" },
+                  },
+                }
+              : putOf(item)
+          }
+          const each = 380_000
+          const puts = Array.from({ length: 10 }, (_, i) => putFor(i, each))
+          const used = transactionBytes([...others, ...puts])
+          // The last Put's item size that brings the request to `total`.
+          return [...others, ...puts, putFor(10, total - used)]
+        }
+
+        const fits = request("tx-exact", TRANSACT_WRITE_MAX_BYTES)
+        expect(fits.length).toBe(14)
+        expect(transactionBytes(fits)).toBe(4_194_304)
+        yield* client.transactWriteItems({ TransactItems: fits })
+        const { Item } = yield* client.getItem({
+          TableName: limTableName,
+          Key: { pk: { S: "tx-exact-put-10" }, sk: { S: "s" } },
+          ConsistentRead: true,
+        })
+        expect(Item?.pad).toBeDefined()
+
+        const over = request("tx-over", TRANSACT_WRITE_MAX_BYTES + 1)
+        expect(transactionBytes(over)).toBe(4_194_305)
+        const message = yield* rejectionOf(client.transactWriteItems({ TransactItems: over }))
+        expect(message).toContain("Transaction payload size cannot exceed 4MB")
+        // The crossing action is the last, so DynamoDB's running total is the whole request.
+        expect(payloadSize(message)).toBe(4_194_305)
+      }).pipe(provideLim),
+    60_000,
+  )
+
+  it.effect(
+    "Batch.write splits versioned puts crossing 4 MB into chunks within 4,194,304 bytes",
+    () => {
+      const sent: Array<ReadonlyArray<TransactWriteItem>> = []
+      const recording = Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const real = yield* DynamoClient
+          return {
+            ...real,
+            transactWriteItems: (input) => {
+              sent.push(input.TransactItems ?? [])
+              return real.transactWriteItems(input)
+            },
+          } satisfies DynamoClientService
+        }),
+      ).pipe(Layer.provide(ClientLayer))
+      const layer = Layer.mergeAll(recording, LimTable.layer({ name: limTableName }))
+      return Effect.gen(function* () {
+        // 25 puts of 150–390 KB, about 6.9 MB in all.
+        const sizes = Array.from({ length: 25 }, (_, i) => 150_000 + ((i * 97_331) % 240_000))
+        const ids = sizes.map((_, i) => `bv-${String(i).padStart(2, "0")}`)
+        yield* Batch.write(
+          ids.map((docId, i) =>
+            LimVersionedDocs.put({ docId, tag: "t", body: "b".repeat(sizes[i]!) }),
+          ),
+        )
+        expect(sent.length).toBeGreaterThanOrEqual(2)
+        for (const [i, chunk] of sent.entries()) {
+          expect(transactionBytes(chunk)).toBeLessThanOrEqual(TRANSACT_WRITE_MAX_BYTES)
+          // Filled: the next chunk's first put would have carried it past 4 MB.
+          const next = sent[i + 1]
+          if (next !== undefined) {
+            expect(transactionBytes(chunk) + transactItemBytes(next[0]!)).toBeGreaterThan(
+              TRANSACT_WRITE_MAX_BYTES,
+            )
+          }
+        }
+        // In caller order, every put once.
+        const pkOf = (item: TransactWriteItem) => item.Put?.Item?.pk?.S
+        expect(sent.flat().map(pkOf)).toEqual(
+          ids.map((docId) => `$lim#v1#limversioneddoc#docid_${docId}`),
+        )
+        // And every item is written.
+        for (const [i, docId] of ids.entries()) {
+          const stored = yield* LimVersionedDocs.get({ docId }).asEffect()
+          expect(stored.body.length).toBe(sizes[i])
+        }
+        sent.length = 0
+
+        // 150 small puts: split at 100 actions.
+        yield* Batch.write(
+          Array.from({ length: 150 }, (_, i) =>
+            LimVersionedDocs.put({ docId: `bs-${i}`, tag: "t", body: "s" }),
+          ),
+        )
+        expect(sent.map((chunk) => chunk.length)).toEqual([100, 50])
+        const written = yield* Effect.forEach([0, 99, 100, 149], (i) =>
+          LimVersionedDocs.get({ docId: `bs-${i}` }).asEffect(),
+        )
+        expect(written.map((doc) => doc.docId)).toEqual(["bs-0", "bs-99", "bs-100", "bs-149"])
+      }).pipe(Effect.provide(layer))
+    },
+    60_000,
   )
 })

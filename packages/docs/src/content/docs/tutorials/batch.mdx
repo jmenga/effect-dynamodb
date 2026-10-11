@@ -262,11 +262,15 @@ The same reasoning rules out the lifecycle configs (**EDD-9049**): entities with
 :::
 
 :::note[Puts of a `versioned` entity are sent as transactions]
-A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems` of up to 100 items (kept under DynamoDB's 4 MB transaction payload), each conditioned on `attribute_not_exists`. A batch that touches such an item more than once, for example a delete and a put of it, is refused before anything is written, because the put runs in its own transaction. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
+A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems`, each conditioned on `attribute_not_exists`. They are chunked at exactly DynamoDB's limits: 100 items and 4,194,304 bytes per transaction, measured as DynamoDB measures them (each item plus its condition; see [How DynamoDB Sizes Items](/effect-dynamodb/guides/data-integrity/#how-dynamodb-sizes-items)). A batch that touches such an item more than once, for example a delete and a put of it, is refused before anything is written, because the put runs in its own transaction. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
 
-- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and `Batch.write` fails with a `ValidationError`. Earlier chunks may already have been written, as with any batch, and the remaining requests aren't sent. Replace an existing item with the entity's own `put()` or `Transaction.transactWrite`.
+- A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and `Batch.write` fails with a `ValidationError`. The message says exactly how many earlier chunks were already written, and the remaining requests aren't sent. Replace an existing item with the entity's own `put()` or `Transaction.transactWrite`.
 - Each chunk costs twice the write capacity of a batch write.
 - Cancellations caused by contention (`TransactionConflict`, throttling) are retried with the batch's backoff settings.
+:::
+
+:::note[Oversized items are named]
+DynamoDB rejects a request holding an item over its 400 KB item limit, or a sort key over 1024 bytes, and writes nothing from it. `Batch.write` recognises the rejection, measures the request it sent, and fails with a `ValidationError` naming the item and its key, with DynamoDB's error as its `cause`. Earlier chunks may already have been written, and the message says exactly which: the batch's versioned-put transactions and non-versioned requests already written, and the requests not sent. Should DynamoDB reject a chunk of versioned puts for its 4 MB limit although the library measured it as fitting, `Batch.write` fails with a `ValidationError` giving both sizes; the chunk is not split again or retried.
 :::
 
 ---
@@ -297,10 +301,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---

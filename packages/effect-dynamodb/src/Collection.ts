@@ -306,8 +306,6 @@ export const make = <
     let q = Query.make<CollectionResult<TEntities>>({
       tableName: "",
       indexName: sharedDynamoIndexName,
-      // A collection is over its members' secondary indexes — GSIs.
-      globalIndex: true,
       pkField: sharedPkField!,
       pkValue: collectionPk(pkComposites),
       skField: sharedSkField,
@@ -324,6 +322,7 @@ export const make = <
         // We need to tag each item with its entity key so the caller can group
         return collectionDecoder(raw) as Effect.Effect<any, ValidationError>
       },
+      keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
     // Clustered collections add begins_with SK condition on collection prefix
@@ -351,8 +350,6 @@ export const make = <
       let q = Query.make({
         tableName: "",
         indexName: sharedDynamoIndexName,
-        // A collection is over its members' secondary indexes — GSIs.
-        globalIndex: true,
         pkField: sharedPkField!,
         pkValue,
         skField: sharedSkField,
@@ -365,6 +362,7 @@ export const make = <
           entity.indexes.primary?.pk.field,
           entity.indexes.primary?.sk.field,
         ],
+        keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
       })
 
       // Clustered entity selectors add begins_with on the entity SK prefix.

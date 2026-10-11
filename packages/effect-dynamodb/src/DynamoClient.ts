@@ -165,6 +165,12 @@ import {
 } from "./internal/BoundVectorQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
+import {
+  diagnoseFailure,
+  explainDiagnosis,
+  type SentTable,
+  withCause,
+} from "./internal/WriteDiagnosis.js"
 import * as Query from "./Query.js"
 import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
@@ -1164,8 +1170,6 @@ const makeFromConfig = (config: {
         const query = Query.make({
           tableName: "",
           indexName: indexDef.index,
-          // An entity's indexes are GSIs (`Table.definition`).
-          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,
@@ -1181,6 +1185,11 @@ const makeFromConfig = (config: {
           // The primary key also holds the entity's history rows; an index
           // never does (they carry no index keys).
           liveRows: indexDef.index === undefined ? entityLike._liveRows?.() : undefined,
+          // DynamoDB's rejection of the key condition (#144) names the accessor.
+          keyConditionDiagnosis: {
+            operation: "query",
+            label: `${entityLike.entityType}.${_indexName}`,
+          },
         })
 
         // Apply SK prefix from provided compositesKeyForm.
@@ -1619,8 +1628,6 @@ const makeFromConfig = (config: {
         let query = Query.make({
           tableName: "",
           indexName: indexDef.index,
-          // An entity's indexes are GSIs (`Table.definition`).
-          globalIndex: indexDef.index !== undefined,
           pkField: indexDef.pk.field,
           pkValue,
           skField: indexDef.sk.field,
@@ -1635,6 +1642,7 @@ const makeFromConfig = (config: {
           ],
           // A collection on the primary key also meets its members' history.
           liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
+          keyConditionDiagnosis: { operation: "query", label: `collection "${collName}"` },
         })
 
         // Add begins_with on collection SK prefix for clustered collections.
@@ -1821,6 +1829,31 @@ const isResourceInUse = (err: DynamoClientError): boolean =>
   "name" in err.cause &&
   (err.cause as { name: string }).name === "ResourceInUseException"
 
+/**
+ * DynamoDB's vector-index limits — dimensions in 1..4096, inline filters per
+ * index, vector indexes per table (an adjustable quota) — are not pre-checked
+ * (#144): a rejected `CreateTable` / `UpdateTable` is diagnosed against the
+ * vector indexes it sent, naming the index and the entities sharing it, and
+ * fails with the error DynamoDB's would have been (same tag), its message
+ * explained and DynamoDB's error kept as the cause. Anything else passes
+ * through.
+ */
+const diagnoseVectorLimits = (
+  operation: "CreateTable" | "UpdateTable",
+  label: string,
+  sent: Omit<SentTable, "_tag" | "operation">,
+) =>
+  diagnoseFailure({
+    sent: () => ({ _tag: "Table", operation, ...sent }),
+    only: ["VectorIndexDimensions", "VectorIndexFilters", "VectorIndexCount"],
+    rewrite: (diagnosis, original): DynamoClientError => {
+      const cause = withCause(explainDiagnosis(diagnosis, label), original)
+      return (original as DynamoClientError)._tag === "DynamoValidationError"
+        ? new DynamoValidationError({ operation, cause })
+        : new DynamoError({ operation, cause })
+    },
+  })
+
 /** Make createTable idempotent — ignore if table already exists. */
 const idempotentCreate = (
   effect: Effect.Effect<void, DynamoClientError>,
@@ -1836,6 +1869,7 @@ const buildTableOperationsFromTable = (
   const vectorIndexes = mergeVectorIndexes(
     table.entities as unknown as Record<string, Parameters<typeof mergeVectorIndexes>[0][string]>,
   )
+  const sharers = (indexName: string) => vectorIndexes.get(indexName)?.sharers ?? []
   return {
     ...buildTableOperations(tableName, client),
     create: (options?: CreateTableOptions) =>
@@ -1846,7 +1880,14 @@ const buildTableOperationsFromTable = (
             BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
             ...def,
           })
-          .pipe(Effect.asVoid),
+          .pipe(
+            Effect.asVoid,
+            diagnoseVectorLimits("CreateTable", `db.tables create of "${tableName}"`, {
+              vectorIndexes: def.VectorIndexes ?? [],
+              sharers,
+              declared: vectorIndexes.size,
+            }),
+          ),
       ),
     addVectorIndex: (indexName) => {
       const entry = vectorIndexes.get(indexName)
@@ -1870,20 +1911,37 @@ const buildTableOperationsFromTable = (
           AttributeType,
         })),
       ]
+      const spec = toVectorIndexSpec(entry.definition, {
+        filters: entry.filters,
+        resolveDbName: entry.resolveDbName,
+      })
       return client
         .updateTable({
           TableName: tableName,
           AttributeDefinitions: attributeDefinitions,
-          VectorIndexUpdates: [
-            {
-              Create: toVectorIndexSpec(entry.definition, {
-                filters: entry.filters,
-                resolveDbName: entry.resolveDbName,
-              }),
-            },
-          ],
+          VectorIndexUpdates: [{ Create: spec }],
         })
-        .pipe(Effect.asVoid)
+        .pipe(
+          Effect.asVoid,
+          // The request shows only the index it adds: a count rejection is
+          // confirmed against the indexes the table already has, read back
+          // after the rejection (unknown if that read fails: passed through).
+          Effect.catch((error) =>
+            client.describeTable({ TableName: tableName }).pipe(
+              Effect.map((described) => described.Table?.VectorIndexes?.length ?? 0),
+              Effect.orElseSucceed(() => undefined),
+              Effect.flatMap((existing) =>
+                Effect.fail(error).pipe(
+                  diagnoseVectorLimits(
+                    "UpdateTable",
+                    `addVectorIndex("${indexName}") on "${tableName}"`,
+                    { vectorIndexes: [spec], sharers, declared: vectorIndexes.size, existing },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        )
     },
   }
 }

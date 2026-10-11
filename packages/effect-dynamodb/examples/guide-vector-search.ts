@@ -117,6 +117,10 @@ const program = Effect.gen(function* () {
 
   // `create()` emits the merged VectorIndexes derived from every registered
   // entity — nothing extra to declare at the table level.
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables.MainTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables.MainTable.create()
 
   // ---------- Write — the embedding is generated for you ----------

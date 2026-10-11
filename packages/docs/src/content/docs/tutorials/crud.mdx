@@ -11,7 +11,7 @@ A comprehensive example demonstrating the full effect-dynamodb high-level API. S
 - Error handling with tagged errors (`ItemNotFound`, `OptimisticLockError`)
 - Index queries with fluent combinators (`reverse`, `filter`, `collect`)
 - Atomic transactions with `Transaction.transactWrite` and `transactGet`
-- Sparse GSI behavior and the all-or-none update constraint
+- Sparse GSI behavior and how updates recompose GSI keys
 - Version history with `versioned: { retain: true }`
 - Soft delete, restore, and purge
 
@@ -366,31 +366,37 @@ const ownerProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }
 // "Beta" is absent — sparse index at work
 ```
 
-### All-or-None Update Constraint
+### Updating GSI Composites
 
-When updating, if the payload includes ANY composite for a GSI, ALL composites for that GSI must be present. This prevents stale GSI entries:
+An update never reads the stored item, so the library recomposes GSI keys from what the update carries: the payload plus the primary key. It does this per key **half** -- partition key and sort key separately -- and only for the halves the update touches. A half the update doesn't touch keeps its stored value:
 
 ```typescript region="sparse-update" example="crud.ts"
-  // #region sparse-update
-  // GOOD: Update without touching GSI composites
-  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ name: "Alice W." })
+// Touches no byTenant composite — its keys are left as stored
+yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ name: "Alice W." })
 
-  // GOOD: Update ALL composites of a GSI
-  yield* db.entities.Employees.update({ employeeId: "e-1" }).set({
-    tenantId: "t-2",
-    region: "eu-west-1",
-  })
+// Touches both halves of byTenant — gsi1pk and gsi1sk are recomposed
+yield* db.entities.Employees.update({ employeeId: "e-1" }).set({
+  tenantId: "t-2",
+  region: "eu-west-1",
+})
 
-  // BAD: Partial GSI composites — runtime ValidationError
-  yield* db.entities.Employees.update({ employeeId: "e-1" })
-    .set({ tenantId: "t-3" }) // missing region!
-    .asEffect()
-    .pipe(
-      Effect.catchTag("ValidationError", (e) =>
-        Effect.succeed(`Must provide both tenantId AND region, or neither`),
-      ),
-    )
+// Touches only the partition half — gsi1pk moves to t-3, gsi1sk keeps eu-west-1
+yield* db.entities.Employees.update({ employeeId: "e-1" }).set({ tenantId: "t-3" })
+const inT3 = yield* db.entities.Employees.byTenant({ tenantId: "t-3" }).collect()
+// → [{ employeeId: "e-1", tenantId: "t-3", region: "eu-west-1", ... }]
+
+// Removing the only partition composite removes gsi1pk — Alpha leaves byOwner
+yield* db.entities.Projects.update({ projectId: "p-1" }).remove(["ownerId"])
+const aliceProjects = yield* db.entities.Projects.byOwner({ ownerId: "u-alice" }).collect()
+// → []
 ```
+
+A partial update is not an error. When a touched half has only some of its composites, the outcome depends on which ones are missing:
+
+- **Trailing composites missing** -- the half is recomposed from the leading composites only, giving a shorter, coarser key.
+- **A leading composite missing** -- the half can't be composed. By default (`indexPolicy` `'preserve'`) the stored half is left as it was and may now be stale; under `'sparse'` the half is removed and the item drops out of the index.
+
+So when you change a composite, also pass the other composites of the same half. [Index Policy](/effect-dynamodb/guides/index-policy/) has the full rules, including how several writers can share one item.
 
 ---
 
@@ -516,10 +522,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("Done."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("Done."))
 ```
 
 ---
@@ -534,7 +537,7 @@ Effect.runPromise(main).then(
 | **Tagged error handling** | `Effect.catchTag("ItemNotFound", ...)` for precise recovery — bound methods return `Effect` directly |
 | **Index queries** | `db.entities.Tasks.byUser(composites).collect()` returns results; `.reverse()`, `.filter()` for combinators |
 | **Transactions** | `transactWrite` for atomic multi-entity creates; `transactGet` for typed tuple reads |
-| **Sparse GSI** | Optional composites produce sparse indexes; all-or-none constraint prevents stale keys |
+| **Sparse GSI** | Optional composites produce sparse indexes; updates recompose only the GSI key halves they touch, and `.remove()` drops a composite's half |
 | **Version history** | `versioned: { retain: true }` creates snapshots; `db.entities.Users.getVersion(key, n)` and `Users.versions(key)` for retrieval |
 | **Soft delete + restore** | `softDelete: true` archives items; `db.entities.Tasks.restore(key)` recomposes all keys |
 | **Purge** | `db.entities.Users.purge(key)` permanently removes item + versions + soft-deleted copies |

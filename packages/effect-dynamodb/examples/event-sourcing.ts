@@ -5,7 +5,8 @@
  * append/read/readFrom/currentVersion operations, fold helpers, Query combinators,
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
- * large commands as stepped commands, and stream indexes.
+ * large commands as stepped commands, stream indexes, event metadata and
+ * timestamps, and stream index projection.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -14,7 +15,19 @@
  *   npx tsx examples/event-sourcing.ts
  */
 
-import { Config, Console, Data, Duration, Effect, Layer, Option, Schema } from "effect"
+import {
+  Config,
+  Console,
+  Crypto,
+  Data,
+  DateTime,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  PlatformError,
+  Schema,
+} from "effect"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -323,13 +336,74 @@ const Scorecards = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 8. Main program
+// 8. Event metadata — a metadata schema on the stream
+// ---------------------------------------------------------------------------
+
+// #region metadata-stream
+// Facts about an event that are not part of the domain event itself.
+const AuditMetadata = Schema.Struct({
+  // The request that produced the event: shared by every event it appends.
+  correlationId: Schema.String,
+  // An id of the event's own: a ULID, minted when the event is decided.
+  eventId: Schema.optionalKey(Schema.String.check(Schema.isULID())),
+  // For an imported event: its id in the store it came from.
+  sourceId: Schema.optionalKey(Schema.String),
+})
+
+const AuditedMatchEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "AuditedMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  metadata: AuditMetadata,
+})
+// #endregion
+
+// #region index-projection
+// Metadata is often an event's largest attribute, and an index projecting ALL
+// copies it into every entry. `projection` keeps it out.
+const AuditedScorecardTable = Table.make({ schema: AppSchema, entities: {} })
+
+const AuditedScorecards = EventStore.makeStream({
+  table: AuditedScorecardTable,
+  streamName: "AuditedScorecard",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+  metadata: AuditMetadata,
+  indexes: {
+    // Every event attribute except `metadata`: read with one query, and
+    // `metadata` is typed (and read as) undefined.
+    byInnings: {
+      index: "lsi1",
+      sk: "lsi1sk",
+      projection: "withoutMetadata",
+      key: (event) =>
+        event._tag === "InningsCompleted" ? `INNINGS#${pad(event.innings)}` : undefined,
+    },
+    // Keys only: the smallest entries. A read queries the index, then fetches
+    // the full events from the table with BatchGetItem, in index order.
+    byRuns: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      projection: "keys",
+      key: (event, version) =>
+        event._tag === "InningsCompleted" ? `RUNS#${pad(event.runs)}#${pad(version)}` : undefined,
+    },
+  },
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 9. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
   const client = yield* DynamoClient
   const tableConfig = yield* EventsTable.Tag
   const scorecardConfig = yield* ScorecardTable.Tag
+  const auditedScorecardConfig = yield* AuditedScorecardTable.Tag
 
   // --- Bind event stream ---
   // #region command-handler
@@ -339,6 +413,16 @@ const program = Effect.gen(function* () {
 
   // --- Create table ---
   yield* Console.log("Creating table:", tableConfig.name)
+  // Start clean: drop the tables a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: tableConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client
+    .deleteTable({ TableName: scorecardConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client
+    .deleteTable({ TableName: auditedScorecardConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
     BillingMode: "PAY_PER_REQUEST",
@@ -863,16 +947,256 @@ const program = Effect.gen(function* () {
   }
   yield* Console.log(`First innings: ${firstInnings.length} event`)
 
+  // --- Event metadata ---
+  yield* Console.log("\n=== Event metadata ===")
+  // #region append-metadata
+  const audited = yield* EventStore.bind(AuditedMatchEvents)
+
+  // One value for the whole append: every event carries a copy.
+  yield* audited.append(
+    { matchId: "m-20" },
+    [
+      new MatchStarted({ venue: "WACA", homeTeam: "AUS", awayTeam: "SL" }),
+      new InningsCompleted({ innings: 1, runs: 301, wickets: 9 }),
+    ],
+    0,
+    { metadata: { correlationId: "req-81c2" } },
+  )
+  // → v1 and v2 both carry { correlationId: "req-81c2" }
+  // #endregion
+  const shared = yield* audited.read({ matchId: "m-20" })
+  yield* Console.log(
+    `Shared: ${shared.map((e) => `v${e.version} ${e.metadata?.correlationId}`).join(", ")}`,
+  )
+
+  // #region event-metadata
+  // An import from a previous store: each event keeps its original id.
+  yield* audited.append(
+    { matchId: "m-21" },
+    [
+      new MatchStarted({ venue: "Kensington Oval", homeTeam: "WI", awayTeam: "ENG" }),
+      new InningsCompleted({ innings: 1, runs: 202, wickets: 10 }),
+      new InningsCompleted({ innings: 2, runs: 205, wickets: 4 }),
+    ],
+    0,
+    {
+      eventMetadata: [
+        { correlationId: "import-17", sourceId: "legacy-118" },
+        // `undefined`: this event is written without metadata.
+        undefined,
+        { correlationId: "import-17", sourceId: "legacy-121" },
+      ],
+    },
+  )
+
+  // Each event reads back with its own entry.
+  const importedEvents = yield* audited.read({ matchId: "m-21" })
+  const sourceIds = importedEvents.map((event) => event.metadata?.sourceId)
+  // → ["legacy-118", undefined, "legacy-121"]
+  // #endregion
+  yield* Console.log(
+    `Imported source ids: ${sourceIds.map((id) => id ?? "(none)").join(", ")}`,
+  )
+
+  // #region handler-event-metadata
+  // One ULID per event: its time comes from the Clock, its random bits from
+  // the Crypto service.
+  const crypto = yield* Crypto.Crypto
+  const mintEventIds = (correlationId: string, events: ReadonlyArray<MatchEvent>) =>
+    Effect.forEach(events, () =>
+      Effect.map(crypto.randomULID, (eventId) => ({ correlationId, eventId })),
+    )
+
+  // Idempotent: a redelivered command fails with DuplicateCommand, so the ids
+  // of its first commit are the only ones ever written.
+  const handleAudited = EventStore.commandHandler(matchDecider, audited, {
+    idempotency: { ttl: Duration.days(1) },
+  })
+
+  // A function of the decision: one entry per event `decide` returned.
+  yield* handleAudited(
+    { matchId: "m-22" },
+    { _tag: "StartMatch", venue: "Adelaide Oval", homeTeam: "AUS", awayTeam: "WI" },
+    { commandId: "msg-4470", eventMetadata: ({ events }) => mintEventIds("msg-4470", events) },
+  )
+  // → v1 carries an eventId such as "01M4M3EK1SVFC94QZ8SC9H0ZPW"
+
+  // A message delivered twice, its first response lost.
+  const completeInnings = handleAudited(
+    { matchId: "m-22" },
+    { _tag: "CompleteInnings", innings: 1, runs: 289, wickets: 10 },
+    { commandId: "msg-4471", eventMetadata: ({ events }) => mintEventIds("msg-4471", events) },
+  )
+  yield* completeInnings
+  const duplicate = yield* Effect.flip(completeInnings)
+  // → DuplicateCommand: v2 keeps the eventId of the first delivery
+  // #endregion
+  const handled = yield* audited.read({ matchId: "m-22" })
+  yield* Console.log(
+    `Handler event ids: ${handled.map((e) => `v${e.version} ${e.metadata?.eventId}`).join(", ")}`,
+  )
+  yield* Console.log(`Redelivery: ${duplicate._tag}`)
+
+  // #region event-timestamps
+  // History from a previous store, each record with its own id and the time
+  // it happened.
+  const legacyRecords = [
+    {
+      sourceId: "legacy-204",
+      occurredAt: "2025-01-02T23:30:00Z",
+      event: new MatchStarted({ venue: "SCG", homeTeam: "AUS", awayTeam: "IND" }),
+    },
+    {
+      sourceId: "legacy-205",
+      occurredAt: "2025-01-03T06:40:00Z",
+      event: new InningsCompleted({ innings: 1, runs: 185, wickets: 10 }),
+    },
+    {
+      sourceId: "legacy-206",
+      occurredAt: "2025-01-04T04:15:00Z",
+      event: new InningsCompleted({ innings: 2, runs: 181, wickets: 10 }),
+    },
+  ]
+
+  // One append keeps every event's original time: entry `i` of
+  // `eventTimestamps` is event `i`'s timestamp (`undefined` keeps the
+  // append's own time). It combines with either metadata option.
+  yield* audited.append(
+    { matchId: "m-23" },
+    legacyRecords.map((record) => record.event),
+    0,
+    {
+      eventMetadata: legacyRecords.map((record) => ({
+        correlationId: "import-18",
+        sourceId: record.sourceId,
+      })),
+      eventTimestamps: legacyRecords.map((record) => DateTime.makeUnsafe(record.occurredAt)),
+    },
+  )
+
+  // Each event reads back with its own time, in UTC.
+  const history = yield* audited.read({ matchId: "m-23" })
+  const occurred = history.map((event) => `${event.metadata?.sourceId} ${event.timestamp}`)
+  // → ["legacy-204 2025-01-02T23:30:00.000Z", "legacy-205 2025-01-03T06:40:00.000Z", …]
+  // #endregion
+  yield* Console.log(`Imported history:\n  ${occurred.join("\n  ")}`)
+
+  // #region handler-event-timestamps-effect
+  // Through the handler, the times can come from an effect — here a lookup in
+  // the import's source log, which fails if a record is missing. The effect's
+  // error and requirements join the handler's.
+  const sourceLog = new Map([["m-24:MatchStarted", "2025-02-01T09:00:00Z"]])
+  const originalTime = (key: string) =>
+    Effect.fromNullishOr(sourceLog.get(key)).pipe(Effect.map((iso) => DateTime.makeUnsafe(iso)))
+
+  const handleImport = EventStore.commandHandler(matchDecider, audited)
+  yield* handleImport(
+    { matchId: "m-24" },
+    { _tag: "StartMatch", venue: "Basin Reserve", homeTeam: "NZL", awayTeam: "SL" },
+    {
+      eventTimestamps: ({ events }) =>
+        Effect.forEach(events, (event) => originalTime(`m-24:${event._tag}`)),
+    },
+  )
+  // → v1 is stamped 2025-02-01T09:00:00.000Z
+  // #endregion
+  const sourced = yield* audited.read({ matchId: "m-24" })
+  yield* Console.log(`Handler-sourced time: ${sourced.map((e) => e.timestamp).join(", ")}`)
+
+  // --- Stream index projection ---
+  yield* Console.log("\n=== Stream index projection ===")
+  // #region index-projection-table
+  const projected = EventStore.indexDefinitions(AuditedScorecards)
+  // byInnings (LSI) → Projection: { ProjectionType: "INCLUDE", NonKeyAttributes:
+  //   ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }
+  // byRuns (GSI)    → Projection: { ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }
+  yield* client.createTable({
+    TableName: auditedScorecardConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [
+      { AttributeName: "pk", KeyType: "HASH" },
+      { AttributeName: "sk", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "pk", AttributeType: "S" },
+      { AttributeName: "sk", AttributeType: "S" },
+      ...projected.AttributeDefinitions,
+    ],
+    LocalSecondaryIndexes: projected.LocalSecondaryIndexes,
+    GlobalSecondaryIndexes: projected.GlobalSecondaryIndexes,
+  })
+  // #endregion
+  const emitted = [
+    ...(projected.LocalSecondaryIndexes ?? []),
+    ...(projected.GlobalSecondaryIndexes ?? []),
+  ].map((index) => `${index.IndexName} ${JSON.stringify(index.Projection)}`)
+  yield* Console.log(`Projections:\n  ${emitted.join("\n  ")}`)
+
+  // #region index-projection-read
+  const auditedScorecards = yield* EventStore.bind(AuditedScorecards)
+  yield* auditedScorecards.append(
+    { matchId: "m-30" },
+    [
+      new MatchStarted({ venue: "Eden Park", homeTeam: "NZL", awayTeam: "ENG" }),
+      new InningsCompleted({ innings: 1, runs: 278, wickets: 10 }),
+      new InningsCompleted({ innings: 2, runs: 301, wickets: 8 }),
+    ],
+    0,
+    { metadata: { correlationId: "req-9a41" } },
+  )
+
+  // "withoutMetadata": the index does not hold metadata, so it reads as
+  // undefined — and its type is `undefined`, so it cannot be read by mistake.
+  const innings = yield* auditedScorecards.readIndex(
+    "byInnings",
+    { matchId: "m-30" },
+    { consistentRead: true },
+  )
+  // → [v2, v3], each with metadata: undefined
+
+  // "keys": the query finds the entries, then the events are fetched from the
+  // table, so metadata is there.
+  const byRuns = yield* auditedScorecards.readIndex(
+    "byRuns",
+    { matchId: "m-30" },
+    { reverse: true },
+  )
+  // → [v3, v2], each with metadata { correlationId: "req-9a41" }
+  // #endregion
+  const slim = innings.map((e) => `v${e.version} metadata=${String(e.metadata)}`)
+  yield* Console.log(`Through byInnings: ${slim.join(", ")}`)
+  const hydrated = byRuns.map((e) => `v${e.version} ${e.metadata?.correlationId}`)
+  yield* Console.log(`Through byRuns: ${hydrated.join(", ")}`)
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
   yield* client.deleteTable({ TableName: scorecardConfig.name })
+  yield* client.deleteTable({ TableName: auditedScorecardConfig.name })
   yield* Console.log("Tables deleted.")
 })
 
 // ---------------------------------------------------------------------------
-// 9. Provide dependencies and run
+// 10. Provide dependencies and run
 // ---------------------------------------------------------------------------
+
+// #region crypto-layer
+// Effect core ships no default Crypto service. This one is backed by the Web
+// Crypto API (`globalThis.crypto`): Node 19+ (Node 18 only with
+// --experimental-global-webcrypto), browsers and edge runtimes.
+const WebCrypto = Layer.succeed(
+  Crypto.Crypto,
+  Crypto.make({
+    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
+    digest: (algorithm, data) =>
+      Effect.tryPromise({
+        try: () => globalThis.crypto.subtle.digest(algorithm, new Uint8Array(data)),
+        catch: (cause) =>
+          PlatformError.badArgument({ module: "Crypto", method: "digest", cause }),
+      }).pipe(Effect.map((digest) => new Uint8Array(digest))),
+  }),
+)
+// #endregion
 
 // #region layer-setup
 const AppLayer = Layer.mergeAll(
@@ -883,12 +1207,11 @@ const AppLayer = Layer.mergeAll(
   }),
   EventsTable.layer({ name: "event-sourcing-example" }),
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
+  AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
+  WebCrypto,
 )
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion

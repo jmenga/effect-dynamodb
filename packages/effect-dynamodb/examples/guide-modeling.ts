@@ -129,6 +129,10 @@ const program = Effect.gen(function* () {
   })
 
   // --- Setup ---
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["modeling-guide-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["modeling-guide-table"]!.create()
   yield* Console.log("Table created\n")
 
@@ -153,8 +157,8 @@ const program = Effect.gen(function* () {
   const updated = yield* db.entities.Employees.update({ employeeId: "emp-alice" as any }).set({
     displayName: "Alice C.",
     department: "Platform",
-    // Must provide all GSI composites for ByTenant:
-    tenantId: "tenant-acme" as any,
+    // department leads byTenant's sort key [department, hireDate]: pass hireDate
+    // too, or the sort key is truncated to the department alone
     hireDate: DateTime.makeUnsafe("2024-01-15T00:00:00.000Z"),
   })
   yield* Console.log(`Updated: ${updated.displayName}, dept=${updated.department}`)
@@ -188,8 +192,5 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nComplete."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nComplete."))
 // #endregion

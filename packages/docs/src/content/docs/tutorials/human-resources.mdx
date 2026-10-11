@@ -26,7 +26,7 @@ As stakeholders of this HR system, we need to support these access patterns:
 5. **Client** — Find a physical office by location (country + state)
 6. **Hiring Manager** — Find employees by title, with salary range queries
 7. **HR** — Find all employees that report to a specific manager
-8. **HR** — Transfer an employee between offices (all GSI composites must be consistent)
+8. **HR** — Transfer an employee between offices (every touched GSI key is recomposed)
 9. **HR** — Atomically onboard a new employee with their first task
 10. **HR** — Terminate an employee (soft delete) and rehire them later (restore)
 
@@ -473,11 +473,11 @@ const jloweReports = yield* db.entities.Employees.byManager({ manager: "jlowe" }
 const cbaskinReports = yield* db.entities.Employees.byManager({ manager: "cbaskin" }).collect()
 ```
 
-### Requirement 8: Employee Transfer (All-or-None GSI Constraints)
+### Requirement 8: Employee Transfer (GSI Key Recomposition)
 
 > As HR, transfer an employee between offices while keeping all indexes consistent.
 
-Transferring an employee touches composites across multiple GSIs. When you update a field that appears in a GSI's composite key, you must provide **all** composites for that GSI — otherwise the index key can't be recomposed. This is the "fetch-merge" pattern.
+Transferring an employee touches composites across multiple GSIs. An update recomposes every GSI key half whose composites it touches, so each index the employee appears in reflects the transfer:
 
 ```typescript region="transfer" example="hr.ts"
   // #region transfer
@@ -494,13 +494,16 @@ Transferring an employee touches composites across multiple GSIs. When you updat
   const jloweReportsAfter = yield* db.entities.Employees.byManager({ manager: "jlowe" }).collect()
 ```
 
-What happens if you provide only some composites? The type system warns you, and at runtime `extractComposites` fails with a `ValidationError` naming the violating index:
+What happens if you provide only some composites? Each half of a GSI key (partition and sort) is recomposed on its own, and only when the update touches it. Setting `office` alone touches only the partition half of `workplaces`: the employee moves to the new office's partition, and the sort key (`team`, `title`, `employee`) is kept as stored. What a touched half that cannot be composed does is set per index by [`indexPolicy`](/effect-dynamodb/guides/index-policy/).
 
-```typescript region="partial-gsi-error" example="hr.ts"
-  const partialError = yield* db.entities.Employees.update({ employee: "dfinlay" })
-    .set({ office: "gw-zoo" } as any)
-    .asEffect()
-    .pipe(Effect.flip)
+```typescript region="partial-gsi-update" example="hr.ts"
+  const moved = yield* db.entities.Employees.update({ employee: "dfinlay" }).set({
+    office: "gw-zoo",
+  })
+
+  const { Employees: gwZooAfter } = yield* db.collections.workplaces!({
+    office: "gw-zoo",
+  }).collect()
 ```
 
 ### Requirement 9: Atomic Onboarding (Transaction)
@@ -592,10 +595,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---
@@ -608,7 +608,7 @@ Effect.runPromise(main).then(
 | **Index overloading** | GSI1 serves `workplaces` collection (employees + offices by office) and `byProject` index (tasks by project) |
 | **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries with grouped results |
 | **Sort key range queries** | Zero-padded salary in `byRole` (GSI4) SK enables `between` queries via `.where()` |
-| **All-or-none GSI updates** | Updating one GSI composite requires all composites for that index |
+| **GSI key recomposition** | An update recomposes each GSI key half whose composites it touches ([Index Policy](/effect-dynamodb/guides/index-policy/)) |
 | **Transactions** | Atomic multi-entity writes for onboarding |
 | **Soft delete + restore** | Termination archives records; rehire restores them with all keys recomposed |
 

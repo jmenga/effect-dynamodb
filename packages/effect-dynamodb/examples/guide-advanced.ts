@@ -127,6 +127,10 @@ const program = Effect.gen(function* () {
 
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["advanced-demo-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["advanced-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
@@ -198,7 +202,7 @@ const program = Effect.gen(function* () {
     .subtract({ stock: 5 })
     .append({ tags: ["premium"] })
     .remove(["description"])
-    .expectedVersion(5)
+    .expectedVersion(6)
   // #endregion
   yield* Console.log("Applied composed update to p-1\n")
 
@@ -283,7 +287,7 @@ const program = Effect.gen(function* () {
   // #region optimistic-condition
   yield* db.entities.Products.update({ productId: "p-1" })
     .set({ price: 24.99 })
-    .expectedVersion(6)
+    .expectedVersion(7)
     .condition((t, { gt }) => gt(t.stock, 0))
   // ConditionExpression: (#version = :v_lock) AND (#stock > :v0)
   // #endregion
@@ -410,8 +414,5 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion

@@ -13,8 +13,9 @@
  *   `VersionConflict` retry policy, caller-supplied `expectedVersion`,
  *   decision-derived `additionalItems`, inline snapshots)
  * - Stream indexes (`makeStream({ indexes })`): sub-streams ordered by a key
- *   derived from each event, on an LSI or GSI — `readIndex`, `query.index`,
- *   and `indexDefinitions` for the `CreateTable` fragments
+ *   derived from each event, on an LSI or GSI, each projecting all of the
+ *   event, all but its metadata, or only its keys — `readIndex`,
+ *   `query.index`, and `indexDefinitions` for the `CreateTable` fragments
  * - `fold` / `foldFrom` helpers for state reconstruction
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
@@ -26,6 +27,7 @@ import type {
   AttributeValue,
   GlobalSecondaryIndex,
   LocalSecondaryIndex,
+  Projection,
 } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
@@ -37,7 +39,6 @@ import {
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   type OptimisticLockError,
-  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   type UniqueConstraintViolation,
   ValidationError,
@@ -61,13 +62,18 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
-  refuseOversizedTransaction,
-  refuseRepeatedItems,
   type TransactItemTarget,
   type TransactWriteItem,
   type TransactWriteOp,
   transactItemTarget,
 } from "./internal/TransactWriteOps.js"
+import {
+  type Diagnosis,
+  diagnosedValidationError,
+  diagnoseFailure,
+  mergeKeyAttributes,
+  withCause,
+} from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import {
@@ -116,6 +122,11 @@ export interface StreamEvent<A, M = Record<string, unknown> | undefined> {
   readonly eventType: string
   readonly data: A
   readonly metadata: M
+  /**
+   * ISO 8601 (UTC): when the event was appended, by the append's `Clock` — or
+   * the `eventTimestamps` entry it was appended with
+   * ({@link AppendOptionsBase.eventTimestamps}).
+   */
   readonly timestamp: string
 }
 
@@ -221,7 +232,7 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
  *   succeeds, at the `every` cadence. A failed snapshot write never fails the
  *   command; the snapshot simply lags until the next threshold crossing.
  * - `"inline"` — the snapshot `Put` rides in the append's own transaction (see
- *   {@link AppendOptions.snapshot}), on every append, or at the `every` cadence
+ *   {@link AppendOptionsBase.snapshot}), on every append, or at the `every` cadence
  *   when one is set. The snapshot is then current after every command that
  *   writes one, so {@link EventStream.readLatest} loads state in one request.
  *   The snapshot counts towards the transaction's item and size limits.
@@ -250,7 +261,7 @@ export interface SnapshotSettings {
  * redelivery whose `decide` returns no events against the loaded state never
  * appends, so it succeeds as a no-op instead of failing with
  * `DuplicateCommand`. Whether a no-op redelivery needs to be told apart is the
- * application's call (see {@link CommandOptions.commandId}).
+ * application's call (see {@link CommandOptionsBase.commandId}).
  *
  * The sentinel is co-located in the stream's own partition, so `commandId`
  * uniqueness is scoped to the stream (which is what "have I already applied this
@@ -276,14 +287,49 @@ export interface AppendIdempotency {
 }
 
 /**
- * Options accepted by {@link EventStream.append}.
+ * The metadata of an {@link EventStream.append}: one value shared by every
+ * event (`metadata`), or one entry per event (`eventMetadata`) — never both.
+ *
+ * Passing both is a compile error, and a `ValidationError` at runtime for an
+ * untyped caller. `undefined` counts as absent for either, so
+ * `{ metadata: undefined, eventMetadata: [...] }` is not "both".
+ */
+export type AppendMetadataOptions<TMetadata> =
+  | {
+      /**
+       * Metadata written onto **every** event of the append — a copy per item,
+       * encoded once through the stream's metadata schema when one is
+       * configured. For metadata that belongs to each event (an event id, the
+       * original occurrence time of an imported event) use `eventMetadata`:
+       * packing a list into `metadata` stores every entry on every item, so
+       * stored metadata grows with the square of the append size.
+       */
+      readonly metadata?: TMetadata
+      readonly eventMetadata?: undefined
+    }
+  | {
+      readonly metadata?: undefined
+      /**
+       * Per-event metadata: entry `i` is written onto event `i` (and read back
+       * as that event's `StreamEvent.metadata`). Each defined entry is encoded
+       * through the stream's metadata schema, as `metadata` is; an `undefined`
+       * entry writes its event without a `metadata` attribute.
+       *
+       * Must have exactly one entry per event — a length mismatch fails with
+       * `ValidationError` before anything is read or written, also for an
+       * append of no events (where only `[]` is accepted).
+       */
+      readonly eventMetadata?: ReadonlyArray<TMetadata | undefined>
+    }
+
+/**
+ * The options of {@link EventStream.append} other than its metadata (see
+ * {@link AppendMetadataOptions}).
  *
  * `TState` is the stream's snapshot state type (`never` for a stream without a
  * `snapshot` config, so `snapshot` cannot be supplied there).
  */
-export interface AppendOptions<TMetadata, TState = never> {
-  /** Per-append metadata, validated against the stream's metadata schema when configured. */
-  readonly metadata?: TMetadata
+export interface AppendOptionsBase<TState = never> {
   /**
    * Caller-owned transact items committed atomically with the events — the same
    * op union `Transaction.transactWrite` accepts (`EntityPut`, `EntityDelete`,
@@ -322,7 +368,36 @@ export interface AppendOptions<TMetadata, TState = never> {
    * is `never`) it dies with `[EDD-9026]`, as `writeSnapshot` does.
    */
   readonly snapshot?: TState
+  /**
+   * Per-event timestamps: entry `i` is written as event `i`'s `timestamp` (and
+   * read back as that event's `StreamEvent.timestamp`), for history imported
+   * with its original occurrence times. An `undefined` entry keeps the
+   * append's `Clock` time. Independent of `metadata` / `eventMetadata`.
+   *
+   * Written with `DateTime.formatIso` — the format the append's own time is
+   * written in — so a zoned `DateTime` is stored as its UTC instant.
+   *
+   * - Must have exactly one entry per event, each a valid `DateTime` (finite
+   *   epoch) or `undefined` — anything else fails with `ValidationError` before anything is read or
+   *   written, also for an append of no events (where only `[]` is accepted).
+   * - Only the event items change: the idempotency sentinel, its TTL and the
+   *   inline snapshot record when the append was written.
+   * - No ordering is enforced. `version` orders a stream; timestamps may
+   *   repeat, run backwards or lie in the future, as imported history can.
+   */
+  readonly eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
 }
+
+/**
+ * Options accepted by {@link EventStream.append}: {@link AppendOptionsBase}
+ * plus the exclusive `metadata` / `eventMetadata` pair
+ * ({@link AppendMetadataOptions}).
+ *
+ * A type alias rather than an interface, since it is an intersection with a
+ * union: an interface cannot extend it.
+ */
+export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState> &
+  AppendMetadataOptions<TMetadata>
 
 /** Error channel of {@link EventStream.append}. */
 export type AppendError =
@@ -419,8 +494,10 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
  * - `undefined` leaves the event out of the index (a sparse index).
  * - An empty string (or any other value) fails the append with
  *   `ValidationError` before anything is written — DynamoDB rejects empty key
- *   values. So do a key over DynamoDB's 1024-byte sort-key limit and a `key`
- *   that throws.
+ *   values — as does a `key` that throws. A key over DynamoDB's 1024-byte
+ *   sort-key limit is sent and rejected by DynamoDB; the append then fails
+ *   with `ValidationError` naming the index and the event (#144), and nothing
+ *   is written.
  *
  * The key is derived only when an event is appended. Events are never
  * rewritten, so changing `key` later leaves events already stored under their
@@ -444,9 +521,9 @@ export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string 
  * An LSI must be created with the table. A table with any LSI caps the item
  * collection of **every** partition key value in it at 10 GB — not only the
  * indexed stream's partitions, but every stream's (indexed or not) and every
- * entity partition sharing the table; a write that would exceed it fails. Its
- * projection must be `ALL`, because events are decoded from the index item —
- * see {@link indexDefinitions}.
+ * entity partition sharing the table; a write that would exceed it fails. What
+ * the index copies from each event is its `projection` — see
+ * {@link StreamIndexProjection}.
  */
 export interface LocalStreamIndexConfig<TEvent> {
   readonly type?: "lsi" | undefined
@@ -455,14 +532,20 @@ export interface LocalStreamIndexConfig<TEvent> {
   /** An LSI uses the table partition key; supplying `pk` is refused (`[EDD-9063]`). */
   readonly pk?: undefined
   readonly key: StreamIndexKey<TEvent>
+  /**
+   * What the index copies from each event — see {@link StreamIndexProjection}.
+   * Default `"all"`. Must match the deployed index.
+   */
+  readonly projection?: StreamIndexProjection | undefined
 }
 
 /**
  * A stream index on a **global** secondary index. `append` writes the stream's
  * partition key value into the `pk` attribute of each indexed event, so the
  * index is scoped to the same stream: the eventually consistent equivalent of
- * an LSI, without the LSI's 10 GB item-collection cap. A strongly consistent
- * read of it is refused with `ValidationError`.
+ * an LSI, without the LSI's 10 GB item-collection cap. DynamoDB rejects a
+ * strongly consistent read of it, diagnosed as a `ValidationError` naming the
+ * index.
  *
  * Unlike an LSI, the GSI itself can be added to an existing table
  * (`UpdateTable`), but that does not index the stream's existing events: the
@@ -473,6 +556,7 @@ export interface LocalStreamIndexConfig<TEvent> {
  * - `pk` — the attribute carrying the stream's partition key (the GSI's HASH key).
  * - `sk` — the attribute carrying the derived key (the GSI's RANGE key).
  * - `key` — see {@link StreamIndexKey}.
+ * - `projection` — see {@link StreamIndexProjection}.
  */
 export interface GlobalStreamIndexConfig<TEvent> {
   readonly type: "gsi"
@@ -480,6 +564,11 @@ export interface GlobalStreamIndexConfig<TEvent> {
   readonly pk: string
   readonly sk: string
   readonly key: StreamIndexKey<TEvent>
+  /**
+   * What the index copies from each event — see {@link StreamIndexProjection}.
+   * Default `"all"`. Must match the deployed index.
+   */
+  readonly projection?: StreamIndexProjection | undefined
 }
 
 /**
@@ -492,30 +581,105 @@ export type StreamIndexConfig<TEvent> =
   | GlobalStreamIndexConfig<TEvent>
 
 /**
+ * What a stream index copies from each event (`projection` on an entry of
+ * `makeStream({ indexes })`). {@link indexDefinitions} emits the matching
+ * `Projection`, and the reads choose their path from it.
+ *
+ * | Value | Emitted `Projection` | Read |
+ * |---|---|---|
+ * | `"all"` (default) | `ALL` | one query |
+ * | `"withoutMetadata"` | `INCLUDE` of every event attribute except `metadata` | one query; `metadata` is `undefined` (and typed so) |
+ * | `"keys"` | `INCLUDE ["__edd_e__"]` — **not** `KEYS_ONLY` | LSI: one query with `Select: ALL_ATTRIBUTES` (DynamoDB fetches each event from the table). GSI: the query, then `BatchGetItem` for the events of each page, in index order |
+ *
+ * `__edd_e__` is always projected because every read filters on it, and
+ * DynamoDB refuses a filter on an attribute an index does not project.
+ *
+ * `metadata` is often an event's largest attribute; `"withoutMetadata"` keeps
+ * it out of the index, and `"keys"` keeps the index entries minimal at the cost
+ * of a table read per event read (rounded up to 4 KB each).
+ *
+ * **The declared projection must match the deployed index.** The library does
+ * not migrate: an LSI's projection is fixed when the table is created, and a
+ * GSI's cannot be updated (it must be deleted and created again). Tables
+ * deployed with CDK or Terraform copy `Projection` from
+ * {@link indexDefinitions}' output. An index deployed narrower than declared
+ * fails reads: DynamoDB refuses the `__edd_e__` filter ("does not project one
+ * or more filter attributes"), or rows lack event attributes, which the read
+ * reports as a `ValidationError` (`operation: "EventStore.index.decode"`)
+ * naming the index.
+ */
+export type StreamIndexProjection = "all" | "withoutMetadata" | "keys"
+
+/**
  * The runtime settings of one stream index, as exposed on
  * {@link EventStream.indexes}. `pk` is the index's partition key attribute:
  * the table's `pk` for an LSI, the configured attribute for a GSI.
+ * `projection` is resolved: `"all"` when the index declares none.
  */
 export interface StreamIndexSettings {
   readonly type: "lsi" | "gsi"
   readonly index: string
   readonly pk: string
   readonly sk: string
+  readonly projection: StreamIndexProjection
+}
+
+/**
+ * The `metadata` type of an event read through a stream index of projection
+ * `P`: `undefined` for a `"withoutMetadata"` index, which does not hold it,
+ * the stream's {@link StreamMetadata} otherwise.
+ */
+export type IndexEventMetadata<TMetadata, P extends StreamIndexProjection> = [P] extends [
+  "withoutMetadata",
+]
+  ? undefined
+  : StreamMetadata<TMetadata>
+
+/** @internal The `projection` an index config declares (`"all"` when none). */
+type ProjectionOf<C> = C extends { readonly projection: infer P extends StreamIndexProjection }
+  ? P
+  : "all"
+
+/**
+ * The projection of each index of a `makeStream({ indexes })` config, by name.
+ * `"all"` for an index that declares none.
+ */
+export type IndexProjectionsOf<TIndexes> = {
+  readonly [K in keyof TIndexes & string]: ProjectionOf<TIndexes[K]>
+}
+
+/** @internal The members a stream index entry may declare. */
+type StreamIndexConfigKey =
+  | keyof LocalStreamIndexConfig<unknown>
+  | keyof GlobalStreamIndexConfig<unknown>
+
+/**
+ * The `indexes` parameter of {@link makeStream}: each entry is a
+ * {@link StreamIndexConfig}, and a member it does not declare (a misspelled
+ * `projection`, say) is typed `never`, so it is a compile error. Inferring
+ * `TIndexes` from the entries turns off TypeScript's own excess-property check,
+ * which would otherwise catch it.
+ */
+export type StreamIndexesConfig<TIndexes, TEvent> = {
+  readonly [K in keyof TIndexes]: StreamIndexConfig<TEvent> & {
+    readonly [P in Exclude<keyof TIndexes[K], StreamIndexConfigKey>]: never
+  }
 }
 
 /**
  * Options accepted by {@link EventStream.readIndex}.
  *
  * - `beginsWith` / `between` — a sort-key condition on the derived key (at most
- *   one of them). Omitted, the whole sub-stream is read. Each bound must be a
- *   non-empty string, and `between`'s lower bound must not sort (by UTF-8
- *   bytes, as DynamoDB sorts) after its upper bound; otherwise the read fails
- *   with `ValidationError` before anything is sent.
+ *   one of them, string bounds). Omitted, the whole sub-stream is read.
+ *   DynamoDB rejects an empty bound, and a `between` whose lower bound sorts
+ *   (by UTF-8 bytes) after its upper bound; the read then fails with a
+ *   `ValidationError` naming the index and the bound, DynamoDB's error as its
+ *   cause.
  * - `reverse` — descending key order.
  * - `limit` — return at most this many events (a positive integer).
- * - `consistentRead` — strongly consistent read. Refused with
- *   `ValidationError` on a GSI-backed index, which DynamoDB reads only
- *   eventually consistently.
+ * - `consistentRead` — strongly consistent read. DynamoDB rejects it on a
+ *   GSI-backed index, which it reads only eventually consistently: the read
+ *   fails with a `ValidationError` naming the index.
  */
 export type ReadIndexOptions = {
   readonly reverse?: boolean | undefined
@@ -526,32 +690,13 @@ export type ReadIndexOptions = {
   | { readonly between?: readonly [string, string] | undefined; readonly beginsWith?: undefined }
 )
 
-/** @internal DynamoDB's limit on a sort key value, which an index key is. */
-const MAX_INDEX_SORT_KEY_BYTES = 1024
-
-/** @internal */
-const utf8 = new TextEncoder()
-
-/**
- * @internal Compare two strings by their UTF-8 bytes — the order DynamoDB
- * sorts (and evaluates `BETWEEN` on) string keys. JavaScript's `<` compares
- * UTF-16 code units, which disagrees for characters outside the BMP.
- */
-const compareUtf8 = (a: string, b: string): number => {
-  const left = utf8.encode(a)
-  const right = utf8.encode(b)
-  const length = Math.min(left.length, right.length)
-  for (let i = 0; i < length; i++) {
-    const diff = left[i]! - right[i]!
-    if (diff !== 0) return diff
-  }
-  return left.length - right.length
-}
-
 /**
  * @internal Why a {@link ReadIndexOptions} key condition cannot be sent, or
- * `undefined` when it can. DynamoDB rejects an empty key value and a
- * `BETWEEN` whose lower bound sorts after its upper bound.
+ * `undefined` when it can: the options' own meaning — at most one of
+ * `beginsWith` and `between`, string bounds (a number would be sent as `N`
+ * against a string key). DynamoDB's rules on the bounds — not empty, a
+ * `between` in order — are DynamoDB's to enforce: its rejection is diagnosed,
+ * naming the index and the bound (#144).
  */
 const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string | undefined => {
   if (options?.beginsWith !== undefined && options.between !== undefined) {
@@ -559,26 +704,18 @@ const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string
   }
   const beginsWith: unknown = options?.beginsWith
   if (beginsWith !== undefined) {
-    if (typeof beginsWith !== "string" || beginsWith.length === 0) {
-      return (
-        "beginsWith must be a non-empty string — DynamoDB rejects an empty key value; " +
-        "omit it to read the whole sub-stream."
-      )
-    }
-    return undefined
+    return typeof beginsWith === "string"
+      ? undefined
+      : "beginsWith must be a string; omit it to read the whole sub-stream."
   }
   const between: unknown = options?.between
   if (between === undefined) return undefined
   if (
     !Array.isArray(between) ||
     between.length !== 2 ||
-    !between.every((bound) => typeof bound === "string" && bound.length > 0)
+    !between.every((bound) => typeof bound === "string")
   ) {
-    return "between must be a pair of non-empty strings — DynamoDB rejects an empty key value."
-  }
-  const [low, high] = between as [string, string]
-  if (compareUtf8(low, high) > 0) {
-    return `between's lower bound ${JSON.stringify(low)} sorts after its upper bound ${JSON.stringify(high)}.`
+    return "between must be a pair of strings."
   }
   return undefined
 }
@@ -591,6 +728,37 @@ interface ResolvedStreamIndex extends StreamIndexSettings {
   readonly name: string
   readonly key: StreamIndexKey<unknown>
 }
+
+/**
+ * @internal The attributes `append` writes on every event item besides the
+ * table key (`pk`, `sk`), the optional `metadata` and the index attributes:
+ * the envelope, `data` and the `__edd_e__` discriminator. Sorted. A
+ * `"withoutMetadata"` stream index projects exactly these.
+ */
+const EVENT_ITEM_ATTRIBUTES = [
+  "__edd_e__",
+  "data",
+  "eventType",
+  "streamId",
+  "timestamp",
+  "version",
+] as const
+
+/** @internal One of {@link EVENT_ITEM_ATTRIBUTES}. */
+type EventItemAttribute = (typeof EVENT_ITEM_ATTRIBUTES)[number]
+
+/**
+ * @internal The event attributes an `"all"` or `"withoutMetadata"` stream index
+ * guarantees on its rows and a decode needs: a row lacking one was read
+ * through an index deployed narrower than declared.
+ */
+const PROJECTED_ENVELOPE_ATTRIBUTES: ReadonlyArray<EventItemAttribute> = [
+  "data",
+  "eventType",
+  "streamId",
+  "timestamp",
+  "version",
+]
 
 /**
  * @internal Attributes a stream writes on its own items — events, snapshot,
@@ -613,11 +781,23 @@ const STREAM_OWNED_ATTRIBUTES: ReadonlyArray<string> = [
   DEFAULT_TTL_ATTRIBUTE_NAME,
 ]
 
+/** @internal Every member a stream index entry may declare (`StreamIndexConfigKey`). */
+const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
+  "type",
+  "index",
+  "pk",
+  "sk",
+  "key",
+  "projection",
+] satisfies ReadonlyArray<StreamIndexConfigKey>
+
 /**
  * @internal Validate `makeStream({ indexes })` at definition time.
  *
  * @throws `[EDD-9063]` for a malformed entry (unknown `type`, a `gsi` without
- *   `pk`, an `lsi` with `pk`, an empty name, a `key` that is not a function).
+ *   `pk`, an `lsi` with `pk`, an empty name, a `key` that is not a function,
+ *   an unknown `projection`, a member the entry type does not declare — a
+ *   misspelled `projection` would otherwise silently mean `"all"`).
  * @throws `[EDD-9064]` for an index attribute that collides with a
  *   stream-owned attribute.
  * @throws `[EDD-9065]` for two indexes sharing a physical index name or an
@@ -638,6 +818,14 @@ const resolveStreamIndexes = (
       fail("EDD-9063", `index "${name}" must be an object; received ${String(raw)}.`)
     }
     const entry = raw as Record<string, unknown>
+    const unknownKey = Object.keys(entry).find((key) => !STREAM_INDEX_CONFIG_KEYS.includes(key))
+    if (unknownKey !== undefined) {
+      fail(
+        "EDD-9063",
+        `index "${name}": unknown member "${unknownKey}"; an index declares ` +
+          `${STREAM_INDEX_CONFIG_KEYS.join(", ")}.`,
+      )
+    }
     const type = (entry.type ?? "lsi") as "lsi" | "gsi"
     if (type !== "lsi" && type !== "gsi") {
       fail(
@@ -669,6 +857,14 @@ const resolveStreamIndexes = (
       fail(
         "EDD-9063",
         `index "${name}": key must be a function (event, version) => string | undefined.`,
+      )
+    }
+    const projection = (entry.projection ?? "all") as StreamIndexProjection
+    if (projection !== "all" && projection !== "withoutMetadata" && projection !== "keys") {
+      fail(
+        "EDD-9063",
+        `index "${name}": projection must be "all", "withoutMetadata" or "keys"; received ` +
+          `${JSON.stringify(entry.projection)}.`,
       )
     }
     const index = entry.index as string
@@ -709,6 +905,7 @@ const resolveStreamIndexes = (
       index,
       pk,
       sk,
+      projection,
       key: entry.key as StreamIndexKey<unknown>,
     })
   }
@@ -811,6 +1008,46 @@ const unverifiedSnapshotRefusal = (
       `append, so it is normally at the head. This stream's snapshot is mode "${settings.mode}"` +
       `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`
 
+/**
+ * @internal Why an `eventTimestamps` value cannot be written for `count`
+ * events — not an array, the wrong length, or an entry that is neither a
+ * valid `DateTime` (finite epoch) nor `undefined` — or `undefined` when it can. `label` opens the
+ * message (`"eventTimestamps has"` / `"eventTimestamps returned"`) and
+ * `events` names the events (`"2 events"` / `"the decision's 2 events"`).
+ */
+const eventTimestampsProblem = (
+  timestamps: unknown,
+  count: number,
+  label: string,
+  events: string,
+): string | undefined => {
+  if (!Array.isArray(timestamps) || timestamps.length !== count) {
+    return (
+      `${label} ${Array.isArray(timestamps) ? timestamps.length : "no"} entries for ${events}: ` +
+      "it needs exactly one entry (a DateTime, or undefined) per event, in order."
+    )
+  }
+  const malformed = timestamps.findIndex(
+    (t) =>
+      t !== undefined && (!DateTime.isDateTime(t) || !Number.isFinite(DateTime.toEpochMillis(t))),
+  )
+  if (malformed === -1) return undefined
+  const entry: unknown = timestamps[malformed]
+  // A DateTime with a NaN epoch (e.g. `setPartsUtc` from a bad parse) passes
+  // `isDateTime` but makes `formatIso` throw, so it is refused here instead.
+  if (DateTime.isDateTime(entry)) {
+    return (
+      `eventTimestamps[${malformed}] is an invalid DateTime (its epoch milliseconds are not a ` +
+      "finite number): each entry must be a valid DateTime, or undefined to keep the append's own time."
+    )
+  }
+  return (
+    `eventTimestamps[${malformed}] is not a DateTime (received ` +
+    `${entry instanceof Date ? "a Date — convert it with DateTime.fromDateUnsafe" : entry === null ? "null" : typeof entry}): ` +
+    "each entry must be a DateTime, or undefined to keep the append's own time."
+  )
+}
+
 // ---------------------------------------------------------------------------
 // EventStream interface
 // ---------------------------------------------------------------------------
@@ -823,7 +1060,9 @@ const unverifiedSnapshotRefusal = (
  *
  * `TIndexName` is the union of the stream's index names (`makeStream({ indexes })`),
  * `never` for a stream without indexes, so {@link EventStream.readIndex} and
- * `query.index` only accept a declared name.
+ * `query.index` only accept a declared name. `TIndexProjections` is each
+ * index's {@link StreamIndexProjection} by name, so an event read through a
+ * `"withoutMetadata"` index has `metadata: undefined`.
  */
 export interface EventStream<
   TEvent,
@@ -831,6 +1070,9 @@ export interface EventStream<
   TMetadata,
   TState = never,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -979,15 +1221,21 @@ export interface EventStream<
    * Read the stream's events in the order of one of its indexes (#140) — the
    * events whose index `key` returned a string, ordered by that key. A
    * convenience over `query.index`; pass `beginsWith` or `between` to narrow
-   * the key range, `reverse`, `limit` and `consistentRead` (refused on a GSI)
-   * — see {@link ReadIndexOptions}.
+   * the key range, `reverse`, `limit` and `consistentRead` (which DynamoDB
+   * rejects on a GSI; the error names the index) — see {@link ReadIndexOptions}.
+   *
+   * How the events are read follows the index's {@link StreamIndexProjection}:
+   * one query for `"all"` and `"withoutMetadata"` (whose events have
+   * `metadata: undefined`, as the type says); for `"keys"`, one query with
+   * `Select: ALL_ATTRIBUTES` on an LSI, or the query followed by `BatchGetItem`
+   * (unprocessed keys retried, index order kept) on a GSI.
    */
-  readIndex(
-    name: TIndexName,
+  readIndex<N extends TIndexName>(
+    name: N,
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
@@ -1000,15 +1248,22 @@ export interface EventStream<
      * A query of one of the stream's indexes (#140), scoped to `streamId`:
      * decoded events in index-key order. It composes with the `Query`
      * combinators — `Query.where` (a condition on the derived key),
-     * `Query.reverse`, `Query.limit`, `Query.consistentRead` (refused with
-     * `ValidationError` on a GSI-backed index) — and terminals
+     * `Query.reverse`, `Query.limit`, `Query.consistentRead` (DynamoDB rejects
+     * it on a GSI-backed index: a `ValidationError` naming the index) — and terminals
      * (`Query.collect`, `Query.execute`, `Query.paginate`). The
      * `__edd_e__ = <stream>.event` filter still applies.
+     *
+     * It reads as {@link EventStream.readIndex} does for the index's
+     * projection: a `"keys"` GSI fetches each page's events with
+     * `BatchGetItem` (`Query.select` moves onto that fetch); `Query.count`
+     * counts index entries and fetches nothing. On a `"keys"` or
+     * `"withoutMetadata"` index, a `Query.filter` on an attribute the index
+     * does not project is refused by DynamoDB — use `Query.filterBy`.
      */
-    index(
-      name: TIndexName,
+    index<N extends TIndexName>(
+      name: N,
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 }
 
@@ -1031,8 +1286,11 @@ export interface EventStream<
  */
 interface AppendTransaction {
   readonly items: Array<TransactWriteItem>
-  /** Parallel to `items`, for `refuseRepeatedItems` / `refuseOversizedTransaction`. */
-  readonly targets: Array<TransactItemTarget>
+  /**
+   * Parallel to `items`, for the failure-time diagnosis: built on its first
+   * call (only on failure), the same array on every call.
+   */
+  readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guardCount: number
   readonly eventCount: number
   readonly additional: BuiltTransactWriteItems
@@ -1105,7 +1363,9 @@ interface AppendTransaction {
  * event's derived key (and, for a GSI, the stream's partition key) on the
  * event item; snapshots and idempotency sentinels never carry them, so they
  * are never in an index. Read with {@link EventStream.readIndex} or
- * `query.index`, and create the indexes with {@link indexDefinitions}.
+ * `query.index`, and create the indexes with {@link indexDefinitions}. Each
+ * index's `projection` (default `"all"`) sets what it copies from each event
+ * and how it is read — see {@link StreamIndexProjection}.
  *
  * Index attributes are written only at append time and events are never
  * rewritten. Declaring an index on a stream that already holds events, or
@@ -1142,7 +1402,9 @@ interface AppendTransaction {
  *   `"inline"`.
  * @throws `[EDD-9063]` for a malformed index: a `type` other than `"lsi"` /
  *   `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk`
- *   / `pk`, or a `key` that is not a function.
+ *   / `pk`, a `key` that is not a function, a `projection` other than
+ *   `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does
+ *   not declare (such as a misspelled `projection`, also a type error).
  * @throws `[EDD-9064]` when an index attribute is one the stream writes itself
  *   (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
  *   `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, or the
@@ -1159,7 +1421,9 @@ export const makeStream = <
   const TStreamId extends { readonly composite: ReadonlyArray<string> },
   TMetadata extends Schema.Top | undefined = undefined,
   TSnapshot extends SnapshotConfig | undefined = undefined,
-  const TIndexName extends string = never,
+  const TIndexes extends {
+    readonly [K in keyof TIndexes]: StreamIndexConfig<Schema.Schema.Type<TEvents[number]>>
+  } = {},
 >(config: {
   readonly table: TTable
   readonly streamName: TStreamName
@@ -1168,15 +1432,14 @@ export const makeStream = <
   readonly metadata?: TMetadata
   readonly snapshot?: TSnapshot
   readonly casing?: DynamoSchema.Casing | undefined
-  readonly indexes?: {
-    readonly [K in TIndexName]: StreamIndexConfig<Schema.Schema.Type<TEvents[number]>>
-  }
+  readonly indexes?: TIndexes & StreamIndexesConfig<TIndexes, Schema.Schema.Type<TEvents[number]>>
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
   TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
   TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
-  TIndexName
+  keyof TIndexes & string,
+  IndexProjectionsOf<TIndexes>
 > => {
   type TEvent = Schema.Schema.Type<TEvents[number]>
   type TStreamIdFields = TStreamId["composite"]
@@ -1247,7 +1510,13 @@ export const makeStream = <
   )
   const indexSettings: Record<string, StreamIndexSettings> = {}
   for (const idx of streamIndexes) {
-    indexSettings[idx.name] = { type: idx.type, index: idx.index, pk: idx.pk, sk: idx.sk }
+    indexSettings[idx.name] = {
+      type: idx.type,
+      index: idx.index,
+      pk: idx.pk,
+      sk: idx.sk,
+      projection: idx.projection,
+    }
   }
   /** Every attribute the indexes write on an event item. */
   const indexAttributes = streamIndexes.flatMap((idx) =>
@@ -1401,10 +1670,12 @@ export const makeStream = <
   // ---------------------------------------------------------------------------
 
   /**
-   * An event's key in a stream index (#140): a non-empty string, or
-   * `undefined` to leave the event out. Anything else — an empty string
-   * (DynamoDB rejects empty key values), another type, a `key` that throws —
-   * is a `ValidationError`, raised before anything is written.
+   * An event's key in a stream index (#140): a string, or `undefined` to
+   * leave the event out. Another type, or a `key` that throws, is a
+   * `ValidationError`, raised before anything is written. DynamoDB's own
+   * rules on a key — not empty, at most 1024 bytes for a sort key — are not
+   * pre-checked: DynamoDB rejects the append and the rejection is diagnosed,
+   * naming the index and event (see `sendAppendTransaction`).
    */
   const deriveIndexKey = (
     idx: ResolvedStreamIndex,
@@ -1428,16 +1699,12 @@ export const makeStream = <
                 "Nothing was written.",
             }),
           )
-        if (typeof derived !== "string" || derived === "") {
-          return refuse(
-            "must be a non-empty string or undefined; received " +
-              (typeof derived === "string" ? "an empty string" : String(derived)),
-          )
-        }
-        if (utf8.encode(derived).length > MAX_INDEX_SORT_KEY_BYTES) {
-          return refuse(
-            `is longer than DynamoDB's ${MAX_INDEX_SORT_KEY_BYTES}-byte limit for a sort key`,
-          )
+        // A string, or the event is not indexed: what the stream's own key
+        // contract means, which DynamoDB cannot see (a number would be sent
+        // as `N`). An empty string is DynamoDB's to reject, and is diagnosed
+        // from its rejection, naming the index and the event (#144).
+        if (typeof derived !== "string") {
+          return refuse(`must be a string or undefined; received ${String(derived)}`)
         }
         return Effect.succeed(derived)
       }),
@@ -1472,12 +1739,31 @@ export const makeStream = <
     tx: AppendTransaction,
     streamIdStr: string,
     commandId: string | undefined,
-  ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> =>
-    client.transactWriteItems({ TransactItems: tx.items }).pipe(
+  ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> => {
+    const sent = () => ({ _tag: "Transaction" as const, items: tx.items, targets: tx.targets })
+    const diagnosed = (
+      diagnosis: Diagnosis,
+      original: unknown,
+    ): AppendTooLarge | ValidationError =>
+      diagnosis._tag === "TooManyItems"
+        ? new AppendTooLarge({
+            streamName: config.streamName,
+            streamId: streamIdStr,
+            count: diagnosis.count,
+            limit: diagnosis.limit,
+            cause: original,
+          })
+        : appendLimitError(diagnosis, original, tx)
+    return client.transactWriteItems({ TransactItems: tx.items }).pipe(
       Effect.as(undefined),
+      // One operation per item (#133, #144): diagnosed BEFORE the conditional
+      // mapping below — DynamoDB can report a repeated item as a conditional
+      // failure, which would read as a version conflict or a lost race (and
+      // be retried). Terminal.
+      diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite: diagnosed }),
       Effect.catch(
         (
-          error: DynamoClientError,
+          error: DynamoClientError | AppendTooLarge | ValidationError,
         ): Effect.Effect<OptimisticLockError | ConcurrentModification, AppendError> => {
           if (!isAwsTransactionCancelled(error.cause)) {
             return Effect.fail(error)
@@ -1549,7 +1835,72 @@ export const makeStream = <
           )
         },
       ),
+      // DynamoDB's limits are not pre-checked (#144): a rejection the
+      // conditional mapping above could not explain is diagnosed against the
+      // transaction sent, naming the event, sentinel, snapshot or additional
+      // item at fault. Over 100 items is `AppendTooLarge`, with the EXPANDED
+      // count.
+      diagnoseFailure({
+        sent,
+        keys: () =>
+          mergeKeyAttributes(
+            {
+              partition: ["pk", ...streamIndexes.map((idx) => idx.pk)],
+              sort: ["sk", ...streamIndexes.map((idx) => idx.sk)],
+            },
+            tx.additional.keys(),
+          ),
+        rewrite: diagnosed,
+      }),
     )
+  }
+
+  /**
+   * A diagnosed rejection of an append (#144) other than its item count. An
+   * over-long (or empty) stream-index sort key OF AN EVENT — the value the
+   * index's `key` function returned — is named by its index and event, as
+   * the `indexes` option reports its other key problems. Only the event puts
+   * carry stream-index keys: an additional item writing the same physical
+   * attribute (single-table designs share `gsi1sk` and the like) is its own
+   * entity's key, and is named as any other item.
+   */
+  const appendLimitError = (
+    diagnosis: Diagnosis,
+    original: unknown,
+    tx: AppendTransaction,
+  ): ValidationError => {
+    if (
+      (diagnosis._tag === "KeyTooLong" && diagnosis.kind === "sort") ||
+      diagnosis._tag === "EmptyKey"
+    ) {
+      const position = tx.targets().indexOf(diagnosis.target)
+      const isEvent = position >= tx.guardCount && position < tx.guardCount + tx.eventCount
+      const idx = isEvent
+        ? streamIndexes.find((candidate) => candidate.sk === diagnosis.attribute)
+        : undefined
+      if (idx !== undefined) {
+        return new ValidationError({
+          entityType,
+          operation: "EventStore.append.indexes",
+          cause: withCause(
+            `The key of index "${idx.name}" for ${diagnosis.target.source} ` +
+              (diagnosis._tag === "KeyTooLong"
+                ? `is ${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a ` +
+                  "sort key."
+                : "is an empty string, which DynamoDB does not accept as a key value; the " +
+                  "key function must return a non-empty string, or undefined to leave the " +
+                  "event out of the index.") +
+              " DynamoDB rejected the append. Nothing was written.",
+            original,
+          ),
+        })
+      }
+    }
+    return diagnosedValidationError(diagnosis, original, {
+      operation: "EventStore.append",
+      entityType,
+    })
+  }
 
   const append = (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -1561,6 +1912,51 @@ export const makeStream = <
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
       const snapshotState = options?.snapshot
+      const eventMetadata = options?.eventMetadata
+
+      // Per-event metadata (#144) is checked first — ahead of the no-op fast
+      // path below, which would otherwise accept `append(id, [], v,
+      // { eventMetadata: [m] })` without looking at it.
+      if (eventMetadata !== undefined) {
+        if (options?.metadata !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventMetadata",
+            cause:
+              "metadata and eventMetadata are mutually exclusive: pass one value shared by " +
+              "every event, or one entry per event. Nothing was written.",
+          })
+        }
+        if (!Array.isArray(eventMetadata) || eventMetadata.length !== events.length) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventMetadata",
+            cause:
+              `eventMetadata has ${Array.isArray(eventMetadata) ? eventMetadata.length : "no"} ` +
+              `entries for ${events.length} events: it needs exactly one entry (or undefined) ` +
+              "per event, in order. Nothing was written.",
+          })
+        }
+      }
+
+      // Per-event timestamps (#144), checked alongside the metadata and for
+      // the same reason: ahead of the no-op fast path.
+      const eventTimestamps = options?.eventTimestamps
+      if (eventTimestamps !== undefined) {
+        const problem = eventTimestampsProblem(
+          eventTimestamps,
+          events.length,
+          "eventTimestamps has",
+          `${events.length} events`,
+        )
+        if (problem !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.eventTimestamps",
+            cause: `${problem} Nothing was written.`,
+          })
+        }
+      }
 
       if (snapshotState !== undefined && snapshot === undefined) {
         return yield* snapshotUnavailable("append({ snapshot })")
@@ -1595,33 +1991,11 @@ export const makeStream = <
         })
       }
 
-      // Guard: every item the transaction will carry — one Put per event, the
-      // items each caller-supplied additional op compiles to, the idempotency
-      // sentinel, the inline snapshot, and the version-contiguity
-      // ConditionCheck when expectedVersion > 0 — must fit DynamoDB's
-      // TransactWriteItems limit. Never split: splitting would break append
-      // atomicity (a large command is stepped by the application instead — one
-      // command, one decision, one atomic append).
-      //
-      // This first check is a LOWER BOUND, counting one item per additional op.
-      // Expansion (uniqueness sentinels, version snapshots — #113) only ever
-      // adds items, so an append that already fails here can never fit, and
-      // failing now keeps an oversized append free. The authoritative check runs
-      // once the ops are compiled, below.
+      // DynamoDB's 100-item limit on one transaction is not pre-checked
+      // (#144): an append is never split — splitting would break its
+      // atomicity — so one over the limit is rejected whole by DynamoDB and
+      // reported as `AppendTooLarge`, with the expanded item count.
       const needsContiguityCheck = expectedVersion > 0 && events.length > 0
-      const fixedItems =
-        events.length +
-        (idempotency !== undefined ? 1 : 0) +
-        (snapshotState !== undefined ? 1 : 0) +
-        (needsContiguityCheck ? 1 : 0)
-      if (fixedItems + additionalOps.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-        return yield* new AppendTooLarge({
-          streamName: config.streamName,
-          streamId: streamIdStr,
-          count: fixedItems + additionalOps.length,
-          limit: TRANSACT_WRITE_ITEMS_LIMIT,
-        })
-      }
 
       const client = yield* DynamoClient
       const tableConfig = yield* config.table.Tag
@@ -1647,7 +2021,8 @@ export const makeStream = <
       const nowDateTime = yield* DateTime.now
       const now = DateTime.formatIso(nowDateTime)
 
-      // Validate and encode metadata to wire form if schema provided
+      // Validate and encode metadata to wire form if schema provided. Shared
+      // by every event; per-event `eventMetadata` is encoded in the loop below.
       let encodedMetadata: Record<string, unknown> | undefined
       if (options?.metadata !== undefined && metadataSchema) {
         const encoded = yield* encodeToWire(
@@ -1686,7 +2061,31 @@ export const makeStream = <
             // events already carry _tag in their encoded form, which wins.
             const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
 
-            const item: Record<string, unknown> = {
+            // This event's own metadata entry (#144), encoded as `metadata`
+            // is; an `undefined` entry writes no metadata attribute.
+            let itemMetadata = encodedMetadata
+            if (eventMetadata !== undefined) {
+              const entry = eventMetadata[i]
+              itemMetadata =
+                entry === undefined
+                  ? undefined
+                  : metadataSchema
+                    ? ((yield* encodeToWire(
+                        metadataSchema as Schema.Codec<any>,
+                        entry,
+                        `EventStore.append.eventMetadata[${i}]`,
+                      )) as Record<string, unknown>)
+                    : (entry as Record<string, unknown>)
+            }
+
+            // This event's own timestamp (#144), or the append's `now`.
+            // `formatIso` renders the UTC instant, so a zoned DateTime is
+            // stored in the same format as `now`.
+            const eventTimestamp = eventTimestamps?.[i]
+
+            // Exactly the table key and EVENT_ITEM_ATTRIBUTES — what a
+            // "withoutMetadata" stream index projects — checked by the type.
+            const envelope: { readonly [K in "pk" | "sk" | EventItemAttribute]: unknown } = {
               pk,
               sk: composeEventSk(version),
               __edd_e__: entityType,
@@ -1694,10 +2093,11 @@ export const makeStream = <
               version,
               eventType: evtType,
               data: eventData,
-              timestamp: now,
+              timestamp: eventTimestamp === undefined ? now : DateTime.formatIso(eventTimestamp),
             }
-            if (encodedMetadata !== undefined) {
-              item.metadata = encodedMetadata
+            const item: Record<string, unknown> = { ...envelope }
+            if (itemMetadata !== undefined) {
+              item.metadata = itemMetadata
             }
 
             // Stream indexes (#140): the derived key, stored raw, and for a
@@ -1813,10 +2213,11 @@ export const makeStream = <
        */
       const layout = (additional: BuiltTransactWriteItems): AppendTransaction => {
         const items: Array<TransactWriteItem> = []
-        const targets: Array<TransactItemTarget> = []
+        // What names each item, so the targets are built only on failure.
+        const naming: Array<() => ReadonlyArray<TransactItemTarget>> = []
         const pushStreamItem = (item: TransactWriteItem, type: string, source: string) => {
           items.push(item)
-          targets.push(transactItemTarget(item, tableName, ["pk", "sk"], type, source))
+          naming.push(() => [transactItemTarget(item, tableName, ["pk", "sk"], type, source)])
         }
         if (contiguityCheck !== undefined) {
           pushStreamItem(contiguityCheck, entityType, "the version-contiguity check")
@@ -1826,7 +2227,7 @@ export const makeStream = <
           pushStreamItem(item, entityType, `the event at version ${expectedVersion + i + 1}`)
         }
         items.push(...additional.items)
-        targets.push(...additional.targets)
+        naming.push(additional.targets)
         const sentinelIndex = sentinelPut === undefined ? -1 : items.length
         if (sentinelPut !== undefined) {
           pushStreamItem(sentinelPut, entityType, "the idempotency sentinel")
@@ -1834,9 +2235,11 @@ export const makeStream = <
         if (snapshotPut !== undefined) {
           pushStreamItem(snapshotPut, snapshotEntityType, "the inline snapshot")
         }
+        let targets: ReadonlyArray<TransactItemTarget> | undefined
         return {
           items,
-          targets,
+          // Built once, on failure: a diagnosis's target is found by identity.
+          targets: () => (targets ??= naming.flatMap((name) => name())),
           guardCount,
           eventCount: eventItems.length,
           additional,
@@ -1857,27 +2260,11 @@ export const makeStream = <
         )
         const tx = layout(additional)
 
-        // Authoritative cap check: one additional op can compile to several
-        // items (#113), so the pre-flight lower bound above is not sufficient.
-        // Reporting the EXPANDED count is the point — "you passed 40 items"
-        // when the caller passed 30 ops is baffling without it.
-        if (tx.items.length > TRANSACT_WRITE_ITEMS_LIMIT) {
-          return yield* new AppendTooLarge({
-            streamName: config.streamName,
-            streamId: streamIdStr,
-            count: tx.items.length,
-            limit: TRANSACT_WRITE_ITEMS_LIMIT,
-          })
-        }
-
-        // Checked before anything is sent: one op per item — an additional
-        // item repeating an event, the contiguity check, the idempotency
-        // sentinel or the inline snapshot is refused, as additional items
-        // repeating each other are — and the transaction within DynamoDB's
-        // 4 MB (#133).
-        yield* refuseRepeatedItems(tx.targets, "EventStore.append")
-        yield* refuseOversizedTransaction(tx.items, tx.targets, "EventStore.append")
-
+        // DynamoDB's rules — one operation per item (an additional item
+        // repeating an event, the contiguity check, the idempotency sentinel
+        // or the inline snapshot, or another additional item), 100 items,
+        // 4 MB, 400 KB per item, 1024-byte sort keys — are not pre-checked:
+        // `sendAppendTransaction` diagnoses DynamoDB's rejection (#144).
         const outcome = yield* sendAppendTransaction(
           client,
           tx,
@@ -2023,22 +2410,42 @@ export const makeStream = <
         timestamp: now,
       }
 
-      yield* client
-        .putItem({
-          TableName: tableName,
-          Item: toAttributeMap(item),
-          // Monotonic: never regress the cache. Losing this race is a no-op,
-          // not an error — the events it summarises are already durable.
-          ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
-          ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
-          ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
-        })
-        .pipe(
-          Effect.catchIf(
-            (error) => isAwsConditionalCheckFailed(error.cause),
-            () => Effect.void,
-          ),
-        )
+      const put = {
+        TableName: tableName,
+        Item: toAttributeMap(item),
+        // Monotonic: never regress the cache. Losing this race is a no-op,
+        // not an error — the events it summarises are already durable.
+        ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
+        ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
+        ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
+      }
+      yield* client.putItem(put).pipe(
+        Effect.catchIf(
+          (error) => isAwsConditionalCheckFailed(error.cause),
+          () => Effect.void,
+        ),
+        // An oversized snapshot is DynamoDB's to reject (#144); named here.
+        diagnoseFailure({
+          sent: () => ({
+            _tag: "Item",
+            item: { Put: put },
+            target: () =>
+              transactItemTarget(
+                { Put: put },
+                tableName,
+                ["pk", "sk"],
+                snapshotEntityType,
+                "the snapshot",
+              ),
+          }),
+          keys: () => ({ partition: ["pk"], sort: ["sk"] }),
+          rewrite: (diagnosis, original) =>
+            diagnosedValidationError(diagnosis, original, {
+              operation: "EventStore.writeSnapshot",
+              entityType: snapshotEntityType,
+            }),
+        }),
+      )
     }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
@@ -2310,14 +2717,70 @@ export const makeStream = <
       pkValue: composeStreamPk(streamId as Record<string, unknown>),
       skField: idx.sk,
       entityTypes: [entityType],
-      decoder: (raw) => decodeStreamEvent(raw),
+      decoder: indexDecoder(idx),
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
-      // A GSI is read only eventually consistently: `Query.consistentRead`
-      // on it is refused before anything is sent.
-      globalIndex: idx.type === "gsi",
+      // DynamoDB's rejection of the key condition (an empty bound, a reversed
+      // `between`) is named against the stream index; so, as for every
+      // query, is a consistent read of a GSI (#144).
+      keyConditionDiagnosis: {
+        operation: "EventStore.readIndex",
+        label: `EventStream "${config.streamName}" index "${idx.name}"`,
+      },
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
+      // A "keys" index holds no events: an LSI has DynamoDB fetch them
+      // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with
+      // `BatchGetItem` on the table key.
+      ...(idx.projection === "keys"
+        ? {
+            hydration:
+              idx.type === "lsi"
+                ? ({ _tag: "Fetch" } as const)
+                : ({ _tag: "BatchGet", tableKey: ["pk", "sk"] } as const),
+          }
+        : {}),
     })
   }
+
+  /**
+   * @internal The decoder of events read through `idx`.
+   *
+   * - `"withoutMetadata"` ignores any `metadata` on the row (an index deployed
+   *   wider than declared still carries it), so the value matches the type.
+   * - `"all"` / `"withoutMetadata"`: a decode failure on a row that lacks an
+   *   attribute the declared projection guarantees is diagnosed as the
+   *   deployed index projecting less than declared — a `ValidationError`
+   *   (`operation: "EventStore.index.decode"`) naming the index, the original
+   *   error kept as its cause. Anything else passes through unchanged.
+   * - `"keys"` decodes items fetched from the table, so a missing attribute
+   *   there is not a projection problem: failures pass through.
+   */
+  const indexDecoder =
+    (idx: ResolvedStreamIndex) =>
+    (raw: Record<string, unknown>): Effect.Effect<StreamEvent<TEvent>, ValidationError> => {
+      if (idx.projection === "keys") return decodeStreamEvent(raw)
+      let row = raw
+      if (idx.projection === "withoutMetadata" && raw.metadata !== undefined) {
+        row = { ...raw }
+        delete row.metadata
+      }
+      return decodeStreamEvent(row).pipe(
+        Effect.mapError((error) => {
+          const missing = PROJECTED_ENVELOPE_ATTRIBUTES.filter((name) => row[name] === undefined)
+          if (missing.length === 0) return error
+          return new ValidationError({
+            entityType,
+            operation: "EventStore.index.decode",
+            cause: withCause(
+              `Stream index "${idx.name}" (physical "${idx.index}") is declared ` +
+                `projection: "${idx.projection}", but its rows lack ${missing.join(", ")}: the ` +
+                "deployed index likely projects less than declared. Deploy the Projection " +
+                "EventStore.indexDefinitions emits for it.",
+              error,
+            ),
+          })
+        }),
+      )
+    }
 
   const readIndex = (
     name: string,
@@ -2399,7 +2862,8 @@ export const makeStream = <
     TStreamIdFields,
     TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
     TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
-    TIndexName
+    keyof TIndexes & string,
+    IndexProjectionsOf<TIndexes>
   >
 }
 
@@ -2433,6 +2897,9 @@ export interface BoundEventStream<
   TMetadata,
   TState = never,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -2502,12 +2969,12 @@ export interface BoundEventStream<
   >
 
   /** See {@link EventStream.readIndex}. */
-  readIndex(
-    name: TIndexName,
+  readIndex<N extends TIndexName>(
+    name: N,
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
     never
   >
@@ -2521,10 +2988,10 @@ export interface BoundEventStream<
       streamId: StreamIdInput<TStreamIdFields>,
     ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
     /** See `EventStream.query.index`. */
-    index(
-      name: TIndexName,
+    index<N extends TIndexName>(
+      name: N,
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 
   /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */
@@ -2557,10 +3024,13 @@ export const bind = <
   TMetadata,
   TState,
   TIndexName extends string = never,
+  TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
+    readonly [K in TIndexName]: "all"
+  },
 >(
-  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
 ): Effect.Effect<
-  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
   never,
   DynamoClient | TableConfig
 > =>
@@ -2605,12 +3075,25 @@ export const bind = <
           ? undefined
           : (id: Record<string, unknown>, floorVersion: number, options?: ReadOptions) =>
               provide(headProbe(id, floorVersion, options)),
-    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>
+    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>
   })
 
 // ---------------------------------------------------------------------------
 // EventStore.indexDefinitions — CreateTable fragments for stream indexes (#140)
 // ---------------------------------------------------------------------------
+
+/**
+ * @internal The `Projection` a stream index of `projection` is created with.
+ * Neither list names a key attribute: table and index keys are always
+ * projected.
+ */
+const projectionDefinition = (projection: StreamIndexProjection): Projection =>
+  projection === "all"
+    ? { ProjectionType: "ALL" }
+    : {
+        ProjectionType: "INCLUDE",
+        NonKeyAttributes: projection === "keys" ? ["__edd_e__"] : [...EVENT_ITEM_ATTRIBUTES],
+      }
 
 /**
  * `CreateTable` fragments for the stream indexes of one or more streams — see
@@ -2627,11 +3110,26 @@ export interface StreamIndexDefinitions {
 /**
  * Derive the `CreateTable` fragments for the stream indexes (#140) of the given
  * streams (`EventStream` or `BoundEventStream`) — `AttributeDefinitions`,
- * `LocalSecondaryIndexes` and `GlobalSecondaryIndexes`, each index projecting
- * `ALL` — to merge into the caller's `CreateTable` input. Event tables are not
- * derived by `Table.definition`, and the table's own `pk` / `sk` are not
- * included: add them (and, on a provisioned table, each GSI's
- * `ProvisionedThroughput`) yourself.
+ * `LocalSecondaryIndexes` and `GlobalSecondaryIndexes` — to merge into the
+ * caller's `CreateTable` input. Event tables are not derived by
+ * `Table.definition`, and the table's own `pk` / `sk` are not included: add
+ * them (and, on a provisioned table, each GSI's `ProvisionedThroughput`)
+ * yourself.
+ *
+ * Each index's `Projection` follows its {@link StreamIndexProjection}:
+ *
+ * | `projection` | `Projection` |
+ * |---|---|
+ * | `"all"` (default) | `{ ProjectionType: "ALL" }` |
+ * | `"withoutMetadata"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }` |
+ * | `"keys"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }` — not `KEYS_ONLY`: every read filters on `__edd_e__` |
+ *
+ * The deployed index must project what is declared — copy `Projection` from
+ * this output into CDK or Terraform definitions. Neither an LSI's nor a GSI's
+ * projection can be changed in place, and the library migrates nothing. A
+ * table projects at most 100 `NonKeyAttributes` across all its indexes;
+ * `"withoutMetadata"` spends 6 of them and `"keys"` 1 (DynamoDB refuses a
+ * table over the limit).
  *
  * An index shared by several streams with the same definition is emitted
  * once. Lists are sorted by index name, attributes by attribute name.
@@ -2639,7 +3137,6 @@ export interface StreamIndexDefinitions {
  * - An LSI can only be created with the table, and caps the item collection
  *   of every partition key value in the table at 10 GB — entity partitions
  *   and streams without indexes included.
- * - The projection must stay `ALL`: events are decoded from the index item.
  *
  * @example
  * ```typescript
@@ -2662,17 +3159,23 @@ export interface StreamIndexDefinitions {
  * ```
  *
  * @throws `[EDD-9067]` when two streams define the same physical index
- *   differently (another type, or other key attributes).
+ *   differently (another type, other key attributes, or another projection).
  */
 export const indexDefinitions = (
   ...streams: ReadonlyArray<{
     readonly streamName: string
-    readonly indexes: { readonly [name: string]: StreamIndexSettings }
+    readonly indexes: {
+      readonly [name: string]: Omit<StreamIndexSettings, "projection"> & {
+        /** Read as `"all"` when absent (a hand-built settings object). */
+        readonly projection?: StreamIndexProjection | undefined
+      }
+    }
   }>
 ): StreamIndexDefinitions => {
   const byIndex = new Map<string, StreamIndexSettings & { readonly owner: string }>()
   for (const stream of streams) {
-    for (const [name, settings] of Object.entries(stream.indexes)) {
+    for (const [name, raw] of Object.entries(stream.indexes)) {
+      const settings: StreamIndexSettings = { ...raw, projection: raw.projection ?? "all" }
       const owner = `index "${name}" of stream "${stream.streamName}"`
       const existing = byIndex.get(settings.index)
       if (existing === undefined) {
@@ -2681,6 +3184,7 @@ export const indexDefinitions = (
           index: settings.index,
           pk: settings.pk,
           sk: settings.sk,
+          projection: settings.projection,
           owner,
         })
         continue
@@ -2688,9 +3192,11 @@ export const indexDefinitions = (
       if (
         existing.type !== settings.type ||
         existing.pk !== settings.pk ||
-        existing.sk !== settings.sk
+        existing.sk !== settings.sk ||
+        existing.projection !== settings.projection
       ) {
-        const describe = (s: StreamIndexSettings) => `${s.type} (pk "${s.pk}", sk "${s.sk}")`
+        const describe = (s: StreamIndexSettings) =>
+          `${s.type} (pk "${s.pk}", sk "${s.sk}", projection "${s.projection}")`
         throw new Error(
           `[EDD-9067] EventStore.indexDefinitions: the physical index "${settings.index}" is ` +
             `defined as ${describe(existing)} by ${existing.owner} and as ${describe(settings)} ` +
@@ -2711,7 +3217,7 @@ export const indexDefinitions = (
         { AttributeName: settings.pk, KeyType: "HASH" as const },
         { AttributeName: settings.sk, KeyType: "RANGE" as const },
       ],
-      Projection: { ProjectionType: "ALL" as const },
+      Projection: projectionDefinition(settings.projection),
     }
     attributes.add(settings.sk)
     if (settings.type === "gsi") {
@@ -2757,7 +3263,7 @@ export interface CommandHandlerOptions {
    * initial attempt). Omit for the default: no retry.
    *
    * `DuplicateCommand` is deliberately NOT retried — it is terminal. Nor is
-   * any call that supplies {@link CommandOptions.expectedVersion}: the caller asked
+   * any call that supplies {@link CommandOptionsBase.expectedVersion}: the caller asked
    * for a conditional write, so its `VersionConflict` is always surfaced.
    */
   readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
@@ -2805,7 +3311,7 @@ export interface CommandHandlerOptions {
    *
    * - **No snapshot item** (a stream not yet snapshotted): the verified load
    *   runs at once, and `decide` runs once.
-   * - **With {@link CommandOptions.expectedVersion}**: a snapshot whose
+   * - **With {@link CommandOptionsBase.expectedVersion}**: a snapshot whose
    *   `asOfVersion` differs from it is re-read verified before the If-Match
    *   check, so only a genuine mismatch is reported (its `actualVersion` is
    *   the verified head). A snapshot at the expected version holds exactly the
@@ -2846,7 +3352,9 @@ export interface CommandHandlerOptions {
 
 /**
  * The outcome of one `decide` call, handed to a function-form
- * {@link CommandOptions.additionalItems}.
+ * {@link CommandOptionsBase.additionalItems}, to `eventMetadata`
+ * ({@link CommandMetadataOptions}) and to
+ * {@link CommandOptionsBase.eventTimestamps}.
  *
  * - `events` — what `decide` returned (never empty: the function is not called
  *   for a no-op decision).
@@ -2868,7 +3376,7 @@ export interface Decision<State, Event> {
 }
 
 /**
- * The forms {@link CommandOptions.additionalItems} accepts: a static array of
+ * The forms {@link CommandOptionsBase.additionalItems} accepts: a static array of
  * transact ops, or a function of the {@link Decision} returning the array
  * directly (pure projection) or as an `Effect` (a projection that needs a read).
  * The effect's `E2` joins the handler's error channel and its `R2` the handler's
@@ -2881,21 +3389,117 @@ export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
     ) => ReadonlyArray<TransactWriteOp> | Effect.Effect<ReadonlyArray<TransactWriteOp>, E2, R2>)
 
 /**
- * Per-call options accepted by a handler produced by {@link commandHandler}.
+ * The form `eventMetadata` ({@link CommandMetadataOptions}) accepts: a
+ * function of the {@link Decision} returning one metadata entry per event
+ * (`undefined` for an event without metadata), directly or as an `Effect`. The
+ * effect's `E3` joins the handler's error channel and its `R3` the handler's
+ * requirements.
  *
- * `State` / `Event` type the {@link Decision} a function-form `additionalItems`
- * receives; `E2` / `R2` are the error and requirements of the `Effect` it may
- * return. The handler infers all four, so they only need naming when this type
- * is written out by hand.
+ * Function-only: the number of events is known only once `decide` has run.
+ * The `Effect` form lets ids be minted through the `Crypto` service
+ * (`crypto.randomULID`, or `randomUUIDv7`), which keeps them deterministic
+ * under `TestClock` and a test `Crypto` layer with fixed bytes.
  */
-export interface CommandOptions<
-  TMetadata,
+export type EventMetadataInput<State, Event, TMetadata, E3 = never, R3 = never> = (
+  decision: Decision<State, Event>,
+) =>
+  | ReadonlyArray<TMetadata | undefined>
+  | Effect.Effect<ReadonlyArray<TMetadata | undefined>, E3, R3>
+
+/**
+ * The form {@link CommandOptionsBase.eventTimestamps} accepts: a function of
+ * the {@link Decision} returning one timestamp per event (`undefined` keeps
+ * the append's `Clock` time), directly or as an `Effect` — exactly as
+ * {@link EventMetadataInput}. The effect's `E4` joins the handler's error
+ * channel and its `R4` the handler's requirements.
+ *
+ * Function-only: the number of events is known only once `decide` has run.
+ * The `Effect` form lets times come from a service (a source log, a
+ * per-tenant clock) or from `Clock`, which keeps them deterministic under
+ * `TestClock`.
+ *
+ * `E4` / `R4` are separate from `eventMetadata`'s `E3` / `R3`: with one shared
+ * pair, an `eventMetadata` effect and an `eventTimestamps` effect with
+ * different error types would not compile — TypeScript fixes the parameter
+ * from one candidate and rejects the other instead of inferring a union.
+ */
+export type EventTimestampsInput<State, Event, E4 = never, R4 = never> = (
+  decision: Decision<State, Event>,
+) =>
+  | ReadonlyArray<DateTime.DateTime | undefined>
+  | Effect.Effect<ReadonlyArray<DateTime.DateTime | undefined>, E4, R4>
+
+/**
+ * The per-call metadata of a {@link commandHandler} handler: one value shared
+ * by every event (`metadata`), or a function deriving one entry per event from
+ * the decision (`eventMetadata`) — never both (see
+ * {@link AppendMetadataOptions}).
+ */
+export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = never> =
+  | {
+      /**
+       * Metadata written onto every event the decision appends (see
+       * {@link AppendMetadataOptions}). Fixed before `decide` runs; to give
+       * each event its own entry, use `eventMetadata`.
+       */
+      readonly metadata?: TMetadata
+      readonly eventMetadata?: undefined
+    }
+  | {
+      readonly metadata?: undefined
+      /**
+       * Per-event metadata derived from the {@link Decision}: the function
+       * returns one entry per event, in order, and entry `i` is written onto
+       * event `i` (see {@link AppendMetadataOptions}).
+       *
+       * - Runs after `decide` and after the new events are folded, receiving
+       *   the same `Decision` a function-form `additionalItems` does — and
+       *   **before** `additionalItems`, so an effectful pair runs in a
+       *   predictable order.
+       * - Not called when `decide` returns no events.
+       * - Re-run on every attempt: each `VersionConflict` retry, and the
+       *   re-decision a stale unverified snapshot triggers
+       *   ({@link CommandHandlerOptions.verifySnapshot}`: false`). Ids minted
+       *   per attempt are safe — a failed attempt writes nothing.
+       * - A result whose length differs from the decision's events fails with
+       *   `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`),
+       *   never retried. A failure of the returned `Effect` surfaces as is,
+       *   and is not retried either.
+       *
+       * Without `idempotency`, a redelivery after a lost response decides and
+       * appends again, minting new ids. With it, the redelivery fails with
+       * `DuplicateCommand`, so the first commit's ids are the only ones written:
+       *
+       * ```ts
+       * // `crypto` is the `Crypto.Crypto` service; a ULID takes its time from the
+       * // `Clock`, so `TestClock` plus a fixed-bytes `Crypto` make it deterministic
+       * const handle = EventStore.commandHandler(decider, stream, {
+       *   idempotency: { ttl: Duration.days(1) },
+       * })
+       * yield* handle(streamId, command, {
+       *   commandId: deliveryId,
+       *   eventMetadata: ({ events }) =>
+       *     Effect.forEach(events, () =>
+       *       Effect.map(crypto.randomULID, (eventId) => ({ eventId })),
+       *     ),
+       * })
+       * ```
+       */
+      readonly eventMetadata?: EventMetadataInput<State, Event, TMetadata, E3, R3>
+    }
+
+/**
+ * The options of a {@link commandHandler} handler other than its metadata
+ * (see {@link CommandMetadataOptions}).
+ */
+export interface CommandOptionsBase<
   State = unknown,
   Event = unknown,
   E2 = never,
   R2 = never,
+  E4 = never,
+  R4 = never,
 > {
-  readonly metadata?: TMetadata
   /**
    * Identifier for this command delivery. Required when the handler was created
    * with `idempotency`; a replayed id fails with `DuplicateCommand` — also when
@@ -2932,7 +3536,7 @@ export interface CommandOptions<
   readonly expectedVersion?: number | undefined
   /**
    * Caller-owned transact items committed atomically with the produced events
-   * (see {@link AppendOptions.additionalItems}).
+   * (see {@link AppendOptionsBase.additionalItems}).
    *
    * Either a static array, or a function of the {@link Decision} — an inline
    * projection — returning the array or an `Effect` of it. The function runs
@@ -2942,16 +3546,79 @@ export interface CommandOptions<
    * `AdditionalItemConditionFailed` refer to the array it returned.
    */
   readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
+  /**
+   * Per-event timestamps derived from the {@link Decision}: the function
+   * returns one entry per event, in order, directly or as an `Effect` (see
+   * {@link EventTimestampsInput}), and entry `i` is written as event `i`'s
+   * `timestamp` — `undefined` keeps the append's `Clock` time (see
+   * {@link AppendOptionsBase.eventTimestamps}). Independent of `metadata` /
+   * `eventMetadata`. The idempotency sentinel, its TTL and an inline snapshot
+   * keep the append's `Clock` time; timestamps carry no ordering check.
+   *
+   * - Runs after `eventMetadata` and before `additionalItems`, each to
+   *   completion before the next, all receiving the same `Decision`; not
+   *   called when `decide` returns no events; re-run on every attempt — each
+   *   `VersionConflict` retry and the re-decision a stale unverified snapshot
+   *   triggers — as `eventMetadata` is.
+   * - A failure of the returned `Effect` surfaces as is, is not retried, and
+   *   `additionalItems` is not run.
+   * - A result — plain or produced by the `Effect` — of the wrong length, or
+   *   with an entry that is neither a valid `DateTime` (finite epoch) nor
+   *   `undefined`, fails with `ValidationError`
+   *   (`operation: "EventStore.commandHandler.eventTimestamps"`), never
+   *   retried. A value that is not a function is refused before anything is
+   *   read.
+   *
+   * ```ts
+   * // plain: the times are in the events
+   * eventTimestamps: ({ events }) => events.map((event) => event.occurredAt)
+   *
+   * // Effect: the times come from a service
+   * eventTimestamps: ({ events }) =>
+   *   Effect.forEach(events, (event) => SourceLog.originalTime(event.sourceId))
+   * ```
+   */
+  readonly eventTimestamps?: EventTimestampsInput<State, Event, E4, R4>
 }
 
-/** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
-export interface IdempotentCommandOptions<
+/**
+ * Per-call options accepted by a handler produced by {@link commandHandler}:
+ * {@link CommandOptionsBase} plus the exclusive `metadata` / `eventMetadata`
+ * pair ({@link CommandMetadataOptions}).
+ *
+ * `State` / `Event` type the {@link Decision} a function-form `additionalItems`,
+ * `eventMetadata` or `eventTimestamps` receives; `E2` / `R2` are the error and
+ * requirements of the `Effect` `additionalItems` may return, `E3` / `R3` those
+ * of the `Effect` `eventMetadata` may return, `E4` / `R4` those of the
+ * `Effect` `eventTimestamps` may return — separate, so effects with different
+ * error types all join the handler's error channel. The handler infers all of
+ * them, so they only need naming when this type is written out by hand.
+ */
+export type CommandOptions<
   TMetadata,
   State = unknown,
   Event = unknown,
   E2 = never,
   R2 = never,
-> extends CommandOptions<TMetadata, State, Event, E2, R2> {
+  E3 = never,
+  R3 = never,
+  E4 = never,
+  R4 = never,
+> = CommandOptionsBase<State, Event, E2, R2, E4, R4> &
+  CommandMetadataOptions<TMetadata, State, Event, E3, R3>
+
+/** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
+export type IdempotentCommandOptions<
+  TMetadata,
+  State = unknown,
+  Event = unknown,
+  E2 = never,
+  R2 = never,
+  E3 = never,
+  R3 = never,
+  E4 = never,
+  R4 = never,
+> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3, E4, R4> & {
   readonly commandId: string
 }
 
@@ -2967,9 +3634,13 @@ type CommandOptionsArgs<
   TEvent,
   E2,
   R2,
+  E3,
+  R3,
+  E4,
+  R4,
 > = TConfig extends { readonly idempotency: object }
-  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2>]
-  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2> | undefined]
+  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4>]
+  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4> | undefined]
 
 type CommandHandlerErrors<E> =
   | E
@@ -2987,7 +3658,8 @@ type CommandHandlerErrors<E> =
 /**
  * A handler over an {@link EventStream}. Generic per call over the error (`E2`)
  * and requirements (`R2`) of a function-form `additionalItems` that returns an
- * `Effect`; both are `never` otherwise.
+ * `Effect`, those (`E3` / `R3`) of an `eventMetadata` that does, and those
+ * (`E4` / `R4`) of an `eventTimestamps` that does; all are `never` otherwise.
  */
 type CommandHandler<
   State,
@@ -2997,19 +3669,20 @@ type CommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2,
-  DynamoClient | TableConfig | R2
+  CommandHandlerErrors<E> | E2 | E3 | E4,
+  DynamoClient | TableConfig | R2 | R3 | R4
 >
 
 /**
  * A handler over a {@link BoundEventStream}: the stream's services are already
- * provided, so a function-form `additionalItems`' `R2` is its only requirement.
+ * provided, so the `R2` / `R3` / `R4` of a function-form `additionalItems` /
+ * `eventMetadata` / `eventTimestamps` are its only requirements.
  */
 type BoundCommandHandler<
   State,
@@ -3019,11 +3692,15 @@ type BoundCommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never>(
+> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2>
-) => Effect.Effect<CommandHandlerResult<State, TEvent>, CommandHandlerErrors<E> | E2, R2>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
+) => Effect.Effect<
+  CommandHandlerResult<State, TEvent>,
+  CommandHandlerErrors<E> | E2 | E3 | E4,
+  R2 | R3 | R4
+>
 
 /**
  * The handler the data-last {@link commandHandler} returns for stream `S`: a
@@ -3049,12 +3726,32 @@ type CommandHandlerFor<
 const hasEventStreamBrand = (u: unknown): boolean =>
   typeof u === "object" && u !== null && EventStreamTypeId in u
 
-/** @internal Resolve a {@link CommandOptions.additionalItems} against a decision. */
+/** @internal Resolve a {@link CommandOptionsBase.additionalItems} against a decision. */
 const deriveAdditionalItems = <State, Event>(
   input: AdditionalItemsInput<State, Event, unknown, unknown> | undefined,
   decision: Decision<State, Event>,
 ): Effect.Effect<ReadonlyArray<TransactWriteOp> | undefined, unknown, unknown> => {
   if (typeof input !== "function") return Effect.succeed(input)
+  const derived = input(decision)
+  return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
+}
+
+/** @internal Resolve an `eventMetadata` ({@link CommandMetadataOptions}) against a decision. */
+const deriveEventMetadata = <State, Event, TMetadata>(
+  input: EventMetadataInput<State, Event, TMetadata, unknown, unknown> | undefined,
+  decision: Decision<State, Event>,
+): Effect.Effect<ReadonlyArray<TMetadata | undefined> | undefined, unknown, unknown> => {
+  if (input === undefined) return Effect.succeed(undefined)
+  const derived = input(decision)
+  return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
+}
+
+/** @internal Resolve a {@link CommandOptionsBase.eventTimestamps} against a decision. */
+const deriveEventTimestamps = <State, Event>(
+  input: EventTimestampsInput<State, Event, unknown, unknown> | undefined,
+  decision: Decision<State, Event>,
+): Effect.Effect<ReadonlyArray<DateTime.DateTime | undefined> | undefined, unknown, unknown> => {
+  if (input === undefined) return Effect.succeed(undefined)
   const derived = input(decision)
   return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
 }
@@ -3100,7 +3797,19 @@ const makeCommandHandlerImpl = <
   return (
     streamId: StreamIdInput<TStreamIdFields>,
     command: Command,
-    callOptions?: CommandOptions<TMetadata, State, TEvent, unknown, unknown> | undefined,
+    callOptions?:
+      | CommandOptions<
+          TMetadata,
+          State,
+          TEvent,
+          unknown,
+          unknown,
+          unknown,
+          unknown,
+          unknown,
+          unknown
+        >
+      | undefined,
   ) => {
     const expectedVersion = callOptions?.expectedVersion
 
@@ -3194,15 +3903,52 @@ const makeCommandHandlerImpl = <
           next = decider.evolve(next, event)
         }
 
-        // 6. Derive the caller's items from the decision. Re-run on every
-        //    attempt (and on a re-decision), because the whole cycle is the
-        //    retried unit.
-        const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, {
+        // 6. Derive the caller's per-event metadata, then per-event
+        //    timestamps, then items, from the decision — in that order
+        //    (#144). Re-run on every attempt (and on a re-decision), because
+        //    the whole cycle is the retried unit.
+        const decision: Decision<State, TEvent> = {
           events: newEvents,
           state: next,
           previous,
           version: baseVersion,
-        })
+        }
+        const eventMetadata = yield* deriveEventMetadata(callOptions?.eventMetadata, decision)
+        // A supplied function must return the array — `undefined` (e.g. a
+        // block body with no `return`) is refused, not silently dropped.
+        if (
+          callOptions?.eventMetadata !== undefined &&
+          (!Array.isArray(eventMetadata) || eventMetadata.length !== newEvents.length)
+        ) {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              `eventMetadata returned ${Array.isArray(eventMetadata) ? eventMetadata.length : "no"} ` +
+              `entries for the decision's ${newEvents.length} events: it must return exactly ` +
+              "one entry (or undefined) per event, in order. Nothing was written.",
+          })
+        }
+        // A function (checked before the load), returning the array or an
+        // `Effect` of it; the result of either form is checked here, so the
+        // error names the handler's option rather than `append`'s.
+        const eventTimestamps = yield* deriveEventTimestamps(callOptions?.eventTimestamps, decision)
+        if (callOptions?.eventTimestamps !== undefined) {
+          const problem = eventTimestampsProblem(
+            eventTimestamps,
+            newEvents.length,
+            "eventTimestamps returned",
+            `the decision's ${newEvents.length} events`,
+          )
+          if (problem !== undefined) {
+            return yield* new ValidationError({
+              entityType: stream.streamName,
+              operation: "EventStore.commandHandler.eventTimestamps",
+              cause: `${problem} Nothing was written.`,
+            })
+          }
+        }
+        const additionalItems = yield* deriveAdditionalItems(callOptions?.additionalItems, decision)
 
         // 7. Append with optimistic concurrency, plus the caller's items, the
         //    dedup sentinel and an inline snapshot, all in one transaction.
@@ -3210,11 +3956,15 @@ const makeCommandHandlerImpl = <
         //    (checked in step 2).
         const appendOptions: {
           metadata?: TMetadata
+          eventMetadata?: ReadonlyArray<TMetadata | undefined>
+          eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
           additionalItems?: ReadonlyArray<TransactWriteOp>
           idempotency?: AppendIdempotency
           snapshot?: State
         } = {}
         if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
+        if (eventMetadata !== undefined) appendOptions.eventMetadata = eventMetadata
+        if (eventTimestamps !== undefined) appendOptions.eventTimestamps = eventTimestamps
         if (additionalItems !== undefined) appendOptions.additionalItems = additionalItems
         if (options?.idempotency !== undefined && callOptions?.commandId !== undefined) {
           appendOptions.idempotency =
@@ -3329,6 +4079,43 @@ const makeCommandHandlerImpl = <
           entityType: stream.streamName,
           operation: "EventStore.commandHandler",
           cause: "commandId is required when commandHandler is configured with `idempotency`.",
+        })
+      }
+
+      // The same backstop for the exclusive metadata pair (#144), and for an
+      // `eventMetadata` or `eventTimestamps` that is not the function it must
+      // be — refused before anything is read, rather than by `append` after
+      // `decide`.
+      if (callOptions?.eventMetadata !== undefined) {
+        if (callOptions.metadata !== undefined) {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              "metadata and eventMetadata are mutually exclusive: pass one value shared by " +
+              "every event, or a function deriving one entry per event. Nothing was written.",
+          })
+        }
+        if (typeof callOptions.eventMetadata !== "function") {
+          return yield* new ValidationError({
+            entityType: stream.streamName,
+            operation: "EventStore.commandHandler.eventMetadata",
+            cause:
+              "eventMetadata must be a function of the decision: the number of events is " +
+              "known only once `decide` has run. Nothing was written.",
+          })
+        }
+      }
+      if (
+        callOptions?.eventTimestamps !== undefined &&
+        typeof callOptions.eventTimestamps !== "function"
+      ) {
+        return yield* new ValidationError({
+          entityType: stream.streamName,
+          operation: "EventStore.commandHandler.eventTimestamps",
+          cause:
+            "eventTimestamps must be a function of the decision: the number of events is " +
+            "known only once `decide` has run. Nothing was written.",
         })
       }
 
@@ -3489,6 +4276,24 @@ const makeCommandHandlerImpl = <
  * yield* handle({ matchId: "m-1" }, command, {
  *   additionalItems: ({ state }) => [Scoreboard.put({ matchId: "m-1", runs: state.runs })],
  * })
+ *
+ * // Per-event metadata derived from the decision: entry i is written onto event i
+ * // (`crypto` is the `Crypto.Crypto` service; `randomUUIDv7` works the same way)
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventMetadata: ({ events }) =>
+ *     Effect.forEach(events, () => Effect.map(crypto.randomULID, (eventId) => ({ eventId }))),
+ * })
+ *
+ * // Per-event timestamps derived from the decision (undefined → the Clock time)
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventTimestamps: ({ events }) => events.map((event) => event.occurredAt),
+ * })
+ *
+ * // ...or from a service, as an Effect (its errors / requirements join the handler's)
+ * yield* handle({ matchId: "m-1" }, command, {
+ *   eventTimestamps: ({ events }) =>
+ *     Effect.forEach(events, (event) => SourceLog.originalTime(event.sourceId)),
+ * })
  * ```
  *
  * Each invocation runs
@@ -3504,7 +4309,7 @@ const makeCommandHandlerImpl = <
  *   item alone (one `GetItem`); an answer that is not a successful append is
  *   confirmed against the head first, and a snapshot that proves stale falls
  *   back to the verified load — in which case `decide` may run twice.
- * - **expectedVersion.** See {@link CommandOptions.expectedVersion}.
+ * - **expectedVersion.** See {@link CommandOptionsBase.expectedVersion}.
  * - **Fold before append.** The new events are folded into state before the
  *   append, so the state returned, snapshotted and handed to a function-form
  *   `additionalItems` (see {@link Decision}) is always the `evolve` fold.
@@ -3514,8 +4319,8 @@ const makeCommandHandlerImpl = <
  *   fresh snapshot is written (best-effort) after a successful append once the
  *   cadence threshold is crossed. See {@link SnapshotMode}.
  * - **One atomic append.** One command, one decision, one append: a decision
- *   too large for one transaction fails with `AppendTooLarge` before anything
- *   is written. A large command is split by the application into stepped
+ *   too large for one transaction is rejected whole by DynamoDB and fails with
+ *   `AppendTooLarge` — nothing is written. A large command is split by the application into stepped
  *   commands — each an ordinary call, chained by `expectedVersion` — so a
  *   failure partway leaves the stream at a real intermediate state.
  *
@@ -3543,8 +4348,8 @@ export const commandHandler: {
     options?: TConfig,
   ): <
     S extends
-      | BoundEventStream<TEvent, any, any, State, any>
-      | EventStream<TEvent, ReadonlyArray<string>, any, State, any>,
+      | BoundEventStream<TEvent, any, any, State, any, any>
+      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any>,
   >(
     stream: S,
   ) => CommandHandlerFor<S, State, Command, TEvent, E, TConfig>
@@ -3559,10 +4364,18 @@ export const commandHandler: {
     TMetadata,
     TState extends State,
     TIndexName extends string,
+    TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+    stream: BoundEventStream<
+      TEvent,
+      TStreamIdFields,
+      TMetadata,
+      TState,
+      TIndexName,
+      TIndexProjections
+    >,
     options?: TConfig,
   ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 
@@ -3576,10 +4389,11 @@ export const commandHandler: {
     TMetadata,
     TState extends State,
     TIndexName extends string,
+    TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName>,
+    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
     options?: TConfig,
   ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 } = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {

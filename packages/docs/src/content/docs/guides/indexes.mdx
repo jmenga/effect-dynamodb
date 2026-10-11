@@ -81,6 +81,8 @@ This is the natural access pattern for shared-PK single-table designs — for ex
 
 GSI access patterns are defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites — see the `task-entity` block above for the canonical shape.
 
+Several entities can overload one physical GSI (`gsi1` serving `byProject` on one entity and `byTenant` on another), but one physical index has one key schema. Every member of a table that declares it, including the auto-generated `_cascade_<field>` indexes and an aggregate's collection and list indexes, must name the same `pk.field` / `sk.field` and agree on GSI versus LSI. Entities on one table must also declare the same primary-key fields. `Table.make` and `Table.definition` throw `[EDD-9069]`, naming both declarers, when they differ; earlier releases silently kept the first declaration, so the other member's items never reached the index.
+
 ### Logical Names as API Surface
 
 Collection names become query accessors on the typed client:
@@ -468,6 +470,7 @@ When you call `DynamoClient.make({ entities, tables })`, the client auto-discove
 - All entities in a collection must share the same PK composite on that index
 - All entities sharing an index must agree on the type (no mixing isolated/clustered)
 - Sub-collections sharing an index must use the same PK and SK fields
+- Every member declaring one physical index must use the same key attributes (`[EDD-9069]`, thrown by `Table.make` / `Table.definition`)
 - No duplicate entity types within a single collection
 
 ## Worked Example: Multi-Tenant Project Management

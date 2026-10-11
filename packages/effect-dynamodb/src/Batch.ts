@@ -8,18 +8,20 @@
  * Batch.get returns a typed tuple inferred per-position.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import {
   DynamoError,
   isAwsTransactionCancelled,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
-import type { Entity, EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
+import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
-import { itemBytes } from "./internal/ItemSize.js"
+import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./internal/ItemSize.js"
 import {
   batchRejectReason,
   composePrimaryKey,
@@ -28,16 +30,19 @@ import {
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./internal/TransactableOps.js"
+import {
+  batchEntries,
+  diagnosedValidationError,
+  diagnoseFailure,
+  type KeyAttributes,
+  keyAttributesOf,
+  mergeKeyAttributes,
+  transactItemTarget,
+} from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
-const MAX_BATCH_GET = 100
 const MAX_BATCH_WRITE = 25
-const MAX_TRANSACT_WRITE = 100
-/** DynamoDB caps a transaction's payload at 4 MB of item data; leave headroom. */
-const MAX_TRANSACT_BYTES = 3_500_000
-const MAX_RETRIES = 5
-const BASE_DELAY_MS = 100
 
 /**
  * Optional retry configuration for batch operations.
@@ -117,98 +122,27 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
 
     const tableNames = yield* resolveTableNames(infos)
 
-    // Build composed keys for each item and track the mapping
-    const itemKeys: Array<{
-      tableName: string
-      composedKey: Record<string, unknown>
-      marshalledKey: Record<string, AttributeValue>
-      entity: Entity
-      index: number
-    }> = []
+    // Compose each position's primary key. `BatchGetItem` does not preserve
+    // order, so `batchGetRaw` matches responses back to positions by key.
+    const requests = infos.map((info) => ({
+      tableName: tableNames.get(info.entity)!,
+      key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
+    }))
+    const fetched = yield* batchGetRaw(client, requests, {
+      maxRetries,
+      baseDelayMs,
+      // A key repeated in one request is DynamoDB's to reject (#144): named by position.
+      describe: (position) => {
+        const entityType = infos[position]!.entity.entityType
+        return { entityType, source: `get ${position} (${entityType})` }
+      },
+    })
 
-    for (let i = 0; i < infos.length; i++) {
-      const info = infos[i]!
-      const tableName = tableNames.get(info.entity)!
-      const composed = composePrimaryKey(info.entity, info.key!)
-
-      itemKeys.push({
-        tableName,
-        composedKey: composed,
-        marshalledKey: toAttributeMap(composed),
-        entity: info.entity,
-        index: i,
-      })
-    }
-
-    // Collect all responses by original index
     const results: Array<unknown> = new Array(items.length).fill(undefined)
-
-    // Process in chunks of MAX_BATCH_GET
-    for (let chunkStart = 0; chunkStart < itemKeys.length; chunkStart += MAX_BATCH_GET) {
-      const chunk = itemKeys.slice(chunkStart, chunkStart + MAX_BATCH_GET)
-
-      // Build request grouped by table
-      let requestItems: Record<string, { Keys: Array<Record<string, AttributeValue>> }> = {}
-      for (const item of chunk) {
-        if (!requestItems[item.tableName]) {
-          requestItems[item.tableName] = { Keys: [] }
-        }
-        requestItems[item.tableName]!.Keys.push(item.marshalledKey)
-      }
-
-      // Retry loop for unprocessed keys
-      let retries = 0
-      while (Object.keys(requestItems).length > 0) {
-        const response = yield* client.batchGetItem({ RequestItems: requestItems })
-
-        // Process responses
-        if (response.Responses) {
-          for (const [tableName, tableItems] of Object.entries(response.Responses)) {
-            for (const responseItem of tableItems) {
-              const raw = fromAttributeMap(responseItem)
-
-              // Match to original position by primary key
-              const matched = chunk.find((item) => {
-                if (item.tableName !== tableName) return false
-                const primary = item.entity.indexes.primary!
-                return (
-                  raw[primary.pk.field] === item.composedKey[primary.pk.field] &&
-                  raw[primary.sk.field] === item.composedKey[primary.sk.field]
-                )
-              })
-
-              if (matched) {
-                const decoded = yield* matched.entity._decodeRecord(raw)
-                results[matched.index] = decoded
-              }
-            }
-          }
-        }
-
-        // Check for unprocessed keys
-        const unprocessed: Record<string, { Keys: Array<Record<string, AttributeValue>> }> = {}
-        if (response.UnprocessedKeys) {
-          for (const [tableName, tableKeys] of Object.entries(response.UnprocessedKeys)) {
-            if (tableKeys.Keys && tableKeys.Keys.length > 0) {
-              unprocessed[tableName] = { Keys: tableKeys.Keys }
-            }
-          }
-        }
-
-        if (Object.keys(unprocessed).length === 0) break
-
-        retries++
-        if (retries > maxRetries) {
-          return yield* new DynamoError({
-            operation: "BatchGetItem",
-            cause: new Error(`Unprocessed keys remain after ${maxRetries} retries`),
-          })
-        }
-
-        // Exponential backoff
-        yield* Effect.sleep(`${baseDelayMs * 2 ** (retries - 1)} millis`)
-        requestItems = unprocessed
-      }
+    for (let i = 0; i < fetched.length; i++) {
+      const item = fetched[i]
+      if (item === undefined) continue
+      results[i] = yield* infos[i]!.entity._decodeRecord(fromAttributeMap(item))
     }
 
     // Cast rationale: results is built as Array<A | undefined> by matching DynamoDB
@@ -231,17 +165,114 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
  */
 type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | BoundWriteOp
 
+/** A versioned put, sent as a create-only `TransactWriteItems` Put (#133). */
+type VersionedPut = {
+  readonly tableName: string
+  readonly entityType: string
+  readonly transactItem: TransactWriteItem
+  /** Primary key and every sort-key attribute, to name a rejected item (#144). */
+  readonly keyFields: ReadonlyArray<string>
+  readonly keys: () => KeyAttributes
+  /** Its exact contribution to a transaction's size (`transactItemBytes`). */
+  readonly bytes: number
+}
+
+/**
+ * Versioned puts in caller order, chunked greedily into transactions of at
+ * most {@link TRANSACT_WRITE_ITEMS_LIMIT} actions and
+ * {@link TRANSACT_WRITE_MAX_BYTES} bytes — DynamoDB's own limits, exactly, by
+ * the exact size model. Chunking picks request boundaries; it refuses nothing.
+ * One put always fits alone: its item is at most 409,600 bytes, or DynamoDB
+ * rejects it as too large.
+ */
+const chunkVersionedPuts = (
+  puts: ReadonlyArray<VersionedPut>,
+): ReadonlyArray<ReadonlyArray<VersionedPut>> => {
+  const chunks: Array<Array<VersionedPut>> = []
+  let bytes = 0
+  for (const put of puts) {
+    const last = chunks[chunks.length - 1]
+    if (
+      last === undefined ||
+      last.length >= TRANSACT_WRITE_ITEMS_LIMIT ||
+      bytes + put.bytes > TRANSACT_WRITE_MAX_BYTES
+    ) {
+      chunks.push([put])
+      bytes = put.bytes
+    } else {
+      last.push(put)
+      bytes += put.bytes
+    }
+  }
+  return chunks
+}
+
+/** What a batch had written when its versioned-put chunk `index` failed, as a clause. */
+const committedBefore = (
+  chunks: ReadonlyArray<ReadonlyArray<VersionedPut>>,
+  index: number,
+): string => {
+  const unsent = "none of the batch's non-versioned requests was sent"
+  if (index === 0) return `no earlier transaction of the batch was written, and ${unsent}`
+  const items = chunks.slice(0, index).reduce((sum, chunk) => sum + chunk.length, 0)
+  return (
+    `the batch's ${index} earlier transaction${index === 1 ? "" : "s"} of versioned puts ` +
+    `(${items} item${items === 1 ? "" : "s"}) ${index === 1 ? "was" : "were"} already ` +
+    `written, and ${unsent}`
+  )
+}
+
+/**
+ * What a batch had written when one of its `BatchWriteItem` requests (the
+ * non-versioned requests, after every versioned-put chunk) was rejected, as a
+ * clause: its versioned-put transactions, the `written` non-versioned requests
+ * of earlier calls (earlier chunks, and this chunk's requests written before
+ * an unprocessed-items retry), and the `unsent` requests after this chunk.
+ */
+const committedBeforeRequest = (
+  versionedChunks: ReadonlyArray<ReadonlyArray<VersionedPut>>,
+  written: number,
+  unsent: number,
+): string => {
+  const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`
+  const parts: Array<string> = []
+  if (versionedChunks.length > 0) {
+    const items = versionedChunks.reduce((sum, chunk) => sum + chunk.length, 0)
+    parts.push(
+      `its ${plural(versionedChunks.length, "transaction")} of versioned puts ` +
+        `(${plural(items, "item")})`,
+    )
+  }
+  if (written > 0) parts.push(plural(written, "non-versioned request"))
+  const wrote =
+    parts.length === 0
+      ? "the batch had written nothing before it"
+      : `the batch had already written ${parts.join(" and ")}`
+  return unsent === 0
+    ? wrote
+    : `${wrote}, and its ${plural(unsent, "later request")} ${unsent === 1 ? "was" : "were"} not sent`
+}
+
 /**
  * Batch-write any number of items across entities/tables.
  * Auto-chunks at 25 items per request. Retries unprocessed items
  * with exponential backoff.
  *
  * Puts of a `versioned` entity are sent first, as create-only
- * `TransactWriteItems` of up to 100 items (`attribute_not_exists`): a batch
- * put cannot continue an existing item's version, so one that would replace an
- * item fails with a `ValidationError` and its chunk writes nothing (the entity's
- * `put` and `Transaction.transactWrite` replace it). Each chunk costs twice the
- * write capacity of a batch write.
+ * `TransactWriteItems` (`attribute_not_exists`), chunked at exactly DynamoDB's
+ * limits: 100 actions and 4,194,304 bytes by DynamoDB's size accounting. A
+ * batch put cannot continue an existing item's version, so one that would
+ * replace an item fails with a `ValidationError` and its chunk writes nothing
+ * (the entity's `put` and `Transaction.transactWrite` replace it). Each chunk
+ * costs twice the write capacity of a batch write. Should DynamoDB reject a
+ * chunk's size all the same, the batch fails with a `ValidationError` giving
+ * both the library's measure and DynamoDB's, and what was already written; the
+ * chunk is not re-split.
+ *
+ * An item over DynamoDB's 400 KB, or a sort key over 1024 bytes, is not
+ * pre-checked (#144): DynamoDB rejects its request, and the batch fails with a
+ * `ValidationError` naming the item, with DynamoDB's error as the cause. The
+ * batch is not atomic: the message says exactly what it had already written.
  *
  * ```typescript
  * yield* Batch.write([
@@ -262,13 +293,7 @@ export const write = (
     const client = yield* DynamoClient
 
     // Build write requests
-    const versionedPuts: Array<{
-      readonly tableName: string
-      readonly entityType: string
-      readonly item: Record<string, AttributeValue>
-      readonly pkField: string
-      readonly bytes: number
-    }> = []
+    const versionedPuts: Array<VersionedPut> = []
     // Every key the batch touches, to refuse one touched twice when a versioned
     // put is involved: its put runs in an earlier transaction than the batch's
     // other requests, so a repeated key would be reordered or misreported.
@@ -291,6 +316,9 @@ export const write = (
     const writeRequests: Array<{
       tableName: string
       request: Record<string, any>
+      entityType: string
+      keyFields: ReadonlyArray<string>
+      keys: () => KeyAttributes
     }> = []
 
     for (const op of operations) {
@@ -309,6 +337,9 @@ export const write = (
 
       const entity = info.entity
       const { name: tableName } = yield* entity._tableTag
+      const primary = entity.indexes.primary!
+      const keyFields = [primary.pk.field, primary.sk.field]
+      const keys = () => keyAttributesOf(entity.indexes as never)
 
       // BatchWriteItem has no ConditionExpression. Silently dropping a
       // condition would turn `create()` into a blind overwrite, so reject
@@ -350,17 +381,31 @@ export const write = (
         touched.set(key, (touched.get(key) ?? 0) + 1)
         if (entity._incarnationToken) {
           versionedKeys.set(key, entity.entityType)
+          const transactItem: TransactWriteItem = {
+            Put: {
+              TableName: tableName,
+              Item: built.marshalled,
+              ConditionExpression: "attribute_not_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": entity.indexes.primary!.pk.field },
+            },
+          }
           versionedPuts.push({
             tableName,
             entityType: entity.entityType,
-            item: built.marshalled,
-            pkField: entity.indexes.primary!.pk.field,
-            bytes: itemBytes(built.marshalled, "upper"),
+            transactItem,
+            keyFields,
+            keys,
+            // Exact, condition and its name included: what DynamoDB counts
+            // toward the transaction's 4 MB (#144).
+            bytes: transactItemBytes(transactItem),
           })
         } else {
           writeRequests.push({
             tableName,
             request: { PutRequest: { Item: built.marshalled } },
+            entityType: entity.entityType,
+            keyFields,
+            keys,
           })
         }
       } else if (info.opType === "delete") {
@@ -371,6 +416,9 @@ export const write = (
         writeRequests.push({
           tableName,
           request: { DeleteRequest: { Key: composed } },
+          entityType: entity.entityType,
+          keyFields,
+          keys,
         })
       } else {
         return yield* new ValidationError({
@@ -396,38 +444,47 @@ export const write = (
       }
     }
 
-    // Versioned puts first, as create-only transactions of up to 100 items and
-    // under DynamoDB's 4 MB transaction payload. Each chunk is atomic; a chunk
-    // that would replace an existing item writes nothing and stops the batch
-    // before any later chunk or the plain requests below.
-    const versionedChunks: Array<typeof versionedPuts> = []
-    for (const put of versionedPuts) {
-      const last = versionedChunks[versionedChunks.length - 1]
-      const lastBytes = last?.reduce((sum, p) => sum + p.bytes, 0) ?? 0
-      if (
-        last === undefined ||
-        last.length >= MAX_TRANSACT_WRITE ||
-        lastBytes + put.bytes > MAX_TRANSACT_BYTES
-      ) {
-        versionedChunks.push([put])
-      } else {
-        last.push(put)
-      }
-    }
-    for (const chunk of versionedChunks) {
-      const transactItems = chunk.map((put) => ({
-        Put: {
-          TableName: put.tableName,
-          Item: put.item,
-          ConditionExpression: "attribute_not_exists(#pk)",
-          ExpressionAttributeNames: { "#pk": put.pkField },
-        },
-      }))
+    // Versioned puts first, as create-only transactions. Each chunk is atomic;
+    // a chunk that would replace an existing item writes nothing and stops the
+    // batch before any later chunk or the plain requests below.
+    const versionedChunks = chunkVersionedPuts(versionedPuts)
+    for (const [chunkIndex, chunk] of versionedChunks.entries()) {
+      const transactItems: Array<TransactWriteItem> = chunk.map((put) => put.transactItem)
+      const committed = committedBefore(versionedChunks, chunkIndex)
 
       let retries = 0
       while (true) {
         const cancelled = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
           Effect.as(undefined),
+          // A limit DynamoDB enforced (#144) — an oversized item, the 4 MB
+          // payload, an over-long sort key — named. Such a rejection carries no
+          // conditional failure, so it is never read as a replacing put.
+          diagnoseFailure({
+            sent: () => ({
+              _tag: "Transaction",
+              items: transactItems,
+              targets: () =>
+                chunk.map((put, index) =>
+                  transactItemTarget(
+                    transactItems[index]!,
+                    put.tableName,
+                    put.keyFields,
+                    put.entityType,
+                    `the versioned put of ${put.entityType}`,
+                  ),
+                ),
+            }),
+            keys: () => mergeKeyAttributes(...chunk.map((put) => put.keys())),
+            // Chunked to fit by the exact size model: should DynamoDB still
+            // reject the payload, the error gives both sizes — never re-split
+            // nor retried — and says exactly what the batch already wrote.
+            rewrite: (diagnosis, original) =>
+              diagnosedValidationError(diagnosis, original, {
+                operation: "batchWrite",
+                entityType: chunk[0]!.entityType,
+                committed,
+              }),
+          }),
           Effect.catchTag("DynamoError", (error) =>
             isAwsTransactionCancelled(error.cause)
               ? Effect.succeed({
@@ -450,9 +507,8 @@ export const write = (
               `Batch.write would replace an existing ${replaced.entityType} item. A versioned ` +
               "entity's replacing put continues the item's version (and snapshots / rotates it), " +
               "which needs the stored item — a batch write could only reset it to version 1. " +
-              "Use the entity's put() or Transaction.transactWrite for it. Nothing in its chunk " +
-              "of versioned puts, nor any " +
-              "non-versioned request, was written; earlier chunks of versioned puts may have been.",
+              "Use the entity's put() or Transaction.transactWrite for it. Nothing in its " +
+              `transaction of versioned puts was written; ${committed}.`,
           })
         }
 
@@ -503,7 +559,58 @@ export const write = (
       // Retry loop for unprocessed items
       let retries = 0
       while (Object.keys(requestItems).length > 0) {
-        const response = yield* client.batchWriteItem({ RequestItems: requestItems })
+        const sentItems = requestItems
+        // What the batch had written before this request: every versioned
+        // chunk, the earlier chunks, and this chunk's requests processed on
+        // earlier attempts (all but the unprocessed ones being retried).
+        const sentCount = Object.values(sentItems).reduce(
+          (sum, requests) => sum + requests.length,
+          0,
+        )
+        const committed = committedBeforeRequest(
+          versionedChunks,
+          chunkStart + chunk.length - sentCount,
+          writeRequests.length - chunkStart - chunk.length,
+        )
+        const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
+          // An oversized item or over-long sort key (#144), named, with what
+          // the batch had already written: Batch.write was never atomic.
+          diagnoseFailure({
+            sent: () => {
+              // The request's entries, in request order, matched back to the
+              // batch's own records (by request object) to name them.
+              const sources = new Map(chunk.map((item) => [item.request, item]))
+              const ordered = Object.values(sentItems).flatMap((requests) =>
+                requests.map((request) => sources.get(request)),
+              )
+              const items = batchEntries(sentItems)
+              return {
+                _tag: "Batch",
+                items,
+                targets: () =>
+                  items.map((item, index) => {
+                    const source = ordered[index]
+                    return transactItemTarget(
+                      item,
+                      source?.tableName ?? "",
+                      source?.keyFields ?? [],
+                      source?.entityType ?? "unknown",
+                      source === undefined
+                        ? `request ${index} of the batch`
+                        : `the ${item.Put !== undefined ? "put" : "delete"} of ${source.entityType}`,
+                    )
+                  }),
+              }
+            },
+            keys: () => mergeKeyAttributes(...chunk.map((item) => item.keys())),
+            rewrite: (diagnosis, original) =>
+              diagnosedValidationError(diagnosis, original, {
+                operation: "batchWrite",
+                entityType: chunk[0]?.entityType ?? "unknown",
+                committed,
+              }),
+          }),
+        )
 
         // Check for unprocessed items
         const unprocessed: Record<string, Array<Record<string, any>>> = {}

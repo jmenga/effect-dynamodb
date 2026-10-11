@@ -403,7 +403,8 @@ for (const task of Object.values(tasks)) {
   assertEq(buildApi.status, "open", "get task status")
   assertEq(buildApi.points, 8, "get task points")
 
-  // Update employee title — must provide all GSI composites for affected indexes
+  // Update employee title — title is in several GSI key halves, so pass the other
+  // composites of those halves too and each one recomposes in full
   const promoted = yield* db.entities.Employees.update({ employee: "tyler" }).set({
     office: "portland",
     team: "development",
@@ -685,10 +686,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---

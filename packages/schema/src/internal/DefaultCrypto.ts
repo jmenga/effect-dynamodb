@@ -9,10 +9,10 @@
  * surfaced as a requirement.
  *
  * The implementation is a thin wrapper over the global Web Crypto API
- * (`globalThis.crypto`), available on Node 18+ and all modern browsers/edge
- * runtimes — NO new dependency. Consumers needing a platform-specific source
- * (e.g. `@effect/platform-node`) may override it via
- * `DynamoClient.make({ crypto })`.
+ * (`globalThis.crypto`), available on Node 19+ (Node 18 only with
+ * `--experimental-global-webcrypto`) and all modern browsers/edge runtimes —
+ * NO new dependency. Consumers needing a platform-specific source (e.g.
+ * `@effect/platform-node`) may override it via `DynamoClient.make({ crypto })`.
  */
 
 import { Crypto, Effect, PlatformError } from "effect"

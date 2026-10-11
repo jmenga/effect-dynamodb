@@ -104,6 +104,10 @@ const AppLayer = Layer.mergeAll(ClientLayer, MainTableLayer)
 
 const program = Effect.gen(function* () {
   const client = yield* DynamoClient
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: "sparse-demo-table" })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: "sparse-demo-table",
     BillingMode: "PAY_PER_REQUEST",
@@ -205,7 +209,4 @@ const program = Effect.gen(function* () {
 // 5. Run
 // =============================================================================
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(
-  () => console.log("Done."),
-  (error: unknown) => console.error("Failed:", error),
-)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(() => console.log("Done."))

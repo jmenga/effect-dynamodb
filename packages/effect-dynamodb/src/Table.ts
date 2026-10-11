@@ -12,11 +12,7 @@ import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
-import {
-  MAX_INLINE_FILTERS,
-  MAX_VECTOR_INDEXES_PER_TABLE,
-  toWireDistanceFunction,
-} from "@effect-dynamodb/schema/VectorIndex.js"
+import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 
@@ -127,6 +123,12 @@ export interface Table<
  *
  * Entities are automatically configured with the table's schema and tag.
  *
+ * Members are checked against each other at definition time: entities sharing a
+ * physical vector index must agree on its settings (EDD-9035), every member
+ * declaring one physical secondary index must agree on its key attributes and
+ * GSI/LSI classification, and every entity must declare the same primary-key
+ * fields (EDD-9069).
+ *
  * @example
  * ```typescript
  * const MainTable = Table.make({
@@ -169,6 +171,12 @@ export const make = <
   // CreateTable round trip.
   validateSharedVectorIndexes(entities)
 
+  // One physical secondary index has one key schema, and every entity on one
+  // table shares its primary key. Refuse members that disagree (EDD-9069) here,
+  // so tables deployed with CDK or Terraform — which never call
+  // `Table.definition` — fail at definition time too.
+  mergeSecondaryIndexes(entities, aggregates, resolvePrimaryKey(entities))
+
   return {
     _tag: "Table" as const,
     schema: config.schema,
@@ -206,13 +214,12 @@ export const make = <
  * by physical index name, validating that all sharers agree.
  *
  * Sharing a physical vector index across entities is the norm in single-table
- * designs — the quota is 5 per table — and it is safe precisely because the
+ * designs — the default quota is 5 per table — and it is safe precisely because the
  * composed `__edd_vp_<name>__` partition value carries the entity type, so a
  * search never crosses entity boundaries (see `DESIGN.md §14`).
  *
  * @throws when two entities disagree on `dimensions` or `distance` (EDD-9035),
- *   or when more than {@link MAX_VECTOR_INDEXES_PER_TABLE} distinct physical
- *   indexes are declared (EDD-9034).
+ *   or on a shared filter attribute's type (EDD-9040).
  */
 export const mergeVectorIndexes = (
   entities: Record<string, EntityLike>,
@@ -222,6 +229,7 @@ export const mergeVectorIndexes = (
     {
       definition: VectorIndexDefinition
       owner: string
+      sharers: Array<string>
       filters: Array<string>
       resolveDbName: (domainName: string) => string
       filterStoredTypes: Record<string, "S" | "N">
@@ -239,6 +247,7 @@ export const mergeVectorIndexes = (
         merged.set(definition.index, {
           definition,
           owner,
+          sharers: [owner],
           filters: [...definition.filters],
           resolveDbName,
           filterStoredTypes: Object.fromEntries(
@@ -259,6 +268,7 @@ export const mergeVectorIndexes = (
             `immutable on a DynamoDB vector index — every entity sharing one must agree.`,
         )
       }
+      if (!existing.sharers.includes(owner)) existing.sharers.push(owner)
       // Filters, unlike dimensions/distance, are per-entity access patterns
       // rather than a shared physical property — one index can serve several
       // entities filtering on different attributes. Union them; keeping only
@@ -283,25 +293,10 @@ export const mergeVectorIndexes = (
     }
   }
 
-  for (const [indexName, entry] of merged) {
-    if (entry.filters.length > MAX_INLINE_FILTERS) {
-      throw new Error(
-        `[EDD-9032] Vector index "${indexName}" resolves to ${entry.filters.length} INLINE_FILTER ` +
-          `attributes once unioned across the entities sharing it ` +
-          `(${[...entry.filters].sort().join(", ")}). DynamoDB allows at most ` +
-          `${MAX_INLINE_FILTERS} per vector index.`,
-      )
-    }
-  }
-
-  if (merged.size > MAX_VECTOR_INDEXES_PER_TABLE) {
-    throw new Error(
-      `[EDD-9034] Table declares ${merged.size} vector indexes ` +
-        `(${[...merged.keys()].sort().join(", ")}). DynamoDB allows at most ` +
-        `${MAX_VECTOR_INDEXES_PER_TABLE} per table.`,
-    )
-  }
-
+  // DynamoDB's own vector-index limits — inline filters per index (after the
+  // union above), vector indexes per table (an adjustable quota) — are not
+  // pre-checked: `db.tables.*.create()` / `addVectorIndex` diagnose DynamoDB's
+  // rejection, naming the index and the entities sharing it (#144).
   return merged
 }
 
@@ -311,6 +306,8 @@ export interface MergedVectorIndex {
   readonly definition: VectorIndexDefinition
   /** Entity type of the first declarer, used in conflict messages. */
   readonly owner: string
+  /** Entity type of every entity declaring the index, in registration order. */
+  readonly sharers: ReadonlyArray<string>
   /** Union of every sharer's declared `filters` (domain names). */
   readonly filters: ReadonlyArray<string>
   /** Stored-name resolver for the first declarer's `storedAs` renames. */
@@ -436,24 +433,149 @@ export interface TableDefinition {
 }
 
 /**
- * Resolve the table's primary PK/SK field names from the first entity carrying a
- * primary index. Aggregates are skipped — they borrow the table's primary key
- * rather than declaring one.
+ * Resolve the table's primary PK/SK field names from the entities' primary
+ * indexes. Aggregates are skipped — they borrow the table's primary key rather
+ * than declaring one.
  *
  * Returns `undefined` when no entity declares a primary index (a table registering
  * only aggregates). Callers that require the primary key must treat that as an error;
  * callers performing best-effort validation should skip their check instead.
+ *
+ * @throws when two entities declare different primary-key fields (EDD-9069). A
+ *   table has one key schema; an entity keyed by other attributes would write
+ *   items lacking the table's key attributes.
  */
 export const resolvePrimaryKey = (
   entities: Record<string, EntityLike>,
 ): { readonly pk: string; readonly sk: string | undefined } | undefined => {
-  for (const entity of Object.values(entities)) {
+  let resolved: { readonly pk: string; readonly sk: string | undefined } | undefined
+  let owner = ""
+  for (const [entityKey, entity] of Object.entries(entities)) {
     const primary = entity.indexes.primary
-    if (primary) {
-      return { pk: primary.pk.field, sk: primary.sk.field }
+    if (!primary) continue
+    const current = { pk: primary.pk.field, sk: primary.sk.field }
+    const name = entity.entityType ?? entityKey
+    if (resolved === undefined) {
+      resolved = current
+      owner = name
+      continue
+    }
+    if (resolved.pk !== current.pk || resolved.sk !== current.sk) {
+      throw new Error(
+        `[EDD-9069] The table's primary key is declared as (${keyList(resolved)}) by entity ` +
+          `"${owner}" and as (${keyList(current)}) by entity "${name}". One table has one key ` +
+          `schema: every entity registered on it must declare the same primary-key fields.`,
+      )
     }
   }
-  return undefined
+  return resolved
+}
+
+const keyList = (keys: { readonly pk: string; readonly sk: string | undefined }): string =>
+  keys.sk === undefined ? keys.pk : `${keys.pk}, ${keys.sk}`
+
+// ---------------------------------------------------------------------------
+// Secondary index merging + validation
+// ---------------------------------------------------------------------------
+
+/** A physical secondary index resolved across every member that declares it. */
+export interface MergedSecondaryIndex {
+  /**
+   * `"gsi"` or `"lsi"`; `undefined` only for an aggregate collection index on a
+   * table with no entity primary key, where the classification is unknown.
+   */
+  readonly kind: "gsi" | "lsi" | undefined
+  readonly pk: string
+  readonly sk: string
+  /** The first declarer, as named in conflict messages. */
+  readonly owner: string
+}
+
+const describeIndexKind = (kind: MergedSecondaryIndex["kind"]): string =>
+  kind === "gsi" ? "a GSI" : kind === "lsi" ? "an LSI" : "an index"
+
+/**
+ * Merge every member's secondary index declarations into one map keyed by
+ * physical index name, refusing members that disagree on its key schema.
+ *
+ * Declarers:
+ * - every non-primary entity index (the auto-generated `_cascade_<field>`
+ *   indexes included) — always a GSI;
+ * - an aggregate's `collection.index` — an LSI when the aggregate's `pkField` is
+ *   the table's primary partition key, a GSI otherwise (unknown when `primary`
+ *   is `undefined`);
+ * - an aggregate's list index — always a GSI.
+ *
+ * Several members sharing one physical index is the norm in single-table
+ * designs (index overloading). They must agree on its key attributes and its
+ * GSI/LSI classification: DynamoDB keys a physical index one way, and a member
+ * writing other attributes would never appear in it.
+ *
+ * @throws on a disagreement (EDD-9069), naming both declarers and both shapes.
+ */
+export const mergeSecondaryIndexes = (
+  entities: Record<string, EntityLike>,
+  aggregates: Record<string, AggregateLike>,
+  primary: { readonly pk: string; readonly sk: string | undefined } | undefined,
+): Map<string, MergedSecondaryIndex> => {
+  const merged = new Map<string, MergedSecondaryIndex>()
+
+  const declare = (indexName: string, declared: MergedSecondaryIndex): void => {
+    const existing = merged.get(indexName)
+    if (existing === undefined) {
+      merged.set(indexName, declared)
+      return
+    }
+    const kindsDisagree =
+      existing.kind !== undefined && declared.kind !== undefined && existing.kind !== declared.kind
+    if (existing.pk !== declared.pk || existing.sk !== declared.sk || kindsDisagree) {
+      throw new Error(
+        `[EDD-9069] Secondary index "${indexName}" is declared as ` +
+          `${describeIndexKind(existing.kind)} keyed (${existing.pk}, ${existing.sk}) by ` +
+          `${existing.owner} and as ${describeIndexKind(declared.kind)} keyed ` +
+          `(${declared.pk}, ${declared.sk}) by ${declared.owner}. One physical index has one ` +
+          `key schema: every member declaring it must agree.`,
+      )
+    }
+    // A declarer whose classification was unknown takes the known one.
+    if (existing.kind === undefined && declared.kind !== undefined) {
+      merged.set(indexName, { ...existing, kind: declared.kind })
+    }
+  }
+
+  for (const [entityKey, entity] of Object.entries(entities)) {
+    const owner = `entity "${entity.entityType ?? entityKey}"`
+    for (const [name, index] of Object.entries(entity.indexes)) {
+      if (!index || name === "primary" || !index.index) continue
+      // Entity index definitions carry no LSI semantics: always a GSI.
+      declare(index.index, { kind: "gsi", pk: index.pk.field, sk: index.sk.field, owner })
+    }
+  }
+
+  for (const [aggregateKey, agg] of Object.entries(aggregates)) {
+    const collectionIndex = agg.collection.index
+    const collectionSk = agg.collection.sk
+    if (collectionIndex !== undefined && collectionSk !== undefined) {
+      declare(collectionIndex, {
+        // DynamoDB LSIs share the base table's partition key; any index that
+        // does IS an LSI.
+        kind: primary === undefined ? undefined : agg.pkField === primary.pk ? "lsi" : "gsi",
+        pk: agg.pkField,
+        sk: collectionSk.field,
+        owner: `aggregate "${aggregateKey}" (collection index)`,
+      })
+    }
+    if (agg.listIndex) {
+      declare(agg.listIndex.index, {
+        kind: "gsi",
+        pk: agg.listIndex.pk.field,
+        sk: agg.listIndex.sk.field,
+        owner: `aggregate "${aggregateKey}" (list index)`,
+      })
+    }
+  }
+
+  return merged
 }
 
 /**
@@ -475,6 +597,10 @@ export const resolvePrimaryKey = (
  * entity's primary index). This matches DynamoDB semantics — any index that shares
  * the base table's partition key IS an LSI — and makes `lsi1`..`lsi5`-style indexes
  * on aggregates work transparently with `db.tables.*.create()`.
+ *
+ * @throws when members disagree on one physical secondary index's key attributes or
+ *   GSI/LSI classification, or entities disagree on the primary-key fields (EDD-9069,
+ *   see {@link mergeSecondaryIndexes}). {@link make} refuses the same tables.
  */
 export const definition = (table: Table): TableDefinition => {
   const members: ReadonlyArray<EntityLike | AggregateLike> = [
@@ -497,10 +623,18 @@ export const definition = (table: Table): TableDefinition => {
   const primaryPk = primary.pk
   const primarySk = primary.sk
 
-  // Pass 2: collect attribute names and classify indexes (GSI vs LSI).
-  const attributeNames = new Set<string>()
+  // Pass 2: classify secondary indexes (GSI vs LSI), refusing members that
+  // disagree on one physical index's key schema (EDD-9069).
+  const secondaryIndexes = mergeSecondaryIndexes(table.entities, table.aggregates, primary)
   const gsiMap = new Map<string, { pk: string; sk: string }>()
   const lsiMap = new Map<string, { pk: string; sk: string }>()
+  for (const [indexName, index] of secondaryIndexes) {
+    const target = index.kind === "lsi" ? lsiMap : gsiMap
+    target.set(indexName, { pk: index.pk, sk: index.sk })
+  }
+
+  // Pass 3: collect attribute names.
+  const attributeNames = new Set<string>()
 
   // Always include the primary key fields in attribute definitions.
   attributeNames.add(primaryPk)
@@ -527,48 +661,20 @@ export const definition = (table: Table): TableDefinition => {
       attributeNames.add(agg.pkField)
       if (collectionIndex !== undefined && collectionSk !== undefined) {
         attributeNames.add(collectionSk.field)
-        if (agg.pkField === primaryPk) {
-          if (!lsiMap.has(collectionIndex) && !gsiMap.has(collectionIndex)) {
-            lsiMap.set(collectionIndex, { pk: agg.pkField, sk: collectionSk.field })
-          }
-        } else {
-          if (!gsiMap.has(collectionIndex) && !lsiMap.has(collectionIndex)) {
-            gsiMap.set(collectionIndex, { pk: agg.pkField, sk: collectionSk.field })
-          }
-        }
       }
 
       // List GSI (if configured) — always a GSI; has its own PK attribute.
       if (agg.listIndex) {
         attributeNames.add(agg.listIndex.pk.field)
         attributeNames.add(agg.listIndex.sk.field)
-        if (!gsiMap.has(agg.listIndex.index) && !lsiMap.has(agg.listIndex.index)) {
-          gsiMap.set(agg.listIndex.index, {
-            pk: agg.listIndex.pk.field,
-            sk: agg.listIndex.sk.field,
-          })
-        }
       }
     } else {
       // Entity — scan index definitions
       const entity = member as EntityLike
-      for (const [indexName, index] of Object.entries(entity.indexes)) {
+      for (const index of Object.values(entity.indexes)) {
         if (!index) continue
-
         attributeNames.add(index.pk.field)
         attributeNames.add(index.sk.field)
-
-        if (indexName === "primary") {
-          // Primary key already captured in pass 1.
-          continue
-        }
-        if (index.index) {
-          // Entity-declared secondary index — always a GSI. Entity index definitions
-          // don't carry LSI semantics; LSIs are only introduced via aggregate collections.
-          if (!gsiMap.has(index.index) && !lsiMap.has(index.index)) {
-            gsiMap.set(index.index, { pk: index.pk.field, sk: index.sk.field })
-          }
-        }
       }
     }
   }

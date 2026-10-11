@@ -96,9 +96,14 @@ Every entity automatically derives 7 types from your domain model and configurat
 
 ### How do GSI composite updates work?
 
-When updating attributes that participate in a GSI's composite key, you must provide **all** composite attributes for that GSI — not just the ones you're changing. This is the "fetch-merge" pattern.
+An update doesn't read the stored item, so GSI keys are recomposed from what the update carries: the payload plus the primary key attributes. Each GSI key has two **halves**, the partition key and the sort key, and each half is handled on its own:
 
-**Why?** GSI keys are recomposed from composite attributes on every update. If you provide only some composites, the library cannot build a complete key, and `extractComposites` will fail with an error.
+- **The update doesn't touch the half** (none of its composites is in the payload, the primary key, or `.remove()`): the stored half is left as it is.
+- **All of the half's composites are available**: the half is recomposed in full.
+- **Only trailing composites are missing**: the half is recomposed from the leading ones, a shorter and coarser key.
+- **A leading composite is missing**: the half can't be composed. Under the default `indexPolicy` (`'preserve'`) the stored half is kept and may now be stale; under `'sparse'` it is removed and the item drops out of the index.
+
+None of these is an error. Rule of thumb: when you change a composite, also pass the other composites of the same half.
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -107,16 +112,21 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.Users
 
-// Entity with GSI: byTenant has composite: ["tenantId", "region"]
+// byTenant: pk composite ["tenantId"], sk composite ["region", "office"]
 
-// WRONG: partial GSI composites — will error
-yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new" })  // Missing "region"!
+// Partition half only — gsi1pk moves to t-new, the sort key is kept as stored
+yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new" })
 
-// CORRECT: provide all composites for the GSI
-yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east-1" })
+// Leading sort composite without the trailing one — gsi1sk is truncated to the region
+yield* users.update({ userId: "u-1" }).set({ region: "eu-west-1" })
+
+// Whole sort half — gsi1sk is recomposed in full
+yield* users.update({ userId: "u-1" }).set({ region: "eu-west-1", office: "dublin" })
 ```
 
-**What about `Entity.remove()`?** When you remove a GSI composite attribute, the corresponding GSI key fields (pk/sk) are automatically removed so the item drops out of the sparse index. If SET and REMOVE target composites of the same GSI, removal wins.
+**What about `Entity.remove()`?** Removing a GSI composite attribute recomposes the key half (pk or sk) that contains it without that attribute. If the half can no longer be composed (the removed attribute was a leading composite), the half is removed whatever its policy, and the item drops out of the index; if it was a trailing composite, the half is truncated. The other half is kept, so the item rejoins the index once a later write composes the removed half again. If SET and REMOVE target the same composite, removal wins.
+
+See [Index Policy](/effect-dynamodb/guides/index-policy/) for the full rules.
 
 ---
 
@@ -307,13 +317,13 @@ yield* users.update({ userId: "123" }).set({ name: "Alice" })
 
 ---
 
-### "GSI key composition failed"
+### Item missing from a GSI query after an update
 
-**Symptom:** Error from `extractComposites` when updating an item.
+**Symptom:** After an update, an item no longer shows up in a GSI query, or shows up under its old key values.
 
-**Cause:** You provided some but not all composite attributes for a GSI. When any composite attribute for a GSI is updated, the library must recompose the entire GSI key, which requires all composites to be present.
+**Cause:** The update touched a GSI key half but didn't carry all of that half's composites. The library recomposes keys only from the update's payload plus the primary key (it doesn't read the stored item). With a leading composite missing, the half can't be composed: under `indexPolicy` `'preserve'` (the default) the stored half is kept and is now stale, and under `'sparse'` it is removed. With only trailing composites missing, the half is truncated to the leading ones. An item is also invisible in a GSI while one of its two key halves is absent.
 
-**Solution:** Provide all composite attributes for the affected GSI:
+**Solution:** When you change a composite, pass the other composites of the same half:
 
 ```typescript
 const db = yield* DynamoClient.make({
@@ -322,12 +332,12 @@ const db = yield* DynamoClient.make({
 })
 const users = db.entities.Users
 
-// If the GSI has composite: ["tenantId", "region"]
-// Provide BOTH when updating either one
-yield* users.update({ userId: "u-1" }).set({ tenantId: "t-new", region: "us-east-1" })
+// If the GSI's sort key has composite: ["region", "office"]
+// pass both when changing either one
+yield* users.update({ userId: "u-1" }).set({ region: "eu-west-1", office: "dublin" })
 ```
 
-If you want to update a non-GSI field without touching the GSI, omit all GSI composites and the GSI key will not be recomposed.
+Updates that touch none of a GSI's composites leave its keys alone. See [Index Policy](/effect-dynamodb/guides/index-policy/) for how each half is evaluated.
 
 ---
 

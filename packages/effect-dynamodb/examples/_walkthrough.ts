@@ -592,6 +592,4 @@ const AppLayer = Layer.merge(
   }),
   MainTable.layer({ name: "cricket-walkthrough" }),
 )
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).catch((err) =>
-  console.error("Failed:", err),
-)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer)))

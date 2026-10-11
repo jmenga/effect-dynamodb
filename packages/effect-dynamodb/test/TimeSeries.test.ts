@@ -21,7 +21,13 @@ import * as Entity from "../src/Entity.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_ITEM_SIZE_UPDATE,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -459,6 +465,86 @@ describe("TimeSeries — append payload shape", () => {
         expect(result.orderByField).toBe("timestamp")
         expect(Option.isSome(result.current)).toBe(true)
       }
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect(
+    "#144: a cancellation whose reason is the current item grown past 400 KB is a ValidationError, not stale",
+    () => {
+      const { entity, tableLayer } = buildEntity()
+      const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+      return Effect.gen(function* () {
+        const rejection = awsTransactionCanceled([
+          { Code: "ValidationError", Message: DDB_ITEM_SIZE_UPDATE },
+          { Code: "None" },
+        ])
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+
+        const result = yield* entity
+          .append({
+            channel: "c-1",
+            deviceId: "d-7",
+            timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          })
+          .pipe(Effect.flip)
+
+        expect(result._tag).toBe("ValidationError")
+        if (result._tag === "ValidationError") {
+          expect(result.entityType).toBe("Telemetry")
+          expect(result.operation).toBe("append")
+          const text = String(result.cause)
+          expect(text).toContain("the item of the current item, at pk=$tsapp#v1#telemetry#")
+          expect(((result.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        }
+        // Never read as stale: no follow-up GetItem.
+        expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect("#144: an oversized event item is named from the request-wide rejection", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+
+      const result = yield* entity
+        .append({
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+          location: "x".repeat(410_000),
+        })
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("ValidationError")
+      if (result._tag === "ValidationError") {
+        expect(String(result.cause)).toContain("the item of the event item, at pk=")
+      }
+      expect(mockGetItem).not.toHaveBeenCalled()
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("#144: an unrecognised ValidationException passes through unchanged", () => {
+    const { entity, tableLayer } = buildEntity()
+    const layer = Layer.merge(TestDynamoClient, tableLayer)
+
+    return Effect.gen(function* () {
+      const rejection = awsValidationException("Some other validation problem")
+      mockTransactWriteItems.mockRejectedValueOnce(rejection)
+
+      const result = yield* entity
+        .append({
+          channel: "c-1",
+          deviceId: "d-7",
+          timestamp: DateTime.makeUnsafe("2026-04-22T10:00:00.000Z"),
+        })
+        .pipe(Effect.flip)
+
+      expect(result._tag).toBe("DynamoError")
+      expect((result as DynamoError).cause).toBe(rejection)
     }).pipe(Effect.provide(layer))
   })
 

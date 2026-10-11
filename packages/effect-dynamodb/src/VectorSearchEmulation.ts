@@ -16,8 +16,9 @@
  * Fidelity is deliberate, not approximate: all three distance functions are
  * computed exactly as the developer guide documents them (including the score
  * DIRECTIONS, which differ), the HASH/INLINE_FILTER equality predicates are
- * evaluated, `ProjectionExpression` is honoured, and results are truncated to
- * `TopK`. The ranking output is unit-tested against the developer guide's
+ * evaluated, `ProjectionExpression` is honoured, results are truncated to
+ * `TopK`, and a `TopK` outside 1..100 is rejected as DynamoDB rejects it. The
+ * ranking output is unit-tested against the developer guide's
  * reference table.
  *
  * What it does NOT emulate: approximate (as opposed to exact) nearest-neighbour
@@ -312,6 +313,24 @@ export const wrap = (
           input.ExpressionAttributeNames,
         )
         const topK = input.TopK ?? 10
+        // Real DynamoDB rejects a TopK outside 1..100 (AWS's documented range,
+        // in its standard member-constraint wording — unverified, as Local
+        // has no SearchVectors); reproduced so the library's diagnosis of it
+        // runs here as it would against AWS.
+        if (topK < 1 || topK > 100) {
+          return yield* new DynamoValidationError({
+            operation: "SearchVectors",
+            cause: Object.assign(
+              new Error(
+                `1 validation error detected: Value '${topK}' at 'topK' failed to satisfy ` +
+                  `constraint: Member must have value ${
+                    topK < 1 ? "greater than or equal to 1" : "less than or equal to 100"
+                  }`,
+              ),
+              { name: "ValidationException" },
+            ),
+          })
+        }
 
         // Real DynamoDB rejects a SearchConditionExpression that names an
         // attribute which is not the HASH element or a declared INLINE_FILTER.

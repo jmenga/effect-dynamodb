@@ -10,7 +10,7 @@ A version control platform managing **users**, **repositories**, **issues**, and
 - 2 GSIs with index overloading
 - 3 cross-entity collection patterns (`owned`, `managed`, `activity`)
 - Status-based sort key composition for filtered queries
-- Entity-scoped `set()` for status updates with GSI all-or-none constraints
+- Entity-scoped `set()` for status updates that recompose GSI sort keys
 - Atomic issue + PR creation via `Transaction.transactWrite`
 
 ---
@@ -409,7 +409,7 @@ Both queries hit GSI1 with the same partition key. DynamoDB serves both from the
 
 > Create a new issue, then close it.
 
-Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in GSI sort keys, changing it triggers GSI key recomposition -- the all-or-none rule means you must provide all composites for affected GSIs.
+Creating an issue is a simple `put`. Closing it requires an `update` with `set()`. Because `status` appears in the sort keys of both GSIs, changing it recomposes those sort keys.
 
 ```typescript region="pattern-4" example="version-control.ts"
   // #region pattern-4
@@ -429,18 +429,18 @@ Creating an issue is a simple `put`. Closing it requires an `update` with `set()
     repoOwner: "octocat",
     repoName: "hello-world",
     issueNumber: "3",
-  }).set({ status: "Closed", username: "torvalds" })
+  }).set({ status: "Closed" })
   assertEq(closedIssue.status, "Closed", "closed issue status")
   assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
 ```
 
-The `username` field must be included in the `set()` even though it hasn't changed -- it's a composite of the `managed` collection alongside `status`, and the all-or-none rule requires all composites for any GSI that's being recomposed.
+`set({ status })` is enough. GSI keys are recomposed per half (partition key and sort key), only for the halves the update touches, from the payload plus the primary key. Both sort keys are `[status, issueNumber]`: `status` comes from the payload and `issueNumber` from the primary key, so each recomposes in full. The `managed` partition key is `[username]`, which the update doesn't touch, so it keeps its stored value. Had a sort key composite been neither in the payload nor in the primary key, you'd pass it too: a half that's missing a composite is truncated or, under the default policy, left stale. See [Index Policy](/effect-dynamodb/guides/index-policy/).
 
 ### Pattern 5: Create Pull Request + Close
 
 > Create a PR, then merge/close it.
 
-The same pattern as issues -- `status` in the sort key means the GSI keys must be fully recomposed on status change.
+The same pattern as issues -- changing `status` recomposes the sort keys of both GSIs, with `pullRequestNumber` taken from the primary key.
 
 ```typescript region="pattern-5" example="version-control.ts"
   // #region pattern-5
@@ -460,7 +460,7 @@ The same pattern as issues -- `status` in the sort key means the GSI keys must b
     repoOwner: "octocat",
     repoName: "hello-world",
     pullRequestNumber: "2",
-  }).set({ status: "Closed", username: "octocat" })
+  }).set({ status: "Closed" })
   assertEq(closedPR.status, "Closed", "closed PR status")
   assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
 ```
@@ -596,10 +596,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---
@@ -612,7 +609,7 @@ Effect.runPromise(main).then(
 | **Index overloading** | GSI1 serves `Owned` (User + Repository) and `Managed` (Issue + PullRequest) collections |
 | **3 collections** | `Owned` (GSI1), `Managed` (GSI1), `Activity` (GSI2) enable cross-entity queries |
 | **Status in sort key** | `status` as first sort key composite groups items by Open/Closed within a partition |
-| **GSI all-or-none** | Changing `status` requires providing all composites for affected GSIs (e.g., `username` for Managed) |
+| **Per-half GSI recomposition** | `set({ status })` recomposes the sort keys that contain `status` (the other composite comes from the primary key) and leaves the untouched `managed` partition key as stored |
 | **Transactions** | Atomic multi-entity writes for issue + PR creation |
 | **Composite primary keys** | Repository, Issue, and PullRequest use multi-attribute partition and sort keys |
 

@@ -4,8 +4,10 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   type AggregateAssemblyError,
   type AggregateDecompositionError,
+  type AggregateTransactionOverflow,
   DynamoError,
   type RefNotFound,
+  type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -14,7 +16,16 @@ import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_SORT_KEY_LOCAL,
+  DDB_TOO_MANY_ITEMS,
+  ddbEmptyIn,
+  ddbPayloadTooLarge,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures: Domain models
@@ -1180,6 +1191,120 @@ describe("Aggregate write path", () => {
         expect(call.TransactItems[0].Put.TableName).toBe("test-table")
       }).pipe(Effect.provide(WriteLayer)),
     )
+
+    it.effect("an oversized item is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "x".repeat(410_000),
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("ArticleItem")
+        expect(String(failure.cause)).toContain(
+          'the item of the ArticleItem item of sub-aggregate "',
+        )
+        expect(String(failure.cause)).toContain("Nothing was written.")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("a size reason in a cancelled group is named by its index (#144)", () =>
+      Effect.gen(function* () {
+        mockTransactWrite.mockRejectedValueOnce(
+          awsTransactionCanceled([{ Code: "ValidationError", Message: DDB_ITEM_SIZE }]),
+        )
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("Aggregate.write(ArticleItem)")
+        expect(String(failure.cause)).toContain("the item of the ArticleItem item of sub-aggregate")
+        expect(String(failure.cause)).toContain("at pk=")
+        expect(mockTransactWrite).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("DynamoDB's 4 MB rejection of a group names its largest items (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(ddbPayloadTooLarge(4_300_000))
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain("4194304 bytes (4 MB)")
+        expect(text).toContain("(it reported 4300000 bytes)")
+        expect(text).toContain("The largest: the ArticleItem item of sub-aggregate")
+        expect(text).toContain("Nothing was written.")
+        expect(((error as ValidationError).cause as Error).cause).toBeInstanceOf(DynamoError)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an unrecognised rejection passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Some other validation problem")
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ArticleAggregate.create({
+          articleId: "a-1",
+          title: "t",
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("an over-long list-index sort key is named from DynamoDB's rejection (#144)", () =>
+      Effect.gen(function* () {
+        const ListedArticles = Aggregate.make(Article, {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["articleId"] },
+          collection: {
+            index: "lsi1",
+            name: "article",
+            sk: { field: "lsi1sk", composite: [] },
+          },
+          list: {
+            index: "gsi1",
+            name: "articlelist",
+            pk: { field: "gsi1pk", composite: [] },
+            sk: { field: "gsi1sk", composite: ["title"] },
+          },
+          root: { entityType: "ArticleItem" },
+          edges: {},
+        })
+        const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
+        mockTransactWrite.mockRejectedValueOnce(rejection)
+        const error = yield* ListedArticles.create({
+          articleId: "a-1",
+          title: "t".repeat(1100),
+          author: "Alice",
+          tags: [],
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("ArticleItem")
+        const text = String(failure.cause)
+        expect(text).toContain('the sort key "gsi1sk" of the ArticleItem item of sub-aggregate')
+        expect(text).toContain("longer than DynamoDB's 1024-byte limit")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(WriteLayer)),
+    )
   })
 
   // -------------------------------------------------------------------------
@@ -1540,6 +1665,120 @@ describe("Aggregate write path", () => {
           expect(mockTransactWrite).toHaveBeenCalledTimes(1)
         }).pipe(Effect.provide(WriteLayer)),
     )
+
+    // DynamoDB's limits are not pre-checked (#144): each group is sent, and a
+    // rejected one is diagnosed, naming what earlier groups already committed.
+    describe("a rejected group is diagnosed, naming the groups already committed (#144)", () => {
+      /** A team with `count` players, each a distinct (hydratable) ref. */
+      const manyPlayers = (count: number) => ({
+        ...matchInput,
+        team1: {
+          ...matchInput.team1,
+          players: Array.from({ length: count }, (_, i) => ({
+            playerId: `p-${i}`,
+            battingPosition: i + 1,
+            isCaptain: i === 0,
+          })),
+        },
+      })
+      /** Every ref resolves: venue, teams, coaches, and any player. */
+      const mockAnyRefs = () => {
+        mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+          const requestItems = input.RequestItems as Record<
+            string,
+            { Keys: Array<Record<string, { S?: string }>> }
+          >
+          const responses: Record<string, Array<Record<string, unknown>>> = {}
+          for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+            responses[tableName] = Keys.map((key) => {
+              const pk = key.pk?.S ?? ""
+              const [, , type, id] = pk.split("#")
+              const value = id!.slice(id!.indexOf("_") + 1)
+              const item: Record<string, unknown> = { pk, sk: `$myapp#v1#${type}` }
+              if (type === "venue")
+                Object.assign(item, { __edd_e__: "Venue", venueId: value, name: "MCG", city: "M" })
+              if (type === "team")
+                Object.assign(item, {
+                  __edd_e__: "Team",
+                  teamId: value,
+                  name: value,
+                  country: value,
+                })
+              if (type === "coach")
+                Object.assign(item, { __edd_e__: "Coach", coachId: value, name: value })
+              if (type === "player") {
+                Object.assign(item, {
+                  __edd_e__: "Player",
+                  playerId: value,
+                  displayName: value,
+                  role: "batter",
+                })
+              }
+              return toAttributeMap(item)
+            })
+          }
+          return Promise.resolve({ Responses: responses })
+        })
+      }
+
+      it.effect(
+        "a group over 100 items: AggregateTransactionOverflow, with what was committed",
+        () =>
+          Effect.gen(function* () {
+            mockAnyRefs()
+            const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+            mockTransactWrite.mockImplementation(async (input: any) => {
+              if (input.TransactItems.length > 100) throw rejection
+              return {}
+            })
+            const error = yield* MatchAggregate.create(manyPlayers(110)).pipe(Effect.flip)
+            expect(error._tag).toBe("AggregateTransactionOverflow")
+            const overflow = error as AggregateTransactionOverflow
+            expect(overflow.aggregate).toBe("MatchItem")
+            expect(overflow.itemCount).toBeGreaterThan(110)
+            expect(overflow.limit).toBe(100)
+            // The root group went first, and committed: the write is not atomic.
+            expect(overflow.committed).toHaveLength(1)
+            expect(overflow.subgraph).not.toBe(overflow.committed![0])
+            expect(overflow.operation).toBe("create")
+            expect(overflow.message).toContain(`already committed: "${overflow.committed![0]}"`)
+            expect(overflow.message).toContain("update or delete the partial aggregate")
+            expect((overflow.cause as DynamoError).cause).toBe(rejection)
+            // Sent, not refused: the root group, then the rejected one; no more.
+            expect(mockTransactWrite).toHaveBeenCalledTimes(2)
+          }).pipe(Effect.provide(WriteLayer)),
+      )
+
+      it.effect("a count rejection the group does not confirm passes through", () =>
+        Effect.gen(function* () {
+          mockRefs()
+          const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+          mockTransactWrite.mockRejectedValueOnce(rejection)
+          // The root group holds a few items: DynamoDB's message is not confirmed.
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).cause).toBe(rejection)
+          expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        }).pipe(Effect.provide(WriteLayer)),
+      )
+
+      it.effect("a later group's oversized item: ValidationError naming the committed groups", () =>
+        Effect.gen(function* () {
+          mockRefs()
+          mockTransactWrite.mockResolvedValueOnce({})
+          const rejection = awsValidationException(DDB_ITEM_SIZE)
+          mockTransactWrite.mockRejectedValueOnce(rejection)
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const text = String((error as ValidationError).cause)
+          expect(text).toContain("This request wrote nothing; earlier transactions of this write")
+          expect(text).toMatch(/already committed sub-aggregates "[^"]+"/)
+          // A create's root is among them: a retry would fail on it.
+          expect(text).toContain("update or delete the partial aggregate")
+          expect(mockTransactWrite).toHaveBeenCalledTimes(2)
+        }).pipe(Effect.provide(WriteLayer)),
+      )
+    })
 
     it.effect("a later group's cancellation stays TransactionCancelled (#134)", () =>
       Effect.gen(function* () {
@@ -3609,12 +3848,23 @@ describe("Aggregate write path", () => {
           (_: any, o: any) => o.or(),
           (t: any, o: any) => o.or(o.eq(t.author, "Alice"), o.and()),
           (_: any, o: any) => o.not(o.and()),
-          (t: any, o: any) => o.isIn(t.author, []),
         ]) {
           const error = yield* ListAggregate.list(undefined, { filter: refused }).pipe(Effect.flip)
           expect(error._tag).toBe("ValidationError")
         }
         expect(mockListQuery).not.toHaveBeenCalled()
+        // An isIn with no values is sent, and DynamoDB's rejection named (#144).
+        mockListQuery.mockRejectedValueOnce(awsValidationException(ddbEmptyIn("Filter")))
+        const emptyIn = yield* ListAggregate.list(undefined, {
+          filter: (t: any, o: any) => o.isIn(t.author, []),
+        }).pipe(Effect.flip)
+        expect(emptyIn._tag).toBe("ValidationError")
+        expect((emptyIn as ValidationError).operation).toBe("list.filter")
+        expect(String((emptyIn as ValidationError).cause)).toContain(
+          'isIn() on "author" has no values',
+        )
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBe("#e0 IN ()")
+        mockListQuery.mockClear()
         // An empty part directly under and is left out; a whole empty filter is none.
         mockListQuery.mockResolvedValue({ Items: [] })
         yield* ListAggregate.list(undefined, {

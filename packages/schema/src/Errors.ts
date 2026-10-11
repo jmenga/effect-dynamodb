@@ -227,12 +227,18 @@ export const isAwsResourceNotFound = (cause: unknown): boolean =>
   "name" in cause &&
   (cause as { name: string }).name === "ResourceNotFoundException"
 
-/** Entity-level transactWriteItems would exceed DynamoDB's 100-item limit */
+/**
+ * An entity's `TransactWriteItems` was rejected by DynamoDB for exceeding its
+ * 100-item limit. Not pre-checked: DynamoDB's rejection is confirmed by
+ * counting the request, and kept as `cause`. Nothing was written.
+ */
 export class TransactionOverflow extends Data.TaggedError("TransactionOverflow")<{
   readonly entityType: string
   readonly operation: string
   readonly itemCount: number
   readonly limit: number
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
 }> {}
 
 /** Referenced entity not found during ref hydration */
@@ -270,13 +276,60 @@ export class AggregateDecompositionError extends Data.TaggedError("AggregateDeco
   readonly reason: string
 }> {}
 
-/** Sub-aggregate exceeds DynamoDB's 100-item transaction limit */
-export class AggregateTransactionOverflow extends Data.TaggedError("AggregateTransactionOverflow")<{
+/** The fields of {@link AggregateTransactionOverflow}. */
+export type AggregateTransactionOverflowFields = {
   readonly aggregate: string
   readonly subgraph: string
   readonly itemCount: number
   readonly limit: number
-}> {}
+  /**
+   * The sub-aggregates earlier transactions of the same write already
+   * committed (each group is its own transaction, so a multi-group write is
+   * not atomic). Empty: nothing was written.
+   */
+  readonly committed?: ReadonlyArray<string> | undefined
+  /**
+   * The write that failed, when known. A failed `create` may leave its root
+   * committed (the root is in the first group), which its `message` says.
+   */
+  readonly operation?: "create" | "update" | undefined
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
+}
+
+/** The readable message of an {@link AggregateTransactionOverflow}. */
+const aggregateTransactionOverflowMessage = (
+  fields: AggregateTransactionOverflowFields,
+): string => {
+  const committed = fields.committed ?? []
+  const head =
+    `Aggregate "${fields.aggregate}": the transaction of sub-aggregate "${fields.subgraph}" ` +
+    `holds ${fields.itemCount} items, over DynamoDB's limit of ${fields.limit} for one ` +
+    "transaction, and DynamoDB rejected it."
+  if (committed.length === 0) return `${head} Nothing was written.`
+  const already =
+    ` Each sub-aggregate is its own transaction, and earlier ones of this write were ` +
+    `already committed: ${committed.map((name) => `"${name}"`).join(", ")}.`
+  return fields.operation === "create"
+    ? `${head}${already} The root may be among them, so a retried create fails its root ` +
+        "guard (ConditionalCheckFailed): update or delete the partial aggregate instead."
+    : `${head}${already}`
+}
+
+/**
+ * A sub-aggregate's transaction exceeds DynamoDB's 100-item limit. Not
+ * pre-checked: DynamoDB rejects that group whole, and the rejection is
+ * confirmed by counting it. Groups written before it stay written —
+ * `committed` names them, and `message` says so.
+ */
+export class AggregateTransactionOverflow extends Data.TaggedError(
+  "AggregateTransactionOverflow",
+)<AggregateTransactionOverflowFields> {
+  constructor(fields: AggregateTransactionOverflowFields) {
+    super(fields)
+    this.message = aggregateTransactionOverflowMessage(fields)
+  }
+}
 
 /** Cascade update partially failed (eventual mode) */
 export class CascadePartialFailure extends Data.TaggedError("CascadePartialFailure")<{
@@ -344,10 +397,13 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 export const TRANSACT_WRITE_ITEMS_LIMIT = 100
 
 /**
- * `EventStore.append` would exceed DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
+ * `EventStore.append` exceeded DynamoDB's {@link TRANSACT_WRITE_ITEMS_LIMIT}
  * (100 items per `TransactWriteItems`). An append is always one atomic
  * transaction — it is never split, because splitting would break append
- * atomicity — so an oversized one is rejected before any request is issued.
+ * atomicity — so DynamoDB rejects an oversized one whole and nothing is
+ * written. The limit is not pre-checked: DynamoDB's rejection is confirmed by
+ * counting the request and reported as this error, with DynamoDB's error as
+ * `cause`.
  *
  * `count` is the total number of transact items the append requires: one Put
  * per event, one `ConditionCheck` (the version-contiguity guard) when
@@ -363,9 +419,9 @@ export const TRANSACT_WRITE_ITEMS_LIMIT = 100
  * `count` against `limit` then tells the caller its configured step size is
  * too large.
  *
- * DynamoDB's 4 MB aggregate cap on one transaction is checked client-side too,
- * by DynamoDB's item-size rules: exceeding it fails with `ValidationError`
- * before anything is sent.
+ * DynamoDB's 4 MB aggregate cap on one transaction and its 400 KB item limit
+ * are diagnosed the same way, from DynamoDB's rejection: a `ValidationError`
+ * naming the item(s) at fault.
  */
 export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly streamName: string
@@ -374,6 +430,8 @@ export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
   readonly count: number
   /** The DynamoDB limit ({@link TRANSACT_WRITE_ITEMS_LIMIT}). */
   readonly limit: number
+  /** DynamoDB's rejection, when the overflow was diagnosed from it. */
+  readonly cause?: unknown
 }> {}
 
 /**

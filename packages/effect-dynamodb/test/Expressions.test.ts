@@ -180,10 +180,11 @@ describe("Expr", () => {
       expect(emptyPartProblem(ops.not(x))).toBeUndefined()
     })
 
-    it("isIn with no values is a problem (#134)", () => {
-      expect(emptyPartProblem(ops.isIn(pb.a, []))).toBeDefined()
-      expect(emptyPartProblem(ops.and(x, ops.not(ops.isIn(pb.a, []))))).toBeDefined()
-      expect(emptyPartProblem(ops.isIn(pb.a, ["1"]))).toBeUndefined()
+    it("isIn with no values is not a problem: it is sent, and DynamoDB's rejection diagnosed (#144)", () => {
+      expect(emptyPartProblem(ops.isIn(pb.a, []))).toBeUndefined()
+      expect(emptyPartProblem(ops.and(x, ops.not(ops.isIn(pb.a, []))))).toBeUndefined()
+      // It compiles to the `IN ()` DynamoDB rejects as a syntax error.
+      expect(compileExpr(ops.isIn(pb.a, [])).expression).toBe("#e0 IN ()")
     })
 
     it("compileExpr refuses what emptyPartProblem refuses, so no caller can bypass it (#134)", () => {
@@ -193,7 +194,6 @@ describe("Expr", () => {
         ops.or(x, ops.and(ops.and())),
         ops.not(ops.and()),
         ops.and(x, ops.or(x, ops.and())),
-        ops.isIn(pb.a, []),
       ]) {
         expect(() => compileExpr(expr)).toThrow(/compileExpr/)
       }

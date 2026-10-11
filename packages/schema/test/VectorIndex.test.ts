@@ -112,7 +112,7 @@ describe("VectorIndex", () => {
     })
   })
 
-  describe("clampTopK", () => {
+  describe("clampTopK (deprecated; unused by the library since #144)", () => {
     it("clamps into 1..100 and floors fractional values", () => {
       expect(VectorIndex.clampTopK(0)).toBe(1)
       expect(VectorIndex.clampTopK(-5)).toBe(1)
@@ -188,17 +188,24 @@ describe("VectorIndex", () => {
       expect(Products._data.vectorIndexes.byDescription?.index).toBe("vec1")
     })
 
-    it("rejects out-of-range dimensions (EDD-9030)", () => {
-      expect(() =>
-        makeProducts({
-          byDescription: { name: "vec1", dimensions: 0, source: { fields: ["description"] } },
-        }),
-      ).toThrow("[EDD-9030]")
-      expect(() =>
-        makeProducts({
-          byDescription: { name: "vec1", dimensions: 5000, source: { fields: ["description"] } },
-        }),
-      ).toThrow("[EDD-9030]")
+    it("leaves out-of-range dimensions to DynamoDB (#144: EDD-9030 retired)", () => {
+      for (const dimensions of [0, 5000]) {
+        expect(() =>
+          makeProducts({
+            byDescription: { name: "vec1", dimensions, source: { fields: ["description"] } },
+          }),
+        ).not.toThrow()
+      }
+    })
+
+    it("rejects non-integer dimensions, which DynamoDB could read as another (EDD-9070)", () => {
+      for (const dimensions of [1536.5, Number.NaN]) {
+        expect(() =>
+          makeProducts({
+            byDescription: { name: "vec1", dimensions, source: { fields: ["description"] } },
+          }),
+        ).toThrow("[EDD-9070]")
+      }
     })
 
     it("rejects an empty source.fields (EDD-9031)", () => {
@@ -237,7 +244,10 @@ describe("VectorIndex", () => {
       ).toThrow("[EDD-9031]")
     })
 
-    it("rejects more than 18 inline filters (EDD-9032)", () => {
+    it("accepts more than 18 inline filters, and more than 5 indexes: DynamoDB's limits (#144)", () => {
+      // Not pre-checked: DynamoDB enforces its own quotas (18 inline filters per
+      // index; 5 vector indexes per table by default, adjustable), and
+      // `db.tables.*.create()` / `addVectorIndex` diagnose its rejection.
       const wide = Schema.Struct({
         id: Schema.String,
         description: Schema.String,
@@ -245,21 +255,40 @@ describe("VectorIndex", () => {
           Array.from({ length: 19 }, (_, i) => [`f${i}`, Schema.String] as const),
         ),
       })
-      expect(() =>
-        Entity.make({
-          model: wide,
-          entityType: "wide",
-          primaryKey: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
+      const entity = Entity.make({
+        model: wide,
+        entityType: "wide",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        vectorIndexes: {
+          byDescription: {
+            name: "vec1",
+            dimensions: 8,
+            source: { fields: ["description"] },
+            filters: Array.from({ length: 19 }, (_, i) => `f${i}`),
           },
-          vectorIndexes: {
-            byDescription: {
-              name: "vec1",
-              dimensions: 8,
-              source: { fields: ["description"] },
-              filters: Array.from({ length: 19 }, (_, i) => `f${i}`),
-            },
+          ...Object.fromEntries(
+            Array.from({ length: 5 }, (_, i) => [
+              `extra${i}`,
+              { name: `vec${i + 2}`, dimensions: 8, source: { fields: ["description"] } },
+            ]),
+          ),
+        },
+      })
+      expect(entity._data.vectorIndexes.byDescription?.filters).toHaveLength(19)
+      expect(Object.keys(entity._data.vectorIndexes)).toHaveLength(6)
+    })
+
+    it("still rejects a filter listed twice (EDD-9032)", () => {
+      expect(() =>
+        makeProducts({
+          byDescription: {
+            name: "vec1",
+            dimensions: 8,
+            source: { fields: ["description"] },
+            filters: ["category", "category"],
           },
         }),
       ).toThrow("[EDD-9032]")

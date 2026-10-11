@@ -1,56 +1,25 @@
 /**
- * Type-level verification for sparse GSI all-or-none constraints.
+ * Type-level verification of `Entity.set` and the entity-scoped `.set`.
  * This file is NOT shipped — it exists solely for `pnpm check` validation.
  *
- * Enforcement:
- * - Data-first: Entity.set(self, updates) — type error at the call site (NoInfer<U>)
- * - Data-last: .pipe(Entity.set(updates)) — clean types, runtime validation catches
- *   partial GSI composites. Runtime is always active on all code paths.
+ * A partial update of a GSI's composites is valid: GSI keys are recomposed
+ * per half (`DESIGN.md` §7). A half whose composites the update gives is
+ * recomposed (truncated to the leading composites given, where it can be); a
+ * half it does not touch is left as stored; a half it touches but cannot
+ * compose follows the index's policy (`'sparse'` removes the key, `'preserve'`
+ * leaves it). So the update payload `U` is a plain partial of the model minus
+ * its primary-key composites, and no combination of GSI composites is a type
+ * or runtime error. (Until the per-half policy, a GSI's composites had to be
+ * updated all together or not at all; that rule is gone.)
  *
- * § Why data-last loses the constraint (with core Effect comparison):
- *
- * Core Effect duals like Ref.set and HashMap.set use a SHARED type parameter
- * across the outer and inner functions:
- *
- *   Ref.set:     <A>(value: A)       → (self: Ref<A>) → Effect<void>
- *   HashMap.set: <K, V>(key: K, v: V) → (self: HashMap<K, V>) → HashMap<K, V>
- *
- * In data-last, A/V are inferred from the arguments. When piped, `self` is
- * checked against that inferred type. Because Ref and HashMap are INVARIANT
- * in their type parameter, a mismatch between the inferred A and self's A
- * produces a type error on self.
- *
- * Entity.set is different. The update constraint U is an all-or-none union:
- *
- *   U = { tenantId: string; region: string } | { tenantId?: never; region?: never }
- *
- * If we used the same shared-parameter pattern:
- *
- *   <U>(updates: U) → (self: EntityUpdate<..., U, ...>) → EntityUpdate<..., U, ...>
- *
- * Then Entity.set({ tenantId: "t-3" }) infers U = { tenantId: string }. When
- * piped, self's U (the all-or-none union above) would need to extend
- * { tenantId: string }. But it doesn't — the NoneAllowed branch has
- * tenantId?: never. So this WOULD error, but at the self position, producing
- * a confusing "EntityUpdate<...> is not assignable to EntityUpdate<...>" message
- * rather than the clear "missing property 'region'" error from data-first.
- *
- * Worse: for non-constrained fields the error is reversed. Entity.set({ name: "Alice" })
- * infers U = { name: string }, then self's U (the all-or-none union) would need
- * to extend { name: string } — but { tenantId?: never; region?: never } doesn't
- * have name at all, so it would ALSO error, even though the update is perfectly valid.
- *
- * The module-level Entity.set uses `Updates extends Record<string, unknown>` in
- * data-last to avoid these false positives, accepting that the constraint is
- * enforced only at runtime. Data-first uses NoInfer<U> for precise type-level
- * enforcement.
- *
- * § Entity-scoped set (the solution):
- *
- * Each Entity instance exposes a `.set` dual where U is pre-bound from the
- * entity definition — following the schemaBodyJson(schema) factory pattern
- * from Effect HTTP. Because U is resolved at entity creation (not inferred
- * from the updates argument), both data-first and data-last paths are type-safe.
+ * Typing:
+ * - Data-first: `Entity.set(self, updates)` checks `updates` against the
+ *   update's `U` (`NoInfer<U>`).
+ * - Data-last: `.pipe(Entity.set(updates))` takes any record
+ *   (`Updates extends Record<string, unknown>`); the module-level dual cannot
+ *   see `U` before `self` is known (see the Ref / HashMap comparison below).
+ * - Entity-scoped: `Employees.set(...)` pre-binds `U` from the entity
+ *   definition, so both forms are checked.
  */
 import { Effect, HashMap, pipe, Ref, Schema } from "effect"
 import * as Entity from "../Entity.js"
@@ -79,13 +48,12 @@ const Employees = Entity.make({
 })
 
 // -----------------------------------------------------------------------
-// DATA-FIRST: Entity.set(self, updates) — runtime validated
-// GSI all-or-none is no longer enforced at the type level (TS 25-member
-// union assignability limit). These all compile; partial composites
-// produce a ValidationError at runtime.
+// DATA-FIRST: Entity.set(self, updates)
+// Any subset of a GSI's composites is a valid update: each GSI half is
+// recomposed from what is given (per-half policy, DESIGN.md §7).
 // -----------------------------------------------------------------------
 
-// Partial GSI composites: tenantId without region — caught at runtime
+// Partial GSI composites: tenantId without region — recomposes gsi1pk only
 Entity.set(Employees.update({ employeeId: "e-1" }), { tenantId: "t-3" })
 
 // All GSI composites
@@ -95,11 +63,11 @@ Entity.set(Employees.update({ employeeId: "e-1" }), { tenantId: "t-3", region: "
 Entity.set(Employees.update({ employeeId: "e-1" }), { name: "Alice" as any })
 
 // -----------------------------------------------------------------------
-// PIPE PATH: .pipe(Entity.set({ ... })) — clean types, runtime-validated
+// PIPE PATH: .pipe(Entity.set({ ... }))
 // -----------------------------------------------------------------------
 
-// Partial GSI composites: no type error in pipe path (runtime catches it)
-const _pipeBadRuntime = Effect.gen(function* () {
+// Partial GSI composites: recomposes the gsi1pk half; gsi1sk is untouched
+const _pipePartial = Effect.gen(function* () {
   yield* Employees.update({ employeeId: "e-1" }).pipe(
     Entity.set({ tenantId: "t-3" }),
     Entity.asModel,
@@ -123,8 +91,9 @@ const _pipeGood2 = Effect.gen(function* () {
 // PIPE CHAIN: Entity.set → Effect.map → Effect.catchTag composes cleanly
 // -----------------------------------------------------------------------
 
-// Partial GSI in pipe chain — no type error; runtime validation catches it.
-// .asEffect() crosses the entity-op/Effect boundary before Effect combinators.
+// Partial GSI in a pipe chain — valid; ValidationError stays in the union
+// (decode / encode), so catchTag on it compiles. .asEffect() crosses the
+// entity-op/Effect boundary before Effect combinators.
 const _pipeChainPartial = Effect.gen(function* () {
   const result: string = yield* Employees.update({ employeeId: "e-1" }).pipe(
     Entity.set({ tenantId: "t-3" }),
@@ -181,32 +150,27 @@ const _hashMapExample = Effect.gen(function* () {
   pipe(map, HashMap.set("c", "hello"))
 })
 
-// Entity.set: WHY it's different — the constraint is a union, not a simple type
+// Entity.set: WHY it's different — U is a partial, and it is phantom
 //
-// If Entity.set used the Ref/HashMap pattern (shared U parameter), then:
-//
-//   Entity.set({ name: "Alice" })  // infers U = { name: string }
-//   // Returns: (self: EntityUpdate<..., { name: string }, ...>) => EntityUpdate<...>
-//
-//   // When piped, self's U is the all-or-none union:
-//   //   { tenantId: string; region: string } | { tenantId?: never; region?: never }
-//   // This union is NOT assignable to { name: string } — FALSE POSITIVE error.
-//   // A perfectly valid non-GSI update would be rejected.
-//
-// So the module-level Entity.set uses `Updates extends Record<string, unknown>`
-// in data-last, accepting any record and deferring validation to runtime.
+// If Entity.set used the Ref/HashMap pattern (shared U parameter), then
+// Entity.set({ name: "Alice" }) would infer U = { name: string }, and the
+// piped self's U (every optional field of the model) would have to match it
+// exactly — a false positive for every update that sets fewer fields than the
+// model has. So the module-level Entity.set takes
+// `Updates extends Record<string, unknown>` in data-last; the entity-scoped
+// `.set` below is the checked form.
 
 // -----------------------------------------------------------------------
-// ENTITY-SCOPED SET: Employees.set() — runtime validated
+// ENTITY-SCOPED SET: Employees.set()
 // -----------------------------------------------------------------------
 // Each Entity instance exposes a `.set` dual where U is pre-bound from the
-// entity definition. GSI all-or-none is enforced at runtime.
+// entity definition, so data-first and data-last are both checked.
 
-// DATA-FIRST: partial GSI composites caught at runtime
+// DATA-FIRST: partial GSI composites — valid, recomposed per half
 Employees.set(Employees.update({ employeeId: "e-1" }), { tenantId: "t-3" })
 
-// DATA-LAST: partial GSI composites caught at runtime
-const _entityScopedBad = Effect.gen(function* () {
+// DATA-LAST: partial GSI composites — valid, recomposed per half
+const _entityScopedPartial = Effect.gen(function* () {
   yield* Employees.update({ employeeId: "e-1" }).pipe(
     Employees.set({ tenantId: "t-3" }),
     Entity.asModel,
@@ -241,14 +205,14 @@ const _entityScopedChain = Effect.gen(function* () {
   return result
 })
 
-void _pipeBadRuntime
+void _pipePartial
 void _pipeGood1
 void _pipeGood2
 void _pipeChainPartial
 void _pipeChainGood
 void _refExample
 void _hashMapExample
-void _entityScopedBad
+void _entityScopedPartial
 void _entityScopedGood1
 void _entityScopedGood2
 void _entityScopedChain

@@ -1,5 +1,57 @@
 # @effect-dynamodb/language-service
 
+## 1.25.0
+
+### Minor Changes
+
+- [`4906069`](https://github.com/jmenga/effect-dynamodb/commit/49060695ea5fb9cc5ed19970e6131c9f819ff390) - EventStore per-event metadata and timestamps on `append` and `commandHandler`, and write limits diagnosed from DynamoDB's rejection instead of pre-checked ([#144](https://github.com/jmenga/effect-dynamodb/issues/144))
+
+  `append`'s `metadata` is one value copied onto every event of the append. Metadata that belongs to one event (an event id used as a publish message id, the id of an imported event in the store it came from) had nowhere to go but a list packed into that value, so every item stored every entry: N² entries for an append of N events, copied again by any stream index. The options below are additive; no option combination that works today changes behaviour. Error reporting for writes DynamoDB rejects for a limit changes as described under **Write limits**.
+  - **`eventMetadata` on `append`.** One entry per event, in the order of `events`: entry `i` is written onto event `i` and read back as that event's `StreamEvent.metadata`. Each defined entry is encoded through the stream's metadata schema, as `metadata` is, and an encode failure names its index (`operation: "EventStore.append.eventMetadata[<i>]"`). An `undefined` entry writes its event without a `metadata` attribute. A length that differs from `events.length` fails with `ValidationError` before anything is sent, even for an append of no events. The read side is unchanged.
+  - **`eventMetadata` on `commandHandler`.** A function of the `Decision` (`{ events, state, previous, version }`, as a function-form `additionalItems` receives) returning the entries, or an `Effect` of them whose error and requirements join the handler's. It runs after the new events are folded and before `additionalItems`, is not called on a no-op, and is re-run on every attempt (each `VersionConflict` retry and the re-decision under `verifySnapshot: false`). A result of the wrong length fails with `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`); neither that nor a failure of the returned `Effect` is retried. Minting ids with the `Crypto` service's `randomULID` (or `randomUUIDv7`) keeps them deterministic under `TestClock` and a test `Crypto` layer with fixed bytes.
+  - **`metadata` and `eventMetadata` are mutually exclusive**, on `append`, the bound stream and the handler. Passing both is a type error, and a `ValidationError` for untyped callers. `undefined` counts as absent, so `{ metadata: undefined, eventMetadata: [...] }` is accepted.
+  - **`eventTimestamps` on `append` and `commandHandler`.** One `DateTime` (or `undefined`) per event, in order: entry `i` is written as event `i`'s `timestamp` and read back as its `StreamEvent.timestamp`, and `undefined` keeps the append's `Clock` time. Entries are written with `DateTime.formatIso`, so a zoned `DateTime` is stored as its UTC instant. It combines with either metadata option, so an import can carry each event's original time (and its source id) instead of pinning the `Clock` per chunk. A length other than `events.length`, or an entry that is neither a `DateTime` nor `undefined`, fails with `ValidationError` (`operation: "EventStore.append.eventTimestamps"`) before anything is sent, even for an append of no events. Only event items change: the idempotency sentinel, its TTL and an inline snapshot keep the append's time, and `version`, not `timestamp`, still orders a stream. On `commandHandler` it is a function of the `Decision` returning the array directly or an `Effect` of it, whose error and requirements join the handler's, run after `eventMetadata` and before `additionalItems` under the same rules; a bad result, plain or from the `Effect`, fails with `ValidationError` (`operation: "EventStore.commandHandler.eventTimestamps"`), and neither that nor a failure of the returned `Effect` is retried.
+  - **Write limits: diagnosed from DynamoDB's rejection, no longer pre-checked.** A new library-wide rule: limits DynamoDB enforces itself (100 items and 4 MB per transaction, 400 KB per item, 2048-byte partition keys and 1024-byte sort keys) are not checked before sending, so a passing write does no extra work. A write over one is sent, DynamoDB rejects it whole (nothing is written), and the library recognises the rejection, confirms it by measuring the request it sent, and fails with an error naming the culprit, with DynamoDB's error kept as its `cause`. The 100-item checks of `transactWrite`, `transactGet`, entity transactions, the transactional cascade and `append`, the 4 MB transaction check, and the stream-index 1024-byte key check no longer run before sending; each still produces the error it did (`DynamoError`, `TransactionOverflow`, `CascadePartialFailure`, `AppendTooLarge` with the expanded `count`, `ValidationError`), now from DynamoDB's rejection, so a rejected write costs a round trip. Newly named: an oversized item or an over-long partition or sort key (table or index key, measured in UTF-8 bytes) on single-item entity writes, entity, aggregate and `transactWrite` transactions, `Batch.write`, `EventStore` snapshot writes and `append` (the event, inline snapshot, idempotency sentinel or additional item, e.g. "the event at version 2"), previously DynamoDB's bare `ValidationException`. A rejection the library does not recognise (for example, AWS wording this release does not know) or cannot confirm passes through as the bare `DynamoValidationError` it always was.
+  - **Request rules: the remaining pre-checks are converted too.** The same rule now covers every request rule DynamoDB enforces itself. Each former refusal is sent and DynamoDB's rejection diagnosed (wordings probed on DynamoDB Local 3.1.0):
+    - **Aggregate groups.** `Aggregate` no longer counts every group before writing the first. Each group is its own transaction, so a multi-group write was never atomic. A group DynamoDB rejects fails as before (`AggregateTransactionOverflow` over 100 items, `ValidationError` for size), and the error now names the sub-aggregates earlier groups already committed (new optional `AggregateTransactionOverflow.committed`). A failed `create` can therefore leave the root written; the message says to `update` or `delete` the partial aggregate.
+    - **One operation per item.** A transaction that touches one item twice (in `transactWrite`, `transactGet` or `append`'s additional items, counting the sentinels and snapshots a guarded put adds) is sent. DynamoDB's rejection becomes the same `ValidationError` (`DynamoError` from `transactGet`) naming both ops. DynamoDB can report a repeat as a failed condition, so the repeat is recognised before any conditional mapping: it is never read as a lost race, retried, or reported as `OptimisticLockError` / `VersionConflict`. A `BatchWriteItem` chunk with a duplicate key, previously a bare `DynamoValidationError`, is now a `ValidationError` naming both requests.
+    - **Expression limits.** A `.condition()` too large to fit beside an entity write's own guard (4,096 characters, 300 operators, 100 `IN` operands) is sent as built. DynamoDB's rejection becomes a `ValidationError` stating the expression's size and the caller's share of it. The strategies that pick a guard that fits (a wide update writing the whole item, an unversioned delete's fallback guard) are unchanged, and now also respect the 100-operand `IN` limit.
+    - **`readIndex` key bounds.** An empty `beginsWith` / `between` bound, or a `between` whose lower bound sorts after its upper bound, is sent. DynamoDB's rejection becomes a `ValidationError` (`operation: "EventStore.readIndex"`) naming the index and the bound. The other option checks (at most one of `beginsWith` / `between`, string bounds, `limit`) stay, because DynamoDB never sees them or would accept them.
+    - **Consistent reads of a GSI.** `.consistentRead()` on an entity index accessor, a collection or a GSI-backed `readIndex` is sent. DynamoDB's rejection becomes a `ValidationError` (`operation: "query.consistentRead"`) naming the index. An entity index pointed at an LSI of a table created outside the library now reads consistently, as DynamoDB allows.
+    - **Empty stream-index keys.** A stream-index `key` that returns `""` is sent. DynamoDB's rejection becomes a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version. A non-string key is still refused before sending.
+    - **Vector-index quotas.** `Entity.make`, `Table.make` and `Table.definition` no longer refuse more than 18 `INLINE_FILTER` attributes per index (`[EDD-9032]` keeps only its duplicate-filter check) or more than 5 vector indexes (`[EDD-9034]`, retired). The per-table quota can be raised through AWS Support, so the old refusal rejected valid configurations. `db.tables.*.create()` and `addVectorIndex` diagnose DynamoDB's rejection, naming the index and every entity sharing it. DynamoDB Local has no vector indexes, so this recognition follows AWS's documented quotas and is covered by unit tests only.
+    - **Vector-index dimensions.** `Entity.make` no longer refuses `dimensions` outside 1–4096 (`[EDD-9030]`, retired). `db.tables.*.create()` and `addVectorIndex` send it, and DynamoDB's rejection is diagnosed into the error DynamoDB returned (same tag), its message naming the index, its dimensions and the entities sharing it. A non-integer `dimensions` is still refused at `Entity.make`, now as `[EDD-9070]`: DynamoDB reads an integer leniently (DynamoDB Local creates `2.9` as `2`), so it could accept another, immutable dimensionality. Unit tests only, as above; AWS's wording is unverified.
+    - **Vector search `topK` is no longer clamped.** `.topK(k)` sends `k` as given. DynamoDB accepts an integer in 1–100 and rejects anything else; `collect()` then fails with a `ValidationError` (`operation: "vectorSearch.<index>.topK"`) naming the `topK` and the accepted range, with DynamoDB's error as its `cause`. **Behaviour change:** `.topK(k)` above 100 (or below 1) used to be clamped silently, so a call that returned fewer results than it asked for now fails — ask for at most 100. `VectorSearchEmulation` rejects an out-of-range `TopK` as DynamoDB does. `VectorIndex.clampTopK` is deprecated and no longer used.
+    - **Aggregate `consistentRead` on a GSI collection index.** `Aggregate.make` no longer refuses it (`[EDD-9042]`, retired). Each assembly read is sent, and DynamoDB's rejection becomes a `ValidationError` (`operation: "get.consistentRead"`, `"update.consistentRead"`, `"list.consistentRead"`) naming the aggregate and the index; `delete`, whose error union has no `ValidationError`, fails with DynamoDB's own `DynamoValidationError`, its message explained. A misconfigured aggregate now fails on its first read rather than at startup.
+    - **`isIn` with no values.** It is no longer refused before sending: it compiles to `IN ()`, which DynamoDB rejects as a syntax error, and the rejection becomes a `ValidationError` naming the `isIn()` and its attribute — on entity writes, transactions, `append`'s additional items, entity, collection and scan filters (`operation: "query.filter"`) and aggregate `list` filters (`"list.filter"`). `Query.asParams` no longer fails for it. The other empty-part refusals (`or()` with no parts, `{}` under `or` / `not`) stay.
+    - **Key bounds on every query.** An empty key bound or a `between` whose lower bound sorts after its upper bound was named only for `readIndex`; every query now names it — entity index accessors and `.where()` (`"User.byTenant"`), collections (`collection "assignments"`) and other queries (`query of <entity>`), naming the index and the bounds. `Batch.get` still sends a repeated key as given; DynamoDB's rejection of it is now a `DynamoError` naming both positions (`get 0 (User) and get 2 (User)`) instead of the bare one.
+    - **What stays a pre-check:** only what DynamoDB cannot see or would accept with another meaning. That is the library's own invariants and option shapes, empty condition parts under `or` / `not` and an `or()` with no parts, a non-integer vector `dimensions`, `Batch.write`'s ordering of versioned puts, the aggregate sort-key collision check, and `[EDD-90xx]` definition errors.
+  - **Exact DynamoDB size accounting.** One measure of DynamoDB's item and transaction sizes now serves both failure diagnosis and `Batch.write`'s chunking, replacing the lower and upper estimates. It was measured on DynamoDB Local and confirmed at the 409,600-byte item and 4,194,304-byte transaction boundaries. It fixes three under-counts. The upper estimate left out a map entry's separator byte. The lower one ignored that a number's digits pair up from the decimal point (`120` and `1.5` take 3 bytes, not 2). A transaction's size left out its expressions and their substituted names and values. An oversized item or transaction is now attributed exactly. See "How DynamoDB Sizes Items" in the Data Integrity guide.
+  - **`Batch.write` splits versioned-put transactions at exactly DynamoDB's limits:** 100 items and 4,194,304 bytes, each put counted with its create-only condition. This replaces a 3.5 MB budget on an estimate, so fewer transactions are sent. If DynamoDB still rejects a chunk for size, `Batch.write` fails with a `ValidationError` giving the library's measure and DynamoDB's reported size; the chunk is not re-split or retried. A failed batch now says exactly what it had already written (versioned-put transactions and non-versioned requests) and what was not sent. Application transactions (`transactWrite`, `append`, `commandHandler`, entity writes) are never split.
+
+  Type-level notes:
+  - `AppendOptions`, `CommandOptions` and `IdempotentCommandOptions` are now type aliases (an intersection with a union, which is how the exclusivity is typed) instead of interfaces. Using them as types is unchanged; an `interface X extends AppendOptions<…>` in user code no longer compiles, since an interface cannot extend a union. Spreading options and adding a key, as in `{ ...options, metadata }` where `options` is one of these types, no longer compiles either, because the spread may already carry `eventMetadata`. Build the object from one branch, or omit `eventMetadata` from the spread. New exported types: `AppendOptionsBase`, `AppendMetadataOptions`, `CommandOptionsBase`, `CommandMetadataOptions` and `EventMetadataInput`.
+  - New exported type `EventTimestampsInput`. `CommandHandler` and `BoundCommandHandler` gain four trailing, defaulted type parameters: `E3` / `R3` for an effectful `eventMetadata` and `E4` / `R4` for an effectful `eventTimestamps`, separate from each other and from `additionalItems`' `E2` / `R2` so effects with different error types are inferred as a union; `CommandOptionsBase` gains `E4` / `R4`. Call sites infer them; hand-written instantiations keep working.
+  - `AppendTooLarge`, `TransactionOverflow` and `AggregateTransactionOverflow` gain an optional `cause` holding DynamoDB's rejection. Constructing them without it still compiles.
+  - `AggregateTransactionOverflow` also gains an optional `committed: ReadonlyArray<string>`, naming the sub-aggregates already written, and an optional `operation: "create" | "update"`; its `message`, previously empty, now states the group, its item count, the limit and what was committed. `[EDD-9030]`, `[EDD-9034]` and `[EDD-9042]` are retired; `[EDD-9070]` is new (a non-integer vector `dimensions`). New exported type `AggregateTransactionOverflowFields` (in `@effect-dynamodb/schema`).
+  - No public error union widens.
+
+- **Stream index projection.** Each entry of `EventStore.makeStream({ indexes })` takes `projection?: "all" | "withoutMetadata" | "keys"`, default `"all"`, so `metadata`, often an event's largest attribute, need not be copied into every index. Existing streams are unchanged, and the library migrates nothing.
+  - **`indexDefinitions`** emits `ALL` for `"all"`; `INCLUDE` of `__edd_e__`, `data`, `eventType`, `streamId`, `timestamp` and `version` for `"withoutMetadata"`; and `INCLUDE ["__edd_e__"]` for `"keys"`. `keys` is **not** `KEYS_ONLY`: every read filters on `__edd_e__`, and DynamoDB refuses a filter on an attribute an index does not project. Two streams declaring one physical index with different projections throw `[EDD-9067]`.
+  - **Reads.** `"withoutMetadata"` is read with one query, and `readIndex` / `query.index` type `metadata` as `undefined` for that index name (the value is dropped even if the deployed index holds it). `"keys"` on an LSI is read with `Select: ALL_ATTRIBUTES`, so DynamoDB fetches each event from the table. `"keys"` on a GSI is read with the index query, then `BatchGetItem` for each page's events (chunks of 100, `UnprocessedKeys` retried with `Batch.get`'s backoff, missing keys re-read once with `ConsistentRead`, index order kept); `query.index` hydrates the same way, and `Query.count` never fetches. A `Query.filter` on a non-`"all"` index may name only projected attributes.
+  - **The declared projection must match the deployed index.** Tables deployed with CDK or Terraform copy `Projection` from `indexDefinitions`. A row lacking an attribute its declared projection holds fails the read with a `ValidationError` (`operation: "EventStore.index.decode"`) naming the index, with the decode error as its `cause`; an index deployed without `__edd_e__` fails with DynamoDB's own "does not project one or more filter attributes" `DynamoValidationError`.
+  - **Definition time.** An unknown `projection`, or a member an index entry does not declare (such as a misspelled `projection`, which would otherwise silently mean `"all"`), throws `[EDD-9063]` and is a type error.
+  - **Types.** `StreamIndexSettings` gains `projection` (optional in `indexDefinitions`' input, so hand-built settings keep compiling). `EventStream` / `BoundEventStream` gain a trailing, defaulted `TIndexProjections` parameter. A wrapper that names the earlier type parameters and omits it still compiles, but its index reads are typed as carrying `metadata` (the default is `"all"`). Pass `IndexProjectionsOf<…>`, or let the type be inferred, so a `withoutMetadata` index reads as `metadata: undefined`. `makeStream`'s index type parameter becomes `TIndexes` (inferred at call sites). `StreamIndexDefinitions` and `Table`'s index types are unchanged. New exported types: `StreamIndexProjection`, `IndexEventMetadata`, `IndexProjectionsOf`, `StreamIndexesConfig`.
+  - `Batch.get` now shares the `BatchGetItem` helper (responses matched to positions through a `Map` instead of a linear search per item). Its behaviour is unchanged, except that DynamoDB's rejection of a request that repeats a key is now named (see **Key bounds on every query**).
+
+### Patch Changes
+
+- **`Entity.purge` retries unprocessed deletes.** Purge deleted an item's rows in `BatchWriteItem` chunks of 25 but ignored the response's `UnprocessedItems`, so under throttling it could return success with rows left behind. Unprocessed deletes are now resent with `Batch.write`'s backoff (5 retries); when the retries run out, purge fails with a `DynamoError` (`operation: "BatchWriteItem"`) stating how many rows remain and exactly how many it had deleted. Purge again to finish.
+- **`AggregateTransactionOverflow` has a readable message.** It was empty. It now names the aggregate, the sub-aggregate group, its item count and DynamoDB's limit, and says what earlier groups of the write already committed (or that nothing was written); for a failed `create`, it adds that the root may be committed, so a retried `create` fails its root guard (`ConditionalCheckFailed`) and the partial aggregate should be updated or deleted instead. Its fields are unchanged.
+- **Examples exit non-zero when they fail.** Every example in `packages/effect-dynamodb/examples`, and the geo package's `vehicle-tracking.ts`, ended with a rejection handler that logged the error and swallowed it. A failing example therefore exited 0, and the docs' runtime test could not catch it. The handler is dropped (keeping the success message), so an unhandled rejection exits Node non-zero, and the tutorial snippets that showed it are updated. Two examples had been failing unseen, and both are fixed with their tutorials: `hr.ts` asserted that a partial GSI update fails, which it has not since the per-half index policy, and `guide-advanced.ts` expected versions one behind.
+- **Conflicting declarations of one physical secondary index are refused (`[EDD-9069]`).** `Table.make` and `Table.definition` used to keep the first of two declarations of one physical index (entity indexes, the auto-generated `_cascade_<field>` indexes, an aggregate's collection and list indexes) silently when a later one named other key attributes or the other GSI/LSI classification. The table was created keyed the first declarer's way, and the other declarer's items never appeared in the index, so its queries returned nothing. Entities on one table that declared different primary-key fields were likewise resolved to the first entity's, leaving the others' writes without the table's key attributes. Both now fail at definition time with `[EDD-9069]`, naming both declarers and both key schemas. **Behaviour change:** a table that constructed with such conflicting declarations now throws at `Table.make` / `Table.definition`; tables whose members agree are unchanged. A conflict introduced only by an aggregate registered on `DynamoClient.make` rather than on `Table.make` surfaces when `DynamoClient.make` derives the table definition, as a vector-index conflict does.
+- **Ref cascades work on tables not keyed `pk` / `sk`.** The cascade built each update's key from the target item's `pk` / `sk` attributes whatever the target entity's primary key was, so on a table keyed by other attributes (e.g. `PK` / `SK`) every eventual-mode update failed (`CascadePartialFailure` with `succeeded: 0`) and a transactional cascade was rejected whole. Each update is now keyed, and a rejected update diagnosed, by its own target entity's primary-key fields; one transactional cascade may span targets keyed differently. Tables keyed `pk` / `sk` behave as before.
+
 ## 1.24.0
 
 ## 1.23.0
@@ -18,7 +70,6 @@
   real `DateTime`s.
 
   ### Before you upgrade
-
   - **Upgrade every reader before any writer, and don't roll back past this
     version once new rows are written.** A self date (`Schema.DateTimeUtc`,
     `Schema.Date`, or one with `storedAs`) inside a `NullOr` or other union, a
@@ -353,7 +404,6 @@
   a hydrated ref, and a self date inside a union, record or tuple.
 
   **Now working.** None of these worked on 1.22.0:
-
   - A ref in a `many` element, declared as `player: Player.pipe(DynamoModel.ref)`
     (it could not be read back even after a fresh write) or as the element itself,
     `Schema.Array(Player.pipe(DynamoModel.ref))` (`update` failed). The plain
@@ -408,7 +458,6 @@
   snapshots) now encode their value through the schema at the path, as `.set()`
   does. Before, they wrote the raw value: a `DateTime` became a map even on a
   plain date field, and a `NumberFromString` value was stored as a number. Now:
-
   - A plain object on a class-typed field is encoded as that class, and a class
     instance is always encoded whole.
   - A plain object or array that mixes wire and domain parts, or holds an
@@ -499,7 +548,6 @@
   `OptimisticLockError` with the real `actualVersion`, a failed `.condition()` is
   a `ConditionalCheckFailed`, and a missing item is an `ItemNotFound`. Three cases
   used to be the other way round:
-
   - A versioned update with `expectedVersion` and a `.condition()` reported a
     failed condition as `OptimisticLockError(-1)`.
   - A retain update with a `.condition()` did the same.
@@ -610,7 +658,6 @@
   current value, so spread records work; a different value is refused.
 
   **Known limitations.** Both are inherent:
-
   - On unversioned entities, nothing can prove an unguarded attribute unchanged.
     So the item a unique-field update returns may show stale values for
     attributes it neither reads nor writes, wide items use the fallback guard
@@ -844,7 +891,6 @@
 
   Two further bugs on the `restore` path, both independent of any rename, are
   fixed alongside:
-
   - **`softDelete: { preserveUnique: true }` made `restore` impossible.** The
     delete deliberately keeps the reservation, so the restore-time sentinel Put's
     `attribute_not_exists` guard could never hold: every restore of a constrained
@@ -883,7 +929,6 @@
   Added on `Query`, `BoundQuery` and `Aggregate.list`'s `ListOptions` (as `filterBy`), so there is one vocabulary rather than three. On an aggregate it runs on the root item **before assembly**, for the same reason `ListOptions.filter` is worth pushing server-side: a rejected root item never pays for its partition read.
 
   Two corners are closed rather than left to be discovered:
-
   - **`.count()`** would have reported the unfiltered count, since `Select: "COUNT"` returns no items to run the predicate against. It now reads the rows and counts the accepted ones — correct, at the cost of the read. Its error channel gains `ValidationError` accordingly, since decoding can now fail during a count.
   - **`.select()` with a predicate** raises **EDD-9054**. A projection returns only the attributes it names, and a predicate is an opaque closure whose attribute reads the library cannot see — so it cannot borrow them into the `ProjectionExpression` the way key attributes are borrowed for cursor rebuilding, and the predicate would be handed items missing the fields it tests.
 
@@ -959,7 +1004,6 @@
 
   `list` now takes the paging vocabulary the rest of the library settled on in
   1.16.0, plus a server-side predicate:
-
   - **`filter`** — a `FilterExpression` on the **root-item** query, in the same
     callback and shorthand forms `BoundQuery.filter()` takes. This is a
     performance fix as much as an ergonomic one: `list` assembles each surviving
@@ -991,7 +1035,6 @@
   An aggregate whose model carried a transformed field could not round-trip: the write path stored Type-side values, so a `bigint` landed as `{"N":"5"}` and assembly's `Schema.BigIntFromString` decode rejected a number. Aggregate attributes are now encoded to their wire form before marshalling, at the root, sub-aggregate roots, `one` edges, `many` elements and propagated context values.
 
   Two further causes are fixed with it:
-
   - **`fieldsOf` did not see through `DynamoModel.configure`**, so any edge whose model is configured — which is most, since `identifier: true` requires it — received **no encoders at all**. Dates on those edges were stored as `{"M":{…}}` or `{"M":{}}`, meaning the date handling added in [#72](https://github.com/jmenga/effect-dynamodb/issues/72) was silently not applying to them.
   - **`aggregate.update` recognised only date transforms** when re-decoding mutated state, so a non-date transform was rejected before any item was built — even when the mutation touched only an untransformed field. The tolerance now covers every leaf transform, and remains scoped to the aggregate decode path: entities pass no such option.
 
@@ -1037,7 +1080,6 @@
 
   Applying `.condition(...)` now widens the operation's error channel with `ConditionalCheckFailed`,
   on every surface it is exposed:
-
   - `BoundPut.condition()` — `db.entities.Users.put(input).condition(...)`
   - `BoundUpdate.condition()` — `db.entities.Users.update(key).set(...).condition(...)`
   - `BoundDelete.condition()` — `db.entities.Users.delete(key).condition(...)`
@@ -1091,7 +1133,6 @@
   Composition now follows one rule at every site: compose from the Encoded form, except when the domain type is numeric and the encoded form is a string, where the numeric Type form is used so it pads. `DynamoModel.DateEpochMs` composites use the padded epoch.
 
   **⚠️ Migration.** Rows keyed on either shape below were written under the old key and will not be found after upgrading — no error, the partition simply does not resolve. Read them by scan and re-`put` before or during the upgrade.
-
   - **Entity primary keys and GSI keys** with a `Schema.BigIntFromString` or `Schema.NumberFromString` composite. On 1.15.0 `put` **succeeded** and wrote these rows (only `get` was broken), so this data exists.
   - **Aggregate partition and collection keys** with a `DateEpochMs` / `DateEpochSeconds` composite, which move from their ISO form to the padded epoch.
 
@@ -1100,7 +1141,6 @@
   Eleven modules previously decided independently what to hand the key composer, which is what produced the divergence. `test/KeyFormInvariant.test.ts` now reads each module as source text and fails if a `KeyComposer` call receives a record that did not go through the shared form.
 
   Fixed by the same change, each previously a silent wrong result:
-
   - `update()` rewrote GSI keys in a different format than `put()` wrote them, evicting the row from its own GSI.
   - `Transaction.transactWrite` / `Batch.write` composed a different primary key than `Entity.put`, producing unreadable orphan rows; `Batch.get`, `transactGet`, `transactWrite(delete)` and `Transaction.check` used the caller's raw key.
   - `purge()` reported success and deleted nothing.
@@ -1115,7 +1155,6 @@
 - [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`0d67a51`](https://github.com/jmenga/effect-dynamodb/commit/0d67a51b1b27907c746c6fe808f929716d12f504) Thanks [@jmenga](https://github.com/jmenga)! - Separate `limit` (results) from `pageSize` (round trips) on queries and scans
 
   `limit` and page size were two different ideas sharing one word. They are now two combinators:
-
   - **`limit(n)`** — return **at most `n` items**. A contract on results. It no longer sets DynamoDB's `Limit`; the query accumulates across as many requests as it takes to reach `n` accepted items or exhaust the key range.
   - **`pageSize(n)`** — fetch in **batches of `n` rows**. This is what sets DynamoDB's `Limit` (rows _examined_ per request). A contract on round trips, not on what comes back.
   - **`maxPages(n)`** — unchanged. Still the hard stop on the number of requests, and the escape hatch when a filter is selective enough that `limit` would otherwise walk a large partition.
@@ -1148,14 +1187,12 @@
   A declared `sk.composite` is now **authoritative**: it replaces the ref-identifier heuristic rather than extending it, so it decides both uniqueness and the order elements sort in. Entries name attributes on the decomposed element and may use a dotted path to reach a hydrated ref (`"umpire.id"` — hydration replaces the id field with the referenced object, so the bare name no longer exists at the top level).
 
   Two related fixes for the same defect — a `many` edge whose sort key is not derived from anything distinguishing:
-
   - **"Element IS the ref" edges now compose a sort key.** `Schema.Array(Player)` hydrates each element to the entity's own flat fields, and the identifier fallback only recognised a field literally named `id`. An entity whose identifier is `playerId` produced _no_ composites, so every element collapsed onto one row. The edge entity's declared `DynamoModel.identifier` field is now used.
   - **Colliding sort keys fail as `AggregateDecompositionError`.** Decomposition detects two items composing the same sort key and fails with the aggregate, the edge and the colliding key — instead of an opaque `DynamoValidationError` naming nothing. This is checked before any write, so nothing is persisted.
 
   A declared composite must resolve to a **scalar** — string, number, bigint, boolean or date. Naming the hydrated ref object itself (`sk: { composite: ["umpire"] }`) rather than a scalar path (`"umpire.id"`) previously serialised the whole object into the sort key; it now fails with `AggregateDecompositionError` pointing at the dotted form.
 
   **Migration.** Sort keys change for two shapes, both of which could not previously hold more than one element:
-
   - edges that already declared `sk.composite` (previously ignored)
   - "element IS the ref" edges whose entity identifier is not named `id` — a single-element edge stored as `$app#v1#matchplayer` now stores as `$app#v1#matchplayer#p-1`
 
@@ -1176,7 +1213,6 @@
   through the same composer the write path uses, applying value serialization, the
   `<name>_` prefix and the schema casing. Additional behaviour that follows from
   composing correctly:
-
   - A condition on a **non-terminal** SK composite covers that value's whole
     subtree — `eq` compiles to a subtree `begins_with`, and inclusive upper bounds
     span the subtree.
@@ -1240,12 +1276,10 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   exhaustively matching on `append`'s error union will need three more cases.
 
 - [#87](https://github.com/jmenga/effect-dynamodb/pull/87) [`f846367`](https://github.com/jmenga/effect-dynamodb/commit/f846367a541fefb9c29f40684f87f89c8333745b) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: guard `append` against TransactWriteItems limits and expectedVersion-ahead version gaps ([#82](https://github.com/jmenga/effect-dynamodb/issues/82))
-
   - New `AppendTooLarge` tagged error and `TRANSACT_WRITE_ITEMS_LIMIT` constant, exported from both `@effect-dynamodb/schema` and `effect-dynamodb`. `append` now pre-validates the transact-item count and fails with `AppendTooLarge` before issuing any request instead of surfacing a raw AWS validation error. The batch is deliberately never chunked — chunking would break append atomicity.
   - `append` now enforces version contiguity. When `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist, so an _ahead_ expected version fails with `VersionConflict` instead of silently writing past the stream head and leaving a permanent gap in the version sequence. The check occupies one transact item, so a single append holds up to 100 events at `expectedVersion === 0` and up to 99 otherwise.
 
 - [#90](https://github.com/jmenga/effect-dynamodb/pull/90) [`5127a60`](https://github.com/jmenga/effect-dynamodb/commit/5127a606049d89da5de92b44f74dc2182e8b4418) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: snapshot support and a `commandHandler` retry option ([#84](https://github.com/jmenga/effect-dynamodb/issues/84)).
-
   - **Snapshots** — opt in with `makeStream({ ..., snapshot: { schema, every? } })`. One
     snapshot item per stream lives in the stream partition under a distinct sort key
     (`$<schema>#v<n>#<stream>.snapshot`) that can never collide with an event sort key.
@@ -1383,7 +1417,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
 - [`bfec5f2`](https://github.com/jmenga/effect-dynamodb/commit/bfec5f22ca03961b2bcc13dfa62b323a7bab6375) Thanks [@mixja](https://github.com/mixja)! - Upgrade to Effect 4.0.0-rc.109 (release candidate)
 
   The workspace moves from `effect@4.0.0-beta.85` to `effect@4.0.0-rc.109` (now published from the main Effect-TS/effect repo). The `effect` peer range is raised to `^4.0.0-rc.109` accordingly. Migrations applied:
-
   - **`Schema.DateValid` removed** — `Schema.Date` now rejects invalid dates itself; all `DateValid` usages (DynamoModel Unsafe date codecs, date-transform substitution) migrate to `Schema.Date` with identical validation semantics.
   - **AST introspection moved to `representation` identities** — the RC removed the `typeConstructor` / `meta` annotation payloads that date/Redacted detection sniffed via `SchemaAST.resolve`. Detection now reads the stable `representation.id` (`effect/schema/Date`, `effect/schema/DateTimeUtc`, `effect/schema/DateTimeZoned`, `effect/schema/Redacted`) through a shared `matchDateRepresentation` helper (deduplicating the former Aggregate.ts matchers).
   - **`Schema.Struct(...)` is now a function** — the `isSchemaClass` detection gains an AST-tag guard (`Declaration` vs `Objects`); without it, Struct-modeled entities were decoded through `new Struct(...)` and silently returned empty objects. A canary test locks the discriminator down.
@@ -1405,7 +1438,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   Two follow-ups to the #62 schema/runtime split, both blocking its headline use case
   (deriving a typed aggregate input/create payload from `@effect-dynamodb/schema` with
   no AWS SDK):
-
   - **#66** — the pure edge constructors (`Aggregate.ref` / `one` / `many`) required a
     `RefEntity` with a runtime `get` method, so aggregate edges could not be authored
     from pure `Entity.make` definitions (which have no `get`). `RefEntity` is now the
@@ -1492,7 +1524,7 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   MainTable.layerConfig({
     name: Config.string("TABLE_NAME"),
     ttlAttributeName: Config.string("TTL_ATTR").pipe(
-      Config.withDefault("_ttl")
+      Config.withDefault("_ttl"),
     ),
   });
   ```
@@ -1508,7 +1540,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   `BoundAppend` gains a `.remove(attrs)` combinator that emits `REMOVE` clauses on the same `UpdateItem` that carries the scoped `SET` and CAS predicate. Use it when an event needs to clear one or more `appendInput` attributes atomically — e.g. an IoT status event whose absence of an `alert` field means "no alert this cycle; drop the existing alert state on the current item."
 
   **Motivating problem.** Before v1.7.4, callers wanting to clear an `appendInput` attribute were stuck with three unsatisfactory workarounds:
-
   - `.append(...)` then `.update().remove([...])` (two writes) — race window: a concurrent writer between the two writes could clobber the cleared state.
   - Sentinel value (e.g. `alertState: "DISABLED"`) — keeps the attribute set, leaves the item in any `'sparse'`-policied GSI half that composes it.
   - `Schema.NullOr` + null payload — writes a literal `NULL` into the item; downstream readers must tolerate it.
@@ -1518,7 +1549,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   **GSI cascade.** Any GSI half whose composite list intersects `attrs` follows the v1.7.1 cascade-override semantics — the half evaluates with the removed composite treated as absent. Under `'sparse'` the half drops; under `'preserve'` it's a no-op (the stored key field is left as-is unless overridden). The motivating shape is a sparse-PK GSI keyed on the cleared attribute — the item drops out of that GSI in the same write.
 
   **Validation.** Names listed in `.remove()` are checked at execution time. The Effect fails with `ValidationError(operation: "append.remove")` if any name:
-
   - is not declared in `appendInput` (enrichment-preservation contract — use `.update().remove([...])` for fields outside `appendInput`);
   - names `orderBy` (would invalidate the CAS anchor);
   - names a primary-key composite (would orphan the item);
@@ -1569,7 +1599,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   Concretely: an entity with `primaryKey: [channel, deviceId]` and a `byChannel: { pk: [channel], sk: [deviceId] }` GSI saw zero items returned from any channel-scoped query under v1.7.0 / v1.7.1, regardless of whether the writes used `.put()`, `.update()`, or `.append()` — the latter two never composed the keys, and `.update()` only re-composed them on calls that explicitly restated `channel` / `deviceId` in the payload (which no realistic writer does).
 
   **The fix** (two minimal patches working together):
-
   1. **`KeyComposer.composeGsiKeysForUpdatePolicyAware`** — the per-half gate now also counts `keyRecord` membership (the entity primary-key attributes carried into the composer alongside the payload). PK-composite-only GSI halves are now correctly classified as touched on every write that has a `keyRecord`.
   2. **`Entity.append()`** — no longer filters PK composites out of the payload it passes to the composer. The filter never solved a real problem (the composer doesn't emit redundant SETs for the underlying composite fields, and idempotent recomposition from immutable PK composites is benign) and combined with the v1.7.1 gate to silently break this pattern.
 
@@ -1590,17 +1619,14 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   v1.7.0 shipped the per-key declaration model (`indexPolicy: { pk, sk }`) but had three connected bugs in how outcomes were rolled up. All three were rooted in the same defect: the model was per-half on declaration but not on evaluation, outcome, or cascade. v1.7.1 makes all four uniformly per-half.
 
   **Bug fixes** (strictly more correct than v1.7.0):
-
   1. **GSI-wide cascade on can't-compose → per-key REMOVE.** v1.7.0 REMOVE'd both `gsiNpk` AND `gsiNsk` whenever either half couldn't compose. v1.7.1 REMOVEs only the half that couldn't compose; the other half's stored value persists. Closes the multi-writer enrichment-on-pk + telemetry-on-sk scenario that v1.7.0 was designed to enable but didn't actually enable correctly.
   2. **`CompositeKeyHoleError` (EDD-9024) deprecated — no longer thrown.** The v1.7.0 throw under preserve+hole was a defensive runtime safety net for a case the type system already catches (required composites can't be omitted under `exactOptionalPropertyTypes` since v1.7.0 reverted the NullishOr widening). The class export is preserved for back-compat with consumers who type-imported it for `Effect.catchTag` handlers, but no code path raises it anymore. Hole patterns now collapse into the unified per-half can't-compose rule.
   3. **Per-half evaluation gate (NEW in v1.7.1).** v1.7.0 fired the policy on every update of every GSI declaring `indexPolicy`, regardless of whether the writer touched the half. This made stamps and unrelated writers blow away sparse halves they didn't own. v1.7.1 skips untouched halves entirely — a half is touched iff at least one of its composite names appears in the update payload OR in `Entity.remove([...])`.
 
   **Behavior change:**
-
   - **`Entity.remove([attr])` is now per-half** (no longer GSI-wide). Removing a composite REMOVEs only the half(s) whose composite list contains it. Other halves follow the per-half evaluation gate (untouched → noop). Combined with the new "cascade override under preserve" rule, the consumer's explicit signal still gets honored — preserve + can't-compose + composite in `removedSet` → REMOVE that half.
 
   **No API changes:**
-
   - Same `indexPolicy: { pk, sk }` declaration shape.
   - Same `Entity.remove([...])` API.
   - Same EDD-9025 invariants (composite attributes can't be `Schema.NullOr`).
@@ -1621,7 +1647,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   The v1.6 per-attribute `indexPolicy` callback model proved unwieldy in practice. The standard `update`/`patch` path has only payload-level information (no read-before-write), so per-attribute granularity within a single composed-key half collapsed to per-half outcomes anyway. v3 simplifies to a per-half declaration with a structural composition rule, and closes the `set({composite: null})` footgun at the type level.
 
   ### What's new in v1.7.0
-
   - **Per-half `indexPolicy: { pk, sk }`.** Both halves default to `'preserve'` when omitted. Replaces the v1.6 `indexPolicy: (item) => ({ attr: 'sparse' | 'preserve' })` callback API.
   - **Structural composition (longest valid leading prefix).** Symmetric on PK and SK — the v1.6 PK-clear-degrades-to-sparse asymmetry is gone. Hierarchical PK truncation (e.g. `pk.composite = ['accountId', 'fleetId']` → omit `fleetId` → partition key truncates to `account#A`) is **new and additive**.
   - **Two-way payload classification.** `null` = `undefined` = absent. The v1.6 three-way classification (present / explicit-clear / omitted) collapses; `set({attr: null})` no longer separately cascades GSI keys.
@@ -1684,27 +1709,22 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
 - indexPolicy v2 — unified-hierarchy attribute model, three-way payload classification, hierarchical SK pruning, hole detection. Plus the SparseMap opt-in is renamed to a typed callable.
 
   **indexPolicy v2 — behavior changes (closes [#36](https://github.com/jmenga/effect-dynamodb/issues/36))**
-
   - The runtime now distinguishes three payload states per composite attribute: present-with-value, explicit clear (`null` or `undefined`), and omitted. `null` and `undefined` collapse — both signal "explicit clear, drop this composite from the key now" — and they cascade unconditionally regardless of policy.
   - Omission still defers to `indexPolicy` (`'sparse'` drops the GSI; `'preserve'` is a no-op).
   - Pre-1.6 collapsed omission and explicit `null`/`undefined`, with `'sparse'` firing on every update regardless of whether the caller touched that composite. **Audit any existing `set({ attr: null })` paths** — intent is now unambiguous (always cascades). Switch any `'sparse'` policies that aren't really membership-driving (hybrid-writer GSIs) to `'preserve'`. See the migration table in the [indexPolicy guide](https://github.com/jmenga/effect-dynamodb/blob/main/packages/docs/src/content/docs/guides/index-policy.mdx#migrating-from-150).
 
   **Hierarchical SK pruning — new opt-in feature**
-
   - When a _trailing_ SK composite is explicitly cleared with `'preserve'` policy, `gsiNsk` truncates to the leading prefix instead of dropping the GSI entirely. The item stays queryable at the parent (coarser) hierarchy depth — geographic, org, workflow, content classification, permission scope, order grouping. See DESIGN.md §7.6.
 
   **Hole detection — new write-time validation**
-
   - An SK composite cleared at position `i` with another SK composite at position `j > i` still present produces a syntactically invalid prefix that no `begins_with` query would match. The library now throws `CompositeKeyHoleError` (EDD-9024) at write time, naming the GSI, the cleared composite, and the offending trailing composite. Pre-existing latent bugs (silent broken keys) become loud failures.
 
   **SparseMap API rename — breaking change, low blast radius**
-
   - `storedAs: 'sparse'` (magic string) → `storedAs: DynamoModel.SparseMap()` (typed callable). The `prefix` option moves from a sibling on `ConfigureAttributes` into the `SparseMap({ prefix })` config object — where it semantically belongs.
   - 1.5.0 was the only release that used the magic string; consumer adoption is minimal. No backward-compat shim — mechanical rename.
   - Two motivations: (1) the magic-string `'sparse'` collided with the `indexPolicy` `'sparse'` value (opposite meanings), confusing consumers; (2) the callable form lets options live where they belong rather than as siblings only meaningful when paired with the right `storedAs` value.
 
   **Type-level changes**
-
   - `EntityUpdateType` now widens each field to `T | null | undefined` so consumers can express explicit clears through TypeScript without casting. The runtime already accepted them via `Schema.NullishOr` wrap.
   - `ConfigureAttributes.storedAs` becomes `Schema.Schema<A> | SparseMapConfig`. The `| 'sparse'` literal union is dropped.
   - `ConfigureAttributes.prefix` removed from top level.
@@ -1719,7 +1739,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   The headline win is per-bucket atomic counters on a fresh item without parent-map ceremony — `ADD totals#2026-01 :1` works as a single op on a row that has never been touched before. Concurrent writers to disjoint buckets never race.
 
   **API surface:**
-
   - `DynamoModel.configure(model, { field: { storedAs: 'sparse' } })` — opt in. Optional `prefix` override.
   - Reads transparent — `get` / `query` / `scan` / batch / streams rebuild the domain `Record<K, V>` from flattened attributes.
   - Record-style writes: `.set({ field: { ... } })` decomposes into one SET per bucket (whole-bucket replace; concurrent disjoint-bucket writes safe).
@@ -1729,7 +1748,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   - Conditional ops: `attribute_exists(<prefix>#<key>)` via the path API.
 
   **Lifecycle interactions:**
-
   - `versioned: { retain: true }` — snapshots preserve flattened attrs verbatim.
   - `softDelete` — sparse data is preserved across soft-delete and restore.
   - `timeSeries` — sparse fields are aggregate state, not event state. They live on the current item only and are **not** carried on event items (`#e#<orderBy>`).
@@ -1801,7 +1819,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   **Fixes [#19](https://github.com/jmenga/effect-dynamodb/issues/19)** — `Entity.put/create/update/upsert` (and `Transaction`/`Batch` put paths) now correctly decode domain values. Previously, TypeScript said "pass me a `DateTime.Utc`" but the runtime decoded via a transform schema that expected an ISO string — callers who followed the TS contract hit a `ValidationError`. The runtime decode now uses `fromSelf` variants for date-annotated fields, matching the TS contract.
 
   **New: declare system-field-colliding timestamps in your model.** If your domain model declares `createdAt` / `updatedAt` with a date-compatible schema (e.g. `Schema.DateTimeUtcFromString`, `Schema.DateFromString`, `Schema.DateTimeUtc`), and `timestamps: true` is set:
-
   - The input type marks the colliding fields as optional — caller may omit them (library auto-generates) or supply their own value (user value wins, useful for imports/backfill).
   - The library-generated timestamp respects the model field's storage encoding, so declaring `createdAt: Schema.DateTimeUtcFromString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))` yields epoch-seconds storage even though the library is generating the value.
   - `createdAt` is treated as immutable in the update schema (stripped entirely).
@@ -1809,7 +1826,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   **New: user-owned non-date fields that collide with a system field name.** If your model declares e.g. `createdAt: Schema.String` (as a user-managed composite value, not a timestamp), the library detects the non-date collision and yields the field to the user — library timestamp management applies only to non-colliding fields (e.g. `updatedAt`). Preserves existing patterns that use `createdAt` as a plain string SK composite.
 
   **Errors:**
-
   - `EDD-9021` — the `version` field cannot be declared in the model alongside `versioned: true`, because optimistic locking requires library-managed increment.
 
   **Type ergonomics.** The exposed `inputSchema` / `createSchema` / `updateSchema` codec types (and the corresponding `Entity.put` / `create` / `update` call signatures) now flatten into plain object literals in hover tooltips instead of showing as wrapped generic aliases.

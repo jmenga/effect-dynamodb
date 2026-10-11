@@ -347,6 +347,8 @@ export const compileExpr = (
       }
       case "between":
         return `${compileOperand(node.operand)} BETWEEN ${compileOperand(node.low)} AND ${compileOperand(node.high)}`
+      // No values compiles to `IN ()`, which DynamoDB rejects; the rejection
+      // is diagnosed, naming the `isIn()` (#144).
       case "in": {
         const vals = node.values.map(compileOperand).join(", ")
         return `${compileOperand(node.operand)} IN (${vals})`
@@ -407,6 +409,10 @@ export const isEmptyExpr = (expr: Expr): boolean =>
  * asserts nothing, so `or(x, {})` would match everything and `not({})`
  * nothing — and `or()` with no parts matches nothing at all. Each is refused
  * with a `ValidationError` before anything is sent, never dropped.
+ *
+ * An `isIn()` with no values is not refused here (#144): it compiles to
+ * `IN ()`, which DynamoDB rejects as a syntax error, and the rejection is
+ * diagnosed (`internal/WriteDiagnosis.ts`, `EmptyIn`) naming the attribute.
  */
 export const emptyPartProblem = (expr: Expr): string | undefined => {
   switch (expr._tag) {
@@ -433,10 +439,6 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       }
       return undefined
     }
-    case "in":
-      return expr.values.length === 0
-        ? "isIn() with no values matches nothing, and DynamoDB rejects `IN ()`. Give it at least one value."
-        : undefined
     case "not":
       if (isEmptyExpr(expr.expr)) {
         return (

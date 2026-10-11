@@ -320,6 +320,10 @@ const main = Effect.gen(function* () {
       entities: { Devices },
       tables: { AppTable },
     })
+    // Start clean: drop the table a failed earlier run may have left behind
+    yield* db.tables.AppTable.delete().pipe(
+      Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+    )
     yield* db.tables.AppTable.create()
   }).pipe(Effect.provide(AppLayer))
   const setupHier = Effect.gen(function* () {
@@ -327,6 +331,10 @@ const main = Effect.gen(function* () {
       entities: { Assets },
       tables: { HierTable },
     })
+    // Start clean: drop the table a failed earlier run may have left behind
+    yield* db.tables.HierTable.delete().pipe(
+      Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+    )
     yield* db.tables.HierTable.create()
   }).pipe(Effect.provide(HierLayer))
 
@@ -360,8 +368,5 @@ const main = Effect.gen(function* () {
   yield* Console.log("\nAll v1.7.1 indexPolicy scenarios passed.")
 })
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion

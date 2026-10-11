@@ -125,6 +125,10 @@ const program = Effect.gen(function* () {
   // --- Create the table (derived from entity definitions) ---
   yield* Console.log("=== Setup ===\n")
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["starter-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["starter-table"]!.create()
   yield* Console.log("Table created\n")
 
@@ -169,12 +173,9 @@ const program = Effect.gen(function* () {
   // --- Update ---
   yield* Console.log("=== Update ===\n")
 
-  // Note: status is a GSI composite, so we must also provide userId
-  // (all composites for the GSI) so the key can be recomposed
-  const updated = yield* db.entities.Tasks.update({ taskId: "t-1" }).set({
-    status: "done",
-    userId: "u-alice",
-  })
+  // status is byUser's sort key, so this update recomposes gsi1sk;
+  // the partition key (userId) isn't touched and keeps its stored value
+  const updated = yield* db.entities.Tasks.update({ taskId: "t-1" }).set({ status: "done" })
   yield* Console.log(`Updated task: "${updated.title}" -> ${updated.status}\n`)
 
   // --- Query: tasks by user via GSI index accessor ---
@@ -217,8 +218,5 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion

@@ -320,10 +320,7 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "expr-demo-table" }),
 )
 const main = program.pipe(Effect.provide(AppLayer))
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 ```
 
 ---

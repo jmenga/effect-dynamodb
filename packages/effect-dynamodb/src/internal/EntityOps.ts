@@ -295,7 +295,7 @@ export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
  *
  * @typeParam A - Decoded model type
  * @typeParam Rec - Record type (model + system fields)
- * @typeParam U - Update payload type (partial model minus keys, with GSI all-or-none constraints)
+ * @typeParam U - Update payload type (partial model minus primary-key composites; GSI keys are recomposed per half)
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */

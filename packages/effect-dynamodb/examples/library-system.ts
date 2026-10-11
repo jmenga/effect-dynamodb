@@ -346,6 +346,12 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 // =============================================================================
 
 const program = Effect.gen(function* () {
+  // Start clean: drop the table a failed earlier run may have left behind
+  const dynamo = yield* DynamoClient
+  const { name: tableName } = yield* LibTable.Tag
+  yield* dynamo
+    .deleteTable({ TableName: tableName })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   // #region seed-insert
   // Typed execution gateway — binds all entities and collections
   const db = yield* DynamoClient.make({
@@ -573,11 +579,6 @@ const program = Effect.gen(function* () {
   yield* db.entities.Books.update({ isbn: "978-0-547-928227", bookId: "b-hobbit" }).set({
     memberId: "m-alice",
     loanEndDate: "2025-04-01",
-    // Must provide all GSI composites for affected indexes
-    authorLastName: "Tolkien",
-    authorFirstName: "J.R.R.",
-    bookTitle: "The Hobbit",
-    releaseDate: "1937-09-21",
   })
 
   // Now the book appears in Alice's loans
@@ -671,10 +672,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
 
 export {

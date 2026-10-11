@@ -73,6 +73,10 @@ const program = Effect.gen(function* () {
 
   // Create table
   console.log("Creating table...")
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: "vehicle-tracking" })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: "vehicle-tracking",
     BillingMode: "PAY_PER_REQUEST",
@@ -142,4 +146,4 @@ const AppLayer = Layer.mergeAll(
   MainTable.layer({ name: "vehicle-tracking" }),
 )
 
-Effect.runPromise(program.pipe(Effect.provide(AppLayer))).catch(console.error)
+Effect.runPromise(program.pipe(Effect.provide(AppLayer)))

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 
 /**
@@ -26,7 +26,20 @@ import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  applyUpdate,
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_ITEM_SIZE_UPDATE,
+  DDB_PARTITION_KEY_AWS,
+  DDB_SORT_KEY_LOCAL,
+  DDB_TABLE_KEY_SIZE_LOCAL,
+  DDB_TOO_MANY_ITEMS,
+  ddbEmptyIn,
+  ddbTooManyOperators,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 /**
  * The attributes a guarded Update SETs, by name — the read-then-write update
@@ -1601,8 +1614,10 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("returns TransactionOverflow when transaction exceeds 100-item limit", () =>
+    it.effect("returns TransactionOverflow when DynamoDB rejects over 100 items (#144)", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
         // Build an entity with 100 unique constraints → 101 transact items (1 main + 100 sentinels)
         const uniqueConstraints: Record<string, ReadonlyArray<string>> = {}
         for (let i = 0; i < 100; i++) {
@@ -1642,8 +1657,10 @@ describe("Entity", () => {
         expect(overflow.operation).toBe("put")
         expect(overflow.itemCount).toBe(101)
         expect(overflow.limit).toBe(100)
-        // transactWriteItems should NOT have been called
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        // Sent once — not pre-checked, and never retried as a lost race —
+        // with DynamoDB's error kept as the cause.
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect((overflow.cause as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -2234,6 +2251,296 @@ describe("Entity", () => {
   // ---------------------------------------------------------------------------
   // update operation
   // ---------------------------------------------------------------------------
+
+  describe("write limits are diagnosed from DynamoDB's rejection (#144)", () => {
+    const Items = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "SimpleItem",
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byName: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: [] },
+            sk: { field: "gsi1sk", composite: ["name"] },
+          },
+        },
+      }),
+    )
+
+    it.effect("put: an oversized item is a ValidationError naming the entity and key", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.put({ itemId: "i-1", name: "x".repeat(410_000) })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("SimpleItem")
+        expect(failure.operation).toBe("put")
+        const text = String(failure.cause)
+        expect(text).toContain(
+          "the item of the SimpleItem put, at pk=$myapp#v1#simpleitem#itemid_i-1",
+        )
+        expect(text).toContain("409600 bytes (400 KB)")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        expect(mockPutItem).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: a sort key over 1024 bytes names its attribute", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockRejectedValueOnce(awsValidationException(DDB_SORT_KEY_LOCAL))
+        const error = yield* Items.put({ itemId: "i-1", name: "n".repeat(1100) })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain('the sort key "gsi1sk"')
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: a partition key over 2048 bytes names its attribute (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TABLE_KEY_SIZE_LOCAL)
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.put({ itemId: "i".repeat(2100), name: "n" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('the partition key "pk" of the SimpleItem put')
+        expect(text).toContain("longer than DynamoDB's 2048-byte limit for a partition key")
+        expect(((error as ValidationError).cause as Error).cause).toBeInstanceOf(DynamoError)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: a partition key over 2048 bytes, in AWS's wording, is named (#144)", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockRejectedValueOnce(awsValidationException(DDB_PARTITION_KEY_AWS))
+        const error = yield* Items.update({ itemId: "i".repeat(2100) })
+          .pipe(Entity.set({ name: "m" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          'the partition key "pk" of the SimpleItem update',
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: a sort-key message with no key over 1024 bytes passes through", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.put({ itemId: "i-1", name: "short" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: an item grown past 400 KB is a ValidationError", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE_UPDATE))
+        const error = yield* Items.update({ itemId: "i-1" })
+          .pipe(Entity.set({ name: "y".repeat(1000) }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("update")
+        expect(String(failure.cause)).toContain(
+          "the SimpleItem update, at pk=$myapp#v1#simpleitem#itemid_i-1",
+        )
+        expect(String(failure.cause)).toContain("not in the request")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("delete: an unrecognised ValidationException passes through unchanged", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(
+          "The provided key element does not match the schema",
+        )
+        mockDeleteItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.delete({ itemId: "i-1" }).asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("create: an oversized item is a ValidationError, never ConditionalCheckFailed", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.create({ itemId: "i-1", name: "x".repeat(410_000) })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain("at pk=$myapp#v1#simpleitem#itemid_i-1")
+        expect(text).toContain("Nothing was written.")
+        expect(((error as ValidationError).cause as Error).cause).toBeInstanceOf(DynamoError)
+        expect(mockPutItem).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("upsert: an item grown past 400 KB is a ValidationError", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE_UPDATE)
+        mockUpdateItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.upsert({ itemId: "i-1", name: "y".repeat(1000) })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("upsert")
+        expect(String(failure.cause)).toContain(
+          "the item of the SimpleItem upsert, at pk=$myapp#v1#simpleitem#itemid_i-1",
+        )
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("upsert: an unrecognised ValidationException passes through unchanged", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException("Some other validation problem")
+        mockUpdateItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.upsert({ itemId: "i-1", name: "n" }).asEffect().pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    const UniqueItems = withConfig(
+      Entity.make({
+        model: User,
+        entityType: "DiagUnique",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        unique: { email: ["email"] },
+      }),
+    )
+
+    it.effect("transaction put: the oversized main item of a unique put is named", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* UniqueItems.put({
+          userId: "u-1",
+          email: "a@x.io",
+          displayName: "x".repeat(410_000),
+          role: "admin",
+        })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("DiagUnique")
+        expect(failure.operation).toBe("put")
+        // Index 0 of the transaction is the item itself, not its sentinel.
+        expect(String(failure.cause)).toContain(
+          "the item of the item, at pk=$myapp#v1#diagunique#userid_u-1",
+        )
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        // A diagnosed limit is terminal: never retried as a lost race.
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "transaction put: a sentinel conflict beside a size reason is still the conflict",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(
+            awsTransactionCanceled([
+              { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+              { Code: "ConditionalCheckFailed" },
+            ]),
+          )
+          mockGetItem.mockResolvedValue({})
+          const error = yield* UniqueItems.put({
+            userId: "u-1",
+            email: "a@x.io",
+            displayName: "Alice",
+            role: "admin",
+          })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("UniqueConstraintViolation")
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    const RetainItems = withConfig(
+      Entity.make({
+        model: SimpleItem,
+        entityType: "DiagRetain",
+        primaryKey: {
+          pk: { field: "pk", composite: ["itemId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        timestamps: true,
+        versioned: { retain: true },
+      }),
+    )
+    const storedRetainItem = () => ({
+      Item: toAttributeMap({
+        itemId: "i-1",
+        name: "Original",
+        createdAt: "2024-01-15T00:00:00Z",
+        updatedAt: "2024-01-15T00:00:00Z",
+        version: 1,
+        pk: "$myapp#v1#diagretain#itemid_i-1",
+        sk: "$myapp#v1#diagretain",
+        __edd_e__: "DiagRetain",
+      }),
+    })
+
+    it.effect(
+      "transaction update: a cancellation reason for an item grown too large is named by index",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValueOnce(storedRetainItem())
+          const rejection = awsTransactionCanceled([
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE_UPDATE },
+            { Code: "None" },
+          ])
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const error = yield* RetainItems.update({ itemId: "i-1" })
+            .pipe(Entity.set({ name: "y".repeat(1000) }))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.entityType).toBe("DiagRetain")
+          expect(failure.operation).toBe("update")
+          expect(String(failure.cause)).toContain(
+            "the item of the item, at pk=$myapp#v1#diagretain#itemid_i-1",
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("transaction update: an unrecognised cancellation passes through", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockResolvedValueOnce(storedRetainItem())
+        const rejection = awsTransactionCanceled([{ Code: "ThrottlingError" }, { Code: "None" }])
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* RetainItems.update({ itemId: "i-1" })
+          .pipe(Entity.set({ name: "z" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 
   describe("update", () => {
     const SimpleEntity = withConfig(
@@ -5674,6 +5981,73 @@ describe("Entity", () => {
       }).pipe(Effect.provide(PurgeTestLayer)),
     )
 
+    describe("UnprocessedItems (retried with Batch.write's backoff)", () => {
+      const partition = (count: number) =>
+        Array.from({ length: count }, (_, i) =>
+          toAttributeMap({
+            pk: "$myapp#v1#purgeitem#i-1",
+            sk: i === 0 ? "$myapp#v1#purgeitem" : `$myapp#v1#purgeitem#v#000000${i}`,
+            __edd_e__: "PurgeItem",
+          }),
+        )
+      const unprocessed = (items: ReadonlyArray<Record<string, unknown>>) => ({
+        UnprocessedItems: {
+          "test-table": items.map((item) => ({
+            DeleteRequest: { Key: { pk: item.pk, sk: item.sk } },
+          })),
+        },
+      })
+
+      it.effect("an unprocessed delete is resent, alone, until it drains", () =>
+        Effect.gen(function* () {
+          const items = partition(3)
+          mockQuery.mockResolvedValueOnce({ Items: items, LastEvaluatedKey: undefined })
+          mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[2]!]))
+          mockBatchWriteItem.mockResolvedValueOnce({})
+
+          const fiber = yield* PurgeEntity.purge({ itemId: "i-1" })
+            .asEffect()
+            .pipe(Effect.provide(PurgeTestLayer), Effect.forkChild)
+          yield* TestClock.adjust("1 seconds")
+          yield* Fiber.join(fiber)
+
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(2)
+          const retried = mockBatchWriteItem.mock.calls[1]![0].RequestItems["test-table"]
+          expect(retried).toEqual([
+            { DeleteRequest: { Key: { pk: items[2]!.pk, sk: items[2]!.sk } } },
+          ])
+        }),
+      )
+
+      it.effect("never draining: fails after the retries, saying exactly what was deleted", () =>
+        Effect.gen(function* () {
+          const items = partition(3)
+          mockQuery.mockResolvedValueOnce({ Items: items, LastEvaluatedKey: undefined })
+          // The first request deletes one of three; the other two never drain.
+          mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[1]!, items[2]!]))
+          for (let i = 0; i < 10; i++) {
+            mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[1]!, items[2]!]))
+          }
+
+          const fiber = yield* PurgeEntity.purge({ itemId: "i-1" })
+            .asEffect()
+            .pipe(Effect.provide(PurgeTestLayer), Effect.forkChild)
+          yield* TestClock.adjust("60 seconds")
+          const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).operation).toBe("BatchWriteItem")
+          const text = String((error as DynamoError).cause)
+          expect(text).toContain(
+            "2 of the partition's 3 items were still unprocessed after 5 retries",
+          )
+          expect(text).toContain("the purge had already deleted 1 of the partition's 3 items")
+          // The first request, then five retries.
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(6)
+        }),
+      )
+    })
+
     it.effect("purge handles soft-deleted item + versions", () =>
       Effect.gen(function* () {
         const PurgeSoftEntity = withConfig(
@@ -7138,7 +7512,6 @@ describe("Entity", () => {
           ops.not(ops.and()),
           ops.or(),
           ops.and(ops.eq(pb.name, "a"), ops.or(ops.and(ops.and()))),
-          ops.isIn(pb.name, []),
         ]
         for (const expr of refused) {
           const cond = () => expr
@@ -7165,6 +7538,31 @@ describe("Entity", () => {
         expect(mockUpdateItem).not.toHaveBeenCalled()
         expect(mockDeleteItem).not.toHaveBeenCalled()
         expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an isIn() with no values is sent, and DynamoDB's rejection named (#144)", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ name: string }>()
+        const pb = createPathBuilder<{ name: string }>()
+        const cond = () => ops.isIn(pb.name, [])
+        const rejection = awsValidationException(ddbEmptyIn("Condition"))
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Plain.put({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition(cond))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('isIn() on "name" in its condition has no values')
+        expect(text).toContain("Nothing was written.")
+        expect(mockPutItem.mock.calls[0]![0].ConditionExpression).toContain("IN ()")
+        mockDeleteItem.mockRejectedValueOnce(rejection)
+        const deleted = yield* Plain.delete({ itemId: "i-1" })
+          .pipe(Plain.condition(cond))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(deleted._tag).toBe("ValidationError")
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -8472,8 +8870,9 @@ describe("Entity", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("transactional cascade fails when >100 items", () =>
+    it.effect("transactional cascade fails when DynamoDB rejects >100 items (#144)", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         mockUpdateItem.mockResolvedValueOnce({
           Attributes: toAttributeMap({
             pk: "$myapp#v1#CascadePlayer#p-1",
@@ -8519,6 +8918,60 @@ describe("Entity", () => {
         if (error._tag === "CascadePartialFailure") {
           expect(error.failed).toBe(101)
           expect(error.succeeded).toBe(0)
+          const diagnosed = error.errors[0] as ValidationError
+          expect(diagnosed._tag).toBe("ValidationError")
+          expect(String(diagnosed.cause)).toContain("holds 101 items")
+        }
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("eventual cascade: an item grown past 400 KB is named in errors (#144)", () =>
+      Effect.gen(function* () {
+        mockUpdateItem
+          .mockResolvedValueOnce({
+            Attributes: toAttributeMap({
+              pk: "$myapp#v1#CascadePlayer#p-1",
+              sk: "$myapp#v1#CascadePlayer",
+              playerId: "p-1",
+              displayName: "Steven Smith",
+              position: "Batter",
+              __edd_e__: "CascadePlayer",
+            }),
+          })
+          .mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE_UPDATE))
+        mockQuery.mockResolvedValueOnce({
+          Items: [
+            toAttributeMap({
+              pk: "$myapp#v1#CascadeSelection#sel-0",
+              sk: "$myapp#v1#CascadeSelection",
+              selectionId: "sel-0",
+              player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+              role: "Captain",
+              __edd_e__: "CascadeSelection",
+              gsi2pk: "$myapp#v1#CascadeSelection#p-1",
+              gsi2sk: "$myapp#v1#CascadeSelection#sel-0",
+            }),
+          ],
+          LastEvaluatedKey: undefined,
+        })
+
+        const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+          .pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({ targets: [CascadeSelectionEntity], mode: "eventual" }),
+          )
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(error._tag).toBe("CascadePartialFailure")
+        if (error._tag === "CascadePartialFailure") {
+          const diagnosed = error.errors[0] as ValidationError
+          expect(diagnosed._tag).toBe("ValidationError")
+          expect(diagnosed.entityType).toBe("CascadeSelection")
+          expect(String(diagnosed.cause)).toContain(
+            "the cascade update of CascadeSelection, at pk=$myapp#v1#CascadeSelection#sel-0",
+          )
         }
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -8583,6 +9036,188 @@ describe("Entity", () => {
           expect(error.succeeded).toBe(1)
           expect(error.failed).toBe(1)
           expect(error.errors).toHaveLength(1)
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    // --- Targets keyed by other attribute names (C2: cascade read `item.pk` /
+    // `item.sk` regardless of the target's primary key) ---
+    class CascadeRoster extends Schema.Class<CascadeRoster>("CascadeRoster")({
+      rosterId: Schema.String,
+      player: CascadePlayer.pipe(DynamoModel.ref),
+    }) {}
+
+    const CascadeRosterEntity = withConfig(
+      Entity.make({
+        model: CascadeRoster,
+        entityType: "CascadeRoster",
+        primaryKey: {
+          pk: { field: "PK", composite: ["rosterId"] },
+          sk: { field: "SK", composite: [] },
+        },
+        refs: {
+          player: {
+            entity: CascadePlayerEntity,
+            cascade: { index: "GSI4", pk: { field: "GSI4PK" }, sk: { field: "GSI4SK" } },
+          },
+        },
+      }),
+    )
+
+    const sourcePlayerUpdate = () =>
+      mockUpdateItem.mockResolvedValueOnce({
+        Attributes: toAttributeMap({
+          pk: "$myapp#v1#CascadePlayer#p-1",
+          sk: "$myapp#v1#CascadePlayer",
+          playerId: "p-1",
+          displayName: "Steven Smith",
+          position: "Batter",
+          __edd_e__: "CascadePlayer",
+        }),
+      })
+
+    const rosterRow = (rosterId: string) =>
+      toAttributeMap({
+        PK: `$myapp#v1#CascadeRoster#${rosterId}`,
+        SK: "$myapp#v1#CascadeRoster",
+        rosterId,
+        player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+        __edd_e__: "CascadeRoster",
+        GSI4PK: "$myapp#v1#CascadeRoster#p-1",
+        GSI4SK: `$myapp#v1#CascadeRoster#${rosterId}`,
+      })
+
+    const selectionRow = (selectionId: string) =>
+      toAttributeMap({
+        pk: `$myapp#v1#CascadeSelection#${selectionId}`,
+        sk: "$myapp#v1#CascadeSelection",
+        selectionId,
+        player: { playerId: "p-1", displayName: "Steve Smith", position: "Batter" },
+        role: "Captain",
+        __edd_e__: "CascadeSelection",
+        gsi2pk: "$myapp#v1#CascadeSelection#p-1",
+        gsi2sk: `$myapp#v1#CascadeSelection#${selectionId}`,
+      })
+
+    it.effect(
+      "eventual cascade keys each update by the target's primary-key fields (PK / SK)",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery.mockResolvedValueOnce({
+            Items: [rosterRow("r-1")],
+            LastEvaluatedKey: undefined,
+          })
+          mockUpdateItem.mockResolvedValueOnce({})
+
+          yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({ targets: [CascadeRosterEntity], mode: "eventual" }),
+            Entity.asModel,
+          )
+
+          expect(mockQuery.mock.calls[0]![0].IndexName).toBe("GSI4")
+          expect(mockUpdateItem).toHaveBeenCalledTimes(2)
+          expect(mockUpdateItem.mock.calls[1]![0].Key).toEqual({
+            PK: { S: "$myapp#v1#CascadeRoster#r-1" },
+            SK: { S: "$myapp#v1#CascadeRoster" },
+          })
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "transactional cascade keys each entry by its own target's primary-key fields (mixed targets)",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery
+            .mockResolvedValueOnce({ Items: [selectionRow("sel-1")], LastEvaluatedKey: undefined })
+            .mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+          mockTransactWriteItems.mockResolvedValueOnce({})
+
+          yield* CascadePlayerEntity.update({ playerId: "p-1" }).pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({
+              targets: [CascadeSelectionEntity, CascadeRosterEntity],
+              mode: "transactional",
+            }),
+            Entity.asModel,
+          )
+
+          const txCall = mockTransactWriteItems.mock.calls[0]![0]
+          expect(txCall.TransactItems.map((item: any) => item.Update.Key)).toEqual([
+            {
+              pk: { S: "$myapp#v1#CascadeSelection#sel-1" },
+              sk: { S: "$myapp#v1#CascadeSelection" },
+            },
+            {
+              PK: { S: "$myapp#v1#CascadeRoster#r-1" },
+              SK: { S: "$myapp#v1#CascadeRoster" },
+            },
+          ])
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "transactional cascade diagnosis names each entry by its own target's key fields",
+      () =>
+        Effect.gen(function* () {
+          sourcePlayerUpdate()
+          mockQuery
+            .mockResolvedValueOnce({ Items: [selectionRow("sel-1")], LastEvaluatedKey: undefined })
+            .mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+          mockTransactWriteItems.mockRejectedValueOnce(
+            awsTransactionCanceled([
+              { Code: "None" },
+              { Code: "ValidationError", Message: DDB_ITEM_SIZE_UPDATE },
+            ]),
+          )
+
+          const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+            .pipe(
+              Entity.set({ displayName: "Steven Smith" }),
+              Entity.cascade({
+                targets: [CascadeSelectionEntity, CascadeRosterEntity],
+                mode: "transactional",
+              }),
+            )
+            .asEffect()
+            .pipe(Effect.flip)
+
+          expect(error._tag).toBe("CascadePartialFailure")
+          if (error._tag === "CascadePartialFailure") {
+            const diagnosed = error.errors[0] as ValidationError
+            expect(diagnosed._tag).toBe("ValidationError")
+            expect(String(diagnosed.cause)).toContain(
+              "the cascade update of CascadeRoster (item 1), at " +
+                "PK=$myapp#v1#CascadeRoster#r-1, SK=$myapp#v1#CascadeRoster",
+            )
+          }
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("eventual cascade diagnosis names the update by the target's key fields", () =>
+      Effect.gen(function* () {
+        sourcePlayerUpdate()
+        mockUpdateItem.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE_UPDATE))
+        mockQuery.mockResolvedValueOnce({ Items: [rosterRow("r-1")], LastEvaluatedKey: undefined })
+
+        const error = yield* CascadePlayerEntity.update({ playerId: "p-1" })
+          .pipe(
+            Entity.set({ displayName: "Steven Smith" }),
+            Entity.cascade({ targets: [CascadeRosterEntity], mode: "eventual" }),
+          )
+          .asEffect()
+          .pipe(Effect.flip)
+
+        expect(error._tag).toBe("CascadePartialFailure")
+        if (error._tag === "CascadePartialFailure") {
+          const diagnosed = error.errors[0] as ValidationError
+          expect(diagnosed._tag).toBe("ValidationError")
+          expect(String(diagnosed.cause)).toContain(
+            "the cascade update of CascadeRoster, at " +
+              "PK=$myapp#v1#CascadeRoster#r-1, SK=$myapp#v1#CascadeRoster",
+          )
         }
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -9936,6 +10571,10 @@ describe("Entity", () => {
     it.effect("errors from an upsert's create name the upsert", () =>
       Effect.gen(function* () {
         // Missing: the upsert creates — under a condition DynamoDB can't take.
+        // Sent as built (#144): DynamoDB rejects it, and the rejection is named.
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsValidationException(ddbTooManyOperators("Condition")),
+        )
         const error = yield* Guarded.upsert(user)
           .pipe(
             Guarded.condition((t: any, { or, eq }: any) =>
@@ -9945,7 +10584,12 @@ describe("Entity", () => {
           .asEffect()
           .pipe(Effect.flip)
         expect([error._tag, (error as any).operation]).toEqual(["ValidationError", "upsert"])
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        const text = String((error as any).cause)
+        expect(text).toMatch(/ConditionExpression of the item, .*: it holds \d+ operators/)
+        // The caller's part (319 operators) and the guard beside it, named.
+        expect(text).toContain("The .condition() alone is")
+        expect(text).toContain("319 operators")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

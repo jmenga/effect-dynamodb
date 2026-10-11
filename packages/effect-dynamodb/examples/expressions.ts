@@ -84,6 +84,10 @@ const program = Effect.gen(function* () {
   // --- Setup ---
   yield* Console.log("=== Setup ===\n")
 
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["expr-demo-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["expr-demo-table"]!.create()
   yield* Console.log("Table created\n")
 
@@ -386,8 +390,5 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion

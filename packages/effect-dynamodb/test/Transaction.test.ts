@@ -13,11 +13,19 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
 import { itemBytes, transactItemBytes } from "../src/internal/ItemSize.js"
-import { refuseOversizedTransaction, transactItemTarget } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsTransactionCanceled,
+  awsValidationException,
+  DDB_ITEM_SIZE,
+  DDB_REPEATED_ITEM,
+  DDB_SORT_KEY_LOCAL,
+  DDB_TOO_MANY_ITEMS,
+  ddbPayloadTooLarge,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // --- Test Models ---
 
@@ -289,13 +297,43 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("fails with DynamoError when exceeding 100-item limit", () =>
+    it.effect(
+      "DynamoDB's rejection of one item read twice is a DynamoError naming both (#144)",
+      () =>
+        Effect.gen(function* () {
+          const rejection = awsValidationException(DDB_REPEATED_ITEM)
+          mockTransactGetItems.mockRejectedValueOnce(rejection)
+          const error = yield* Transaction.transactGet([
+            UserEntity.get({ userId: "u-1" }),
+            OrderEntity.get({ orderId: "o-1" }),
+            UserEntity.get({ userId: "u-1" }),
+          ]).pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).operation).toBe("TransactGetItems")
+          expect(String((error as DynamoError).cause)).toContain(
+            "TransactGetItems reads one item more than once — get 0 (User) and get 2 (User) both " +
+              "read the item at pk=",
+          )
+          expect(((error as DynamoError).cause as Error).cause).toBeInstanceOf(DynamoError)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("DynamoDB's rejection of 101 items is a DynamoError, confirmed by count (#144)", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+        mockTransactGetItems.mockRejectedValueOnce(rejection)
         const items = Array.from({ length: 101 }, (_, i) => UserEntity.get({ userId: `u-${i}` }))
 
         const error = yield* Transaction.transactGet(items).pipe(Effect.flip)
         expect(error._tag).toBe("DynamoError")
         expect((error as DynamoError).operation).toBe("TransactGetItems")
+        expect(String((error as DynamoError).cause)).toContain(
+          "TransactGetItems supports a maximum of 100 items; the request holds 101",
+        )
+        // Sent, not pre-checked; DynamoDB's error is kept one step down.
+        expect(mockTransactGetItems).toHaveBeenCalledOnce()
+        // The DynamoClientError the call failed with, wrapping DynamoDB's own.
+        expect((((error as DynamoError).cause as Error).cause as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -485,8 +523,9 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("fails with DynamoError when exceeding 100-item limit", () =>
+    it.effect("DynamoDB's rejection of 101 items is a DynamoError, confirmed by count (#144)", () =>
       Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const operations = Array.from({ length: 101 }, (_, i) =>
           UserEntity.delete({ userId: `u-${i}` }),
         )
@@ -494,6 +533,34 @@ describe("Transaction", () => {
         const error = yield* Transaction.transactWrite(operations).pipe(Effect.flip)
         expect(error._tag).toBe("DynamoError")
         expect((error as DynamoError).operation).toBe("TransactWriteItems")
+        expect(String((error as DynamoError).cause)).toContain("maximum of 100 items")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unrecognised ValidationException passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(
+          "One or more parameter values were invalid: An AttributeValue may not contain an empty string",
+        )
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* Transaction.transactWrite([UserEntity.delete({ userId: "u-1" })]).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a count rejection the request does not confirm passes through (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* Transaction.transactWrite([UserEntity.delete({ userId: "u-1" })]).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("DynamoError")
+        expect((error as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -992,9 +1059,10 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("the 100-item cap counts EXPANDED items and says so", () =>
+    it.effect("the 100-item rejection counts EXPANDED items and says so", () =>
       Effect.gen(function* () {
         // 34 ops x 3 items each = 102 > 100, while 34 ops alone would pass.
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_TOO_MANY_ITEMS))
         const ops = Array.from({ length: 34 }, (_, i) =>
           LifecycleMembers.put({ memberId: `m-${i}`, email: `e${i}@x.io`, label: "L" }),
         )
@@ -1004,7 +1072,9 @@ describe("Transaction", () => {
         expect(error._tag).toBe("DynamoError")
         const message = String((error as DynamoError).cause)
         expect(message).toContain("34 operation(s) expanded to 102 items")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        // Sent once and rejected whole: a diagnosed limit is never retried.
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems).toHaveLength(102)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1120,12 +1190,14 @@ describe("Transaction", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  describe("one op per item: a repeated item is refused before writing (#133)", () => {
+  describe("one op per item: DynamoDB's rejection of a repeated item is named (#133, #144)", () => {
     const user = (userId: string, name: string) =>
       ({ userId, email: `${userId}@x.io`, name, role: "member" }) as const
 
-    it.effect("two ops on one plain item are refused, and nothing is written", () =>
+    it.effect("two ops on one plain item are sent; DynamoDB's rejection is named", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_REPEATED_ITEM)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
         const error = yield* Transaction.transactWrite([
           UserEntity.put(user("u-1", "A")),
           UserEntity.delete({ userId: "u-1" }),
@@ -1135,27 +1207,57 @@ describe("Transaction", () => {
         expect(failure.entityType).toBe("User")
         expect(String(failure.cause)).toContain("touches one item more than once")
         expect(String(failure.cause)).toMatch(/operation 0 \(User\) and operation 1 \(User\)/)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(String(failure.cause)).toContain("Nothing was written.")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("two puts of one versioned retain item are refused, not judged a lost race", () =>
+    it.effect("DynamoDB's message without a repeat in the request passes through", () =>
       Effect.gen(function* () {
-        const member = (label: string) => ({ memberId: "m-9", email: "m9@x.io", label })
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_REPEATED_ITEM))
         const error = yield* Transaction.transactWrite([
-          LifecycleMembers.put(member("a")),
-          LifecycleMembers.put(member("b")),
+          UserEntity.put(user("u-1", "A")),
+          UserEntity.delete({ userId: "u-2" }),
         ]).pipe(Effect.flip)
-        expect(error._tag).toBe("ValidationError")
-        expect((error as ValidationError).entityType).toBe("LifecycleMember")
-        expect(String((error as ValidationError).cause)).toContain(
-          "touches one item more than once",
-        )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(error._tag).toBe("DynamoError")
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("swapping unique values between two items repeats a sentinel and is refused", () =>
+    it.effect(
+      "two puts of one versioned retain item: never judged a lost race, never retried",
+      () =>
+        Effect.gen(function* () {
+          // DynamoDB applies the operations in order: the second put's guard
+          // fails against the first, and the request comes back as a
+          // conditional failure — what a lost race looks like (#144).
+          mockTransactWriteItems.mockImplementation(async (input: any) =>
+            Promise.reject(
+              awsTransactionCanceled(
+                input.TransactItems.map((_: unknown, i: number) =>
+                  i === input.TransactItems.length - 1
+                    ? { Code: "ConditionalCheckFailed" }
+                    : { Code: "None" },
+                ),
+              ),
+            ),
+          )
+          const member = (label: string) => ({ memberId: "m-9", email: "m9@x.io", label })
+          const error = yield* Transaction.transactWrite([
+            LifecycleMembers.put(member("a")),
+            LifecycleMembers.put(member("b")),
+          ]).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect((error as ValidationError).entityType).toBe("LifecycleMember")
+          expect(String((error as ValidationError).cause)).toContain(
+            "touches one item more than once",
+          )
+          // Diagnosed before the race reading: one attempt, no retry.
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("swapping unique values between two items repeats a sentinel: named", () =>
       Effect.gen(function* () {
         // Both items exist, each holding (and owning) its own value's sentinel.
         const stored: Record<string, Record<string, unknown>> = {
@@ -1189,6 +1291,7 @@ describe("Transaction", () => {
                 }),
               }
         })
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_REPEATED_ITEM))
         const error = yield* Transaction.transactWrite([
           SparseMembers.put({ memberId: "s-1", email: "s2@x.io", label: "L" }),
           SparseMembers.put({ memberId: "s-2", email: "s1@x.io", label: "L" }),
@@ -1198,7 +1301,10 @@ describe("Transaction", () => {
         expect(String((error as ValidationError).cause)).toContain(
           "touches one item more than once",
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(String((error as ValidationError).cause)).toContain(
+          "through a uniqueness sentinel or version snapshot it writes",
+        )
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1215,97 +1321,72 @@ describe("Transaction", () => {
     )
   })
 
-  describe("a transaction over DynamoDB's 4 MB is refused before writing (#133)", () => {
+  describe("a transaction over DynamoDB's 4 MB is diagnosed from its rejection (#133, #144)", () => {
     const big = "x".repeat(380_000)
     const user = (i: number) =>
       ({ userId: `u-${i}`, email: `u${i}@x.io`, name: big, role: "member" }) as const
     const member = (i: number) => ({ memberId: `m-${i}`, email: `m${i}@x.io`, label: big })
 
-    it.effect("items totalling more than 4 MB are refused, naming the largest", () =>
+    it.effect("DynamoDB's 4 MB rejection names the largest items, keeping its error as cause", () =>
       Effect.gen(function* () {
+        const rejection = awsValidationException(ddbPayloadTooLarge(4_670_000))
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
         const error = yield* Transaction.transactWrite(
           Array.from({ length: 12 }, (_, i) => UserEntity.put(user(i))),
         ).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         const failure = error as ValidationError
         expect(failure.entityType).toBe("User")
-        expect(String(failure.cause)).toContain("over its limit of 4194304 bytes (4 MB)")
-        expect(String(failure.cause)).toMatch(/The largest is operation \d+ \(User\)'s/)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(failure.operation).toBe("transactWrite")
+        expect(String(failure.cause)).toContain("4194304 bytes (4 MB)")
+        expect(String(failure.cause)).toContain("(it reported 4670000 bytes)")
+        expect(String(failure.cause)).toMatch(/The largest: operation \d+ \(User\), at pk=/)
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("a retain put counts twice: its item and its snapshot", () =>
       Effect.gen(function* () {
-        // Six 380 KB items: 2.3 MB as plain puts — written…
-        mockTransactWriteItems.mockResolvedValueOnce({})
-        yield* Transaction.transactWrite(
-          Array.from({ length: 6 }, (_, i) => UserEntity.put(user(i))),
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsValidationException(ddbPayloadTooLarge(4_600_000)),
         )
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
-        // …but 4.6 MB as retain puts, each snapshotted in the same transaction.
         const error = yield* Transaction.transactWrite(
           Array.from({ length: 6 }, (_, i) => LifecycleMembers.put(member(i))),
         ).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).entityType).toBe("LifecycleMember")
         expect(String((error as ValidationError).cause)).toContain("counts twice")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("is no longer pre-checked: what DynamoDB accepts is written", () =>
+      Effect.gen(function* () {
+        // 12 items of ~380 KB: over 4 MB by the library's count, refused locally
+        // before #144. DynamoDB is the judge now.
+        mockTransactWriteItems.mockResolvedValueOnce({})
+        yield* Transaction.transactWrite(
+          Array.from({ length: 12 }, (_, i) => UserEntity.put(user(i))),
+        )
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("the limit is exactly 4 MB by DynamoDB's item-size rules", () =>
-      Effect.gen(function* () {
-        // An item of one attribute `a`: 1 byte of name plus its value.
-        const put = (bytes: number) => ({
-          Put: { TableName: "t", Item: { a: { S: "x".repeat(bytes - 1) } } },
-        })
-        const target = transactItemTarget(put(2), "t", ["a"], "Doc", "operation 0 (Doc)")
-        yield* refuseOversizedTransaction([put(4 * 1024 * 1024)], [target], "transactWrite")
-        const over = yield* refuseOversizedTransaction(
-          [put(4 * 1024 * 1024 + 1)],
-          [target],
-          "transactWrite",
-        ).pipe(Effect.flip)
-        expect(over._tag).toBe("ValidationError")
-        expect(String(over.cause)).toContain("total at least 4194305 bytes")
-      }),
-    )
-
-    it.effect("numbers count as DynamoDB stores them: 25 lists of 12,000 floats fit", () =>
-      Effect.gen(function* () {
-        // ~2.9 MB as DynamoDB counts it (a byte per two significant digits,
-        // plus one); counted by digits it read as 5.5 MB and was refused.
-        const vec = Array.from({ length: 12_000 }, (_, i) => ({
-          N: String(0.1234567890123 + i * 1e-13),
-        }))
-        const items = Array.from({ length: 25 }, (_, i) => ({
-          Put: { TableName: "t", Item: { pk: { S: `p${i}` }, vec: { L: vec } } },
-        }))
-        const targets = items.map((item, i) =>
-          transactItemTarget(item, "t", ["pk"], "Vec", `operation ${i} (Vec)`),
-        )
-        yield* refuseOversizedTransaction(items, targets, "transactWrite")
-      }),
-    )
-
-    it("number sizes trim leading and trailing zeros and count digit pairs", () => {
-      const n = (value: string) => itemBytes({ a: { N: value } }) - 1
-      expect(n("5")).toBe(2)
-      expect(n("12")).toBe(2)
-      expect(n("123")).toBe(3)
-      expect(n("-0.00012300")).toBe(3)
-      expect(n("1000000")).toBe(2)
-      expect(n("0.1234567890123")).toBe(8)
-      expect(n("1e+21")).toBe(2)
-      // Zero has no significant digits: one byte.
-      expect(n("0")).toBe(1)
-      expect(n("-0.000")).toBe(1)
-      // The batch budget keeps its higher count.
-      expect(itemBytes({ a: { N: "0.1234567890123" } }, "upper")).toBeGreaterThan(9)
+    it("numbers count as DynamoDB stores them: 25 lists of 12,000 floats fit", () => {
+      // ~2.7 MB as DynamoDB counts it (a byte per base-100 digit pair, plus
+      // one, plus one per list element); counted by digits it would read as 5.5 MB.
+      const vec = Array.from({ length: 12_000 }, (_, i) => ({
+        N: String(0.1234567890123 + i * 1e-13),
+      }))
+      const items = Array.from({ length: 25 }, (_, i) => ({
+        Put: { TableName: "t", Item: { pk: { S: `p${i}` }, vec: { L: vec } } },
+      }))
+      const total = items.reduce((sum, item) => sum + transactItemBytes(item), 0)
+      expect(total).toBeLessThan(4 * 1024 * 1024)
     })
 
-    it("an Update counts only its key: its values may be the condition's", () => {
+    it("an Update counts its key and both expressions with their substitutions", () => {
+      // Key 5 + "SET #a = :a" (11) + "a" + "x" + "#b = :b" (7) + "b" + 1,000.
       expect(
         transactItemBytes({
           Update: {
@@ -1317,7 +1398,7 @@ describe("Transaction", () => {
             ExpressionAttributeValues: { ":a": { S: "x" }, ":b": { S: "y".repeat(1000) } },
           },
         }),
-      ).toBe(5)
+      ).toBe(5 + 11 + 1 + 1 + 7 + 1 + 1000)
     })
 
     it("item sizes count attribute names, UTF-8 strings and raw binary", () => {
@@ -1325,6 +1406,111 @@ describe("Transaction", () => {
       expect(itemBytes({ b: { B: new Uint8Array(10) } })).toBe(11)
       expect(transactItemBytes({ Delete: { TableName: "t", Key: { pk: { S: "abc" } } } })).toBe(5)
     })
+  })
+
+  describe("an item over DynamoDB's 400 KB is diagnosed from its rejection (#144)", () => {
+    it.effect("names the operation and key of the oversized item", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_ITEM_SIZE)
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put({ userId: "u-0", email: "u0@x.io", name: "small", role: "member" }),
+          UserEntity.put({
+            userId: "u-1",
+            email: "u1@x.io",
+            name: "x".repeat(410_000),
+            role: "member",
+          }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        expect(failure.operation).toBe("transactWrite")
+        expect(String(failure.cause)).toContain("the item of operation 1 (User), at pk=")
+        expect(String(failure.cause)).toContain("409600 bytes (400 KB)")
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("none over by the lower bound: the largest is named as the likely culprit", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put({ userId: "u-0", email: "u0@x.io", name: "small", role: "member" }),
+          UserEntity.put({
+            userId: "u-1",
+            email: "u1@x.io",
+            name: "x".repeat(399_000),
+            role: "member",
+          }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          "most likely the item of operation 1 (User)",
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a cancellation whose reason is an item-size ValidationError is named by index", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+          ]),
+        )
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put({ userId: "u-0", email: "u0@x.io", name: "a", role: "member" }),
+          UserEntity.put({ userId: "u-1", email: "u1@x.io", name: "b", role: "member" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("operation 1 (User)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a conditional failure beside it is still TransactionCancelled", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsTransactionCanceled([
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ValidationError", Message: DDB_ITEM_SIZE },
+          ]),
+        )
+        const error = yield* Transaction.transactWrite([
+          UserEntity.put({ userId: "u-0", email: "u0@x.io", name: "a", role: "member" }),
+          UserEntity.put({ userId: "u-1", email: "u1@x.io", name: "b", role: "member" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("TransactionCancelled")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a sort key over 1024 bytes is named with its attribute", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_SORT_KEY_LOCAL))
+        const error = yield* Transaction.transactWrite([
+          OrderEntity.put({
+            orderId: "o-1",
+            userId: "u-1",
+            product: "p",
+            quantity: 1,
+            status: "pending",
+          }),
+          // gsi1sk composes the orderId: 1100 bytes of it.
+          OrderEntity.put({
+            orderId: "o".repeat(1100),
+            userId: "u-1",
+            product: "p",
+            quantity: 1,
+            status: "pending",
+          }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toMatch(/the sort key "(sk|gsi1sk)" of operation 1 \(Order\)/)
+        expect(text).toContain("1024-byte limit")
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {

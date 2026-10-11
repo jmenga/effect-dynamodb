@@ -14,14 +14,18 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
+import {
+  DynamoError,
+  type DynamoValidationError,
+  type ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import { awsValidationException, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -258,15 +262,60 @@ describe("Aggregate — base-table assembly", () => {
       ).not.toThrow()
     })
 
-    it("throws EDD-9042 when combined with a GSI-shaped collection index", () => {
-      expect(() =>
-        Aggregate.make(Order, {
-          ...baseAggregateConfig,
-          table: AltTable,
-          collection: { index: "gsi2", name: "order", sk: { field: "gsi2sk", composite: [] } },
-          consistentRead: true,
-        }),
-      ).toThrow(/EDD-9042/)
+    describe("with a GSI-shaped collection index (#144: diagnosed, not refused at make())", () => {
+      const GsiConsistentOrder = Aggregate.make(Order, {
+        ...baseAggregateConfig,
+        table: AltTable,
+        collection: { index: "gsi2", name: "order", sk: { field: "gsi2sk", composite: [] } },
+        consistentRead: true,
+      })
+      const AltLayer = Layer.merge(TestDynamoClient, AltTable.layer({ name: "alt-table" }))
+      const rejectConsistentGsi = () =>
+        mockQuery.mockRejectedValueOnce(
+          awsValidationException("Consistent read cannot be true when querying a GSI"),
+        )
+
+      it.effect(
+        "sends the consistent read; DynamoDB's rejection names the aggregate and index",
+        () =>
+          Effect.gen(function* () {
+            rejectConsistentGsi()
+            const error = yield* GsiConsistentOrder.get({ id: "o-1" }).pipe(Effect.flip)
+            expect(error._tag).toBe("ValidationError")
+            const failure = error as ValidationError
+            expect(failure.entityType).toBe("OrderRoot")
+            expect(failure.operation).toBe("get.consistentRead")
+            const text = String(failure.cause)
+            expect(text).toContain('Aggregate "OrderRoot" get:')
+            expect(text).toContain('index "gsi2" is a global secondary index')
+            expect(text).toContain("Drop `consistentRead` from the aggregate")
+            expect(mockQuery.mock.calls[0]![0]).toMatchObject({
+              IndexName: "gsi2",
+              ConsistentRead: true,
+            })
+          }).pipe(Effect.provide(AltLayer)),
+      )
+
+      it.effect("delete's read keeps DynamoDB's tag (its union has no ValidationError)", () =>
+        Effect.gen(function* () {
+          rejectConsistentGsi()
+          const error = yield* GsiConsistentOrder.delete({ id: "o-1" }).pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoValidationError")
+          expect(String((error as DynamoValidationError).cause)).toContain(
+            'Aggregate "OrderRoot" delete:',
+          )
+        }).pipe(Effect.provide(AltLayer)),
+      )
+
+      it.effect("another rejection passes through unchanged", () =>
+        Effect.gen(function* () {
+          const original = awsValidationException("Some other problem")
+          mockQuery.mockRejectedValueOnce(original)
+          const error = yield* GsiConsistentOrder.get({ id: "o-1" }).pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).cause).toBe(original)
+        }).pipe(Effect.provide(AltLayer)),
+      )
     })
   })
 

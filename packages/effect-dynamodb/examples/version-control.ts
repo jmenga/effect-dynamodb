@@ -320,6 +320,10 @@ const program = Effect.gen(function* () {
   })
 
   // --- Setup: create table ---
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* db.tables["vcs-table"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
   yield* db.tables["vcs-table"]!.create()
 
   // --- Seed data ---
@@ -421,7 +425,7 @@ const program = Effect.gen(function* () {
     repoOwner: "octocat",
     repoName: "hello-world",
     issueNumber: "3",
-  }).set({ status: "Closed", username: "torvalds" })
+  }).set({ status: "Closed" })
   assertEq(closedIssue.status, "Closed", "closed issue status")
   assertEq(closedIssue.subject, "Enhancement: Add CI pipeline", "closed issue preserves subject")
   // #endregion
@@ -449,7 +453,7 @@ const program = Effect.gen(function* () {
     repoOwner: "octocat",
     repoName: "hello-world",
     pullRequestNumber: "2",
-  }).set({ status: "Closed", username: "octocat" })
+  }).set({ status: "Closed" })
   assertEq(closedPR.status, "Closed", "closed PR status")
   assertEq(closedPR.subject, "Add CONTRIBUTING.md", "closed PR preserves subject")
   // #endregion
@@ -623,10 +627,7 @@ const AppLayer = Layer.mergeAll(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("\nFailed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
 
 export {

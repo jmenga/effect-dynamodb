@@ -318,6 +318,10 @@ const program = Effect.gen(function* () {
   yield* Console.log("=== Aggregates & Relational Patterns ===\n")
 
   // --- Create table (GSI only — the aggregate assembles off the base table) ---
+  // Start clean: drop the table a failed earlier run may have left behind
+  yield* client
+    .deleteTable({ TableName: tableConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
     BillingMode: "PAY_PER_REQUEST",
@@ -681,8 +685,5 @@ const AppLayer = Layer.merge(
 
 const main = program.pipe(Effect.provide(AppLayer))
 
-Effect.runPromise(main).then(
-  () => console.log("\nDone."),
-  (err) => console.error("Failed:", err),
-)
+Effect.runPromise(main).then(() => console.log("\nDone."))
 // #endregion
