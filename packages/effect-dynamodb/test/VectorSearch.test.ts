@@ -35,6 +35,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
+import { DynamoError, DynamoValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -1551,6 +1552,215 @@ describe("DynamoClient.make embedder validation", () => {
         Layer.mergeAll(
           Layer.succeed(DynamoClient, makeMockClient(capture)),
           MainTable.layer({ name: "test-table" }),
+        ),
+      ),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 7. Vector-index limits are DynamoDB's to enforce (#144)
+// ---------------------------------------------------------------------------
+
+describe("vector-index limits: sent, and DynamoDB's rejection diagnosed (#144)", () => {
+  // DynamoDB Local has no vector indexes, and AWS documents the quotas (18
+  // inline filters per index, 5 vector indexes per table — adjustable) but not
+  // the wording of their rejection: these pin the recogniser with mocked
+  // rejections only.
+  class Wide extends Schema.Class<Wide>("Wide")({
+    wideId: Schema.String,
+    description: Schema.String,
+    ...Object.fromEntries(Array.from({ length: 19 }, (_, i) => [`f${i}`, Schema.String] as const)),
+  }) {}
+  const WideFilters = Entity.make({
+    model: Wide,
+    entityType: "WideFilters",
+    primaryKey: {
+      pk: { field: "pk", composite: ["wideId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    vectorIndexes: {
+      byDescription: {
+        name: "vecw",
+        dimensions: DIMENSIONS,
+        source: { fields: ["description"] },
+        filters: Array.from({ length: 19 }, (_, i) => `f${i}`) as never,
+      },
+    },
+  })
+  const ManyIndexes = Entity.make({
+    model: Wide,
+    entityType: "ManyIndexes",
+    primaryKey: {
+      pk: { field: "pk", composite: ["wideId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    vectorIndexes: Object.fromEntries(
+      Array.from({ length: 6 }, (_, i) => [
+        `by${i}`,
+        { name: `vecm${i}`, dimensions: DIMENSIONS, source: { fields: ["description"] } },
+      ]),
+    ) as never,
+  })
+
+  it("over-limit declarations are defined, not refused: the table is DynamoDB's to judge", () => {
+    const WideTable = Table.make({ schema: AppSchema, entities: { WideFilters } })
+    const ManyTable = Table.make({ schema: AppSchema, entities: { ManyIndexes } })
+    const wide = Table.definition(WideTable as unknown as Table.Table).VectorIndexes!
+    expect(
+      wide[0]!.SearchSchema!.filter((e) => e.SearchSchemaElementType === "INLINE_FILTER"),
+    ).toHaveLength(19)
+    expect(Table.definition(ManyTable as unknown as Table.Table).VectorIndexes).toHaveLength(6)
+  })
+
+  const tableClient = (fail: (operation: string) => unknown, existing = 0) =>
+    mockDynamoClientLayer({
+      createTable: () => Effect.fail(fail("CreateTable") as never),
+      updateTable: () => Effect.fail(fail("UpdateTable") as never),
+      describeTable: () =>
+        Effect.succeed({
+          Table: {
+            VectorIndexes: Array.from({ length: existing }, (_, i) => ({
+              IndexName: `vecm${i}`,
+            })),
+          },
+        } as never),
+    })
+  const validation = (operation: string, message: string) =>
+    new DynamoValidationError({
+      operation,
+      cause: Object.assign(new Error(message), { name: "ValidationException" }),
+    })
+
+  it.effect("CreateTable: too many inline filters names the index and its sharers", () => {
+    const WideTable = Table.make({ schema: AppSchema, entities: { WideFilters } })
+    let original: unknown
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { WideFilters },
+        tables: { WideTable },
+        embedder: { dimensions: DIMENSIONS, embed: () => Effect.succeed([1, 0, 0, 0]) },
+      })
+      const error = yield* db.tables.WideTable.create().pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoValidationError")
+      const text = String(error.cause)
+      expect(text).toContain('DynamoDB rejected vector index "vecw": it declares 19 INLINE_FILTER')
+      expect(text).toContain("(WideFilters)")
+      expect(text).toContain("The table was not created.")
+      expect((error.cause as Error).cause).toBe(original)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          tableClient((operation) => {
+            original = validation(
+              operation,
+              "One or more parameter values were invalid: vector index exceeds the maximum " +
+                "number of INLINE_FILTER attributes",
+            )
+            return original
+          }),
+          WideTable.layer({ name: "wide-table" }),
+        ),
+      ),
+    )
+  })
+
+  it.effect(
+    "addVectorIndex: a vector-index quota rejection keeps its tag and names the index",
+    () => {
+      const ManyTable = Table.make({ schema: AppSchema, entities: { ManyIndexes } })
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ManyIndexes },
+          tables: { ManyTable },
+          embedder: { dimensions: DIMENSIONS, embed: () => Effect.succeed([1, 0, 0, 0]) },
+        })
+        const error = yield* db.tables.ManyTable.addVectorIndex("vecm5").pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        const text = String(error.cause)
+        expect(text).toContain('adding vector index "vecm5" (ManyIndexes)')
+        expect(text).toContain("the table already has 5 vector indexes")
+        expect(text).toContain("declare 6 in all")
+        expect(text).toContain("adjustable through AWS Service Quotas")
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            tableClient(
+              (operation) =>
+                new DynamoError({
+                  operation,
+                  cause: Object.assign(new Error("Vector index limit exceeded for the table"), {
+                    name: "LimitExceededException",
+                  }),
+                }),
+              5,
+            ),
+            ManyTable.layer({ name: "many-table" }),
+          ),
+        ),
+      )
+    },
+  )
+
+  it.effect(
+    "addVectorIndex: a concurrent-creation limit, or a quota with room left, passes through",
+    () => {
+      const ManyTable = Table.make({ schema: AppSchema, entities: { ManyIndexes } })
+      const concurrent = new DynamoError({
+        operation: "UpdateTable",
+        cause: Object.assign(
+          new Error(
+            "Subscriber limit exceeded: Only 1 vector index can be created or deleted " +
+              "simultaneously per table",
+          ),
+          { name: "LimitExceededException" },
+        ),
+      })
+      const quota = new DynamoError({
+        operation: "UpdateTable",
+        cause: Object.assign(new Error("Vector index limit exceeded for the table"), {
+          name: "LimitExceededException",
+        }),
+      })
+      const run = (original: unknown, existing: number) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { ManyIndexes },
+            tables: { ManyTable },
+            embedder: { dimensions: DIMENSIONS, embed: () => Effect.succeed([1, 0, 0, 0]) },
+          })
+          return yield* db.tables.ManyTable.addVectorIndex("vecm1").pipe(Effect.flip)
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              tableClient(() => original, existing),
+              ManyTable.layer({ name: "many-table" }),
+            ),
+          ),
+        )
+      return Effect.gen(function* () {
+        expect(yield* run(concurrent, 1)).toBe(concurrent)
+        expect(yield* run(quota, 1)).toBe(quota)
+      })
+    },
+  )
+
+  it.effect("an unrelated rejection passes through unchanged", () => {
+    const WideTable = Table.make({ schema: AppSchema, entities: { WideFilters } })
+    const original = validation("CreateTable", "One or more parameter values were invalid")
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { WideFilters },
+        tables: { WideTable },
+        embedder: { dimensions: DIMENSIONS, embed: () => Effect.succeed([1, 0, 0, 0]) },
+      })
+      const error = yield* db.tables.WideTable.create().pipe(Effect.flip)
+      expect(error).toBe(original)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          tableClient(() => original),
+          WideTable.layer({ name: "wide-table" }),
         ),
       ),
     )

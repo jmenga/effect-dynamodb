@@ -29,9 +29,17 @@ export const MIN_TOP_K = 1
 export const MAX_TOP_K = 100
 /** Default `TopK` applied when `.topK()` is not called. */
 export const DEFAULT_TOP_K = 10
-/** Maximum `INLINE_FILTER` attributes per vector index. */
+/**
+ * Maximum `INLINE_FILTER` attributes per vector index (AWS quota, not
+ * adjustable). Not pre-checked: DynamoDB rejects an index over it, and the
+ * rejection is diagnosed against the request (#144).
+ */
 export const MAX_INLINE_FILTERS = 18
-/** Maximum vector indexes per physical table. */
+/**
+ * Vector indexes per physical table — AWS's DEFAULT quota, which AWS Support
+ * can raise. Not pre-checked: DynamoDB rejects a table over the account's
+ * quota, and the rejection is diagnosed against the request (#144).
+ */
 export const MAX_VECTOR_INDEXES_PER_TABLE = 5
 
 // ---------------------------------------------------------------------------
@@ -376,14 +384,6 @@ export const validateVectorIndexes = (params: {
     checkFields("partition", definition.partition)
     checkFields("filters", definition.filters)
 
-    if (definition.filters.length > MAX_INLINE_FILTERS) {
-      throw new Error(
-        `[EDD-9032] Entity "${entityType}": vector index "${logicalName}" declares ` +
-          `${definition.filters.length} filters. DynamoDB allows at most ${MAX_INLINE_FILTERS} ` +
-          `INLINE_FILTER attributes per vector index.`,
-      )
-    }
-
     const duplicateFilter = definition.filters.find(
       (field, i) => definition.filters.indexOf(field) !== i,
     )
@@ -403,13 +403,6 @@ export const validateVectorIndexes = (params: {
       )
     }
     seenPhysical.set(definition.index, logicalName)
-  }
-
-  if (seenPhysical.size > MAX_VECTOR_INDEXES_PER_TABLE) {
-    throw new Error(
-      `[EDD-9034] Entity "${entityType}" declares ${seenPhysical.size} vector indexes. ` +
-        `DynamoDB allows at most ${MAX_VECTOR_INDEXES_PER_TABLE} per table.`,
-    )
   }
 }
 

@@ -96,6 +96,7 @@ import {
   parseSimpleShorthand,
   toExpr,
 } from "./internal/Expr.js"
+import { countOperators, expressionFits } from "./internal/ExpressionLimits.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import {
   freshIncarnationToken,
@@ -399,62 +400,8 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
   readonly input: unknown
 }> {}
 
-/** DynamoDB's limits on one expression: its length, and its operators + functions. */
-const EXPRESSION_LIMIT = 4096
-const OPERATOR_LIMIT = 300
-
-/**
- * The tokens of a compiled expression. Names and values are placeholders
- * (`#…`, `:…`), so no operator can hide inside one.
- */
-const EXPRESSION_TOKEN = /#\w+|:\w+|<>|<=|>=|[=<>()+\-,.[\]]|[A-Za-z_]\w*|\d+/g
-
-/**
- * The operators DynamoDB counts against an expression's 300 (#133), measured
- * against DynamoDB: in a condition, each comparison (`=`, `<>`, `<`, `<=`,
- * `>`, `>=`), `AND` / `OR` / `NOT`, `BETWEEN` (whose own `AND` is part of it,
- * not another operator), `IN`, and each function; in an update, each `+` /
- * `-` and each function (`if_not_exists`, `list_append`) — a `SET` clause's
- * `=` is not an operator.
- */
-/** @internal */
-export const countOperators = (expression: string, kind: "condition" | "update"): number => {
-  const tokens = expression.match(EXPRESSION_TOKEN) ?? []
-  let count = 0
-  let betweens = 0
-  for (const [i, token] of tokens.entries()) {
-    const word = token.toUpperCase()
-    const isFunction = /^[A-Za-z_]\w*$/.test(token) && tokens[i + 1] === "("
-    if (kind === "update") {
-      if (token === "+" || token === "-" || isFunction) count++
-      continue
-    }
-    if (isFunction) count++
-    else if (["=", "<>", "<", "<=", ">", ">="].includes(token)) count++
-    else if (word === "BETWEEN") {
-      count++
-      betweens++
-    } else if (word === "AND" && betweens > 0) betweens--
-    else if (word === "AND" || word === "OR" || word === "NOT" || word === "IN") count++
-  }
-  return count
-}
-
-/** What DynamoDB counts against an expression's limits. */
-const expressionCost = (
-  expression: string | undefined,
-  kind: "condition" | "update" = "condition",
-): { readonly length: number; readonly operators: number } =>
-  expression === undefined
-    ? { length: 0, operators: 0 }
-    : { length: expression.length, operators: countOperators(expression, kind) }
-const expressionFits = (
-  expression: string,
-  kind: "condition" | "update" = "condition",
-): boolean => {
-  const cost = expressionCost(expression, kind)
-  return cost.length <= EXPRESSION_LIMIT && cost.operators <= OPERATOR_LIMIT
-}
+/** @internal Re-exported for tests: what DynamoDB counts against an expression's 300 operators. */
+export { countOperators }
 
 const bytesKey = (bytes: Uint8Array): string => Array.from(bytes).join(",")
 
@@ -2562,8 +2509,16 @@ const makeImpl = <
   ]
   const entityRangeKeys = (): ReadonlyArray<string> => rangeKeysOf(config.indexes)
 
-  /** Diagnose a rejected single-item write (`PutItem` / `UpdateItem` / `DeleteItem`). */
-  const diagnoseItemWrite = (operation: string, item: TransactWriteItem) =>
+  /**
+   * Diagnose a rejected single-item write (`PutItem` / `UpdateItem` /
+   * `DeleteItem`). `callerCondition`: the caller's own `.condition()` within
+   * the write's condition, to say how much of an over-long one is theirs.
+   */
+  const diagnoseItemWrite = (
+    operation: string,
+    item: TransactWriteItem,
+    callerCondition?: () => string | undefined,
+  ) =>
     diagnoseFailure({
       sent: () => ({
         _tag: "Item",
@@ -2575,6 +2530,7 @@ const makeImpl = <
             entityType,
             () => `the ${entityType} ${operation}`,
           )[0]!,
+        callerCondition,
       }),
       rangeKeys: entityRangeKeys,
       rewrite: (diagnosis, original) =>
@@ -2585,7 +2541,12 @@ const makeImpl = <
    * Diagnose a rejected `TransactWriteItems` of this entity's write: over 100
    * items is `TransactionOverflow`, every other limit `ValidationError`.
    */
-  const diagnoseTransactionWrite = (operation: string, items: ReadonlyArray<TransactWriteItem>) =>
+  const diagnoseTransactionWrite = (
+    operation: string,
+    items: ReadonlyArray<TransactWriteItem>,
+    /** The caller's own `.condition()` within the first item's (its main write's) condition. */
+    callerCondition?: () => string | undefined,
+  ) =>
     diagnoseFailure({
       sent: () => ({
         _tag: "Transaction",
@@ -2594,6 +2555,7 @@ const makeImpl = <
           targetsFor(items, entityKeyFields(), entityType, (index) =>
             index === 0 ? "the item" : `item ${index} of the ${operation} transaction`,
           ),
+        callerCondition: (index: number) => (index === 0 ? callerCondition?.() : undefined),
       }),
       rangeKeys: entityRangeKeys,
       rewrite: (diagnosis, original): TransactionOverflow | ValidationError =>
@@ -3472,30 +3434,6 @@ const makeImpl = <
     return new ConditionalCheckFailed({ entityType, key })
   }
 
-  /**
-   * A condition the library sends — its own guard plus the user's
-   * `.condition()` — that exceeds DynamoDB's limits on one expression (4 KB,
-   * 300 operators and functions): refused BEFORE writing (#133).
-   */
-  const oversizedCondition = (
-    operation: string,
-    condition: string | undefined,
-    user: string | undefined,
-  ): ValidationError | undefined => {
-    if (condition === undefined || expressionFits(condition)) return undefined
-    const own = expressionCost(user)
-    return new ValidationError({
-      entityType,
-      operation,
-      cause:
-        `The ${operation}'s condition is ${expressionCost(condition).length} characters / ` +
-        `${expressionCost(condition).operators} operators — beyond DynamoDB's limits on one ` +
-        `expression (${EXPRESSION_LIMIT} characters, ${OPERATOR_LIMIT} operators). The ` +
-        `.condition() alone is ${own.length} characters / ${own.operators} operators, and ` +
-        "the library's own guard needs room beside it: simplify the condition.",
-    })
-  }
-
   /** The domain field a stored attribute holds (`storedAs` renames reversed). */
   const domainNameOf = (attr: string): string =>
     Object.keys(data.modelFields as object).find((field) => resolveDbName(field) === attr) ?? attr
@@ -3508,21 +3446,21 @@ const makeImpl = <
    * absent). `"item"` means the whole item — a tombstone copies all of it —
    * so every stored attribute is guarded, plus every attribute the entity
    * knows of that was absent; an item too wide for that falls back to the
-   * strongest guard within DynamoDB's expression limit (never a refusal).
+   * strongest guard within DynamoDB's expression limit (never a refusal). A
+   * guard that cannot fit beside `others` at all is sent as it is: DynamoDB
+   * rejects the expression, and the rejection is diagnosed (#144).
    */
   const deleteGuard = (
     read: globalThis.Record<string, AttributeValue>,
     dependsOn: "item" | ReadonlyArray<string>,
     /** The rest of the condition, ANDed with the guard (the user's, …). */
     others: string | undefined,
-  ):
-    | {
-        readonly expression: string
-        readonly names: globalThis.Record<string, string>
-        readonly values: globalThis.Record<string, AttributeValue>
-        readonly inputs: ReadonlyArray<string>
-      }
-    | ValidationError => {
+  ): {
+    readonly expression: string
+    readonly names: globalThis.Record<string, string>
+    readonly values: globalThis.Record<string, AttributeValue>
+    readonly inputs: ReadonlyArray<string>
+  } => {
     // Whether a guard fits beside `others` within DynamoDB's real limits.
     const fits = (guard: string) =>
       expressionFits(others === undefined || others === "" ? guard : `${guard} AND (${others})`)
@@ -3543,13 +3481,10 @@ const makeImpl = <
       }
       const incarnation = incarnationGuard(read, names, values)
       if (incarnation !== undefined) parts.push(incarnation)
-      const expression = parts.join(" AND ")
-      if (!fits(expression)) return tooLargeBeside(expression)
-      return { expression, names, values, inputs: [] }
+      return { expression: parts.join(" AND "), names, values, inputs: [] }
     }
     names["#dpk"] = pkField
     parts.push("attribute_exists(#dpk)")
-    if (!fits(parts.join(" AND "))) return tooLargeBeside(parts.join(" AND "))
     const attrs =
       dependsOn === "item"
         ? [
@@ -3604,16 +3539,6 @@ const makeImpl = <
       inputs.push(attr)
     }
     return { expression, names, values, inputs }
-
-    function tooLargeBeside(guard: string): ValidationError {
-      return (
-        oversizedCondition(
-          "write",
-          others === undefined || others === "" ? guard : `${guard} AND (${others})`,
-          others,
-        ) ?? new ValidationError({ entityType, operation: "write", cause: "condition too large" })
-      )
-    }
   }
 
   /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
@@ -4358,13 +4283,12 @@ const makeImpl = <
               inputs: [] as ReadonlyArray<string>,
             }
           : deleteGuard(current, uniqueAttrs, userCondition?.expression)
-      if (guard instanceof ValidationError) return yield* guard
       const mainValues = { ...guard.values, ...userCondition?.values }
+      // Sent as built: a condition over DynamoDB's expression limits is
+      // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
       const mainCondition = userCondition
         ? `${guard.expression} AND (${userCondition.expression})`
         : guard.expression
-      const tooLarge = oversizedCondition(args.operation, mainCondition, userCondition?.expression)
-      if (tooLarge !== undefined) return yield* tooLarge
 
       const items: Array<TransactWriteItem> = [
         {
@@ -4604,8 +4528,16 @@ const makeImpl = <
           }),
           // Terminal: a diagnosed limit is never retried as a lost race.
           plan.items.length === 1
-            ? diagnoseItemWrite(args.operation, plan.items[0]!)
-            : diagnoseTransactionWrite(args.operation, plan.items),
+            ? diagnoseItemWrite(
+                args.operation,
+                plan.items[0]!,
+                () => args.userCondition?.expression,
+              )
+            : diagnoseTransactionWrite(
+                args.operation,
+                plan.items,
+                () => args.userCondition?.expression,
+              ),
         )
         if (verdict === undefined) return plan
         switch (verdict._tag) {
@@ -5947,12 +5879,10 @@ const makeImpl = <
         // versioned (exact), otherwise under the strongest guard that fits —
         // the same fallback a wide soft delete uses.
         const wide = !expressionFits(updateExpression, "update")
-        const wideGuardOrRefusal =
+        const wideGuard =
           wide && !systemFields.version
             ? deleteGuard(currentItem, "item", condParts.slice(1).join(" AND "))
             : undefined
-        if (wideGuardOrRefusal instanceof ValidationError) return yield* wideGuardOrRefusal
-        const wideGuard = wideGuardOrRefusal
         const putCondition =
           wideGuard === undefined
             ? condParts.join(" AND ")
@@ -5970,14 +5900,8 @@ const makeImpl = <
           ...(Object.keys(putValues).length > 0 && { ExpressionAttributeValues: putValues }),
           ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
         }
-        const tooLarge = oversizedCondition(
-          "update",
-          wide ? putCondition : mainUpdate.ConditionExpression,
-          userCond !== undefined
-            ? compileCondition(userCond, resolveDbName)?.expression
-            : undefined,
-        )
-        if (tooLarge !== undefined) return yield* tooLarge
+        // A condition over DynamoDB's expression limits is sent as built:
+        // DynamoDB rejects it, and the rejection is diagnosed (#144).
         // The stored attributes the rejection compares: the guarded inputs,
         // and on the wide fallback whatever else its guard covered.
         const guardedAttrs = [
@@ -6070,7 +5994,11 @@ const makeImpl = <
               Effect.mapError((err) =>
                 isAwsConditionalCheckFailed(err.cause) ? recordRejected(err.cause.Item) : err,
               ),
-              diagnoseItemWrite("update", wide ? { Put: mainPut } : { Update: mainUpdate }),
+              diagnoseItemWrite(
+                "update",
+                wide ? { Put: mainPut } : { Update: mainUpdate },
+                () => uc?.expression,
+              ),
             ),
           )
           oldImage = result.Attributes ?? currentItem
@@ -6206,7 +6134,7 @@ const makeImpl = <
                   return err
                 },
               ),
-              diagnoseTransactionWrite("update", transactItems),
+              diagnoseTransactionWrite("update", transactItems, () => uc?.expression),
             ),
           )
         }
@@ -6854,17 +6782,9 @@ const makeImpl = <
         const incarnation = incarnationGuard(casRead.raw, names, values)
         if (incarnation !== undefined) condParts.push(incarnation)
       }
+      // Sent as built: a condition over DynamoDB's expression limits is
+      // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
       const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
-      {
-        const tooLarge = oversizedCondition(
-          "update",
-          conditionExpression,
-          sentCond !== undefined
-            ? compileCondition(sentCond, resolveDbName)?.expression
-            : undefined,
-        )
-        if (tooLarge !== undefined) return yield* tooLarge
-      }
 
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
@@ -6897,14 +6817,6 @@ const makeImpl = <
           const incarnation = incarnationGuard(snapshot.raw, names, values)
           if (incarnation !== undefined) guardParts.push(incarnation)
         }
-        const tooLarge = oversizedCondition(
-          "update",
-          guardParts.join(" AND "),
-          sentCond !== undefined
-            ? compileCondition(sentCond, resolveDbName)?.expression
-            : undefined,
-        )
-        if (tooLarge !== undefined) return yield* tooLarge
         const transactItems = [
           {
             Update: {
@@ -6954,7 +6866,7 @@ const makeImpl = <
               return err
             },
           ),
-          diagnoseTransactionWrite("update", transactItems),
+          diagnoseTransactionWrite("update", transactItems, () => uc?.expression),
         )
         // A transacted Update returns no attributes. The old item is exact:
         // the version condition proves `snapshot.raw` is what it replaced.
@@ -7053,9 +6965,11 @@ const makeImpl = <
             return err
           },
         ),
-        diagnoseItemWrite("update", {
-          Update: updateInput as NonNullable<TransactWriteItem["Update"]>,
-        }),
+        diagnoseItemWrite(
+          "update",
+          { Update: updateInput as NonNullable<TransactWriteItem["Update"]> },
+          () => uc?.expression,
+        ),
       )
 
       // A cascade never meets an old-image mode here: that combination is
@@ -7373,7 +7287,6 @@ const makeImpl = <
                 // into them (#133).
                 yield* checkVersion(result.Item, "delete")
                 const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
-                if (softGuard instanceof ValidationError) return yield* softGuard
 
                 const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
                 // Clock-backed time source; `now` is the ISO timestamp used for the
@@ -7484,7 +7397,13 @@ const makeImpl = <
                   softGuard.inputs,
                   snapshotAt,
                   releases,
-                ).pipe(diagnoseTransactionWrite("delete", transactItems))
+                ).pipe(
+                  diagnoseTransactionWrite(
+                    "delete",
+                    transactItems,
+                    () => userCondition?.expression,
+                  ),
+                )
                 return result.Item
               } else {
                 // --- Hard delete with unique constraints and/or retained history ---
@@ -7552,7 +7471,6 @@ const makeImpl = <
                     : [],
                   userCondition?.expression,
                 )
-                if (hardGuard instanceof ValidationError) return yield* hardGuard
 
                 const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
 
@@ -7604,7 +7522,13 @@ const makeImpl = <
                   hardGuard.inputs,
                   snapshotAt,
                   releases,
-                ).pipe(diagnoseTransactionWrite("delete", transactItems))
+                ).pipe(
+                  diagnoseTransactionWrite(
+                    "delete",
+                    transactItems,
+                    () => userCondition?.expression,
+                  ),
+                )
                 return result.Item
               }
             })
@@ -8682,7 +8606,6 @@ const makeImpl = <
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
-        globalIndex: indexDef.index !== undefined,
         pkField: indexDef.pk.field,
         pkValue,
         skField: indexDef.sk.field,
@@ -9445,7 +9368,10 @@ const makeImpl = <
                   diagnosedValidationError(diagnosis, original, {
                     operation: "purge",
                     entityType,
-                    partial: true,
+                    committed:
+                      i === 0
+                        ? "the purge had deleted none of the partition's items before it"
+                        : `the purge had already deleted ${i} of the partition's ${allItems.length} items`,
                   }),
               }),
             )

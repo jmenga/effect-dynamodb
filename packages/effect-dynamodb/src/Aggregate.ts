@@ -74,6 +74,7 @@ import {
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import {
+  type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
   transactItemTarget,
@@ -3264,29 +3265,12 @@ function writeTransactionGroups(
   rootGuard?: RootGuard,
 ): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed> {
   return Effect.gen(function* () {
-    // Validate ALL group sizes BEFORE writing any group. Each group is its own
-    // transaction (DynamoDB: 100 items per TransactWriteItems), and the per-group
-    // count now spans Puts AND Deletes together — so an `update` that both adds and
-    // removes many edges roughly doubles the count. Checking up front means an
-    // oversized later group fails fast instead of partially committing earlier ones.
-    //
-    // Kept under the #144 standard (no pre-checks of limits DynamoDB enforces):
-    // DynamoDB judges one group at a time, so only this check can stop earlier
-    // groups committing when a later one is too large — an invariant across
-    // transactions, not a mirror of DynamoDB's. Each group's own rejection (its
-    // size, its sort keys) is diagnosed below.
-    for (const group of groups) {
-      const itemCount = group.puts.length + group.deletes.length
-      if (itemCount > 100) {
-        return yield* new AggregateTransactionOverflow({
-          aggregate: aggregateName,
-          subgraph: group.group,
-          itemCount,
-          limit: 100,
-        })
-      }
-    }
-
+    // Each group is its own transaction (DynamoDB: 100 items per
+    // TransactWriteItems, Puts AND Deletes together). DynamoDB's limits are
+    // not pre-checked (#144): a group over one is sent, rejected whole, and
+    // diagnosed — naming the sub-aggregates earlier groups already committed,
+    // since a multi-group write was never atomic.
+    const committed: Array<string> = []
     for (const [groupIndex, group] of groups.entries()) {
       // Each group is one transaction — Puts AND Deletes applied atomically, so an
       // edge add and a sibling edge removal in the same sub-aggregate commit together.
@@ -3315,7 +3299,57 @@ function writeTransactionGroups(
         ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
       ]
 
+      // Named once, for both diagnoses below.
+      const sent = () => ({
+        _tag: "Transaction" as const,
+        items: transactItems,
+        targets: () =>
+          transactItems.map((item) => {
+            const entityType = item.Put?.Item?.__edd_e__?.S ?? aggregateName
+            return transactItemTarget(
+              item,
+              tableName,
+              [keys.pkField, "sk"],
+              entityType,
+              `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
+                `sub-aggregate "${group.group}"`,
+            )
+          }),
+      })
+      const already = [...committed]
+      const diagnosed = (
+        diagnosis: Diagnosis,
+        original: unknown,
+      ): AggregateTransactionOverflow | ValidationError =>
+        diagnosis._tag === "TooManyItems"
+          ? new AggregateTransactionOverflow({
+              aggregate: aggregateName,
+              subgraph: group.group,
+              itemCount: diagnosis.count,
+              limit: diagnosis.limit,
+              committed: already,
+              cause: original,
+            })
+          : diagnosedValidationError(diagnosis, original, {
+              operation: `Aggregate.write(${aggregateName})`,
+              entityType: aggregateName,
+              // Each group commits on its own: say exactly what already did.
+              ...(already.length > 0 && {
+                committed:
+                  `earlier transactions of this write already committed sub-aggregates ` +
+                  already.map((name) => `"${name}"`).join(", ") +
+                  (rootGuard !== undefined
+                    ? ", so a retried create fails on the existing root: update or delete " +
+                      "the partial aggregate instead"
+                    : ""),
+              }),
+            })
+
       yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+        // One operation per item (#144): diagnosed BEFORE the root guard's
+        // mapping, which would read a repeat's conditional failure as an
+        // existing root.
+        diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite: diagnosed }),
         Effect.mapError((error) => {
           if (
             error.cause != null &&
@@ -3349,41 +3383,9 @@ function writeTransactionGroups(
         }),
         // A limit DynamoDB enforced (#144), named — after the root guard's
         // mapping, which a conditional failure always takes.
-        diagnoseFailure({
-          sent: () => ({
-            _tag: "Transaction",
-            items: transactItems,
-            targets: () =>
-              transactItems.map((item) => {
-                const entityType = item.Put?.Item?.__edd_e__?.S ?? aggregateName
-                return transactItemTarget(
-                  item,
-                  tableName,
-                  [keys.pkField, "sk"],
-                  entityType,
-                  `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
-                    `sub-aggregate "${group.group}"`,
-                )
-              }),
-          }),
-          rangeKeys: () => keys.rangeKeys,
-          rewrite: (diagnosis, original): AggregateTransactionOverflow | ValidationError =>
-            diagnosis._tag === "TooManyItems"
-              ? new AggregateTransactionOverflow({
-                  aggregate: aggregateName,
-                  subgraph: group.group,
-                  itemCount: diagnosis.count,
-                  limit: diagnosis.limit,
-                  cause: original,
-                })
-              : diagnosedValidationError(diagnosis, original, {
-                  operation: `Aggregate.write(${aggregateName})`,
-                  entityType: aggregateName,
-                  // Each group commits on its own: earlier ones may be written.
-                  partial: groupIndex > 0,
-                }),
-        }),
+        diagnoseFailure({ sent, rangeKeys: () => keys.rangeKeys, rewrite: diagnosed }),
       )
+      committed.push(group.group)
     }
   })
 }

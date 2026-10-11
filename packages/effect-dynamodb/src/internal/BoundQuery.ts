@@ -250,8 +250,9 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A>
 
   /**
-   * Enable consistent reads. Refused with a `ValidationError` when it runs on
-   * a GSI, which DynamoDB reads only eventually consistently.
+   * Enable consistent reads. DynamoDB rejects them on a GSI, which it reads
+   * only eventually consistently: the query then fails with a
+   * `ValidationError` naming the index.
    */
   readonly consistentRead: () => BoundQuery<Model, SkRemaining, A>
 

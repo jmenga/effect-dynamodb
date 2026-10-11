@@ -170,6 +170,41 @@ export const DDB_TOO_MANY_ITEMS =
 export const ddbPayloadTooLarge = (bytes: number): string =>
   `Transaction payload size cannot exceed 4MB. Payload Size: ${bytes}`
 export const DDB_SORT_KEY_LOCAL = "One or more parameter values were invalid: Size limit exceeded"
+/** A table key over its size limit, on DynamoDB Local (single write, or a cancellation reason). */
+export const DDB_TABLE_KEY_SIZE_LOCAL =
+  "Hash primary key values must be under 2048 bytes, and range primary key values must be " +
+  "under 1024 bytes"
+/** Two operations on one item in a transaction (or `TransactGetItems`). */
+export const DDB_REPEATED_ITEM =
+  "Transaction request cannot include multiple operations on one item"
+/** Two requests for one item in a `BatchWriteItem` / `BatchGetItem`. */
+export const DDB_REPEATED_BATCH_ITEM = "Provided list of item keys contains duplicates"
+/** An expression over 4,096 characters (`kind`: Condition, Update, KeyCondition, …). */
+export const ddbExpressionTooLong = (kind: string, size?: number): string =>
+  `Invalid ${kind}Expression: Expression size has exceeded the maximum allowed size` +
+  (size === undefined ? "" : `; expression size: ${size}`)
+/** An expression over 300 operators. DynamoDB stops counting at 301. */
+export const ddbTooManyOperators = (kind: string): string =>
+  `Invalid ${kind}Expression: The expression contains too many operators; operator count: 301`
+/** An `IN` over 100 operands. */
+export const ddbTooManyInOperands = (kind: string, count: number): string =>
+  `Invalid ${kind}Expression: The IN operator is provided with too many operands; number of operands: ${count}`
+/** An empty key value: a table key's wording, then a secondary index key's. */
+export const ddbEmptyTableKey = (key: string): string =>
+  "One or more parameter values are not valid. The AttributeValue for a key attribute cannot " +
+  `contain an empty string value. Key: ${key}`
+export const ddbEmptyIndexKey = (index: string, key: string): string =>
+  "One or more parameter values are not valid. A value specified for a secondary index key is " +
+  "not supported. The AttributeValue for a key attribute cannot contain an empty string value. " +
+  `IndexName: ${index}, IndexKey: ${key}`
+/** A `BETWEEN` whose lower bound sorts after its upper bound. */
+export const ddbBetweenReversed = (low: string, high: string): string =>
+  "Invalid KeyConditionExpression: The BETWEEN operator requires upper bound to be greater than " +
+  `or equal to lower bound; lower bound operand: AttributeValue: {S:${low}}, upper bound ` +
+  `operand: AttributeValue: {S:${high}}`
+/** A consistent read of a GSI. */
+export const DDB_CONSISTENT_READ_GSI = "Consistent read cannot be true when querying a GSI"
+export const DDB_CONSISTENT_SCAN_GSI = "Consistent read cannot be true when scanning a GSI"
 export const DDB_SORT_KEY_AWS =
   "One or more parameter values were invalid: Aggregated size of all range keys has exceeded " +
   "the size limit of 1024 bytes"

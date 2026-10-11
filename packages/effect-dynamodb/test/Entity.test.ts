@@ -34,6 +34,7 @@ import {
   DDB_ITEM_SIZE_UPDATE,
   DDB_SORT_KEY_LOCAL,
   DDB_TOO_MANY_ITEMS,
+  ddbTooManyOperators,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
 
@@ -10447,6 +10448,10 @@ describe("Entity", () => {
     it.effect("errors from an upsert's create name the upsert", () =>
       Effect.gen(function* () {
         // Missing: the upsert creates — under a condition DynamoDB can't take.
+        // Sent as built (#144): DynamoDB rejects it, and the rejection is named.
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsValidationException(ddbTooManyOperators("Condition")),
+        )
         const error = yield* Guarded.upsert(user)
           .pipe(
             Guarded.condition((t: any, { or, eq }: any) =>
@@ -10456,7 +10461,12 @@ describe("Entity", () => {
           .asEffect()
           .pipe(Effect.flip)
         expect([error._tag, (error as any).operation]).toEqual(["ValidationError", "upsert"])
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        const text = String((error as any).cause)
+        expect(text).toMatch(/ConditionExpression of the item, .*: it holds \d+ operators/)
+        // The caller's part (319 operators) and the guard beside it, named.
+        expect(text).toContain("The .condition() alone is")
+        expect(text).toContain("319 operators")
+        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
   })

@@ -1,36 +1,63 @@
 /**
- * @internal Failure-time diagnosis of DynamoDB's write limits (#144).
+ * @internal Failure-time diagnosis of DynamoDB's rejections (#144).
  *
- * The library does not pre-check limits DynamoDB enforces itself — the 400 KB
- * item, the 4 MB and 100-item transaction, the 1024-byte sort key. It sends the
- * write; when DynamoDB rejects it, this module:
+ * The library does not pre-check limits or request rules DynamoDB enforces
+ * itself — the 400 KB item, the 4 MB and 100-item transaction, the 1024-byte
+ * sort key, one operation per item, the limits on one expression, an empty key
+ * value, a reversed `BETWEEN`, a consistent read of a GSI, a table's vector
+ * index limits. It sends the request; when DynamoDB rejects it, this module:
  *
  * 1. **recognises** the rejection by a stable fragment of its message (a
- *    request-wide `ValidationException`, or a `TransactionCanceledException`
- *    whose positional reason carries `Code: "ValidationError"`);
- * 2. **confirms** it by measuring the request the site sent — exactly (an item
- *    count, a key's UTF-8 bytes: confirmed only when over the limit) or, for
- *    DynamoDB's approximate item sizes, by checking the request holds
- *    something the message can apply to;
- * 3. **attributes** it to the culprit item, using the targets the site built.
+ *    request-wide `ValidationException` or `LimitExceededException`, or a
+ *    `TransactionCanceledException` whose positional reason carries
+ *    `Code: "ValidationError"`);
+ * 2. **confirms** it against the request the site sent — an item count, a
+ *    key's UTF-8 bytes, an expression's length or operators, two entries
+ *    naming one item, an empty key value, the order of two bounds (each
+ *    confirmed only when the request breaks the rule), or, for item and
+ *    transaction sizes, by checking the request holds something the message
+ *    can apply to and measuring it exactly (`ItemSize.ts`);
+ * 3. **attributes** it to the culprit, using the targets the site built.
  *
  * A site turns the {@link Diagnosis} into its own tagged error with
  * DynamoDB's error kept as the cause ({@link withCause}); anything
  * unrecognised or unconfirmed passes through unchanged. Nothing is measured,
  * and no target is built, unless DynamoDB has rejected the request.
+ *
+ * Every site goes through {@link diagnoseFailure}: writes ({@link SentWrite}),
+ * reads ({@link SentRead}) and table management ({@link SentTable}) share the
+ * one recognise / confirm / rewrite path.
  */
 
-import type { AttributeValue, TransactWriteItem, WriteRequest } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  TransactGetItem,
+  TransactWriteItem,
+  WriteRequest,
+} from "@aws-sdk/client-dynamodb"
 import {
   isAwsTransactionCancelled,
   isAwsValidationError,
   TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  MAX_INLINE_FILTERS,
+  MAX_VECTOR_INDEXES_PER_TABLE,
+} from "@effect-dynamodb/schema/VectorIndex.js"
 import { Effect } from "effect"
+import {
+  countOperators,
+  EXPRESSION_MAX_LENGTH,
+  EXPRESSION_MAX_OPERATORS,
+  expressionCost,
+  IN_MAX_OPERANDS,
+  largestInOperands,
+} from "./ExpressionLimits.js"
 import {
   attributeBytes,
   ITEM_MAX_BYTES,
+  itemBytes,
   TRANSACT_WRITE_MAX_BYTES,
   transactItemBytes,
 } from "./ItemSize.js"
@@ -57,17 +84,24 @@ export type TransactItemTarget = {
 /**
  * The target of a transact entry in `tableName`, keyed by `keyFields` (the
  * table's primary key attributes): read from a Put's item, or any other
- * entry's `Key`.
+ * entry's `Key` (a `TransactGetItems` entry's included).
  */
 export const transactItemTarget = (
-  item: TransactWriteItem,
+  item: TransactWriteItem | TransactGetItem,
   tableName: string,
   keyFields: ReadonlyArray<string>,
   entityType: string,
   source: string,
 ): TransactItemTarget => {
   const attributes: Record<string, AttributeValue> | undefined =
-    item.Put?.Item ?? item.Delete?.Key ?? item.Update?.Key ?? item.ConditionCheck?.Key
+    "Get" in item && item.Get !== undefined
+      ? item.Get.Key
+      : (() => {
+          const write = item as TransactWriteItem
+          return (
+            write.Put?.Item ?? write.Delete?.Key ?? write.Update?.Key ?? write.ConditionCheck?.Key
+          )
+        })()
   const parts = keyFields.map((field) => {
     const value = attributes?.[field]
     return { field, value, text: value?.S ?? value?.N ?? JSON.stringify(value ?? null) }
@@ -88,35 +122,93 @@ export const transactItemTarget = (
 // ---------------------------------------------------------------------------
 
 /**
- * What a site sent, as the diagnosis needs it. A single-item write is given
- * in its transact-entry form (`{ Put }`, `{ Update }`, `{ Delete }`); a batch
- * as its requests flattened to the same form ({@link batchEntries}). Targets
- * are thunks: built only once DynamoDB has rejected the request.
+ * What a writing site sent, as the diagnosis needs it. A single-item write is
+ * given in its transact-entry form (`{ Put }`, `{ Update }`, `{ Delete }`); a
+ * batch as its requests flattened to the same form ({@link batchEntries}).
+ * Targets are thunks: built only once DynamoDB has rejected the request.
+ *
+ * `callerCondition` is the caller's own `.condition()` on the entry at an
+ * index (the rest of its `ConditionExpression` is the library's guard), to
+ * say how much of an expression rejected for its size is the caller's.
  */
 export type SentWrite =
   | {
       readonly _tag: "Item"
       readonly item: TransactWriteItem
       readonly target: () => TransactItemTarget
+      readonly callerCondition?: (() => string | undefined) | undefined
     }
   | {
       readonly _tag: "Transaction"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
+      readonly callerCondition?: ((index: number) => string | undefined) | undefined
     }
   | {
       readonly _tag: "Batch"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
     }
-  | { readonly _tag: "TransactGet"; readonly count: number }
+  | {
+      readonly _tag: "TransactGet"
+      readonly count: number
+      /** The item each `Get` reads, to name a repeated one. */
+      readonly targets?: (() => ReadonlyArray<TransactItemTarget>) | undefined
+    }
+
+/** What a reading site sent: the `Query` / `Scan` request, as sent. */
+export type SentRead = {
+  readonly _tag: "Read"
+  readonly scan: boolean
+  readonly input: {
+    readonly IndexName?: string | undefined
+    readonly KeyConditionExpression?: string | undefined
+    readonly ExpressionAttributeNames?: Record<string, string> | undefined
+    readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+    readonly ConsistentRead?: boolean | undefined
+  }
+}
+
+/** A vector index as a `CreateTable` / `UpdateTable` request declares it. */
+export type SentVectorIndex = {
+  readonly IndexName?: string | undefined
+  readonly SearchSchema?:
+    | ReadonlyArray<{
+        readonly AttributeName?: string | undefined
+        readonly SearchSchemaElementType?: string | undefined
+      }>
+    | undefined
+}
+
+/** What a table-management site sent: the vector indexes of its request. */
+export type SentTable = {
+  readonly _tag: "Table"
+  readonly operation: "CreateTable" | "UpdateTable"
+  /** The vector indexes the request creates. */
+  readonly vectorIndexes: ReadonlyArray<SentVectorIndex>
+  /** The entities sharing a physical vector index, to name them. */
+  readonly sharers: (indexName: string) => ReadonlyArray<string>
+  /** How many vector indexes the table's entities declare in all. */
+  readonly declared: number
+  /**
+   * `UpdateTable` only: how many vector indexes the table had when DynamoDB
+   * rejected the request, read back (`DescribeTable`) after the rejection.
+   * The request shows only the index it adds, so a count rejection is
+   * confirmed only when these plus the request's exceed the limit; unknown
+   * (the read failed) means unconfirmed.
+   */
+  readonly existing?: number | undefined
+}
+
+/** Any request a site sent. */
+export type Sent = SentWrite | SentRead | SentTable
 
 /** A confirmed reading of DynamoDB's rejection, naming the culprit. */
 export type Diagnosis =
   | {
       readonly _tag: "ItemTooLarge"
       readonly target: TransactItemTarget
-      /** The item's size by the library's lower-bound count, when the request carries it. */
+      /** The item's exact size (`itemBytes`), when the request carries the item. */
       readonly bytes: number | undefined
       /** No item measures over the limit: this is the largest, named as the likely culprit. */
       readonly likely: boolean
@@ -126,7 +218,11 @@ export type Diagnosis =
       readonly _tag: "TransactionTooLarge"
       /** DynamoDB's `Payload Size`, when its message carries one. */
       readonly reported: number | undefined
-      /** The library's lower-bound total of the items sent. */
+      /**
+       * The request's exact size by the library's model (`transactItemBytes`
+       * summed). At or under the limit, the model disagrees with DynamoDB for
+       * this request — the error says so and gives both numbers.
+       */
       readonly measured: number
       /** The largest contributors, largest first (at most three). */
       readonly largest: ReadonlyArray<{
@@ -140,6 +236,79 @@ export type Diagnosis =
       readonly attribute: string
       readonly bytes: number
     }
+  | {
+      /** Two entries of one request target one item (DynamoDB allows one each). */
+      readonly _tag: "RepeatedItem"
+      readonly first: TransactItemTarget
+      readonly second: TransactItemTarget
+      /** The request was a `BatchWriteItem`, not a transaction. */
+      readonly batch: boolean
+    }
+  | {
+      readonly _tag: "ExpressionTooLarge"
+      readonly target: TransactItemTarget
+      readonly expression: "ConditionExpression" | "UpdateExpression"
+      readonly limit: "length" | "operators" | "inOperands"
+      /** The expression's length, operators, or largest `IN`, as DynamoDB counts them. */
+      readonly measured: number
+      /** The caller's own `.condition()` within it, when the site knows it. */
+      readonly caller:
+        | { readonly length: number; readonly operators: number; readonly inOperands: number }
+        | undefined
+    }
+  | {
+      /** A write puts an empty string (or binary) in a key attribute. */
+      readonly _tag: "EmptyKey"
+      readonly target: TransactItemTarget
+      readonly attribute: string
+      /** The secondary index whose key it is, as DynamoDB named it. */
+      readonly index: string | undefined
+    }
+  | {
+      /** A query's key condition compares a key attribute with an empty value. */
+      readonly _tag: "EmptyKeyBound"
+      readonly attribute: string
+      readonly index: string | undefined
+    }
+  | {
+      /** A query's `BETWEEN` whose lower bound sorts after its upper bound. */
+      readonly _tag: "BetweenReversed"
+      readonly attribute: string
+      readonly index: string | undefined
+      readonly low: string
+      readonly high: string
+    }
+  | {
+      /** A consistent read of a GSI, which DynamoDB reads only eventually consistently. */
+      readonly _tag: "ConsistentReadOnGsi"
+      readonly index: string
+      readonly scan: boolean
+    }
+  | {
+      /** A vector index with more `INLINE_FILTER` attributes than DynamoDB allows. */
+      readonly _tag: "VectorIndexFilters"
+      readonly operation: "CreateTable" | "UpdateTable"
+      readonly index: string
+      readonly filters: ReadonlyArray<string>
+      readonly sharers: ReadonlyArray<string>
+      readonly limit: number
+    }
+  | {
+      /** More vector indexes on one table than DynamoDB allows the account. */
+      readonly _tag: "VectorIndexCount"
+      readonly operation: "CreateTable" | "UpdateTable"
+      /** The vector indexes the request creates, with the entities sharing each. */
+      readonly indexes: ReadonlyArray<{
+        readonly index: string
+        readonly sharers: ReadonlyArray<string>
+      }>
+      /** How many vector indexes the table's entities declare in all. */
+      readonly declared: number
+      /** `UpdateTable`: how many vector indexes the table already had. */
+      readonly existing: number | undefined
+      /** The limit DynamoDB stated, if its message carries one. */
+      readonly stated: number | undefined
+    }
 
 // ---------------------------------------------------------------------------
 // Recognise
@@ -150,8 +319,35 @@ const ITEM_SIZE_UPDATE = /Item size to update has exceeded/i
 const ITEM_COUNT = /length less than or equal to 100\b/i
 const PAYLOAD = /payload size cannot exceed 4\s?MB/i
 const PAYLOAD_SIZE = /Payload Size:\s*(\d+)/i
-// DynamoDB Local's wording, then AWS's documented one.
-const SORT_KEY = /Size limit exceeded|Aggregated size of all range keys/i
+// An index key's wording on DynamoDB Local, AWS's documented one, then a
+// table key's on DynamoDB Local (partition and sort key in one message).
+const SORT_KEY =
+  /Size limit exceeded|Aggregated size of all range keys|range primary key values must be under 1024 bytes/i
+// A transaction (or `TransactGetItems`) naming one item twice; a batch
+// request doing so.
+const REPEATED = /cannot include multiple operations on one item/i
+const REPEATED_BATCH = /Provided list of item keys contains duplicates/i
+const EXPRESSION_KIND = /Invalid (\w+)Expression:/i
+const EXPRESSION_LENGTH = /Expression size has exceeded the maximum allowed size/i
+const EXPRESSION_OPERATORS = /too many operators/i
+const EXPRESSION_IN = /IN operator is provided with too many operands/i
+const EMPTY_KEY = /cannot contain an empty string value/i
+const EMPTY_KEY_INDEX = /IndexName:\s*([^,\s]+),\s*IndexKey:\s*([^,\s]+)/i
+const EMPTY_KEY_TABLE = /(?<!Index)Key:\s*([^,\s]+)/
+const BETWEEN_REVERSED = /BETWEEN operator requires upper bound to be greater than or equal to/i
+const CONSISTENT_GSI = /Consistent read cannot be true when (querying|scanning) a GSI/i
+// AWS documents the vector-index quotas (18 inline filters per index, 5
+// vector indexes per table, adjustable) but not the wording of their
+// rejection, and DynamoDB Local has no vector indexes: matched loosely, and
+// confirmed against the request.
+const VECTOR = /vector/i
+const VECTOR_FILTERS = /inline.?filter/i
+const VECTOR_COUNT = /limit|exceed|maximum|at most|too many/i
+const STATED_LIMIT = /(?:limit|maximum|at most|exceeds?)\D{0,40}?(\d+)/i
+// Limits on vector indexes that are not their count per table: how many may
+// be created at once ("Only 1 … index can be created or deleted
+// simultaneously per table"), or a name's length.
+const VECTOR_NOT_COUNT = /simultaneous|at a time|concurrent|in progress|length/i
 
 type CancellationReason = {
   readonly code?: string | undefined
@@ -170,10 +366,17 @@ const messageOf = (cause: unknown): string => {
   return ""
 }
 
+const isAwsLimitExceeded = (cause: unknown): boolean =>
+  cause != null &&
+  typeof cause === "object" &&
+  "name" in cause &&
+  (cause as { name: unknown }).name === "LimitExceededException"
+
 /**
- * The failure a write's error carries, if it is one this module can read: a
- * DynamoDB `ValidationException` (however the client classified it), a
- * `TransactionCanceledException`, or a site's `TransactionCancelled`.
+ * The failure a site's error carries, if it is one this module can read: a
+ * DynamoDB `ValidationException` or `LimitExceededException` (however the
+ * client classified it), a `TransactionCanceledException`, or a site's
+ * `TransactionCancelled`.
  */
 const readFailure = (error: unknown): Failure | undefined => {
   if (error === null || typeof error !== "object" || !("_tag" in error)) return undefined
@@ -188,7 +391,9 @@ const readFailure = (error: unknown): Failure | undefined => {
   }
   if (tagged._tag !== "DynamoError" && tagged._tag !== "DynamoValidationError") return undefined
   const cause = tagged.cause
-  if (isAwsValidationError(cause)) return { _tag: "Request", message: messageOf(cause) }
+  if (isAwsValidationError(cause) || isAwsLimitExceeded(cause)) {
+    return { _tag: "Request", message: messageOf(cause) }
+  }
   if (isAwsTransactionCancelled(cause)) {
     return {
       _tag: "Cancelled",
@@ -200,7 +405,7 @@ const readFailure = (error: unknown): Failure | undefined => {
   return undefined
 }
 
-/** Whether `error` is a write failure this module could diagnose at all. */
+/** Whether `error` is a rejection this module could diagnose at all. */
 export const isDiagnosable = (error: unknown): boolean => readFailure(error) !== undefined
 
 // ---------------------------------------------------------------------------
@@ -234,7 +439,12 @@ const writtenAttributes = (item: TransactWriteItem): Record<string, AttributeVal
 }
 
 /** A key attribute's size, by DynamoDB's rules: a string's UTF-8 bytes, a binary's bytes. */
-const keyBytes = (value: AttributeValue): number => attributeBytes(value, "lower")
+const keyBytes = (value: AttributeValue): number => attributeBytes(value)
+
+/** An empty string or binary: what DynamoDB refuses as a key value. */
+const isEmptyKeyValue = (value: AttributeValue | undefined): boolean =>
+  value !== undefined &&
+  ((value.S !== undefined && value.S === "") || (value.B !== undefined && value.B.length === 0))
 
 /** The first range-key attribute of `item` over {@link SORT_KEY_MAX_BYTES}. */
 const oversizedRangeKey = (
@@ -251,20 +461,126 @@ const oversizedRangeKey = (
   return undefined
 }
 
+/** A Put's item size — the 400 KB measure, which its expressions do not count toward. */
 const putBytes = (item: TransactWriteItem): number | undefined =>
-  item.Put === undefined ? undefined : transactItemBytes(item)
+  item.Put === undefined ? undefined : itemBytes(item.Put.Item ?? {})
+
+/** An entry's expression of `kind`, if it carries one. */
+const expressionOf = (
+  item: TransactWriteItem,
+  kind: "ConditionExpression" | "UpdateExpression",
+): string | undefined => {
+  if (kind === "UpdateExpression") return item.Update?.UpdateExpression
+  return (
+    item.Put?.ConditionExpression ??
+    item.Update?.ConditionExpression ??
+    item.Delete?.ConditionExpression ??
+    item.ConditionCheck?.ConditionExpression
+  )
+}
+
+/**
+ * UTF-8 byte order — the order DynamoDB sorts (and evaluates `BETWEEN` on)
+ * string keys. JavaScript's `<` compares UTF-16 code units, which disagrees
+ * for characters outside the BMP.
+ */
+const utf8 = new TextEncoder()
+export const compareUtf8 = (a: string, b: string): number =>
+  compareBytes(utf8.encode(a), utf8.encode(b))
+
+const compareBytes = (left: Uint8Array, right: Uint8Array): number => {
+  const length = Math.min(left.length, right.length)
+  for (let i = 0; i < length; i++) {
+    const diff = left[i]! - right[i]!
+    if (diff !== 0) return diff
+  }
+  return left.length - right.length
+}
+
+/** `a` sorts after `b` as DynamoDB orders key values of their (shared) type. */
+const sortsAfter = (a: AttributeValue, b: AttributeValue): boolean => {
+  if (a.S !== undefined && b.S !== undefined) return compareUtf8(a.S, b.S) > 0
+  if (a.N !== undefined && b.N !== undefined) return Number(a.N) > Number(b.N)
+  if (a.B !== undefined && b.B !== undefined) return compareBytes(a.B, b.B) > 0
+  return false
+}
+
+/** A key value, readable. */
+const keyValueText = (value: AttributeValue): string =>
+  value.S ??
+  value.N ??
+  (value.B !== undefined ? `<${value.B.length} bytes>` : JSON.stringify(value))
+
+/**
+ * The comparisons of a key condition — `#a = :v`, `#a BETWEEN :l AND :h`,
+ * `begins_with(#a, :v)` — with their attributes resolved through `names`.
+ */
+const keyComparisons = (
+  input: SentRead["input"],
+): ReadonlyArray<{
+  readonly attribute: string
+  readonly operator: "between" | "other"
+  readonly values: ReadonlyArray<AttributeValue>
+}> => {
+  const expression = input.KeyConditionExpression ?? ""
+  const names = input.ExpressionAttributeNames ?? {}
+  const values = input.ExpressionAttributeValues ?? {}
+  const attribute = (token: string) => names[token] ?? token
+  const value = (token: string) => values[token]
+  const found: Array<{
+    attribute: string
+    operator: "between" | "other"
+    values: ReadonlyArray<AttributeValue>
+  }> = []
+  const defined = (vs: ReadonlyArray<AttributeValue | undefined>) =>
+    vs.filter((v): v is AttributeValue => v !== undefined)
+  for (const m of expression.matchAll(/([#\w.]+)\s+BETWEEN\s+(:\w+)\s+AND\s+(:\w+)/gi)) {
+    found.push({
+      attribute: attribute(m[1]!),
+      operator: "between",
+      values: defined([value(m[2]!), value(m[3]!)]),
+    })
+  }
+  for (const m of expression.matchAll(/begins_with\s*\(\s*([#\w.]+)\s*,\s*(:\w+)\s*\)/gi)) {
+    found.push({ attribute: attribute(m[1]!), operator: "other", values: defined([value(m[2]!)]) })
+  }
+  for (const m of expression.matchAll(/([#\w.]+)\s*(?:=|<>|<=|>=|<|>)\s*(:\w+)/g)) {
+    found.push({ attribute: attribute(m[1]!), operator: "other", values: defined([value(m[2]!)]) })
+  }
+  return found
+}
 
 // ---------------------------------------------------------------------------
-// Confirm and attribute
+// Confirm and attribute: writes
 // ---------------------------------------------------------------------------
 
 const entriesOf = (sent: SentWrite): ReadonlyArray<TransactWriteItem> =>
   sent._tag === "Item" ? [sent.item] : sent._tag === "TransactGet" ? [] : sent.items
 
+const targetsOf = (sent: SentWrite): ReadonlyArray<TransactItemTarget> => {
+  if (sent._tag === "Item") return [sent.target()]
+  if (sent._tag === "TransactGet") return sent.targets?.() ?? []
+  return sent.targets()
+}
+
 const targetAt = (sent: SentWrite, index: number): TransactItemTarget | undefined => {
   if (sent._tag === "Item") return index === 0 ? sent.target() : undefined
-  if (sent._tag === "TransactGet") return undefined
+  if (sent._tag === "TransactGet") return sent.targets?.()[index]
   return sent.targets()[index]
+}
+
+/** The first two entries of `sent` that target one item, if any do. */
+const repeatedItem = (sent: SentWrite): Diagnosis | undefined => {
+  if (sent._tag === "Item") return undefined
+  const seen = new Map<string, TransactItemTarget>()
+  for (const target of targetsOf(sent)) {
+    const first = seen.get(target.identity)
+    if (first !== undefined) {
+      return { _tag: "RepeatedItem", first, second: target, batch: sent._tag === "Batch" }
+    }
+    seen.set(target.identity, target)
+  }
+  return undefined
 }
 
 /** The `Put` over the item limit, else the largest `Put` (likely), else `undefined`. */
@@ -326,11 +642,99 @@ const anySortKey = (sent: SentWrite, rangeKeys: ReadonlyArray<string>): Diagnosi
   return undefined
 }
 
+/**
+ * An expression-limit rejection, confirmed: the first entry whose expression
+ * of the kind DynamoDB named (either, if it named none) breaks that limit.
+ */
+const oversizedExpression = (message: string, sent: SentWrite): Diagnosis | undefined => {
+  const limit = EXPRESSION_LENGTH.test(message)
+    ? ("length" as const)
+    : EXPRESSION_OPERATORS.test(message)
+      ? ("operators" as const)
+      : EXPRESSION_IN.test(message)
+        ? ("inOperands" as const)
+        : undefined
+  if (limit === undefined) return undefined
+  const named = EXPRESSION_KIND.exec(message)?.[1]?.toLowerCase()
+  const kinds: ReadonlyArray<"ConditionExpression" | "UpdateExpression"> =
+    named === "condition"
+      ? ["ConditionExpression"]
+      : named === "update"
+        ? ["UpdateExpression"]
+        : named === undefined
+          ? ["ConditionExpression", "UpdateExpression"]
+          : []
+  const entries = entriesOf(sent)
+  for (const kind of kinds) {
+    for (const [index, item] of entries.entries()) {
+      const expression = expressionOf(item, kind)
+      if (expression === undefined) continue
+      const counting = kind === "UpdateExpression" ? "update" : "condition"
+      const measured =
+        limit === "length"
+          ? expression.length
+          : limit === "operators"
+            ? countOperators(expression, counting)
+            : largestInOperands(expression)
+      const max =
+        limit === "length"
+          ? EXPRESSION_MAX_LENGTH
+          : limit === "operators"
+            ? EXPRESSION_MAX_OPERATORS
+            : IN_MAX_OPERANDS
+      if (measured <= max) continue
+      const target = targetAt(sent, index)
+      if (target === undefined) return undefined
+      const callerText =
+        kind !== "ConditionExpression"
+          ? undefined
+          : sent._tag === "Item"
+            ? sent.callerCondition?.()
+            : sent._tag === "Transaction"
+              ? sent.callerCondition?.(index)
+              : undefined
+      const cost = callerText === undefined ? undefined : expressionCost(callerText)
+      return {
+        _tag: "ExpressionTooLarge",
+        target,
+        expression: kind,
+        limit,
+        measured,
+        caller:
+          cost === undefined || callerText === undefined
+            ? undefined
+            : { ...cost, inOperands: largestInOperands(callerText) },
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * An empty-key rejection, confirmed: an entry writes an empty value to the
+ * key attribute DynamoDB named.
+ */
+const emptyKey = (message: string, sent: SentWrite): Diagnosis | undefined => {
+  const onIndex = EMPTY_KEY_INDEX.exec(message)
+  const attribute = onIndex?.[2] ?? EMPTY_KEY_TABLE.exec(message)?.[1]
+  if (attribute === undefined) return undefined
+  const entries = entriesOf(sent)
+  for (const [index, item] of entries.entries()) {
+    if (!isEmptyKeyValue(writtenAttributes(item)[attribute])) continue
+    const target = targetAt(sent, index)
+    return target === undefined
+      ? undefined
+      : { _tag: "EmptyKey", target, attribute, index: onIndex?.[1] }
+  }
+  return undefined
+}
+
 const diagnoseRequest = (
   message: string,
   sent: SentWrite,
   rangeKeys: ReadonlyArray<string>,
 ): Diagnosis | undefined => {
+  if (REPEATED.test(message) || REPEATED_BATCH.test(message)) return repeatedItem(sent)
   if (ITEM_COUNT.test(message)) {
     const count =
       sent._tag === "TransactGet"
@@ -363,6 +767,14 @@ const diagnoseRequest = (
     }
   }
   if (SORT_KEY.test(message)) return anySortKey(sent, rangeKeys)
+  if (EMPTY_KEY.test(message)) return emptyKey(message, sent)
+  if (
+    EXPRESSION_LENGTH.test(message) ||
+    EXPRESSION_OPERATORS.test(message) ||
+    EXPRESSION_IN.test(message)
+  ) {
+    return oversizedExpression(message, sent)
+  }
   if (ITEM_SIZE_UPDATE.test(message)) {
     if (sent._tag === "Item") {
       return sent.item.Update === undefined && sent.item.Put === undefined
@@ -385,7 +797,13 @@ const diagnoseCancellation = (
   sent: SentWrite,
   rangeKeys: ReadonlyArray<string>,
 ): Diagnosis | undefined => {
-  // A conditional failure is the site's to explain, never this module's.
+  // A request that repeats an item can never commit, whatever DynamoDB
+  // reported for it: DynamoDB Local applies the operations in order, and a
+  // repeat whose condition then fails comes back as a conditional failure
+  // indistinguishable from a lost race.
+  const repeated = repeatedItem(sent)
+  if (repeated !== undefined) return repeated
+  // Any other conditional failure is the site's to explain, never this module's.
   if (reasons.some((reason) => reason?.code === "ConditionalCheckFailed")) return undefined
   const entries = entriesOf(sent)
   for (const [index, reason] of reasons.entries()) {
@@ -411,22 +829,123 @@ const diagnoseCancellation = (
   return undefined
 }
 
+// ---------------------------------------------------------------------------
+// Confirm and attribute: reads
+// ---------------------------------------------------------------------------
+
+const diagnoseRead = (message: string, sent: SentRead): Diagnosis | undefined => {
+  const index = sent.input.IndexName
+  if (CONSISTENT_GSI.test(message)) {
+    return sent.input.ConsistentRead === true && index !== undefined
+      ? { _tag: "ConsistentReadOnGsi", index, scan: sent.scan }
+      : undefined
+  }
+  if (sent.scan) return undefined
+  if (BETWEEN_REVERSED.test(message)) {
+    for (const comparison of keyComparisons(sent.input)) {
+      const [low, high] = comparison.values
+      if (comparison.operator !== "between" || low === undefined || high === undefined) continue
+      if (!sortsAfter(low, high)) continue
+      return {
+        _tag: "BetweenReversed",
+        attribute: comparison.attribute,
+        index,
+        low: keyValueText(low),
+        high: keyValueText(high),
+      }
+    }
+    return undefined
+  }
+  if (EMPTY_KEY.test(message)) {
+    const attribute =
+      EMPTY_KEY_INDEX.exec(message)?.[2] ?? EMPTY_KEY_TABLE.exec(message)?.[1] ?? undefined
+    if (attribute === undefined) return undefined
+    const empty = keyComparisons(sent.input).some(
+      (comparison) =>
+        comparison.attribute === attribute && comparison.values.some((v) => isEmptyKeyValue(v)),
+    )
+    return empty ? { _tag: "EmptyKeyBound", attribute, index } : undefined
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Confirm and attribute: table management
+// ---------------------------------------------------------------------------
+
+const inlineFilters = (index: SentVectorIndex): ReadonlyArray<string> =>
+  (index.SearchSchema ?? [])
+    .filter((element) => element.SearchSchemaElementType === "INLINE_FILTER")
+    .map((element) => element.AttributeName ?? "")
+
+const diagnoseTable = (message: string, sent: SentTable): Diagnosis | undefined => {
+  if (!VECTOR.test(message) || sent.vectorIndexes.length === 0) return undefined
+  if (VECTOR_FILTERS.test(message)) {
+    // The index DynamoDB named, if it named one of the request's; else the
+    // first over the limit.
+    const over = sent.vectorIndexes.filter(
+      (index) => inlineFilters(index).length > MAX_INLINE_FILTERS,
+    )
+    const culprit =
+      over.find((index) => index.IndexName !== undefined && message.includes(index.IndexName)) ??
+      over[0]
+    if (culprit === undefined) return undefined
+    const name = culprit.IndexName ?? ""
+    return {
+      _tag: "VectorIndexFilters",
+      operation: sent.operation,
+      index: name,
+      filters: inlineFilters(culprit),
+      sharers: sent.sharers(name),
+      limit: MAX_INLINE_FILTERS,
+    }
+  }
+  if (!VECTOR_COUNT.test(message) || VECTOR_NOT_COUNT.test(message)) return undefined
+  const statedText = STATED_LIMIT.exec(message)?.[1]
+  const stated = statedText === undefined ? undefined : Number(statedText)
+  const limit = stated ?? MAX_VECTOR_INDEXES_PER_TABLE
+  const indexes = sent.vectorIndexes.map((index) => ({
+    index: index.IndexName ?? "",
+    sharers: sent.sharers(index.IndexName ?? ""),
+  }))
+  // Confirmed by counting against the limit DynamoDB stated, or its default
+  // quota. `CreateTable` carries every vector index; `UpdateTable` adds to
+  // the ones the table already has, read back after the rejection.
+  const existing = sent.operation === "UpdateTable" ? sent.existing : 0
+  if (existing === undefined || existing + indexes.length <= limit) return undefined
+  return {
+    _tag: "VectorIndexCount",
+    operation: sent.operation,
+    indexes,
+    declared: sent.declared,
+    existing: sent.operation === "UpdateTable" ? existing : undefined,
+    stated,
+  }
+}
+
 /**
  * Read DynamoDB's rejection of `sent`. `rangeKeys` names the sort-key
- * attributes the request writes (the table's and its indexes'), for the
- * sort-key shape. `undefined`: unrecognised or unconfirmed — the site fails
- * with `error` unchanged.
+ * attributes a write writes (the table's and its indexes'), for the sort-key
+ * shape. `undefined`: unrecognised or unconfirmed — the site fails with
+ * `error` unchanged.
  */
-export const diagnoseWriteFailure = (
+export const diagnoseRejection = (
   error: unknown,
-  sent: SentWrite,
-  rangeKeys: ReadonlyArray<string>,
+  sent: Sent,
+  rangeKeys: ReadonlyArray<string> = [],
 ): Diagnosis | undefined => {
   const failure = readFailure(error)
   if (failure === undefined) return undefined
-  return failure._tag === "Request"
-    ? diagnoseRequest(failure.message, sent, rangeKeys)
-    : diagnoseCancellation(failure.reasons, sent, rangeKeys)
+  switch (sent._tag) {
+    case "Read":
+      return failure._tag === "Request" ? diagnoseRead(failure.message, sent) : undefined
+    case "Table":
+      return failure._tag === "Request" ? diagnoseTable(failure.message, sent) : undefined
+    default:
+      return failure._tag === "Request"
+        ? diagnoseRequest(failure.message, sent, rangeKeys)
+        : diagnoseCancellation(failure.reasons, sent, rangeKeys)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,19 +954,31 @@ export const diagnoseWriteFailure = (
 
 const named = (target: TransactItemTarget): string => `${target.source}, at ${target.key}`
 
+const list = (items: ReadonlyArray<string>): string => items.join(", ")
+
+/** How a site describes what its operation had written before the rejected request. */
+export type ExplainOptions = {
+  /**
+   * What earlier requests of the operation are known to have written, as a
+   * clause: `"2 earlier transactions of versioned puts (200 items) were
+   * already written"`. A multi-request operation always says exactly what it
+   * wrote; never a vague "may have been written".
+   */
+  readonly committed?: string | undefined
+}
+
 /**
  * The explanation every site puts in its error, so the wording is identical
- * library-wide. `partial`: earlier requests of the operation may already have
- * been written (`Batch.write`, which was never atomic).
+ * library-wide. See {@link ExplainOptions} for a multi-request operation.
  */
 export const explainDiagnosis = (
   diagnosis: Diagnosis,
   operation: string,
-  options?: { readonly partial?: boolean | undefined },
+  options?: ExplainOptions,
 ): string => {
   const outcome =
-    options?.partial === true
-      ? "This request wrote nothing; earlier requests of the operation may already have been written."
+    options?.committed !== undefined
+      ? `This request wrote nothing; ${options.committed}.`
       : "Nothing was written."
   switch (diagnosis._tag) {
     case "ItemTooLarge":
@@ -458,11 +989,11 @@ export const explainDiagnosis = (
         named(diagnosis.target) +
         (diagnosis.bytes === undefined
           ? " (the item it would produce is not in the request, so it cannot be measured)"
-          : `, at least ${diagnosis.bytes} bytes by DynamoDB's item-size rules`) +
+          : `, ${diagnosis.bytes} bytes by DynamoDB's item-size rules`) +
         "." +
         (diagnosis.likely
-          ? " No item measures over the limit by the library's lower-bound count, and " +
-            "DynamoDB's sizes are approximate, so the largest is named."
+          ? " No item measures over the limit by the library's size model (measured against " +
+            "DynamoDB Local; AWS documents its sizes as approximate), so the largest is named."
           : "") +
         ` ${outcome}`
       )
@@ -471,25 +1002,131 @@ export const explainDiagnosis = (
         `${operation}: the transaction holds ${diagnosis.count} items, over DynamoDB's limit ` +
         `of ${diagnosis.limit} items for one transaction. ${outcome}`
       )
-    case "TransactionTooLarge":
+    case "TransactionTooLarge": {
+      const disagrees = diagnosis.measured <= TRANSACT_WRITE_MAX_BYTES
       return (
         `${operation}: DynamoDB rejected the transaction for exceeding its limit of ` +
         `${TRANSACT_WRITE_MAX_BYTES} bytes (4 MB) for one transaction` +
         (diagnosis.reported === undefined ? "" : ` (it reported ${diagnosis.reported} bytes)`) +
-        `; its items total at least ${diagnosis.measured} bytes by DynamoDB's item-size rules. ` +
-        "The largest: " +
+        `; the library measures the request at ${diagnosis.measured} bytes ` +
+        "(its items, or an update's or delete's key, plus every expression with its names and values)." +
+        (diagnosis.reported === undefined
+          ? ""
+          : " DynamoDB's figure is its running total in request order, up to the action that " +
+            "crossed the limit.") +
+        (disagrees
+          ? " That is within the limit: the library's size model disagrees with DynamoDB's for " +
+            "this request, so it was not split to fit."
+          : "") +
+        " The largest: " +
         diagnosis.largest
           .map(({ target, bytes }) => `${named(target)} (${bytes} bytes)`)
           .join("; ") +
         ". A put of a retain entity counts twice: its item and its version snapshot. " +
         `Split the operations into smaller transactions. ${outcome}`
       )
+    }
     case "SortKeyTooLong":
       return (
         `${operation}: the sort key "${diagnosis.attribute}" of ${named(diagnosis.target)} is ` +
         `${diagnosis.bytes} bytes, longer than DynamoDB's ${SORT_KEY_MAX_BYTES}-byte limit for ` +
         `a sort key. ${outcome}`
       )
+    case "RepeatedItem":
+      return diagnosis.batch
+        ? `${operation}: the batch request touches one item more than once — ` +
+            `${diagnosis.first.source} and ${diagnosis.second.source} both target the item at ` +
+            `${diagnosis.second.key}. DynamoDB allows one request per item in a batch request, ` +
+            `and rejected it. Write the item once. ${outcome}`
+        : `${operation}: the transaction touches one item more than once — ` +
+            `${diagnosis.first.source} and ${diagnosis.second.source} both target the item at ` +
+            `${diagnosis.second.key}. DynamoDB allows one operation per item in a transaction, ` +
+            "counting the uniqueness sentinels and version snapshots a put writes, and rejected " +
+            `it. Split the operations into separate writes. ${outcome}`
+    case "ExpressionTooLarge": {
+      const subject = `the ${diagnosis.expression} of ${named(diagnosis.target)}`
+      const over =
+        diagnosis.limit === "length"
+          ? `it is ${diagnosis.measured} characters, over DynamoDB's limit of ` +
+            `${EXPRESSION_MAX_LENGTH} characters for one expression`
+          : diagnosis.limit === "operators"
+            ? `it holds ${diagnosis.measured} operators and functions, over DynamoDB's limit of ` +
+              `${EXPRESSION_MAX_OPERATORS} for one expression`
+            : `an IN in it holds ${diagnosis.measured} operands, over DynamoDB's limit of ` +
+              `${IN_MAX_OPERANDS}`
+      const caller = diagnosis.caller
+      // The library added a guard beside the caller's condition: say so.
+      const shared =
+        caller !== undefined &&
+        (diagnosis.limit === "length"
+          ? caller.length
+          : diagnosis.limit === "operators"
+            ? caller.operators
+            : caller.inOperands) < diagnosis.measured
+      const advice =
+        caller !== undefined && shared
+          ? ` The .condition() alone is ${caller.length} characters / ${caller.operators} ` +
+            "operators, and the library's own guard needs room beside it: simplify the condition."
+          : diagnosis.expression === "UpdateExpression"
+            ? " Split the update into smaller ones."
+            : " Simplify the condition."
+      return `${operation}: DynamoDB rejected ${subject}: ${over}.${advice} ${outcome}`
+    }
+    case "EmptyKey":
+      return (
+        `${operation}: DynamoDB rejected ${named(diagnosis.target)}: it writes an empty value ` +
+        `to the key attribute "${diagnosis.attribute}"` +
+        (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
+        `, and DynamoDB does not accept an empty string as a key value. ${outcome}`
+      )
+    case "EmptyKeyBound":
+      return (
+        `${operation}: DynamoDB rejected the query: its key condition compares the key ` +
+        `attribute "${diagnosis.attribute}"` +
+        (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
+        " with an empty string, which DynamoDB does not accept as a key value."
+      )
+    case "BetweenReversed":
+      return (
+        `${operation}: DynamoDB rejected the query: between's lower bound ` +
+        `${JSON.stringify(diagnosis.low)} sorts after its upper bound ` +
+        `${JSON.stringify(diagnosis.high)} on "${diagnosis.attribute}"` +
+        (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
+        " (DynamoDB orders strings by their UTF-8 bytes)."
+      )
+    case "ConsistentReadOnGsi":
+      return (
+        `consistentRead: index "${diagnosis.index}" is a global secondary index, which ` +
+        "DynamoDB reads only eventually consistently, so DynamoDB rejected the consistent " +
+        `${diagnosis.scan ? "scan" : "query"}.`
+      )
+    case "VectorIndexFilters":
+      return (
+        `${operation}: DynamoDB rejected vector index "${diagnosis.index}": it declares ` +
+        `${diagnosis.filters.length} INLINE_FILTER attributes (${list(diagnosis.filters)}), over ` +
+        `DynamoDB's limit of ${diagnosis.limit} per vector index. They are the union of the ` +
+        `filters of the entities sharing it (${list(diagnosis.sharers)}). ` +
+        (diagnosis.operation === "CreateTable"
+          ? "The table was not created."
+          : "Nothing was changed.")
+      )
+    case "VectorIndexCount": {
+      const indexes = diagnosis.indexes
+        .map(({ index, sharers }) => `"${index}" (${list(sharers)})`)
+        .join(", ")
+      const quota = `its limit on vector indexes per table (${
+        diagnosis.stated === undefined
+          ? `${MAX_VECTOR_INDEXES_PER_TABLE} by default`
+          : diagnosis.stated
+      }; the quota is adjustable through AWS Service Quotas)`
+      return diagnosis.operation === "CreateTable"
+        ? `${operation}: DynamoDB rejected the table's ${diagnosis.indexes.length} vector ` +
+            `indexes, ${indexes}, for exceeding ${quota}. The table was not created.`
+        : `${operation}: DynamoDB rejected adding vector index ${indexes} for exceeding ` +
+            `${quota}: the table already has ${diagnosis.existing ?? 0} vector ` +
+            `${diagnosis.existing === 1 ? "index" : "indexes"}, and its entities declare ` +
+            `${diagnosis.declared} in all. Nothing was changed.`
+    }
   }
 }
 
@@ -502,21 +1139,29 @@ export const withCause = (message: string, original: unknown): Error =>
   new Error(message, { cause: original })
 
 /** The entity (or stream) a diagnosis names, for an error's `entityType`. */
-export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): string =>
-  diagnosis._tag === "ItemTooLarge" || diagnosis._tag === "SortKeyTooLong"
-    ? diagnosis.target.entityType
-    : diagnosis._tag === "TransactionTooLarge"
-      ? (diagnosis.largest[0]?.target.entityType ?? fallback)
-      : fallback
+export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): string => {
+  switch (diagnosis._tag) {
+    case "ItemTooLarge":
+    case "SortKeyTooLong":
+    case "ExpressionTooLarge":
+    case "EmptyKey":
+      return diagnosis.target.entityType
+    case "RepeatedItem":
+      return diagnosis.first.entityType
+    case "TransactionTooLarge":
+      return diagnosis.largest[0]?.target.entityType ?? fallback
+    default:
+      return fallback
+  }
+}
 
 /** The `ValidationError` a diagnosis becomes at most sites. */
 export const diagnosedValidationError = (
   diagnosis: Diagnosis,
   original: unknown,
-  options: {
+  options: ExplainOptions & {
     readonly operation: string
     readonly entityType: string
-    readonly partial?: boolean | undefined
   },
 ): ValidationError =>
   new ValidationError({
@@ -530,23 +1175,35 @@ export const diagnosedValidationError = (
 // ---------------------------------------------------------------------------
 
 /**
- * Wrap a site's write so that, on failure only, a diagnosable error is read
+ * Wrap a site's request so that, on failure only, a diagnosable error is read
  * against what was sent and — when confirmed — rewritten by `rewrite`.
- * Everything else, and every success, passes through untouched. Placed after
- * the site's own conditional-failure mapping, so it only ever sees what that
- * mapping could not explain.
+ * Everything else, and every success, passes through untouched.
+ *
+ * Placed after the site's own conditional-failure mapping, so it only ever
+ * sees what that mapping could not explain — except for a repeated item: a
+ * site whose mapping reads conditional failures (and may retry them) wraps its
+ * request a second time, BEFORE that mapping, with `only: ["RepeatedItem"]`,
+ * because DynamoDB can report a repeat as a conditional failure that reads as
+ * a lost race. A diagnosis is terminal: no retry loop sees it.
+ *
+ * `only` limits the rewrite to those diagnoses; any other passes through.
  */
 export const diagnoseFailure =
   <E2>(options: {
-    readonly sent: () => SentWrite
-    readonly rangeKeys: () => ReadonlyArray<string>
+    readonly sent: () => Sent
+    readonly rangeKeys?: (() => ReadonlyArray<string>) | undefined
+    readonly only?: ReadonlyArray<Diagnosis["_tag"]> | undefined
     readonly rewrite: (diagnosis: Diagnosis, original: unknown) => E2
   }) =>
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> =>
-    Effect.catch(self, (error: E) => {
+    Effect.catch(self, (error: E): Effect.Effect<never, E | E2> => {
       if (!isDiagnosable(error)) return Effect.fail(error)
-      const diagnosis = diagnoseWriteFailure(error, options.sent(), options.rangeKeys())
-      return Effect.fail(diagnosis === undefined ? error : options.rewrite(diagnosis, error))
+      const diagnosis = diagnoseRejection(error, options.sent(), options.rangeKeys?.() ?? [])
+      if (diagnosis === undefined) return Effect.fail(error)
+      if (options.only !== undefined && !options.only.includes(diagnosis._tag)) {
+        return Effect.fail(error)
+      }
+      return Effect.fail(options.rewrite(diagnosis, error))
     }) as Effect.Effect<A, E | E2, R>
 
 // ---------------------------------------------------------------------------

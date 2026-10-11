@@ -37,7 +37,13 @@ import {
   judgeCancellation,
   type TransactWriteOp,
 } from "./internal/TransactWriteOps.js"
-import { diagnosedValidationError, diagnoseFailure, withCause } from "./internal/WriteDiagnosis.js"
+import {
+  type Diagnosis,
+  diagnosedValidationError,
+  diagnoseFailure,
+  transactItemTarget,
+  withCause,
+} from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
@@ -160,10 +166,25 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
         }
         return error as DynamoClientError | TransactionCancelled
       }),
-      // Over DynamoDB's 100 items: rejected by DynamoDB, confirmed by count.
+      // Over DynamoDB's 100 items, or one item read twice: rejected by
+      // DynamoDB, confirmed against the request (#144).
       diagnoseFailure({
-        sent: () => ({ _tag: "TransactGet", count: transactItems.length }),
-        rangeKeys: () => [],
+        sent: () => ({
+          _tag: "TransactGet",
+          count: transactItems.length,
+          targets: () =>
+            transactItems.map((item, index) => {
+              const entity = infos[index]!.entity
+              const primary = entity.indexes.primary!
+              return transactItemTarget(
+                item,
+                item.Get.TableName,
+                [primary.pk.field, primary.sk.field],
+                entity.entityType,
+                `get ${index} (${entity.entityType})`,
+              )
+            }),
+        }),
         rewrite: (diagnosis, original) =>
           diagnosis._tag === "TooManyItems"
             ? new DynamoError({
@@ -174,7 +195,18 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
                   original,
                 ),
               })
-            : (original as DynamoClientError),
+            : diagnosis._tag === "RepeatedItem"
+              ? new DynamoError({
+                  operation: "TransactGetItems",
+                  cause: withCause(
+                    `TransactGetItems reads one item more than once — ${diagnosis.first.source} ` +
+                      `and ${diagnosis.second.source} both read the item at ` +
+                      `${diagnosis.second.key}. DynamoDB allows one operation per item in a ` +
+                      "transaction, and rejected it. Read the item once.",
+                    original,
+                  ),
+                })
+              : (original as DynamoClientError),
       }),
     )
 
@@ -220,11 +252,13 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
  * `ConcurrentModification`. A caller's own condition failing is
  * `TransactionCancelled`; a taken unique value is `UniqueConstraintViolation`.
  *
- * DynamoDB's limits are not pre-checked (#144): a transaction over them is
+ * DynamoDB's rules are not pre-checked (#144): a transaction breaking one is
  * sent, rejected whole, and reported naming the culprit — over 100 items
- * (counted after expansion) as `DynamoError`, an oversized item, a payload
- * over 4 MB or a sort key over 1024 bytes as `ValidationError` — with
- * DynamoDB's error as the cause. Nothing is written.
+ * (counted after expansion) as `DynamoError`; two ops touching one item, an
+ * oversized item, a payload over 4 MB, a sort key over 1024 bytes or a
+ * condition over DynamoDB's expression limits as `ValidationError` — with
+ * DynamoDB's error as the cause. Nothing is written, and a repeated item is
+ * never retried as a lost race.
  *
  * ```typescript
  * yield* Transaction.transactWrite([
@@ -255,11 +289,38 @@ export const transactWrite = (
       const built = yield* buildTransactWriteItems(operations, "transactWrite")
       const transactItems = built.items
 
+      // Named once, for both diagnoses below.
+      const sent = () => ({
+        _tag: "Transaction" as const,
+        items: transactItems,
+        targets: built.targets,
+      })
+      const diagnosed = (diagnosis: Diagnosis, original: unknown) =>
+        diagnosis._tag === "TooManyItems"
+          ? new DynamoError({
+              operation: "TransactWriteItems",
+              cause: withCause(
+                `TransactWriteItems supports a maximum of ${diagnosis.limit} items; ` +
+                  `${operations.length} operation(s) expanded to ${diagnosis.count} items ` +
+                  "(uniqueness sentinels and version snapshots each occupy one)",
+                original,
+              ),
+            })
+          : diagnosedValidationError(diagnosis, original, {
+              operation: "transactWrite",
+              entityType: "unknown",
+            })
+
       const outcome = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
         Effect.as(undefined),
+        // One operation per item (#133, #144): a transaction that touches one
+        // item twice is DynamoDB's to reject, and is diagnosed BEFORE the
+        // conditional mapping — DynamoDB can report a repeat as a conditional
+        // failure, which would read as a lost race and be retried.
+        diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite: diagnosed }),
         Effect.catch(
           (
-            error: DynamoClientError,
+            error: DynamoClientError | ValidationError,
           ): Effect.Effect<
             OptimisticLockError | ConcurrentModification,
             DynamoClientError | ValidationError | UniqueConstraintViolation | TransactionCancelled
@@ -284,25 +345,7 @@ export const transactWrite = (
         // here, after the conditional mapping, naming the item at fault. The
         // 100-item limit counts the EXPANDED items — one op can emit several
         // (uniqueness sentinels, version snapshots) — and keeps its #113 tag.
-        diagnoseFailure({
-          sent: () => ({ _tag: "Transaction", items: transactItems, targets: () => built.targets }),
-          rangeKeys: built.rangeKeys,
-          rewrite: (diagnosis, original) =>
-            diagnosis._tag === "TooManyItems"
-              ? new DynamoError({
-                  operation: "TransactWriteItems",
-                  cause: withCause(
-                    `TransactWriteItems supports a maximum of ${diagnosis.limit} items; ` +
-                      `${operations.length} operation(s) expanded to ${diagnosis.count} items ` +
-                      "(uniqueness sentinels and version snapshots each occupy one)",
-                    original,
-                  ),
-                })
-              : diagnosedValidationError(diagnosis, original, {
-                  operation: "transactWrite",
-                  entityType: "unknown",
-                }),
-        }),
+        diagnoseFailure({ sent, rangeKeys: built.rangeKeys, rewrite: diagnosed }),
       )
       if (outcome === undefined) return
       lost = outcome

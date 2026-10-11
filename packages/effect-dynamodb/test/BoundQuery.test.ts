@@ -14,7 +14,11 @@ import { compileExpr, createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsValidationException,
+  DDB_CONSISTENT_READ_GSI,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
 // Test model type
@@ -700,24 +704,28 @@ describe("collectionNaming (#133)", () => {
   )
 })
 
-describe("a consistent read of a GSI is refused before sending (#133)", () => {
-  const make = (indexName: string | undefined, globalIndex: boolean) =>
+describe("a consistent read of a GSI is diagnosed from DynamoDB's rejection (#144)", () => {
+  const make = (indexName: string | undefined) =>
     Query.make({
       tableName: "t",
       indexName,
-      globalIndex,
       pkField: "pk",
       pkValue: "p",
       skField: "sk",
       entityTypes: ["A"],
       decoder: (raw) => Effect.succeed(raw),
     })
+  // DynamoDB's rejection, observed on DynamoDB Local.
+  const gsiRead = (input: { readonly IndexName?: string; readonly ConsistentRead?: boolean }) =>
+    input.ConsistentRead === true && input.IndexName === "gsi1"
+      ? Promise.reject(awsValidationException(DDB_CONSISTENT_READ_GSI))
+      : Promise.resolve({ Items: [] })
 
-  it.effect("refused on a GSI, sent on the table or an LSI", () =>
+  it.effect("sent as asked; DynamoDB's rejection named on every terminal", () =>
     Effect.gen(function* () {
       mockQuery.mockReset()
-      mockQuery.mockResolvedValue({ Items: [] })
-      const gsi = Query.consistentRead(make("gsi1", true))
+      mockQuery.mockImplementation(gsiRead)
+      const gsi = Query.consistentRead(make("gsi1"))
       for (const run of [
         Query.collect(gsi),
         Query.execute(gsi),
@@ -725,17 +733,44 @@ describe("a consistent read of a GSI is refused before sending (#133)", () => {
         Query.paginate(gsi).pipe(Effect.flatMap((pages) => Stream.runCollect(pages))),
       ]) {
         const error = yield* Effect.flip(
-          run as Effect.Effect<unknown, { readonly _tag: string }, DynamoClient>,
+          run as Effect.Effect<
+            unknown,
+            { readonly _tag: string; readonly cause?: unknown },
+            DynamoClient
+          >,
         )
         expect(error._tag).toBe("ValidationError")
+        expect((error as { readonly operation?: string }).operation).toBe("query.consistentRead")
+        expect(String(error.cause)).toContain(
+          'index "gsi1" is a global secondary index, which DynamoDB reads only eventually consistently',
+        )
+        // DynamoDB's error is kept, one step down.
+        expect(((error.cause as Error).cause as DynamoError)._tag).toBe("DynamoError")
       }
-      expect(mockQuery).not.toHaveBeenCalled()
-      yield* Query.collect(Query.consistentRead(make(undefined, false)))
-      yield* Query.collect(Query.consistentRead(make("lsi1", false)))
-      expect(mockQuery.mock.calls.map((call) => call[0].ConsistentRead)).toEqual([true, true])
-      // Without consistentRead a GSI is read as always.
-      yield* Query.collect(make("gsi1", true))
-      expect(mockQuery.mock.calls[2]![0].ConsistentRead).toBeUndefined()
+      // Every request was sent: nothing is refused before DynamoDB rules.
+      expect(mockQuery).toHaveBeenCalledTimes(4)
+      expect(mockQuery.mock.calls.every((call) => call[0].ConsistentRead === true)).toBe(true)
+      // The table and an LSI read consistently as asked.
+      yield* Query.collect(Query.consistentRead(make(undefined)))
+      yield* Query.collect(Query.consistentRead(make("lsi1")))
+      expect(mockQuery.mock.calls.slice(4).map((call) => call[0].ConsistentRead)).toEqual([
+        true,
+        true,
+      ])
+    }).pipe(Effect.provide(TestDynamoClient)),
+  )
+
+  it.effect("unconfirmed or unrecognised rejections pass through unchanged", () =>
+    Effect.gen(function* () {
+      mockQuery.mockReset()
+      // The GSI message without a consistent read in the request: unconfirmed.
+      mockQuery.mockRejectedValueOnce(awsValidationException(DDB_CONSISTENT_READ_GSI))
+      const unconfirmed = yield* Effect.flip(Query.collect(make("gsi1")))
+      expect(unconfirmed._tag).toBe("DynamoError")
+      // Another rejection of a consistent read: not this diagnosis.
+      mockQuery.mockRejectedValueOnce(awsValidationException("Something else"))
+      const other = yield* Effect.flip(Query.collect(Query.consistentRead(make("gsi1"))))
+      expect(other._tag).toBe("DynamoError")
     }).pipe(Effect.provide(TestDynamoClient)),
   )
 })

@@ -4,6 +4,7 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   type AggregateAssemblyError,
   type AggregateDecompositionError,
+  type AggregateTransactionOverflow,
   DynamoError,
   type RefNotFound,
   type ValidationError,
@@ -20,6 +21,7 @@ import {
   awsValidationException,
   DDB_ITEM_SIZE,
   DDB_SORT_KEY_LOCAL,
+  DDB_TOO_MANY_ITEMS,
   ddbPayloadTooLarge,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
@@ -1662,6 +1664,117 @@ describe("Aggregate write path", () => {
           expect(mockTransactWrite).toHaveBeenCalledTimes(1)
         }).pipe(Effect.provide(WriteLayer)),
     )
+
+    // DynamoDB's limits are not pre-checked (#144): each group is sent, and a
+    // rejected one is diagnosed, naming what earlier groups already committed.
+    describe("a rejected group is diagnosed, naming the groups already committed (#144)", () => {
+      /** A team with `count` players, each a distinct (hydratable) ref. */
+      const manyPlayers = (count: number) => ({
+        ...matchInput,
+        team1: {
+          ...matchInput.team1,
+          players: Array.from({ length: count }, (_, i) => ({
+            playerId: `p-${i}`,
+            battingPosition: i + 1,
+            isCaptain: i === 0,
+          })),
+        },
+      })
+      /** Every ref resolves: venue, teams, coaches, and any player. */
+      const mockAnyRefs = () => {
+        mockBatchGetItem.mockImplementation((input: Record<string, unknown>) => {
+          const requestItems = input.RequestItems as Record<
+            string,
+            { Keys: Array<Record<string, { S?: string }>> }
+          >
+          const responses: Record<string, Array<Record<string, unknown>>> = {}
+          for (const [tableName, { Keys }] of Object.entries(requestItems)) {
+            responses[tableName] = Keys.map((key) => {
+              const pk = key.pk?.S ?? ""
+              const [, , type, id] = pk.split("#")
+              const value = id!.slice(id!.indexOf("_") + 1)
+              const item: Record<string, unknown> = { pk, sk: `$myapp#v1#${type}` }
+              if (type === "venue")
+                Object.assign(item, { __edd_e__: "Venue", venueId: value, name: "MCG", city: "M" })
+              if (type === "team")
+                Object.assign(item, {
+                  __edd_e__: "Team",
+                  teamId: value,
+                  name: value,
+                  country: value,
+                })
+              if (type === "coach")
+                Object.assign(item, { __edd_e__: "Coach", coachId: value, name: value })
+              if (type === "player") {
+                Object.assign(item, {
+                  __edd_e__: "Player",
+                  playerId: value,
+                  displayName: value,
+                  role: "batter",
+                })
+              }
+              return toAttributeMap(item)
+            })
+          }
+          return Promise.resolve({ Responses: responses })
+        })
+      }
+
+      it.effect(
+        "a group over 100 items: AggregateTransactionOverflow, with what was committed",
+        () =>
+          Effect.gen(function* () {
+            mockAnyRefs()
+            const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+            mockTransactWrite.mockImplementation(async (input: any) => {
+              if (input.TransactItems.length > 100) throw rejection
+              return {}
+            })
+            const error = yield* MatchAggregate.create(manyPlayers(110)).pipe(Effect.flip)
+            expect(error._tag).toBe("AggregateTransactionOverflow")
+            const overflow = error as AggregateTransactionOverflow
+            expect(overflow.aggregate).toBe("MatchItem")
+            expect(overflow.itemCount).toBeGreaterThan(110)
+            expect(overflow.limit).toBe(100)
+            // The root group went first, and committed: the write is not atomic.
+            expect(overflow.committed).toHaveLength(1)
+            expect(overflow.subgraph).not.toBe(overflow.committed![0])
+            expect((overflow.cause as DynamoError).cause).toBe(rejection)
+            // Sent, not refused: the root group, then the rejected one; no more.
+            expect(mockTransactWrite).toHaveBeenCalledTimes(2)
+          }).pipe(Effect.provide(WriteLayer)),
+      )
+
+      it.effect("a count rejection the group does not confirm passes through", () =>
+        Effect.gen(function* () {
+          mockRefs()
+          const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
+          mockTransactWrite.mockRejectedValueOnce(rejection)
+          // The root group holds a few items: DynamoDB's message is not confirmed.
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).cause).toBe(rejection)
+          expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+        }).pipe(Effect.provide(WriteLayer)),
+      )
+
+      it.effect("a later group's oversized item: ValidationError naming the committed groups", () =>
+        Effect.gen(function* () {
+          mockRefs()
+          mockTransactWrite.mockResolvedValueOnce({})
+          const rejection = awsValidationException(DDB_ITEM_SIZE)
+          mockTransactWrite.mockRejectedValueOnce(rejection)
+          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const text = String((error as ValidationError).cause)
+          expect(text).toContain("This request wrote nothing; earlier transactions of this write")
+          expect(text).toMatch(/already committed sub-aggregates "[^"]+"/)
+          // A create's root is among them: a retry would fail on it.
+          expect(text).toContain("update or delete the partial aggregate")
+          expect(mockTransactWrite).toHaveBeenCalledTimes(2)
+        }).pipe(Effect.provide(WriteLayer)),
+      )
+    })
 
     it.effect("a later group's cancellation stays TransactionCancelled (#134)", () =>
       Effect.gen(function* () {

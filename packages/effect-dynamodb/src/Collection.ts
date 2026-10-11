@@ -306,8 +306,6 @@ export const make = <
     let q = Query.make<CollectionResult<TEntities>>({
       tableName: "",
       indexName: sharedDynamoIndexName,
-      // A collection is over its members' secondary indexes — GSIs.
-      globalIndex: true,
       pkField: sharedPkField!,
       pkValue: collectionPk(pkComposites),
       skField: sharedSkField,
@@ -351,8 +349,6 @@ export const make = <
       let q = Query.make({
         tableName: "",
         indexName: sharedDynamoIndexName,
-        // A collection is over its members' secondary indexes — GSIs.
-        globalIndex: true,
         pkField: sharedPkField!,
         pkValue,
         skField: sharedSkField,

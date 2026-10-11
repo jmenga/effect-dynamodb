@@ -35,7 +35,12 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { refuseRepeatedItems, transactItemTarget } from "../src/internal/TransactWriteOps.js"
+import {
+  diagnosedValidationError,
+  diagnoseRejection,
+  type Sent,
+  transactItemTarget,
+} from "../src/internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -45,9 +50,13 @@ import {
   awsValidationException,
   DDB_ITEM_SIZE,
   DDB_ITEM_SIZE_UPDATE,
+  DDB_REPEATED_ITEM,
   DDB_SORT_KEY_AWS,
   DDB_SORT_KEY_LOCAL,
   DDB_TOO_MANY_ITEMS,
+  ddbBetweenReversed,
+  ddbEmptyIndexKey,
+  ddbEmptyTableKey,
   ddbPayloadTooLarge,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
@@ -354,6 +363,44 @@ const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
 beforeEach(() => {
   vi.resetAllMocks()
 })
+
+/**
+ * A query answered as DynamoDB answers it (observed on DynamoDB Local): a
+ * consistent read of `gsi1`, an empty key value or a reversed `BETWEEN` (by
+ * UTF-8 bytes) is rejected with DynamoDB's own message; anything else finds
+ * nothing.
+ */
+const localQueryRules = async (input: any) => {
+  if (input.ConsistentRead === true && input.IndexName === "gsi1") {
+    throw awsValidationException("Consistent read cannot be true when querying a GSI")
+  }
+  const values = input.ExpressionAttributeValues ?? {}
+  const sk = input.ExpressionAttributeNames?.["#sk"]
+  for (const token of [":sk", ":sk1", ":sk2"]) {
+    if (values[token]?.S === "") {
+      throw awsValidationException(
+        input.IndexName === undefined
+          ? ddbEmptyTableKey(sk)
+          : ddbEmptyIndexKey(input.IndexName, sk),
+      )
+    }
+  }
+  const low = values[":sk1"]?.S
+  const high = values[":sk2"]?.S
+  if (low !== undefined && high !== undefined) {
+    const utf8 = new TextEncoder()
+    const [l, h] = [utf8.encode(low), utf8.encode(high)]
+    let order = l.length - h.length
+    for (let i = 0; i < Math.min(l.length, h.length); i++) {
+      if (l[i] !== h[i]) {
+        order = l[i]! - h[i]!
+        break
+      }
+    }
+    if (order > 0) throw awsValidationException(ddbBetweenReversed(low, high))
+  }
+  return { Items: [] }
+}
 
 // ---------------------------------------------------------------------------
 // Helper to build mock query results
@@ -1122,30 +1169,58 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("refuses additional items that repeat one item, before writing (#133)", () =>
-      Effect.gen(function* () {
-        const twice = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
-          additionalItems: [
-            Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
-            Watermarks.put({ writerId: "ingest-1", lastSeq: 2 }),
-          ],
-        }).pipe(Effect.flip)
-        expect(twice._tag).toBe("ValidationError")
-        expect((twice as ValidationError).entityType).toBe("Watermark")
-        expect(String((twice as ValidationError).cause)).toContain(
-          "touches one item more than once",
-        )
+    it.effect(
+      "additional items that repeat one item: DynamoDB's rejection, named (#133, #144)",
+      () =>
+        Effect.gen(function* () {
+          // Sent as built: DynamoDB rejects a transaction touching one item twice.
+          mockTransactWriteItems.mockRejectedValueOnce(awsValidationException(DDB_REPEATED_ITEM))
+          const twice = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+            additionalItems: [
+              Watermarks.put({ writerId: "ingest-1", lastSeq: 1 }),
+              Watermarks.put({ writerId: "ingest-1", lastSeq: 2 }),
+            ],
+          }).pipe(Effect.flip)
+          expect(twice._tag).toBe("ValidationError")
+          expect((twice as ValidationError).entityType).toBe("Watermark")
+          expect((twice as ValidationError).operation).toBe("EventStore.append")
+          expect(String((twice as ValidationError).cause)).toContain(
+            "touches one item more than once — operation 0 (Watermark) and operation 1 (Watermark)",
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
 
-        // A versioned retain put repeated: refused too, never judged a lost race.
-        const retained = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
-          additionalItems: [
-            Registrations.put({ regId: "r-1", code: "a" }),
-            Registrations.put({ regId: "r-1", code: "a" }),
-          ],
-        }).pipe(Effect.flip)
-        expect(retained._tag).toBe("ValidationError")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
-      }).pipe(Effect.provide(TestLayer)),
+    it.effect(
+      "a repeated item reported as a conditional failure is never retried as a race (#144)",
+      () =>
+        Effect.gen(function* () {
+          // DynamoDB applies the operations in order; a repeat whose guard then
+          // fails comes back as `[None, …, ConditionalCheckFailed]` — what a lost
+          // race looks like. It is diagnosed before the conflict reading, once.
+          mockTransactWriteItems.mockImplementation(async (input: any) =>
+            Promise.reject(
+              awsTransactionCanceled(
+                input.TransactItems.map((_: unknown, i: number) =>
+                  i === input.TransactItems.length - 1
+                    ? { Code: "ConditionalCheckFailed" }
+                    : { Code: "None" },
+                ),
+              ),
+            ),
+          )
+          const retained = yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+            additionalItems: [
+              Registrations.put({ regId: "r-1", code: "a" }),
+              Registrations.put({ regId: "r-1", code: "a" }),
+            ],
+          }).pipe(Effect.flip)
+          expect(retained._tag).toBe("ValidationError")
+          expect(String((retained as ValidationError).cause)).toContain(
+            "touches one item more than once",
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("an append over DynamoDB's 4 MB is diagnosed, naming the largest items (#144)", () =>
@@ -1202,57 +1277,56 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("an additional item repeating a stream item is refused by the same check", () =>
+    it.effect("an additional item repeating a stream item is named by the same diagnosis", () =>
       Effect.gen(function* () {
         // No entity key composes to a stream key (names prefix every composite),
-        // so the stream-side targets are proven against the check directly.
+        // so the stream-side targets are proven against the diagnosis directly.
         const key = {
           pk: { S: "$cricket#v1#match#m-1" },
           sk: { S: "$cricket#v1#match.event_1#0000000001" },
         }
-        const error = yield* refuseRepeatedItems(
-          [
-            transactItemTarget(
-              { Put: { TableName: "events-table", Item: { ...key, data: { S: "x" } } } },
-              "events-table",
-              ["pk", "sk"],
-              "match.event",
-              "the event at version 1",
-            ),
-            transactItemTarget(
-              { Delete: { TableName: "events-table", Key: key } },
-              "events-table",
-              ["pk", "sk"],
-              "Watermark",
-              "operation 0 (Watermark)",
-            ),
-          ],
-          "EventStore.append",
-        ).pipe(Effect.flip)
+        const rejected = new DynamoError({
+          operation: "TransactWriteItems",
+          cause: awsValidationException(DDB_REPEATED_ITEM),
+        })
+        const sent = (tables: readonly [string, string]): Sent => {
+          const items = [
+            { Put: { TableName: tables[0], Item: { ...key, data: { S: "x" } } } },
+            { Delete: { TableName: tables[1], Key: key } },
+          ]
+          return {
+            _tag: "Transaction",
+            items,
+            targets: () => [
+              transactItemTarget(
+                items[0]!,
+                tables[0],
+                ["pk", "sk"],
+                "match.event",
+                "the event at version 1",
+              ),
+              transactItemTarget(
+                items[1]!,
+                tables[1],
+                ["pk", "sk"],
+                "Watermark",
+                "operation 0 (Watermark)",
+              ),
+            ],
+          }
+        }
+        const diagnosis = diagnoseRejection(rejected, sent(["events-table", "events-table"]))
+        expect(diagnosis?._tag).toBe("RepeatedItem")
+        const error = diagnosedValidationError(diagnosis!, rejected, {
+          operation: "EventStore.append",
+          entityType: "match.event",
+        })
         expect(error.entityType).toBe("match.event")
         expect(String(error.cause)).toContain(
           "the event at version 1 and operation 0 (Watermark) both target the item",
         )
-        // A different table is a different item.
-        yield* refuseRepeatedItems(
-          [
-            transactItemTarget(
-              { Delete: { TableName: "a", Key: key } },
-              "a",
-              ["pk", "sk"],
-              "X",
-              "x",
-            ),
-            transactItemTarget(
-              { Delete: { TableName: "b", Key: key } },
-              "b",
-              ["pk", "sk"],
-              "X",
-              "y",
-            ),
-          ],
-          "EventStore.append",
-        )
+        // A different table is a different item: unconfirmed, passed through.
+        expect(diagnoseRejection(rejected, sent(["a", "b"]))).toBeUndefined()
       }),
     )
 
@@ -6010,7 +6084,7 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("refuses an empty, non-string, oversized or throwing key before writing", () =>
+    it.effect("refuses a non-string or throwing key before writing", () =>
       Effect.gen(function* () {
         const withKey = (key: (event: unknown) => unknown) =>
           EventStore.makeStream({
@@ -6021,8 +6095,7 @@ describe("EventStore stream indexes (#140)", () => {
             indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: key as () => string } },
           })
         const cases: ReadonlyArray<[(event: unknown) => unknown, RegExp]> = [
-          [() => "", /empty string/],
-          [() => 42, /non-empty string/],
+          [() => 42, /must be a string or undefined; received 42/],
           [
             () => {
               throw new Error("boom")
@@ -6044,6 +6117,41 @@ describe("EventStore stream indexes (#140)", () => {
         yield* withKey(() => "x".repeat(1025)).append({ matchId: "m-1" }, [started()], 0)
         expect(mockTransactWriteItems).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "an empty key is sent, and DynamoDB's rejection names the index and event (#144)",
+      () =>
+        Effect.gen(function* () {
+          const Empty = EventStore.makeStream({
+            table: EventsTable,
+            streamName: "KeyCheck",
+            events: [MatchStarted],
+            streamId: { composite: ["matchId"] },
+            indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: () => "" } },
+          })
+          const rejection = awsValidationException(ddbEmptyIndexKey("lsi1", "lsi1sk"))
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const error = yield* Empty.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.operation).toBe("EventStore.append.indexes")
+          expect(String(failure.cause)).toContain(
+            'The key of index "byKey" for the event at version 1 is an empty string',
+          )
+          expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+          // The empty key was sent as derived.
+          const sent = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+          expect(sent.lsi1sk).toEqual({ S: "" })
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+
+          // The message without an empty key in the request: unconfirmed, passed through.
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const unconfirmed = yield* MatchEvents.append({ matchId: "m-1" }, [started()], 0).pipe(
+            Effect.flip,
+          )
+          expect(unconfirmed._tag).toBe("DynamoError")
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect(
@@ -6224,24 +6332,32 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("queries a GSI by its pk attribute and refuses consistentRead on it", () =>
-      Effect.gen(function* () {
-        mockQuery.mockResolvedValue({ Items: [] })
-        yield* IndexedMatch.query.index("byResult", { matchId: "m-1" }).pipe(Query.collect)
-        const call = mockQuery.mock.calls[0]![0]
-        expect(call.IndexName).toBe("gsi1")
-        expect(Object.values(call.ExpressionAttributeNames)).toContain("gsi1pk")
-        expect(fromAttributeMap(call.ExpressionAttributeValues)[":pk"]).toBe(pk)
-        expect(call.ConsistentRead).toBeUndefined()
+    it.effect(
+      "queries a GSI by its pk attribute; DynamoDB's refusal of consistentRead is named",
+      () =>
+        Effect.gen(function* () {
+          mockQuery.mockImplementation(localQueryRules)
+          yield* IndexedMatch.query.index("byResult", { matchId: "m-1" }).pipe(Query.collect)
+          const call = mockQuery.mock.calls[0]![0]
+          expect(call.IndexName).toBe("gsi1")
+          expect(Object.values(call.ExpressionAttributeNames)).toContain("gsi1pk")
+          expect(fromAttributeMap(call.ExpressionAttributeValues)[":pk"]).toBe(pk)
+          expect(call.ConsistentRead).toBeUndefined()
 
-        const error = yield* IndexedMatch.readIndex(
-          "byResult",
-          { matchId: "m-1" },
-          { consistentRead: true },
-        ).pipe(Effect.flip)
-        expect(error._tag).toBe("ValidationError")
-        expect(mockQuery).toHaveBeenCalledOnce()
-      }).pipe(Effect.provide(TestLayer)),
+          const error = yield* IndexedMatch.readIndex(
+            "byResult",
+            { matchId: "m-1" },
+            { consistentRead: true },
+          ).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect((error as ValidationError).operation).toBe("query.consistentRead")
+          expect(String((error as ValidationError).cause)).toContain(
+            'index "gsi1" is a global secondary index',
+          )
+          // Sent, and rejected by DynamoDB: nothing is refused before it rules.
+          expect(mockQuery).toHaveBeenCalledTimes(2)
+          expect(mockQuery.mock.calls[1]![0].ConsistentRead).toBe(true)
+        }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("readIndex applies between, reverse and limit", () =>
@@ -6286,13 +6402,9 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("readIndex refuses empty and inverted key bounds before sending", () =>
+    it.effect("readIndex refuses non-string key bounds before sending", () =>
       Effect.gen(function* () {
         const refused: ReadonlyArray<EventStore.ReadIndexOptions> = [
-          { beginsWith: "" },
-          { between: ["", "INN#0009"] },
-          { between: ["INN#0001", ""] },
-          { between: ["INN#0009", "INN#0001"] },
           { between: ["INN#0001"] } as never,
           { between: ["INN#0001", 9] } as never,
           { beginsWith: 1 } as never,
@@ -6310,36 +6422,71 @@ describe("EventStore stream indexes (#140)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("readIndex orders between bounds by UTF-8 bytes, as DynamoDB does", () =>
+    it.effect(
+      "readIndex sends empty and inverted key bounds; DynamoDB's rejection is named (#144)",
+      () =>
+        Effect.gen(function* () {
+          mockQuery.mockImplementation(localQueryRules)
+          const empty = 'key attribute "lsi1sk" of index "lsi1" with an empty string'
+          const cases: ReadonlyArray<readonly [EventStore.ReadIndexOptions, string]> = [
+            [{ beginsWith: "" }, empty],
+            [{ between: ["", "INN#0009"] }, empty],
+            [{ between: ["INN#0001", ""] }, empty],
+            [
+              { between: ["INN#0009", "INN#0001"] },
+              `between's lower bound "INN#0009" sorts after its upper bound "INN#0001" on "lsi1sk"`,
+            ],
+          ]
+          for (const [options, named] of cases) {
+            const error = yield* IndexedMatch.readIndex(
+              "byInnings",
+              { matchId: "m-1" },
+              options,
+            ).pipe(Effect.flip)
+            expect(error._tag).toBe("ValidationError")
+            const failure = error as ValidationError
+            expect(failure.operation).toBe("EventStore.readIndex")
+            expect(String(failure.cause)).toContain('EventStream "IndexedMatch" index "byInnings"')
+            expect(String(failure.cause)).toContain(named)
+            expect(((failure.cause as Error).cause as DynamoError)._tag).toBe("DynamoError")
+          }
+          expect(mockQuery).toHaveBeenCalledTimes(cases.length)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("readIndex confirms a reversed between by UTF-8 bytes, as DynamoDB orders", () =>
       Effect.gen(function* () {
-        mockQuery.mockResolvedValue({ Items: [] })
+        mockQuery.mockImplementation(localQueryRules)
         // UTF-16 code units put U+FFFF after U+1F600 (a surrogate pair, 0xD83D…);
         // UTF-8 bytes — DynamoDB's order — put it before (EF… < F0…).
         yield* IndexedMatch.readIndex(
           "byInnings",
           { matchId: "m-1" },
-          {
-            between: ["￿", "\u{1F600}"],
-          },
+          { between: ["\uFFFF", "\u{1F600}"] },
         )
         // Equal bounds are a valid (point) range.
         yield* IndexedMatch.readIndex(
           "byInnings",
           { matchId: "m-1" },
-          {
-            between: ["INN#0001", "INN#0001"],
-          },
+          { between: ["INN#0001", "INN#0001"] },
         )
-        expect(mockQuery).toHaveBeenCalledTimes(2)
         const reversed = yield* IndexedMatch.readIndex(
           "byInnings",
           { matchId: "m-1" },
-          {
-            between: ["\u{1F600}", "￿"],
-          },
+          { between: ["\u{1F600}", "\uFFFF"] },
         ).pipe(Effect.flip)
         expect(reversed._tag).toBe("ValidationError")
-        expect(mockQuery).toHaveBeenCalledTimes(2)
+        expect(String((reversed as ValidationError).cause)).toContain("sorts after its upper bound")
+        expect(mockQuery).toHaveBeenCalledTimes(3)
+
+        // DynamoDB's message on bounds in order (by UTF-8): unconfirmed, passed through.
+        mockQuery.mockRejectedValueOnce(awsValidationException(ddbBetweenReversed("a", "b")))
+        const unconfirmed = yield* IndexedMatch.readIndex(
+          "byInnings",
+          { matchId: "m-1" },
+          { between: ["\uFFFF", "\u{1F600}"] },
+        ).pipe(Effect.flip)
+        expect(unconfirmed._tag).toBe("DynamoError")
       }).pipe(Effect.provide(TestLayer)),
     )
 

@@ -14,21 +14,34 @@ import {
   type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
-  diagnoseWriteFailure,
+  diagnoseRejection,
   explainDiagnosis,
   rangeKeysOf,
+  type SentRead,
+  type SentTable,
   type SentWrite,
   targetsFor,
 } from "../src/internal/WriteDiagnosis.js"
 import {
   awsTransactionCanceled,
   awsValidationException,
+  DDB_CONSISTENT_READ_GSI,
+  DDB_CONSISTENT_SCAN_GSI,
   DDB_ITEM_SIZE,
   DDB_ITEM_SIZE_UPDATE,
+  DDB_REPEATED_BATCH_ITEM,
+  DDB_REPEATED_ITEM,
   DDB_SORT_KEY_AWS,
   DDB_SORT_KEY_LOCAL,
+  DDB_TABLE_KEY_SIZE_LOCAL,
   DDB_TOO_MANY_ITEMS,
+  ddbBetweenReversed,
+  ddbEmptyIndexKey,
+  ddbEmptyTableKey,
+  ddbExpressionTooLong,
   ddbPayloadTooLarge,
+  ddbTooManyInOperands,
+  ddbTooManyOperators,
 } from "./helpers/MockDynamoClient.js"
 
 // --- Fixtures ---------------------------------------------------------------
@@ -96,7 +109,7 @@ const single = (item: TransactWriteItem): SentWrite => ({
 
 const RANGE_KEYS = ["sk", "gsi1sk"]
 
-const diagnose = (error: unknown, sent: SentWrite) => diagnoseWriteFailure(error, sent, RANGE_KEYS)
+const diagnose = (error: unknown, sent: SentWrite) => diagnoseRejection(error, sent, RANGE_KEYS)
 
 const expectTag = <T extends Diagnosis["_tag"]>(
   diagnosis: Diagnosis | undefined,
@@ -110,7 +123,7 @@ const expectTag = <T extends Diagnosis["_tag"]>(
 
 describe("WriteDiagnosis (#144)", () => {
   describe("shape 1 — PutItem over 400 KB", () => {
-    it("names the one item, with its lower-bound size", () => {
+    it("names the one item, with its exact size", () => {
       const item = put("a", 410_000)
       const d = expectTag(diagnose(rejected(DDB_ITEM_SIZE), single(item)), "ItemTooLarge")
       expect(d.target.key).toBe("pk=p#a, sk=s")
@@ -120,12 +133,27 @@ describe("WriteDiagnosis (#144)", () => {
       expect(explainDiagnosis(d, "put")).toContain("the item of the item, at pk=p#a, sk=s")
     })
 
-    it("the message is the evidence: an item under the lower bound is still named, not likely", () => {
+    it("the message is the evidence: an item measured under the limit is still named, not likely", () => {
       const d = expectTag(
         diagnose(rejected(DDB_ITEM_SIZE), single(put("a", 400_000))),
         "ItemTooLarge",
       )
       expect(d.likely).toBe(false)
+    })
+  })
+
+  describe("shape 1 — item size excludes expressions", () => {
+    it("a Put's condition counts toward the transaction, not toward its 400 KB", () => {
+      const item: TransactWriteItem = {
+        Put: {
+          ...put("a", 409_600).Put!,
+          ConditionExpression: "attribute_not_exists(#pk)",
+          ExpressionAttributeNames: { "#pk": "pk" },
+        },
+      }
+      const d = expectTag(diagnose(rejected(DDB_ITEM_SIZE), single(item)), "ItemTooLarge")
+      expect(d.bytes).toBe(409_600)
+      expect(explainDiagnosis(d, "put")).toContain(", 409600 bytes by DynamoDB's item-size rules.")
     })
   })
 
@@ -153,7 +181,7 @@ describe("WriteDiagnosis (#144)", () => {
       expect(d.likely).toBe(false)
     })
 
-    it("none over by the lower bound: the largest Put, named as the likely culprit", () => {
+    it("none measured over: the largest Put, named as the likely culprit", () => {
       const items = [put("a", 1000), put("b", 300_000), put("c", 2000)]
       const d = expectTag(diagnose(rejected(DDB_ITEM_SIZE), transaction(items)), "ItemTooLarge")
       expect(d.target.source).toBe("operation 1 (Doc)")
@@ -221,9 +249,9 @@ describe("WriteDiagnosis (#144)", () => {
       const sent: SentWrite = { _tag: "Batch", items, targets: () => targets(items) }
       const d = expectTag(diagnose(rejected(DDB_ITEM_SIZE), sent), "ItemTooLarge")
       expect(d.target.key).toBe("pk=p#c, sk=s")
-      expect(explainDiagnosis(d, "batchWrite", { partial: true })).toContain(
-        "earlier requests of the operation may already have been written",
-      )
+      expect(
+        explainDiagnosis(d, "batchWrite", { committed: "the batch had written nothing before it" }),
+      ).toContain("This request wrote nothing; the batch had written nothing before it.")
     })
   })
 
@@ -267,6 +295,56 @@ describe("WriteDiagnosis (#144)", () => {
       const text = explainDiagnosis(d, "transactWrite")
       expect(text).toContain("(it reported 4200000 bytes)")
       expect(text).toContain("counts twice")
+    })
+
+    it("measures exactly, expressions and their substitutions included", () => {
+      const conditioned: TransactWriteItem = {
+        Put: {
+          ...put("a", 1000).Put!,
+          ConditionExpression: "attribute_not_exists(#pk)",
+          ExpressionAttributeNames: { "#pk": "pk" },
+        },
+      }
+      const items = [conditioned, update("b", { attr: "v".repeat(500) }), del("c")]
+      const d = expectTag(
+        diagnose(rejected(ddbPayloadTooLarge(4_200_000)), transaction(items)),
+        "TransactionTooLarge",
+      )
+      // Put: 1,000 + condition 25 + "pk" 2. Update: key 8 + "SET #a0 = :v0" 13
+      // + "attr" 4 + 500. Delete: key 8.
+      expect(d.measured).toBe(1027 + 525 + 8)
+    })
+
+    it("measured over the limit: no disagreement is claimed", () => {
+      const items = Array.from({ length: 11 }, (_, i) => put(String(i), 400_000))
+      const d = expectTag(
+        diagnose(rejected(ddbPayloadTooLarge(4_400_000)), transaction(items)),
+        "TransactionTooLarge",
+      )
+      expect(d.measured).toBe(4_400_000)
+      const text = explainDiagnosis(d, "transactWrite")
+      expect(text).toContain("the library measures the request at 4400000 bytes")
+      expect(text).toContain("running total in request order")
+      expect(text).not.toContain("disagrees")
+    })
+
+    it("measured within the limit: the error gives both sizes and says the model disagrees", () => {
+      const items = [put("a", 4_000_000)]
+      const d = expectTag(
+        diagnose(rejected(ddbPayloadTooLarge(4_194_305)), transaction(items)),
+        "TransactionTooLarge",
+      )
+      expect(d.measured).toBe(4_000_000)
+      expect(d.reported).toBe(4_194_305)
+      const text = explainDiagnosis(d, "batchWrite", {
+        committed: "the batch's 2 earlier transactions were already written",
+      })
+      expect(text).toContain("(it reported 4194305 bytes)")
+      expect(text).toContain("the library measures the request at 4000000 bytes")
+      expect(text).toContain("size model disagrees with DynamoDB's for this request")
+      expect(text).toContain(
+        "This request wrote nothing; the batch's 2 earlier transactions were already written.",
+      )
     })
 
     it("without a parsable size, still diagnosed", () => {
@@ -446,6 +524,506 @@ describe("WriteDiagnosis (#144)", () => {
         expect(failure.operation).toBe("op")
         expect(String(failure.cause)).toContain("operation 0 (Doc), at pk=p#a, sk=s")
         expect((failure.cause as Error).cause).toBe(original)
+      }),
+    )
+  })
+
+  describe("table key size — DynamoDB Local's wording (#144 S27)", () => {
+    it("recognised request-wide and as a cancellation reason, confirmed by the sort key's bytes", () => {
+      const long: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p" }, sk: { S: "s".repeat(1025) } } },
+      }
+      const d = expectTag(
+        diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(long)),
+        "SortKeyTooLong",
+      )
+      expect(d.attribute).toBe("sk")
+      expect(d.bytes).toBe(1025)
+      expectTag(
+        diagnose(
+          cancelled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_TABLE_KEY_SIZE_LOCAL },
+          ]),
+          transaction([put("a"), long]),
+        ),
+        "SortKeyTooLong",
+      )
+    })
+
+    it("a partition key over its limit (no sort key over 1024): passed through", () => {
+      const longPk: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p".repeat(2049) }, sk: { S: "s" } } },
+      }
+      expect(diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(longPk))).toBeUndefined()
+    })
+  })
+
+  describe("one operation per item (P2 / P2a / P2b)", () => {
+    it("a transaction naming one item twice: both entries named", () => {
+      const d = expectTag(
+        diagnose(rejected(DDB_REPEATED_ITEM), transaction([put("a"), put("b"), del("a")])),
+        "RepeatedItem",
+      )
+      expect(d.first.source).toBe("operation 0 (Doc)")
+      expect(d.second.source).toBe("operation 2 (Doc)")
+      expect(d.batch).toBe(false)
+      const text = explainDiagnosis(d, "transactWrite")
+      expect(text).toContain(
+        "the transaction touches one item more than once — operation 0 (Doc) and operation 2 (Doc) " +
+          "both target the item at pk=p#a, sk=s",
+      )
+      expect(text).toContain("Nothing was written.")
+    })
+
+    it("DynamoDB's message on a request with no repeat: passed through", () => {
+      expect(
+        diagnose(rejected(DDB_REPEATED_ITEM), transaction([put("a"), put("b")])),
+      ).toBeUndefined()
+    })
+
+    it("a repeat reported as a conditional failure (P2a) is still a repeat — never a lost race", () => {
+      const d = expectTag(
+        diagnose(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]),
+          transaction([put("a"), put("a")]),
+        ),
+        "RepeatedItem",
+      )
+      expect(d.first.source).toBe("operation 0 (Doc)")
+      // Without a repeat, a conditional failure stays the site's to explain.
+      expect(
+        diagnose(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]),
+          transaction([put("a"), put("b")]),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("a batch request naming one item twice (P2b)", () => {
+      const items = batchEntries({
+        t: [
+          { PutRequest: { Item: put("a").Put!.Item! } },
+          { DeleteRequest: { Key: del("a").Delete!.Key! } },
+        ],
+      })
+      const d = expectTag(
+        diagnose(rejected(DDB_REPEATED_BATCH_ITEM), {
+          _tag: "Batch",
+          items,
+          targets: () => targets(items),
+        }),
+        "RepeatedItem",
+      )
+      expect(d.batch).toBe(true)
+      expect(explainDiagnosis(d, "batchWrite")).toContain(
+        "the batch request touches one item more than once",
+      )
+    })
+
+    it("a TransactGetItems reading one item twice", () => {
+      const keys = [del("a"), del("b"), del("a")]
+      const d = expectTag(
+        diagnose(rejected(DDB_REPEATED_ITEM), {
+          _tag: "TransactGet",
+          count: keys.length,
+          targets: () => targets(keys),
+        }),
+        "RepeatedItem",
+      )
+      expect(d.second.source).toBe("operation 2 (Doc)")
+    })
+
+    it("a different table is a different item", () => {
+      const a = put("a")
+      const other: TransactWriteItem = { Put: { ...a.Put!, TableName: "u" } }
+      expect(diagnose(rejected(DDB_REPEATED_ITEM), transaction([a, other]))).toBeUndefined()
+    })
+  })
+
+  describe("expression limits (P3 / P4 / P5)", () => {
+    const conditioned = (expression: string): TransactWriteItem => ({
+      Put: { ...put("a").Put!, ConditionExpression: expression },
+    })
+    const ors = (n: number) => Array.from({ length: n }, (_, i) => `#a = :v${i}`).join(" OR ")
+
+    it("a condition over 4,096 characters: its length, and the caller's share", () => {
+      const caller = `#a = :${"v".repeat(4100)}`
+      const expression = `attribute_not_exists(#pk) AND (${caller})`
+      const d = expectTag(
+        diagnoseRejection(rejected(ddbExpressionTooLong("Condition", expression.length)), {
+          ...single(conditioned(expression)),
+          callerCondition: () => caller,
+        } as SentWrite),
+        "ExpressionTooLarge",
+      )
+      expect(d.expression).toBe("ConditionExpression")
+      expect(d.limit).toBe("length")
+      expect(d.measured).toBe(expression.length)
+      const text = explainDiagnosis(d, "put")
+      expect(text).toContain(`it is ${expression.length} characters, over DynamoDB's limit of 4096`)
+      expect(text).toContain(`The .condition() alone is ${caller.length} characters`)
+      expect(text).toContain("the library's own guard needs room beside it")
+    })
+
+    it("the whole condition the caller's: no guard is blamed", () => {
+      const expression = ors(160)
+      const d = expectTag(
+        diagnoseRejection(rejected(ddbTooManyOperators("Condition")), {
+          ...single(conditioned(expression)),
+          callerCondition: () => expression,
+        } as SentWrite),
+        "ExpressionTooLarge",
+      )
+      expect(d.limit).toBe("operators")
+      expect(d.measured).toBe(319)
+      const text = explainDiagnosis(d, "delete")
+      expect(text).toContain("it holds 319 operators and functions, over DynamoDB's limit of 300")
+      expect(text).toContain("Simplify the condition.")
+      expect(text).not.toContain("own guard")
+    })
+
+    it("an IN over 100 operands", () => {
+      const list = Array.from({ length: 101 }, (_, i) => `:v${i}`).join(", ")
+      const d = expectTag(
+        diagnose(
+          rejected(ddbTooManyInOperands("Condition", 101)),
+          single(conditioned(`#a IN (${list})`)),
+        ),
+        "ExpressionTooLarge",
+      )
+      expect(d.limit).toBe("inOperands")
+      expect(d.measured).toBe(101)
+    })
+
+    it("an update expression, by its kind; the transaction's first culprit is named", () => {
+      const wide = `SET ${Array.from({ length: 301 }, (_, i) => `#a${i} = #a${i} + :v`).join(", ")}`
+      const items: Array<TransactWriteItem> = [
+        put("a"),
+        { Update: { ...update("b").Update!, UpdateExpression: wide } },
+      ]
+      const d = expectTag(
+        diagnose(rejected(ddbTooManyOperators("Update")), transaction(items)),
+        "ExpressionTooLarge",
+      )
+      expect(d.expression).toBe("UpdateExpression")
+      expect(d.target.source).toBe("operation 1 (Doc)")
+      expect(explainDiagnosis(d, "update")).toContain("Split the update into smaller ones.")
+    })
+
+    it("no expression over the limit DynamoDB named: passed through", () => {
+      expect(
+        diagnose(rejected(ddbExpressionTooLong("Condition", 4097)), single(conditioned("#a = :v"))),
+      ).toBeUndefined()
+      // The kind matters: a long condition does not confirm an update's rejection.
+      expect(
+        diagnose(
+          rejected(ddbExpressionTooLong("Update")),
+          single(conditioned(`#a = :${"v".repeat(4100)}`)),
+        ),
+      ).toBeUndefined()
+    })
+  })
+
+  describe("an empty key value on a write (P11)", () => {
+    it("names the item, the attribute and the index DynamoDB named", () => {
+      const item: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p#a" }, sk: { S: "s" }, lsi1sk: { S: "" } } },
+      }
+      const d = expectTag(
+        diagnose(rejected(ddbEmptyIndexKey("lsi1", "lsi1sk")), transaction([put("b"), item])),
+        "EmptyKey",
+      )
+      expect(d.attribute).toBe("lsi1sk")
+      expect(d.index).toBe("lsi1")
+      expect(d.target.source).toBe("operation 1 (Doc)")
+      expect(explainDiagnosis(d, "put")).toContain(
+        'it writes an empty value to the key attribute "lsi1sk" of index "lsi1"',
+      )
+    })
+
+    it("a table key", () => {
+      const item: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p" }, sk: { S: "" } } },
+      }
+      const d = expectTag(diagnose(rejected(ddbEmptyTableKey("sk")), single(item)), "EmptyKey")
+      expect(d.index).toBeUndefined()
+    })
+
+    it("no empty value for that attribute in the request: passed through", () => {
+      expect(
+        diagnose(rejected(ddbEmptyIndexKey("lsi1", "lsi1sk")), single(put("a"))),
+      ).toBeUndefined()
+    })
+  })
+
+  describe("reads (P7 / P8 / P10)", () => {
+    const read = (input: SentRead["input"], scan = false): SentRead => ({
+      _tag: "Read",
+      scan,
+      input,
+    })
+    const query = (condition: string, values: Record<string, string>, index?: string) =>
+      read({
+        IndexName: index,
+        KeyConditionExpression: condition,
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "lsi1sk" },
+        ExpressionAttributeValues: Object.fromEntries(
+          Object.entries(values).map(([k, v]) => [k, { S: v }]),
+        ),
+      })
+    const queryRejected = (message: string) =>
+      new DynamoValidationError({ operation: "Query", cause: awsValidationException(message) })
+
+    it("a consistent read of a GSI: a query or a scan", () => {
+      const d = expectTag(
+        diagnoseRejection(
+          queryRejected(DDB_CONSISTENT_READ_GSI),
+          read({ IndexName: "gsi1", ConsistentRead: true }),
+        ),
+        "ConsistentReadOnGsi",
+      )
+      expect(d.index).toBe("gsi1")
+      expect(explainDiagnosis(d, "query")).toContain(
+        'index "gsi1" is a global secondary index, which DynamoDB reads only eventually consistently',
+      )
+      expectTag(
+        diagnoseRejection(
+          queryRejected(DDB_CONSISTENT_SCAN_GSI),
+          read({ IndexName: "gsi1", ConsistentRead: true }, true),
+        ),
+        "ConsistentReadOnGsi",
+      )
+      // Not a consistent read, or of the table: unconfirmed.
+      expect(
+        diagnoseRejection(queryRejected(DDB_CONSISTENT_READ_GSI), read({ IndexName: "gsi1" })),
+      ).toBeUndefined()
+      expect(
+        diagnoseRejection(queryRejected(DDB_CONSISTENT_READ_GSI), read({ ConsistentRead: true })),
+      ).toBeUndefined()
+    })
+
+    it("an empty key bound, under begins_with, BETWEEN or a comparison", () => {
+      for (const [condition, values] of [
+        ["#pk = :pk AND begins_with(#sk, :sk)", { ":pk": "p", ":sk": "" }],
+        ["#pk = :pk AND #sk BETWEEN :sk1 AND :sk2", { ":pk": "p", ":sk1": "", ":sk2": "b" }],
+        ["#pk = :pk AND #sk >= :sk", { ":pk": "p", ":sk": "" }],
+      ] as const) {
+        const d = expectTag(
+          diagnoseRejection(
+            queryRejected(ddbEmptyIndexKey("lsi1", "lsi1sk")),
+            query(condition, values, "lsi1"),
+          ),
+          "EmptyKeyBound",
+        )
+        expect(d.attribute).toBe("lsi1sk")
+        expect(d.index).toBe("lsi1")
+      }
+      // No empty value on the attribute DynamoDB named: unconfirmed.
+      expect(
+        diagnoseRejection(
+          queryRejected(ddbEmptyIndexKey("lsi1", "lsi1sk")),
+          query("#pk = :pk AND begins_with(#sk, :sk)", { ":pk": "p", ":sk": "a" }, "lsi1"),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("a reversed BETWEEN, confirmed in DynamoDB's UTF-8 order", () => {
+      const between = "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2"
+      const d = expectTag(
+        diagnoseRejection(
+          queryRejected(ddbBetweenReversed("b", "a")),
+          query(between, { ":pk": "p", ":sk1": "b", ":sk2": "a" }),
+        ),
+        "BetweenReversed",
+      )
+      expect([d.low, d.high, d.attribute]).toEqual(["b", "a", "lsi1sk"])
+      // "￿" sorts before "\u{1F600}" by UTF-8 (after it by UTF-16): in order.
+      expect(
+        diagnoseRejection(
+          queryRejected(ddbBetweenReversed("x", "y")),
+          query(between, { ":pk": "p", ":sk1": "￿", ":sk2": "\u{1F600}" }),
+        ),
+      ).toBeUndefined()
+      expectTag(
+        diagnoseRejection(
+          queryRejected(ddbBetweenReversed("x", "y")),
+          query(between, { ":pk": "p", ":sk1": "\u{1F600}", ":sk2": "￿" }),
+        ),
+        "BetweenReversed",
+      )
+    })
+
+    it("a write's message on a read, or a read's on a write: passed through", () => {
+      expect(
+        diagnoseRejection(queryRejected(DDB_ITEM_SIZE), read({ IndexName: "gsi1" })),
+      ).toBeUndefined()
+      expect(diagnose(rejected(DDB_CONSISTENT_READ_GSI), single(put("a")))).toBeUndefined()
+    })
+  })
+
+  describe("vector-index limits on CreateTable / UpdateTable (AWS quotas; no DynamoDB Local support)", () => {
+    const vectorIndex = (name: string, filters: number) => ({
+      IndexName: name,
+      SearchSchema: [
+        { AttributeName: "__edd_vp__", SearchSchemaElementType: "HASH" },
+        ...Array.from({ length: filters }, (_, i) => ({
+          AttributeName: `f${i}`,
+          SearchSchemaElementType: "INLINE_FILTER",
+        })),
+      ],
+    })
+    const table = (
+      operation: "CreateTable" | "UpdateTable",
+      indexes: ReadonlyArray<ReturnType<typeof vectorIndex>>,
+      declared = indexes.length,
+      existing?: number,
+    ): SentTable => ({
+      _tag: "Table",
+      operation,
+      vectorIndexes: indexes,
+      sharers: (name) => (name === "vec1" ? ["Product", "Article"] : ["Product"]),
+      declared,
+      existing,
+    })
+    const tableRejected = (message: string, name = "ValidationException") =>
+      new DynamoValidationError({
+        operation: "CreateTable",
+        cause: Object.assign(new Error(message), { name }),
+      })
+
+    it("too many inline filters: the index, its filters and its sharers", () => {
+      const d = expectTag(
+        diagnoseRejection(
+          tableRejected("Vector index vec1 exceeds the maximum number of inline filter attributes"),
+          table("CreateTable", [vectorIndex("vec0", 3), vectorIndex("vec1", 19)]),
+        ),
+        "VectorIndexFilters",
+      )
+      expect(d.index).toBe("vec1")
+      expect(d.filters).toHaveLength(19)
+      expect(d.sharers).toEqual(["Product", "Article"])
+      const text = explainDiagnosis(d, 'db.tables create of "t"')
+      expect(text).toContain('DynamoDB rejected vector index "vec1": it declares 19 INLINE_FILTER')
+      expect(text).toContain("(Product, Article)")
+      expect(text).toContain("The table was not created.")
+      // No index over 18 filters in the request: unconfirmed.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index exceeds the maximum number of inline filters"),
+          table("CreateTable", [vectorIndex("vec0", 18)]),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("too many vector indexes on CreateTable: confirmed by count, the stated quota honoured", () => {
+      const six = Array.from({ length: 6 }, (_, i) => vectorIndex(`vec${i}`, 1))
+      const d = expectTag(
+        diagnoseRejection(
+          tableRejected("Too many vector indexes: limit exceeded", "LimitExceededException"),
+          table("CreateTable", six),
+        ),
+        "VectorIndexCount",
+      )
+      expect(d.indexes).toHaveLength(6)
+      expect(explainDiagnosis(d, "create")).toContain(
+        "the quota is adjustable through AWS Service Quotas",
+      )
+      // A raised quota: six indexes are within a stated limit of 8, so unconfirmed.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index limit of 8 exceeded"),
+          table("CreateTable", six),
+        ),
+      ).toBeUndefined()
+      // Five, the default quota: unconfirmed without a stated lower limit.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index limit exceeded"),
+          table("CreateTable", six.slice(0, 5)),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("too many vector indexes on UpdateTable: confirmed by the indexes the table already has", () => {
+      const d = expectTag(
+        diagnoseRejection(
+          tableRejected("Vector index limit exceeded for table"),
+          table("UpdateTable", [vectorIndex("vec2", 1)], 6, 5),
+        ),
+        "VectorIndexCount",
+      )
+      const text = explainDiagnosis(d, 'addVectorIndex("vec2")')
+      expect(text).toContain('adding vector index "vec2" (Product)')
+      expect(text).toContain("the table already has 5 vector indexes")
+      expect(text).toContain("declare 6 in all")
+      expect(text).toContain("Nothing was changed.")
+      // Room under the default quota of 5: unconfirmed.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index limit exceeded for table"),
+          table("UpdateTable", [vectorIndex("vec2", 1)], 6, 2),
+        ),
+      ).toBeUndefined()
+      // The table's indexes could not be read back: unconfirmed.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index limit exceeded for table"),
+          table("UpdateTable", [vectorIndex("vec2", 1)], 6),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("UpdateTable limits that are not the per-table count: passed through", () => {
+      // Another vector index is still being created: a concurrency limit,
+      // whose stated "1" would otherwise read as a quota of one.
+      expect(
+        diagnoseRejection(
+          tableRejected(
+            "Subscriber limit exceeded: Only 1 vector index can be created or deleted " +
+              "simultaneously per table",
+            "LimitExceededException",
+          ),
+          table("UpdateTable", [vectorIndex("vec2", 1)], 2, 1),
+        ),
+      ).toBeUndefined()
+      // A name too long.
+      expect(
+        diagnoseRejection(
+          tableRejected("Vector index name exceeds maximum length of 255 characters"),
+          table("UpdateTable", [vectorIndex("vec2", 1)], 6, 5),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("a rejection not about vector indexes: passed through", () => {
+      expect(
+        diagnoseRejection(
+          tableRejected("Limit exceeded for GSIs"),
+          table("CreateTable", [vectorIndex("vec0", 19)]),
+        ),
+      ).toBeUndefined()
+    })
+  })
+
+  describe("diagnoseFailure — only", () => {
+    it.effect("rewrites only the diagnoses named; any other passes through", () =>
+      Effect.gen(function* () {
+        const rewrite = (diagnosis: Diagnosis, original: unknown) =>
+          diagnosedValidationError(diagnosis, original, { operation: "op", entityType: "Doc" })
+        const sent = () => transaction([put("a"), put("a", 500_000)])
+        const repeat = rejected(DDB_REPEATED_ITEM)
+        const repeated = yield* Effect.fail(repeat).pipe(
+          diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite }),
+          Effect.flip,
+        )
+        expect(repeated).toBeInstanceOf(ValidationError)
+        const size = rejected(DDB_ITEM_SIZE)
+        const passed = yield* Effect.fail(size).pipe(
+          diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite }),
+          Effect.flip,
+        )
+        expect(passed).toBe(size)
       }),
     )
   })

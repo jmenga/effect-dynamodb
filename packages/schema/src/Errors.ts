@@ -276,12 +276,23 @@ export class AggregateDecompositionError extends Data.TaggedError("AggregateDeco
   readonly reason: string
 }> {}
 
-/** Sub-aggregate exceeds DynamoDB's 100-item transaction limit */
+/**
+ * A sub-aggregate's transaction exceeds DynamoDB's 100-item limit. Not
+ * pre-checked: DynamoDB rejects that group whole, and the rejection is
+ * confirmed by counting it. Groups written before it stay written —
+ * `committed` names them.
+ */
 export class AggregateTransactionOverflow extends Data.TaggedError("AggregateTransactionOverflow")<{
   readonly aggregate: string
   readonly subgraph: string
   readonly itemCount: number
   readonly limit: number
+  /**
+   * The sub-aggregates earlier transactions of the same write already
+   * committed (each group is its own transaction, so a multi-group write is
+   * not atomic). Empty: nothing was written.
+   */
+  readonly committed?: ReadonlyArray<string> | undefined
   /** DynamoDB's rejection, when the overflow was diagnosed from it. */
   readonly cause?: unknown
 }> {}

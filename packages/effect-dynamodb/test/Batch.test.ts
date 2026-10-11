@@ -1,3 +1,4 @@
+import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError, type ValidationError } from "@effect-dynamodb/schema/Errors.js"
@@ -7,11 +8,14 @@ import { beforeEach, describe, expect, vi } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactionBytes } from "../src/internal/ItemSize.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import {
   awsValidationException,
   DDB_ITEM_SIZE,
+  DDB_REPEATED_BATCH_ITEM,
+  ddbPayloadTooLarge,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
 
@@ -1180,9 +1184,113 @@ describe("Batch", () => {
         expect(failure.operation).toBe("batchWrite")
         const text = String(failure.cause)
         expect(text).toContain("the item of the put of Order, at pk=")
-        expect(text).toContain("earlier requests of the operation may already have been written")
+        expect(text).toContain(
+          "This request wrote nothing; the batch had written nothing before it.",
+        )
         expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a rejected first chunk of plain requests: nothing written, the later requests not sent (#144)",
+      () =>
+        Effect.gen(function* () {
+          mockBatchWriteItem.mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+          const error = yield* Batch.write([
+            OrderEntity.put({
+              orderId: "big",
+              userId: "u-1",
+              product: "x".repeat(410_000),
+              quantity: 1,
+              status: "pending",
+            }),
+            ...Array.from({ length: 29 }, (_, i) =>
+              UserEntity.put({ userId: `u-${i}`, email: "a@x.io", name: "A", role: "admin" }),
+            ),
+          ]).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toContain(
+            "This request wrote nothing; the batch had written nothing before it, and its 5 " +
+              "later requests were not sent.",
+          )
+          expect(mockBatchWriteItem).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a rejected later chunk of plain requests names the versioned transactions and requests written (#144)",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          mockBatchWriteItem
+            .mockResolvedValueOnce({})
+            .mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+          const error = yield* Batch.write([
+            ...Array.from({ length: 101 }, (_, i) =>
+              VersionedNotes.put({ noteId: `n-${i}`, body: "a" }),
+            ),
+            ...Array.from({ length: 26 }, (_, i) =>
+              UserEntity.put({ userId: `u-${i}`, email: "a@x.io", name: "A", role: "admin" }),
+            ),
+            OrderEntity.put({
+              orderId: "big",
+              userId: "u-1",
+              product: "x".repeat(410_000),
+              quantity: 1,
+              status: "pending",
+            }),
+          ]).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toContain(
+            "This request wrote nothing; the batch had already written its 2 transactions of " +
+              "versioned puts (101 items) and 25 non-versioned requests.",
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(2)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a rejected retry of unprocessed items counts the chunk's requests already written (#144)",
+      () =>
+        Effect.gen(function* () {
+          const big = toAttributeMap({
+            orderId: "big",
+            userId: "u-1",
+            product: "x".repeat(410_000),
+            quantity: 1,
+            status: "pending",
+            pk: "$myapp#v1#order#orderid_big",
+            sk: "$myapp#v1#order",
+            __edd_e__: "Order",
+          })
+          mockBatchWriteItem
+            .mockResolvedValueOnce({
+              UnprocessedItems: { "test-table": [{ PutRequest: { Item: big } }] },
+            })
+            .mockRejectedValueOnce(awsValidationException(DDB_ITEM_SIZE))
+          const fiber = yield* Batch.write(
+            [
+              UserEntity.put({ userId: "u-1", email: "a@x.io", name: "A", role: "admin" }),
+              UserEntity.put({ userId: "u-2", email: "b@x.io", name: "B", role: "admin" }),
+              OrderEntity.put({
+                orderId: "big",
+                userId: "u-1",
+                product: "x".repeat(410_000),
+                quantity: 1,
+                status: "pending",
+              }),
+            ],
+            { baseDelayMs: 1 },
+          ).pipe(Effect.flip, Effect.provide(TestLayer), Effect.forkChild)
+          yield* TestClock.adjust("1 seconds")
+          const error = yield* Fiber.join(fiber)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toContain(
+            "This request wrote nothing; the batch had already written 2 non-versioned requests.",
+          )
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(2)
+        }),
     )
 
     it.effect("an oversized versioned put is named from its transaction's rejection (#144)", () =>
@@ -1200,9 +1308,33 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("an unrecognised rejection of a batch passes through unchanged (#144)", () =>
+    it.effect("a batch request naming one item twice: DynamoDB's rejection, named (#144)", () =>
       Effect.gen(function* () {
-        const rejection = awsValidationException("Provided list of item keys contains duplicates")
+        const rejection = awsValidationException(DDB_REPEATED_BATCH_ITEM)
+        mockBatchWriteItem.mockRejectedValueOnce(rejection)
+        const error = yield* Batch.write([
+          UserEntity.put({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
+          UserEntity.delete({ userId: "u-1" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.entityType).toBe("User")
+        const text = String(failure.cause)
+        expect(text).toContain(
+          "the batch request touches one item more than once — the put of User and the delete " +
+            "of User both target the item at pk=",
+        )
+        expect(text).toContain(
+          "This request wrote nothing; the batch had written nothing before it.",
+        )
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        expect(mockBatchWriteItem).toHaveBeenCalledOnce()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a rejection the request does not confirm passes through unchanged (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_REPEATED_BATCH_ITEM)
         mockBatchWriteItem.mockRejectedValueOnce(rejection)
         const error = yield* Batch.write([
           UserEntity.put({ userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" }),
@@ -1212,24 +1344,161 @@ describe("Batch", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("bounds a versioned-put transaction by DynamoDB's 4 MB payload", () =>
-      Effect.gen(function* () {
+    describe("versioned-put transactions split at exactly DynamoDB's limits (#144)", () => {
+      const sentChunks = () =>
+        mockTransactWriteItems.mock.calls.map(
+          (call) => call[0].TransactItems as ReadonlyArray<TransactWriteItem>,
+        )
+
+      /**
+       * The size of a VersionedNote put whose body is empty, as the batch sends
+       * it (condition included), measured from a real call: every byte of a
+       * longer body adds one.
+       */
+      const baseBytes = Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValue({})
-        // ~380 KB each: 12 of them exceed 4 MB in one transaction.
-        const body = "x".repeat(380_000)
-        yield* Batch.write(
-          Array.from({ length: 12 }, (_, i) => VersionedNotes.put({ noteId: `big-${i}`, body })),
+        yield* Batch.write([
+          VersionedNotes.put({ noteId: "n-00", body: "x" }),
+          VersionedNotes.put({ noteId: "n-01", body: "x" }),
+        ])
+        const [chunk] = sentChunks()
+        const sizes = chunk!.map((item) => transactionBytes([item]))
+        // Same-length ids: every put measures the same.
+        expect(sizes[0]).toBe(sizes[1])
+        mockTransactWriteItems.mockReset()
+        return sizes[0]! - 1
+      })
+
+      /** Puts whose sizes (condition included) are exactly `sizes`. */
+      const putsOf = (base: number, sizes: ReadonlyArray<number>) =>
+        sizes.map((size, i) =>
+          VersionedNotes.put({
+            noteId: `n-${String(i).padStart(2, "0")}`,
+            body: "x".repeat(size - base),
+          }),
         )
-        const sizes = mockTransactWriteItems.mock.calls.map(
-          (call) => call[0].TransactItems.length as number,
-        )
-        expect(sizes.length).toBeGreaterThan(1)
-        expect(sizes.reduce((a, b) => a + b, 0)).toBe(12)
-        for (const call of mockTransactWriteItems.mock.calls) {
-          expect(JSON.stringify(call[0].TransactItems).length).toBeLessThan(4_000_000)
-        }
-      }).pipe(Effect.provide(TestLayer)),
-    )
+
+      /** Eleven sizes summing to `total`, each well under the 409,600-byte item limit. */
+      const elevenSummingTo = (total: number) => {
+        const each = Math.floor(total / 11)
+        return [...Array.from({ length: 10 }, () => each), total - each * 10]
+      }
+
+      it.effect("puts totalling exactly 4,194,304 bytes go in one transaction", () =>
+        Effect.gen(function* () {
+          const base = yield* baseBytes
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* Batch.write(putsOf(base, elevenSummingTo(TRANSACT_WRITE_MAX_BYTES)))
+          const chunks = sentChunks()
+          expect(chunks).toHaveLength(1)
+          expect(chunks[0]).toHaveLength(11)
+          expect(transactionBytes(chunks[0]!)).toBe(4_194_304)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("one byte more splits off the put that crosses the limit", () =>
+        Effect.gen(function* () {
+          const base = yield* baseBytes
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* Batch.write(putsOf(base, elevenSummingTo(TRANSACT_WRITE_MAX_BYTES + 1)))
+          const chunks = sentChunks()
+          expect(chunks.map((chunk) => chunk.length)).toEqual([10, 1])
+          for (const chunk of chunks) {
+            expect(transactionBytes(chunk)).toBeLessThanOrEqual(TRANSACT_WRITE_MAX_BYTES)
+          }
+          expect(chunks.reduce((sum, chunk) => sum + transactionBytes(chunk), 0)).toBe(4_194_305)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("100 small puts go in one transaction", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* Batch.write(
+            Array.from({ length: 100 }, (_, i) =>
+              VersionedNotes.put({ noteId: `n-${i}`, body: "a" }),
+            ),
+          )
+          expect(sentChunks().map((chunk) => chunk.length)).toEqual([100])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("~380 KB puts: each transaction holds as many as fit, in caller order", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          const body = "x".repeat(380_000)
+          yield* Batch.write(
+            Array.from({ length: 12 }, (_, i) =>
+              VersionedNotes.put({ noteId: `big-${String(i).padStart(2, "0")}`, body }),
+            ),
+          )
+          const chunks = sentChunks()
+          // 11 × ~380 KB = ~4.18 MB fits; the twelfth does not.
+          expect(chunks.map((chunk) => chunk.length)).toEqual([11, 1])
+          const ids = chunks.flat().map((item) => item.Put!.Item!.noteId!.S)
+          expect(ids).toEqual(
+            Array.from({ length: 12 }, (_, i) => `big-${String(i).padStart(2, "0")}`),
+          )
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect(
+        "a chunk DynamoDB rejects for size anyway: both sizes in the error, never re-split",
+        () =>
+          Effect.gen(function* () {
+            const base = yield* baseBytes
+            const rejection = awsValidationException(ddbPayloadTooLarge(4_194_400))
+            mockTransactWriteItems.mockRejectedValueOnce(rejection)
+            const error = yield* Batch.write(
+              putsOf(base, elevenSummingTo(TRANSACT_WRITE_MAX_BYTES)),
+            ).pipe(Effect.flip)
+
+            expect(error._tag).toBe("ValidationError")
+            const failure = error as ValidationError
+            expect(failure.operation).toBe("batchWrite")
+            expect(failure.entityType).toBe("VersionedNote")
+            const text = String(failure.cause)
+            expect(text).toContain("(it reported 4194400 bytes)")
+            expect(text).toContain("the library measures the request at 4194304 bytes")
+            expect(text).toContain("size model disagrees with DynamoDB's")
+            expect(text).toContain("the versioned put of VersionedNote")
+            expect(text).toContain(
+              "no earlier transaction of the batch was written, and none of the batch's " +
+                "non-versioned requests was sent",
+            )
+            expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+            // Sent once, whole: no re-split, no retry.
+            expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+            expect(mockBatchWriteItem).not.toHaveBeenCalled()
+          }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a later chunk's size rejection says exactly what was already written", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems
+            .mockResolvedValueOnce({})
+            .mockRejectedValueOnce(awsValidationException(ddbPayloadTooLarge(4_194_305)))
+          const error = yield* Batch.write([
+            ...Array.from({ length: 101 }, (_, i) =>
+              VersionedNotes.put({ noteId: `n-${i}`, body: "a" }),
+            ),
+            OrderEntity.put({
+              orderId: "o-1",
+              userId: "u-1",
+              product: "x",
+              quantity: 1,
+              status: "pending",
+            }),
+          ]).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          const text = String((error as ValidationError).cause)
+          expect(text).toContain(
+            "the batch's 1 earlier transaction of versioned puts (100 items) was already written",
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+          expect(mockBatchWriteItem).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
 
     it.effect("sizes binary attributes by their bytes, not their JSON", () =>
       Effect.gen(function* () {

@@ -62,7 +62,6 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
-  refuseRepeatedItems,
   type TransactItemTarget,
   type TransactWriteItem,
   type TransactWriteOp,
@@ -543,8 +542,9 @@ export interface LocalStreamIndexConfig<TEvent> {
  * A stream index on a **global** secondary index. `append` writes the stream's
  * partition key value into the `pk` attribute of each indexed event, so the
  * index is scoped to the same stream: the eventually consistent equivalent of
- * an LSI, without the LSI's 10 GB item-collection cap. A strongly consistent
- * read of it is refused with `ValidationError`.
+ * an LSI, without the LSI's 10 GB item-collection cap. DynamoDB rejects a
+ * strongly consistent read of it, diagnosed as a `ValidationError` naming the
+ * index.
  *
  * Unlike an LSI, the GSI itself can be added to an existing table
  * (`UpdateTable`), but that does not index the stream's existing events: the
@@ -669,15 +669,16 @@ export type StreamIndexesConfig<TIndexes, TEvent> = {
  * Options accepted by {@link EventStream.readIndex}.
  *
  * - `beginsWith` / `between` — a sort-key condition on the derived key (at most
- *   one of them). Omitted, the whole sub-stream is read. Each bound must be a
- *   non-empty string, and `between`'s lower bound must not sort (by UTF-8
- *   bytes, as DynamoDB sorts) after its upper bound; otherwise the read fails
- *   with `ValidationError` before anything is sent.
+ *   one of them, string bounds). Omitted, the whole sub-stream is read.
+ *   DynamoDB rejects an empty bound, and a `between` whose lower bound sorts
+ *   (by UTF-8 bytes) after its upper bound; the read then fails with a
+ *   `ValidationError` naming the index and the bound, DynamoDB's error as its
+ *   cause.
  * - `reverse` — descending key order.
  * - `limit` — return at most this many events (a positive integer).
- * - `consistentRead` — strongly consistent read. Refused with
- *   `ValidationError` on a GSI-backed index, which DynamoDB reads only
- *   eventually consistently.
+ * - `consistentRead` — strongly consistent read. DynamoDB rejects it on a
+ *   GSI-backed index, which it reads only eventually consistently: the read
+ *   fails with a `ValidationError` naming the index.
  */
 export type ReadIndexOptions = {
   readonly reverse?: boolean | undefined
@@ -688,29 +689,13 @@ export type ReadIndexOptions = {
   | { readonly between?: readonly [string, string] | undefined; readonly beginsWith?: undefined }
 )
 
-/** @internal */
-const utf8 = new TextEncoder()
-
-/**
- * @internal Compare two strings by their UTF-8 bytes — the order DynamoDB
- * sorts (and evaluates `BETWEEN` on) string keys. JavaScript's `<` compares
- * UTF-16 code units, which disagrees for characters outside the BMP.
- */
-const compareUtf8 = (a: string, b: string): number => {
-  const left = utf8.encode(a)
-  const right = utf8.encode(b)
-  const length = Math.min(left.length, right.length)
-  for (let i = 0; i < length; i++) {
-    const diff = left[i]! - right[i]!
-    if (diff !== 0) return diff
-  }
-  return left.length - right.length
-}
-
 /**
  * @internal Why a {@link ReadIndexOptions} key condition cannot be sent, or
- * `undefined` when it can. DynamoDB rejects an empty key value and a
- * `BETWEEN` whose lower bound sorts after its upper bound.
+ * `undefined` when it can: the options' own meaning — at most one of
+ * `beginsWith` and `between`, string bounds (a number would be sent as `N`
+ * against a string key). DynamoDB's rules on the bounds — not empty, a
+ * `between` in order — are DynamoDB's to enforce: its rejection is diagnosed,
+ * naming the index and the bound (#144).
  */
 const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string | undefined => {
   if (options?.beginsWith !== undefined && options.between !== undefined) {
@@ -718,26 +703,18 @@ const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string
   }
   const beginsWith: unknown = options?.beginsWith
   if (beginsWith !== undefined) {
-    if (typeof beginsWith !== "string" || beginsWith.length === 0) {
-      return (
-        "beginsWith must be a non-empty string — DynamoDB rejects an empty key value; " +
-        "omit it to read the whole sub-stream."
-      )
-    }
-    return undefined
+    return typeof beginsWith === "string"
+      ? undefined
+      : "beginsWith must be a string; omit it to read the whole sub-stream."
   }
   const between: unknown = options?.between
   if (between === undefined) return undefined
   if (
     !Array.isArray(between) ||
     between.length !== 2 ||
-    !between.every((bound) => typeof bound === "string" && bound.length > 0)
+    !between.every((bound) => typeof bound === "string")
   ) {
-    return "between must be a pair of non-empty strings — DynamoDB rejects an empty key value."
-  }
-  const [low, high] = between as [string, string]
-  if (compareUtf8(low, high) > 0) {
-    return `between's lower bound ${JSON.stringify(low)} sorts after its upper bound ${JSON.stringify(high)}.`
+    return "between must be a pair of strings."
   }
   return undefined
 }
@@ -1243,8 +1220,8 @@ export interface EventStream<
    * Read the stream's events in the order of one of its indexes (#140) — the
    * events whose index `key` returned a string, ordered by that key. A
    * convenience over `query.index`; pass `beginsWith` or `between` to narrow
-   * the key range, `reverse`, `limit` and `consistentRead` (refused on a GSI)
-   * — see {@link ReadIndexOptions}.
+   * the key range, `reverse`, `limit` and `consistentRead` (which DynamoDB
+   * rejects on a GSI; the error names the index) — see {@link ReadIndexOptions}.
    *
    * How the events are read follows the index's {@link StreamIndexProjection}:
    * one query for `"all"` and `"withoutMetadata"` (whose events have
@@ -1270,8 +1247,8 @@ export interface EventStream<
      * A query of one of the stream's indexes (#140), scoped to `streamId`:
      * decoded events in index-key order. It composes with the `Query`
      * combinators — `Query.where` (a condition on the derived key),
-     * `Query.reverse`, `Query.limit`, `Query.consistentRead` (refused with
-     * `ValidationError` on a GSI-backed index) — and terminals
+     * `Query.reverse`, `Query.limit`, `Query.consistentRead` (DynamoDB rejects
+     * it on a GSI-backed index: a `ValidationError` naming the index) — and terminals
      * (`Query.collect`, `Query.execute`, `Query.paginate`). The
      * `__edd_e__ = <stream>.event` filter still applies.
      *
@@ -1308,8 +1285,11 @@ export interface EventStream<
  */
 interface AppendTransaction {
   readonly items: Array<TransactWriteItem>
-  /** Parallel to `items`, for `refuseRepeatedItems` and the failure-time write diagnosis. */
-  readonly targets: Array<TransactItemTarget>
+  /**
+   * Parallel to `items`, for the failure-time diagnosis: built on its first
+   * call (only on failure), the same array on every call.
+   */
+  readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guardCount: number
   readonly eventCount: number
   readonly additional: BuiltTransactWriteItems
@@ -1689,13 +1669,12 @@ export const makeStream = <
   // ---------------------------------------------------------------------------
 
   /**
-   * An event's key in a stream index (#140): a non-empty string, or
-   * `undefined` to leave the event out. Anything else — an empty string
-   * (DynamoDB rejects empty key values), another type, a `key` that throws —
-   * is a `ValidationError`, raised before anything is written. A key over
-   * DynamoDB's 1024-byte sort-key limit is not pre-checked: DynamoDB rejects
-   * the append and the rejection is diagnosed, naming the index and event
-   * (see `sendAppendTransaction`).
+   * An event's key in a stream index (#140): a string, or `undefined` to
+   * leave the event out. Another type, or a `key` that throws, is a
+   * `ValidationError`, raised before anything is written. DynamoDB's own
+   * rules on a key — not empty, at most 1024 bytes for a sort key — are not
+   * pre-checked: DynamoDB rejects the append and the rejection is diagnosed,
+   * naming the index and event (see `sendAppendTransaction`).
    */
   const deriveIndexKey = (
     idx: ResolvedStreamIndex,
@@ -1719,11 +1698,12 @@ export const makeStream = <
                 "Nothing was written.",
             }),
           )
-        if (typeof derived !== "string" || derived === "") {
-          return refuse(
-            "must be a non-empty string or undefined; received " +
-              (typeof derived === "string" ? "an empty string" : String(derived)),
-          )
+        // A string, or the event is not indexed: what the stream's own key
+        // contract means, which DynamoDB cannot see (a number would be sent
+        // as `N`). An empty string is DynamoDB's to reject, and is diagnosed
+        // from its rejection, naming the index and the event (#144).
+        if (typeof derived !== "string") {
+          return refuse(`must be a string or undefined; received ${String(derived)}`)
         }
         return Effect.succeed(derived)
       }),
@@ -1758,12 +1738,31 @@ export const makeStream = <
     tx: AppendTransaction,
     streamIdStr: string,
     commandId: string | undefined,
-  ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> =>
-    client.transactWriteItems({ TransactItems: tx.items }).pipe(
+  ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> => {
+    const sent = () => ({ _tag: "Transaction" as const, items: tx.items, targets: tx.targets })
+    const diagnosed = (
+      diagnosis: Diagnosis,
+      original: unknown,
+    ): AppendTooLarge | ValidationError =>
+      diagnosis._tag === "TooManyItems"
+        ? new AppendTooLarge({
+            streamName: config.streamName,
+            streamId: streamIdStr,
+            count: diagnosis.count,
+            limit: diagnosis.limit,
+            cause: original,
+          })
+        : appendLimitError(diagnosis, original, tx)
+    return client.transactWriteItems({ TransactItems: tx.items }).pipe(
       Effect.as(undefined),
+      // One operation per item (#133, #144): diagnosed BEFORE the conditional
+      // mapping below — DynamoDB can report a repeated item as a conditional
+      // failure, which would read as a version conflict or a lost race (and
+      // be retried). Terminal.
+      diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite: diagnosed }),
       Effect.catch(
         (
-          error: DynamoClientError,
+          error: DynamoClientError | AppendTooLarge | ValidationError,
         ): Effect.Effect<OptimisticLockError | ConcurrentModification, AppendError> => {
           if (!isAwsTransactionCancelled(error.cause)) {
             return Effect.fail(error)
@@ -1841,24 +1840,16 @@ export const makeStream = <
       // item at fault. Over 100 items is `AppendTooLarge`, with the EXPANDED
       // count.
       diagnoseFailure({
-        sent: () => ({ _tag: "Transaction", items: tx.items, targets: () => tx.targets }),
+        sent,
         rangeKeys: () => [
           "sk",
           ...streamIndexes.map((idx) => idx.sk),
           ...tx.additional.rangeKeys(),
         ],
-        rewrite: (diagnosis, original): AppendTooLarge | ValidationError =>
-          diagnosis._tag === "TooManyItems"
-            ? new AppendTooLarge({
-                streamName: config.streamName,
-                streamId: streamIdStr,
-                count: diagnosis.count,
-                limit: diagnosis.limit,
-                cause: original,
-              })
-            : appendLimitError(diagnosis, original, tx),
+        rewrite: diagnosed,
       }),
     )
+  }
 
   /**
    * A diagnosed rejection of an append (#144) other than its item count. An
@@ -1873,8 +1864,8 @@ export const makeStream = <
     original: unknown,
     tx: AppendTransaction,
   ): ValidationError => {
-    if (diagnosis._tag === "SortKeyTooLong") {
-      const position = tx.targets.indexOf(diagnosis.target)
+    if (diagnosis._tag === "SortKeyTooLong" || diagnosis._tag === "EmptyKey") {
+      const position = tx.targets().indexOf(diagnosis.target)
       const isEvent = position >= tx.guardCount && position < tx.guardCount + tx.eventCount
       const idx = isEvent
         ? streamIndexes.find((candidate) => candidate.sk === diagnosis.attribute)
@@ -1884,9 +1875,14 @@ export const makeStream = <
           entityType,
           operation: "EventStore.append.indexes",
           cause: withCause(
-            `The key of index "${idx.name}" for ${diagnosis.target.source} is ` +
-              `${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a sort key. ` +
-              "Nothing was written.",
+            `The key of index "${idx.name}" for ${diagnosis.target.source} ` +
+              (diagnosis._tag === "SortKeyTooLong"
+                ? `is ${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a ` +
+                  "sort key."
+                : "is an empty string, which DynamoDB does not accept as a key value; the " +
+                  "key function must return a non-empty string, or undefined to leave the " +
+                  "event out of the index.") +
+              " DynamoDB rejected the append. Nothing was written.",
             original,
           ),
         })
@@ -2209,10 +2205,11 @@ export const makeStream = <
        */
       const layout = (additional: BuiltTransactWriteItems): AppendTransaction => {
         const items: Array<TransactWriteItem> = []
-        const targets: Array<TransactItemTarget> = []
+        // What names each item, so the targets are built only on failure.
+        const naming: Array<() => ReadonlyArray<TransactItemTarget>> = []
         const pushStreamItem = (item: TransactWriteItem, type: string, source: string) => {
           items.push(item)
-          targets.push(transactItemTarget(item, tableName, ["pk", "sk"], type, source))
+          naming.push(() => [transactItemTarget(item, tableName, ["pk", "sk"], type, source)])
         }
         if (contiguityCheck !== undefined) {
           pushStreamItem(contiguityCheck, entityType, "the version-contiguity check")
@@ -2222,7 +2219,7 @@ export const makeStream = <
           pushStreamItem(item, entityType, `the event at version ${expectedVersion + i + 1}`)
         }
         items.push(...additional.items)
-        targets.push(...additional.targets)
+        naming.push(additional.targets)
         const sentinelIndex = sentinelPut === undefined ? -1 : items.length
         if (sentinelPut !== undefined) {
           pushStreamItem(sentinelPut, entityType, "the idempotency sentinel")
@@ -2230,9 +2227,11 @@ export const makeStream = <
         if (snapshotPut !== undefined) {
           pushStreamItem(snapshotPut, snapshotEntityType, "the inline snapshot")
         }
+        let targets: ReadonlyArray<TransactItemTarget> | undefined
         return {
           items,
-          targets,
+          // Built once, on failure: a diagnosis's target is found by identity.
+          targets: () => (targets ??= naming.flatMap((name) => name())),
           guardCount,
           eventCount: eventItems.length,
           additional,
@@ -2253,14 +2252,11 @@ export const makeStream = <
         )
         const tx = layout(additional)
 
-        // Checked before anything is sent: one op per item — an additional
-        // item repeating an event, the contiguity check, the idempotency
-        // sentinel or the inline snapshot is refused, as additional items
-        // repeating each other are (#133). DynamoDB's own limits — 100 items,
-        // 4 MB, 400 KB per item, 1024-byte sort keys — are diagnosed from its
-        // rejection instead (#144).
-        yield* refuseRepeatedItems(tx.targets, "EventStore.append")
-
+        // DynamoDB's rules — one operation per item (an additional item
+        // repeating an event, the contiguity check, the idempotency sentinel
+        // or the inline snapshot, or another additional item), 100 items,
+        // 4 MB, 400 KB per item, 1024-byte sort keys — are not pre-checked:
+        // `sendAppendTransaction` diagnoses DynamoDB's rejection (#144).
         const outcome = yield* sendAppendTransaction(
           client,
           tx,
@@ -2715,9 +2711,13 @@ export const makeStream = <
       entityTypes: [entityType],
       decoder: indexDecoder(idx),
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
-      // A GSI is read only eventually consistently: `Query.consistentRead`
-      // on it is refused before anything is sent.
-      globalIndex: idx.type === "gsi",
+      // DynamoDB's rejection of the key condition (an empty bound, a reversed
+      // `between`) is named against the stream index; so, as for every
+      // query, is a consistent read of a GSI (#144).
+      keyConditionDiagnosis: {
+        operation: "EventStore.readIndex",
+        label: `EventStream "${config.streamName}" index "${idx.name}"`,
+      },
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
       // A "keys" index holds no events: an LSI has DynamoDB fetch them
       // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with

@@ -184,55 +184,18 @@ export interface BuiltTransactWriteItems {
   readonly items: Array<TransactWriteItem>
   /** Parallel to `items`: `provenance[i]` describes `items[i]`. */
   readonly provenance: Array<ItemProvenance>
-  /** Parallel to `items`: the item each one writes, for {@link refuseRepeatedItems}. */
-  readonly targets: Array<TransactItemTarget>
+  /**
+   * Parallel to `items`: the item each one writes, to name it in a diagnosed
+   * rejection (`internal/WriteDiagnosis.ts`) — two entries naming one item, an
+   * oversized item, an over-long sort key. A thunk: needed only on failure.
+   */
+  readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
   /**
    * The sort-key attributes the ops' entities write (primary and index), for
    * diagnosing a rejected sort key. A thunk: needed only on failure.
    */
   readonly rangeKeys: () => ReadonlyArray<string>
-}
-
-// ---------------------------------------------------------------------------
-// One op per item (#133)
-// ---------------------------------------------------------------------------
-
-/**
- * Refuse a transaction that writes (or checks) one item more than once —
- * BEFORE it is sent. DynamoDB allows one operation per item in a transaction
- * and rejects the whole request otherwise; worse, the reasons it reports for
- * a guarded put can read as a lost race (`[None, ConditionalCheckFailed]`), so
- * the put would be retried and finally misreported as `OptimisticLockError`
- * on one backend, and as a raw validation error on another. The targets
- * include the items an op derives — uniqueness sentinels (reserved or
- * released) and version snapshots — so two items swapping unique values, which
- * release and claim the same sentinels, are refused too.
- */
-export const refuseRepeatedItems = (
-  targets: ReadonlyArray<TransactItemTarget>,
-  operation: string,
-): Effect.Effect<void, ValidationError> => {
-  const seen = new Map<string, TransactItemTarget>()
-  for (const target of targets) {
-    const first = seen.get(target.identity)
-    if (first === undefined) {
-      seen.set(target.identity, target)
-      continue
-    }
-    return Effect.fail(
-      new ValidationError({
-        entityType: first.entityType,
-        operation,
-        cause:
-          `${operation}: the transaction touches one item more than once — ${first.source} and ` +
-          `${target.source} both target the item at ${target.key}. DynamoDB allows one ` +
-          "operation per item in a transaction, counting the uniqueness sentinels and version " +
-          "snapshots a put writes. Split the operations into separate writes. Nothing was written.",
-      }),
-    )
-  }
-  return Effect.void
 }
 
 /**
@@ -247,13 +210,14 @@ export const refuseRepeatedItems = (
  * cancellation reasons positionally MUST use it instead of assuming 1:1, and
  * read a guarded put's reasons through {@link judgeCancellation}.
  *
- * Refuses items that repeat one item ({@link refuseRepeatedItems}) among those
- * it builds; a caller adding items of its own checks them against `targets`.
- *
- * DynamoDB's limits (100 items, 4 MB, 400 KB per item, 1024-byte sort keys)
- * are not pre-checked: the caller sends the transaction and diagnoses
- * DynamoDB's rejection through `internal/WriteDiagnosis.ts`, which counts the
- * EXPANDED items and names the culprit through `targets` (and `rangeKeys`).
+ * DynamoDB's rules (one operation per item, 100 items, 4 MB, 400 KB per
+ * item, 1024-byte sort keys, the limits on one expression) are not
+ * pre-checked: the caller sends the transaction and diagnoses DynamoDB's
+ * rejection through `internal/WriteDiagnosis.ts`, which counts the EXPANDED
+ * items and names the culprit through `targets` (and `rangeKeys`) — two ops
+ * touching one item included, among them two puts that swap unique values
+ * and so release and claim the same sentinels. A caller adding items of its
+ * own appends their targets to these.
  */
 export const buildTransactWriteItems = (
   operations: ReadonlyArray<TransactWriteOp>,
@@ -265,7 +229,7 @@ export const buildTransactWriteItems = (
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) {
-      return { items: [], provenance: [], targets: [], guarded: [], rangeKeys: () => [] }
+      return { items: [], provenance: [], targets: () => [], guarded: [], rangeKeys: () => [] }
     }
 
     const opInfos: Array<{
@@ -346,18 +310,20 @@ export const buildTransactWriteItems = (
 
     const items: Array<TransactWriteItem> = []
     const provenance: Array<ItemProvenance> = []
-    const targets: Array<TransactItemTarget> = []
+    // What names each item, kept so its target is built only on failure.
+    const naming: Array<() => TransactItemTarget> = []
     const guarded: Array<GuardedPut> = []
     let tableName = ""
     let keyFields: ReadonlyArray<string> = []
     const push = (item: TransactWriteItem, from: ItemProvenance, derived = false) => {
       items.push(item)
       provenance.push(from)
-      targets.push(
+      const [table, fields] = [tableName, keyFields]
+      naming.push(() =>
         transactItemTarget(
           item,
-          tableName,
-          keyFields,
+          table,
+          fields,
           from.entityType,
           `operation ${from.opIndex} (${from.entityType}${
             derived ? ", through a uniqueness sentinel or version snapshot it writes" : ""
@@ -431,10 +397,10 @@ export const buildTransactWriteItems = (
       }
     }
 
-    yield* refuseRepeatedItems(targets, operation)
     const rangeKeys = () => [
       ...new Set(opInfos.flatMap((op) => rangeKeysOf(op.entity.indexes as never))),
     ]
+    const targets = () => naming.map((name) => name())
     return { items, provenance, targets, guarded, rangeKeys }
   })
 

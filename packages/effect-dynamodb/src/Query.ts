@@ -8,7 +8,11 @@
  * Implements Pipeable for ergonomic composition.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  QueryCommandOutput,
+  ScanCommandOutput,
+} from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
@@ -16,6 +20,7 @@ import { DynamoClient, type DynamoClientError, type DynamoClientService } from "
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
 import { compilePath } from "./internal/PathBuilder.js"
+import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
 // ---------------------------------------------------------------------------
@@ -63,11 +68,6 @@ interface QueryState {
   readonly maxPagesValue: number | undefined
   readonly scanForward: boolean
   readonly consistentRead: boolean
-  /**
-   * The index is a GSI, which DynamoDB only reads eventually consistently:
-   * `consistentRead` is refused before sending (#133).
-   */
-  readonly globalIndex: boolean
   readonly ignoreOwnershipFlag: boolean
   readonly exclusiveStartKey: Record<string, AttributeValue> | undefined
   readonly isScan: boolean
@@ -108,6 +108,19 @@ interface QueryState {
    * `projection: "keys"` sets it.
    */
   readonly hydration: QueryHydration | undefined
+  /** See {@link KeyConditionDiagnosis}. */
+  readonly keyConditionDiagnosis: KeyConditionDiagnosis | undefined
+}
+
+/**
+ * @internal Diagnose DynamoDB's rejection of the query's key condition — an
+ * empty key value, a `BETWEEN` whose lower bound sorts after its upper — as a
+ * `ValidationError` with `operation`, its message prefixed `label` (#144).
+ * Without it, those rejections pass through as DynamoDB's own.
+ */
+export interface KeyConditionDiagnosis {
+  readonly operation: string
+  readonly label: string
 }
 
 /**
@@ -206,8 +219,6 @@ export const make = <A>(config: {
   readonly skField: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
-  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
-  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -217,12 +228,15 @@ export const make = <A>(config: {
   readonly prepare?: QueryPrepare | undefined
   /** See {@link QueryState.hydration}. */
   readonly hydration?: QueryHydration | undefined
+  /** See {@link KeyConditionDiagnosis}. */
+  readonly keyConditionDiagnosis?: KeyConditionDiagnosis | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
     hydration: config.hydration,
+    keyConditionDiagnosis: config.keyConditionDiagnosis,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -237,7 +251,6 @@ export const make = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
-    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: false,
@@ -260,8 +273,6 @@ export const makeScan = <A>(config: {
   readonly indexName: string | undefined
   readonly entityTypes: ReadonlyArray<string>
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
-  /** `indexName` names a GSI (see {@link QueryState.globalIndex}). */
-  readonly globalIndex?: boolean | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -275,6 +286,7 @@ export const makeScan = <A>(config: {
     prepare: config.prepare,
     keepRow: undefined,
     hydration: undefined,
+    keyConditionDiagnosis: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -289,7 +301,6 @@ export const makeScan = <A>(config: {
     maxPagesValue: undefined,
     scanForward: true,
     consistentRead: false,
-    globalIndex: config.globalIndex ?? false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
     isScan: true,
@@ -384,9 +395,10 @@ export const reverse = <A>(self: Query<A>): Query<A> =>
   })
 
 /**
- * Enable consistent reads for this query (or scan). Refused with a
- * `ValidationError` when it runs on a global secondary index, which DynamoDB
- * reads only eventually consistently.
+ * Enable consistent reads for this query (or scan). Sent as asked: DynamoDB
+ * rejects it on a global secondary index, which it reads only eventually
+ * consistently, and the query fails with a `ValidationError`
+ * (`operation: "query.consistentRead"`) naming the index (#144).
  */
 export const consistentRead: {
   (): <A>(self: Query<A>) => Query<A>
@@ -984,18 +996,7 @@ const prepared = (
   tableName: string,
 ): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
   // A consistent read of a GSI — which DynamoDB only reads eventually
-  // consistently — is refused before anything is sent (#133).
-  if (state.consistentRead && state.globalIndex) {
-    return Effect.fail(
-      new ValidationError({
-        entityType: state.entityTypes.join(", ") || "unknown",
-        operation: "query.consistentRead",
-        cause:
-          `consistentRead: index "${state.indexName}" is a global secondary index, which ` +
-          "DynamoDB reads only eventually consistently. Nothing was sent.",
-      }),
-    )
-  }
+  // consistently — is DynamoDB's to reject: diagnosed by `send` (#144).
   // A filter with an empty part where none may be is refused before
   // anything is sent (#133).
   const filterRefusal = refuseEmptyFilterParts(state)
@@ -1018,6 +1019,49 @@ const prepared = (
                 ),
         }
       })
+}
+
+/**
+ * @internal Send one request of a terminal. DynamoDB's rejection of what the
+ * library does not pre-check (#144) is diagnosed against the request sent: a
+ * consistent read of a GSI always, and the key condition's rules (an empty key
+ * value, a reversed `BETWEEN`) when the query asks for it
+ * ({@link KeyConditionDiagnosis}). Anything else passes through.
+ */
+const send = (
+  client: DynamoClientService,
+  state: QueryState,
+  cmd: ReturnType<typeof buildDynamoCommand>,
+): Effect.Effect<QueryCommandOutput | ScanCommandOutput, DynamoClientError | ValidationError> => {
+  const keyCondition = state.keyConditionDiagnosis
+  const request: Effect.Effect<QueryCommandOutput | ScanCommandOutput, DynamoClientError> =
+    state.isScan ? client.scan(cmd) : client.query(cmd)
+  return request.pipe(
+    diagnoseFailure({
+      sent: () => ({ _tag: "Read", scan: state.isScan, input: cmd }),
+      only:
+        keyCondition === undefined
+          ? ["ConsistentReadOnGsi"]
+          : ["ConsistentReadOnGsi", "EmptyKeyBound", "BetweenReversed"],
+      rewrite: (diagnosis, original) => {
+        const entityType = state.entityTypes.join(", ") || "unknown"
+        return diagnosis._tag === "ConsistentReadOnGsi"
+          ? new ValidationError({
+              entityType,
+              operation: "query.consistentRead",
+              cause: withCause(explainDiagnosis(diagnosis, "query"), original),
+            })
+          : new ValidationError({
+              entityType,
+              operation: keyCondition?.operation ?? "query",
+              cause: withCause(
+                explainDiagnosis(diagnosis, keyCondition?.label ?? "query"),
+                original,
+              ),
+            })
+      },
+    }),
+  )
 }
 
 /** @internal Does the decoded item pass every client-side predicate? */
@@ -1223,7 +1267,7 @@ export const execute = <A>(
         { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining, pageCount) },
         borrowedFields,
       )
-      const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+      const result = yield* send(client, state, cmd)
 
       const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
       const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
@@ -1341,7 +1385,7 @@ const pageStream = <A>(
           },
           borrowedFields,
         )
-        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+        const result = yield* send(client, state, cmd)
 
         const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
         const { items: decoded } = yield* examinePage<A>(
@@ -1428,7 +1472,7 @@ export const count = <A>(
           ExclusiveStartKey: start,
           Limit: computeRequestLimit(state, remaining, pages),
         })
-        const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+        const result = yield* send(client, state, cmd)
         const rows = (result.Items ?? []) as Array<Record<string, AttributeValue>>
         counted += rows.filter((row) => !isExcludedRow(state, row)).length
         start = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
@@ -1450,7 +1494,7 @@ export const count = <A>(
         Select: "COUNT",
         Limit: computeRequestLimit(state, remaining),
       })
-      const result = state.isScan ? yield* client.scan(cmd) : yield* client.query(cmd)
+      const result = yield* send(client, state, cmd)
 
       total += result.Count ?? 0
       exclusiveStartKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined

@@ -237,7 +237,10 @@ describe("VectorIndex", () => {
       ).toThrow("[EDD-9031]")
     })
 
-    it("rejects more than 18 inline filters (EDD-9032)", () => {
+    it("accepts more than 18 inline filters, and more than 5 indexes: DynamoDB's limits (#144)", () => {
+      // Not pre-checked: DynamoDB enforces its own quotas (18 inline filters per
+      // index; 5 vector indexes per table by default, adjustable), and
+      // `db.tables.*.create()` / `addVectorIndex` diagnose its rejection.
       const wide = Schema.Struct({
         id: Schema.String,
         description: Schema.String,
@@ -245,21 +248,40 @@ describe("VectorIndex", () => {
           Array.from({ length: 19 }, (_, i) => [`f${i}`, Schema.String] as const),
         ),
       })
-      expect(() =>
-        Entity.make({
-          model: wide,
-          entityType: "wide",
-          primaryKey: {
-            pk: { field: "pk", composite: ["id"] },
-            sk: { field: "sk", composite: [] },
+      const entity = Entity.make({
+        model: wide,
+        entityType: "wide",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        vectorIndexes: {
+          byDescription: {
+            name: "vec1",
+            dimensions: 8,
+            source: { fields: ["description"] },
+            filters: Array.from({ length: 19 }, (_, i) => `f${i}`),
           },
-          vectorIndexes: {
-            byDescription: {
-              name: "vec1",
-              dimensions: 8,
-              source: { fields: ["description"] },
-              filters: Array.from({ length: 19 }, (_, i) => `f${i}`),
-            },
+          ...Object.fromEntries(
+            Array.from({ length: 5 }, (_, i) => [
+              `extra${i}`,
+              { name: `vec${i + 2}`, dimensions: 8, source: { fields: ["description"] } },
+            ]),
+          ),
+        },
+      })
+      expect(entity._data.vectorIndexes.byDescription?.filters).toHaveLength(19)
+      expect(Object.keys(entity._data.vectorIndexes)).toHaveLength(6)
+    })
+
+    it("still rejects a filter listed twice (EDD-9032)", () => {
+      expect(() =>
+        makeProducts({
+          byDescription: {
+            name: "vec1",
+            dimensions: 8,
+            source: { fields: ["description"] },
+            filters: ["category", "category"],
           },
         }),
       ).toThrow("[EDD-9032]")

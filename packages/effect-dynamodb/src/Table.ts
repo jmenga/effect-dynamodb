@@ -12,11 +12,7 @@ import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
-import {
-  MAX_INLINE_FILTERS,
-  MAX_VECTOR_INDEXES_PER_TABLE,
-  toWireDistanceFunction,
-} from "@effect-dynamodb/schema/VectorIndex.js"
+import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 
@@ -218,13 +214,12 @@ export const make = <
  * by physical index name, validating that all sharers agree.
  *
  * Sharing a physical vector index across entities is the norm in single-table
- * designs — the quota is 5 per table — and it is safe precisely because the
+ * designs — the default quota is 5 per table — and it is safe precisely because the
  * composed `__edd_vp_<name>__` partition value carries the entity type, so a
  * search never crosses entity boundaries (see `DESIGN.md §14`).
  *
  * @throws when two entities disagree on `dimensions` or `distance` (EDD-9035),
- *   or when more than {@link MAX_VECTOR_INDEXES_PER_TABLE} distinct physical
- *   indexes are declared (EDD-9034).
+ *   or on a shared filter attribute's type (EDD-9040).
  */
 export const mergeVectorIndexes = (
   entities: Record<string, EntityLike>,
@@ -234,6 +229,7 @@ export const mergeVectorIndexes = (
     {
       definition: VectorIndexDefinition
       owner: string
+      sharers: Array<string>
       filters: Array<string>
       resolveDbName: (domainName: string) => string
       filterStoredTypes: Record<string, "S" | "N">
@@ -251,6 +247,7 @@ export const mergeVectorIndexes = (
         merged.set(definition.index, {
           definition,
           owner,
+          sharers: [owner],
           filters: [...definition.filters],
           resolveDbName,
           filterStoredTypes: Object.fromEntries(
@@ -271,6 +268,7 @@ export const mergeVectorIndexes = (
             `immutable on a DynamoDB vector index — every entity sharing one must agree.`,
         )
       }
+      if (!existing.sharers.includes(owner)) existing.sharers.push(owner)
       // Filters, unlike dimensions/distance, are per-entity access patterns
       // rather than a shared physical property — one index can serve several
       // entities filtering on different attributes. Union them; keeping only
@@ -295,25 +293,10 @@ export const mergeVectorIndexes = (
     }
   }
 
-  for (const [indexName, entry] of merged) {
-    if (entry.filters.length > MAX_INLINE_FILTERS) {
-      throw new Error(
-        `[EDD-9032] Vector index "${indexName}" resolves to ${entry.filters.length} INLINE_FILTER ` +
-          `attributes once unioned across the entities sharing it ` +
-          `(${[...entry.filters].sort().join(", ")}). DynamoDB allows at most ` +
-          `${MAX_INLINE_FILTERS} per vector index.`,
-      )
-    }
-  }
-
-  if (merged.size > MAX_VECTOR_INDEXES_PER_TABLE) {
-    throw new Error(
-      `[EDD-9034] Table declares ${merged.size} vector indexes ` +
-        `(${[...merged.keys()].sort().join(", ")}). DynamoDB allows at most ` +
-        `${MAX_VECTOR_INDEXES_PER_TABLE} per table.`,
-    )
-  }
-
+  // DynamoDB's own vector-index limits — inline filters per index (after the
+  // union above), vector indexes per table (an adjustable quota) — are not
+  // pre-checked: `db.tables.*.create()` / `addVectorIndex` diagnose DynamoDB's
+  // rejection, naming the index and the entities sharing it (#144).
   return merged
 }
 
@@ -323,6 +306,8 @@ export interface MergedVectorIndex {
   readonly definition: VectorIndexDefinition
   /** Entity type of the first declarer, used in conflict messages. */
   readonly owner: string
+  /** Entity type of every entity declaring the index, in registration order. */
+  readonly sharers: ReadonlyArray<string>
   /** Union of every sharer's declared `filters` (domain names). */
   readonly filters: ReadonlyArray<string>
   /** Stored-name resolver for the first declarer's `storedAs` renames. */
