@@ -444,7 +444,7 @@ returns `Map<physicalName, { kind: "gsi" | "lsi"; pk: string; sk: string; owner:
 - **Also refused in the same pass:** entities on one table that disagree on the primary key's
   `pk.field` / `sk.field`. `resolvePrimaryKey` (`Table.ts:447-457`) silently takes the first entity's
   primary key, and every other entity's writes then lack the table's key attributes. No fixture declares
-  a primary key other than `pk` / `sk`, so nothing existing trips it (§11 #7: please confirm).
+  a primary key other than `pk` / `sk`, so nothing existing trips it (§11 #7: confirmed by user).
 
 **Changelog (behaviour change).** A table whose members declare one physical index with different key
 attributes or classification, or different primary-key fields, used to construct and failed only at
@@ -512,7 +512,7 @@ yield* handleAudited({ matchId: "m-22" }, command, {
   (`` `${deliveryId}:${version + i + 1}` ``). That id is not a ULID, so it would fail the new check. It is
   replaced by the library's own answer to redelivery: an idempotent handler called with
   `commandId: deliveryId`. A redelivered command fails with `DuplicateCommand`, and the first commit's
-  ULIDs stand (§11 #18: please confirm). `eventstore-event-metadata.md` §4.3 is updated to match.
+  ULIDs stand (§11 #18: confirmed by user). `eventstore-event-metadata.md` §4.3 is updated to match.
 - **Tests.**
   - One new unit test in `test/EventStore.test.ts` runs the documented handler pattern under `TestClock`
     with a test `Crypto` layer (`randomBytes` returns fixed bytes) and asserts the exact ULIDs written.
@@ -688,12 +688,12 @@ Examples are written first, with region markers; the MDX follows; then doctest s
 |---|---|---|---|
 | 1 | Stream `projection: "all" \| "withoutMetadata" \| "keys"`, a string-literal union, default `"all"` | **In** (§3.1) | user (A) |
 | 2 | Entity index projection | **Out**, to become a GitHub issue. Body drafted with this work: motivation, why deferred, findings, and the entity decisions with recommendations. | user (B) |
-| 3 | `Table.GlobalSecondaryIndex` / `LocalSecondaryIndex` `Projection` widening | **Not widened.** Stream fragments get their own types (§3.2), because entity projection is out | design: please confirm |
+| 3 | `Table.GlobalSecondaryIndex` / `LocalSecondaryIndex` `Projection` widening | **Not widened.** Stream fragments get their own types (§3.2), because entity projection is out | design: confirmed by user |
 | 4 | `keys` emitted as `INCLUDE ["__edd_e__"]`, not `KEYS_ONLY` | **In.** Keeps the ownership filter and one read path; no ownership-by-key mode (§2.2) | user (A); probed |
 | 5 | `readIndex` per mode: one query for `withoutMetadata`; LSI `Select: ALL_ATTRIBUTES`; GSI query + `BatchGetItem` with retries and index order | **In** (§3.3) | user (A) |
 | 6 | `query.index` on a `keys` index | **Hydrates** through the shared `QueryState.hydration` hook (§3.4) | user (A) |
 | 7 | C1: refuse conflicting physical secondary-index declarations (`[EDD-9069]`) at `Table.make` / `Table.definition` | **In** (§6.1); changelog notes the behaviour change | user (C1) |
-| 7a | Same pass: refuse entities disagreeing on primary-key fields (`resolvePrimaryKey` first-wins) | **In.** Same bug class, same merge; no fixture trips it | design: **please confirm** |
+| 7a | Same pass: refuse entities disagreeing on primary-key fields (`resolvePrimaryKey` first-wins) | **In.** Same bug class, same merge; no fixture trips it | design: **confirmed by user** |
 | 8 | C2: cascade uses the target's primary-key fields, including its write-diagnosis targets and range keys | **In** (§6.2) | user (C2) |
 | 9 | `Batch.get` refactored onto the hydration helper (removes the O(n²) match) | **In**: adjacent debt | design (golden rule) |
 | 10 | Decode-failure diagnosis for stream index reads (`EventStore.index.decode`) | **In** (§4): self-contained in `EventStore.ts`, confirmed on the row | user (E) |
@@ -701,10 +701,10 @@ Examples are written first, with region markers; the MDX follows; then doctest s
 | 12 | Rewriting DynamoDB's filter rejection (`does not project … [__edd_e__]`) for stream reads | **Out**: needs an error hook in three `Query` terminals, not self-contained; DynamoDB's message already names index and attribute; the guide explains it | user (E): not small |
 | 13 | `DescribeTable` confirmation of a decode failure | **Out**: optional per E; the row-level check suffices and needs no extra IAM | user (E): optional |
 | 14 | Detecting silent drift (declared `all`, deployed `withoutMetadata`; deployed wider) | **Out**: documented only | design |
-| 15 | 100-`NonKeyAttributes` check in `indexDefinitions` | **Out**: it cannot see the whole table; it takes 17 `withoutMetadata` indexes to reach; DynamoDB / CDK rejects; docs state the cost per index | design: please confirm |
+| 15 | 100-`NonKeyAttributes` check in `indexDefinitions` | **Out**: it cannot see the whole table; it takes 17 `withoutMetadata` indexes to reach; DynamoDB / CDK rejects; docs state the cost per index | design: confirmed by user |
 | 16 | Vector indexes | **Unchanged** (`ALL`; separate API, quota and limits) | user |
 | 17 | D: docs examples mint event ids with `crypto.randomULID`, validated with `Schema.isULID()`; `randomUUIDv7` mentioned; example `Crypto` layer from `Crypto.make` over Web Crypto; deterministic test with `TestClock` and a test `Crypto` layer | **In** (§7) | user (D) |
-| 18 | The delivery-id-derived event id example (`msg-4471:2`) | **Changed**: replaced by an idempotent handler (`commandId: deliveryId`), because a derived id is not a ULID; `eventstore-event-metadata.md` §4.3 follows | design: **please confirm** |
+| 18 | The delivery-id-derived event id example (`msg-4471:2`) | **Changed**: replaced by an idempotent handler (`commandId: deliveryId`), because a derived id is not a ULID; `eventstore-event-metadata.md` §4.3 follows | design: **confirmed by user** |
 | 19 | `ulid()` for entity ids in `gamemanager.mdx` / `DESIGN.md:415` | **Unchanged**: not event ids | design |
 | 20 | Existing unit / connected tests using literal event ids | **Unchanged**: they test pairing, not minting | design |
 | 21 | DESIGN.md "Index Properties" inaccuracies (`type` default, "GSI/LSI") | **Fixed in passing** (§10) | design (golden rule) |

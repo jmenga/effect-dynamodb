@@ -830,13 +830,13 @@ keep. Line numbers are approximate (`~`) as of `f6db640`.
 | C7 | `Query.ts:~988` | `consistentRead` on a GSI (also reached by `readIndex` on a GSI index, `EventStore.ts:~2718`) | (i) | P10 | **Convert** (discovered): recognise `Consistent read cannot be true when (querying\|scanning) a GSI`, confirm `ConsistentRead && IndexName` names a GSI the query knows, rewrite to today's `ValidationError` text |
 | C8 | `EventStore.ts:~1722` | stream-index key `""` | (i) for `""` | P11: rejected request-wide, naming `IndexName` / `IndexKey` | **Convert the empty-string half** (discovered): confirm an event put writing `""` to that attribute; name the index and event version. The non-string half stays (K2) |
 | C9 | `Batch.ts:45`, `:300` | `MAX_TRANSACT_BYTES = 3_500_000` on the `"upper"` estimate | strategy, wrong measure | DynamoDB's limit is 4,194,304 by §6A.2 | **Change** to exact 4,194,304 (§6A.3) |
-| D1 | `schema/src/VectorIndex.ts:~347` | EDD-9030 dimensions an integer in 1..4096 | (i) | AWS: max 4,096, not adjustable; purely a mirror | **Propose convert** — beyond the listed items, needs your call. Local cannot test it |
-| D2 | `Aggregate.ts:~1235` | EDD-9042 `consistentRead` with a GSI collection (make time) | (i) | P10 | **Propose convert** with C7 — needs your call: it moves a startup error to every read |
-| D3 | `schema/src/VectorIndex.ts:~423` `clampTopK` | silently clamps `TopK` into 1..100 | (i)-mirror, and **silent** | it rewrites the caller's request instead of refusing; AWS max 100, not adjustable | **Propose:** send as given and diagnose the `SearchVectors` rejection — needs your call. Local cannot test it |
+| D1 | `schema/src/VectorIndex.ts:~347` | EDD-9030 dimensions an integer in 1..4096 | (i) | AWS: max 4,096, not adjustable; purely a mirror | **Converted** (S12); the non-integer half kept as `[EDD-9070]`. Local cannot test it |
+| D2 | `Aggregate.ts:~1235` | EDD-9042 `consistentRead` with a GSI collection (make time) | (i) | P10 | **Converted** (S15) |
+| D3 | `schema/src/VectorIndex.ts:~423` `clampTopK` | silently clamps `TopK` into 1..100 | (i)-mirror, and **silent** | it rewrites the caller's request instead of refusing; AWS max 100, not adjustable | **Converted** (S13). Local cannot test it |
 | K1 | `EventStore.ts:~716` | at most one of `beginsWith` / `between` | (ii) | our API's input | Keep |
 | K2 | `EventStore.ts:~721`, `~734`, `~1722` | non-string bound / non-string index key | (ii) | our API's contract (string keys); a number would be sent as `N` | Keep |
 | K3 | `EventStore.ts:~2794` | `readIndex` `limit` a positive integer | (ii) | never reaches DynamoDB as `Limit: 0`; `1.5` is accepted (P9) | Keep |
-| K4 | `internal/Expr.ts:~411` `emptyPartProblem` (`Query.ts:~968`, `Aggregate.ts:~3477`, `TransactWriteOps.ts:~118`, `EntityOps.ts:~83`, `Entity.ts:~8195`) | `or()`, `or(x, {})`, `not({})`, `isIn([])` | (ii) | `or(x, {})` / `not({})` compile to conditions DynamoDB accepts with a widened meaning. `isIn([])` alone mirrors P14's syntax error | Keep as one rule; `isIn([])` listed for your call |
+| K4 | `internal/Expr.ts:~411` `emptyPartProblem` (`Query.ts:~968`, `Aggregate.ts:~3477`, `TransactWriteOps.ts:~118`, `EntityOps.ts:~83`, `Entity.ts:~8195`) | `or()`, `or(x, {})`, `not({})`, `isIn([])` | (ii) | `or(x, {})` / `not({})` compile to conditions DynamoDB accepts with a widened meaning. `isIn([])` alone mirrors P14's syntax error | Keep, except `isIn([])`: **converted** (S17) |
 | K5 | `TransactWriteOps.ts:~290` | `Transaction.check({})` | (ii) | a check that asserts nothing has no meaning to send | Keep |
 | K6 | `Entity.ts:~7169` | delete `returnValues` other than none / allOld | (ii) | P13 mirrors it for a plain `DeleteItem`, but read-first deletes are transactions that never send `ReturnValues`: DynamoDB cannot see it there | Keep |
 | K7 | `Batch.ts:~236–283`, `TransactableOps.ts:~123`, `~201` (EDD-9049, EDD-9048) | unrecognised op; a condition on a batch write; multi-item lifecycle features in a batch | (ii) | `BatchWriteItem` has no condition. Sending would drop the meaning | Keep |
@@ -864,19 +864,19 @@ keep. Line numbers are approximate (`~`) as of `f6db640`.
   by §6.3 shape 8's `SORT_KEY` fragment, so a table sort key over 1,024 bytes passes through
   today. It arrives request-wide on single writes and batches, and as a cancellation reason in
   transactions. Add the fragment; confirm by measuring the table's sort key (> 1,024), or the
-  partition key (> 2,048) once §11 row 17 lands.
+  partition key (> 2,048) once §11 row 17 lands. *(Done: S27, then S35 for the partition key.)*
 - **Index partition keys share the sort keys' wording.** "Size limit exceeded" also covers a
   GSI partition key over 2,048 bytes. Today it passes through, because no range key measures
-  over 1,024; it can be diagnosed with §11 row 17.
+  over 1,024; it can be diagnosed with §11 row 17. *(Done: S35.)*
 - **Local accepts an over-long index sort key written by an update** (P12a). Shape 8 for an
   `Update` cannot be exercised on Local: unit tests only.
 - **Local supports no vector indexes** (P15). A `Table.definition` with vector indexes fails
   `CreateTable` on Local. That is pre-existing; vector connected tests must stay mocked.
 - **Read-side expression and key rejections** (P3–P5, P7, P8, P10 on `Query` / `BoundQuery` /
   collections) have no pre-check today and pass through. The §6A.4c/d/C7 recognisers can serve
-  them; candidate.
+  them; candidate. *(P7, P8 and P10 done: S29, C7. P3–P5 on a filter still pass through.)*
 - **`Batch.get` / hydration duplicate keys** (P2b on `BatchGetItem`) pass through
-  (`internal/Hydrate.ts` documents it). Candidate.
+  (`internal/Hydrate.ts` documents it). Candidate. *(Done: S29.)*
 
 ### 6A.7 Examples that swallow failures (scope 5, adjacent debt)
 
@@ -915,23 +915,23 @@ Only these:
 
 | # | Item | Decision | Source |
 |---|---|---|---|
-| S1 | Aggregate up-front group count | **Converted**; the error states the committed groups; `AggregateTransactionOverflow.committed?` added (additive) | user (listed); field: design — please confirm |
-| S2 | Partial aggregate after a failed `create` (root committed) | **Documented** in the error ("update or delete the partial aggregate"); no compensation | design — please confirm |
+| S1 | Aggregate up-front group count | **Converted**; the error states the committed groups; `AggregateTransactionOverflow.committed?` added (additive) | user (listed); field: design — confirmed by user |
+| S2 | Partial aggregate after a failed `create` (root committed) | **Documented** in the error ("update or delete the partial aggregate"); no compensation | design — confirmed by user |
 | S3 | `refuseRepeatedItems` | **Converted**; `RepeatedItem` diagnosis runs **before** the conditional mapping and is terminal | user (listed); placement: design (P2a) |
-| S4 | Any cancellation of a request that repeats an item → `RepeatedItem` | **In**: Local reports some repeats as `ConditionalCheckFailed` (P2a), and such a request can never commit | probe; design — please confirm |
+| S4 | Any cancellation of a request that repeats an item → `RepeatedItem` | **In**: Local reports some repeats as `ConditionalCheckFailed` (P2a), and such a request can never commit | probe; design — confirmed by user |
 | S5 | `BatchWriteItem` duplicate keys in a chunk (P2b) | **In**: diagnosed as `RepeatedItem`, naming what the batch had already written | discovered |
 | S6 | `oversizedCondition` / `tooLargeBeside` | **Converted** (size, operators, `IN` operands) | user (listed) |
 | S7 | `expressionFits` strategies (wide update split, strongest-guard fallback) | **Kept**: strategy | design |
 | S8 | `readIndex` empty bound / reversed `between` | **Converted** | user (listed) |
-| S9 | `readIndex` `limit` check | **Kept**: DynamoDB never sees it (`Query.limit ≤ 0` sends nothing; `1.5` accepted) | probe — please confirm (brief expected a conversion) |
+| S9 | `readIndex` `limit` check | **Kept**: DynamoDB never sees it (`Query.limit ≤ 0` sends nothing; `1.5` accepted) | probe — confirmed by user (brief expected a conversion) |
 | S10 | Vector limits EDD-9032 / EDD-9034, `Table.ts` and `schema/src/VectorIndex.ts` | **Converted**; recognition from AWS quotas, unit tests only; per-table quota is adjustable, so the pre-check was wrong | user (listed); schema twins: design |
 | S11 | Vector recogniser wording | **Unverified**: Local has no vector support and AWS documents no message | gap reported |
-| S12 | EDD-9030 dimensions range | **Proposed convert** — pending your call | discovered |
-| S13 | `clampTopK` silent clamping | **Proposed:** send as given + diagnose — pending your call | discovered |
+| S12 | EDD-9030 dimensions range | **Converted**: dimensions outside 1..4096 are sent, and DynamoDB's `CreateTable` / `UpdateTable` rejection is diagnosed (`VectorIndexDimensions`), naming the index and its sharers; unit tests only (Local has no vector indexes), AWS wording unverified. `[EDD-9030]` is **retired**. A non-integer `dimensions` stays refused at `Entity.make`, as `[EDD-9070]`: Local reads an integer member leniently (`ReadCapacityUnits: 2.9` is created as `2`), so DynamoDB could accept it as another, immutable dimensionality (class ii) | user (§6A.11) |
+| S13 | `clampTopK` silent clamping | **Converted**: `.topK(k)` sends `k` as given; a `SearchVectors` rejection is diagnosed (`TopKOutOfRange`) into the `ValidationError` already in `VectorSearchError` (no union widened), naming the topK and 1..100. A non-integer is sent too (no new pre-check); Local's lenient integers suggest AWS truncates it, as the old floor did. `clampTopK` stays exported, deprecated. `VectorSearchEmulation` rejects an out-of-range `TopK` as AWS does. **Behaviour change**: a call that returned fewer results than asked now fails | user (§6A.11) |
 | S14 | `Query.consistentRead` on a GSI | **Converted** | discovered (class i) |
-| S15 | EDD-9042 aggregate `consistentRead` + GSI (make time) | **Proposed convert** — pending your call | discovered |
+| S15 | EDD-9042 aggregate `consistentRead` + GSI (make time) | **Converted**: `Aggregate.make` no longer refuses it; each assembly read diagnoses DynamoDB's rejection (`ConsistentReadOnGsi`), naming the aggregate and the index — `ValidationError` (`<op>.consistentRead`) for `get` / `update` / `list`, and DynamoDB's own `DynamoValidationError` tag, explained, for `delete`, whose union has no `ValidationError`. `[EDD-9042]` is **retired** | user (§6A.11) |
 | S16 | Stream-index key `""` | **Converted** (empty half); type half kept | discovered |
-| S17 | `isIn([])` inside `emptyPartProblem` | **Kept** as one rule — reported for your call | design |
+| S17 | `isIn([])` inside `emptyPartProblem` | **Converted**: the `in` case is removed; `compileExpr` emits `IN ()`, DynamoDB rejects it as a syntax error (P14), and the rejection is diagnosed (`EmptyIn`) on entity writes, transactions (request-wide), `append`'s additional items, entity / collection / scan filters and aggregate `list` filters, naming the `isIn()` and its attribute. The other `emptyPartProblem` cases (`or()`, `{}` under `or` / `not`) stay: our semantic rules | user (§6A.11) |
 | S18 | Delete `returnValues` mode check | **Kept**: read-first deletes never send it | design |
 | S19 | Aggregate #103 sort-key collision | **Kept**: cross-group collisions are accepted by DynamoDB | design |
 | S20 | Vector dimension checks on write / query | **Kept, open**: DynamoDB's behaviour unverifiable on Local | design |
@@ -942,11 +942,16 @@ Only these:
 | S25 | A measured-to-fit chunk rejected by DynamoDB | **Decision A**: diagnosed `ValidationError` with both sizes, returned; no re-split, no retry | user |
 | S26 | Application-requested transactions | **Never split**; size rejections diagnosed | user |
 | S27 | Table-key size wording (P12) not recognised | **In**: add the fragment | discovered |
-| S28 | Partition-key size diagnosis (§11 row 17) | **Unchanged — candidate**; P12 gives its Local wording | design |
-| S29 | Read-side expression / key diagnosis; `BatchGetItem` duplicates | **Out — candidates** | discovered |
+| S28 | Partition-key size diagnosis (§11 row 17) | **Superseded by S35** | design |
+| S29 | Read-side expression / key diagnosis; `BatchGetItem` duplicates | **Converted**: every `Query` diagnoses the empty-bound and reversed-`between` rejections (P7, P8), on failure only, named by the query's accessor (`LimDoc.byTag`, `collection "x"`) or `query of <entity types>`. `Batch.get` does **not** de-duplicate (by design, `internal/Hydrate.ts`), so a repeated key's `BatchGetItem` rejection (P2b) is now diagnosed: a `DynamoError` naming both positions. Read-side expression-size limits (P3–P5 on a filter) are still passed through | user (§6A.11) |
 | S30 | Over-long index sort key via `UpdateItem` | **Unit tests only**: Local accepts it (P12a) | probe gap |
 | S31 | Examples swallowing failures | **In** — all 32, not 11; drop the rejection handler | user (adjacent debt) |
-| S32 | `guide-streams.ts` never runs its program | **Out** — flagged | discovered |
+| S32 | `guide-streams.ts` never runs its program | **Fixed**: the example now runs its program against DynamoDB Local (docs agent) | user (§6A.11) |
+| S33 | `AggregateTransactionOverflow` had an empty `message` | **Fixed (additive)**: its `message` names the aggregate, the group, its item count and the limit, and says what earlier groups committed (`committed`) or that nothing was written. A new optional `operation?: "create" \| "update"` lets a failed `create`'s message say the root may be committed, so a retried create fails its root guard and the caller should update or delete the partial aggregate | user (§6A.11) |
+| S34 | `Entity.purge` ignored `UnprocessedItems` | **Fixed**: each `BatchWriteItem` chunk's unprocessed deletes are resent with `Batch.write`'s backoff (`MAX_RETRIES` 5, `BASE_DELAY_MS` 100, shared from `internal/Hydrate.ts`; no `BatchWriteItem` retry helper existed to reuse). When retries run out, a `DynamoError` (`BatchWriteItem`) says how many items remain and exactly how many the purge had deleted | user (§6A.11) |
+| S35 | Partition key over 2048 bytes; Local's table-key wording | **In**: `SortKeyTooLong` becomes `KeyTooLong { kind: "partition" \| "sort" }`, confirmed by measuring the request's table and index key attributes (sites pass `keys: { partition, sort }`). Local's table-key wording (P12) and index wording ("Size limit exceeded") are confirmed against both kinds; AWS's documented sort-key wording against sort keys only, and AWS's partition-key wording ("Size of hashkey has exceeded the maximum size limit of 2048 bytes", unverified) against partition keys only. The table-key fragment was already matched (S27); a long partition key under it passed through until now. Put, update, transactions (cancellation reason or request-wide), batch writes, cascades, `append` and snapshots | user (§6A.11) |
+| S36 | Docs still describing the all-or-none GSI update rule | **Fixed**: guides and tutorials (docs agent), and the source comments on `Entity.set`, `EntityUpdate`'s `U`, `EntityCombinators.set` and `internal/sparse_check.ts`, now describe per-half recomposition | user (§6A.11) |
+| S37 | Examples that clear their table at start | **Fixed** (docs agent): each example drops its tables at start, so a failed run cannot break the next | user (§6A.11) |
 
 ### 6A.10 Implementation notes
 
@@ -962,14 +967,13 @@ Only these:
   `countOperators` move to `internal/ExpressionLimits.ts` (`Entity.countOperators` is
   re-exported for its tests); `expressionFits` also respects the 100-operand `IN` limit.
 - **Read diagnosis scope.** Every `Query` / `Scan` diagnoses a consistent read of a GSI
-  (C7). The key-bound rules (P7, P8) are diagnosed only for queries that ask
-  (`Query.make({ keyConditionDiagnosis })`), which today is the stream-index query behind
-  `readIndex` and `query.index`; other queries pass those rejections through, as S29 left
-  them. `QueryState.globalIndex` is removed (it fed only the old pre-check), so an entity
-  index pointed at an LSI of a table created outside the library now reads consistently,
-  as DynamoDB allows.
-- **Not converted, pending a decision:** D1 (EDD-9030), D2 (EDD-9042), D3 (`clampTopK`) and
-  `isIn([])` (S12, S13, S15, S17) are unchanged.
+  (C7). The key-bound rules (P7, P8) were at first diagnosed only for queries that asked
+  (`Query.make({ keyConditionDiagnosis })`), the stream-index query behind `readIndex` and
+  `query.index`; §6A.11 extends them to every query. `QueryState.globalIndex` is removed
+  (it fed only the old pre-check), so an entity index pointed at an LSI of a table created
+  outside the library now reads consistently, as DynamoDB allows.
+- **Decided after review (§6A.11):** D1 (EDD-9030), D2 (EDD-9042), D3 (`clampTopK`) and
+  `isIn([])` (S12, S13, S15, S17) are converted; S29 is converted.
 - **Examples (S31).** The rejection handler is dropped from all 32 examples, the 16 MDX
   snippets that show it, and `effect-dynamodb-geo/examples/vehicle-tracking.ts`. The lines
   sit inside `#region`s in 27 of them, not outside as §6A.7 assumed, so the MDX moved with
@@ -982,6 +986,39 @@ Only these:
   measured size model is published as "How DynamoDB Sizes Items" in
   `guides/data-integrity.mdx`, linked from the API reference's Batch and write-limit
   passages and the batch tutorial.
+
+### 6A.11 Final decisions (third review)
+
+*Added when the user confirmed every open item. Rows S12, S13, S15, S17, S29, S32 and
+S33–S37 of §6A.9 record them; this section adds what the implementation found.*
+
+- **`isIn([])` (S17).** `compileExpr` already emits `IN ()` for an empty `isIn` once
+  `emptyPartProblem` no longer refuses it; no compiler change was needed. Local rejects it
+  request-wide (also inside a transaction) with `Invalid <Kind>Expression: Syntax error;
+  token: ")", near: "()"` — `near` running on to the next token (`"())"`, `"() AND"`) when
+  one follows, so the recogniser matches the prefix `near: "()` and confirms by finding
+  `IN ()` in the condition or filter of the kind named. `asParams` no longer fails for it.
+- **Every query's key bounds (S29).** `KeyConditionDiagnosis` is now only naming: each
+  `Query` diagnoses `EmptyKeyBound`, `BetweenReversed` and `EmptyIn` (as `query.filter`);
+  entity accessors (`Entity.query.<index>`, `db.entities.X.<index>`), collections
+  (`Collection.make`, `db.collections.x`) pass a label naming themselves. An aggregate's
+  `list` query diagnoses `EmptyIn`; its assembly read diagnoses `ConsistentReadOnGsi`.
+- **Vector dimensions and TopK (S12, S13).** `SentTable`'s vector indexes carry
+  `Dimensions`; a new `SentSearch` carries a search's `TopK`. Both are recognised on the
+  member name in AWS's standard constraint wording (`Value '5000' at
+  'vectorIndexes.1.member.dimensions' failed to satisfy constraint: …`), unverified, and
+  confirmed exactly against the request.
+- **Key sizes (S35).** `diagnoseFailure({ rangeKeys })` becomes `keys: () => KeyAttributes`
+  (`rangeKeysOf` → `keyAttributesOf`, plus `mergeKeyAttributes`). Probed on Local 3.1.0: a
+  table partition key of 2,049 bytes is rejected on `PutItem`, `UpdateItem` / `DeleteItem` /
+  `GetItem` keys and `BatchWriteItem` with P12's wording (a cancellation reason in a
+  transaction); a GSI partition key of 2,049 bytes with "Size limit exceeded"
+  (request-wide, also in a transaction); an `UpdateItem` SETting a 2,049-byte GSI partition
+  key is **accepted** by Local, like P12a — unit tests only. A `Query` whose key condition
+  holds a 2,049-byte partition key is accepted (it returns nothing).
+- **`BatchGetItem` repeats (S29).** `batchGetRaw` takes `describe(position)`; `Batch.get`
+  names each position `get <i> (<Entity>)`. A new `SentWrite` variant `BatchGet` carries
+  the keys' targets.
 
 ---
 
@@ -1283,19 +1320,19 @@ otherwise `1.26.0`.
 | 7 | 400 KB per-item check (this PR) | **Converted** — removed, diagnosed | user |
 | 8 | 4 MB per-transaction check (#133) | **Converted** — removed, diagnosed | user |
 | 9 | 100-item checks: `transactGet` (`Transaction.ts` ~123), entity transactional cascade (`Entity.ts` ~4819), `EventStore` (`AppendTooLarge` ×2) | **Converted**; `AppendTooLarge` kept as the public error | user (listed) |
-| 9a | 100-item check: `transactWrite`'s expanded count (`Transaction.ts` ~250, #113) | **Converted** — not in the listed lines, but the same mirror. Changes a documented no-AWS-call behaviour: the expanded-count `DynamoError` (same tag and message) now comes from DynamoDB's rejection, and only when its wording is recognised | design — please confirm |
-| 10 | 100-item check: `Entity`'s `checkTransactionLimit` (guarded put, update, delete ×2, restore) | **Converted** — not in the listed lines, but the same mirror; applying the standard library-wide | design — please confirm |
+| 9a | 100-item check: `transactWrite`'s expanded count (`Transaction.ts` ~250, #113) | **Converted** — not in the listed lines, but the same mirror. Changes a documented no-AWS-call behaviour: the expanded-count `DynamoError` (same tag and message) now comes from DynamoDB's rejection, and only when its wording is recognised | design — confirmed by user |
+| 10 | 100-item check: `Entity`'s `checkTransactionLimit` (guarded put, update, delete ×2, restore) | **Converted** — not in the listed lines, but the same mirror; applying the standard library-wide | design — confirmed by user |
 | 11 | 100-item check: `Aggregate` groups, checked up front across all groups | **Converted** (§6A.4a) — the up-front loop is removed; each group's rejection is diagnosed and names the groups already committed. Supersedes "kept — open" | user |
 | 12 | `EventStore` 1024-byte stream-index sort-key check (append path) | **Converted**; of the non-empty-string check on the same result, the empty-string half is now converted too (§6A.5 C8, §6A.9 S16) and the type half stays | user |
 | 13 | `readIndex` `beginsWith` / `between` validation | **Converted** (§6A.4d) — empty value and reversed `between` diagnosed from DynamoDB's rejection; the one-of, type and `limit` checks stay (§6A.9 S9) | user |
 | 14 | Diagnosis at every single-item, `TransactWriteItems` and `BatchWriteItem` site (§6.5) | **In** | user |
-| 15 | No public error union widened; `AppendTooLarge` / `TransactionOverflow` / `AggregateTransactionOverflow` gain an optional `cause` | **In** — additive fields, so DynamoDB's error can be kept as cause | design — please confirm |
+| 15 | No public error union widened; `AppendTooLarge` / `TransactionOverflow` / `AggregateTransactionOverflow` gain an optional `cause` | **In** — additive fields, so DynamoDB's error can be kept as cause | design — confirmed by user |
 | 16 | `Entity` expression limits (4 KB / 300 operators on a condition — `oversizedCondition`) | **Converted** (§6A.4c) — wordings observed (§6A.1 P3–P5); `expressionFits` strategies kept | user |
-| 17 | Partition key over 2048 bytes | **Not diagnosed in this PR** — no pre-check existed; one more recogniser in the module when wanted | design — candidate |
+| 17 | Partition key over 2048 bytes | **Diagnosed** (§6A.9 S35) — no pre-check existed; `KeyTooLong` names the item and the attribute | user |
 | 18 | `Table.definition` vector-index limits | **Converted** (§6A.4e), with their `Entity.make` twins — recognised from AWS's quotas, unit tests only (Local has no vector indexes). Supersedes "kept" | user |
 | 19 | `Batch` chunking (25 / 100 / 3.5 MB) | **Kept as chunking, budget changed**: versioned-put transactions split at exactly 4,194,304 bytes / 100 items by the exact size model; a mismatch is returned diagnosed, never re-split (§6A.3) | user |
 | 20 | Own invariants and misdiagnosis guards (`refuseRepeatedItems`, empty-part conditions, option-shape checks) | **Kept**, except `refuseRepeatedItems`, now **converted** to a failure-time `RepeatedItem` diagnosis placed before the conditional mapping (§6A.4b) | user |
-| 21 | Stream-index projection (item 5 of the review) | **Deferred — pending your decision**; `Table.ts` projections untouched | user |
+| 21 | Stream-index projection (item 5 of the review) | **In** — designed and implemented in `index-projection.md` | user |
 | 22 | Returning metadata / timestamps from `append` / the handler | **Out** (§7.4) | design |
-| 23 | `Aggregate` delete's `BatchWriteItem` | **Not diagnosed** — deletes of stored keys cannot meet these limits, and `delete`'s error union has no `ValidationError`; wrapping it would widen a public union | design — please confirm |
-| 24 | Library-wide pre-check sweep, exact size model, examples' exit status | See §6A.9 (S1–S32) | user |
+| 23 | `Aggregate` delete's `BatchWriteItem` | **Not diagnosed** — deletes of stored keys cannot meet these limits, and `delete`'s error union has no `ValidationError`; wrapping it would widen a public union | design — confirmed by user |
+| 24 | Library-wide pre-check sweep, exact size model, examples' exit status | See §6A.9 (S1–S37) | user |
