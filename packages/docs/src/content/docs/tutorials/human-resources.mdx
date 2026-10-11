@@ -26,7 +26,7 @@ As stakeholders of this HR system, we need to support these access patterns:
 5. **Client** — Find a physical office by location (country + state)
 6. **Hiring Manager** — Find employees by title, with salary range queries
 7. **HR** — Find all employees that report to a specific manager
-8. **HR** — Transfer an employee between offices (all GSI composites must be consistent)
+8. **HR** — Transfer an employee between offices (every touched GSI key is recomposed)
 9. **HR** — Atomically onboard a new employee with their first task
 10. **HR** — Terminate an employee (soft delete) and rehire them later (restore)
 
@@ -608,7 +608,7 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Index overloading** | GSI1 serves `workplaces` collection (employees + offices by office) and `byProject` index (tasks by project) |
 | **Collections** | `Workplaces` (GSI1) and `Assignments` (GSI3) enable cross-entity queries with grouped results |
 | **Sort key range queries** | Zero-padded salary in `byRole` (GSI4) SK enables `between` queries via `.where()` |
-| **All-or-none GSI updates** | Updating one GSI composite requires all composites for that index |
+| **GSI key recomposition** | An update recomposes each GSI key half whose composites it touches ([Index Policy](/effect-dynamodb/guides/index-policy/)) |
 | **Transactions** | Atomic multi-entity writes for onboarding |
 | **Soft delete + restore** | Termination archives records; rehire restores them with all keys recomposed |
 
