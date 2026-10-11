@@ -41,7 +41,13 @@ import {
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
-import { rangeKeysOf, type TransactItemTarget, transactItemTarget } from "./WriteDiagnosis.js"
+import {
+  type KeyAttributes,
+  keyAttributesOf,
+  mergeKeyAttributes,
+  type TransactItemTarget,
+  transactItemTarget,
+} from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
 // ConditionCheck — composable from EntityGet + condition expression
@@ -192,10 +198,11 @@ export interface BuiltTransactWriteItems {
   readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
   /**
-   * The sort-key attributes the ops' entities write (primary and index), for
-   * diagnosing a rejected sort key. A thunk: needed only on failure.
+   * The key attributes the ops' entities write (primary and index, partition
+   * and sort), for diagnosing a rejected key size. A thunk: needed only on
+   * failure.
    */
-  readonly rangeKeys: () => ReadonlyArray<string>
+  readonly keys: () => KeyAttributes
 }
 
 /**
@@ -211,10 +218,10 @@ export interface BuiltTransactWriteItems {
  * read a guarded put's reasons through {@link judgeCancellation}.
  *
  * DynamoDB's rules (one operation per item, 100 items, 4 MB, 400 KB per
- * item, 1024-byte sort keys, the limits on one expression) are not
+ * item, 2048-byte partition and 1024-byte sort keys, the limits on one expression) are not
  * pre-checked: the caller sends the transaction and diagnoses DynamoDB's
  * rejection through `internal/WriteDiagnosis.ts`, which counts the EXPANDED
- * items and names the culprit through `targets` (and `rangeKeys`) — two ops
+ * items and names the culprit through `targets` (and `keys`) — two ops
  * touching one item included, among them two puts that swap unique values
  * and so release and claim the same sentinels. A caller adding items of its
  * own appends their targets to these.
@@ -229,7 +236,13 @@ export const buildTransactWriteItems = (
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) {
-      return { items: [], provenance: [], targets: () => [], guarded: [], rangeKeys: () => [] }
+      return {
+        items: [],
+        provenance: [],
+        targets: () => [],
+        guarded: [],
+        keys: () => mergeKeyAttributes(),
+      }
     }
 
     const opInfos: Array<{
@@ -397,11 +410,10 @@ export const buildTransactWriteItems = (
       }
     }
 
-    const rangeKeys = () => [
-      ...new Set(opInfos.flatMap((op) => rangeKeysOf(op.entity.indexes as never))),
-    ]
+    const keys = () =>
+      mergeKeyAttributes(...opInfos.map((op) => keyAttributesOf(op.entity.indexes as never)))
     const targets = () => naming.map((name) => name())
-    return { items, provenance, targets, guarded, rangeKeys }
+    return { items, provenance, targets, guarded, keys }
   })
 
 // ---------------------------------------------------------------------------

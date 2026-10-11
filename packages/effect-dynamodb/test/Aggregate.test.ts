@@ -22,6 +22,7 @@ import {
   DDB_ITEM_SIZE,
   DDB_SORT_KEY_LOCAL,
   DDB_TOO_MANY_ITEMS,
+  ddbEmptyIn,
   ddbPayloadTooLarge,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
@@ -1739,6 +1740,9 @@ describe("Aggregate write path", () => {
             // The root group went first, and committed: the write is not atomic.
             expect(overflow.committed).toHaveLength(1)
             expect(overflow.subgraph).not.toBe(overflow.committed![0])
+            expect(overflow.operation).toBe("create")
+            expect(overflow.message).toContain(`already committed: "${overflow.committed![0]}"`)
+            expect(overflow.message).toContain("update or delete the partial aggregate")
             expect((overflow.cause as DynamoError).cause).toBe(rejection)
             // Sent, not refused: the root group, then the rejected one; no more.
             expect(mockTransactWrite).toHaveBeenCalledTimes(2)
@@ -3844,12 +3848,23 @@ describe("Aggregate write path", () => {
           (_: any, o: any) => o.or(),
           (t: any, o: any) => o.or(o.eq(t.author, "Alice"), o.and()),
           (_: any, o: any) => o.not(o.and()),
-          (t: any, o: any) => o.isIn(t.author, []),
         ]) {
           const error = yield* ListAggregate.list(undefined, { filter: refused }).pipe(Effect.flip)
           expect(error._tag).toBe("ValidationError")
         }
         expect(mockListQuery).not.toHaveBeenCalled()
+        // An isIn with no values is sent, and DynamoDB's rejection named (#144).
+        mockListQuery.mockRejectedValueOnce(awsValidationException(ddbEmptyIn("Filter")))
+        const emptyIn = yield* ListAggregate.list(undefined, {
+          filter: (t: any, o: any) => o.isIn(t.author, []),
+        }).pipe(Effect.flip)
+        expect(emptyIn._tag).toBe("ValidationError")
+        expect((emptyIn as ValidationError).operation).toBe("list.filter")
+        expect(String((emptyIn as ValidationError).cause)).toContain(
+          'isIn() on "author" has no values',
+        )
+        expect(mockListQuery.mock.calls[0]![0].FilterExpression).toBe("#e0 IN ()")
+        mockListQuery.mockClear()
         // An empty part directly under and is left out; a whole empty filter is none.
         mockListQuery.mockResolvedValue({ Items: [] })
         yield* ListAggregate.list(undefined, {

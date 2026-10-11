@@ -71,6 +71,7 @@ import {
   type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
+  mergeKeyAttributes,
   withCause,
 } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
@@ -1841,11 +1842,14 @@ export const makeStream = <
       // count.
       diagnoseFailure({
         sent,
-        rangeKeys: () => [
-          "sk",
-          ...streamIndexes.map((idx) => idx.sk),
-          ...tx.additional.rangeKeys(),
-        ],
+        keys: () =>
+          mergeKeyAttributes(
+            {
+              partition: ["pk", ...streamIndexes.map((idx) => idx.pk)],
+              sort: ["sk", ...streamIndexes.map((idx) => idx.sk)],
+            },
+            tx.additional.keys(),
+          ),
         rewrite: diagnosed,
       }),
     )
@@ -1853,7 +1857,8 @@ export const makeStream = <
 
   /**
    * A diagnosed rejection of an append (#144) other than its item count. An
-   * over-long stream-index key OF AN EVENT is named by its index and event, as
+   * over-long (or empty) stream-index sort key OF AN EVENT — the value the
+   * index's `key` function returned — is named by its index and event, as
    * the `indexes` option reports its other key problems. Only the event puts
    * carry stream-index keys: an additional item writing the same physical
    * attribute (single-table designs share `gsi1sk` and the like) is its own
@@ -1864,7 +1869,10 @@ export const makeStream = <
     original: unknown,
     tx: AppendTransaction,
   ): ValidationError => {
-    if (diagnosis._tag === "SortKeyTooLong" || diagnosis._tag === "EmptyKey") {
+    if (
+      (diagnosis._tag === "KeyTooLong" && diagnosis.kind === "sort") ||
+      diagnosis._tag === "EmptyKey"
+    ) {
       const position = tx.targets().indexOf(diagnosis.target)
       const isEvent = position >= tx.guardCount && position < tx.guardCount + tx.eventCount
       const idx = isEvent
@@ -1876,7 +1884,7 @@ export const makeStream = <
           operation: "EventStore.append.indexes",
           cause: withCause(
             `The key of index "${idx.name}" for ${diagnosis.target.source} ` +
-              (diagnosis._tag === "SortKeyTooLong"
+              (diagnosis._tag === "KeyTooLong"
                 ? `is ${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a ` +
                   "sort key."
                 : "is an empty string, which DynamoDB does not accept as a key value; the " +
@@ -2430,7 +2438,7 @@ export const makeStream = <
                 "the snapshot",
               ),
           }),
-          rangeKeys: () => ["sk"],
+          keys: () => ({ partition: ["pk"], sort: ["sk"] }),
           rewrite: (diagnosis, original) =>
             diagnosedValidationError(diagnosis, original, {
               operation: "EventStore.writeSnapshot",

@@ -17,14 +17,21 @@
  * Keys are sent as given. Callers pass keys that are unique within one
  * request — a page of one stream's index never repeats a key — and a repeated
  * key is not de-duplicated: DynamoDB rejects the request ("Provided list of
- * item keys contains duplicates"), and that `DynamoError` passes through, as
- * `Batch.get` has always behaved.
+ * item keys contains duplicates"), and the rejection is diagnosed (#144) as a
+ * `DynamoError` naming both positions (`describe`), DynamoDB's error kept as
+ * the cause.
  */
 
 import type { AttributeValue, KeysAndAttributes } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
+import {
+  diagnoseFailure,
+  type TransactItemTarget,
+  transactItemTarget,
+  withCause,
+} from "./WriteDiagnosis.js"
 
 /** DynamoDB's limit on the keys of one `BatchGetItem` request. */
 export const MAX_BATCH_GET = 100
@@ -48,6 +55,13 @@ export interface HydrateOptions {
   readonly baseDelayMs?: number | undefined
   /** Re-read keys missing from the responses once, strongly consistently. */
   readonly rereadMissing?: boolean | undefined
+  /**
+   * The entity a request reads and how to name it in an error (`get 2
+   * (User)`), for a rejection of a repeated key. Default: `request <i>`.
+   */
+  readonly describe?:
+    | ((position: number) => { readonly entityType: string; readonly source: string })
+    | undefined
 }
 
 /** A key attribute value, as a string that is equal iff the values are. */
@@ -89,6 +103,40 @@ export const batchGetRaw = (
     const identities = requests.map((request, i) =>
       identity(request.tableName, keyNames[i]!, request.key),
     )
+
+    /**
+     * The item each key of a sent request reads, in request order, named by
+     * its position (a repeated key's occurrences by successive positions).
+     */
+    const repeatTargets = (
+      sentItems: Record<string, KeysAndAttributes>,
+    ): ReadonlyArray<TransactItemTarget> => {
+      const seen = new Map<string, number>()
+      return Object.entries(sentItems).flatMap(([tableName, entry]) =>
+        (entry.Keys ?? []).map((key) => {
+          const names = Object.keys(key).sort()
+          const id = identity(tableName, names, key)
+          const occurrence = seen.get(id) ?? 0
+          seen.set(id, occurrence + 1)
+          const positions = identities.flatMap((candidate, i) => (candidate === id ? [i] : []))
+          const position = positions[Math.min(occurrence, positions.length - 1)]
+          const described =
+            position === undefined
+              ? { entityType: "unknown", source: "a request" }
+              : (options.describe?.(position) ?? {
+                  entityType: "unknown",
+                  source: `request ${position}`,
+                })
+          return transactItemTarget(
+            { Get: { TableName: tableName, Key: key } },
+            tableName,
+            names,
+            described.entityType,
+            described.source,
+          )
+        }),
+      )
+    }
 
     /** Fetch the requests at `positions`, filling `results`. */
     const fetch = (positions: ReadonlyArray<number>, consistentRead: boolean) =>
@@ -135,7 +183,28 @@ export const batchGetRaw = (
 
           let retries = 0
           while (Object.keys(requestItems).length > 0) {
-            const response = yield* client.batchGetItem({ RequestItems: requestItems })
+            const sentItems = requestItems
+            const response = yield* client.batchGetItem({ RequestItems: sentItems }).pipe(
+              // A key repeated in one request (#144): DynamoDB's rejection,
+              // confirmed and named by the positions that read it.
+              diagnoseFailure({
+                sent: () => ({ _tag: "BatchGet", targets: () => repeatTargets(sentItems) }),
+                only: ["RepeatedItem"],
+                rewrite: (diagnosis, original) =>
+                  diagnosis._tag !== "RepeatedItem"
+                    ? (original as DynamoClientError)
+                    : new DynamoError({
+                        operation: "BatchGetItem",
+                        cause: withCause(
+                          `BatchGetItem reads one item more than once — ` +
+                            `${diagnosis.first.source} and ${diagnosis.second.source} both ` +
+                            `read the item at ${diagnosis.second.key}. DynamoDB allows each key ` +
+                            "once in a request, and rejected it. Read the item once.",
+                          original,
+                        ),
+                      }),
+              }),
+            )
 
             for (const [tableName, items] of Object.entries(response.Responses ?? {})) {
               const lists = tableKeyNames.get(tableName)

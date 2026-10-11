@@ -19,13 +19,20 @@ import type * as DynamoSchema from "./DynamoSchema.js"
 // Limits (DynamoDB service quotas)
 // ---------------------------------------------------------------------------
 
-/** Minimum vector dimensionality accepted by DynamoDB. */
+/**
+ * Minimum vector dimensionality accepted by DynamoDB. Not pre-checked: DynamoDB
+ * rejects an index outside 1..4096, and the rejection is diagnosed against the
+ * request (#144).
+ */
 export const MIN_DIMENSIONS = 1
-/** Maximum vector dimensionality accepted by DynamoDB. */
+/** Maximum vector dimensionality accepted by DynamoDB (not pre-checked; see {@link MIN_DIMENSIONS}). */
 export const MAX_DIMENSIONS = 4096
-/** Minimum `TopK` accepted by `SearchVectors`. */
+/**
+ * Minimum `TopK` accepted by `SearchVectors`. Not pre-checked: `.topK()` sends
+ * what it is given, and DynamoDB's rejection is diagnosed (#144).
+ */
 export const MIN_TOP_K = 1
-/** Maximum `TopK` accepted by `SearchVectors` (hard limit — there is no pagination). */
+/** Maximum `TopK` accepted by `SearchVectors` (hard limit — there is no pagination; not pre-checked). */
 export const MAX_TOP_K = 100
 /** Default `TopK` applied when `.topK()` is not called. */
 export const DEFAULT_TOP_K = 10
@@ -334,13 +341,20 @@ export type VectorFilterInput<TField extends string = string> = {
 }
 
 // ---------------------------------------------------------------------------
-// Validation (EDD-903x)
+// Validation (EDD-903x, EDD-9070)
 // ---------------------------------------------------------------------------
 
 /**
  * Validate an entity's vector index declarations at `Entity.make()` time.
  *
- * @throws on invalid configuration (EDD-903x).
+ * DynamoDB's own limits are not checked here (#144): dimensions outside
+ * 1..4096, too many `INLINE_FILTER` attributes or vector indexes are sent, and
+ * DynamoDB's rejection of the `CreateTable` / `UpdateTable` is diagnosed. A
+ * non-integer `dimensions` stays refused: DynamoDB reads an integer member
+ * leniently (DynamoDB Local truncates `2.9` to `2`), so it could be accepted as
+ * a different, immutable dimensionality.
+ *
+ * @throws on invalid configuration (EDD-903x, EDD-9070).
  */
 export const validateVectorIndexes = (params: {
   readonly entityType: string
@@ -352,14 +366,11 @@ export const validateVectorIndexes = (params: {
   const seenPhysical = new Map<string, string>()
 
   for (const [logicalName, definition] of Object.entries(definitions)) {
-    if (
-      !Number.isInteger(definition.dimensions) ||
-      definition.dimensions < MIN_DIMENSIONS ||
-      definition.dimensions > MAX_DIMENSIONS
-    ) {
+    if (!Number.isInteger(definition.dimensions)) {
       throw new Error(
-        `[EDD-9030] Entity "${entityType}": vector index "${logicalName}" has dimensions ` +
-          `${definition.dimensions}. DynamoDB accepts an integer in ${MIN_DIMENSIONS}..${MAX_DIMENSIONS}.`,
+        `[EDD-9070] Entity "${entityType}": vector index "${logicalName}" has dimensions ` +
+          `${definition.dimensions}, which is not an integer. Declare the embedding's exact ` +
+          `dimensionality.`,
       )
     }
 
@@ -409,9 +420,9 @@ export const validateVectorIndexes = (params: {
 /**
  * Clamp a caller-supplied `TopK` into DynamoDB's accepted range.
  *
- * Clamping (rather than failing) mirrors how `.limit()` behaves elsewhere in the
- * library — an out-of-range K is a caller mistake with an obvious correct
- * interpretation, not a data-integrity problem.
+ * @deprecated No longer used by the library (#144): `.topK()` sends the value
+ * it is given, and DynamoDB's rejection of one outside 1..100 is diagnosed as
+ * a `ValidationError` naming it. Kept so existing imports compile.
  */
 export const clampTopK = (topK: number): number =>
   Math.min(MAX_TOP_K, Math.max(MIN_TOP_K, Math.floor(topK)))

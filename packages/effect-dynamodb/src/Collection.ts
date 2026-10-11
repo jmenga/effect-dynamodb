@@ -322,6 +322,7 @@ export const make = <
         // We need to tag each item with its entity key so the caller can group
         return collectionDecoder(raw) as Effect.Effect<any, ValidationError>
       },
+      keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
     // Clustered collections add begins_with SK condition on collection prefix
@@ -361,6 +362,7 @@ export const make = <
           entity.indexes.primary?.pk.field,
           entity.indexes.primary?.sk.field,
         ],
+        keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
       })
 
       // Clustered entity selectors add begins_with on the entity SK prefix.

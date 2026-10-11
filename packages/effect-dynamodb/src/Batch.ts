@@ -34,7 +34,9 @@ import {
   batchEntries,
   diagnosedValidationError,
   diagnoseFailure,
-  rangeKeysOf,
+  type KeyAttributes,
+  keyAttributesOf,
+  mergeKeyAttributes,
   transactItemTarget,
 } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
@@ -126,7 +128,15 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
       tableName: tableNames.get(info.entity)!,
       key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
     }))
-    const fetched = yield* batchGetRaw(client, requests, { maxRetries, baseDelayMs })
+    const fetched = yield* batchGetRaw(client, requests, {
+      maxRetries,
+      baseDelayMs,
+      // A key repeated in one request is DynamoDB's to reject (#144): named by position.
+      describe: (position) => {
+        const entityType = infos[position]!.entity.entityType
+        return { entityType, source: `get ${position} (${entityType})` }
+      },
+    })
 
     const results: Array<unknown> = new Array(items.length).fill(undefined)
     for (let i = 0; i < fetched.length; i++) {
@@ -162,7 +172,7 @@ type VersionedPut = {
   readonly transactItem: TransactWriteItem
   /** Primary key and every sort-key attribute, to name a rejected item (#144). */
   readonly keyFields: ReadonlyArray<string>
-  readonly rangeKeys: () => ReadonlyArray<string>
+  readonly keys: () => KeyAttributes
   /** Its exact contribution to a transaction's size (`transactItemBytes`). */
   readonly bytes: number
 }
@@ -308,7 +318,7 @@ export const write = (
       request: Record<string, any>
       entityType: string
       keyFields: ReadonlyArray<string>
-      rangeKeys: () => ReadonlyArray<string>
+      keys: () => KeyAttributes
     }> = []
 
     for (const op of operations) {
@@ -329,7 +339,7 @@ export const write = (
       const { name: tableName } = yield* entity._tableTag
       const primary = entity.indexes.primary!
       const keyFields = [primary.pk.field, primary.sk.field]
-      const rangeKeys = () => rangeKeysOf(entity.indexes as never)
+      const keys = () => keyAttributesOf(entity.indexes as never)
 
       // BatchWriteItem has no ConditionExpression. Silently dropping a
       // condition would turn `create()` into a blind overwrite, so reject
@@ -384,7 +394,7 @@ export const write = (
             entityType: entity.entityType,
             transactItem,
             keyFields,
-            rangeKeys,
+            keys,
             // Exact, condition and its name included: what DynamoDB counts
             // toward the transaction's 4 MB (#144).
             bytes: transactItemBytes(transactItem),
@@ -395,7 +405,7 @@ export const write = (
             request: { PutRequest: { Item: built.marshalled } },
             entityType: entity.entityType,
             keyFields,
-            rangeKeys,
+            keys,
           })
         }
       } else if (info.opType === "delete") {
@@ -408,7 +418,7 @@ export const write = (
           request: { DeleteRequest: { Key: composed } },
           entityType: entity.entityType,
           keyFields,
-          rangeKeys,
+          keys,
         })
       } else {
         return yield* new ValidationError({
@@ -464,7 +474,7 @@ export const write = (
                   ),
                 ),
             }),
-            rangeKeys: () => [...new Set(chunk.flatMap((put) => put.rangeKeys()))],
+            keys: () => mergeKeyAttributes(...chunk.map((put) => put.keys())),
             // Chunked to fit by the exact size model: should DynamoDB still
             // reject the payload, the error gives both sizes — never re-split
             // nor retried — and says exactly what the batch already wrote.
@@ -592,7 +602,7 @@ export const write = (
                   }),
               }
             },
-            rangeKeys: () => [...new Set(chunk.flatMap((item) => item.rangeKeys()))],
+            keys: () => mergeKeyAttributes(...chunk.map((item) => item.keys())),
             rewrite: (diagnosis, original) =>
               diagnosedValidationError(diagnosis, original, {
                 operation: "batchWrite",

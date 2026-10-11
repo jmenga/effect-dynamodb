@@ -274,25 +274,30 @@ describe("Batch", () => {
     )
 
     it.effect(
-      "sends a repeated key as given, so DynamoDB's duplicate-key rejection passes through",
+      "sends a repeated key as given; DynamoDB's duplicate-key rejection names both gets (#144)",
       () =>
         Effect.gen(function* () {
-          mockBatchGetItem.mockRejectedValueOnce(
-            new Error("Provided list of item keys contains duplicates"),
-          )
+          const rejection = awsValidationException(DDB_REPEATED_BATCH_ITEM)
+          mockBatchGetItem.mockRejectedValueOnce(rejection)
 
           const error = yield* Batch.get([
             UserEntity.get({ userId: "u-1" }),
+            UserEntity.get({ userId: "u-2" }),
             UserEntity.get({ userId: "u-1" }),
           ]).pipe(Effect.flip)
 
           expect(error._tag).toBe("DynamoError")
+          const text = String((error as DynamoError).cause)
+          expect(text).toContain(
+            "BatchGetItem reads one item more than once — get 0 (User) and get 2 (User)",
+          )
+          expect(((error as DynamoError).cause as Error).cause).toBeInstanceOf(DynamoError)
           expect(mockBatchGetItem).toHaveBeenCalledOnce()
           const request = mockBatchGetItem.mock.calls[0]![0] as {
             RequestItems: Record<string, { Keys: ReadonlyArray<unknown> }>
           }
-          // Both keys are sent: the library does not quietly de-duplicate.
-          expect(request.RequestItems["test-table"]!.Keys).toHaveLength(2)
+          // Every key is sent: the library does not quietly de-duplicate.
+          expect(request.RequestItems["test-table"]!.Keys).toHaveLength(3)
         }).pipe(Effect.provide(TestLayer)),
     )
 

@@ -2,10 +2,12 @@
  * @internal Failure-time diagnosis of DynamoDB's rejections (#144).
  *
  * The library does not pre-check limits or request rules DynamoDB enforces
- * itself — the 400 KB item, the 4 MB and 100-item transaction, the 1024-byte
- * sort key, one operation per item, the limits on one expression, an empty key
- * value, a reversed `BETWEEN`, a consistent read of a GSI, a table's vector
- * index limits. It sends the request; when DynamoDB rejects it, this module:
+ * itself — the 400 KB item, the 4 MB and 100-item transaction, the 2048-byte
+ * partition key and 1024-byte sort key, one operation per item, the limits on
+ * one expression, an `IN ()` with no operands, an empty key value, a reversed
+ * `BETWEEN`, a consistent read of a GSI, a table's vector index limits, a
+ * vector search's `TopK`. It sends the request; when DynamoDB rejects it, this
+ * module:
  *
  * 1. **recognises** the rejection by a stable fragment of its message (a
  *    request-wide `ValidationException` or `LimitExceededException`, or a
@@ -25,8 +27,9 @@
  * and no target is built, unless DynamoDB has rejected the request.
  *
  * Every site goes through {@link diagnoseFailure}: writes ({@link SentWrite}),
- * reads ({@link SentRead}) and table management ({@link SentTable}) share the
- * one recognise / confirm / rewrite path.
+ * reads ({@link SentRead}), table management ({@link SentTable}) and vector
+ * searches ({@link SentSearch}) share the one recognise / confirm / rewrite
+ * path.
  */
 
 import type {
@@ -42,8 +45,12 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  MAX_DIMENSIONS,
   MAX_INLINE_FILTERS,
+  MAX_TOP_K,
   MAX_VECTOR_INDEXES_PER_TABLE,
+  MIN_DIMENSIONS,
+  MIN_TOP_K,
 } from "@effect-dynamodb/schema/VectorIndex.js"
 import { Effect } from "effect"
 import {
@@ -62,8 +69,22 @@ import {
   transactItemBytes,
 } from "./ItemSize.js"
 
+/** DynamoDB's limit on a partition (hash) key value, in UTF-8 bytes. */
+export const PARTITION_KEY_MAX_BYTES = 2048
+
 /** DynamoDB's limit on a sort (range) key value, in UTF-8 bytes. */
 export const SORT_KEY_MAX_BYTES = 1024
+
+/**
+ * The key attributes a write can carry — its table's and its indexes' — by
+ * kind, so an over-long key value can be measured against its limit.
+ */
+export type KeyAttributes = {
+  readonly partition: ReadonlyArray<string>
+  readonly sort: ReadonlyArray<string>
+}
+
+const NO_KEYS: KeyAttributes = { partition: [], sort: [] }
 
 // ---------------------------------------------------------------------------
 // Targets: the item an entry writes, and how to name it
@@ -155,6 +176,11 @@ export type SentWrite =
       /** The item each `Get` reads, to name a repeated one. */
       readonly targets?: (() => ReadonlyArray<TransactItemTarget>) | undefined
     }
+  | {
+      /** A `BatchGetItem` request: the item each of its keys reads, in request order. */
+      readonly _tag: "BatchGet"
+      readonly targets: () => ReadonlyArray<TransactItemTarget>
+    }
 
 /** What a reading site sent: the `Query` / `Scan` request, as sent. */
 export type SentRead = {
@@ -163,15 +189,24 @@ export type SentRead = {
   readonly input: {
     readonly IndexName?: string | undefined
     readonly KeyConditionExpression?: string | undefined
+    readonly FilterExpression?: string | undefined
     readonly ExpressionAttributeNames?: Record<string, string> | undefined
     readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
     readonly ConsistentRead?: boolean | undefined
   }
 }
 
+/** What a vector search sent: its `SearchVectors` request's `TopK`. */
+export type SentSearch = {
+  readonly _tag: "Search"
+  readonly index: string
+  readonly topK: number
+}
+
 /** A vector index as a `CreateTable` / `UpdateTable` request declares it. */
 export type SentVectorIndex = {
   readonly IndexName?: string | undefined
+  readonly Dimensions?: number | undefined
   readonly SearchSchema?:
     | ReadonlyArray<{
         readonly AttributeName?: string | undefined
@@ -201,7 +236,7 @@ export type SentTable = {
 }
 
 /** Any request a site sent. */
-export type Sent = SentWrite | SentRead | SentTable
+export type Sent = SentWrite | SentRead | SentTable | SentSearch
 
 /** A confirmed reading of DynamoDB's rejection, naming the culprit. */
 export type Diagnosis =
@@ -231,8 +266,10 @@ export type Diagnosis =
       }>
     }
   | {
-      readonly _tag: "SortKeyTooLong"
+      /** A key value over its limit: 2048 bytes for a partition key, 1024 for a sort key. */
+      readonly _tag: "KeyTooLong"
       readonly target: TransactItemTarget
+      readonly kind: "partition" | "sort"
       readonly attribute: string
       readonly bytes: number
     }
@@ -265,6 +302,18 @@ export type Diagnosis =
       readonly index: string | undefined
     }
   | {
+      /**
+       * An `isIn()` with no values: its `IN ()`, which DynamoDB rejects as a
+       * syntax error, in a write's condition or a read's filter.
+       */
+      readonly _tag: "EmptyIn"
+      readonly expression: "ConditionExpression" | "FilterExpression"
+      /** The attribute (path) the `isIn()` tests. */
+      readonly attribute: string
+      /** The write whose condition holds it; `undefined` for a read's filter. */
+      readonly target: TransactItemTarget | undefined
+    }
+  | {
       /** A query's key condition compares a key attribute with an empty value. */
       readonly _tag: "EmptyKeyBound"
       readonly attribute: string
@@ -294,6 +343,20 @@ export type Diagnosis =
       readonly limit: number
     }
   | {
+      /** A vector index whose dimensions are outside the range DynamoDB accepts. */
+      readonly _tag: "VectorIndexDimensions"
+      readonly operation: "CreateTable" | "UpdateTable"
+      readonly index: string
+      readonly dimensions: number
+      readonly sharers: ReadonlyArray<string>
+    }
+  | {
+      /** A vector search's `TopK` outside the range DynamoDB accepts. */
+      readonly _tag: "TopKOutOfRange"
+      readonly index: string
+      readonly topK: number
+    }
+  | {
       /** More vector indexes on one table than DynamoDB allows the account. */
       readonly _tag: "VectorIndexCount"
       readonly operation: "CreateTable" | "UpdateTable"
@@ -319,10 +382,23 @@ const ITEM_SIZE_UPDATE = /Item size to update has exceeded/i
 const ITEM_COUNT = /length less than or equal to 100\b/i
 const PAYLOAD = /payload size cannot exceed 4\s?MB/i
 const PAYLOAD_SIZE = /Payload Size:\s*(\d+)/i
-// An index key's wording on DynamoDB Local, AWS's documented one, then a
-// table key's on DynamoDB Local (partition and sort key in one message).
-const SORT_KEY =
-  /Size limit exceeded|Aggregated size of all range keys|range primary key values must be under 1024 bytes/i
+// A key value over its limit. DynamoDB Local words a table key's (partition
+// and sort key in one message: "Hash primary key values must be under 2048
+// bytes, and range primary key values must be under 1024 bytes") and an index
+// key's ("One or more parameter values were invalid: Size limit exceeded")
+// alike for both kinds, so either is confirmed against both. AWS words each
+// kind its own way: "Aggregated size of all range keys has exceeded the size
+// limit of 1024 bytes" (documented) and "Size of hashkey has exceeded the
+// maximum size limit of 2048 bytes" (as AWS reports it; unverified here — Local
+// cannot produce it).
+const KEY_SIZE_EITHER =
+  /Size limit exceeded|Hash primary key values must be under 2048 bytes|range primary key values must be under 1024 bytes/i
+const KEY_SIZE_SORT = /Aggregated size of all range keys/i
+const KEY_SIZE_PARTITION = /Size of hash\s?key has exceeded/i
+const KEY_SIZE = new RegExp(
+  [KEY_SIZE_EITHER, KEY_SIZE_SORT, KEY_SIZE_PARTITION].map((r) => r.source).join("|"),
+  "i",
+)
 // A transaction (or `TransactGetItems`) naming one item twice; a batch
 // request doing so.
 const REPEATED = /cannot include multiple operations on one item/i
@@ -336,6 +412,23 @@ const EMPTY_KEY_INDEX = /IndexName:\s*([^,\s]+),\s*IndexKey:\s*([^,\s]+)/i
 const EMPTY_KEY_TABLE = /(?<!Index)Key:\s*([^,\s]+)/
 const BETWEEN_REVERSED = /BETWEEN operator requires upper bound to be greater than or equal to/i
 const CONSISTENT_GSI = /Consistent read cannot be true when (querying|scanning) a GSI/i
+// `IN ()` — an `isIn()` with no values — is a syntax error to DynamoDB
+// (Local: 'Invalid ConditionExpression: Syntax error; token: ")", near: "()"',
+// the `near` running on to the next token — `"())"`, `"() AND"` — when one
+// follows; `FilterExpression` likewise), request-wide even in a transaction.
+// The message names no attribute: confirmed by finding the `IN ()` in the
+// request.
+const EMPTY_IN = /Syntax error; token: "\)", near: "\(\)/i
+const EMPTY_IN_OPERAND = /((?:size\(\s*)?[#\w.[\]]+\)?)\s+IN\s*\(\s*\)/i
+// A vector index's dimensions or a vector search's TopK outside DynamoDB's
+// range. DynamoDB Local has neither vector indexes nor `SearchVectors`, so
+// these follow AWS's documented ranges (Dimensions 1..4096, TopK 1..100) and
+// its standard member-constraint wording ("Value '5000' at
+// 'vectorIndexes.1.member.dimensions' failed to satisfy constraint: Member
+// must have value less than or equal to 4096"); unverified on AWS. Matched on
+// the member's name only, and confirmed against the request.
+const VECTOR_DIMENSIONS = /dimension/i
+const TOP_K = /top\s?k/i
 // AWS documents the vector-index quotas (18 inline filters per index, 5
 // vector indexes per table, adjustable) but not the wording of their
 // rejection, and DynamoDB Local has no vector indexes: matched loosely, and
@@ -446,19 +539,48 @@ const isEmptyKeyValue = (value: AttributeValue | undefined): boolean =>
   value !== undefined &&
   ((value.S !== undefined && value.S === "") || (value.B !== undefined && value.B.length === 0))
 
-/** The first range-key attribute of `item` over {@link SORT_KEY_MAX_BYTES}. */
-const oversizedRangeKey = (
+/**
+ * The first key attribute of `item` over its limit — a partition key over
+ * {@link PARTITION_KEY_MAX_BYTES}, a sort key over {@link SORT_KEY_MAX_BYTES} —
+ * among the `kinds` a rejection can mean.
+ */
+const oversizedKey = (
   item: TransactWriteItem,
-  rangeKeys: ReadonlyArray<string>,
-): { readonly attribute: string; readonly bytes: number } | undefined => {
+  keys: KeyAttributes,
+  kinds: ReadonlyArray<"partition" | "sort">,
+):
+  | { readonly kind: "partition" | "sort"; readonly attribute: string; readonly bytes: number }
+  | undefined => {
   const written = writtenAttributes(item)
-  for (const attribute of rangeKeys) {
-    const value = written[attribute]
-    if (value === undefined) continue
-    const bytes = keyBytes(value)
-    if (bytes > SORT_KEY_MAX_BYTES) return { attribute, bytes }
+  for (const kind of kinds) {
+    const limit = kind === "partition" ? PARTITION_KEY_MAX_BYTES : SORT_KEY_MAX_BYTES
+    for (const attribute of kind === "partition" ? keys.partition : keys.sort) {
+      const value = written[attribute]
+      if (value === undefined) continue
+      const bytes = keyBytes(value)
+      if (bytes > limit) return { kind, attribute, bytes }
+    }
   }
   return undefined
+}
+
+/** The key kinds a key-size message can mean. */
+const keySizeKinds = (message: string): ReadonlyArray<"partition" | "sort"> =>
+  KEY_SIZE_EITHER.test(message)
+    ? ["partition", "sort"]
+    : KEY_SIZE_PARTITION.test(message)
+      ? ["partition"]
+      : ["sort"]
+
+/** The attribute (path) an `IN ()` in `expression` tests, its placeholders resolved. */
+const emptyInOperand = (
+  expression: string | undefined,
+  names: Record<string, string> | undefined,
+): string | undefined => {
+  const operand = EMPTY_IN_OPERAND.exec(expression ?? "")?.[1]
+  return operand === undefined
+    ? undefined
+    : operand.replace(/#\w+/g, (token) => names?.[token] ?? token)
 }
 
 /** A Put's item size — the 400 KB measure, which its expressions do not count toward. */
@@ -555,7 +677,11 @@ const keyComparisons = (
 // ---------------------------------------------------------------------------
 
 const entriesOf = (sent: SentWrite): ReadonlyArray<TransactWriteItem> =>
-  sent._tag === "Item" ? [sent.item] : sent._tag === "TransactGet" ? [] : sent.items
+  sent._tag === "Item"
+    ? [sent.item]
+    : sent._tag === "TransactGet" || sent._tag === "BatchGet"
+      ? []
+      : sent.items
 
 const targetsOf = (sent: SentWrite): ReadonlyArray<TransactItemTarget> => {
   if (sent._tag === "Item") return [sent.target()]
@@ -576,7 +702,12 @@ const repeatedItem = (sent: SentWrite): Diagnosis | undefined => {
   for (const target of targetsOf(sent)) {
     const first = seen.get(target.identity)
     if (first !== undefined) {
-      return { _tag: "RepeatedItem", first, second: target, batch: sent._tag === "Batch" }
+      return {
+        _tag: "RepeatedItem",
+        first,
+        second: target,
+        batch: sent._tag === "Batch" || sent._tag === "BatchGet",
+      }
     }
     seen.set(target.identity, target)
   }
@@ -620,24 +751,46 @@ const growingUpdate = (sent: SentWrite): Diagnosis | undefined => {
     : { _tag: "ItemTooLarge", target, bytes: undefined, likely: sent._tag !== "Item" }
 }
 
-const sortKeyAt = (
+const keyAt = (
   sent: SentWrite,
   index: number,
-  rangeKeys: ReadonlyArray<string>,
+  keys: KeyAttributes,
+  kinds: ReadonlyArray<"partition" | "sort">,
 ): Diagnosis | undefined => {
   const item = entriesOf(sent)[index]
   if (item === undefined) return undefined
-  const over = oversizedRangeKey(item, rangeKeys)
+  const over = oversizedKey(item, keys, kinds)
   if (over === undefined) return undefined
   const target = targetAt(sent, index)
-  return target === undefined ? undefined : { _tag: "SortKeyTooLong", target, ...over }
+  return target === undefined ? undefined : { _tag: "KeyTooLong", target, ...over }
 }
 
-const anySortKey = (sent: SentWrite, rangeKeys: ReadonlyArray<string>): Diagnosis | undefined => {
+const anyKey = (
+  sent: SentWrite,
+  keys: KeyAttributes,
+  kinds: ReadonlyArray<"partition" | "sort">,
+): Diagnosis | undefined => {
   const entries = entriesOf(sent)
   for (let index = 0; index < entries.length; index++) {
-    const found = sortKeyAt(sent, index, rangeKeys)
+    const found = keyAt(sent, index, keys, kinds)
     if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/**
+ * An `IN ()` rejection, confirmed: the first entry whose condition holds an
+ * `IN` with no operands.
+ */
+const emptyInCondition = (sent: SentWrite): Diagnosis | undefined => {
+  for (const [index, item] of entriesOf(sent).entries()) {
+    const entry = item.Put ?? item.Update ?? item.Delete ?? item.ConditionCheck
+    const attribute = emptyInOperand(entry?.ConditionExpression, entry?.ExpressionAttributeNames)
+    if (attribute === undefined) continue
+    const target = targetAt(sent, index)
+    return target === undefined
+      ? undefined
+      : { _tag: "EmptyIn", expression: "ConditionExpression", attribute, target }
   }
   return undefined
 }
@@ -732,7 +885,7 @@ const emptyKey = (message: string, sent: SentWrite): Diagnosis | undefined => {
 const diagnoseRequest = (
   message: string,
   sent: SentWrite,
-  rangeKeys: ReadonlyArray<string>,
+  keys: KeyAttributes,
 ): Diagnosis | undefined => {
   if (REPEATED.test(message) || REPEATED_BATCH.test(message)) return repeatedItem(sent)
   if (ITEM_COUNT.test(message)) {
@@ -766,8 +919,13 @@ const diagnoseRequest = (
       largest,
     }
   }
-  if (SORT_KEY.test(message)) return anySortKey(sent, rangeKeys)
+  if (KEY_SIZE.test(message)) return anyKey(sent, keys, keySizeKinds(message))
   if (EMPTY_KEY.test(message)) return emptyKey(message, sent)
+  if (EMPTY_IN.test(message)) {
+    return EXPRESSION_KIND.exec(message)?.[1]?.toLowerCase() === "condition"
+      ? emptyInCondition(sent)
+      : undefined
+  }
   if (
     EXPRESSION_LENGTH.test(message) ||
     EXPRESSION_OPERATORS.test(message) ||
@@ -795,7 +953,7 @@ const diagnoseRequest = (
 const diagnoseCancellation = (
   reasons: ReadonlyArray<CancellationReason | undefined>,
   sent: SentWrite,
-  rangeKeys: ReadonlyArray<string>,
+  keys: KeyAttributes,
 ): Diagnosis | undefined => {
   // A request that repeats an item can never commit, whatever DynamoDB
   // reported for it: DynamoDB Local applies the operations in order, and a
@@ -811,8 +969,8 @@ const diagnoseCancellation = (
     const message = reason.message ?? ""
     const item = entries[index]
     if (item === undefined) continue
-    if (SORT_KEY.test(message)) {
-      const found = sortKeyAt(sent, index, rangeKeys)
+    if (KEY_SIZE.test(message)) {
+      const found = keyAt(sent, index, keys, keySizeKinds(message))
       if (found !== undefined) return found
       continue
     }
@@ -839,6 +997,16 @@ const diagnoseRead = (message: string, sent: SentRead): Diagnosis | undefined =>
     return sent.input.ConsistentRead === true && index !== undefined
       ? { _tag: "ConsistentReadOnGsi", index, scan: sent.scan }
       : undefined
+  }
+  if (EMPTY_IN.test(message)) {
+    if (EXPRESSION_KIND.exec(message)?.[1]?.toLowerCase() !== "filter") return undefined
+    const attribute = emptyInOperand(
+      sent.input.FilterExpression,
+      sent.input.ExpressionAttributeNames,
+    )
+    return attribute === undefined
+      ? undefined
+      : { _tag: "EmptyIn", expression: "FilterExpression", attribute, target: undefined }
   }
   if (sent.scan) return undefined
   if (BETWEEN_REVERSED.test(message)) {
@@ -878,8 +1046,30 @@ const inlineFilters = (index: SentVectorIndex): ReadonlyArray<string> =>
     .filter((element) => element.SearchSchemaElementType === "INLINE_FILTER")
     .map((element) => element.AttributeName ?? "")
 
+const outOfDimensionRange = (index: SentVectorIndex): boolean =>
+  index.Dimensions !== undefined &&
+  (index.Dimensions < MIN_DIMENSIONS || index.Dimensions > MAX_DIMENSIONS)
+
 const diagnoseTable = (message: string, sent: SentTable): Diagnosis | undefined => {
-  if (!VECTOR.test(message) || sent.vectorIndexes.length === 0) return undefined
+  if (sent.vectorIndexes.length === 0) return undefined
+  if (VECTOR_DIMENSIONS.test(message)) {
+    // The index DynamoDB named, if it named one of the request's; else the
+    // first outside the range.
+    const over = sent.vectorIndexes.filter(outOfDimensionRange)
+    const culprit =
+      over.find((index) => index.IndexName !== undefined && message.includes(index.IndexName)) ??
+      over[0]
+    if (culprit === undefined) return undefined
+    const name = culprit.IndexName ?? ""
+    return {
+      _tag: "VectorIndexDimensions",
+      operation: sent.operation,
+      index: name,
+      dimensions: culprit.Dimensions!,
+      sharers: sent.sharers(name),
+    }
+  }
+  if (!VECTOR.test(message)) return undefined
   if (VECTOR_FILTERS.test(message)) {
     // The index DynamoDB named, if it named one of the request's; else the
     // first over the limit.
@@ -924,15 +1114,25 @@ const diagnoseTable = (message: string, sent: SentTable): Diagnosis | undefined 
 }
 
 /**
- * Read DynamoDB's rejection of `sent`. `rangeKeys` names the sort-key
- * attributes a write writes (the table's and its indexes'), for the sort-key
- * shape. `undefined`: unrecognised or unconfirmed — the site fails with
- * `error` unchanged.
+ * A search rejected for its `TopK`, confirmed: the `TopK` sent is not an
+ * integer in DynamoDB's range.
+ */
+const diagnoseSearch = (message: string, sent: SentSearch): Diagnosis | undefined =>
+  TOP_K.test(message) &&
+  (!Number.isInteger(sent.topK) || sent.topK < MIN_TOP_K || sent.topK > MAX_TOP_K)
+    ? { _tag: "TopKOutOfRange", index: sent.index, topK: sent.topK }
+    : undefined
+
+/**
+ * Read DynamoDB's rejection of `sent`. `keys` names the key attributes a write
+ * writes (the table's and its indexes', by kind), for the key-size shape.
+ * `undefined`: unrecognised or unconfirmed — the site fails with `error`
+ * unchanged.
  */
 export const diagnoseRejection = (
   error: unknown,
   sent: Sent,
-  rangeKeys: ReadonlyArray<string> = [],
+  keys: KeyAttributes = NO_KEYS,
 ): Diagnosis | undefined => {
   const failure = readFailure(error)
   if (failure === undefined) return undefined
@@ -941,10 +1141,12 @@ export const diagnoseRejection = (
       return failure._tag === "Request" ? diagnoseRead(failure.message, sent) : undefined
     case "Table":
       return failure._tag === "Request" ? diagnoseTable(failure.message, sent) : undefined
+    case "Search":
+      return failure._tag === "Request" ? diagnoseSearch(failure.message, sent) : undefined
     default:
       return failure._tag === "Request"
-        ? diagnoseRequest(failure.message, sent, rangeKeys)
-        : diagnoseCancellation(failure.reasons, sent, rangeKeys)
+        ? diagnoseRequest(failure.message, sent, keys)
+        : diagnoseCancellation(failure.reasons, sent, keys)
   }
 }
 
@@ -1026,12 +1228,17 @@ export const explainDiagnosis = (
         `Split the operations into smaller transactions. ${outcome}`
       )
     }
-    case "SortKeyTooLong":
+    case "KeyTooLong": {
+      const [kind, limit] =
+        diagnosis.kind === "partition"
+          ? ["partition key", PARTITION_KEY_MAX_BYTES]
+          : ["sort key", SORT_KEY_MAX_BYTES]
       return (
-        `${operation}: the sort key "${diagnosis.attribute}" of ${named(diagnosis.target)} is ` +
-        `${diagnosis.bytes} bytes, longer than DynamoDB's ${SORT_KEY_MAX_BYTES}-byte limit for ` +
-        `a sort key. ${outcome}`
+        `${operation}: the ${kind} "${diagnosis.attribute}" of ${named(diagnosis.target)} is ` +
+        `${diagnosis.bytes} bytes, longer than DynamoDB's ${limit}-byte limit for ` +
+        `a ${kind}. ${outcome}`
       )
+    }
     case "RepeatedItem":
       return diagnosis.batch
         ? `${operation}: the batch request touches one item more than once — ` +
@@ -1079,6 +1286,15 @@ export const explainDiagnosis = (
         (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
         `, and DynamoDB does not accept an empty string as a key value. ${outcome}`
       )
+    case "EmptyIn":
+      return diagnosis.target === undefined
+        ? `${operation}: DynamoDB rejected the filter: isIn() on "${diagnosis.attribute}" has no ` +
+            "values, and DynamoDB rejects the `IN ()` it compiles to as a syntax error. Give " +
+            "isIn() at least one value, or leave the filter out."
+        : `${operation}: DynamoDB rejected ${named(diagnosis.target)}: isIn() on ` +
+            `"${diagnosis.attribute}" in its condition has no values, and DynamoDB rejects the ` +
+            "`IN ()` it compiles to as a syntax error. Give isIn() at least one value, or " +
+            `leave the condition out. ${outcome}`
     case "EmptyKeyBound":
       return (
         `${operation}: DynamoDB rejected the query: its key condition compares the key ` +
@@ -1109,6 +1325,23 @@ export const explainDiagnosis = (
         (diagnosis.operation === "CreateTable"
           ? "The table was not created."
           : "Nothing was changed.")
+      )
+    case "VectorIndexDimensions":
+      return (
+        `${operation}: DynamoDB rejected vector index "${diagnosis.index}": its dimensions ` +
+        `(${diagnosis.dimensions}) are outside the range DynamoDB accepts, ` +
+        `${MIN_DIMENSIONS}..${MAX_DIMENSIONS}. The entities sharing it ` +
+        `(${list(diagnosis.sharers)}) declare it. ` +
+        (diagnosis.operation === "CreateTable"
+          ? "The table was not created."
+          : "Nothing was changed.")
+      )
+    case "TopKOutOfRange":
+      return (
+        `${operation}: DynamoDB rejected the search of vector index "${diagnosis.index}": ` +
+        `topK(${diagnosis.topK}) is outside the range DynamoDB accepts, an integer in ` +
+        `${MIN_TOP_K}..${MAX_TOP_K}. ` +
+        `A vector search returns at most ${MAX_TOP_K} results, with no further pages.`
       )
     case "VectorIndexCount": {
       const indexes = diagnosis.indexes
@@ -1142,10 +1375,12 @@ export const withCause = (message: string, original: unknown): Error =>
 export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): string => {
   switch (diagnosis._tag) {
     case "ItemTooLarge":
-    case "SortKeyTooLong":
+    case "KeyTooLong":
     case "ExpressionTooLarge":
     case "EmptyKey":
       return diagnosis.target.entityType
+    case "EmptyIn":
+      return diagnosis.target?.entityType ?? fallback
     case "RepeatedItem":
       return diagnosis.first.entityType
     case "TransactionTooLarge":
@@ -1191,14 +1426,14 @@ export const diagnosedValidationError = (
 export const diagnoseFailure =
   <E2>(options: {
     readonly sent: () => Sent
-    readonly rangeKeys?: (() => ReadonlyArray<string>) | undefined
+    readonly keys?: (() => KeyAttributes) | undefined
     readonly only?: ReadonlyArray<Diagnosis["_tag"]> | undefined
     readonly rewrite: (diagnosis: Diagnosis, original: unknown) => E2
   }) =>
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> =>
     Effect.catch(self, (error: E): Effect.Effect<never, E | E2> => {
       if (!isDiagnosable(error)) return Effect.fail(error)
-      const diagnosis = diagnoseRejection(error, options.sent(), options.rangeKeys?.() ?? [])
+      const diagnosis = diagnoseRejection(error, options.sent(), options.keys?.() ?? NO_KEYS)
       if (diagnosis === undefined) return Effect.fail(error)
       if (options.only !== undefined && !options.only.includes(diagnosis._tag)) {
         return Effect.fail(error)
@@ -1251,15 +1486,32 @@ export const batchEntries = (
   )
 
 /**
- * The sort-key attributes an entity writes: its primary sort key and each
- * index's. `indexes` is an entity's `indexes` record.
+ * The key attributes an entity writes, by kind: its primary key's and each
+ * index's partition and sort keys. `indexes` is an entity's `indexes` record.
  */
-export const rangeKeysOf = (
-  indexes: Readonly<Record<string, { readonly sk?: { readonly field: string } | undefined }>>,
-): ReadonlyArray<string> => [
-  ...new Set(
-    Object.values(indexes).flatMap((index) =>
-      index?.sk?.field === undefined ? [] : [index.sk.field],
+export const keyAttributesOf = (
+  indexes: Readonly<
+    Record<
+      string,
+      {
+        readonly pk?: { readonly field: string } | undefined
+        readonly sk?: { readonly field: string } | undefined
+      }
+    >
+  >,
+): KeyAttributes => {
+  const fields = (half: "pk" | "sk") => [
+    ...new Set(
+      Object.values(indexes).flatMap((index) =>
+        index?.[half]?.field === undefined ? [] : [index[half]!.field],
+      ),
     ),
-  ),
-]
+  ]
+  return { partition: fields("pk"), sort: fields("sk") }
+}
+
+/** Key attributes from several sources, each attribute once per kind. */
+export const mergeKeyAttributes = (...all: ReadonlyArray<KeyAttributes>): KeyAttributes => ({
+  partition: [...new Set(all.flatMap((keys) => keys.partition))],
+  sort: [...new Set(all.flatMap((keys) => keys.sort))],
+})

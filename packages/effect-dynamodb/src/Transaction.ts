@@ -345,7 +345,7 @@ export const transactWrite = (
         // here, after the conditional mapping, naming the item at fault. The
         // 100-item limit counts the EXPANDED items — one op can emit several
         // (uniqueness sentinels, version snapshots) — and keeps its #113 tag.
-        diagnoseFailure({ sent, rangeKeys: built.rangeKeys, rewrite: diagnosed }),
+        diagnoseFailure({ sent, keys: built.keys, rewrite: diagnosed }),
       )
       if (outcome === undefined) return
       lost = outcome

@@ -107,12 +107,15 @@ export const asNative = <Self extends EntityOp<any, any, any, any>>(
 /**
  * Set the fields to update.
  *
- * When updating GSI composite fields, the consumer is responsible for providing ALL
- * composites for that GSI (fetch-merge pattern). If only some composites are provided,
- * `extractComposites` in KeyComposer will throw during GSI key recomposition.
+ * Any subset of a GSI's composites may be set: GSI keys are recomposed per half
+ * (`DESIGN.md` §7). A half whose composites are given is recomposed — truncated
+ * to the leading composites given, where that loses nothing; a half the update
+ * does not touch is left as stored; a half it touches but cannot compose follows
+ * the index's policy (`'sparse'` removes the key, `'preserve'` leaves it).
  *
- * When using `Entity.remove()` on a GSI composite attribute, the corresponding GSI
- * key fields (pk/sk) are automatically removed so the item drops out of the sparse index.
+ * When using `Entity.remove()` on a GSI composite attribute, the key of the half
+ * holding it is removed (per half, not the whole GSI) so the item drops out of
+ * the sparse index, unless the rest of the update recomposes a prefix.
  */
 export const set: {
   <Updates extends globalThis.Record<string, unknown>>(

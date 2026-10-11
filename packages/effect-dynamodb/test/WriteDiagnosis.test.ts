@@ -16,8 +16,9 @@ import {
   diagnoseFailure,
   diagnoseRejection,
   explainDiagnosis,
-  rangeKeysOf,
+  keyAttributesOf,
   type SentRead,
+  type SentSearch,
   type SentTable,
   type SentWrite,
   targetsFor,
@@ -29,6 +30,7 @@ import {
   DDB_CONSISTENT_SCAN_GSI,
   DDB_ITEM_SIZE,
   DDB_ITEM_SIZE_UPDATE,
+  DDB_PARTITION_KEY_AWS,
   DDB_REPEATED_BATCH_ITEM,
   DDB_REPEATED_ITEM,
   DDB_SORT_KEY_AWS,
@@ -36,9 +38,11 @@ import {
   DDB_TABLE_KEY_SIZE_LOCAL,
   DDB_TOO_MANY_ITEMS,
   ddbBetweenReversed,
+  ddbEmptyIn,
   ddbEmptyIndexKey,
   ddbEmptyTableKey,
   ddbExpressionTooLong,
+  ddbMemberOutOfRange,
   ddbPayloadTooLarge,
   ddbTooManyInOperands,
   ddbTooManyOperators,
@@ -107,9 +111,9 @@ const single = (item: TransactWriteItem): SentWrite => ({
   target: () => targetsFor([item], ["pk", "sk"], "Doc", () => "the item")[0]!,
 })
 
-const RANGE_KEYS = ["sk", "gsi1sk"]
+const KEYS = { partition: ["pk", "gsi1pk"], sort: ["sk", "gsi1sk"] }
 
-const diagnose = (error: unknown, sent: SentWrite) => diagnoseRejection(error, sent, RANGE_KEYS)
+const diagnose = (error: unknown, sent: SentWrite) => diagnoseRejection(error, sent, KEYS)
 
 const expectTag = <T extends Diagnosis["_tag"]>(
   diagnosis: Diagnosis | undefined,
@@ -366,7 +370,7 @@ describe("WriteDiagnosis (#144)", () => {
         }
         const d = expectTag(
           diagnose(rejected(message), transaction([put("z"), item])),
-          "SortKeyTooLong",
+          "KeyTooLong",
         )
         expect(d.attribute).toBe("gsi1sk")
         expect(d.bytes).toBe(1025)
@@ -381,14 +385,14 @@ describe("WriteDiagnosis (#144)", () => {
         Put: { TableName: "t", Item: { pk: { S: "p" }, sk: { S: "é".repeat(513) } } },
       }
       expect(
-        expectTag(diagnose(rejected(DDB_SORT_KEY_LOCAL), single(item)), "SortKeyTooLong").bytes,
+        expectTag(diagnose(rejected(DDB_SORT_KEY_LOCAL), single(item)), "KeyTooLong").bytes,
       ).toBe(1026)
     })
 
     it("reads an Update's SET pairs", () => {
       const d = expectTag(
         diagnose(rejected(DDB_SORT_KEY_AWS), single(update("a", { gsi1sk: longKey }))),
-        "SortKeyTooLong",
+        "KeyTooLong",
       )
       expect(d.attribute).toBe("gsi1sk")
     })
@@ -402,7 +406,7 @@ describe("WriteDiagnosis (#144)", () => {
         { Code: "ValidationError", Message: DDB_SORT_KEY_LOCAL },
       ])
       expect(
-        expectTag(diagnose(error, transaction([put("a"), item])), "SortKeyTooLong").attribute,
+        expectTag(diagnose(error, transaction([put("a"), item])), "KeyTooLong").attribute,
       ).toBe("sk")
     })
 
@@ -476,7 +480,7 @@ describe("WriteDiagnosis (#144)", () => {
         spy()
         return transaction([put("a", 500_000)])
       },
-      rangeKeys: () => RANGE_KEYS,
+      keys: () => KEYS,
       rewrite: (diagnosis: Diagnosis, original: unknown) =>
         diagnosedValidationError(diagnosis, original, { operation: "op", entityType: "Doc" }),
     })
@@ -533,10 +537,7 @@ describe("WriteDiagnosis (#144)", () => {
       const long: TransactWriteItem = {
         Put: { TableName: "t", Item: { pk: { S: "p" }, sk: { S: "s".repeat(1025) } } },
       }
-      const d = expectTag(
-        diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(long)),
-        "SortKeyTooLong",
-      )
+      const d = expectTag(diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(long)), "KeyTooLong")
       expect(d.attribute).toBe("sk")
       expect(d.bytes).toBe(1025)
       expectTag(
@@ -547,15 +548,31 @@ describe("WriteDiagnosis (#144)", () => {
           ]),
           transaction([put("a"), long]),
         ),
-        "SortKeyTooLong",
+        "KeyTooLong",
       )
     })
 
-    it("a partition key over its limit (no sort key over 1024): passed through", () => {
+    it("a partition key over 2048 bytes: named as the partition key", () => {
       const longPk: TransactWriteItem = {
         Put: { TableName: "t", Item: { pk: { S: "p".repeat(2049) }, sk: { S: "s" } } },
       }
-      expect(diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(longPk))).toBeUndefined()
+      const d = expectTag(
+        diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(longPk)),
+        "KeyTooLong",
+      )
+      expect(d.kind).toBe("partition")
+      expect(d.attribute).toBe("pk")
+      expect(d.bytes).toBe(2049)
+      expect(explainDiagnosis(d, "put")).toContain(
+        'the partition key "pk" of the item, at pk=' +
+          "p".repeat(2049) +
+          ", sk=s is 2049 bytes, longer than DynamoDB's 2048-byte limit for a partition key.",
+      )
+      // 2048 bytes is within the limit: unconfirmed.
+      const atLimit: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p".repeat(2048) }, sk: { S: "s" } } },
+      }
+      expect(diagnose(rejected(DDB_TABLE_KEY_SIZE_LOCAL), single(atLimit))).toBeUndefined()
     })
   })
 
@@ -1006,6 +1023,250 @@ describe("WriteDiagnosis (#144)", () => {
     })
   })
 
+  describe("partition key over 2048 bytes (#144)", () => {
+    const longGsiPk: TransactWriteItem = {
+      Put: {
+        TableName: "t",
+        Item: { pk: { S: "p" }, sk: { S: "s" }, gsi1pk: { S: "g".repeat(2049) } },
+      },
+    }
+
+    it("an index partition key under DynamoDB Local's index wording, request-wide in a transaction", () => {
+      const d = expectTag(
+        diagnose(rejected(DDB_SORT_KEY_LOCAL), transaction([put("a"), longGsiPk])),
+        "KeyTooLong",
+      )
+      expect(d.kind).toBe("partition")
+      expect(d.attribute).toBe("gsi1pk")
+      expect(d.target.source).toBe("operation 1 (Doc)")
+    })
+
+    it("AWS's partition-key wording confirms only a partition key", () => {
+      expect(
+        expectTag(diagnose(rejected(DDB_PARTITION_KEY_AWS), single(longGsiPk)), "KeyTooLong").kind,
+      ).toBe("partition")
+      // A long sort key is not what AWS's partition-key message means.
+      const longSk: TransactWriteItem = {
+        Put: { TableName: "t", Item: { pk: { S: "p" }, sk: { S: "s".repeat(1025) } } },
+      }
+      expect(diagnose(rejected(DDB_PARTITION_KEY_AWS), single(longSk))).toBeUndefined()
+      // Nor is a long partition key what AWS's sort-key message means.
+      expect(diagnose(rejected(DDB_SORT_KEY_AWS), single(longGsiPk))).toBeUndefined()
+    })
+
+    it("a table partition key in a cancellation reason, and an update's key", () => {
+      const longKey = "p".repeat(2049)
+      const updateLong: TransactWriteItem = {
+        Update: {
+          TableName: "t",
+          Key: { pk: { S: longKey }, sk: { S: "s" } },
+          UpdateExpression: "SET #n = :n",
+          ExpressionAttributeNames: { "#n": "n" },
+          ExpressionAttributeValues: { ":n": { S: "1" } },
+        },
+      }
+      const d = expectTag(
+        diagnose(
+          cancelled([
+            { Code: "None" },
+            { Code: "ValidationError", Message: DDB_TABLE_KEY_SIZE_LOCAL },
+          ]),
+          transaction([put("a"), updateLong]),
+        ),
+        "KeyTooLong",
+      )
+      expect(d.kind).toBe("partition")
+      expect(d.target.source).toBe("operation 1 (Doc)")
+      // An update SETting an index partition key (DynamoDB Local accepts it; AWS does not).
+      expect(
+        expectTag(
+          diagnose(rejected(DDB_SORT_KEY_LOCAL), single(update("a", { gsi1pk: longKey }))),
+          "KeyTooLong",
+        ).attribute,
+      ).toBe("gsi1pk")
+    })
+
+    it("a batch: the request named, with what the batch had already written", () => {
+      const items = [put("a"), longGsiPk]
+      const d = expectTag(
+        diagnose(rejected(DDB_SORT_KEY_LOCAL), {
+          _tag: "Batch",
+          items,
+          targets: () => targets(items),
+        }),
+        "KeyTooLong",
+      )
+      expect(
+        explainDiagnosis(d, "batchWrite", { committed: "the batch had written 25 requests" }),
+      ).toContain("This request wrote nothing; the batch had written 25 requests.")
+    })
+  })
+
+  describe("an isIn() with no values: IN () (P14)", () => {
+    const conditioned = (expression: string): TransactWriteItem => ({
+      Put: {
+        ...put("a").Put!,
+        ConditionExpression: expression,
+        ExpressionAttributeNames: { "#e0": "status", "#e1": "meta" },
+      },
+    })
+
+    it("in a write's condition: the item and the attribute named", () => {
+      const d = expectTag(
+        diagnose(
+          rejected(ddbEmptyIn("Condition", "())")),
+          single(conditioned("attribute_not_exists(#e1) AND (#e1.#e0 IN ())")),
+        ),
+        "EmptyIn",
+      )
+      expect(d.attribute).toBe("meta.status")
+      expect(
+        expectTag(
+          diagnose(
+            rejected(ddbEmptyIn("Condition", "() AND")),
+            single(conditioned("size(#e0) IN () AND #e1 = :v")),
+          ),
+          "EmptyIn",
+        ).attribute,
+      ).toBe("size(status)")
+      expect(d.expression).toBe("ConditionExpression")
+      const text = explainDiagnosis(d, "put")
+      expect(text).toContain('isIn() on "meta.status" in its condition has no values')
+      expect(text).toContain("Nothing was written.")
+    })
+
+    it("request-wide in a transaction: the entry holding it named", () => {
+      const d = expectTag(
+        diagnose(
+          rejected(ddbEmptyIn("Condition")),
+          transaction([put("z"), conditioned("#e0 IN ()")]),
+        ),
+        "EmptyIn",
+      )
+      expect(d.target?.source).toBe("operation 1 (Doc)")
+    })
+
+    it("in a read's filter", () => {
+      const read: SentRead = {
+        _tag: "Read",
+        scan: true,
+        input: { FilterExpression: "#e0 IN ()", ExpressionAttributeNames: { "#e0": "status" } },
+      }
+      const d = expectTag(diagnoseRejection(rejected(ddbEmptyIn("Filter")), read), "EmptyIn")
+      expect(d.target).toBeUndefined()
+      expect(explainDiagnosis(d, "query of Doc")).toContain(
+        'DynamoDB rejected the filter: isIn() on "status" has no values',
+      )
+    })
+
+    it("no IN () in the request, or the other expression kind: passed through", () => {
+      expect(
+        diagnose(rejected(ddbEmptyIn("Condition")), single(conditioned("#e0 IN (:v)"))),
+      ).toBeUndefined()
+      expect(
+        diagnose(rejected(ddbEmptyIn("Filter")), single(conditioned("#e0 IN ()"))),
+      ).toBeUndefined()
+      const read: SentRead = {
+        _tag: "Read",
+        scan: false,
+        input: { FilterExpression: "#e0 = :v", ExpressionAttributeNames: { "#e0": "status" } },
+      }
+      expect(diagnoseRejection(rejected(ddbEmptyIn("Filter")), read)).toBeUndefined()
+    })
+  })
+
+  describe("vector dimensions and TopK (AWS's documented ranges; no DynamoDB Local support)", () => {
+    const vectorTable = (dimensions: ReadonlyArray<number>): SentTable => ({
+      _tag: "Table",
+      operation: "CreateTable",
+      vectorIndexes: dimensions.map((Dimensions, i) => ({
+        IndexName: `vec${i}`,
+        Dimensions,
+        SearchSchema: [{ AttributeName: "__edd_vp__", SearchSchemaElementType: "HASH" }],
+      })),
+      sharers: () => ["Product", "Article"],
+      declared: dimensions.length,
+    })
+
+    it("dimensions outside 1..4096: the index, its dimensions and its sharers", () => {
+      const d = expectTag(
+        diagnoseRejection(
+          rejected(
+            ddbMemberOutOfRange(
+              5000,
+              "vectorIndexes.2.member.dimensions",
+              "less than or equal to 4096",
+            ),
+          ),
+          vectorTable([1536, 5000]),
+        ),
+        "VectorIndexDimensions",
+      )
+      expect(d.index).toBe("vec1")
+      expect(d.dimensions).toBe(5000)
+      const text = explainDiagnosis(d, 'db.tables create of "t"')
+      expect(text).toContain('DynamoDB rejected vector index "vec1": its dimensions (5000)')
+      expect(text).toContain("1..4096")
+      expect(text).toContain("(Product, Article)")
+      expect(text).toContain("The table was not created.")
+      expect(
+        expectTag(
+          diagnoseRejection(rejected("Dimensions must be at least 1"), vectorTable([0])),
+          "VectorIndexDimensions",
+        ).dimensions,
+      ).toBe(0)
+    })
+
+    it("every index within range: passed through", () => {
+      expect(
+        diagnoseRejection(rejected("Invalid dimensions"), vectorTable([1, 4096])),
+      ).toBeUndefined()
+    })
+
+    it("a TopK outside 1..100, or not an integer: named", () => {
+      const search = (topK: number): SentSearch => ({ _tag: "Search", index: "vec1", topK })
+      const message = ddbMemberOutOfRange(500, "topK", "less than or equal to 100")
+      const d = expectTag(diagnoseRejection(rejected(message), search(500)), "TopKOutOfRange")
+      const text = explainDiagnosis(d, "vectorSearch.byDescription")
+      expect(text).toContain('search of vector index "vec1": topK(500) is outside')
+      expect(text).toContain("an integer in 1..100")
+      expectTag(diagnoseRejection(rejected(message), search(0)), "TopKOutOfRange")
+      expectTag(diagnoseRejection(rejected(message), search(2.5)), "TopKOutOfRange")
+      // Within range: unconfirmed.
+      expect(diagnoseRejection(rejected(message), search(100))).toBeUndefined()
+      // A rejection not about TopK: passed through.
+      expect(diagnoseRejection(rejected("Something else"), search(500))).toBeUndefined()
+    })
+  })
+
+  describe("BatchGetItem repeating a key (P2b)", () => {
+    it("both reads named", () => {
+      const key = { pk: { S: "p#a" }, sk: { S: "s" } }
+      const target = (source: string) =>
+        targetsFor(
+          [{ Delete: { TableName: "t", Key: key } }],
+          ["pk", "sk"],
+          "Doc",
+          () => source,
+        )[0]!
+      const d = expectTag(
+        diagnose(rejected(DDB_REPEATED_BATCH_ITEM), {
+          _tag: "BatchGet",
+          targets: () => [target("get 0 (Doc)"), target("get 3 (Doc)")],
+        }),
+        "RepeatedItem",
+      )
+      expect(d.first.source).toBe("get 0 (Doc)")
+      expect(d.second.source).toBe("get 3 (Doc)")
+      expect(
+        diagnose(rejected(DDB_REPEATED_BATCH_ITEM), {
+          _tag: "BatchGet",
+          targets: () => [target("get 0 (Doc)")],
+        }),
+      ).toBeUndefined()
+    })
+  })
+
   describe("diagnoseFailure — only", () => {
     it.effect("rewrites only the diagnoses named; any other passes through", () =>
       Effect.gen(function* () {
@@ -1028,13 +1289,13 @@ describe("WriteDiagnosis (#144)", () => {
     )
   })
 
-  it("rangeKeysOf collects the primary and index sort keys, once each", () => {
+  it("keyAttributesOf collects the primary and index keys by kind, once each", () => {
     expect(
-      rangeKeysOf({
-        primary: { sk: { field: "sk" } },
-        byA: { sk: { field: "gsi1sk" } },
-        byB: { sk: { field: "gsi1sk" } },
+      keyAttributesOf({
+        primary: { pk: { field: "pk" }, sk: { field: "sk" } },
+        byA: { pk: { field: "gsi1pk" }, sk: { field: "gsi1sk" } },
+        byB: { pk: { field: "gsi1pk" }, sk: { field: "gsi1sk" } },
       }),
-    ).toEqual(["sk", "gsi1sk"])
+    ).toEqual({ partition: ["pk", "gsi1pk"], sort: ["sk", "gsi1sk"] })
   })
 })

@@ -7,7 +7,13 @@ import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import {
+  awsValidationException,
+  ddbBetweenReversed,
+  ddbEmptyIn,
+  ddbEmptyTableKey,
+  mockDynamoClientLayer,
+} from "./helpers/MockDynamoClient.js"
 
 /**
  * Attribute shape the filter/condition expressions in this file are written
@@ -658,7 +664,6 @@ describe("Query", () => {
         const ops = createConditionOps<{ id: string; name: string }>()
         const pb = createPathBuilder<{ id: string; name: string }>()
         for (const filter of [
-          ops.isIn(pb.id, []),
           ops.or(ops.eq(pb.id, "a"), ops.and()),
           ops.not(ops.and()),
           ops.or(),
@@ -692,7 +697,6 @@ describe("Query", () => {
           ops.or(),
           ops.and(ops.eq(pb.name, "b"), ops.or(ops.eq(pb.id, "a"), ops.and(ops.and()))),
           ops.not(ops.or(ops.eq(pb.id, "a"), ops.not(ops.and()))),
-          ops.isIn(pb.id, []),
         ]
         for (const filter of refused) {
           const query = makeTestQuery().pipe(Query.filterExpr(filter))
@@ -710,6 +714,26 @@ describe("Query", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
+    it.effect("an isIn() with no values is sent; DynamoDB's rejection is named (#144)", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ id: string; name: string }>()
+        const pb = createPathBuilder<{ id: string; name: string }>()
+        const rejection = awsValidationException(ddbEmptyIn("Filter"))
+        mockQuery.mockRejectedValueOnce(rejection)
+        const error = yield* Effect.flip(
+          Query.collect(makeTestQuery().pipe(Query.filterExpr(ops.isIn(pb.name, [])))),
+        )
+        expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe("#eddE IN (:et0) AND (#e0 IN ())")
+        expect(error).toBeInstanceOf(ValidationError)
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("query.filter")
+        expect(String(failure.cause)).toContain(
+          'query of User: DynamoDB rejected the filter: isIn() on "name" has no values',
+        )
+        expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
     it.effect("a top-level OR is parenthesised, so it can't admit other entities", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
@@ -721,6 +745,71 @@ describe("Query", () => {
         expect(mockQuery.mock.calls[0]![0].FilterExpression).toBe(
           "#eddE IN (:et0) AND ((#e0 = :e1) OR (#e2 = :e3))",
         )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+  })
+
+  describe("key-condition rejections are named on every query (#144, S29)", () => {
+    it.effect("a reversed between: the attribute, the index and both bounds", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(ddbBetweenReversed("b", "a"))
+        mockQuery.mockRejectedValueOnce(rejection)
+        const error = yield* Effect.flip(
+          Query.collect(
+            Query.make<{ id: string }>({
+              tableName: "TestTable",
+              indexName: "gsi1",
+              pkField: "gsi1pk",
+              pkValue: "p",
+              skField: "gsi1sk",
+              entityTypes: ["User"],
+              decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+            }).pipe(Query.where({ between: ["b", "a"] })),
+          ),
+        )
+        expect(error).toBeInstanceOf(ValidationError)
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("query")
+        expect(String(failure.cause)).toContain(
+          'query of User: DynamoDB rejected the query: between\'s lower bound "b" sorts after ' +
+            'its upper bound "a" on "gsi1sk" of index "gsi1"',
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("an empty bound; a query's own naming is used when it gives one", () =>
+      Effect.gen(function* () {
+        mockQuery.mockRejectedValueOnce(awsValidationException(ddbEmptyTableKey("sk")))
+        const error = yield* Effect.flip(
+          Query.collect(
+            Query.make<{ id: string }>({
+              tableName: "TestTable",
+              indexName: undefined,
+              pkField: "pk",
+              pkValue: "p",
+              skField: "sk",
+              entityTypes: ["User"],
+              decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+              keyConditionDiagnosis: { operation: "query", label: "User.byAccount" },
+            }).pipe(Query.where({ beginsWith: "" })),
+          ),
+        )
+        expect(String((error as ValidationError).cause)).toContain(
+          "User.byAccount: DynamoDB rejected the query: its key condition compares the key " +
+            'attribute "sk" with an empty string',
+        )
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect("a rejection the request does not confirm passes through", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(ddbBetweenReversed("a", "b"))
+        mockQuery.mockRejectedValueOnce(rejection)
+        const error = yield* Effect.flip(
+          Query.collect(makeTestQuery().pipe(Query.where({ between: ["a", "b"] }))),
+        )
+        expect(error).toBeInstanceOf(DynamoError)
+        expect((error as DynamoError).cause).toBe(rejection)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
   })

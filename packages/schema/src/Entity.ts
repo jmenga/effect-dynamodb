@@ -636,7 +636,7 @@ export const buildEntityDefinition = (config: {
   }
 
   // ---------------------------------------------------------------------------
-  // Validate + normalize vector indexes (EDD-903x)
+  // Validate + normalize vector indexes (EDD-903x, EDD-9070)
   // ---------------------------------------------------------------------------
 
   const vectorIndexes: globalThis.Record<string, VectorIndexDefinition> = {}
@@ -663,7 +663,7 @@ export const buildEntityDefinition = (config: {
     for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes)) {
       vectorIndexes[logicalName] = normalizeVectorIndexConfig(vectorConfig)
     }
-    // Field-existence validation (EDD-9030..9033) runs before type derivation
+    // Field-existence validation (EDD-9031..9033, EDD-9070) runs before type derivation
     // so an unknown filter field reports EDD-9031, not a derivation failure.
     validateVectorIndexes({
       entityType: config.entityType,

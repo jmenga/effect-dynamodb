@@ -208,3 +208,25 @@ export const DDB_CONSISTENT_SCAN_GSI = "Consistent read cannot be true when scan
 export const DDB_SORT_KEY_AWS =
   "One or more parameter values were invalid: Aggregated size of all range keys has exceeded " +
   "the size limit of 1024 bytes"
+/**
+ * A partition key over 2048 bytes, as AWS reports it (unverified here:
+ * DynamoDB Local words it as {@link DDB_TABLE_KEY_SIZE_LOCAL}, or
+ * {@link DDB_SORT_KEY_LOCAL} for an index key).
+ */
+export const DDB_PARTITION_KEY_AWS =
+  "One or more parameter values were invalid: Size of hashkey has exceeded the maximum size " +
+  "limit of2048 bytes"
+/**
+ * An `IN ()` — an `isIn()` with no values (`kind`: Condition, Filter). `near`
+ * runs on to the token after it, when one follows: `"())"`, `"() AND"`.
+ */
+export const ddbEmptyIn = (kind: string, near = "()"): string =>
+  `Invalid ${kind}Expression: Syntax error; token: ")", near: "${near}"`
+/**
+ * AWS's standard member-constraint wording, for a member out of its range
+ * (vector `dimensions`, `topK`). Unverified: DynamoDB Local has no vector
+ * indexes or `SearchVectors`.
+ */
+export const ddbMemberOutOfRange = (value: number, member: string, bound: string): string =>
+  `1 validation error detected: Value '${value}' at '${member}' failed to satisfy constraint: ` +
+  `Member must have value ${bound}`

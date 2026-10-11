@@ -276,13 +276,8 @@ export class AggregateDecompositionError extends Data.TaggedError("AggregateDeco
   readonly reason: string
 }> {}
 
-/**
- * A sub-aggregate's transaction exceeds DynamoDB's 100-item limit. Not
- * pre-checked: DynamoDB rejects that group whole, and the rejection is
- * confirmed by counting it. Groups written before it stay written —
- * `committed` names them.
- */
-export class AggregateTransactionOverflow extends Data.TaggedError("AggregateTransactionOverflow")<{
+/** The fields of {@link AggregateTransactionOverflow}. */
+export type AggregateTransactionOverflowFields = {
   readonly aggregate: string
   readonly subgraph: string
   readonly itemCount: number
@@ -293,9 +288,48 @@ export class AggregateTransactionOverflow extends Data.TaggedError("AggregateTra
    * not atomic). Empty: nothing was written.
    */
   readonly committed?: ReadonlyArray<string> | undefined
+  /**
+   * The write that failed, when known. A failed `create` may leave its root
+   * committed (the root is in the first group), which its `message` says.
+   */
+  readonly operation?: "create" | "update" | undefined
   /** DynamoDB's rejection, when the overflow was diagnosed from it. */
   readonly cause?: unknown
-}> {}
+}
+
+/** The readable message of an {@link AggregateTransactionOverflow}. */
+const aggregateTransactionOverflowMessage = (
+  fields: AggregateTransactionOverflowFields,
+): string => {
+  const committed = fields.committed ?? []
+  const head =
+    `Aggregate "${fields.aggregate}": the transaction of sub-aggregate "${fields.subgraph}" ` +
+    `holds ${fields.itemCount} items, over DynamoDB's limit of ${fields.limit} for one ` +
+    "transaction, and DynamoDB rejected it."
+  if (committed.length === 0) return `${head} Nothing was written.`
+  const already =
+    ` Each sub-aggregate is its own transaction, and earlier ones of this write were ` +
+    `already committed: ${committed.map((name) => `"${name}"`).join(", ")}.`
+  return fields.operation === "create"
+    ? `${head}${already} The root may be among them, so a retried create fails its root ` +
+        "guard (ConditionalCheckFailed): update or delete the partial aggregate instead."
+    : `${head}${already}`
+}
+
+/**
+ * A sub-aggregate's transaction exceeds DynamoDB's 100-item limit. Not
+ * pre-checked: DynamoDB rejects that group whole, and the rejection is
+ * confirmed by counting it. Groups written before it stay written —
+ * `committed` names them, and `message` says so.
+ */
+export class AggregateTransactionOverflow extends Data.TaggedError(
+  "AggregateTransactionOverflow",
+)<AggregateTransactionOverflowFields> {
+  constructor(fields: AggregateTransactionOverflowFields) {
+    super(fields)
+    this.message = aggregateTransactionOverflowMessage(fields)
+  }
+}
 
 /** Cascade update partially failed (eventual mode) */
 export class CascadePartialFailure extends Data.TaggedError("CascadePartialFailure")<{

@@ -112,7 +112,7 @@ describe("VectorIndex", () => {
     })
   })
 
-  describe("clampTopK", () => {
+  describe("clampTopK (deprecated; unused by the library since #144)", () => {
     it("clamps into 1..100 and floors fractional values", () => {
       expect(VectorIndex.clampTopK(0)).toBe(1)
       expect(VectorIndex.clampTopK(-5)).toBe(1)
@@ -188,17 +188,24 @@ describe("VectorIndex", () => {
       expect(Products._data.vectorIndexes.byDescription?.index).toBe("vec1")
     })
 
-    it("rejects out-of-range dimensions (EDD-9030)", () => {
-      expect(() =>
-        makeProducts({
-          byDescription: { name: "vec1", dimensions: 0, source: { fields: ["description"] } },
-        }),
-      ).toThrow("[EDD-9030]")
-      expect(() =>
-        makeProducts({
-          byDescription: { name: "vec1", dimensions: 5000, source: { fields: ["description"] } },
-        }),
-      ).toThrow("[EDD-9030]")
+    it("leaves out-of-range dimensions to DynamoDB (#144: EDD-9030 retired)", () => {
+      for (const dimensions of [0, 5000]) {
+        expect(() =>
+          makeProducts({
+            byDescription: { name: "vec1", dimensions, source: { fields: ["description"] } },
+          }),
+        ).not.toThrow()
+      }
+    })
+
+    it("rejects non-integer dimensions, which DynamoDB could read as another (EDD-9070)", () => {
+      for (const dimensions of [1536.5, Number.NaN]) {
+        expect(() =>
+          makeProducts({
+            byDescription: { name: "vec1", dimensions, source: { fields: ["description"] } },
+          }),
+        ).toThrow("[EDD-9070]")
+      }
     })
 
     it("rejects an empty source.fields (EDD-9031)", () => {

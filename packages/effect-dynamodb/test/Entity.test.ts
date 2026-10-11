@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { DateTime, Duration, Effect, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 
 /**
@@ -32,8 +32,11 @@ import {
   awsValidationException,
   DDB_ITEM_SIZE,
   DDB_ITEM_SIZE_UPDATE,
+  DDB_PARTITION_KEY_AWS,
   DDB_SORT_KEY_LOCAL,
+  DDB_TABLE_KEY_SIZE_LOCAL,
   DDB_TOO_MANY_ITEMS,
+  ddbEmptyIn,
   ddbTooManyOperators,
   mockDynamoClientLayer,
 } from "./helpers/MockDynamoClient.js"
@@ -2297,6 +2300,35 @@ describe("Entity", () => {
           .pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain('the sort key "gsi1sk"')
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("put: a partition key over 2048 bytes names its attribute (#144)", () =>
+      Effect.gen(function* () {
+        const rejection = awsValidationException(DDB_TABLE_KEY_SIZE_LOCAL)
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Items.put({ itemId: "i".repeat(2100), name: "n" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('the partition key "pk" of the SimpleItem put')
+        expect(text).toContain("longer than DynamoDB's 2048-byte limit for a partition key")
+        expect(((error as ValidationError).cause as Error).cause).toBeInstanceOf(DynamoError)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("update: a partition key over 2048 bytes, in AWS's wording, is named (#144)", () =>
+      Effect.gen(function* () {
+        mockUpdateItem.mockRejectedValueOnce(awsValidationException(DDB_PARTITION_KEY_AWS))
+        const error = yield* Items.update({ itemId: "i".repeat(2100) })
+          .pipe(Entity.set({ name: "m" }))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain(
+          'the partition key "pk" of the SimpleItem update',
+        )
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -5949,6 +5981,73 @@ describe("Entity", () => {
       }).pipe(Effect.provide(PurgeTestLayer)),
     )
 
+    describe("UnprocessedItems (retried with Batch.write's backoff)", () => {
+      const partition = (count: number) =>
+        Array.from({ length: count }, (_, i) =>
+          toAttributeMap({
+            pk: "$myapp#v1#purgeitem#i-1",
+            sk: i === 0 ? "$myapp#v1#purgeitem" : `$myapp#v1#purgeitem#v#000000${i}`,
+            __edd_e__: "PurgeItem",
+          }),
+        )
+      const unprocessed = (items: ReadonlyArray<Record<string, unknown>>) => ({
+        UnprocessedItems: {
+          "test-table": items.map((item) => ({
+            DeleteRequest: { Key: { pk: item.pk, sk: item.sk } },
+          })),
+        },
+      })
+
+      it.effect("an unprocessed delete is resent, alone, until it drains", () =>
+        Effect.gen(function* () {
+          const items = partition(3)
+          mockQuery.mockResolvedValueOnce({ Items: items, LastEvaluatedKey: undefined })
+          mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[2]!]))
+          mockBatchWriteItem.mockResolvedValueOnce({})
+
+          const fiber = yield* PurgeEntity.purge({ itemId: "i-1" })
+            .asEffect()
+            .pipe(Effect.provide(PurgeTestLayer), Effect.forkChild)
+          yield* TestClock.adjust("1 seconds")
+          yield* Fiber.join(fiber)
+
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(2)
+          const retried = mockBatchWriteItem.mock.calls[1]![0].RequestItems["test-table"]
+          expect(retried).toEqual([
+            { DeleteRequest: { Key: { pk: items[2]!.pk, sk: items[2]!.sk } } },
+          ])
+        }),
+      )
+
+      it.effect("never draining: fails after the retries, saying exactly what was deleted", () =>
+        Effect.gen(function* () {
+          const items = partition(3)
+          mockQuery.mockResolvedValueOnce({ Items: items, LastEvaluatedKey: undefined })
+          // The first request deletes one of three; the other two never drain.
+          mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[1]!, items[2]!]))
+          for (let i = 0; i < 10; i++) {
+            mockBatchWriteItem.mockResolvedValueOnce(unprocessed([items[1]!, items[2]!]))
+          }
+
+          const fiber = yield* PurgeEntity.purge({ itemId: "i-1" })
+            .asEffect()
+            .pipe(Effect.provide(PurgeTestLayer), Effect.forkChild)
+          yield* TestClock.adjust("60 seconds")
+          const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+
+          expect(error._tag).toBe("DynamoError")
+          expect((error as DynamoError).operation).toBe("BatchWriteItem")
+          const text = String((error as DynamoError).cause)
+          expect(text).toContain(
+            "2 of the partition's 3 items were still unprocessed after 5 retries",
+          )
+          expect(text).toContain("the purge had already deleted 1 of the partition's 3 items")
+          // The first request, then five retries.
+          expect(mockBatchWriteItem).toHaveBeenCalledTimes(6)
+        }),
+      )
+    })
+
     it.effect("purge handles soft-deleted item + versions", () =>
       Effect.gen(function* () {
         const PurgeSoftEntity = withConfig(
@@ -7413,7 +7512,6 @@ describe("Entity", () => {
           ops.not(ops.and()),
           ops.or(),
           ops.and(ops.eq(pb.name, "a"), ops.or(ops.and(ops.and()))),
-          ops.isIn(pb.name, []),
         ]
         for (const expr of refused) {
           const cond = () => expr
@@ -7440,6 +7538,31 @@ describe("Entity", () => {
         expect(mockUpdateItem).not.toHaveBeenCalled()
         expect(mockDeleteItem).not.toHaveBeenCalled()
         expect(mockGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an isIn() with no values is sent, and DynamoDB's rejection named (#144)", () =>
+      Effect.gen(function* () {
+        const ops = createConditionOps<{ name: string }>()
+        const pb = createPathBuilder<{ name: string }>()
+        const cond = () => ops.isIn(pb.name, [])
+        const rejection = awsValidationException(ddbEmptyIn("Condition"))
+        mockPutItem.mockRejectedValueOnce(rejection)
+        const error = yield* Plain.put({ itemId: "i-1", name: "n" })
+          .pipe(Plain.condition(cond))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('isIn() on "name" in its condition has no values')
+        expect(text).toContain("Nothing was written.")
+        expect(mockPutItem.mock.calls[0]![0].ConditionExpression).toContain("IN ()")
+        mockDeleteItem.mockRejectedValueOnce(rejection)
+        const deleted = yield* Plain.delete({ itemId: "i-1" })
+          .pipe(Plain.condition(cond))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(deleted._tag).toBe("ValidationError")
       }).pipe(Effect.provide(TestLayer)),
     )
   })

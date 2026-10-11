@@ -22,6 +22,7 @@ import {
   AggregateTransactionOverflow,
   ConditionalCheckFailed,
   DynamoError,
+  DynamoValidationError,
   type ItemNotFound,
   RefNotFound,
   TransactionCancelled,
@@ -77,7 +78,11 @@ import {
   type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
+  explainDiagnosis,
+  type KeyAttributes,
+  mergeKeyAttributes,
   transactItemTarget,
+  withCause,
 } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
@@ -593,8 +598,11 @@ interface AggregateConfig<
    * the RCU cost of every assembly read.
    *
    * Only valid where the assembly query can be strongly consistent: the base table (no
-   * `collection.index`) or an LSI. DynamoDB rejects consistent reads against a GSI, so
-   * combining this with a GSI-shaped collection index throws at `make()` time.
+   * `collection.index`) or an LSI. DynamoDB rejects consistent reads against a GSI; with
+   * a GSI collection index, each assembly read fails with that rejection, named for the
+   * aggregate and the index (a `ValidationError`, `operation: "<op>.consistentRead"`;
+   * `delete`'s read keeps DynamoDB's `DynamoValidationError` tag). It is not refused at
+   * `make()` time (#144).
    */
   readonly consistentRead?: boolean
   readonly context?: ReadonlyArray<string>
@@ -1121,13 +1129,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const aggregateName = config.root.entityType
   const groupKeys: GroupKeys = {
     pkField: config.pk.field,
-    // Every sort-key attribute an aggregate item can carry: `sk`, the
-    // collection index's SK mirror, and the list index's SK (root items).
-    rangeKeys: [
-      "sk",
-      ...(config.collection.sk === undefined ? [] : [config.collection.sk.field]),
-      ...(config.list === undefined ? [] : [config.list.sk.field]),
-    ],
+    // Every key attribute an aggregate item can carry: `pk` / `sk`, the
+    // collection index's PK and SK mirror, and the list index's (root items).
+    keys: mergeKeyAttributes({
+      partition: [
+        "pk",
+        config.pk.field,
+        ...(config.list === undefined ? [] : [config.list.pk.field]),
+      ],
+      sort: [
+        "sk",
+        ...(config.collection.sk === undefined ? [] : [config.collection.sk.field]),
+        ...(config.list === undefined ? [] : [config.list.sk.field]),
+      ],
+    }),
   }
   const contextFields = config.context ?? []
 
@@ -1203,15 +1218,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
     enforceChecks: true,
   }) as unknown as Schema.Codec<any>
 
-  // Validate the collection index / consistency combination against the table's
-  // primary key. Best effort: a table registering only aggregates has no primary key
-  // to resolve, in which case both checks are skipped rather than guessed at.
+  // Validate the collection index against the table's primary key. Best effort: a
+  // table registering only aggregates has no primary key to resolve, in which case
+  // the check is skipped rather than guessed at. `consistentRead` on a GSI collection
+  // index is not refused here: DynamoDB rejects the consistent read, and the
+  // assembly read diagnoses it, naming the aggregate and the index (#144).
   const consistentRead = config.consistentRead ?? false
   const tablePrimary = resolvePrimaryKey(config.table.entities)
-  const collectionIsGsi =
-    tablePrimary !== undefined &&
-    config.collection.index !== undefined &&
-    config.pk.field !== tablePrimary.pk
 
   if (tablePrimary !== undefined && config.collection.index === undefined) {
     if (config.pk.field !== tablePrimary.pk) {
@@ -1230,17 +1243,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         `be supplied together. The collection SK exists only to give the index something to ` +
         `sort by — declare both to assemble through an index, or neither to assemble off the ` +
         `base table.`,
-    )
-  }
-
-  if (consistentRead && collectionIsGsi) {
-    throw new Error(
-      `[EDD-9042] Aggregate "${aggregateName}": \`consistentRead\` is not supported against a ` +
-        `GSI. Collection index "${config.collection.index}" is partitioned by ` +
-        `"${config.pk.field}" rather than the table's primary partition key ` +
-        `("${tablePrimary?.pk}"), which makes it a GSI, and DynamoDB serves GSI reads as ` +
-        `eventually consistent only. Drop \`consistentRead\`, or key the aggregate on the ` +
-        `table's primary partition key so assembly reads the base table.`,
     )
   }
 
@@ -1353,8 +1355,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
     return toCompositeKeyRecord(compositeKeyForm, composites)
   }
 
-  /** Shared: compose PK and query all items */
-  const fetchPartition = (key: Record<string, unknown>) =>
+  /**
+   * DynamoDB's rejection of an assembly read (#144) — a consistent read of a
+   * GSI collection index — explained for the aggregate and its index.
+   */
+  const assemblyReadCause = (operation: string, diagnosis: Diagnosis, original: unknown) =>
+    withCause(
+      `Aggregate "${aggregateName}" ${operation}: ${explainDiagnosis(diagnosis, operation)} ` +
+        "Drop `consistentRead` from the aggregate, or key it on the table's primary " +
+        "partition key so assembly reads the base table.",
+      original,
+    )
+
+  /** Compose the PK and query all items; a rejected read fails as `rejected` names it. */
+  const readPartition = <E>(
+    key: Record<string, unknown>,
+    rejected: (diagnosis: Diagnosis, original: unknown) => E,
+  ) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const tableConfig: TableConfig = yield* config.table.Tag
@@ -1367,9 +1384,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
         config.pk.field,
         pkValue,
         consistentRead,
+        rejected,
       )
       return { client, tableConfig, pkValue, composites, allItems }
     })
+
+  /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
+  const fetchPartition = (key: Record<string, unknown>, operation: string) =>
+    readPartition(
+      key,
+      (diagnosis, original) =>
+        new ValidationError({
+          entityType: aggregateName,
+          operation: `${operation}.consistentRead`,
+          cause: assemblyReadCause(operation, diagnosis, original),
+        }),
+    )
 
   const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
 
@@ -1397,7 +1427,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     get: (key) =>
       Effect.gen(function* () {
-        const { allItems } = yield* fetchPartition(key)
+        const { allItems } = yield* fetchPartition(key, "get")
 
         if (allItems.length === 0) {
           return yield* new AggregateAssemblyError({
@@ -1503,7 +1533,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     update: (key, mutationFn) =>
       Effect.gen(function* () {
-        const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key)
+        const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update")
 
         if (allItems.length === 0) {
           return yield* new AggregateAssemblyError({
@@ -1675,7 +1705,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     delete: (key) =>
       Effect.gen(function* () {
-        const { client, tableConfig, allItems } = yield* fetchPartition(key)
+        const { client, tableConfig, allItems } = yield* readPartition(
+          key,
+          // `delete` declares no `ValidationError`: a rejected read keeps
+          // DynamoDB's own tag, its message explained.
+          (diagnosis, original) =>
+            new DynamoValidationError({
+              operation: "Query",
+              cause: assemblyReadCause("delete", diagnosis, original),
+            }),
+        )
 
         if (allItems.length === 0) {
           return yield* new AggregateAssemblyError({
@@ -1777,16 +1816,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
               ...listPkComposites,
               String(shard),
             ])
-            return queryListPartition(client, tableConfig, listConfig, config.schema, {
-              pkValue: shardPkValue,
-              skValues,
-              limit,
-              pageSize,
-              filter: rootFilter,
-              accept: options?.filterBy,
-              reverse: options?.reverse === true,
-              keyFields: listKeyFields,
-            })
+            return queryListPartition(
+              client,
+              tableConfig,
+              listConfig,
+              config.schema,
+              {
+                pkValue: shardPkValue,
+                skValues,
+                limit,
+                pageSize,
+                filter: rootFilter,
+                accept: options?.filterBy,
+                reverse: options?.reverse === true,
+                keyFields: listKeyFields,
+              },
+              aggregateName,
+            )
           })
           const shardResults = yield* Effect.all(shardQueries)
           const merged = shardResults.flatMap((r) => r.items)
@@ -1799,17 +1845,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
             : undefined
           const listPkValue = composeCollectionKey(config.schema, listConfig.name, listPkComposites)
-          const result = yield* queryListPartition(client, tableConfig, listConfig, config.schema, {
-            pkValue: listPkValue,
-            skValues,
-            limit,
-            pageSize,
-            startKey,
-            filter: rootFilter,
-            accept: options?.filterBy,
-            reverse: options?.reverse === true,
-            keyFields: listKeyFields,
-          })
+          const result = yield* queryListPartition(
+            client,
+            tableConfig,
+            listConfig,
+            config.schema,
+            {
+              pkValue: listPkValue,
+              skValues,
+              limit,
+              pageSize,
+              startKey,
+              filter: rootFilter,
+              accept: options?.filterBy,
+              reverse: options?.reverse === true,
+              keyFields: listKeyFields,
+            },
+            aggregateName,
+          )
           rootItems = result.items
           nextKey = result.lastKey
         }
@@ -1822,7 +1875,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             key[composite] = rootItem[composite]
           }
           const assembled = yield* Effect.gen(function* () {
-            const { allItems } = yield* fetchPartition(key)
+            const { allItems } = yield* fetchPartition(key, "list")
             if (allItems.length === 0) return undefined
 
             const result = yield* assembleAggregate(
@@ -2077,14 +2130,16 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
 // Internal: Query all items in the aggregate partition
 // ---------------------------------------------------------------------------
 
-const queryAllItems = (
+const queryAllItems = <E>(
   client: DynamoClientService,
   tableName: string,
   indexName: string | undefined,
   pkField: string,
   pkValue: string,
   consistentRead: boolean,
-): Effect.Effect<Array<Record<string, unknown>>, DynamoClientError> =>
+  /** A consistent read of a GSI, which DynamoDB rejects, as the caller names it (#144). */
+  consistentReadRejected: (diagnosis: Diagnosis, original: unknown) => E,
+): Effect.Effect<Array<Record<string, unknown>>, DynamoClientError | E> =>
   Effect.gen(function* () {
     const allItems: Array<Record<string, unknown>> = []
     let exclusiveStartKey: Record<string, AttributeValue> | undefined
@@ -2093,7 +2148,7 @@ const queryAllItems = (
     // discriminates them by `__edd_e__`, so there is no sort-key condition and no
     // ordering requirement — which is why `IndexName` is optional here.
     do {
-      const result = yield* client.query({
+      const input = {
         TableName: tableName,
         IndexName: indexName,
         KeyConditionExpression: "#pk = :pk",
@@ -2101,7 +2156,14 @@ const queryAllItems = (
         ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
         ExclusiveStartKey: exclusiveStartKey,
         ConsistentRead: consistentRead || undefined,
-      })
+      }
+      const result = yield* client.query(input).pipe(
+        diagnoseFailure({
+          sent: () => ({ _tag: "Read", scan: false, input }),
+          only: ["ConsistentReadOnGsi"],
+          rewrite: consistentReadRejected,
+        }),
+      )
 
       if (result.Items) {
         for (const item of result.Items) {
@@ -3237,8 +3299,8 @@ type WriteGroupsError =
 /** The aggregate's item keys, to name an item in a diagnosed rejection (#144). */
 interface GroupKeys {
   readonly pkField: string
-  /** Sort-key attributes the items carry: `sk`, the collection index's and the list index's. */
-  readonly rangeKeys: ReadonlyArray<string>
+  /** Key attributes the items carry: the table's, the collection index's and the list index's. */
+  readonly keys: KeyAttributes
 }
 
 function writeTransactionGroups(
@@ -3328,6 +3390,7 @@ function writeTransactionGroups(
               itemCount: diagnosis.count,
               limit: diagnosis.limit,
               committed: already,
+              operation: rootGuard !== undefined ? "create" : "update",
               cause: original,
             })
           : diagnosedValidationError(diagnosis, original, {
@@ -3383,7 +3446,7 @@ function writeTransactionGroups(
         }),
         // A limit DynamoDB enforced (#144), named — after the root guard's
         // mapping, which a conditional failure always takes.
-        diagnoseFailure({ sent, rangeKeys: () => keys.rangeKeys, rewrite: diagnosed }),
+        diagnoseFailure({ sent, keys: () => keys.keys, rewrite: diagnosed }),
       )
       committed.push(group.group)
     }
@@ -3458,8 +3521,9 @@ const DELETE_BASE_DELAY_MS = 100
  * the same thing here as they do on an entity query, under the same empty-part
  * rules (#134): a filter that asserts nothing (`{}`, `and()`) is no filter, an
  * empty part directly under `and` is left out, and one anywhere else — or an
- * `or()` with no parts, or an `isIn` with no values — is refused with a
- * `ValidationError` before anything is sent.
+ * `or()` with no parts — is refused with a `ValidationError` before anything
+ * is sent. An `isIn` with no values is sent, and DynamoDB's rejection of its
+ * `IN ()` diagnosed (#144).
  */
 const compileListFilter = <Model>(
   filter: ListFilter<Model> | undefined,
@@ -3562,7 +3626,8 @@ const queryListPartition = (
   listConfig: ListCollectionConfig,
   schema: DynamoSchemaModule.DynamoSchema,
   options: ListPartitionOptions,
-): Effect.Effect<ListPartitionResult, DynamoClientError> =>
+  aggregateName: string,
+): Effect.Effect<ListPartitionResult, DynamoClientError | ValidationError> =>
   Effect.gen(function* () {
     const { filter, limit, pkValue, skValues } = options
 
@@ -3591,7 +3656,7 @@ const queryListPartition = (
     for (;;) {
       const remaining = limit === undefined ? undefined : limit - items.length
       const requestLimit = listRequestLimit(options, remaining)
-      const result = yield* client.query({
+      const input = {
         TableName: tableConfig.name,
         IndexName: listConfig.index,
         KeyConditionExpression: keyCondition,
@@ -3601,7 +3666,24 @@ const queryListPartition = (
         ...(filter !== undefined ? { FilterExpression: filter.expression } : {}),
         ...(requestLimit !== undefined ? { Limit: requestLimit } : {}),
         ...(options.reverse === true ? { ScanIndexForward: false } : {}),
-      })
+      }
+      const result = yield* client.query(input).pipe(
+        // DynamoDB's rejection of the filter's `IN ()` (an `isIn` with no
+        // values), not pre-checked, is named (#144).
+        diagnoseFailure({
+          sent: () => ({ _tag: "Read", scan: false, input }),
+          only: ["EmptyIn"],
+          rewrite: (diagnosis, original) =>
+            new ValidationError({
+              entityType: aggregateName,
+              operation: "list.filter",
+              cause: withCause(
+                explainDiagnosis(diagnosis, `Aggregate "${aggregateName}" list`),
+                original,
+              ),
+            }),
+        }),
+      )
 
       const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
       const lastEvaluatedKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined

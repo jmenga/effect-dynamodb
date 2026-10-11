@@ -35,7 +35,11 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
-import { DynamoError, DynamoValidationError } from "@effect-dynamodb/schema/Errors.js"
+import {
+  DynamoError,
+  DynamoValidationError,
+  type ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -667,31 +671,60 @@ describe("vector search read path", () => {
     }).pipe(Effect.provide(makeEmulatedLayer(capture)))
   })
 
-  it.effect("clamps topK into 1..100 and truncates results", () => {
-    const capture: Capture = {
-      scanItems: [
-        storedItem("a", "footwear", [1, 0, 0, 0]),
-        storedItem("b", "footwear", [0.9, 0.1, 0, 0]),
-        storedItem("c", "footwear", [0.8, 0.2, 0, 0]),
-      ],
-    }
+  it.effect(
+    "sends topK as given and truncates results; out of range is DynamoDB's rejection, named (#144)",
+    () => {
+      const capture: Capture = {
+        scanItems: [
+          storedItem("a", "footwear", [1, 0, 0, 0]),
+          storedItem("b", "footwear", [0.9, 0.1, 0, 0]),
+          storedItem("c", "footwear", [0.8, 0.2, 0, 0]),
+        ],
+      }
+      setVector("x", [1, 0, 0, 0])
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Products },
+          tables: { MainTable },
+        })
+        const hits = yield* db.entities.Products.byDescription("x")
+          .partition({ tenantId: "t-1" })
+          .topK(2)
+          .collect()
+        expect(hits).toHaveLength(2)
+        // Never clamped into a smaller search: sent, rejected, and named.
+        for (const topK of [1000, 0]) {
+          const error = yield* Effect.flip(
+            db.entities.Products.byDescription("x")
+              .partition({ tenantId: "t-1" })
+              .topK(topK)
+              .collect(),
+          )
+          expect(error._tag).toBe("ValidationError")
+          const failure = error as ValidationError
+          expect(failure.operation).toBe("vectorSearch.byDescription.topK")
+          const text = String(failure.cause)
+          expect(text).toContain(`topK(${topK}) is outside the range DynamoDB accepts`)
+          expect(text).toContain("1..100")
+          expect(((failure.cause as Error).cause as { _tag: string })._tag).toBe(
+            "DynamoValidationError",
+          )
+        }
+      }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+    },
+  )
+
+  it.effect("topK reaches SearchVectors unchanged", () => {
+    const capture: Capture = {}
     setVector("x", [1, 0, 0, 0])
     return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { Products },
-        tables: { MainTable },
-      })
-      const hits = yield* db.entities.Products.byDescription("x")
+      const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
+      yield* db.entities.Products.byDescription("x")
         .partition({ tenantId: "t-1" })
-        .topK(2)
+        .topK(250)
         .collect()
-      expect(hits).toHaveLength(2)
-      const clamped = yield* db.entities.Products.byDescription("x")
-        .partition({ tenantId: "t-1" })
-        .topK(1000)
-        .collect()
-      expect(clamped).toHaveLength(3)
-    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+      expect(capture.searchVectors?.TopK).toBe(250)
+    }).pipe(Effect.provide(makeLayer(capture)))
   })
 
   it.effect("accepts a pre-computed query vector without an Embedder", () => {
@@ -1660,6 +1693,86 @@ describe("vector-index limits: sent, and DynamoDB's rejection diagnosed (#144)",
             return original
           }),
           WideTable.layer({ name: "wide-table" }),
+        ),
+      ),
+    )
+  })
+
+  // Dimensions outside 1..4096: AWS's documented range, in AWS's standard
+  // member-constraint wording (unverified — Local has no vector indexes).
+  const Huge = Entity.make({
+    model: Wide,
+    entityType: "HugeDims",
+    primaryKey: {
+      pk: { field: "pk", composite: ["wideId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    vectorIndexes: {
+      byDescription: { name: "vech", dimensions: 5000, source: { fields: ["description"] } },
+    },
+  })
+  const dimensionsRejection = (operation: string, member: string) =>
+    validation(
+      operation,
+      `1 validation error detected: Value '5000' at '${member}' failed to satisfy constraint: ` +
+        "Member must have value less than or equal to 4096",
+    )
+  const hugeClient = { dimensions: 5000, embed: () => Effect.succeed([] as Array<number>) }
+
+  it("dimensions outside 1..4096 are defined, not refused at Entity.make (EDD-9030 retired)", () => {
+    const HugeTable = Table.make({ schema: AppSchema, entities: { Huge } })
+    expect(
+      Table.definition(HugeTable as unknown as Table.Table).VectorIndexes![0]!.Dimensions,
+    ).toBe(5000)
+  })
+
+  it.effect("CreateTable: dimensions outside 1..4096 name the index and its sharers", () => {
+    const HugeTable = Table.make({ schema: AppSchema, entities: { Huge } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Huge },
+        tables: { HugeTable },
+        embedder: hugeClient,
+      })
+      const error = yield* db.tables.HugeTable.create().pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoValidationError")
+      const text = String(error.cause)
+      expect(text).toContain('DynamoDB rejected vector index "vech": its dimensions (5000)')
+      expect(text).toContain("1..4096")
+      expect(text).toContain("(HugeDims)")
+      expect(text).toContain("The table was not created.")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          tableClient((operation) =>
+            dimensionsRejection(operation, "vectorIndexes.1.member.dimensions"),
+          ),
+          HugeTable.layer({ name: "huge-table" }),
+        ),
+      ),
+    )
+  })
+
+  it.effect("addVectorIndex: dimensions outside 1..4096 are named; nothing was changed", () => {
+    const HugeTable = Table.make({ schema: AppSchema, entities: { Huge } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Huge },
+        tables: { HugeTable },
+        embedder: hugeClient,
+      })
+      const error = yield* db.tables.HugeTable.addVectorIndex("vech").pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoValidationError")
+      const text = String(error.cause)
+      expect(text).toContain('vector index "vech": its dimensions (5000)')
+      expect(text).toContain("Nothing was changed.")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          tableClient((operation) =>
+            dimensionsRejection(operation, "vectorIndexUpdates.1.member.create.dimensions"),
+          ),
+          HugeTable.layer({ name: "huge-table" }),
         ),
       ),
     )

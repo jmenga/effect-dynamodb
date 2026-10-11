@@ -113,10 +113,12 @@ interface QueryState {
 }
 
 /**
- * @internal Diagnose DynamoDB's rejection of the query's key condition — an
- * empty key value, a `BETWEEN` whose lower bound sorts after its upper — as a
- * `ValidationError` with `operation`, its message prefixed `label` (#144).
- * Without it, those rejections pass through as DynamoDB's own.
+ * @internal How a query names DynamoDB's rejection of its key condition — an
+ * empty key value, a `BETWEEN` whose lower bound sorts after its upper — and of
+ * its filter (an `isIn()` with no values): a `ValidationError` with
+ * `operation` (the filter's is always `"query.filter"`), its message prefixed
+ * `label` (#144). Every query diagnoses those rejections; without this, they
+ * are named `operation: "query"` and `label` "query of <entity types>".
  */
 export interface KeyConditionDiagnosis {
   readonly operation: string
@@ -1023,42 +1025,40 @@ const prepared = (
 
 /**
  * @internal Send one request of a terminal. DynamoDB's rejection of what the
- * library does not pre-check (#144) is diagnosed against the request sent: a
- * consistent read of a GSI always, and the key condition's rules (an empty key
- * value, a reversed `BETWEEN`) when the query asks for it
- * ({@link KeyConditionDiagnosis}). Anything else passes through.
+ * library does not pre-check (#144) is diagnosed against the request sent, on
+ * failure only: a consistent read of a GSI, the key condition's rules (an
+ * empty key value, a reversed `BETWEEN`) and an `isIn()` with no values in the
+ * filter, named as {@link KeyConditionDiagnosis} says. Anything else passes
+ * through.
  */
 const send = (
   client: DynamoClientService,
   state: QueryState,
   cmd: ReturnType<typeof buildDynamoCommand>,
 ): Effect.Effect<QueryCommandOutput | ScanCommandOutput, DynamoClientError | ValidationError> => {
-  const keyCondition = state.keyConditionDiagnosis
   const request: Effect.Effect<QueryCommandOutput | ScanCommandOutput, DynamoClientError> =
     state.isScan ? client.scan(cmd) : client.query(cmd)
   return request.pipe(
     diagnoseFailure({
       sent: () => ({ _tag: "Read", scan: state.isScan, input: cmd }),
-      only:
-        keyCondition === undefined
-          ? ["ConsistentReadOnGsi"]
-          : ["ConsistentReadOnGsi", "EmptyKeyBound", "BetweenReversed"],
+      only: ["ConsistentReadOnGsi", "EmptyKeyBound", "BetweenReversed", "EmptyIn"],
       rewrite: (diagnosis, original) => {
         const entityType = state.entityTypes.join(", ") || "unknown"
-        return diagnosis._tag === "ConsistentReadOnGsi"
-          ? new ValidationError({
-              entityType,
-              operation: "query.consistentRead",
-              cause: withCause(explainDiagnosis(diagnosis, "query"), original),
-            })
-          : new ValidationError({
-              entityType,
-              operation: keyCondition?.operation ?? "query",
-              cause: withCause(
-                explainDiagnosis(diagnosis, keyCondition?.label ?? "query"),
-                original,
-              ),
-            })
+        const naming = state.keyConditionDiagnosis ?? {
+          operation: "query",
+          label: `query of ${entityType}`,
+        }
+        const [operation, label] =
+          diagnosis._tag === "ConsistentReadOnGsi"
+            ? ["query.consistentRead", "query"]
+            : diagnosis._tag === "EmptyIn"
+              ? ["query.filter", naming.label]
+              : [naming.operation, naming.label]
+        return new ValidationError({
+          entityType,
+          operation,
+          cause: withCause(explainDiagnosis(diagnosis, label), original),
+        })
       },
     }),
   )
@@ -1510,8 +1510,7 @@ export const count = <A>(
  * Return the built DynamoDB command input without executing.
  * Useful for debugging, logging, or passing to DynamoClient directly.
  * Fails with a `ValidationError` for a filter the query would refuse to send
- * (an empty part under `or` / `not`, an `or()` with no parts, an `isIn` with
- * no values).
+ * (an empty part under `or` / `not`, an `or()` with no parts).
  */
 export const asParams = <A>(
   self: Query<A>,

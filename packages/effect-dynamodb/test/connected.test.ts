@@ -4201,6 +4201,9 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           expect(overflow.limit).toBe(100)
           expect(overflow.subgraph).toBe("team2")
           expect(overflow.committed).toEqual(["root", "team1"])
+          expect(overflow.message).toContain('sub-aggregate "team2" holds')
+          expect(overflow.message).toContain('already committed: "root", "team1"')
+          expect(overflow.message).toContain("a retried create fails its root guard")
 
           // Exactly what it names was written: the root and team1, not team2.
           const sks = yield* rawSks(matchPk("mc-over"))
@@ -4266,6 +4269,8 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
         expect(overflow.subgraph).toBe("team2")
         expect(overflow.committed).toContain("team1")
         expect(overflow.committed).not.toContain("team2")
+        expect(overflow.message).toContain('"team1"')
+        expect(overflow.message).not.toContain("retried create")
 
         // team1's change is committed; team2 is as it was.
         const fetched = yield* MatchCardAggregate.get({ id: "mc-upd-over" })
@@ -21250,7 +21255,6 @@ describeConnected("#133 — path operations on index composites and unique field
         (t: any, { or, eq, and }: any) => or(eq(t.label, "first"), and()),
         (_: any, { not, and }: any) => not(and()),
         (_: any, { or }: any) => or(),
-        (t: any, { isIn }: any) => isIn(t.label, []),
       ]
       yield* devices.put({ id: "ep-1", owner: "ep", label: "first" })
       for (const cond of refused) {
@@ -21271,6 +21275,20 @@ describeConnected("#133 — path operations on index composites and unique field
         const filtered = yield* devices.scan().filter(cond).collect().pipe(Effect.flip)
         expect(filtered._tag).toBe("ValidationError")
       }
+      // An isIn() with no values is sent (#144): DynamoDB rejects its `IN ()`,
+      // and the rejection is named — on the bound put and in a filter.
+      const emptyIn = (t: any, { isIn }: any) => isIn(t.label, [])
+      const put = yield* devices
+        .put({ id: "ep-2", owner: "ep", label: "x" })
+        .condition(emptyIn)
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(put._tag).toBe("ValidationError")
+      expect(String(put.cause)).toContain('isIn() on "label" in its condition has no values')
+      expect(yield* rawItem("G133DevicePlain", "ep-2")).toBeUndefined()
+      const scanned = yield* devices.scan().filter(emptyIn).collect().pipe(Effect.flip)
+      expect(scanned._tag).toBe("ValidationError")
+      expect(scanned.operation).toBe("query.filter")
       // Directly under and, or as the whole filter, an empty part is none.
       const kept = (t: any, { and, eq }: any) => and(eq(t.owner, "ep"), and())
       expect((yield* devices.scan().filter(kept).collect()).map((d: any) => d.id)).toEqual(["ep-1"])
@@ -21755,9 +21773,23 @@ const LimVersionedDocs = Entity.make({
   versioned: true,
 })
 
+/** An index partition key composed from a model field: long enough, over 2048 bytes. */
+const LimGsiPks = Entity.make({
+  model: LimDoc,
+  entityType: "LimGsiPk",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  indexes: {
+    byTagPk: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tag"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+  },
+})
+
 const LimTable = Table.make({
   schema: limSchema,
-  entities: { LimDocs, LimRetainDocs, LimLongSks, LimVersionedDocs },
+  entities: { LimDocs, LimRetainDocs, LimLongSks, LimVersionedDocs, LimGsiPks },
 })
 const provideLim = Effect.provide(
   Layer.mergeAll(ClientLayer, LimTable.layer({ name: limTableName })),
@@ -22098,6 +22130,157 @@ describeConnected("write limits diagnosed from DynamoDB's rejection (#144)", () 
       expect(text).toContain("the ConditionExpression of the LimDoc put")
       expect(text).toMatch(/it is \d{4} characters, over DynamoDB's limit of 4096 characters/)
       expect(yield* absent("long-cond")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // Partition keys over 2048 bytes (#144): DynamoDB Local words a table key's
+  // ("Hash primary key values must be under 2048 bytes, …") and an index
+  // key's ("Size limit exceeded") alike for both kinds; confirmed by measuring
+  // the request's key attributes.
+  // -------------------------------------------------------------------------
+
+  const longId = "d".repeat(2100)
+
+  it.effect("#18 a table partition key over 2048 bytes: put, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: longId, tag: "t", body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('the partition key "pk" of the LimDoc put')
+      expect(text).toContain("2048-byte limit for a partition key")
+      expect(text).toContain("Nothing was written.")
+    }).pipe(provideLim),
+  )
+
+  it.effect("#19 an index partition key over 2048 bytes: put, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimGsiPks.put({ docId: "gsi-pk", tag: "g".repeat(2100), body: "b" })
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "gsi1pk" of the LimGsiPk put',
+      )
+    }).pipe(provideLim),
+  )
+
+  it.effect("#20 a table partition key over 2048 bytes: update's key, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.update({ docId: longId })
+        .pipe(Entity.set({ body: "c" }))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "pk" of the LimDoc update',
+      )
+    }).pipe(provideLim),
+  )
+
+  it.effect("#21 a partition key over 2048 bytes in a transaction (a cancellation reason)", () =>
+    Effect.gen(function* () {
+      const error = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "tx-pk-small", tag: "t", body: "s" }),
+        LimDocs.put({ docId: longId, tag: "t", body: "s" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'the partition key "pk" of operation 1 (LimDoc)',
+      )
+      expect(yield* absent("tx-pk-small")).toBe(true)
+    }).pipe(provideLim),
+  )
+
+  it.effect(
+    "#22 a partition key over 2048 bytes in Batch.write: named, with what was written",
+    () =>
+      Effect.gen(function* () {
+        const error = yield* Batch.write([
+          LimDocs.put({ docId: "batch-pk-small", tag: "t", body: "s" }),
+          LimGsiPks.put({ docId: "batch-pk-big", tag: "g".repeat(2100), body: "s" }),
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('the partition key "gsi1pk" of the put of LimGsiPk')
+        expect(yield* absent("batch-pk-small")).toBe(true)
+      }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // An isIn() with no values (#144 S17): sent as `IN ()`, which DynamoDB
+  // rejects as a syntax error naming nothing; confirmed and named.
+  // -------------------------------------------------------------------------
+
+  it.effect("#23 isIn() with no values in a condition: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const error = yield* LimDocs.put({ docId: "empty-in", tag: "t", body: "b" })
+        .pipe(LimDocs.condition((t: any, { isIn }: any) => isIn(t.body, [])))
+        .asEffect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain('isIn() on "body" in its condition has no values')
+      expect(yield* absent("empty-in")).toBe(true)
+      // In a transaction, the rejection is request-wide: the entry is named.
+      const tx = yield* Transaction.transactWrite([
+        LimDocs.put({ docId: "empty-in-a", tag: "t", body: "b" }),
+        LimDocs.put({ docId: "empty-in-b", tag: "t", body: "b" }).pipe(
+          LimDocs.condition((t: any, { isIn }: any) => isIn(t.body, [])),
+        ),
+      ]).pipe(Effect.flip)
+      expect(tx._tag).toBe("ValidationError")
+      expect(String((tx as ValidationError).cause)).toContain("operation 1 (LimDoc)")
+    }).pipe(provideLim),
+  )
+
+  it.effect("#24 isIn() with no values in a filter: DynamoDB's rejection, named", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { LimDocs }, tables: { LimTable } })
+      const error = yield* db.entities.LimDocs.byTag({})
+        .filter((t, { isIn }) => isIn(t.body, []))
+        .collect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect((error as ValidationError).operation).toBe("query.filter")
+      expect(String((error as ValidationError).cause)).toContain(
+        'LimDoc.byTag: DynamoDB rejected the filter: isIn() on "body" has no values',
+      )
+    }).pipe(provideLim),
+  )
+
+  // -------------------------------------------------------------------------
+  // Key-condition rejections on every query (#144 S29), and a BatchGetItem
+  // repeating a key.
+  // -------------------------------------------------------------------------
+
+  it.effect("#25 an entity accessor's reversed between: the accessor, index and bounds named", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { LimDocs }, tables: { LimTable } })
+      const error = yield* db.entities.LimDocs.byTag({})
+        .where((t, { between }) => between(t.tag, "zeta", "alpha"))
+        .collect()
+        .pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      const text = String((error as ValidationError).cause)
+      expect(text).toContain("LimDoc.byTag: DynamoDB rejected the query: between's lower bound")
+      expect(text).toContain('on "gsi1sk" of index "gsi1"')
+    }).pipe(provideLim),
+  )
+
+  it.effect("#26 Batch.get reading one key twice: DynamoDB's rejection, both gets named", () =>
+    Effect.gen(function* () {
+      const error = yield* Batch.get([
+        LimDocs.get({ docId: "bg-1" }),
+        LimDocs.get({ docId: "bg-2" }),
+        LimDocs.get({ docId: "bg-1" }),
+      ]).pipe(Effect.flip)
+      expect(error._tag).toBe("DynamoError")
+      expect(String((error as { cause: unknown }).cause)).toContain(
+        "BatchGetItem reads one item more than once — get 0 (LimDoc) and get 2 (LimDoc)",
+      )
     }).pipe(provideLim),
   )
 

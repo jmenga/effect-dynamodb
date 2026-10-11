@@ -31,11 +31,12 @@ import type {
   VectorFilterInput,
   VectorIndexDefinition,
 } from "@effect-dynamodb/schema/VectorIndex.js"
-import { clampTopK, DEFAULT_TOP_K, toSimilarity } from "@effect-dynamodb/schema/VectorIndex.js"
+import { DEFAULT_TOP_K, toSimilarity } from "@effect-dynamodb/schema/VectorIndex.js"
 import { Effect, Option } from "effect"
 import { DynamoClient, type DynamoClientError } from "../DynamoClient.js"
 import { fromAttributeMap, toAttributeValue } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
+import { diagnoseFailure, explainDiagnosis, withCause } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
 // Result shape
@@ -84,7 +85,11 @@ export interface BoundVectorQueryCombinators<Model, Partition, Filters extends s
     filters: VectorFilterInput<Filters>,
   ) => BoundVectorQuery<Model, Partition, Filters, A>
 
-  /** Number of nearest neighbours to return. Clamped to 1..100; default 10. */
+  /**
+   * Number of nearest neighbours to return; default 10. Sent as given, never
+   * clamped: DynamoDB accepts an integer in 1..100, and when it rejects the
+   * value `collect()` fails with a `ValidationError` naming it.
+   */
   readonly topK: (k: number) => BoundVectorQuery<Model, Partition, Filters, A>
 
   /** Project a subset of attributes. Returns partial records. */
@@ -197,7 +202,9 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
   }
 
   topK(k: number): BoundVectorQueryImpl<Model, Partition, Filters, A> {
-    return this._with({ topK: clampTopK(k) })
+    // Sent as given (#144): DynamoDB's rejection of a TopK outside 1..100 is
+    // diagnosed at `collect()`, never clamped into a smaller search.
+    return this._with({ topK: k })
   }
 
   select(
@@ -333,9 +340,24 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         input.ProjectionExpression = projectionParts.join(", ")
       }
 
-      const output = yield* client
-        .searchVectors(input)
-        .pipe(Effect.mapError((error) => classifyBackfill(error, tableName, definition.index)))
+      const output = yield* client.searchVectors(input).pipe(
+        Effect.mapError((error) => classifyBackfill(error, tableName, definition.index)),
+        // A TopK outside DynamoDB's range is not pre-checked (#144): its
+        // rejection is confirmed against the TopK sent and named.
+        diagnoseFailure({
+          sent: () => ({ _tag: "Search", index: definition.index, topK: state.topK }),
+          only: ["TopKOutOfRange"],
+          rewrite: (diagnosis, original) =>
+            new ValidationErrorClass({
+              entityType,
+              operation: `vectorSearch.${logicalName}.topK`,
+              cause: withCause(
+                explainDiagnosis(diagnosis, `vectorSearch.${logicalName}`),
+                original,
+              ),
+            }),
+        }),
+      )
 
       // 4. Decode each hit through the entity schema and normalize the score.
       const hits: Array<VectorHit<A>> = []

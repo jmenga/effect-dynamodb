@@ -1185,6 +1185,11 @@ const makeFromConfig = (config: {
           // The primary key also holds the entity's history rows; an index
           // never does (they carry no index keys).
           liveRows: indexDef.index === undefined ? entityLike._liveRows?.() : undefined,
+          // DynamoDB's rejection of the key condition (#144) names the accessor.
+          keyConditionDiagnosis: {
+            operation: "query",
+            label: `${entityLike.entityType}.${_indexName}`,
+          },
         })
 
         // Apply SK prefix from provided compositesKeyForm.
@@ -1637,6 +1642,7 @@ const makeFromConfig = (config: {
           ],
           // A collection on the primary key also meets its members' history.
           liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
+          keyConditionDiagnosis: { operation: "query", label: `collection "${collName}"` },
         })
 
         // Add begins_with on collection SK prefix for clustered collections.
@@ -1824,12 +1830,13 @@ const isResourceInUse = (err: DynamoClientError): boolean =>
   (err.cause as { name: string }).name === "ResourceInUseException"
 
 /**
- * DynamoDB's vector-index limits — inline filters per index, vector indexes
- * per table (an adjustable quota) — are not pre-checked (#144): a rejected
- * `CreateTable` / `UpdateTable` is diagnosed against the vector indexes it
- * sent, naming the index and the entities sharing it, and fails with the
- * error DynamoDB's would have been (same tag), its message explained and
- * DynamoDB's error kept as the cause. Anything else passes through.
+ * DynamoDB's vector-index limits — dimensions in 1..4096, inline filters per
+ * index, vector indexes per table (an adjustable quota) — are not pre-checked
+ * (#144): a rejected `CreateTable` / `UpdateTable` is diagnosed against the
+ * vector indexes it sent, naming the index and the entities sharing it, and
+ * fails with the error DynamoDB's would have been (same tag), its message
+ * explained and DynamoDB's error kept as the cause. Anything else passes
+ * through.
  */
 const diagnoseVectorLimits = (
   operation: "CreateTable" | "UpdateTable",
@@ -1838,7 +1845,7 @@ const diagnoseVectorLimits = (
 ) =>
   diagnoseFailure({
     sent: () => ({ _tag: "Table", operation, ...sent }),
-    only: ["VectorIndexFilters", "VectorIndexCount"],
+    only: ["VectorIndexDimensions", "VectorIndexFilters", "VectorIndexCount"],
     rewrite: (diagnosis, original): DynamoClientError => {
       const cause = withCause(explainDiagnosis(diagnosis, label), original)
       return (original as DynamoClientError)._tag === "DynamoValidationError"

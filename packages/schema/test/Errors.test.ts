@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  AggregateTransactionOverflow,
   ConditionalCheckFailed,
   DynamoError,
   ItemDeleted,
@@ -11,6 +12,44 @@ import {
 } from "../src/Errors.js"
 
 describe("Errors", () => {
+  describe("AggregateTransactionOverflow has a readable message (#144)", () => {
+    const base = { aggregate: "Match", subgraph: "team2", itemCount: 107, limit: 100 }
+
+    it("nothing committed: says nothing was written", () => {
+      const err = new AggregateTransactionOverflow(base)
+      expect(err._tag).toBe("AggregateTransactionOverflow")
+      expect(err.message).toBe(
+        'Aggregate "Match": the transaction of sub-aggregate "team2" holds 107 items, over ' +
+          "DynamoDB's limit of 100 for one transaction, and DynamoDB rejected it. Nothing was written.",
+      )
+    })
+
+    it("names what earlier groups committed", () => {
+      const err = new AggregateTransactionOverflow({
+        ...base,
+        committed: ["root", "team1"],
+        operation: "update",
+      })
+      expect(err.message).toContain('already committed: "root", "team1".')
+      expect(err.message).not.toContain("retried create")
+    })
+
+    it("a failed create: the root may be committed, so update or delete the partial aggregate", () => {
+      const err = new AggregateTransactionOverflow({
+        ...base,
+        committed: ["root"],
+        operation: "create",
+      })
+      expect(err.message).toContain(
+        "The root may be among them, so a retried create fails its root guard " +
+          "(ConditionalCheckFailed): update or delete the partial aggregate instead.",
+      )
+      // Additive: the fields are unchanged.
+      expect(err.committed).toEqual(["root"])
+      expect(err.subgraph).toBe("team2")
+    })
+  })
+
   it("DynamoError has correct tag", () => {
     const err = new DynamoError({ operation: "PutItem", cause: new Error("boom") })
     expect(err._tag).toBe("DynamoError")

@@ -12,6 +12,7 @@ import type {
   DeleteItemCommandInput,
   TransactWriteItem,
   UpdateItemCommandInput,
+  WriteRequest,
 } from "@aws-sdk/client-dynamodb"
 import {
   type ConfiguredModel,
@@ -30,6 +31,7 @@ import {
   ConcurrentModification,
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
+  DynamoError,
   EmbeddingError,
   ItemNotDeleted,
   ItemNotFound,
@@ -97,6 +99,7 @@ import {
   toExpr,
 } from "./internal/Expr.js"
 import { countOperators, expressionFits } from "./internal/ExpressionLimits.js"
+import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
 import {
   freshIncarnationToken,
@@ -108,7 +111,7 @@ import {
   batchEntries,
   diagnosedValidationError,
   diagnoseFailure,
-  rangeKeysOf,
+  keyAttributesOf,
   targetsFor,
   transactItemTarget,
 } from "./internal/WriteDiagnosis.js"
@@ -968,7 +971,12 @@ export interface Entity<
     DynamoClient | TableConfig
   >
 
-  /** Permanently remove an item plus all version history and sentinels. */
+  /**
+   * Permanently remove an item plus all version history and sentinels. Deletes
+   * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
+   * backoff; not atomic, so a failure says exactly how many items it had
+   * already deleted.
+   */
   readonly purge: (
     key: EntityKeyType<TModel, TIndexes>,
   ) => EntityDelete<DynamoClientError | ValidationError, DynamoClient | TableConfig>
@@ -1051,7 +1059,10 @@ export interface Entity<
   /**
    * Set combinator pre-bound to this entity's update type.
    *
-   * GSI all-or-none composites are enforced at runtime via `ValidationError`.
+   * Any subset of a GSI's composites may be set: GSI keys are recomposed per
+   * half — a half whose composites are given is recomposed, an untouched half
+   * is left as stored, and a touched half that cannot be composed follows the
+   * index's policy (`'sparse'` removes it, `'preserve'` keeps it).
    *
    * @example
    * ```typescript
@@ -1454,7 +1465,12 @@ export interface BoundEntity<
     never
   >
 
-  /** Permanently remove an item plus all version history and sentinels. */
+  /**
+   * Permanently remove an item plus all version history and sentinels. Deletes
+   * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
+   * backoff; not atomic, so a failure says exactly how many items it had
+   * already deleted.
+   */
   readonly purge: (key: TKey) => Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** Soft-deleted item accessors. */
@@ -2507,7 +2523,7 @@ const makeImpl = <
     config.indexes.primary.pk.field,
     config.indexes.primary.sk.field,
   ]
-  const entityRangeKeys = (): ReadonlyArray<string> => rangeKeysOf(config.indexes)
+  const entityKeys = () => keyAttributesOf(config.indexes)
 
   /**
    * Diagnose a rejected single-item write (`PutItem` / `UpdateItem` /
@@ -2532,7 +2548,7 @@ const makeImpl = <
           )[0]!,
         callerCondition,
       }),
-      rangeKeys: entityRangeKeys,
+      keys: entityKeys,
       rewrite: (diagnosis, original) =>
         diagnosedValidationError(diagnosis, original, { operation, entityType }),
     })
@@ -2557,7 +2573,7 @@ const makeImpl = <
           ),
         callerCondition: (index: number) => (index === 0 ? callerCondition?.() : undefined),
       }),
-      rangeKeys: entityRangeKeys,
+      keys: entityKeys,
       rewrite: (diagnosis, original): TransactionOverflow | ValidationError =>
         diagnosis._tag === "TooManyItems"
           ? new TransactionOverflow({
@@ -4839,7 +4855,10 @@ const makeImpl = <
                   )
                 }),
             }),
-            rangeKeys: () => [...new Set(allUpdateOps.map((op) => op.keyFields[1]))],
+            keys: () => ({
+              partition: [...new Set(allUpdateOps.map((op) => op.keyFields[0]))],
+              sort: [...new Set(allUpdateOps.map((op) => op.keyFields[1]))],
+            }),
             rewrite: (diagnosis, original) =>
               new CascadePartialFailure({
                 sourceEntity: sourceEntityType,
@@ -4883,7 +4902,7 @@ const makeImpl = <
                     `the cascade update of ${op.entityType}`,
                   ),
               }),
-              rangeKeys: () => [op.keyFields[1]],
+              keys: () => ({ partition: [op.keyFields[0]], sort: [op.keyFields[1]] }),
               rewrite: (diagnosis, original) =>
                 diagnosedValidationError(diagnosis, original, {
                   operation: "cascade",
@@ -8435,7 +8454,7 @@ const makeImpl = <
                 index === 0 ? "the current item" : "the event item",
               ),
           }),
-          rangeKeys: entityRangeKeys,
+          keys: entityKeys,
           rewrite: (diagnosis, original) =>
             diagnosedValidationError(diagnosis, original, { operation: "append", entityType }),
         }),
@@ -8618,6 +8637,8 @@ const makeImpl = <
           config.indexes.primary.pk.field,
           config.indexes.primary.sk.field,
         ],
+        // DynamoDB's rejection of the key condition (#144) names the accessor.
+        keyConditionDiagnosis: { operation: "query", label: `${entityType}.query.${indexName}` },
       })
       if (hasSkComposites) {
         // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
@@ -9333,10 +9354,17 @@ const makeImpl = <
             }
           }
 
-          // Batch delete in chunks of 25
+          // Batch delete in chunks of 25. `UnprocessedItems` are retried with
+          // `Batch.write`'s backoff; what the purge had deleted is always
+          // stated exactly, whether a request is rejected or retries run out.
+          let deleted = 0
+          const deletedSoFar = () =>
+            deleted === 0
+              ? "the purge had deleted none of the partition's items"
+              : `the purge had already deleted ${deleted} of the partition's ${allItems.length} items`
           for (let i = 0; i < allItems.length; i += 25) {
             const chunk = allItems.slice(i, i + 25)
-            const requestItems = {
+            let requestItems: globalThis.Record<string, Array<WriteRequest>> = {
               [tableName]: chunk.map((item) => ({
                 DeleteRequest: {
                   Key: {
@@ -9346,35 +9374,62 @@ const makeImpl = <
                 },
               })),
             }
-            yield* client.batchWriteItem({ RequestItems: requestItems }).pipe(
-              // Deletes of stored keys: wrapped for uniformity (#144).
-              diagnoseFailure({
-                sent: () => {
-                  const items = batchEntries(requestItems)
-                  return {
-                    _tag: "Batch",
-                    items,
-                    targets: () =>
-                      targetsFor(
-                        items,
-                        entityKeyFields(),
-                        entityType,
-                        (index) => `purged item ${i + index}`,
-                      ),
-                  }
-                },
-                rangeKeys: entityRangeKeys,
-                rewrite: (diagnosis, original) =>
-                  diagnosedValidationError(diagnosis, original, {
-                    operation: "purge",
-                    entityType,
-                    committed:
-                      i === 0
-                        ? "the purge had deleted none of the partition's items before it"
-                        : `the purge had already deleted ${i} of the partition's ${allItems.length} items`,
-                  }),
-              }),
-            )
+            let retries = 0
+            for (;;) {
+              const sentItems = requestItems
+              const sentCount = Object.values(sentItems).reduce(
+                (sum, requests) => sum + requests.length,
+                0,
+              )
+              const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
+                // Deletes of stored keys: wrapped for uniformity (#144).
+                diagnoseFailure({
+                  sent: () => {
+                    const items = batchEntries(sentItems)
+                    return {
+                      _tag: "Batch",
+                      items,
+                      targets: () =>
+                        targetsFor(
+                          items,
+                          entityKeyFields(),
+                          entityType,
+                          (index) => `purged item ${deleted + index}`,
+                        ),
+                    }
+                  },
+                  keys: entityKeys,
+                  rewrite: (diagnosis, original) =>
+                    diagnosedValidationError(diagnosis, original, {
+                      operation: "purge",
+                      entityType,
+                      committed: `${deletedSoFar()} before it`,
+                    }),
+                }),
+              )
+              const unprocessed: globalThis.Record<string, Array<WriteRequest>> = {}
+              let remaining = 0
+              for (const [table, requests] of Object.entries(response.UnprocessedItems ?? {})) {
+                if (requests.length === 0) continue
+                unprocessed[table] = requests
+                remaining += requests.length
+              }
+              deleted += sentCount - remaining
+              if (remaining === 0) break
+              retries++
+              if (retries > MAX_RETRIES) {
+                return yield* new DynamoError({
+                  operation: "BatchWriteItem",
+                  cause: new Error(
+                    `purge: ${remaining} of the partition's ${allItems.length} items were still ` +
+                      `unprocessed after ${MAX_RETRIES} retries; ${deletedSoFar()}. The rest ` +
+                      "were not deleted: purge again to finish.",
+                  ),
+                })
+              }
+              yield* Effect.sleep(`${BASE_DELAY_MS * 2 ** (retries - 1)} millis`)
+              requestItems = unprocessed
+            }
           }
         }),
       self,
@@ -9804,7 +9859,7 @@ export const bind = <
                         () => "the re-embedded item",
                       )[0]!,
                   }),
-                  rangeKeys: () => rangeKeysOf(entity.indexes as never),
+                  keys: () => keyAttributesOf(entity.indexes as never),
                   rewrite: (diagnosis, original) =>
                     diagnosedValidationError(diagnosis, original, {
                       operation: "reembed",
