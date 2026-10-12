@@ -1589,6 +1589,34 @@ describe("DynamoClient.make embedder validation", () => {
       ),
     )
   })
+
+  it.effect("an explicit embedder reaches bound CRUD with no ambient Embedder", () => {
+    const capture: Capture = {}
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+        embedder: { dimensions: DIMENSIONS, embed: () => Effect.succeed([0, 0, 0, 1]) },
+      })
+      yield* db.entities.Products.put({
+        productId: "p-1",
+        tenantId: "t-1",
+        name: "Trail Boot",
+        description: "Waterproof hiking boot",
+        category: "footwear",
+        price: 120,
+      })
+      const item = capture.putItem?.Item as Record<string, AttributeValue>
+      expect(item[VECTOR_ATTR]).toEqual({ L: [{ N: "0" }, { N: "0" }, { N: "0" }, { N: "1" }] })
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          MainTable.layer({ name: "test-table" }),
+        ),
+      ),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

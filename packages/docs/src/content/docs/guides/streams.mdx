@@ -93,7 +93,7 @@ const MainTable = Table.make({
 
 ## Decoding from AttributeValue Format
 
-For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes via the entity's item schema in a single step, returning an `Effect` that fails with `ValidationError` on schema mismatch:
+For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes it as a table read does, in a single step: `field:` renames are reversed, [sparse maps](/effect-dynamodb/guides/sparse-maps/) are rebuilt, and [packed fields](/effect-dynamodb/guides/packed-storage/) are decoded by their stored form. It returns an `Effect` that fails with `ValidationError` on schema mismatch, or when a compressed value's codec isn't registered (the error's `cause` is then a `CompressorNotRegistered`):
 
 ```typescript region="decode-marshalled" example="guide-streams.ts"
 const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
@@ -112,7 +112,7 @@ const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
 
 ## Decoding from Unmarshalled Format
 
-If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMap` or `@aws-sdk/util-dynamodb`), use `Entity.itemSchema` to get a Schema codec for direct decoding:
+If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMap` or `@aws-sdk/util-dynamodb`), use `Entity.itemSchema` to get a Schema codec for direct decoding. It's a pure schema: it doesn't map `field:` renamed attributes back to their domain names, rebuild sparse maps or decode packed fields. For an entity that uses any of those, pass the unmarshalled item to `Entity.decodeMarshalledItem` instead, which accepts both forms:
 
 ```typescript region="decode-unmarshalled" example="guide-streams.ts"
 const employeeFromItem = Entity.itemSchema(EmployeeEntity)
@@ -137,6 +137,7 @@ type EmployeeMarshalled = Entity.Marshalled<typeof EmployeeEntity>
 //     readonly NULL?: boolean
 //     readonly L?: ReadonlyArray<unknown>
 //     readonly M?: Record<string, unknown>
+//     readonly B?: Uint8Array
 //   }
 // }
 ```
@@ -175,7 +176,31 @@ const handleTaskChange = (task: Entity.Record<typeof TaskEntity>) =>
   Console.log(`Task changed: ${task.title} (${task.status})`)
 ```
 
+## Binary Values and Packed Storage
+
+Lambda triggers and EventBridge Pipes deliver stream records as DynamoDB JSON with `B` and `BS` values as **base64 text**, and `@aws-sdk/util-dynamodb`'s `unmarshall` leaves them as text. `Entity.decodeMarshalledItem` decodes them at any depth, so a [packed field](/effect-dynamodb/guides/packed-storage/) compressed to `B` decodes the same from a stream record as from a table read.
+
+For an EventStore stream, `stream.decodeStreamImage(image)` returns exactly the `StreamEvent` the read paths return, or `Option.none()` for an image that isn't one of the stream's events:
+
+```typescript region="stream-image" example="guide-packed-storage.ts"
+// One handler for a table's NewImage records. decodeStreamImage returns
+// Option.none() for anything that is not one of the stream's events.
+const decodeImage = (image: EventStore.StreamImage) =>
+  Effect.gen(function* () {
+    const event = yield* Ledger.decodeStreamImage(image)
+    if (Option.isSome(event)) {
+      // Exactly the StreamEvent Ledger.read returns
+      return `ledger ${event.value.version}: ${event.value.data._tag}`
+    }
+    const order = (yield* Entity.decodeMarshalledItem(Orders, image)) as Order
+    return `order ${order.orderId}: ${order.lines.length} line(s)`
+  })
+```
+
+Compressors come from a `Compression` service in context (for example `Compression.layer([...])` merged into the application layer), as for table reads. See [DynamoDB Streams images](/effect-dynamodb/guides/packed-storage/#dynamodb-streams-images) in the Packed Storage guide.
+
 ## What's Next?
 
 - [Testing](/effect-dynamodb/guides/testing/) — Testing patterns with mocked DynamoClient
 - [Modeling](/effect-dynamodb/guides/modeling/) — Model, schema, table, entity definitions
+- [Packed Storage](/effect-dynamodb/guides/packed-storage/) — JSON and compressed storage, and decoding it from stream records

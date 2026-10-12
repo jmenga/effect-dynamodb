@@ -18,6 +18,11 @@ import {
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
+import {
+  collectionPackedQueryOptions,
+  entityPackedQueryOptions,
+  type PackedAttributeGuard,
+} from "./internal/Packed.js"
 import * as Query from "./Query.js"
 import type { TableConfig } from "./Table.js"
 
@@ -43,6 +48,14 @@ interface CollectionEntity {
     any,
     import("@effect-dynamodb/schema/Errors.js").ValidationError
   >
+  /** Packed attributes an expression may not look inside (EDD-9076, #147). */
+  readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** Read packed attributes of a raw row by their stored form (#147). */
+  readonly _unpackFields?:
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
+    | undefined
+  /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
+  readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +335,7 @@ export const make = <
         // We need to tag each item with its entity key so the caller can group
         return collectionDecoder(raw) as Effect.Effect<any, ValidationError>
       },
+      ...collectionPackedQueryOptions(entityEntries.map(([, entity]) => entity)),
       keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
@@ -355,6 +369,7 @@ export const make = <
         skField: sharedSkField,
         entityTypes: [entity.entityType],
         decoder: (raw) => entity._decodeRecord(raw),
+        ...entityPackedQueryOptions(entity),
         resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
         keyFields: [
           sharedPkField,

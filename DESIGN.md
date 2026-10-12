@@ -1313,6 +1313,42 @@ yield* db.entities.Pages.update({ pageId: 'p1' })
 // → 1 GetItem + 1 UpdateItem (REMOVE metrics#2026-04 + SET status with version CAS)
 ```
 
+### Packed Storage (`storedAs: DynamoModel.Packed()`, #147)
+
+> Full design: [`docs/designs/storage-encoding.md`](docs/designs/storage-encoding.md).
+
+**Problem.** A native map is the most expensive shape DynamoDB returns: the SDK parses a type-wrapped node per value and `unmarshall` rebuilds the graph again. For bulk reads of structured values (event `data`, documents, folded state) a single JSON string reads ~2× faster through the library (downstream Lambda benchmark: 5,990 small events, 121 vs 261 ms select + fold, JIT off), at ~19% more stored bytes; a ~47 KB state compresses ~11× (zstd: 5 WCU vs 47 as JSON, 38 as a map), which also matters for the 400 KB item limit. Compressing small values is a net read loss (threshold 0: −24% RCU, ~4× slower reads), hence the 1 KB default threshold.
+
+**Config.** One declarative config, defined in `@effect-dynamodb/schema` and shared by Entity and EventStore:
+
+```ts
+DynamoModel.Packed({ format: "json" })                                       // S
+DynamoModel.Packed({ format: "json", compression: { codec: "zstd", threshold: 1024 } })
+
+DynamoModel.configure(Order, { lines: { storedAs: DynamoModel.Packed({ format: "json" }) } })
+EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema, storedAs: Packed(…) } })
+```
+
+`format: "binary"` (SchemaBinary) is reserved, not accepted. Metadata stays a map; the default for every attribute stays native.
+
+**Stored form — self-describing, no marker attribute.** Readers dispatch on the stored value, never on the current config, so switching encodings needs no rewrite:
+
+| Stored | Read as |
+|---|---|
+| `M` / `L` / other native | legacy native value |
+| `S` | `JSON.parse` |
+| `B` | byte 0 header `vvv ff ccc` (layout version `001`; format `00` json, `01` binary reserved; codec `000` none, `001` gzip, `010` brotli, `011` zstd) → decompress → `JSON.parse` |
+
+A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
+
+**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge) and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
+
+**Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
+
+**EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` (or its synchronous twin `valueBytesSync`, with explicit compressors) give callers the exact stored sizes for chunk planning. Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
+
+**Entity.** Packing runs after renames and sparse flattening, before marshalling (put / create / upsert / update `.set()` / `Batch.write` / `Transaction.transactWrite` / time-series `append`, which packs once and writes the same value on the current and event item); unpacking runs after unmarshalling, before sparse rebuild and renames, in every decoder (get, queries, scans, collections, batch and transactional reads, versions, history, soft-deleted reads, `ReturnValues`). Reads also dispatch on every object/array-shaped field that is not configured packed, so turning packing off needs no rewrite. `asNative` returns the stored `S` / `B`; raw projections (`select`, `Entity.project`) return a packed field whole as its parsed JSON. The read-merge update path (retain, unique, computed composites) carries packed values the update does not name byte-identical, and a restated immutable packed field is compared by its unpacked JSON. At the type level an entity carries its packed field names (`TPackedFields`): their `PathBuilder` paths are `PackedPath`s, accepted only by `exists` / `notExists` and projections. `Entity.decodeMarshalledItem` decodes DynamoDB Streams images by stored form (`B` as bytes or base64, DynamoDB JSON or unmarshalled) and now also applies renames and sparse maps. Aggregate edges store their edge entity's packed fields packed (a `one` edge's flattened entity, a `many` element that is the entity) and, like entities, read every object/array-shaped edge attribute by its stored form, so an edge written packed still reads after the edge entity's packing is turned off; a packed field cannot be an edge discriminator or `many` sort-key composite (EDD-9072).
+
 ### Hierarchical Key Truncation
 
 Hierarchical truncation — leaf composites being *refinements* that should *demote* the item, not *evict* it — is the unifying property across many real-world domains:
@@ -3398,6 +3434,59 @@ by the stream, `[EDD-9065]` indexes sharing a physical index or attribute.
   a changed `key`, covers only events appended from then on. The library does not
   backfill.
 
+### Packed Storage (#147)
+
+```typescript
+const Ledger = EventStore.makeStream({
+  table, streamName: "Ledger", events: [Recorded, Voided], streamId: { composite: ["ledgerId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+  snapshot: {
+    schema: LedgerState, mode: "inline",
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+  },
+})
+```
+
+Event `data` and snapshot `state` may be stored packed (§7 "Packed Storage"); metadata
+always stays a map (`storedAs` admits only `data`, `[EDD-9079]`; a packed state schema
+must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, state }`.
+
+- **Write.** `append` (and so `commandHandler`) packs each event's `data` after the
+  schema encode and before marshalling, and the inline snapshot's `state` the same way
+  (as does `writeSnapshot`). The `TransactWriteItems` request carries the stored bytes,
+  so the 400 KB / 4 MB failure diagnosis attributes stored sizes — nothing is
+  pre-checked.
+- **Read.** Every event decode reads `data` by its stored form (always: an event's native
+  `data` is a map), and a snapshot's `state` when it is configured packed or its schema
+  is object/array-shaped — so a stream holding native, JSON and compressed items reads
+  through any of its definitions: `read`, `readFrom`, `currentVersion`, `readLatest`,
+  `readSnapshot`, `readIndex`, `query.events`, `query.index` (all projections, including
+  the `"keys"` GSI `BatchGetItem` hydration) and `decodeStreamImage`.
+- **Raw rows.** `Query.make({ rawRow })` gives `select` / `selectPaths` a row hook; a
+  stream's queries set it to "read `data` by its stored form", so a raw row's `data` is
+  plain parsed JSON (not schema-decoded) whether the item stored `M`, `S` or `B`.
+- **Filters.** `Query.make({ packed })` lists the packed attributes; with
+  `storedAs.data`, `Query.filterExpr` on `data.*` (or any operator but
+  `attribute_exists` / `attribute_not_exists` on `data`) and a projection inside `data`
+  throw `[EDD-9076]`, pointing to `Query.filterBy`.
+- **Planning (caller-side).** `measureAppend(streamId, events, expectedVersion, options)`
+  builds the stream's own items with the same builder `append` uses and returns each
+  event item's size, the sentinel's, the inline snapshot's and the stream-owned
+  transaction bytes (`additionalItems` excluded); `measureSnapshot` sizes a snapshot
+  item. `R = TableConfig`; nothing is read or written.
+- **Streams.** `decodeStreamImage(image)` returns the read paths' `StreamEvent` for one of
+  the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and
+  EventBridge Pipes deliver them) or unmarshalled — and `Option.none()` for any other
+  item (snapshot, sentinel, foreign). `decodeStreamImage(image, { raw: true })` returns
+  a `RawStreamEvent`: the same event plus `rawData`, the `data` wire form the decode read
+  (unmodelled fields included), so a consumer never parses an image twice.
+- **Codecs.** Read from the `Compression` service in context (no new `R`); `bind`
+  captures it with the rest of the context and refuses a registry without the codecs
+  `storedAs` names (`[EDD-9078]`, a defect); an unbound stream checks the registry its
+  first operation runs with the same way. A stored value whose codec is missing anyway
+  fails with the operation's existing `ValidationError`, whose `cause` is a
+  `CompressorNotRegistered` — no error channel changes.
+
 ### Command Handler Retry
 
 ```typescript
@@ -3799,6 +3888,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and by an unverified-snapshot If-Match whose decision is confirmed against the head (the head read), and unset on any other append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
+| `CompressorNotRegistered` | Never in an error channel: the `cause` of the `ValidationError` a packed value fails with when it needs a compression codec with no registered `Compressor` — a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
 | `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
 
 ### Declared Errors per Operation
@@ -3807,6 +3897,14 @@ Each operation declares a fixed error union, whatever the entity's
 configuration: a `put` declares `UniqueConstraintViolation` even on an entity
 without unique constraints. Every union also includes `DynamoClientError`,
 plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
+
+Packed storage (#147) adds no member to any union: a packed value that needs a
+compression codec the process has not registered — on write over the
+threshold, or on read of a value an earlier writer compressed — fails with the
+operation's existing `ValidationError`, whose `cause` is a
+`CompressorNotRegistered` (`codec`, `direction`, `entityType`, `attribute`,
+`operation`). Packing is opt-in, so a caller that never packs sees exactly the
+pre-#147 unions.
 
 | Operation | Declared errors (besides `DynamoClientError`) |
 |-----------|-----------------------------------------------|
@@ -3823,6 +3921,7 @@ plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
+| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 
@@ -3885,6 +3984,7 @@ for unrelated errors and the collision was caught only at review.
 | 9051–9058 | Aggregate cursors, read-path descriptors, sort-key pins, client predicates, collection casing, nested aggregates, self dates |
 | 9059–9061 | Reserved — PR #129 (`transactWrite` updates) |
 | 9062–9067 | EventStore command path: snapshot mode, stream indexes |
+| 9071–9079 | Packed storage encoding (`DynamoModel.Packed`, compressors) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -3950,8 +4050,17 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9068` | `EventStore.ts` | `verifySnapshot: false` on a stream whose snapshot config is not `mode: "inline"` without `every` — thrown by `commandHandler` at handler construction, a defect from `readLatest` |
 | `EDD-9069` | `Table.ts` | Table members disagree on one physical secondary index's key attributes or GSI/LSI classification (entity indexes, `_cascade_<field>` indexes, aggregate collection and list indexes), or entities declare different primary-key fields — thrown by `Table.make` and `Table.definition` |
 | `EDD-9070` | `VectorIndex.ts` | Vector index `dimensions` is not an integer — DynamoDB reads an integer member leniently, so it could create the index with another, immutable dimensionality |
+| `EDD-9071` | `DynamoModel.ts` | `DynamoModel.Packed(...)` options invalid: `format` other than `"json"` (`"binary"` is reserved, not yet supported), unknown `compression.codec`, `threshold` not a non-negative safe integer, or an unknown option key |
+| `EDD-9072` | `Entity.ts` (schema), `Aggregate.ts`, `DynamoClient.ts` | A packed field is a key or index attribute source: a primary-key or secondary-index composite (incl. collection-injected indexes), `timeSeries.orderBy`, a vector index filter field, or an aggregate discriminator / list / collection composite |
+| `EDD-9073` | `Entity.ts` (schema), `EventStore.ts` | A packed field's (or packed snapshot state's) encoded side is not object/array-shaped — a scalar, a date (so never a TTL attribute), binary, a set, or a union with such a member — or the packed field does not exist on the model |
+| `EDD-9074` | `Entity.ts` (schema) | A unique constraint names a packed field |
+| `EDD-9075` | `Entity.ts` (schema) | A packed field is a `DynamoModel.ref` field |
+| `EDD-9076` | `Query.ts`, `Entity.ts`, `internal/BoundCrud.ts`, `Transaction.ts` | A condition, filter or projection addresses a path inside a packed attribute, or applies anything but `attribute_exists` / `attribute_not_exists` to it (thrown when the expression is built; EventStore messages point to `Query.filterBy`) |
+| `EDD-9077` | `Entity.ts` | An update applies anything but a whole-value `.set()` / `.remove()` to a packed field (`add`, `subtract`, `append`, `deleteFromSet`, any `path*` op) — a `ValidationError` at execution |
+| `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
+| `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 
-Next free code: **`EDD-9071`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9080`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

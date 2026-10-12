@@ -1,10 +1,4 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Config, ConfigProvider, DateTime, Effect, Layer, Schema } from "effect"
-import { beforeEach, vi } from "vitest"
-
-const configFromMap = (entries: Record<string, string>) =>
-  ConfigProvider.layer(ConfigProvider.fromUnknown(entries))
-
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
@@ -18,12 +12,17 @@ import {
   ThrottlingError,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Config, ConfigProvider, DateTime, Effect, Layer, Schema } from "effect"
+import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+
+const configFromMap = (entries: Record<string, string>) =>
+  ConfigProvider.layer(ConfigProvider.fromUnknown(entries))
 
 // Create a mock DynamoClient layer for testing
 const mockPutItem = vi.fn()

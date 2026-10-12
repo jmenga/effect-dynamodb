@@ -1,4 +1,5 @@
 import { Data, type Option } from "effect"
+import type { CompressionCodec } from "./DynamoModel.js"
 
 /** Wraps AWS SDK errors from DynamoDB operations */
 export class DynamoError extends Data.TaggedError("DynamoError")<{
@@ -355,6 +356,55 @@ export class EmbeddingError extends Data.TaggedError("EmbeddingError")<{
   readonly reason: string
   readonly cause?: unknown
 }> {}
+
+/** The fields of a {@link CompressorNotRegistered}. */
+export type CompressorNotRegisteredFields = {
+  /** The codec no compressor is registered for. */
+  readonly codec: CompressionCodec
+  /** `"compress"` on a write over the threshold; `"decompress"` on a read of a `B` value. */
+  readonly direction: "compress" | "decompress"
+  /** The entity type, or `"<stream>.event"` / `"<stream>.snapshot"` for an EventStore stream. */
+  readonly entityType: string
+  /** The stored attribute name. */
+  readonly attribute: string
+  /** The operation that packed or unpacked the value. */
+  readonly operation: string
+}
+
+/**
+ * A packed value needs a compression codec that has no registered
+ * `Compressor`: a write whose JSON crossed its `compression.threshold`, or a
+ * read of a `B` value whose header names the codec.
+ *
+ * Never a member of an operation's error channel: packed storage is opt-in, so
+ * it surfaces as the `cause` of the operation's existing `ValidationError`
+ * (whose `entityType` and `operation` match). Inspect it to tell a deployment
+ * misconfiguration from an undecodable value:
+ *
+ * ```ts
+ * Effect.catchTag("ValidationError", (e) =>
+ *   e.cause instanceof CompressorNotRegistered ? alertOps(e.cause) : Effect.fail(e))
+ * ```
+ *
+ * Register the codec through the `Compression`
+ * service — `Compression.layer([...])` merged into the application layer,
+ * or `DynamoClient.make({ compressors })` — for Node with
+ * `effect-dynamodb/compression/zlib`. Keep registering a codec for as
+ * long as values written with it exist.
+ */
+export class CompressorNotRegistered extends Data.TaggedError(
+  "CompressorNotRegistered",
+)<CompressorNotRegisteredFields> {
+  constructor(fields: CompressorNotRegisteredFields) {
+    super(fields)
+    this.message =
+      `${fields.entityType}: attribute "${fields.attribute}" needs the "${fields.codec}" ` +
+      `compressor to ${fields.direction} its packed value (${fields.operation}), but none is ` +
+      `registered. Register one through the Compression service — e.g. ` +
+      `Compression.layer([...]) merged into the application layer, with ` +
+      `effect-dynamodb/compression/zlib.`
+  }
+}
 
 /**
  * `SearchVectors` was called against a vector index that is still backfilling.

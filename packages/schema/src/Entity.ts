@@ -21,7 +21,9 @@ import {
   type ConfiguredModel,
   type DynamoEncoding,
   type ExtractIdentifier,
+  type ExtractPackedFields,
   getIdentifierField,
+  getPackedFields,
   getSparseFields,
   isConfiguredModel,
   isHidden,
@@ -29,6 +31,7 @@ import {
   isRecordSchema,
   isRef,
   isRefField,
+  type PackedConfig,
   type SparseConfig,
 } from "./DynamoModel.js"
 import type * as DynamoSchema from "./DynamoSchema.js"
@@ -44,6 +47,7 @@ import type {
   UniqueConstraintDef,
   VersionedConfig,
 } from "./internal/EntityConfig.js"
+import { packedIndexRefusal, resolvePackedPlan } from "./internal/EntityPacked.js"
 import {
   allCompositeAttributes,
   buildDerivedSchemas,
@@ -208,6 +212,16 @@ export interface EntityDefinitionData {
   readonly entityVersion: number
   readonly sparseFields: globalThis.Record<string, SparseConfig>
   readonly hasSparseFields: boolean
+  /** Domain field name → packed storage config (`storedAs: DynamoModel.Packed`). */
+  readonly packedFields: Readonly<globalThis.Record<string, PackedConfig>>
+  /** Stored attribute name (after `field` renames) → packed storage config. */
+  readonly packedAttributes: Readonly<globalThis.Record<string, PackedConfig>>
+  /**
+   * Stored attribute names read by their stored form (packed ones plus every
+   * object/array-shaped field — see `internal/EntityPacked.ts`).
+   */
+  readonly dispatchAttributes: ReadonlyArray<string>
+  readonly hasPackedFields: boolean
   readonly fieldRenames: globalThis.Record<string, string>
   readonly hasRenames: boolean
   readonly renameToDynamo: (item: globalThis.Record<string, unknown>) => void
@@ -266,6 +280,7 @@ export interface EntityDefinition<
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
+  TPackedFields extends string = never,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -287,6 +302,13 @@ export interface EntityDefinition<
    * partition attributes on writes, and build search accessors.
    */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+
+  /**
+   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
+   * Carries the `TPackedFields` type, which narrows expression path builders:
+   * a packed field can be tested only with `exists` / `notExists` as a whole.
+   */
+  readonly _packedFields: ReadonlyArray<TPackedFields>
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -438,6 +460,27 @@ export const buildEntityDefinition = (config: {
       }
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Packed fields (storedAs: DynamoModel.Packed) — EDD-9072..9075, EDD-9073.
+  // Checked before the other derivations so a packed composite / filter field
+  // reports its own code rather than a downstream derivation failure.
+  // ---------------------------------------------------------------------------
+
+  const packedPlan = resolvePackedPlan({
+    entityType: config.entityType,
+    model: config.model as Schema.Top,
+    packedFields: getPackedFields(config.model as Schema.Top),
+    sparseFields: getSparseFields(config.model as Schema.Top),
+    modelFields,
+    indexes: config.indexes,
+    unique: config.unique,
+    timeSeries: config.timeSeries,
+    vectorIndexes: config.vectorIndexes,
+    resolveDbName: (name) =>
+      (configuredAttributes as globalThis.Record<string, { readonly field?: string }>)[name]
+        ?.field ?? name,
+  })
 
   // ---------------------------------------------------------------------------
   // EDD-9025: composite attribute schemas must not include `null`.
@@ -931,6 +974,10 @@ export const buildEntityDefinition = (config: {
     entityVersion,
     sparseFields,
     hasSparseFields,
+    packedFields: packedPlan.packedFields,
+    packedAttributes: packedPlan.packedAttributes,
+    dispatchAttributes: packedPlan.dispatchAttributes,
+    hasPackedFields: packedPlan.hasPackedFields,
     fieldRenames,
     hasRenames,
     renameToDynamo,
@@ -1024,7 +1071,8 @@ export const make = <
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,
-  TVectorIndexes
+  TVectorIndexes,
+  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
@@ -1078,6 +1126,7 @@ const makeDefinitionImpl = (config: {
     generatedId: config.generatedId,
     vectorIndexes: config.vectorIndexes,
     _vectorIndexes: data.vectorIndexes,
+    _packedFields: Object.keys(data.packedFields),
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
@@ -1090,6 +1139,8 @@ const makeDefinitionImpl = (config: {
       tableTag = injectedTableTag
     },
     _injectIndex: (name: string, def: IndexDefinition) => {
+      const refused = packedIndexRefusal(data.entityType, data.packedFields, name, def)
+      if (refused !== undefined) throw new Error(refused)
       allIndexes = { ...allIndexes, [name]: def }
     },
     get _schema() {

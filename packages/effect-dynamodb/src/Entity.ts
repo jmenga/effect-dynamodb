@@ -18,6 +18,7 @@ import {
   type ConfiguredModel,
   type DynamoEncoding,
   type ExtractIdentifier,
+  type ExtractPackedFields,
   getIdentifierField,
   getSparseFields,
   isConfiguredModel,
@@ -50,6 +51,7 @@ import {
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -100,7 +102,20 @@ import {
 } from "./internal/Expr.js"
 import { countOperators, expressionFits } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
-import { compilePath, createPathBuilder } from "./internal/PathBuilder.js"
+import {
+  decodeImage,
+  imageEntityType,
+  ownRowsRawRow,
+  type PackedAttributeGuard,
+  packAttributeValueSync,
+  packedExprRefusal,
+  packedProjectionRefusal,
+  packItemSync,
+  type StreamImage,
+  unpackRow,
+  withRegistry,
+} from "./internal/Packed.js"
+import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
   freshIncarnationToken,
   generateTimestampPrimitive,
@@ -550,6 +565,7 @@ export interface Entity<
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
+  TPackedFields extends string = never,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -568,6 +584,54 @@ export interface Entity<
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
 
+  /**
+   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
+   * Carries the `TPackedFields` type, which narrows expression path builders:
+   * a packed field can be tested only with `exists` / `notExists` as a whole.
+   */
+  readonly _packedFields: ReadonlyArray<TPackedFields>
+
+  /**
+   * @internal Pack, in place, the packed attributes of an item keyed by stored
+   * names (after renames and sparse flattening), before `toAttributeMap`.
+   * `only` restricts packing to those stored attribute names.
+   */
+  readonly _packFields: (
+    item: globalThis.Record<string, unknown>,
+    operation: string,
+    only?: ReadonlySet<string>,
+  ) => Effect.Effect<void, ValidationError>
+
+  /**
+   * @internal Read, in place, every dispatch-eligible attribute of an
+   * unmarshalled item (stored names) by its stored form — native unchanged,
+   * `S` JSON, `B` header + payload — before sparse rebuild and renames.
+   */
+  readonly _unpackFields: (
+    raw: globalThis.Record<string, unknown>,
+    operation?: string,
+  ) => Effect.Effect<void, ValidationError>
+
+  /**
+   * @internal The stored attributes {@link _unpackFields} reads by stored form
+   * (packed ∪ dispatch-eligible): a projection naming none of them runs no
+   * raw-row hook.
+   */
+  readonly _dispatchAttributes: ReadonlyArray<string>
+
+  /**
+   * @internal The packed attributes an expression or projection may not look
+   * inside (`[EDD-9076]`), by domain AND stored name.
+   */
+  readonly _packedGuards: ReadonlyArray<PackedAttributeGuard>
+
+  /**
+   * @internal Decode a DynamoDB Streams image (DynamoDB JSON with `B` as bytes
+   * or base64, or an unmarshalled item) into an item record — the
+   * implementation of {@link decodeMarshalledItem}.
+   */
+  readonly _decodeImage: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
+
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
@@ -576,7 +640,7 @@ export interface Entity<
     readonly refEntityType: string
   }>
 
-  /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
+  /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
   ) => Effect.Effect<any, ValidationError>
@@ -1131,8 +1195,11 @@ export interface Entity<
   readonly condition: {
     (
       cb: (
-        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
-        ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
+        t: import("./internal/PathBuilder.js").PathBuilder<
+          PathModel<ModelType<TModel>, TPackedFields>,
+          PathModel<ModelType<TModel>, TPackedFields>
+        >,
+        ops: import("./internal/Expr.js").ConditionOps<PathModel<ModelType<TModel>, TPackedFields>>,
       ) => import("./internal/Expr.js").Expr,
     ): ConditionPipeable
     (shorthand: globalThis.Record<string, unknown>): ConditionPipeable
@@ -1150,8 +1217,11 @@ export interface Entity<
   readonly filter: {
     (
       cb: (
-        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
-        ops: import("./internal/Expr.js").ConditionOps<ModelType<TModel>>,
+        t: import("./internal/PathBuilder.js").PathBuilder<
+          PathModel<ModelType<TModel>, TPackedFields>,
+          PathModel<ModelType<TModel>, TPackedFields>
+        >,
+        ops: import("./internal/Expr.js").ConditionOps<PathModel<ModelType<TModel>, TPackedFields>>,
       ) => import("./internal/Expr.js").Expr,
     ): <A>(self: Query.Query<A>) => Query.Query<A>
     (shorthand: globalThis.Record<string, unknown>): <A>(self: Query.Query<A>) => Query.Query<A>
@@ -1171,8 +1241,17 @@ export interface Entity<
   readonly select: {
     (
       cb: (
-        t: import("./internal/PathBuilder.js").PathBuilder<ModelType<TModel>, ModelType<TModel>>,
-      ) => ReadonlyArray<import("./internal/PathBuilder.js").Path<ModelType<TModel>, any>>,
+        t: import("./internal/PathBuilder.js").PathBuilder<
+          PathModel<ModelType<TModel>, TPackedFields>,
+          PathModel<ModelType<TModel>, TPackedFields>
+        >,
+      ) => ReadonlyArray<
+        | import("./internal/PathBuilder.js").Path<PathModel<ModelType<TModel>, TPackedFields>, any>
+        | import("./internal/PathBuilder.js").PackedPath<
+            PathModel<ModelType<TModel>, TPackedFields>,
+            any
+          >
+      >,
     ): (self: Query.Query<any>) => Query.Query<any>
     (attributes: ReadonlyArray<string>): (self: Query.Query<any>) => Query.Query<any>
   }
@@ -1226,6 +1305,7 @@ export interface BoundEntity<
   TVersioned extends VersionedConfig | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
+  TPackedFields extends string = never,
 > {
   // --- CRUD Operations ---
 
@@ -1278,7 +1358,8 @@ export interface BoundEntity<
     | ConcurrentModification
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    TPackedFields
   >
 
   /**
@@ -1302,7 +1383,8 @@ export interface BoundEntity<
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    TPackedFields
   >
 
   /**
@@ -1330,7 +1412,8 @@ export interface BoundEntity<
     | ValidationError
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    TPackedFields
   >
 
   /**
@@ -1352,7 +1435,9 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | DeleteAppliedButUnreadable
+    | DeleteAppliedButUnreadable,
+    void,
+    TPackedFields
   >
 
   /**
@@ -1380,7 +1465,8 @@ export interface BoundEntity<
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    TPackedFields
   >
 
   /**
@@ -1408,7 +1494,8 @@ export interface BoundEntity<
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    TPackedFields
   >
 
   /** Delete an existing item, fails if not found. Returns a fluent {@link BoundDelete}. */
@@ -1423,7 +1510,9 @@ export interface BoundEntity<
     | ConcurrentModification
     | ValidationError
     | DeleteAppliedButUnreadable
-    | ConditionalCheckFailed
+    | ConditionalCheckFailed,
+    void,
+    TPackedFields
   >
 
   // --- Lifecycle Operations ---
@@ -1449,7 +1538,11 @@ export interface BoundEntity<
    */
   readonly versions: (
     key: TKey,
-  ) => import("./internal/BoundQuery.js").BoundQuery<ModelType<TModel>, never, ModelType<TModel>>
+  ) => import("./internal/BoundQuery.js").BoundQuery<
+    PathModel<ModelType<TModel>, TPackedFields>,
+    never,
+    ModelType<TModel>
+  >
 
   /** Restore a soft-deleted item. */
   readonly restore: (
@@ -1491,7 +1584,11 @@ export interface BoundEntity<
      */
     readonly list: (
       key: TKey,
-    ) => import("./internal/BoundQuery.js").BoundQuery<ModelType<TModel>, never, ModelType<TModel>>
+    ) => import("./internal/BoundQuery.js").BoundQuery<
+      PathModel<ModelType<TModel>, TPackedFields>,
+      never,
+      ModelType<TModel>
+    >
   }
 
   // --- Time-series Operations (only when `timeSeries` is configured) ---
@@ -1525,7 +1622,8 @@ export interface BoundEntity<
         ModelType<TModel>,
         { readonly current: ModelType<TModel> },
         DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
-        DynamoClientError | ValidationError | StaleAppend
+        DynamoClientError | ValidationError | StaleAppend,
+        TPackedFields
       >
     : never
 
@@ -1542,7 +1640,7 @@ export interface BoundEntity<
     ? (
         key: TKey,
       ) => import("./internal/BoundQuery.js").BoundQuery<
-        ModelType<TModel>,
+        PathModel<ModelType<TModel>, TPackedFields>,
         { readonly [K in NonNullable<TTimeSeries>["orderBy"] & string]: string },
         ModelType<TModel>
       >
@@ -1819,7 +1917,8 @@ export const make = <
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,
-  TVectorIndexes
+  TVectorIndexes,
+  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -1972,7 +2071,8 @@ const makeImpl = <
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,
-  TVectorIndexes
+  TVectorIndexes,
+  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   // Derivation (validation + schema/ref/sparse/rename resolution) is shared with
   // the pure `@effect-dynamodb/schema` Entity.make via `buildEntityDefinition`,
@@ -2296,6 +2396,14 @@ const makeImpl = <
     readonly field: string
     readonly attr: string
     readonly value: AttributeValue
+    /** The encoded (wire) value — what a packed field's stored JSON is compared with. */
+    readonly wire: unknown
+    /**
+     * A packed field (#147): its stored bytes depend on the codec and threshold
+     * in force when written, so it is compared by its unpacked JSON, after a
+     * read — never by a condition on the stored value.
+     */
+    readonly packed: boolean
   }
 
   /**
@@ -2314,22 +2422,55 @@ const makeImpl = <
       if (encoded.issue !== undefined) {
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }
-      out.push({ field, attr: resolveDbName(field), value: toAttributeValue(encoded.encoded) })
+      out.push({
+        field,
+        attr: resolveDbName(field),
+        value: toAttributeValue(encoded.encoded),
+        wire: encoded.encoded,
+        packed: field in packedFields,
+      })
     }
     return out
   }
+  const immutableChangedMessage = (field: string) =>
+    `.set() of "${field}": "${field}" is immutable and the update's value ` +
+    "differs from the stored one."
+  /** A restated immutable value that differs from the stored item's (packed fields excepted). */
   const immutableMismatch = (
     asserted: ReadonlyArray<AssertedImmutable>,
     stored: Readonly<globalThis.Record<string, unknown>>,
   ): string | undefined => {
     const changed = asserted.find(
-      ({ attr, value }) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, value),
+      ({ attr, value, packed }) =>
+        !packed && !attributeValueEquals(stored[attr] as AttributeValue | undefined, value),
     )
-    return changed === undefined
-      ? undefined
-      : `.set() of "${changed.field}": "${changed.field}" is immutable and the update's value ` +
-          "differs from the stored one."
+    return changed === undefined ? undefined : immutableChangedMessage(changed.field)
   }
+  /**
+   * A restated immutable PACKED value that differs from the stored item's,
+   * compared by the stored value's unpacked JSON (#147) — whatever codec or
+   * threshold it was written under.
+   */
+  const packedImmutableMismatch = (
+    asserted: ReadonlyArray<AssertedImmutable>,
+    stored: Readonly<globalThis.Record<string, AttributeValue>>,
+  ): Effect.Effect<string | undefined, ValidationError> =>
+    Effect.gen(function* () {
+      for (const { field, attr, wire, packed } of asserted) {
+        if (!packed) continue
+        const storedValue = stored[attr]
+        if (storedValue === undefined) {
+          if (wire === undefined || wire === null) continue
+          return immutableChangedMessage(field)
+        }
+        const raw = fromAttributeMap({ [attr]: storedValue }) as globalThis.Record<string, unknown>
+        yield* unpackFields(raw, "update.decode")
+        if (!attributeValueEquals(toAttributeValue(raw[attr]), toAttributeValue(wire))) {
+          return immutableChangedMessage(field)
+        }
+      }
+      return undefined
+    })
 
   /**
    * Whether an update can safely create the item it names (#133): its payload
@@ -2388,6 +2529,173 @@ const makeImpl = <
   const deserializeSparseFields = (raw: globalThis.Record<string, unknown>): void => {
     if (!hasSparseFields) return
     decodeSparseFields(raw, sparseFields)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Packed fields (`storedAs: DynamoModel.Packed`) — see
+  // `docs/designs/storage-encoding.md` §6. Packing runs after renames and
+  // sparse flattening, before `toAttributeMap`; unpacking after
+  // `fromAttributeMap`, before sparse rebuild and renames — the same points as
+  // the sparse layout, keyed by stored attribute names.
+  // ---------------------------------------------------------------------------
+
+  const { packedFields, packedAttributes, dispatchAttributes, hasPackedFields } = data
+
+  /**
+   * Pack, in place, the packed attributes of a stored-name item. `only`
+   * restricts it to those stored attributes (the read-merge update path packs
+   * only the fields it names: the others still hold their stored value).
+   */
+  const packFields = (
+    item: globalThis.Record<string, unknown>,
+    operation: string,
+    only?: ReadonlySet<string>,
+  ): Effect.Effect<void, ValidationError> => {
+    if (!hasPackedFields) return Effect.void
+    const targets =
+      only === undefined
+        ? packedAttributes
+        : Object.fromEntries(Object.entries(packedAttributes).filter(([attr]) => only.has(attr)))
+    if (Object.keys(targets).length === 0) return Effect.void
+    return withRegistry((registry) =>
+      packItemSync(item, targets, registry, { entityType, operation: `${operation}.packed` }),
+    )
+  }
+
+  /** Pack one attribute's wire value straight to its `AttributeValue` (an `UpdateItem` SET). */
+  const packAttribute = (
+    attribute: string,
+    wire: unknown,
+    operation: string,
+  ): Effect.Effect<AttributeValue | undefined, ValidationError> =>
+    withRegistry((registry) =>
+      packAttributeValueSync(
+        packedAttributes[attribute]!,
+        wire,
+        registry,
+        { entityType, operation: `${operation}.packed` },
+        attribute,
+      ),
+    )
+
+  /**
+   * Read, in place, the dispatch-eligible attributes of a stored-name row by
+   * their stored form. A row with no string or binary value on any of them
+   * (every native row) costs one `typeof` per attribute.
+   */
+  const unpackFields = (
+    raw: globalThis.Record<string, unknown>,
+    operation = "decode",
+  ): Effect.Effect<void, ValidationError> =>
+    dispatchAttributes.length === 0
+      ? Effect.void
+      : unpackRow(raw, dispatchAttributes, { entityType, operation })
+
+  /**
+   * A domain-named copy of `record` with its packed (or once-packed) attributes
+   * read by their stored form. The update paths derive vector source text from
+   * it: an untouched packed field still holds its stored value there (a JSON
+   * string or compressed bytes), not the value the source `compose` expects.
+   * `record` itself is left as is, so the write still carries the stored bytes.
+   */
+  const unpackedDomainCopy = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError> => {
+    if (dispatchAttributes.length === 0) return Effect.succeed(record)
+    const stored = { ...record }
+    renameToDynamo(stored)
+    return Effect.map(unpackFields(stored, operation), () => {
+      renameFromDynamo(stored)
+      return stored
+    })
+  }
+
+  /** The packed attributes an expression or projection may not look inside (EDD-9076). */
+  const packedGuards: ReadonlyArray<PackedAttributeGuard> = Object.entries(packedFields).flatMap(
+    ([field, storedAs]) => {
+      const guard = (attribute: string): PackedAttributeGuard => ({
+        attribute,
+        owner: `Entity "${entityType}"`,
+        storedAs,
+        alternative: () =>
+          `To filter on it, use .filterBy((item) => ...), which runs on the decoded item; to ` +
+          `condition a write on it, read the item and compare in code, then write the whole ` +
+          `value with .set({ ${field} }).`,
+      })
+      const stored = resolveDbName(field)
+      return stored === field ? [guard(field)] : [guard(field), guard(stored)]
+    },
+  )
+
+  /** Throw `[EDD-9076]` when an expression looks inside a packed field. */
+  const refusePackedExpr = (expr: Expr, usage: string): void => {
+    const refused = packedExprRefusal(expr, packedGuards, usage)
+    if (refused !== undefined) throw new Error(refused)
+  }
+
+  /**
+   * The `Query.make` options of this entity's queries: the packed guards, and
+   * the raw-row hook that reads packed attributes of a projected row of THIS
+   * entity type by their stored form (parsed JSON, not schema-decoded) — rows
+   * of other types (`ignoreOwnership()`) are left untouched.
+   */
+  const packedQueryOptions: {
+    readonly packed: ReadonlyArray<PackedAttributeGuard>
+    readonly rawRow: Query.QueryRawRow | undefined
+  } = {
+    packed: packedGuards,
+    rawRow: ownRowsRawRow(entityType, dispatchAttributes, (raw) => unpackFields(raw)),
+  }
+
+  /**
+   * `[EDD-9077]`: an update applies anything but a whole-value `.set()` /
+   * `.remove()` to a packed field — DynamoDB cannot compute inside one opaque
+   * value. `undefined` when the update is fine.
+   */
+  const refusedPackedUpdate = (uState: UpdateState): string | undefined => {
+    if (!hasPackedFields) return undefined
+    const refuse = (op: string, field: string) =>
+      `[EDD-9077] Entity "${entityType}": ${op} on "${field}", but "${field}" is stored packed ` +
+      `(format "${packedFields[field]!.format}"): DynamoDB holds it as one opaque string or ` +
+      `binary value and cannot apply ${op} inside it. Write the whole value with ` +
+      `.set({ ${field} }) (or .remove(["${field}"])).`
+    const records: ReadonlyArray<readonly [string, object | undefined]> = [
+      [".add()", uState.add],
+      [".subtract()", uState.subtract],
+      [".append()", uState.append],
+      [".deleteFromSet()", uState.deleteFromSet],
+    ]
+    for (const [op, values] of records) {
+      for (const field of Object.keys(values ?? {})) {
+        if (field in packedFields) return refuse(op, field)
+      }
+    }
+    const pathOps: ReadonlyArray<
+      readonly [string, ReadonlyArray<{ readonly segments: ReadonlyArray<string | number> }>]
+    > = [
+      ["pathSet", uState.pathSets ?? []],
+      ["pathRemove", (uState.pathRemoves ?? []).map((segments) => ({ segments }))],
+      ["pathAdd", uState.pathAdds ?? []],
+      ["pathSubtract", uState.pathSubtracts ?? []],
+      ["pathAppend", uState.pathAppends ?? []],
+      ["pathPrepend", uState.pathPrepends ?? []],
+      ["pathIfNotExists", uState.pathIfNotExists ?? []],
+      ["pathDelete", uState.pathDeletes ?? []],
+    ]
+    for (const [op, ops] of pathOps) {
+      for (const { segments } of ops) {
+        const head = segments[0]
+        if (typeof head === "string" && head in packedFields) return refuse(op, head)
+      }
+    }
+    for (const { field } of uState.sparseRemoveEntries ?? []) {
+      if (field in packedFields) return refuse(".removeEntries()", field)
+    }
+    for (const field of uState.sparseClearFields ?? []) {
+      if (field in packedFields) return refuse(".clearMap()", field)
+    }
+    return undefined
   }
 
   /**
@@ -2791,22 +3099,26 @@ const makeImpl = <
     return corruption === undefined ? Effect.void : Effect.fail(corruption)
   }
 
-  const decodeRecord = (raw: globalThis.Record<string, unknown>) => {
+  const decodeRecord = (
+    raw: globalThis.Record<string, unknown>,
+  ): Effect.Effect<any, ValidationError> => {
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
-    deserializeSparseFields(raw)
-    renameFromDynamo(raw)
-    return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
-      Effect.map(attachPrototype),
-      Effect.mapError(
-        (cause) =>
-          new ValidationError({
-            entityType,
-            operation: "decode",
-            cause,
-          }),
-      ),
-    )
+    return Effect.flatMap(unpackFields(raw), () => {
+      deserializeSparseFields(raw)
+      renameFromDynamo(raw)
+      return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
+        Effect.map(attachPrototype),
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType,
+              operation: "decode",
+              cause,
+            }),
+        ),
+      )
+    })
   }
 
   /** Decode a raw item using the schema selected by mode */
@@ -2817,38 +3129,73 @@ const makeImpl = <
   ) => {
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
+    // Native: the item as stored — packed values stay their `S` / `B`.
     if (mode === "native") return Effect.succeed(marshalled)
-    // Collect flattened sparse-map attributes back into the domain Record.
-    // Must happen before rename so the rebuilt Record sits at the domain field
-    // name (sparse field renaming is not supported).
-    deserializeSparseFields(raw)
-    // Rename DynamoDB attributes back to domain field names. Substituted
-    // schemas handle wire→domain conversion (date primitives, Redacted, etc.).
-    renameFromDynamo(raw)
-    const targetSchema =
-      mode === "model"
-        ? schemas.modelSchema
-        : mode === "record"
-          ? schemas.recordSchema
-          : schemas.itemSchema
-    return Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
-      Effect.map((decoded) =>
-        mode === "model" && isSchemaClass && !hasHiddenFields
-          ? new (rawModel as any)(decoded)
-          : mode !== "item"
-            ? attachPrototype(decoded)
-            : decoded,
-      ),
-      Effect.mapError(
-        (cause) =>
-          new ValidationError({
-            entityType,
-            operation: "decode",
-            cause,
-          }),
-      ),
-    )
+    return Effect.flatMap(unpackFields(raw), () => {
+      // Collect flattened sparse-map attributes back into the domain Record.
+      // Must happen before rename so the rebuilt Record sits at the domain field
+      // name (sparse field renaming is not supported).
+      deserializeSparseFields(raw)
+      // Rename DynamoDB attributes back to domain field names. Substituted
+      // schemas handle wire→domain conversion (date primitives, Redacted, etc.).
+      renameFromDynamo(raw)
+      const targetSchema =
+        mode === "model"
+          ? schemas.modelSchema
+          : mode === "record"
+            ? schemas.recordSchema
+            : schemas.itemSchema
+      return Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
+        Effect.map((decoded) =>
+          mode === "model" && isSchemaClass && !hasHiddenFields
+            ? new (rawModel as any)(decoded)
+            : mode !== "item"
+              ? attachPrototype(decoded)
+              : decoded,
+        ),
+        Effect.mapError(
+          (cause) =>
+            new ValidationError({
+              entityType,
+              operation: "decode",
+              cause,
+            }),
+        ),
+      )
+    })
   }
+
+  /**
+   * Decode a DynamoDB Streams image into an item record (`Entity.Item`): the
+   * image normalised (DynamoDB JSON or unmarshalled; `B` as bytes or base64),
+   * its dispatch-eligible attributes read by stored form, then sparse rebuild,
+   * renames and the item-schema decode — exactly what a table read applies.
+   */
+  const decodeImageItem = (image: StreamImage): Effect.Effect<unknown, ValidationError> =>
+    Effect.gen(function* () {
+      // An image of another entity type is decoded as 1.25.0 decoded it: its
+      // attributes are never read as packed values (a plain string of that
+      // type is not this entity's JSON). The type is read off the raw image.
+      const owner = imageEntityType(image)
+      const raw = yield* decodeImage(
+        image,
+        owner === undefined || owner === entityType ? dispatchAttributes : [],
+        { entityType, operation: "decodeMarshalledItem" },
+        { probe: config.indexes.primary.pk.field },
+      )
+      const corruption = versionCorruption(raw, "decodeMarshalledItem")
+      if (corruption !== undefined) return yield* corruption
+      deserializeSparseFields(raw)
+      renameFromDynamo(raw)
+      const decoded = yield* Schema.decodeUnknownEffect(schemas.itemSchema as Schema.Codec<any>)(
+        raw,
+      ).pipe(
+        Effect.mapError(
+          (cause) => new ValidationError({ entityType, operation: "decodeMarshalledItem", cause }),
+        ),
+      )
+      return attachPrototype(decoded)
+    })
 
   const nowIso = (now: DateTime.Utc) => DateTime.formatIso(now)
 
@@ -3218,7 +3565,11 @@ const makeImpl = <
     tableName: string,
     updatePayload: globalThis.Record<string, unknown>,
     uState: UpdateState,
-  ): Effect.Effect<VectorWriteResult, EmbeddingError | DynamoClientError, DynamoClient> =>
+  ): Effect.Effect<
+    VectorWriteResult,
+    EmbeddingError | DynamoClientError | ValidationError,
+    DynamoClient
+  > =>
     Effect.gen(function* () {
       if (!hasVectorIndexes) return { sets: {}, removes: [] }
       const withVectors = uState.withVectors
@@ -3244,6 +3595,9 @@ const makeImpl = <
         const current = yield* client.getItem({ TableName: tableName, Key: marshalledKey })
         if (current.Item) {
           const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
+          // Packed fields are read by their stored form: the source text is
+          // derived from the value, not its JSON string or compressed bytes.
+          yield* unpackFields(currentDomain, "update.vector")
           renameFromDynamo(currentDomain)
           merged = { ...currentDomain, ...merged }
         }
@@ -3710,21 +4064,23 @@ const makeImpl = <
     }
     if (mode === "native") return Effect.succeed(projected)
     const raw = fromAttributeMap(projected) as globalThis.Record<string, unknown>
-    deserializeSparseFields(raw)
-    renameFromDynamo(raw)
-    const target =
-      mode === "model"
-        ? schemas.modelSchema
-        : mode === "record"
-          ? schemas.recordSchema
-          : schemas.itemSchema
-    const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
-    const present = Object.fromEntries(Object.entries(fields).filter(([name]) => name in raw))
-    return Schema.decodeUnknownEffect(Schema.Struct(present) as unknown as Schema.Codec<any>)(
-      raw,
-    ).pipe(
-      Effect.mapError((cause) => new ValidationError({ entityType, operation: "decode", cause })),
-    )
+    return Effect.flatMap(unpackFields(raw), () => {
+      deserializeSparseFields(raw)
+      renameFromDynamo(raw)
+      const target =
+        mode === "model"
+          ? schemas.modelSchema
+          : mode === "record"
+            ? schemas.recordSchema
+            : schemas.itemSchema
+      const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
+      const present = Object.fromEntries(Object.entries(fields).filter(([name]) => name in raw))
+      return Schema.decodeUnknownEffect(Schema.Struct(present) as unknown as Schema.Codec<any>)(
+        raw,
+      ).pipe(
+        Effect.mapError((cause) => new ValidationError({ entityType, operation: "decode", cause })),
+      )
+    })
   }
   /**
    * The value an update returns for its `returnValues` mode, from the item
@@ -5069,6 +5425,11 @@ const makeImpl = <
               cause: e instanceof Error ? e.message : String(e),
             })
           }
+          // Pack `storedAs: DynamoModel.Packed` fields to their stored form
+          // (JSON string, or compressed binary over the threshold) — after
+          // renames and sparse flattening, before marshalling, so every size
+          // measured from here on is the stored size.
+          yield* packFields(item, operation)
 
           // The caller's condition, ANDed onto `create`'s not-exists guard —
           // a guard no `.condition()` can replace (#133). `upsert`'s create
@@ -5198,6 +5559,17 @@ const makeImpl = <
           let projectionExpression: string | undefined
           let projectionNames: globalThis.Record<string, string> | undefined
           if (opts.projection && opts.projection.length > 0) {
+            const packedProjection = packedProjectionRefusal(
+              opts.projection.map((attribute) => [attribute]),
+              packedGuards,
+            )
+            if (packedProjection !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "get.projection",
+                cause: packedProjection,
+              })
+            }
             const proj = Projection.projection(opts.projection)
             projectionExpression = proj.expression
             projectionNames = proj.names
@@ -5218,9 +5590,12 @@ const makeImpl = <
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
-          // Raw mode: return unmarshalled record without schema decode
+          // Raw mode: return unmarshalled record without schema decode — a
+          // packed attribute as its parsed JSON (#147).
           if (mode === "raw") {
-            return fromAttributeMap(result.Item)
+            const row = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
+            yield* unpackFields(row)
+            return row
           }
 
           // Unmarshall and decode using selected mode
@@ -5246,6 +5621,15 @@ const makeImpl = <
     preRead?: globalThis.Record<string, AttributeValue>,
   ) =>
     Effect.gen(function* () {
+      // A packed field takes only a whole-value .set() / .remove() (#147).
+      const packedRefusal = refusedPackedUpdate(requested)
+      if (packedRefusal !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: packedRefusal,
+        })
+      }
       // Path operations on a field that feeds a key or a unique sentinel
       // become the record operations they are equivalent to, or are
       // refused (#133) — before anything reads the state.
@@ -5727,7 +6111,14 @@ const makeImpl = <
           )
           // `newItem` is the fully merged post-update item (removals already
           // applied above), so a put-style recompute is exact.
-          const vectorWrite = yield* computeVectorAttributes(newItem, uState.withVectors, embedFor)
+          // Untouched packed fields still hold their stored form on `newItem`
+          // (kept byte-identical for the write diff), so the source text is
+          // derived from an unpacked copy.
+          const vectorWrite = yield* computeVectorAttributes(
+            yield* unpackedDomainCopy(newItem, "update.vector"),
+            uState.withVectors,
+            embedFor,
+          )
           Object.assign(newItem, vectorWrite.sets)
           for (const field of vectorWrite.removes) delete newItem[field]
         }
@@ -5744,10 +6135,25 @@ const makeImpl = <
             cause: e instanceof Error ? e.message : String(e),
           })
         }
+        // Pack only the packed fields this update names: the others still
+        // hold the stored value read above (a string or bytes), carried
+        // byte-identical so the "write only what differs" diff below leaves
+        // them alone (#147).
+        yield* packFields(
+          newItem,
+          "update",
+          new Set(
+            Object.entries(hydratedUpdates as globalThis.Record<string, unknown>)
+              .filter(([field, value]) => field in packedFields && value != null)
+              .map(([field]) => resolveDbName(field)),
+          ),
+        )
 
         const currentItem = currentResult.Item
         yield* checkVersion(currentItem, "update")
-        const immutableChange = immutableMismatch(immutables, currentItem)
+        const immutableChange =
+          immutableMismatch(immutables, currentItem) ??
+          (yield* packedImmutableMismatch(immutables, currentItem))
         if (immutableChange !== undefined) {
           return yield* new ValidationError({
             entityType,
@@ -6221,7 +6627,9 @@ const makeImpl = <
           return yield* missingItem()
         }
         yield* checkVersion(current.Item, "update")
-        const immutableChange = immutableMismatch(immutables, current.Item)
+        const immutableChange =
+          immutableMismatch(immutables, current.Item) ??
+          (yield* packedImmutableMismatch(immutables, current.Item))
         if (immutableChange !== undefined) {
           return yield* new ValidationError({
             entityType,
@@ -6288,6 +6696,28 @@ const makeImpl = <
           (ops) => ops === undefined || Object.keys(ops).length === 0,
         ) &&
         !hasPathOps(uState)
+      // A restated packed immutable cannot be asserted by a condition on its
+      // stored bytes (they depend on the codec and threshold it was written
+      // under): an unread write reads it and compares the unpacked JSON
+      // (#147). The write still requires the item (`attribute_exists`), and
+      // no library write changes an immutable value in between.
+      if (plainWrite && immutables.some((asserted) => asserted.packed)) {
+        const stored = yield* client.getItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          ConsistentRead: true,
+        })
+        if (stored.Item !== undefined) {
+          const packedChange = yield* packedImmutableMismatch(immutables, stored.Item)
+          if (packedChange !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause: packedChange,
+            })
+          }
+        }
+      }
       // Build UpdateExpression
       const setClauses: Array<string> = []
       const names: globalThis.Record<string, string> = {}
@@ -6352,8 +6782,13 @@ const makeImpl = <
 
         const nameKey = `#u${counter}`
         const valKey = `:u${counter}`
-        names[nameKey] = resolveDbName(attr)
-        values[valKey] = toAttributeValue(val)
+        const storedName = resolveDbName(attr)
+        names[nameKey] = storedName
+        // A packed field is written whole, as its stored form (#147).
+        values[valKey] =
+          attr in packedFields
+            ? (yield* packAttribute(storedName, val, "update"))!
+            : toAttributeValue(val)
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -6788,7 +7223,8 @@ const makeImpl = <
       }
       if (plainWrite) {
         // Restated immutable values must match the item's.
-        for (const [i, { attr, value }] of immutables.entries()) {
+        for (const [i, { attr, value, packed }] of immutables.entries()) {
+          if (packed) continue // read and compared above (#147)
           names[`#imm${i}`] = attr
           values[`:imm${i}`] = value
           condParts.push(`#imm${i} = :imm${i}`)
@@ -7867,8 +8303,13 @@ const makeImpl = <
 
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            names[nameKey] = resolveDbName(attr)
-            values[valKey] = toAttributeValue(val)
+            const storedName = resolveDbName(attr)
+            names[nameKey] = storedName
+            // A packed field is written whole, as its stored form (#147).
+            values[valKey] =
+              attr in packedFields
+                ? (yield* packAttribute(storedName, val, "upsert"))!
+                : toAttributeValue(val)
 
             // Immutable fields use if_not_exists — only set on first create
             if (immutableFields.has(attr)) {
@@ -8132,6 +8573,16 @@ const makeImpl = <
       // `append` takes its condition as an argument — no `condition`
       // combinator — so an empty one becomes none here (#133).
       const userCondition = nonEmptyCondition(givenCondition)
+      if (userCondition !== undefined) {
+        const packedRefusal = packedExprRefusal(toExpr(userCondition), packedGuards, "condition")
+        if (packedRefusal !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "append.condition",
+            cause: packedRefusal,
+          })
+        }
+      }
       const emptyPart =
         userCondition === undefined ? undefined : emptyPartProblem(toExpr(userCondition))
       if (emptyPart !== undefined) {
@@ -8254,6 +8705,16 @@ const makeImpl = <
       // `encoded` is already in wire-form via Schema.encode — used directly.
       const serialisedInput: globalThis.Record<string, unknown> = { ...encoded }
 
+      // Packed `appendInput` fields (#147), packed ONCE: the same stored value
+      // is SET on the current item and written on the event item.
+      const packedStored: globalThis.Record<string, unknown> = {}
+      for (const field of Object.keys(packedFields)) {
+        if (serialisedInput[field] !== undefined) {
+          packedStored[resolveDbName(field)] = serialisedInput[field]
+        }
+      }
+      yield* packFields(packedStored, "append")
+
       // ---------- Build UpdateItem (scoped SET + CAS) ----------
       const setClauses: Array<string> = []
       const names: globalThis.Record<string, string> = {}
@@ -8270,8 +8731,9 @@ const makeImpl = <
         if (val === undefined) continue
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
-        names[nameKey] = resolveDbName(attr)
-        values[valKey] = toAttributeValue(val)
+        const storedName = resolveDbName(attr)
+        names[nameKey] = storedName
+        values[valKey] = toAttributeValue(attr in packedFields ? packedStored[storedName] : val)
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -8384,6 +8846,8 @@ const makeImpl = <
       const eventItem: globalThis.Record<string, unknown> = { ...encoded }
       // Rename domain → DB names for the Put (matches put path)
       renameToDynamo(eventItem)
+      // The packed fields' stored values — the same ones SET above (#147).
+      Object.assign(eventItem, packedStored)
       // pk + sk (event)
       eventItem[primary.pk.field] = pkValue
       eventItem[primary.sk.field] = eventSk
@@ -8577,19 +9041,23 @@ const makeImpl = <
       // NOT carry `<prefix>#*` attributes. `deserializeSparseFields` populates
       // empty `{}` Records under the domain field names so the historyRecord
       // schema (which still includes the sparse Record fields) decodes.
-      deserializeSparseFields(raw)
-      renameFromDynamo(raw)
-      return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(raw).pipe(
-        Effect.map(attachPrototype),
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType,
-              operation: "history.decode",
-              cause,
-            }),
-        ),
-      )
+      return Effect.flatMap(unpackFields(raw, "history.decode"), () => {
+        deserializeSparseFields(raw)
+        renameFromDynamo(raw)
+        return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(
+          raw,
+        ).pipe(
+          Effect.map(attachPrototype),
+          Effect.mapError(
+            (cause) =>
+              new ValidationError({
+                entityType,
+                operation: "history.decode",
+                cause,
+              }),
+          ),
+        )
+      })
     }
 
     return Query.make({
@@ -8600,6 +9068,7 @@ const makeImpl = <
       skField: primary.sk.field,
       entityTypes: [entityType],
       decoder: (raw) => decodeHistory(raw),
+      ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
     }).pipe(Query.where({ beginsWith: prefix }))
@@ -8630,6 +9099,8 @@ const makeImpl = <
         skField: indexDef.sk.field,
         entityTypes: [entityType],
         decoder: (raw) => decodeRecord(raw),
+        ...packedQueryOptions,
+        ...packedQueryOptions,
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
         keyFields: [
           indexDef.pk.field,
@@ -8668,6 +9139,7 @@ const makeImpl = <
       indexName: undefined,
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
+      ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
       liveRows: liveRows(),
@@ -8804,6 +9276,7 @@ const makeImpl = <
       skField: primary.sk.field,
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
+      ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
       prepare: withLegacy,
@@ -8838,6 +9311,9 @@ const makeImpl = <
           // Soft-deleted items have GSI keys stripped — always use deletedRecordSchema
           // (itemSchema would fail because it expects GSI key fields that aren't present)
           if (mode === "native") return tombstone
+          // Packed fields: read by their stored form (copied as-is onto the
+          // tombstone, #147).
+          yield* unpackFields(raw, "deleted.get.decode")
           // Sparse Map fields: rebuild domain Records from flattened attrs so
           // soft-deleted items decode correctly. Sparse data is preserved
           // verbatim across soft-delete (GSI keys are stripped, sparse data is
@@ -8876,22 +9352,26 @@ const makeImpl = <
     const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
       const corruption = versionCorruption(raw, "deleted.list.decode")
       if (corruption !== undefined) return Effect.fail(corruption)
-      // Sparse fields are domain data and are preserved across soft-delete.
-      // Rebuild Records from flattened attrs before schema decode.
-      deserializeSparseFields(raw)
-      // Then attribute → domain names, same order as `decodeRecord` (#127).
-      renameFromDynamo(raw)
-      return Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(raw).pipe(
-        Effect.map(attachPrototype),
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType,
-              operation: "deleted.list.decode",
-              cause,
-            }),
-        ),
-      )
+      return Effect.flatMap(unpackFields(raw, "deleted.list.decode"), () => {
+        // Sparse fields are domain data and are preserved across soft-delete.
+        // Rebuild Records from flattened attrs before schema decode.
+        deserializeSparseFields(raw)
+        // Then attribute → domain names, same order as `decodeRecord` (#127).
+        renameFromDynamo(raw)
+        return Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(
+          raw,
+        ).pipe(
+          Effect.map(attachPrototype),
+          Effect.mapError(
+            (cause) =>
+              new ValidationError({
+                entityType,
+                operation: "deleted.list.decode",
+                cause,
+              }),
+          ),
+        )
+      })
     }
 
     return Query.make({
@@ -8902,6 +9382,7 @@ const makeImpl = <
       skField: primary.sk.field,
       entityTypes: [],
       decoder: (raw) => decodeDeleted(raw),
+      ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
     }).pipe(Query.where({ beginsWith: deletedPrefix }))
@@ -9456,6 +9937,7 @@ const makeImpl = <
       typeof cbOrShorthand === "function"
         ? cbOrShorthand(entityPathBuilder, entityConditionOps)
         : parseSimpleShorthand(cbOrShorthand)
+    refusePackedExpr(expr, "condition")
     return (self: any) => conditionCombinator(self, expr)
   }
 
@@ -9470,6 +9952,7 @@ const makeImpl = <
       typeof cbOrShorthand === "function"
         ? cbOrShorthand(entityPathBuilder, entityConditionOps)
         : parseSimpleShorthand(cbOrShorthand)
+    refusePackedExpr(expr, "filter")
     return <A>(q: Query.Query<A>): Query.Query<A> => filterExpr(q, expr)
   }
 
@@ -9481,12 +9964,18 @@ const makeImpl = <
       | ((t: any) => ReadonlyArray<{ segments: ReadonlyArray<string | number> }>)
       | ReadonlyArray<string>,
   ) => {
+    const refuse = (paths: ReadonlyArray<ReadonlyArray<string | number>>) => {
+      const refused = packedProjectionRefusal(paths, packedGuards)
+      if (refused !== undefined) throw new Error(refused)
+    }
     if (typeof cbOrAttrs === "function") {
       const paths = cbOrAttrs(entityPathBuilder)
       const segments = paths.map((p: { segments: ReadonlyArray<string | number> }) => p.segments)
+      refuse(segments)
       return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
         selectPaths(q, segments)
     }
+    refuse(cbOrAttrs.map((attribute) => [attribute]))
     return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
       Query.select(q, cbOrAttrs)
   }
@@ -9517,8 +10006,14 @@ const makeImpl = <
     generatedId: config.generatedId as TGeneratedId,
     vectorIndexes: config.vectorIndexes as TVectorIndexes,
     _vectorIndexes: vectorIndexes,
+    _packedFields: Object.keys(packedFields),
+    _packFields: packFields,
+    _unpackFields: unpackFields,
+    _dispatchAttributes: dispatchAttributes,
+    _packedGuards: packedGuards,
+    _decodeImage: decodeImageItem,
     _resolvedRefs: resolvedRefs,
-    /** @internal Full decode pipeline: rename + schema decode. Used by Batch/Aggregate. */
+    /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
     /** @internal Domain field name → stored attribute name (`storedAs` renames). */
     _resolveDbName: resolveDbName,
@@ -9543,6 +10038,8 @@ const makeImpl = <
       tableTag = injectedTableTag
     },
     _injectIndex: (name: string, def: IndexDefinition) => {
+      const refused = packedIndexRefusal(entityType, packedFields, name, def)
+      if (refused !== undefined) throw new Error(refused)
       allIndexes = { ...allIndexes, [name]: def }
     },
     get _schema() {
@@ -9599,7 +10096,8 @@ const makeImpl = <
     ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
     TTimeSeries,
     TGeneratedId,
-    TVectorIndexes
+    TVectorIndexes,
+    ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
   >
 
   // Assign self so operation closures can reference the entity
@@ -9633,6 +10131,7 @@ export const bind = <
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
+  TPackedFields extends string = never,
 >(
   entity: Entity<
     TModel,
@@ -9646,7 +10145,8 @@ export const bind = <
     TIdentifier,
     TTimeSeries,
     TGeneratedId,
-    TVectorIndexes
+    TVectorIndexes,
+    TPackedFields
   >,
 ): Effect.Effect<
   BoundEntity<
@@ -9658,7 +10158,8 @@ export const bind = <
     TTimestamps,
     TVersioned,
     TGeneratedId,
-    TVectorIndexes
+    TVectorIndexes,
+    TPackedFields
   >,
   never,
   DynamoClient | TableConfig
@@ -10021,7 +10522,8 @@ export const bind = <
       TTimestamps,
       TVersioned,
       TGeneratedId,
-      TVectorIndexes
+      TVectorIndexes,
+      TPackedFields
     >
   })
 
@@ -10200,7 +10702,21 @@ export type Record<
  * `Entity.Input<typeof TeamPlayerSelection>` = `{ teamId: string, playerId: string, ... }`
  */
 export type Input<E extends { readonly model: Schema.Top }> =
-  E extends Entity<infer M extends Schema.Top, any, any, any, any, any, any, infer R, any>
+  E extends Entity<
+    infer M extends Schema.Top,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+    infer R,
+    any,
+    undefined,
+    undefined,
+    undefined,
+    infer _P extends string
+  >
     ? EntityRefInputType<M, R>
     : EntityInputType<E["model"]>
 
@@ -10212,7 +10728,21 @@ export type Input<E extends { readonly model: Schema.Top }> =
  * `Entity.Create<typeof Teams>` = `{ name: string, gender: Gender, league: League }`
  */
 export type Create<E extends { readonly model: Schema.Top; readonly indexes: any }> =
-  E extends Entity<infer M extends Schema.Top, any, infer I, any, any, any, any, infer R, infer Id>
+  E extends Entity<
+    infer M extends Schema.Top,
+    any,
+    infer I,
+    any,
+    any,
+    any,
+    any,
+    infer R,
+    infer Id,
+    undefined,
+    undefined,
+    undefined,
+    infer _P extends string
+  >
     ? EntityRefCreateType<M, I, R, Id extends string ? Id : undefined>
     : Omit<EntityInputType<E["model"]>, PrimaryKeyComposites<E["indexes"]>>
 
@@ -10223,7 +10753,21 @@ export type Create<E extends { readonly model: Schema.Top; readonly indexes: any
  * `Entity.Update<typeof Users>` = `{ email?: string, displayName?: string, ... }`
  */
 export type Update<E extends { readonly model: Schema.Top; readonly indexes: any }> =
-  E extends Entity<infer M extends Schema.Top, any, infer I, any, any, any, any, infer R, any>
+  E extends Entity<
+    infer M extends Schema.Top,
+    any,
+    infer I,
+    any,
+    any,
+    any,
+    any,
+    infer R,
+    any,
+    undefined,
+    undefined,
+    undefined,
+    infer _P extends string
+  >
     ? EntityRefUpdateType<M, I, R>
     : EntityUpdateType<E["model"], E["indexes"]>
 
@@ -10261,6 +10805,8 @@ export type Marshalled<_E> = globalThis.Record<
     readonly NULL?: boolean
     readonly L?: ReadonlyArray<unknown>
     readonly M?: globalThis.Record<string, unknown>
+    /** Binary — a compressed packed value (`DynamoModel.Packed`) among others. */
+    readonly B?: Uint8Array
   }
 >
 
@@ -10320,19 +10866,39 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
 /**
  * Decode a marshalled DynamoDB item (AttributeValue format) into a typed Entity.Record.
  *
- * Unmarshalls the AttributeValue map to plain JS, then decodes via the entity's item schema.
- * Useful for consuming DynamoDB Streams events or raw SDK responses.
+ * Built for DynamoDB Streams records (`NewImage` / `OldImage`) and raw SDK
+ * responses. Applies exactly what a table read applies:
  *
- * Returns an Effect that fails with `ValidationError` if the item doesn't match the schema.
+ * - **Packed fields** (`storedAs: DynamoModel.Packed`) are read by their
+ *   stored form — a legacy native map, a JSON string (`S`), or compressed
+ *   binary (`B`). Lambda and EventBridge Pipes deliver `B` / `BS` members as
+ *   base64 text; they are decoded at any depth.
+ * - Sparse-map fields are rebuilt and `field:` renames reversed.
+ *
+ * Accepts DynamoDB JSON (`{ pk: { S: "…" }, … }`, `B` as bytes or base64) or
+ * an already-unmarshalled item. Fails with `ValidationError` if the item does
+ * not match the schema, or when a compressed value's codec is not registered —
+ * its `cause` is then a `CompressorNotRegistered` (register the codec with a
+ * `Compression.layer([...])` provided where the decode runs).
+ *
+ * Note: {@link itemSchema} is a pure schema over unmarshalled items and does
+ * not unpack — use this for entities with packed fields.
  */
 export const decodeMarshalledItem = (
-  entity: EntityWithSchemas & { readonly entityType: string },
-  marshalledItem: globalThis.Record<string, AttributeValue>,
+  entity: EntityWithSchemas & {
+    readonly entityType: string
+    readonly _decodeImage?: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
+  },
+  marshalledItem: StreamImage,
 ): Effect.Effect<unknown, ValidationError> => {
-  const corruption = entity._versionCorruption?.(marshalledItem, "decodeMarshalledItem")
+  if (entity._decodeImage !== undefined) return entity._decodeImage(marshalledItem)
+  const corruption = entity._versionCorruption?.(
+    marshalledItem as Readonly<globalThis.Record<string, unknown>>,
+    "decodeMarshalledItem",
+  )
   if (corruption !== undefined) return Effect.fail(corruption)
   return Schema.decodeUnknownEffect(entity.schemas.itemSchema)(
-    fromAttributeMap(marshalledItem),
+    fromAttributeMap(marshalledItem as globalThis.Record<string, AttributeValue>),
   ).pipe(
     Effect.map((decoded) => (entity._attachPrototype ? entity._attachPrototype(decoded) : decoded)),
     Effect.mapError(

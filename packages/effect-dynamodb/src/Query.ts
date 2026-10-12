@@ -19,6 +19,11 @@ import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
+import {
+  type PackedAttributeGuard,
+  packedExprRefusal,
+  packedProjectionRefusal,
+} from "./internal/Packed.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
@@ -74,6 +79,18 @@ interface QueryState {
   readonly projection: ReadonlyArray<string> | undefined
   readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
+  /**
+   * How a raw row ({@link select} / {@link selectPaths}) is handed back: the
+   * identity, unless the query's items store attributes packed — then each
+   * packed attribute present is read by its stored form to its parsed JSON
+   * (not schema-decoded). See {@link QueryRawRow}.
+   */
+  readonly rawRow: QueryRawRow | undefined
+  /**
+   * The packed attributes of the query's items: a filter or projection that
+   * looks inside one is refused when it is added (`[EDD-9076]`).
+   */
+  readonly packed: ReadonlyArray<PackedAttributeGuard>
   /** Optional effect to resolve table name at execution time (for deferred resolution) */
   readonly resolveTableName: Effect.Effect<string, never, any> | undefined
   /**
@@ -111,6 +128,52 @@ interface QueryState {
   /** See {@link KeyConditionDiagnosis}. */
   readonly keyConditionDiagnosis: KeyConditionDiagnosis | undefined
 }
+
+/**
+ * @internal Turns a raw row into the plain row {@link select} returns: each
+ * packed attribute it carries read by its stored form (`S` → JSON, `B` →
+ * header + payload, native → unchanged), never schema-decoded.
+ */
+export type QueryRawRow = {
+  (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, ValidationError>
+  /**
+   * Attributes the hook reads to decide how to read a row — a collection's
+   * `__edd_e__`, which names the member whose packed attributes to read. They
+   * are borrowed into an active projection and stripped again once the hook
+   * has run, so the caller sees exactly what it selected.
+   */
+  readonly reads?: ReadonlyArray<string> | undefined
+  /**
+   * The stored attributes the hook may rewrite. A projection that names none
+   * of them drops the hook — nothing is borrowed and no row is examined.
+   * Absent: the hook runs on every projection.
+   */
+  readonly attributes?: ReadonlyArray<string> | undefined
+}
+
+/**
+ * @internal The raw-row hook a projection of `paths` runs: the query's
+ * {@link QueryState.rawRow}, unless it declares the attributes it rewrites
+ * ({@link QueryRawRow.attributes}) and the projection names none of them.
+ */
+const projectedRawRow = (
+  hook: QueryRawRow | undefined,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): QueryRawRow | undefined => {
+  if (hook?.attributes === undefined) return hook
+  const rewrites = new Set(hook.attributes)
+  return paths.some((path) => rewrites.has(String(path[0]))) ? hook : undefined
+}
+
+/** @internal The raw-row hook the projection of `state` runs, if any. */
+const activeRawRow = (state: QueryState): QueryRawRow | undefined =>
+  projectedRawRow(state.rawRow, [
+    ...(state.projection ?? []).map((attribute) => [attribute]),
+    ...(state.projectionPaths ?? []),
+  ])
+
+/** @internal The attributes the active raw-row hook of `state` reads (see {@link QueryRawRow.reads}). */
+const rawRowReads = (state: QueryState): ReadonlyArray<string> => activeRawRow(state)?.reads ?? []
 
 /**
  * @internal How a query names DynamoDB's rejection of its key condition — an
@@ -232,8 +295,14 @@ export const make = <A>(config: {
   readonly hydration?: QueryHydration | undefined
   /** See {@link KeyConditionDiagnosis}. */
   readonly keyConditionDiagnosis?: KeyConditionDiagnosis | undefined
+  /** See {@link QueryState.rawRow}. */
+  readonly rawRow?: QueryRawRow | undefined
+  /** See {@link QueryState.packed}. */
+  readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    rawRow: config.rawRow,
+    packed: config.packed ?? [],
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -282,8 +351,14 @@ export const makeScan = <A>(config: {
   readonly liveRows?: LiveRows | undefined
   /** See {@link QueryState.prepare}. */
   readonly prepare?: QueryPrepare | undefined
+  /** See {@link QueryState.rawRow}. */
+  readonly rawRow?: QueryRawRow | undefined
+  /** See {@link QueryState.packed}. */
+  readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    rawRow: config.rawRow,
+    packed: config.packed ?? [],
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -460,11 +535,31 @@ export const startFrom: {
         }),
 )
 
+/** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
+const rawRowDecoder = (
+  hook: QueryRawRow | undefined,
+): ((raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>) =>
+  hook ?? ((raw) => Effect.succeed(raw))
+
+/** @internal Throw `[EDD-9076]` for a projection inside a packed attribute. */
+const refusePackedProjection = (
+  state: QueryState,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): void => {
+  const refused = packedProjectionRefusal(paths, state.packed)
+  if (refused !== undefined) throw new Error(refused)
+}
+
 /**
  * Select specific attributes to return (ProjectionExpression).
  * Reduces read capacity and network transfer. When projection is active,
  * items are returned as raw `Record<string, unknown>` instead of decoded
  * schema instances, since projected items may be partial.
+ *
+ * An attribute stored packed (`DynamoModel.Packed` — an EventStore stream's
+ * `data`, for one) comes back as its parsed JSON, whatever its stored form
+ * (a native map, a JSON string, or compressed bytes), and may only be
+ * selected whole: a path inside it throws `[EDD-9076]`.
  */
 export const select: {
   (attributes: ReadonlyArray<string>): <A>(self: Query<A>) => Query<Record<string, unknown>>
@@ -475,10 +570,12 @@ export const select: {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
+    const paths = attributes.map((attribute) => [attribute])
+    refusePackedProjection(self._state, paths)
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projection: attributes,
-      decoder: (raw) => Effect.succeed(raw),
+      decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
     })
   },
 )
@@ -497,11 +594,17 @@ export const selectProjected = <A>(
   if (self._state.predicates.length > 0) {
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
+  refusePackedProjection(self._state, storedPaths)
+  const rawRow = rawRowDecoder(projectedRawRow(self._state.rawRow, storedPaths))
   return new QueryImpl<Record<string, unknown>>({
     ...self._state,
     projection: undefined,
     projectionPaths: storedPaths,
-    decoder: (raw) => Effect.succeed(decode(raw) as Record<string, unknown>),
+    decoder: (raw) =>
+      Effect.map(
+        rawRow(raw),
+        (row) => decode(row as Record<string, unknown>) as Record<string, unknown>,
+      ),
   })
 }
 
@@ -534,6 +637,12 @@ export const selectRenamed = <A>(
 /**
  * Add an Expr-based filter expression to the query.
  * Multiple filterExpr calls are ANDed together.
+ *
+ * On a query whose items store an attribute packed (`DynamoModel.Packed` — an
+ * EventStore stream with `storedAs.data`, for one), a filter that addresses a
+ * path inside it, or applies anything but `attribute_exists` /
+ * `attribute_not_exists` to it, throws `[EDD-9076]`: DynamoDB sees one opaque
+ * value. Use {@link filterBy}, which runs on the decoded item.
  */
 export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
@@ -545,6 +654,8 @@ export const filterExpr: {
   // `or()` with no parts — is kept, and refused when the query runs
   // (`emptyPartProblem`).
   if (isEmptyExpr(expr)) return self
+  const refused = packedExprRefusal(expr, self._state.packed, "filter")
+  if (refused !== undefined) throw new Error(refused)
   return new QueryImpl<A>({
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
@@ -639,10 +750,11 @@ export const selectPaths: {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
+    refusePackedProjection(self._state, paths)
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projectionPaths: paths,
-      decoder: (raw) => Effect.succeed(raw),
+      decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
     })
   },
 )
@@ -871,9 +983,16 @@ const hydrateRows = (
     const borrowed =
       projected.size === 0
         ? []
-        : [pkName, skName, ...(ownership ? ["__edd_e__"] : [])].filter(
-            (field) => !projected.has(field),
-          )
+        : [
+            ...new Set([
+              pkName,
+              skName,
+              ...(ownership ? ["__edd_e__"] : []),
+              ...rawRowReads(state),
+            ]),
+          ].filter((field) => !projected.has(field))
+    // What the raw-row hook reads survives until it has run (see `examinePage`).
+    const keptForRawRow = new Set(rawRowReads(state))
     const expression = buildProjection(state, names, borrowed)
     const fetched = yield* batchGetRaw(client, requests, {
       projection: expression === undefined ? undefined : { expression, names },
@@ -904,7 +1023,7 @@ const hydrateRows = (
         continue
       }
       const stripped = { ...item }
-      for (const field of borrowed) delete stripped[field]
+      for (const field of borrowed) if (!keptForRawRow.has(field)) delete stripped[field]
       hydrated.push(stripped)
     }
     return hydrated
@@ -1123,6 +1242,8 @@ const cursorProjectionFields = (
   // A query that drops rows reads what it judges them by (#133).
   if (state.keepRow !== undefined && state.skField !== undefined) borrowed.add(state.skField)
   for (const attr of state.liveRows?.reads ?? []) borrowed.add(attr)
+  // …and a raw-row hook reads what it dispatches on (a collection's `__edd_e__`).
+  for (const attr of rawRowReads(state)) borrowed.add(attr)
   return [...borrowed].filter((field) => !projected.has(field))
 }
 
@@ -1150,6 +1271,20 @@ const examinePage = <A>(
 > =>
   Effect.gen(function* () {
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+    // Borrowed attributes the raw-row hook reads are stripped after it ran:
+    // borrowed into the request's projection, or — on a `BatchGet`-hydrated
+    // query — into the hydrating fetch's (see `hydrateRows`).
+    const hookReads = new Set(rawRowReads(state))
+    const strippedAfterHook = new Set(borrowedFields.filter((field) => hookReads.has(field)))
+    if (state.hydration?._tag === "BatchGet") {
+      const projected = new Set<string>([
+        ...(state.projection ?? []),
+        ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
+      ])
+      if (projected.size > 0) {
+        for (const field of hookReads) if (!projected.has(field)) strippedAfterHook.add(field)
+      }
+    }
     const items: Array<A> = []
     let next = 0
     while (next < returned.length) {
@@ -1171,8 +1306,9 @@ const examinePage = <A>(
         const source = sources[k]
         if (source === undefined) continue
         const raw = fromAttributeMap(source)
-        for (const field of borrowedFields) delete raw[field]
+        for (const field of borrowedFields) if (!hookReads.has(field)) delete raw[field]
         const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
+        for (const field of strippedAfterHook) delete raw[field]
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
         if (budget !== undefined && items.length >= budget) {

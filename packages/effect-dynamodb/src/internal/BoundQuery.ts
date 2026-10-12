@@ -17,7 +17,7 @@ import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
 import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
 import { ExprTag, parseSimpleShorthand } from "./Expr.js"
-import type { Path, PathBuilder } from "./PathBuilder.js"
+import type { PackedPath, Path, PathBuilder } from "./PathBuilder.js"
 
 /**
  * An expression with every attribute path's top-level field renamed to its
@@ -222,7 +222,9 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   /** Select specific attributes (projection). Callback or string array. */
   readonly select: {
     (
-      fn: (t: PathBuilder<Model, Model, never>) => ReadonlyArray<Path<Model, any, any>>,
+      fn: (
+        t: PathBuilder<Model, Model, never>,
+      ) => ReadonlyArray<Path<Model, any, any> | PackedPath<Model, any, any>>,
     ): BoundQuery<Model, SkRemaining, Record<string, unknown>>
     (attributes: ReadonlyArray<string>): BoundQuery<Model, SkRemaining, Record<string, unknown>>
   }
@@ -558,7 +560,9 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   // --- select ---
   select(
     fnOrAttrs:
-      | ((t: PathBuilder<Model, Model, never>) => ReadonlyArray<Path<Model, any, any>>)
+      | ((
+          t: PathBuilder<Model, Model, never>,
+        ) => ReadonlyArray<Path<Model, any, any> | PackedPath<Model, any, any>>)
       | ReadonlyArray<string>,
   ): BoundQueryImpl<Model, SkRemaining, Record<string, unknown>> {
     const [paths, form] =

@@ -24,6 +24,7 @@ import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
+import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKey,
   getRejectReason,
@@ -78,6 +79,14 @@ export const check: {
     // Sync API — there is no error channel to fail into, so this stays a throw.
     throw new Error(getRejectReason("Transaction.check"))
   }
+  // A packed field may be tested only as a whole (`[EDD-9076]`, #147).
+  const refused = packedCompiledRefusal(
+    condition.expression,
+    condition.names,
+    info.entity._packedGuards ?? [],
+    "condition check",
+  )
+  if (refused !== undefined) throw new Error(refused)
   return {
     [ConditionCheckTypeId]: ConditionCheckTypeId,
     _entity: info.entity,

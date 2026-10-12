@@ -103,6 +103,11 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
+import {
+  Compression,
+  type Compressor,
+  make as makeCompressionRegistry,
+} from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -164,7 +169,14 @@ import {
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
-import { createPathBuilder } from "./internal/PathBuilder.js"
+import {
+  codecRequirements,
+  collectionPackedQueryOptions,
+  entityPackedQueryOptions,
+  type PackedAttributeGuard,
+  unregisteredCodecError,
+} from "./internal/Packed.js"
+import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
   diagnoseFailure,
   explainDiagnosis,
@@ -427,6 +439,36 @@ export interface DynamoClientService {
   ) => Effect.Effect<ListTagsOfResourceCommandOutput, DynamoClientError>
 }
 
+/** Static client configuration accepted by {@link DynamoClient.layer}. */
+type ClientConfig = {
+  readonly region: string
+  readonly endpoint?: string | undefined
+  readonly credentials?:
+    | { readonly accessKeyId: string; readonly secretAccessKey: string }
+    | undefined
+}
+
+/** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
+type ClientConfigFromConfig = {
+  readonly region: Config.Config<string>
+  readonly endpoint?: Config.Config<string> | undefined
+  readonly credentials?:
+    | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
+    | undefined
+}
+
+/**
+ * Add the `Compression` service built from `compressors` beside a client
+ * layer. The registry is validated (EDD-9078) when the layer is constructed.
+ */
+const withCompressors = <E>(
+  client: Layer.Layer<DynamoClient, E>,
+  compressors: ReadonlyArray<Compressor> | undefined,
+): Layer.Layer<DynamoClient, E> | Layer.Layer<DynamoClient | Compression, E> =>
+  compressors === undefined
+    ? client
+    : Layer.merge(client, Layer.succeed(Compression, makeCompressionRegistry(compressors)))
+
 /**
  * Effect Context.Service for the DynamoDB client service.
  *
@@ -448,15 +490,39 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
    * @param config.credentials - Optional static credentials
+   * @param config.compressors - Optional compressors for packed storage
+   *   (`DynamoModel.Packed` with `compression`). When given, the layer also
+   *   provides the `Compression` service built from them. That reaches whatever
+   *   this layer is merged with — but not past a wrapper that consumes it
+   *   through `Layer.provide` (a decorated client, say), whose output is only
+   *   `DynamoClient`. Prefer a separate `Compression.layer([...])` merged into
+   *   the application layer, which works however the client is composed.
+   *
+   * @example
+   * ```typescript
+   * import * as ZlibCompression from "effect-dynamodb/compression/zlib"
+   * // Recommended: the compressors as their own layer, beside the client
+   * const AppLayer = Layer.mergeAll(
+   *   DynamoClient.layer({ region: "us-east-1" }),
+   *   Compression.layer([ZlibCompression.zstd()]),
+   * )
+   * // Also works, when this layer is used directly:
+   * const live = DynamoClient.layer({ region: "us-east-1", compressors: [ZlibCompression.zstd()] })
+   * ```
    */
-  static readonly layer = (config: {
-    readonly region: string
-    readonly endpoint?: string | undefined
-    readonly credentials?:
-      | { readonly accessKeyId: string; readonly secretAccessKey: string }
-      | undefined
-  }): Layer.Layer<DynamoClient> =>
-    Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials))
+  static readonly layer: {
+    (
+      config: ClientConfig & { readonly compressors: ReadonlyArray<Compressor> },
+    ): Layer.Layer<DynamoClient | Compression>
+    (config: ClientConfig & { readonly compressors?: undefined }): Layer.Layer<DynamoClient>
+    (
+      config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined },
+    ): Layer.Layer<DynamoClient>
+  } = (config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined }) =>
+    withCompressors(
+      Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials)),
+      config.compressors,
+    ) as never
 
   /**
    * Create a live Layer that reads configuration from Effect Config providers
@@ -465,29 +531,45 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials
+   * @param config.compressors - Optional compressors for packed storage; when
+   *   given, the layer also provides the `Compression` service (see {@link layer}
+   *   for why a separate `Compression.layer([...])` is the recommended form).
    */
-  static readonly layerConfig = (config: {
-    readonly region: Config.Config<string>
-    readonly endpoint?: Config.Config<string> | undefined
-    readonly credentials?:
-      | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
-      | undefined
-  }): Layer.Layer<DynamoClient, Config.ConfigError> =>
-    Layer.effect(
-      DynamoClient,
-      Effect.gen(function* () {
-        const region = yield* config.region
-        const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-        const credentials = config.credentials
-          ? yield* Config.option(config.credentials)
-          : undefined
-        return yield* buildService(
-          region,
-          endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-          credentials && credentials._tag === "Some" ? credentials.value : undefined,
-        )
-      }),
-    )
+  static readonly layerConfig: {
+    (
+      config: ClientConfigFromConfig & { readonly compressors: ReadonlyArray<Compressor> },
+    ): Layer.Layer<DynamoClient | Compression, Config.ConfigError>
+    (
+      config: ClientConfigFromConfig & { readonly compressors?: undefined },
+    ): Layer.Layer<DynamoClient, Config.ConfigError>
+    (
+      config: ClientConfigFromConfig & {
+        readonly compressors?: ReadonlyArray<Compressor> | undefined
+      },
+    ): Layer.Layer<DynamoClient, Config.ConfigError>
+  } = (
+    config: ClientConfigFromConfig & {
+      readonly compressors?: ReadonlyArray<Compressor> | undefined
+    },
+  ) =>
+    withCompressors(
+      Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const region = yield* config.region
+          const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
+          const credentials = config.credentials
+            ? yield* Config.option(config.credentials)
+            : undefined
+          return yield* buildService(
+            region,
+            endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
+            credentials && credentials._tag === "Some" ? credentials.value : undefined,
+          )
+        }),
+      ),
+      config.compressors,
+    ) as never
 
   /**
    * Create a typed client gateway from entities, aggregates, and (optionally) tables.
@@ -521,6 +603,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -535,6 +618,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly aggregates: TAggregates
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -549,6 +633,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -559,6 +644,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -603,29 +689,21 @@ export type CollectionSelected<TResult> = {
  */
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
-  readonly collect: () => Effect.Effect<
-    TResult,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
-    never
-  >
+  readonly collect: () => Effect.Effect<TResult, DynamoClientError | ValidationError, never>
   /** Execute a single page, grouped like `collect()`. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    DynamoClientError | ValidationError,
     never
   >
   /** Stream every item, page by page, each tagged with its member. */
   readonly paginate: () => Stream.Stream<
     CollectionStreamItem<TResult>,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    DynamoClientError | ValidationError,
     never
   >
   /** Count the members' items (every member's, together). */
-  readonly count: () => Effect.Effect<
-    number,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
-    never
-  >
+  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
   /**
    * Project attributes — by domain name, per member: each member's items come
    * back as partial records under its key.
@@ -706,17 +784,18 @@ export type TypedClient<
       any,
       infer TS,
       infer GenId,
-      infer VI
+      infer VI,
+      infer P
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-              Schema.Schema.Type<M>,
+              PathModel<Schema.Schema.Type<M>, P>,
               never,
               Schema.Schema.Type<M>
             >
-          } & EntityIndexAccessors<M, I, R> &
+          } & EntityIndexAccessors<M, I, R, P> &
             EntityVectorAccessors<M, VI>
         >
       : TEntities[K] extends EntityDefinition<
@@ -731,17 +810,18 @@ export type TypedClient<
             any,
             infer TS,
             infer GenId,
-            infer VI
+            infer VI,
+            infer P
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-                Schema.Schema.Type<M>,
+                PathModel<Schema.Schema.Type<M>, P>,
                 never,
                 Schema.Schema.Type<M>
               >
-            } & EntityIndexAccessors<M, I, R> &
+            } & EntityIndexAccessors<M, I, R, P> &
               EntityVectorAccessors<M, VI>
           >
         : never
@@ -822,11 +902,12 @@ type EntityIndexAccessors<
   M extends Schema.Top,
   I extends Record<string, IndexDefinition>,
   R = undefined,
+  P extends string = never,
 > = {
   readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
   ) => import("./internal/BoundQuery.js").BoundQuery<
-    Schema.Schema.Type<M>,
+    PathModel<Schema.Schema.Type<M>, P>,
     ResolveSkFields<M, I, K, Provided, R>,
     Schema.Schema.Type<M>
   >
@@ -997,6 +1078,16 @@ interface EntityLike {
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
+  /** Packed attributes an expression may not look inside (EDD-9076, #147). */
+  readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** The domain fields stored packed. */
+  readonly _packedFields?: ReadonlyArray<string> | undefined
+  /** Read packed attributes of a raw row by their stored form (#147). */
+  readonly _unpackFields?:
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
+    | undefined
+  /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
+  readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
@@ -1034,12 +1125,25 @@ const collectionLiveRows = (
   }
 }
 
+/**
+ * Each packed field of an entity once, by its domain name, with its config: a
+ * renamed field has a guard per name (domain and stored), both carrying it.
+ */
+const packedFieldConfigs = (
+  entity: EntityLike,
+): Array<readonly [string, PackedAttributeGuard["storedAs"] | undefined]> =>
+  (entity._packedFields ?? []).map((field) => [
+    field,
+    entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs,
+  ])
+
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
   readonly aggregates?: Record<string, AggregateType<any, any, any>>
   readonly tables?: Record<string, TableLike>
   readonly crypto?: Crypto.Crypto
   readonly embedder?: EmbedderService
+  readonly compressors?: ReadonlyArray<Compressor>
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // 1. Resolve the provide function from context.
@@ -1062,10 +1166,46 @@ const makeFromConfig = (config: {
     const ambientEmbedder = Context.getOption(baseCtx, Embedder)
     const embedderService =
       config.embedder ?? (Option.isSome(ambientEmbedder) ? ambientEmbedder.value : undefined)
-    const ctx =
+    const withEmbedder =
       embedderService !== undefined
         ? Context.add(withCrypto, Embedder, embedderService)
         : withCrypto
+    // Bundle the compressor registry for packed storage the same way: explicit
+    // `compressors` win, then an ambient `Compression` at bind time. Without
+    // either nothing is added. A `Compression` provided only at run time then
+    // reaches bound operations (they read it with `Effect.serviceOption`), but
+    // only when no bound member's `Packed` config names a codec: such a member
+    // fails the bind-time [EDD-9078] check below before any operation runs.
+    const ambientCompression = Context.getOption(baseCtx, Compression)
+    const compressionRegistry =
+      config.compressors !== undefined
+        ? makeCompressionRegistry(config.compressors)
+        : Option.isSome(ambientCompression)
+          ? ambientCompression.value
+          : undefined
+    // A bound member whose packed config names a codec meets values
+    // compressed with it on every read and write, so the codec must be
+    // registered here — a configuration defect (`[EDD-9078]`) at bind, not a
+    // ValidationError on the first compressed value (#147).
+    const codecError = unregisteredCodecError(
+      "DynamoClient.make",
+      [
+        ...Object.entries(config.entities).flatMap(([key, entity]) =>
+          codecRequirements(`entity "${key}"`, packedFieldConfigs(entity as unknown as EntityLike)),
+        ),
+        ...Object.entries(config.aggregates ?? {}).flatMap(([key, aggregate]) =>
+          [...(aggregate._packedByType ?? new Map())].flatMap(([edgeType, packed]) =>
+            codecRequirements(`aggregate "${key}" (edge "${edgeType}")`, Object.entries(packed)),
+          ),
+        ),
+      ],
+      compressionRegistry,
+    )
+    if (codecError !== undefined) throw codecError
+    const ctx =
+      compressionRegistry !== undefined
+        ? Context.add(withEmbedder, Compression, compressionRegistry)
+        : withEmbedder
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -1175,6 +1315,7 @@ const makeFromConfig = (config: {
           skField: indexDef.sk.field,
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
+          ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
             indexDef.pk.field,
@@ -1473,16 +1614,13 @@ const makeFromConfig = (config: {
         typeof (rawEntity as { get?: unknown }).get === "function"
           ? rawEntity
           : entityFromDefinition(rawEntity as unknown as EntityDefinition)
-      // Provide the resolved Crypto service into the bind so the bound `put`
-      // (which yields `Crypto.Crypto` when `generatedId` is configured) resolves
-      // it from context — keeping the bound method at `R = never`. `bind`
-      // respects an already-present Crypto and only fills its own default when
-      // absent, so this override is honored.
-      const bound = yield* Effect.provideService(
-        entityBind(entity as EntityType),
-        Crypto.Crypto,
-        cryptoService,
-      )
+      // Provide the resolved services (Crypto, Embedder, Compression) into the
+      // bind: `bind` captures its context at bind time, so the bound CRUD
+      // methods resolve the explicit `crypto`, `embedder` and `compressors`
+      // given here — keeping them at `R = never`. `bind` respects an
+      // already-present Crypto and only fills its own default when absent, so
+      // the override is honored.
+      const bound = yield* provide(entityBind(entity as EntityType))
       const entityLike = entity as unknown as EntityLike
       const accessors: Record<string, unknown> = {}
 
@@ -1527,6 +1665,8 @@ const makeFromConfig = (config: {
           schema: entityLike._schema,
           tableTag: entityLike._tableTag,
           decode: (raw) => entityLike._decodeRecord(raw),
+          unpackRaw: entityLike._unpackFields,
+          unpackAttributes: entityLike._dispatchAttributes,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
         }
@@ -1541,6 +1681,7 @@ const makeFromConfig = (config: {
           indexName: undefined,
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
+          ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
           liveRows: entityLike._liveRows?.(),
@@ -1633,6 +1774,7 @@ const makeFromConfig = (config: {
           skField: indexDef.sk.field,
           entityTypes,
           decoder: collDecoder as any,
+          ...collectionPackedQueryOptions(members.map((m) => m.entityLike)),
           resolveTableName: firstMember.entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
             indexDef.pk.field,
@@ -1711,7 +1853,9 @@ const makeFromConfig = (config: {
     const boundAggregates: Record<string, unknown> = {}
     if (config.aggregates) {
       for (const [key, aggregate] of Object.entries(config.aggregates)) {
-        boundAggregates[key] = yield* aggregateBind(aggregate)
+        // Same as entities: the aggregate captures the resolved services
+        // (notably `Compression`, for packed edge entity fields) at bind time.
+        boundAggregates[key] = yield* provide(aggregateBind(aggregate))
       }
     }
 

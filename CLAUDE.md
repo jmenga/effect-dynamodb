@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 2239 core tests, 373 schema tests, 56 geo tests, 90 language-service tests, 48 doctest tests, 35 examples, 589 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 2435 core tests, 539 schema tests, 57 geo tests, 90 language-service tests, 49 doctest tests, 36 examples, 623 connected tests against DynamoDB Local.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -50,7 +50,9 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 
 > **Package split (issue #62):** the pure, AWS-free derivation layer lives in
 > `@effect-dynamodb/schema` (`packages/schema/src/`): `DynamoModel`, `DynamoSchema`,
-> `KeyComposer`, `Errors`, `Projection`, the entity/aggregate derivation internals
+> `KeyComposer`, `Errors`, `Projection`, `Compression` (the `Compressor` interface + registry
+> service for packed storage; no `node:zlib`, guarded by `node-free-guard.test.ts`), the
+> pure packed codec (`internal/PackedCodec.ts`), the entity/aggregate derivation internals
 > (`EntityConfig`, `EntityTypes`, `EntitySchemas`, `Aggregate*`, `SchemaAccessors`,
 > `DefaultCrypto`), and a **pure `Entity.make` / `Aggregate.make`** that return a
 > definition carrying the derived `inputSchema` / `updateSchema` / `createSchema`
@@ -79,6 +81,8 @@ packages/effect-dynamodb/src/
 ├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
+├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
+├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
 │   ├── Expr.ts         # Expr ADT — 16 expression node types, ConditionOps, compileExpr, parseShorthand
@@ -92,6 +96,7 @@ packages/effect-dynamodb/src/
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
 │   ├── CompositeCodec.ts # (schema pkg) THE composite key-form rule — every path uses it; see DESIGN §7
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
+│   ├── Packed.ts       # Packed storage over items: pack/unpack attributes, stream-image normalisation (base64 B), EDD-9076 expression guards
 │   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
 │   └── ...             # AggregateCursor, AggregateEdges, etc.
 └── index.ts            # Public API barrel export
@@ -117,6 +122,8 @@ DynamoModel → effect (Schema)
 DynamoSchema → (standalone)
 KeyComposer → (standalone)
 Marshaller → @aws-sdk/util-dynamodb
+StorageEncoding → Marshaller, internal/Packed, Compression + PackedCodec (schema pkg)
+compression/zlib → node:zlib, Compression (schema pkg, types only)
 Projection → (standalone)
 Errors → effect (Data)
 ```
@@ -323,6 +330,7 @@ Do NOT:
 | `guides/queries.mdx` | `examples/guide-queries.ts` |
 | `guides/expressions.mdx` | `examples/guide-expressions.ts` |
 | `guides/timeseries.mdx` | `examples/guide-timeseries.ts` |
+| `guides/packed-storage.mdx` | `examples/guide-packed-storage.ts` |
 | `guides/vector-search.mdx` | `examples/guide-vector-search.ts` |
 | ... (all other tutorials/guides follow the same pattern) | |
 
@@ -513,6 +521,12 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Unverified snapshot loads — `verifySnapshot: false` (`CommandHandlerOptions` / `ReadLatestOptions`).** Accepted ONLY on `snapshot.mode: "inline"` without `every` (the one mode whose snapshot is normally at the head); anything else is `[EDD-9068]` — thrown by `commandHandler` at construction, a defect from `readLatest`; ignored without a snapshot config. Loads the snapshot item alone (one `GetItem`); with no snapshot item it falls back to the verified `readLatest`. Contract: **no answer decided on an unverified snapshot is returned until the head confirms it** — a successful append confirms it by itself; a domain error, a no-op or an append `VersionConflict` costs one more read. If-Match ≠ snapshot `asOfVersion` → verified re-read BEFORE `decide` (the #136 check, verified `actualVersion`). If-Match = `asOfVersion` → `decide` on the snapshot (exactly the state the caller saw); a non-append answer is checked with a head `Query` bounded below by the snapshot's version (reverse, `Limit: 1` over `[floor+1 … max]` — reads ZERO items while the snapshot is current; never a `currentVersion`-style read of the newest event, which would pay the event size the option exists to skip), and a head past the If-Match answers as the verified handler (`DuplicateCommand` probe, else `VersionConflict { actualVersion: head }`) — never re-decided. No If-Match: domain error / no-op → head check, stale → verified load + re-decide once; append conflict → verified load, events past the snapshot → re-decide once, snapshot at head → genuine race → `retry` policy. **Why `decide` runs twice:** a decision made on a lagging snapshot is stale and cannot be patched, only made again (the same price a `VersionConflict` retry pays); surfacing it instead would fail or mis-answer every command on the stream, because only a successful inline append rewrites the snapshot. At most once per attempt; a function-form `additionalItems` re-runs only when both decisions append. Do NOT reintroduce "staleness always surfaces at the append" reasoning — it does not hold for decisions that append nothing.
 - **An append is never split — large commands are stepped commands (#141 not implemented).** One command → one decision → one atomic append: an append carries one decision's events and the ONE state after all of them, so split across transactions it would have no valid intermediate state (snapshot, projection, sentinel) at the boundaries. Over the limits → `AppendTooLarge` / `ValidationError` before anything is written. The application splits a large command into fixed-size steps, each an ordinary `commandHandler` call chained by `expectedVersion` (with idempotency, a `commandId` per step, e.g. `${commandId}#step-${n}`); a failure partway leaves a real intermediate state. A redelivered large command (same `commandId`, original `expectedVersion`) resumes by skipping each `DuplicateCommand` step while KEEPING the stale If-Match (so the next step is sentinel-probed before `decide`), then running the first `VersionConflict` step at its `actualVersion` — never chain from the head after a duplicate (`decide` would run against already-applied steps). Do not re-add a library-side chunked append.
 - **Stream indexes (#140).** `makeStream({ indexes })` — LSI (default) or GSI (`pk` attribute filled with the stream's partition key); `key(event, version)` stored RAW, `undefined` = sparse; only event items carry index attributes. `readIndex` / `query.index` with type-checked names; `indexDefinitions` emits projection-`ALL` CreateTable fragments. An LSI must be created with the table and caps EVERY partition key value's item collection at 10 GB; index attributes are written only by `append`, never backfilled. EDD-9062–9067.
+
+### Packed Storage (#147, `docs/designs/storage-encoding.md`, `guides/packed-storage.mdx`)
+- **One config, two consumers.** `DynamoModel.Packed({ format: "json", compression?: { codec, threshold? } })` — entity fields via `configure(..., { f: { storedAs } })`, EventStore via `makeStream({ storedAs: { data } })` + `snapshot.storedAs`. Default stays native; metadata always a map.
+- **Self-describing stored form, no marker attribute.** Native = legacy, `S` = JSON, `B` = header byte (`vvv ff ccc`: v1, json, codec) + compressed JSON. Readers dispatch on the stored value, never the config, so switching needs no rewrite. Compress only at `>= threshold` (default 1024) AND when smaller.
+- **Compressors via `Compression` service read from context** (no new `R`): `DynamoClient.make({ compressors })` > ambient at bind > ambient at run. Recommend `Compression.layer([...])` merged into the app layer (`DynamoClient.layer({ compressors })`'s output is lost behind a wrapper consumed via `Layer.provide`). A codec a bound member / stream config names must be registered at bind (`DynamoClient.make`, `EventStore.bind`) or an unbound stream's first op → `[EDD-9078]` defect. Any other missing codec → `ValidationError` whose `cause` is `CompressorNotRegistered` (never a new error-union member: packing is opt-in, so error channels stay those of 1.25.0). Read hot paths run a sync codec core, one Effect per row (`bench/packed-decode.ts`).
+- **Packing runs after encode/rename/sparse, before marshalling**, so every size measurement (diagnosis, `measureAppend`, `valueBytes`) counts stored bytes. Guards: EDD-9071–9079.
 
 ### Aggregate Operations
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.

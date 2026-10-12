@@ -403,5 +403,8 @@ export const validateAndBuildPutItem = (
       })
     }
 
+    // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
+    yield* entity._packFields(item, operation)
+
     return { item, marshalled: toAttributeMap(item), now, createdAtSupplied }
   })

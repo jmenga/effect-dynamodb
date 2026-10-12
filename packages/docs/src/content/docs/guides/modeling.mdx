@@ -47,7 +47,7 @@ Each field accepts an `AttributeConfig` object with these options:
 | Option | Type | Description |
 |--------|------|-------------|
 | `field` | `string` | Rename the domain field to a different DynamoDB attribute name |
-| `storedAs` | `DynamoModel.*` schema | Override DynamoDB storage encoding (must match domain type) |
+| `storedAs` | `DynamoModel.*` date schema, `DynamoModel.SparseMap()` or `DynamoModel.Packed(...)` | Override how the field is stored: a date encoding (must match the domain type), or a storage layout (see [Storage Layouts](#storage-layouts)) |
 | `immutable` | `boolean` | Exclude from `Entity.Update` — read-only after creation |
 | `identifier` | `boolean` | Mark as the identity field for ref/aggregate resolution |
 | `ref` | `boolean` | Mark as a denormalized reference to another entity |
@@ -124,6 +124,28 @@ The new stored form can't be read by 1.22.0. A 1.22.0 reader fails with `Expecte
 
 Until old rows are rewritten, the attribute is a map (`M`) on old rows and a string or number on new ones. A filter on it can therefore match the two differently, and DynamoDB Streams consumers see the type change.
 :::
+
+### Storage Layouts
+
+Two `storedAs` values change how a structured field is laid out on the item, rather than how one value is encoded:
+
+| `storedAs` | Valid on | Stored as | Use when |
+|---|---|---|---|
+| *(omitted)* | any field | a native map (`M`) or list (`L`) | the default; DynamoDB can address paths inside it |
+| `DynamoModel.SparseMap()` | a `Schema.Record` | one top-level attribute per entry (`metrics#2026-04`) | each key is updated, counted or checked on its own. See [Sparse Maps](/effect-dynamodb/guides/sparse-maps/). |
+| `DynamoModel.Packed({ format: "json", compression? })` | a struct, class, array, record or union of them | one JSON string (`S`), or compressed binary (`B`) at or above a threshold | the value is read and written whole, and you want faster bulk reads or fewer write units. See [Packed Storage](/effect-dynamodb/guides/packed-storage/). |
+
+```typescript
+const OrderModel = DynamoModel.configure(Order, {
+  lines: { storedAs: DynamoModel.Packed({ format: "json" }) },
+  details: {
+    field: "d",
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+  },
+})
+```
+
+A packed field can't be a key or index composite, a unique-constraint field or a ref, and DynamoDB can't see inside it. Conditions and filters only test whether it exists, and updates replace it whole. Readers go by each item's stored form, so turning packing on or off needs no data rewrite.
 
 ### Immutable Fields
 
@@ -448,3 +470,4 @@ See [DynamoDB Streams](/effect-dynamodb/guides/streams/) for usage.
 - [Queries](/effect-dynamodb/guides/queries/) — Use the pipeable Query API
 - [Data Integrity](/effect-dynamodb/guides/data-integrity/) — Unique constraints and optimistic concurrency
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) — Soft delete, versioning, TTL
+- [Packed Storage](/effect-dynamodb/guides/packed-storage/) — Store structured fields as JSON, compressed above a threshold

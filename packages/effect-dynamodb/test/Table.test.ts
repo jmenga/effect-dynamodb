@@ -556,6 +556,28 @@ describe("Table", () => {
       )
     })
 
+    it("a refused Table.make leaves its members bound to their earlier table", () => {
+      const configured: Array<string> = []
+      const tracked = (
+        entityType: string,
+        primary?: { readonly pk: string; readonly sk: string },
+      ) => ({
+        ...entityWith(entityType, {}, primary),
+        _configure: () => {
+          configured.push(entityType)
+        },
+      })
+      expect(() =>
+        Table.make({
+          schema,
+          entities: { User: tracked("User"), Order: tracked("Order", { pk: "PK", sk: "SK" }) },
+        }),
+      ).toThrow(/\[EDD-9069\]/)
+      expect(configured).toEqual([])
+      Table.make({ schema, entities: { User: tracked("User") } })
+      expect(configured).toEqual(["User"])
+    })
+
     it("refuses entities that disagree on the primary-key fields", () => {
       expectRefused(
         {

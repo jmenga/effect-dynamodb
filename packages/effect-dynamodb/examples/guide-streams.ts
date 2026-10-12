@@ -164,6 +164,7 @@ type EmployeeMarshalled = Entity.Marshalled<typeof EmployeeEntity>
 //     readonly NULL?: boolean
 //     readonly L?: ReadonlyArray<unknown>
 //     readonly M?: Record<string, unknown>
+//     readonly B?: Uint8Array
 //   }
 // }
 // #endregion
