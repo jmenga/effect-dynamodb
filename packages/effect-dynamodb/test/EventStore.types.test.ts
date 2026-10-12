@@ -32,13 +32,24 @@
  *   neither channel) or an `Effect` of it, whose error / requirements join as a
  *   separate `E4` / `R4` — so it infers next to an `eventMetadata` effect with a
  *   different error type, the case one shared `E3` / `R3` pair would break.
+ * - Packed storage (#147): `storedAs` admits only `data`, and it and
+ *   `snapshot.storedAs` only a `DynamoModel.Packed` config; every operation
+ *   that writes or decodes events or snapshots carries
+ *   `CompressorNotRegistered`; `measureAppend` / `measureSnapshot` need only
+ *   `TableConfig` (nothing on a bound stream) and `decodeStreamImage` nothing,
+ *   returning the read paths' `StreamEvent`.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
  */
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type { ValidationError, VersionConflict } from "@effect-dynamodb/schema/Errors.js"
+import type {
+  CompressorNotRegistered,
+  ValidationError,
+  VersionConflict,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Context, Data, DateTime, Effect, type Option, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
@@ -1145,5 +1156,117 @@ describe("EventStore.commandHandler types", () => {
         expect(true).toBe(true)
       })
     })
+  })
+})
+
+describe("EventStore packed storage types (#147)", () => {
+  const Packed = EventStore.makeStream({
+    table: AppTable,
+    streamName: "Packed",
+    events: [Incremented],
+    streamId: { composite: ["counterId"] },
+    metadata: Schema.Struct({ by: Schema.String }),
+    storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+    snapshot: {
+      schema: Schema.Struct({ total: Schema.Number }),
+      storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+    },
+  })
+
+  it("storedAs admits only data, and only Packed configs", () => {
+    typeOnly(() => {
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "Bad",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        // @ts-expect-error — metadata always stays a map
+        storedAs: { metadata: DynamoModel.Packed({ format: "json" }) },
+      })
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "Bad",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        // @ts-expect-error — not a Packed config
+        storedAs: { data: { format: "json" } },
+      })
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "Bad",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        // @ts-expect-error — not a Packed config
+        snapshot: { schema: Schema.Struct({ total: Schema.Number }), storedAs: "json" },
+      })
+    })
+    expectTypeOf(Packed.storedAs).toEqualTypeOf<EventStore.StreamStorageSettings>()
+  })
+
+  it("error channels carry CompressorNotRegistered", () => {
+    typeOnly(() => {
+      expectTypeOf<CompressorNotRegistered>().toExtend<
+        Effect.Error<ReturnType<typeof Packed.read>>
+      >()
+      expectTypeOf<CompressorNotRegistered>().toExtend<
+        Effect.Error<ReturnType<typeof Packed.readLatest>>
+      >()
+      expectTypeOf<CompressorNotRegistered>().toExtend<
+        Effect.Error<ReturnType<typeof Packed.readSnapshot>>
+      >()
+      expectTypeOf<CompressorNotRegistered>().toExtend<
+        Effect.Error<ReturnType<typeof Packed.writeSnapshot>>
+      >()
+      expectTypeOf<CompressorNotRegistered>().toExtend<EventStore.AppendError>()
+      expectTypeOf<CompressorNotRegistered>().toExtend<
+        Effect.Error<ReturnType<typeof Query.collect<unknown>>>
+      >()
+      const handled = EventStore.commandHandler(decider, Packed)(key, command)
+      expectTypeOf<CompressorNotRegistered>().toExtend<Effect.Error<typeof handled>>()
+    })
+    expect(true).toBe(true)
+  })
+
+  it("measureAppend / measureSnapshot / decodeStreamImage signatures", () => {
+    typeOnly(() => {
+      const measured = Packed.measureAppend(key, [new Incremented({ by: 1 })], 0, {
+        metadata: { by: "me" },
+        snapshot: { total: 1 },
+      })
+      expectTypeOf(measured).toEqualTypeOf<
+        Effect.Effect<
+          EventStore.AppendMeasurement,
+          ValidationError | CompressorNotRegistered,
+          Table.TableConfig
+        >
+      >()
+      // @ts-expect-error — additionalItems are not measured
+      Packed.measureAppend(key, [], 0, { additionalItems: [] })
+      expectTypeOf(Packed.measureSnapshot(key, { total: 1 }, 1)).toEqualTypeOf<
+        Effect.Effect<number, ValidationError | CompressorNotRegistered, Table.TableConfig>
+      >()
+      // @ts-expect-error — no snapshot config: the state is never
+      Counter.measureSnapshot(key, { total: 1 }, 1)
+      const decoded = Packed.decodeStreamImage({ pk: { S: "x" } })
+      expectTypeOf(decoded).toEqualTypeOf<
+        Effect.Effect<
+          Option.Option<EventStore.StreamEvent<Incremented, { readonly by: string } | undefined>>,
+          ValidationError | CompressorNotRegistered,
+          never
+        >
+      >()
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Packed)
+        expectTypeOf(bound.measureAppend(key, [], 0)).toEqualTypeOf<
+          Effect.Effect<
+            EventStore.AppendMeasurement,
+            ValidationError | CompressorNotRegistered,
+            never
+          >
+        >()
+        expectTypeOf(bound.decodeStreamImage({})).toEqualTypeOf<typeof decoded>()
+      })
+    })
+    expect(true).toBe(true)
   })
 })
