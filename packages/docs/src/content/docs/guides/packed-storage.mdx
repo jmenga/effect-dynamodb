@@ -212,7 +212,7 @@ The typed `PathBuilder` also rejects these at compile time: a packed field's pat
 - **Version snapshots** (`versioned: { retain: true }`), **soft-delete tombstones** and **time-series event items** copy the stored value as it is: `S` stays `S`, `B` stays the same bytes. `restore` writes it back unchanged.
 - An update that reads the item first (retain, unique constraints) carries packed values it doesn't name byte for byte, so an unrelated update doesn't re-encode them.
 - An `immutable` packed field is compared by its unpacked JSON, not by its bytes, so the same value under a different codec or threshold still matches.
-- **Aggregate** edge entities store their packed fields packed. An aggregate `update` writes only the edges whose values changed.
+- **Aggregate** edge entities store their packed fields packed, and edge items are read by their stored form, so turning an edge entity's packing off needs no rewrite either. An aggregate `update` writes only the edges whose values changed.
 - A `DynamoModel.ref` copy of an entity stores the referenced entity's fields natively inside the copy. Packing belongs to the owning entity's storage.
 
 ## Registering compressors
