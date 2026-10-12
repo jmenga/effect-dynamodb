@@ -1496,6 +1496,51 @@ With CDK or Terraform, copy each `Projection` from `indexDefinitions` exactly. I
 - **Wider than declared** works and costs more. One drift fails nothing: an index declared `all` but deployed `withoutMetadata` reads `metadata` as `undefined`.
 :::
 
+## Step 21: Packed Storage
+
+Event `data` and snapshot `state` are stored as native DynamoDB maps by default. For long streams that you fold often, or for large states, store them as one JSON string instead, compressed above a threshold:
+
+```typescript title="stream.ts" region="stream" example="guide-packed-storage.ts"
+class Recorded extends Schema.TaggedClass<Recorded>()("Recorded", {
+  amount: Schema.Number,
+  note: Schema.String,
+}) {}
+
+class Voided extends Schema.TaggedClass<Voided>()("Voided", {
+  reason: Schema.String,
+}) {}
+
+type LedgerEvent = Recorded | Voided
+
+const LedgerState = Schema.Struct({
+  total: Schema.Number,
+  entries: Schema.Array(Schema.Struct({ amount: Schema.Number, note: Schema.String })),
+})
+type LedgerState = typeof LedgerState.Type
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Orders } })
+
+const Ledger = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Ledger",
+  events: [Recorded, Voided],
+  streamId: { composite: ["ledgerId"] },
+  metadata: Schema.Struct({ correlationId: Schema.String }),
+  // Event data as JSON (S); metadata always stays a map
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+  snapshot: {
+    schema: LedgerState,
+    mode: "inline",
+    // Snapshot state as JSON, zstd-compressed from 1 KB (the default threshold)
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+  },
+})
+```
+
+Reading ~6,000 events is about 3× faster when `data` is JSON, and a ~48 KB state stored as zstd-compressed JSON takes about 5 write units instead of ~39. Every read path decodes each item by its stored form, so turning packing on needs no rewrite. A stream can hold a mix of map, JSON and compressed items. Metadata stays a map.
+
+`Query.select` raw rows return `data` as parsed JSON whatever its stored form. A filter on a path inside packed `data` is refused with `[EDD-9076]`, so use `Query.filterBy`. `measureAppend` and `measureSnapshot` return the stored sizes for chunk planning, and `decodeStreamImage` decodes DynamoDB Streams records. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) for compressor registration, the stored form, sizing and rollout order.
+
 ---
 
 ## Running the Example
@@ -1580,10 +1625,12 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Event metadata** | `makeStream({ metadata })` declares the schema; `append(..., { metadata })` shares one value, `{ eventMetadata }` gives each event its own entry; on a handler, `eventMetadata: (decision) => entries` derives them after `decide` |
 | **Event timestamps** | `append(..., { eventTimestamps })` writes each event's own `DateTime` as its `timestamp` (`undefined` keeps the append time); on a handler, `eventTimestamps: (decision) => timestamps`. `version`, not `timestamp`, orders a stream |
 | **Index projection** | `projection: "withoutMetadata"` (`INCLUDE` without `metadata`, read in one query) or `"keys"` (`INCLUDE ["__edd_e__"]`, events fetched from the table) on a stream index; the deployed `Projection` must match `indexDefinitions` |
+| **Packed storage** | `makeStream({ storedAs: { data: DynamoModel.Packed(...) } })` and `snapshot.storedAs` store data and state as JSON, compressed above a threshold; readers decode by the stored form, so a stream can mix encodings |
 
 ## What's Next?
 
 - [Modeling Guide](/effect-dynamodb/guides/modeling/) — Deep dive into models, schemas, tables, and entities
 - [Queries Guide](/effect-dynamodb/guides/queries/) — Query combinators, pagination, and filtering
+- [Packed Storage Guide](/effect-dynamodb/guides/packed-storage/) — JSON and compressed storage for event data and snapshot state
 - [Example: Unique Constraints](/effect-dynamodb/tutorials/unique-constraints/) — Globally unique fields and idempotency keys
 - [Example: Human Resources](/effect-dynamodb/tutorials/human-resources/) — Single-table design with collections and transactions
