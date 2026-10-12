@@ -311,7 +311,7 @@ const packedBytes = (
  *   schema: LedgerState,
  *   value: state,
  *   storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
- *   compressors: [NodeCompression.zstd()],
+ *   compressors: [ZlibCompression.zstd()],
  * })
  * ```
  */

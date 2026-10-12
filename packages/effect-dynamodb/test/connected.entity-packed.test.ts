@@ -42,7 +42,7 @@ import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
@@ -374,7 +374,7 @@ const ClientLayer = DynamoClient.layer({
   region: "us-east-1",
   endpoint: ENDPOINT,
   credentials,
-  compressors: [NodeCompression.gzip(), NodeCompression.zstd()],
+  compressors: [ZlibCompression.gzip(), ZlibCompression.zstd()],
 })
 const BareClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })
 const Tables = Layer.mergeAll(
@@ -849,7 +849,7 @@ describeConnected("Entity packed fields (#147)", () => {
       const db = yield* DynamoClient.make({
         entities: { Orders },
         tables: { MainTable },
-        compressors: [NodeCompression.gzip(), NodeCompression.zstd()],
+        compressors: [ZlibCompression.gzip(), ZlibCompression.zstd()],
       })
       yield* db.entities.Orders.put(order("explicit-1"))
       const stored = (yield* rawItem("order", "explicit-1"))!

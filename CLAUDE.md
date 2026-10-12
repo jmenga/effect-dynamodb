@@ -82,7 +82,7 @@ packages/effect-dynamodb/src/
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
-├── compression/node.ts # Subpath `effect-dynamodb/compression/node` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
+├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
 │   ├── Expr.ts         # Expr ADT — 16 expression node types, ConditionOps, compileExpr, parseShorthand
@@ -123,7 +123,7 @@ DynamoSchema → (standalone)
 KeyComposer → (standalone)
 Marshaller → @aws-sdk/util-dynamodb
 StorageEncoding → Marshaller, internal/Packed, Compression + PackedCodec (schema pkg)
-compression/node → node:zlib, Compression (schema pkg, types only)
+compression/zlib → node:zlib, Compression (schema pkg, types only)
 Projection → (standalone)
 Errors → effect (Data)
 ```

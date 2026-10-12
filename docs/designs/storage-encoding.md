@@ -6,7 +6,7 @@
 `Compressor` interface, the pure pack/unpack codec, entity definition guards, the
 `CompressorNotRegistered` error), `packages/effect-dynamodb` (Entity, EventStore, Query,
 Aggregate, Batch, Transaction, Collection, DynamoClient, new `StorageEncoding` module, new
-subpath `effect-dynamodb/compression/node`), docs, examples
+subpath `effect-dynamodb/compression/zlib`), docs, examples
 **Semver impact:** `minor` (lockstep across the four publishable packages). Additive API
 surface; the default storage is unchanged — see §14.
 
@@ -53,8 +53,8 @@ const Ledger = EventStore.makeStream({
 
 Compression implementations are **pluggable**: a small synchronous `Compressor` interface
 (`codec` + `compress` + `decompress` on `Uint8Array`), registered through a `Compression`
-service that `DynamoClient.layer({ compressors })` provides. Node implementations
-(`node:zlib`) ship from a new subpath, `effect-dynamodb/compression/node`; the core never
+service that `DynamoClient.layer({ compressors })` provides. `node:zlib`-backed implementations
+ship from a new subpath, `effect-dynamodb/compression/zlib`; the core never
 imports `node:zlib`.
 
 The stored form is **self-describing per attribute**. Readers dispatch on what is stored,
@@ -145,7 +145,7 @@ Three consequences shape the design:
 - Default map; metadata map; no zstd dictionary; no per-event-type override.
 - Self-describing stored form, no marker attribute; readers dispatch on the stored value.
 - Compress only at ≥ threshold *and* when smaller; default threshold 1,024.
-- Pluggable sync compressors; Node implementations from a subpath; unregistered codec on
+- Pluggable sync compressors; `node:zlib`-backed implementations from a subpath; unregistered codec on
   read or write fails with a tagged error naming it.
 - Guards, refusals and helpers as listed in §6–§8; diagnose-on-failure for sizes.
 
@@ -314,10 +314,10 @@ as a standalone `Compression.layer([...])` merged into the application layer bes
 client:
 
 ```ts
-import * as NodeCompression from "effect-dynamodb/compression/node"
+import * as ZlibCompression from "effect-dynamodb/compression/zlib"
 const AppLayer = Layer.mergeAll(
   DynamoClient.layer({ region: "us-east-1" }),
-  Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+  Compression.layer([ZlibCompression.zstd(), ZlibCompression.gzip()]),
 )
 ```
 
@@ -345,8 +345,8 @@ widened return type would have broken existing annotations.) The registry is val
 `R`, but the service + `serviceOption` matches the `Embedder` precedent and keeps "no
 registry" distinguishable from "empty registry" for the bind-time precedence above.
 
-**Node implementations** — new subpath export `effect-dynamodb/compression/node`
-(`src/compression/node.ts`, `package.json` `exports["./compression/node"]`):
+**`node:zlib`-backed implementations** — new subpath export `effect-dynamodb/compression/zlib`
+(`src/compression/zlib.ts`, `package.json` `exports["./compression/zlib"]`):
 
 ```ts
 export const gzip:   (options?: { readonly level?: number; readonly maxOutputLength?: number }) => Compressor
@@ -1166,7 +1166,7 @@ isolation, and the remaining difference moves with GC timing, not with the libra
 
 ### 12.2 Unit — effect-dynamodb (mocked `DynamoClient`)
 
-- `test/compression-node.test.ts`: gzip/brotli/zstd round-trip, `available()`,
+- `test/compression-zlib.test.ts`: gzip/brotli/zstd round-trip, `available()`,
   `maxOutputLength` enforcement, the 64 MiB default bound (a bomb one byte over it is
   refused by every codec, exactly the bound reads, `Infinity` lifts it, and a packed value
   over it reads as a `ValidationError`), invalid `maxOutputLength` refused at construction,
@@ -1261,7 +1261,7 @@ in §12.1 prove a packed field cannot enter a composite.
 | `guides/streams.mdx` + `examples/guide-streams.ts` | base64 `B` in Lambda / EventBridge Pipes images; `decodeMarshalledItem` with packed fields; `EventStream.decodeStreamImage`; `itemSchema` does not unpack |
 | `tutorials/event-sourcing.mdx`, `guides/modeling.mdx`, `guides/sparse-maps.mdx` | one-paragraph pointers to the new guide (`storedAs` options list in modeling) |
 | `DESIGN.md` | §7 "Packed Storage" (short, this commit); EDD registry rows 9071–9079 (this commit); §12 EventStore paragraph, §15 error taxonomy and "Declared Errors per Operation" (implementation commits) |
-| `CLAUDE.md` | module structure (`Compression`, `StorageEncoding`, `compression/node`), test counts |
+| `CLAUDE.md` | module structure (`Compression`, `StorageEncoding`, `compression/zlib`), test counts |
 | `README.md` | feature list mention |
 | changeset | `minor`, all four packages; `pnpm changeset version` in the PR (Release Workflow) |
 
@@ -1322,7 +1322,7 @@ this design introduced. **Source** says who decided.
 | 27 | Open Q: one stream-wide encoding or per-event-type override | **Stream-wide only**; per-type out | user |
 | 28 | Open Q: default threshold | **1024** | user |
 | 29 | Open Q: exposing fingerprint mode | **Out** | user |
-| 30 | Open Q: zstd / brotli optional for runtimes without them | **In**: compressors are pluggable; `NodeCompression.zstd()` errors on Node < 22.15, `available()` omits it | user; design |
+| 30 | Open Q: zstd / brotli optional for runtimes without them | **In**: compressors are pluggable; `ZlibCompression.zstd()` errors on Node < 22.15, `available()` omits it | user; design |
 | 31 | Not in scope: changing the default encoding | **Out** | issue |
 | 32 | Not in scope: re-encoding existing data | **Out** | issue |
 | 33 | R1 stored-size helper (value under a config; full event item incl. metadata) | **In**: `StorageEncoding.valueBytes`, `stream.measureAppend`, `stream.measureSnapshot`, `StorageEncoding.limits` (§3.5, §8.2) | consumer |
@@ -1346,7 +1346,7 @@ this design introduced. **Source** says who decided.
 | 51 | Fail-fast check at `DynamoClient.make` that every configured codec is registered | **Added in review (row 63)**: a store configured with a codec meets values compressed with it, so readers need the codec too; `[EDD-9078]` defect at `DynamoClient.make` / `EventStore.bind`, or an unbound stream's first operation. Past bind, the run-time `ValidationError` (cause `CompressorNotRegistered`) covers the rest | design; changed by review |
 | 52 | Unregistered codec → tagged error naming the codec | **Changed**: `CompressorNotRegistered` names it, as the `cause` of a `ValidationError` — not a new error-channel member, which broke never-packing consumers (§5.3) | user |
 | 53 | Corrupt / unsupported packed values | **`ValidationError`** (§5.3), like any undecodable row | design |
-| 54 | Node compressors from a subpath (`effect-dynamodb/compression/node`) | **In**; `maxOutputLength` option added for decompression bombs, bounded at 64 MiB by default (downstream review) | user; option: design; default: review |
+| 54 | `node:zlib` compressors from a subpath (renamed from `/node` so the subpath names the API it needs, not a runtime) (`effect-dynamodb/compression/zlib`) | **In**; `maxOutputLength` option added for decompression bombs, bounded at 64 MiB by default (downstream review) | user; option: design; default: review |
 | 55 | Compressor tuning in the config (level, quality) | **Out of the config**: on the compressor factory (§3.1) | design |
 | 56 | `Entity.decodeMarshalledItem` ignores renames and sparse maps (found while designing R2) | **In — adjacent debt** fixed in the same change (§3.5) | design (golden rule) |
 | 57 | `Entity.itemSchema` unpacking | **Out**: a pure schema cannot decompress; documented (§3.5) | design |
@@ -1356,7 +1356,7 @@ this design introduced. **Source** says who decided.
 | 61 | New error codes | `EDD-9071`–`EDD-9079`, registry rows added in this commit | design |
 | 62 | Review P1: per-value unpack overhead | **In**: synchronous codec core, one Effect per row / image / partition, registry read from the fiber once per row (none for a row with nothing packed), non-fatal `TextDecoder` with a fatal re-check, `StorageEncoding.*Sync` twins, `bench/packed-decode.ts` (§11). Out: reusing a native zstd context across calls (Node exposes no sync API for it) | review; design |
 | 63 | Review P2: configured codec checked at bind | **In**: `[EDD-9078]` defect from `DynamoClient.make` (entities, aggregate edges) and `EventStore.bind`, and from an unbound stream's first operation per registry (§3.4). A codec-naming member now needs its codec registered where it is bound (a run-time-only registry no longer suffices for it). Out: unbound entity operations and the `query.*` stream descriptors (no single entry point; they keep the run-time `ValidationError`) | review; design |
-| 64 | Review P3: decompression-bomb guard | **In**: 64 MiB default `maxOutputLength` in the Node compressors, configurable, `Infinity` lifts it (§3.4) | review |
+| 64 | Review P3: decompression-bomb guard | **In**: 64 MiB default `maxOutputLength` in the zlib compressors, configurable, `Infinity` lifts it (§3.4) | review |
 | 65 | Review P4: raw data from `decodeStreamImage` | **In**: `{ raw: true }` → `RawStreamEvent` with `rawData` (§3.5). Out: the same on `Entity.decodeMarshalledItem` — it returns the item itself, so a raw view needs a different result shape; not cheap-and-consistent | review; design |
 | 66 | Review P5: `Compression` lost behind a wrapper layer | **In**: docs, guide and example lead with a standalone `Compression.layer([...])` merged into the app layer, and explain the `Layer.provide` pitfall (§3.4). `DynamoClient.layer({ compressors })` / `layerConfig` **kept**: they work when used directly, and removing them is not needed to fix the pitfall | review; design |
 | 67 | Review P6: synchronous `valueBytes` | **In**: `StorageEncoding.valueBytesSync({ schema, value, storedAs?, compressors? })` — the options object of `valueBytes` plus explicit compressors, rather than the reviewer's sketched `(value, config, { compressor })`, so the two read alike and the schema encode (dates, renames inside the value) is the same (§3.5) | review; design |
@@ -1376,7 +1376,7 @@ this design introduced. **Source** says who decided.
    module (`encode`, `decode`, `decodeUnmarshalled`, `valueBytes`, each with a `*Sync` twin;
    `limits`); stream methods `measureAppend`,
    `measureSnapshot`, `decodeStreamImage`; Node factories `gzip`, `brotli`, `zstd`,
-   `available` from `effect-dynamodb/compression/node`.
+   `available` from `effect-dynamodb/compression/zlib`.
 3. **Header:** one byte, `vvv ff ccc`: version `001`; format `00` json, `01` binary
    (reserved); codec `000` none, `001` gzip, `010` brotli, `011` zstd. Writers emit
    `0x21`/`0x22`/`0x23`.

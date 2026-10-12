@@ -2,7 +2,7 @@
  * Node-free guard — `@effect-dynamodb/schema` is runtime-neutral: compression
  * goes through the pluggable `Compression` registry, and the package never
  * imports `node:zlib` (or any other Node builtin) in its source or built JS.
- * Node compressors live in `effect-dynamodb/compression/node`.
+ * zlib compressors live in `effect-dynamodb/compression/zlib`.
  */
 import { execFileSync } from "node:child_process"
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"

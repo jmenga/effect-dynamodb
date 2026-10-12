@@ -500,14 +500,14 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    *
    * @example
    * ```typescript
-   * import * as NodeCompression from "effect-dynamodb/compression/node"
+   * import * as ZlibCompression from "effect-dynamodb/compression/zlib"
    * // Recommended: the compressors as their own layer, beside the client
    * const AppLayer = Layer.mergeAll(
    *   DynamoClient.layer({ region: "us-east-1" }),
-   *   Compression.layer([NodeCompression.zstd()]),
+   *   Compression.layer([ZlibCompression.zstd()]),
    * )
    * // Also works, when this layer is used directly:
-   * const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
+   * const live = DynamoClient.layer({ region: "us-east-1", compressors: [ZlibCompression.zstd()] })
    * ```
    */
   static readonly layer: {

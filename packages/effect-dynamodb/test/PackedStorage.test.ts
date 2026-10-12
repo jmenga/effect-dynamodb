@@ -10,7 +10,7 @@ import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Exit } from "effect"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import {
   currentRegistry,
   decodeImage,
@@ -24,7 +24,7 @@ import {
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import { missingCompressor } from "./helpers/MissingCompressor.js"
 
-const registry = Compression.make(NodeCompression.available())
+const registry = Compression.make(ZlibCompression.available())
 const ctx = { entityType: "Order", operation: "put.packed" }
 const readCtx = { entityType: "Order", operation: "decode" }
 
@@ -56,7 +56,7 @@ describe("currentRegistry", () => {
   it.effect("is the provided registry", () =>
     Effect.gen(function* () {
       expect((yield* currentRegistry).codecs).toEqual(["gzip"])
-    }).pipe(Effect.provide(Compression.layer([NodeCompression.gzip()]))),
+    }).pipe(Effect.provide(Compression.layer([ZlibCompression.gzip()]))),
   )
 })
 
@@ -198,7 +198,7 @@ describe("stream images", () => {
     Effect.gen(function* () {
       const image = yield* packedImage
       expect(yield* decodeImage(image, ["s", "b", "native"], readCtx)).toEqual(expected)
-    }).pipe(Effect.provide(Compression.layer(NodeCompression.available()))),
+    }).pipe(Effect.provide(Compression.layer(ZlibCompression.available()))),
   )
 
   it.effect("DynamoDB JSON with B / BS as base64 at any depth (Lambda, Pipes)", () =>
@@ -213,7 +213,7 @@ describe("stream images", () => {
       expect(JSON.parse(JSON.stringify(lambda))).toEqual(lambda) // pure JSON, as delivered
       const decoded = yield* decodeImage(lambda, ["s", "b", "native"], readCtx)
       expect(decoded).toEqual({ ...expected, nested: { inner: [new Uint8Array([9, 9])] } })
-    }).pipe(Effect.provide(Compression.layer(NodeCompression.available()))),
+    }).pipe(Effect.provide(Compression.layer(ZlibCompression.available()))),
   )
 
   it.effect("unmarshalled image with packed B as Uint8Array or as base64 text", () =>
@@ -223,7 +223,7 @@ describe("stream images", () => {
       const withBase64 = { ...raw, b: base64(raw.b as Uint8Array) }
       expect(String(withBase64.b)[0]).toMatch(/[I-P]/)
       expect(yield* decodeImage(withBase64, ["s", "b", "native"], readCtx)).toEqual(expected)
-    }).pipe(Effect.provide(Compression.layer(NodeCompression.available()))),
+    }).pipe(Effect.provide(Compression.layer(ZlibCompression.available()))),
   )
 
   it.effect('an S whose JSON would look like base64 never does (JSON starts with { [ " …)', () =>

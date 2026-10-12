@@ -605,7 +605,7 @@ const packedError = (message: string): Error =>
  * needs no rewrite.
  *
  * Compression codecs are pluggable: register implementations through the
- * `Compression` service (for Node, `effect-dynamodb/compression/node`).
+ * `Compression` service (`node:zlib`-backed ones ship from `effect-dynamodb/compression/zlib`).
  *
  * @example
  * ```ts

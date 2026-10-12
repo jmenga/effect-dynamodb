@@ -27,7 +27,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Layer, Schema } from "effect"
 import { Base64 } from "effect/encoding"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -79,7 +79,7 @@ const payload = (i: number): Payload => ({
   lines: Array.from({ length: 16 }, (_, j) => ({ sku: `SKU-${i}-${j}`, qty: j + 1, price: 9.99 })),
 })
 
-const zstd = NodeCompression.zstd()
+const zstd = ZlibCompression.zstd()
 const registry = Compression.make([zstd])
 const zstd0 = DynamoModel.Packed({ format: "json", compression: { codec: "zstd", threshold: 0 } })
 const json = DynamoModel.Packed({ format: "json" })

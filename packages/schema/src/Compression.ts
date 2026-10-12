@@ -5,8 +5,8 @@
  * This module is runtime-neutral: it declares the synchronous
  * {@link Compressor} interface, a registry keyed by codec, and the
  * {@link Compression} service through which a registry reaches the read and
- * write paths. It never imports a compression library. Node implementations
- * (`node:zlib`: gzip, brotli, zstd) ship from `effect-dynamodb/compression/node`;
+ * write paths. It never imports a compression library. `node:zlib`-backed implementations
+ * (gzip, brotli, zstd) ship from `effect-dynamodb/compression/zlib`;
  * any other runtime can supply its own.
  *
  * Every pack/unpack site reads the service with `Effect.serviceOption`, so no
@@ -95,11 +95,11 @@ export const empty: CompressionRegistry = make([])
  *
  * @example
  * ```typescript
- * import * as NodeCompression from "effect-dynamodb/compression/node"
+ * import * as ZlibCompression from "effect-dynamodb/compression/zlib"
  *
  * const AppLayer = Layer.mergeAll(
  *   DynamoClient.layer({ region: "us-east-1" }),
- *   Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+ *   Compression.layer([ZlibCompression.zstd(), ZlibCompression.gzip()]),
  * )
  * ```
  */

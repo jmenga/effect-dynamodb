@@ -6,7 +6,7 @@ import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Config, ConfigProvider, Effect, Layer, Option, Schema } from "effect"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Table from "../src/Table.js"
@@ -28,7 +28,7 @@ describe("DynamoClient.layer({ compressors })", () => {
       Effect.provide(
         DynamoClient.layer({
           ...clientConfig,
-          compressors: [NodeCompression.zstd(), NodeCompression.gzip()],
+          compressors: [ZlibCompression.zstd(), ZlibCompression.gzip()],
         }),
       ),
     ),
@@ -47,7 +47,7 @@ describe("DynamoClient.layer({ compressors })", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Compression.layer([NodeCompression.brotli()]),
+          Compression.layer([ZlibCompression.brotli()]),
           DynamoClient.layer(clientConfig),
         ),
       ),
@@ -58,7 +58,7 @@ describe("DynamoClient.layer({ compressors })", () => {
     expect(() =>
       DynamoClient.layer({
         ...clientConfig,
-        compressors: [NodeCompression.gzip(), NodeCompression.gzip()],
+        compressors: [ZlibCompression.gzip(), ZlibCompression.gzip()],
       }),
     ).toThrow(/\[EDD-9078\]/)
   })
@@ -73,7 +73,7 @@ describe("DynamoClient.layerConfig({ compressors })", () => {
       Effect.provide(
         DynamoClient.layerConfig({
           region: Config.String("REGION"),
-          compressors: [NodeCompression.gzip()],
+          compressors: [ZlibCompression.gzip()],
         }),
       ),
       Effect.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ REGION: "us-east-1" }))),
@@ -115,7 +115,7 @@ describe("Compression behind a wrapper layer (the guide's pitfall)", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          traced(DynamoClient.layer({ ...clientConfig, compressors: [NodeCompression.zstd()] })),
+          traced(DynamoClient.layer({ ...clientConfig, compressors: [ZlibCompression.zstd()] })),
           TableLayer,
         ),
       ),
@@ -131,7 +131,7 @@ describe("Compression behind a wrapper layer (the guide's pitfall)", () => {
       Effect.provide(
         Layer.mergeAll(
           traced(DynamoClient.layer(clientConfig)),
-          Compression.layer([NodeCompression.zstd()]),
+          Compression.layer([ZlibCompression.zstd()]),
           TableLayer,
         ),
       ),
@@ -144,7 +144,7 @@ describe("Compression behind a wrapper layer (the guide's pitfall)", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          DynamoClient.layer({ ...clientConfig, compressors: [NodeCompression.zstd()] }),
+          DynamoClient.layer({ ...clientConfig, compressors: [ZlibCompression.zstd()] }),
           TableLayer,
         ),
       ),

@@ -39,9 +39,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./compression/node": {
-      "types": "./dist/compression/node.d.ts",
-      "import": "./dist/compression/node.js"
+    "./compression/zlib": {
+      "types": "./dist/compression/zlib.d.ts",
+      "import": "./dist/compression/zlib.js"
     }
   },
   "files": [

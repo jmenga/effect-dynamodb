@@ -1319,10 +1319,10 @@ import { StorageEncoding } from "effect-dynamodb"
 | `Compressor` | `{ codec: "gzip" \| "brotli" \| "zstd", compress(input: Uint8Array): Uint8Array, decompress(input: Uint8Array): Uint8Array }` — a synchronous codec implementation |
 | `Compression` | `Context.Service` holding a `CompressionRegistry` (`get(codec)`, `codecs`). `Compression.layer(compressors)` provides one; `Compression.make(compressors)` builds one (throws `[EDD-9078]` on two compressors for one codec or an unknown codec); `Compression.empty` has none |
 
-Node implementations, from the `effect-dynamodb/compression/node` entry point (the only module that imports `node:zlib`):
+`node:zlib`-backed implementations, from the `effect-dynamodb/compression/zlib` entry point (the only module that imports `node:zlib`):
 
 ```typescript
-import * as NodeCompression from "effect-dynamodb/compression/node"
+import * as ZlibCompression from "effect-dynamodb/compression/zlib"
 ```
 
 | Export | Description |

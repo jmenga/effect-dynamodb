@@ -19,7 +19,7 @@ import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 import { beforeEach } from "vitest"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import * as EventStore from "../src/EventStore.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { itemBytes, transactItemBytes, transactionBytes } from "../src/internal/ItemSize.js"
@@ -336,7 +336,7 @@ const InMemoryClient = mockDynamoClientLayer({
 })
 
 const TableLayer = LedgerTable.layer({ name: "ledger-table" })
-const Codecs = Compression.layer([NodeCompression.gzip(), NodeCompression.zstd()])
+const Codecs = Compression.layer([ZlibCompression.gzip(), ZlibCompression.zstd()])
 /** Client + table + every codec. */
 const TestLayer = Layer.mergeAll(InMemoryClient, TableLayer, Codecs)
 /** Client + table, no `Compression` service at all. */
@@ -506,7 +506,7 @@ describe("EventStore packed storage — append (#147)", () => {
         // A registry without the codec is refused the same way, by name.
         const gzipOnly = unregisteredCodecDefect(
           yield* Effect.exit(
-            ZstdLedger.read(id).pipe(Effect.provide(Compression.layer([NodeCompression.gzip()]))),
+            ZstdLedger.read(id).pipe(Effect.provide(Compression.layer([ZlibCompression.gzip()]))),
           ),
         )
         expect(gzipOnly).toContain('the Compression registry in scope has "gzip"')
@@ -1203,7 +1203,7 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
         const zstd = DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } })
         const forms: ReadonlyArray<AttributeValue> = [
           { S: JSON.stringify(extra) },
-          StorageEncoding.encodeSync(zstd, extra, { compressors: [NodeCompression.zstd()] })!,
+          StorageEncoding.encodeSync(zstd, extra, { compressors: [ZlibCompression.zstd()] })!,
           toAttributeMap({ data: extra }).data!,
         ]
         expect(forms[1]!.B).toBeInstanceOf(Uint8Array)
@@ -1299,7 +1299,7 @@ describe("EventStore packed storage — bound streams (#147)", () => {
       const gzipOnly = unregisteredCodecDefect(
         yield* Effect.exit(
           EventStore.bind(ZstdLedger).pipe(
-            Effect.provide(Compression.layer([NodeCompression.gzip()])),
+            Effect.provide(Compression.layer([ZlibCompression.gzip()])),
           ),
         ),
       )

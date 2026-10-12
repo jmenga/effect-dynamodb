@@ -34,7 +34,7 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Config, Effect, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 import { afterAll, beforeAll, describe, expect } from "vitest"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as EventStore from "../src/EventStore.js"
 import { ITEM_MAX_BYTES, itemBytes } from "../src/internal/ItemSize.js"
@@ -198,7 +198,7 @@ const ClientLayer = DynamoClient.layer({
   region: "us-east-1",
   endpoint: ENDPOINT,
   credentials,
-  compressors: [NodeCompression.gzip(), NodeCompression.zstd()],
+  compressors: [ZlibCompression.gzip(), ZlibCompression.zstd()],
 })
 /** The same client with no compressors. */
 const BareClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })

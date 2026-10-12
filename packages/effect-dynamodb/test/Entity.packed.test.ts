@@ -26,7 +26,7 @@ import { DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
@@ -431,7 +431,7 @@ const InMemoryClient = mockDynamoClientLayer({
 })
 
 const TableLayer = MainTable.layer({ name: "packed-entity-table" })
-const Codecs = Compression.layer([NodeCompression.gzip(), NodeCompression.brotli()])
+const Codecs = Compression.layer([ZlibCompression.gzip(), ZlibCompression.brotli()])
 const TestLayer = Layer.mergeAll(InMemoryClient, TableLayer, Codecs)
 const NoCodecs = Layer.mergeAll(InMemoryClient, TableLayer)
 
@@ -994,7 +994,7 @@ describe("Entity packed fields — update", () => {
       })
       // Same JSON, stored by an older writer as compressed binary: still equal.
       const live = stored("d-2")
-      const gz = NodeCompression.gzip().compress(
+      const gz = ZlibCompression.gzip().compress(
         new TextEncoder().encode(JSON.stringify({ source: "import", tags: ["a"] })),
       )
       store.set(keyOf(live), { ...live, origin: { B: new Uint8Array([0x21, ...gz]) } })
@@ -1420,7 +1420,7 @@ describe("Entity packed fields — collections", () => {
       const db = yield* DynamoClient.make({
         entities: { Tickets, Invoices },
         tables: { CollTable },
-        compressors: [NodeCompression.gzip()],
+        compressors: [ZlibCompression.gzip()],
       })
       const thread = Array.from({ length: 30 }, (_, i) => `message ${i}`)
       yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
@@ -1443,15 +1443,15 @@ describe("Entity packed fields — collections", () => {
 describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
   const body = { text: "y".repeat(200) }
   const origin = { source: "s", tags: ["a"] }
-  const Brotli = Compression.layer([NodeCompression.brotli()])
-  const Gzip = Compression.layer([NodeCompression.gzip()])
+  const Brotli = Compression.layer([ZlibCompression.brotli()])
+  const Gzip = Compression.layer([ZlibCompression.gzip()])
 
   it.effect("explicit compressors reach bound CRUD and query accessors with nothing ambient", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Orders, Docs, Readings },
         tables: { MainTable },
-        compressors: [NodeCompression.gzip()],
+        compressors: [ZlibCompression.gzip()],
       })
       yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
       const doc = [...store.values()].find((item) => item.__edd_e__?.S === "Doc")!
@@ -1471,7 +1471,7 @@ describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
       const db = yield* DynamoClient.make({
         entities: { Orders, Docs, Readings },
         tables: { MainTable },
-        compressors: [NodeCompression.gzip()],
+        compressors: [ZlibCompression.gzip()],
       })
       yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
       expect((yield* db.entities.Docs.get({ docId: "d-1" })).body).toEqual(body)
@@ -1519,7 +1519,7 @@ describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
           DynamoClient.make({
             entities: { Orders },
             tables: { MainTable },
-            compressors: [NodeCompression.brotli()],
+            compressors: [ZlibCompression.brotli()],
           }).pipe(Effect.provide(Gzip)),
         ),
       )

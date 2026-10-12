@@ -14,7 +14,7 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import * as NodeCompression from "../src/compression/node.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
@@ -123,7 +123,7 @@ const InMemoryClient = mockDynamoClientLayer({
 const TestLayer = Layer.mergeAll(
   InMemoryClient,
   MainTable.layer({ name: "agg-table" }),
-  Compression.layer([NodeCompression.gzip()]),
+  Compression.layer([ZlibCompression.gzip()]),
 )
 
 beforeEach(() => {
@@ -414,7 +414,7 @@ describe("Aggregate — packed edges through DynamoClient.make({ compressors })"
         entities: { Venues },
         aggregates: { Matches },
         tables: { MainTable },
-        compressors: [NodeCompression.gzip()],
+        compressors: [ZlibCompression.gzip()],
       })
       yield* db.entities.Venues.put({ venueId: "v-1", name: "MCG", layout })
       yield* db.aggregates.Matches.create({
@@ -448,7 +448,7 @@ describe("Aggregate — packed edges through DynamoClient.make({ compressors })"
             entities: {},
             aggregates: { Matches },
             tables: { MainTable },
-            compressors: [NodeCompression.brotli()],
+            compressors: [ZlibCompression.brotli()],
           }),
         ),
       )
@@ -458,7 +458,7 @@ describe("Aggregate — packed edges through DynamoClient.make({ compressors })"
         entities: {},
         aggregates: { Matches },
         tables: { MainTable },
-      }).pipe(Effect.provide(Compression.layer([NodeCompression.gzip()])))
+      }).pipe(Effect.provide(Compression.layer([ZlibCompression.gzip()])))
     }).pipe(Effect.provide(Bare)),
   )
 })

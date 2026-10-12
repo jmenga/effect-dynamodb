@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /**
- * Node compressors for packed storage — `effect-dynamodb/compression/node`.
+ * `node:zlib` compressors for packed storage — `effect-dynamodb/compression/zlib`.
  *
  * `node:zlib`-backed {@link Compressor} implementations of the three codecs
  * `DynamoModel.Packed({ format: "json", compression: { codec } })` accepts.
@@ -11,11 +11,11 @@
  * @example
  * ```typescript
  * import { Compression, DynamoClient } from "effect-dynamodb"
- * import * as NodeCompression from "effect-dynamodb/compression/node"
+ * import * as ZlibCompression from "effect-dynamodb/compression/zlib"
  *
  * const AppLayer = Layer.mergeAll(
  *   DynamoClient.layer({ region: "us-east-1" }),
- *   Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+ *   Compression.layer([ZlibCompression.zstd(), ZlibCompression.gzip()]),
  * )
  * ```
  *
@@ -40,7 +40,7 @@ export type { Compressor } from "@effect-dynamodb/schema/Compression.js"
  */
 export const DEFAULT_MAX_OUTPUT_LENGTH = 64 * 1024 * 1024
 
-/** Options shared by every Node compressor. */
+/** Options shared by every zlib compressor. */
 export interface DecompressOptions {
   /**
    * Upper bound, in bytes, on one value's decompressed size — a guard against
@@ -61,7 +61,7 @@ const decompressOptions = (options: DecompressOptions): { maxOutputLength?: numb
   if (limit === Number.POSITIVE_INFINITY) return {}
   if (!Number.isSafeInteger(limit) || limit < 1) {
     throw new Error(
-      `effect-dynamodb/compression/node: maxOutputLength must be a positive integer number of ` +
+      `effect-dynamodb/compression/zlib: maxOutputLength must be a positive integer number of ` +
         `bytes, or Infinity — got ${String(limit)}`,
     )
   }
@@ -110,7 +110,7 @@ export const brotli = (
   }
 }
 
-/** True iff this Node runtime has zstd (`zlib.zstdCompressSync`, Node ≥ 22.15). */
+/** True iff this runtime's `node:zlib` has zstd (`zlib.zstdCompressSync`, Node ≥ 22.15). */
 export const hasZstd = (): boolean =>
   typeof (zlib as { readonly zstdCompressSync?: unknown }).zstdCompressSync === "function" &&
   typeof (zlib as { readonly zstdDecompressSync?: unknown }).zstdDecompressSync === "function"
@@ -129,7 +129,7 @@ export const zstd = (
 ): Compressor => {
   if (!hasZstd()) {
     throw new Error(
-      "effect-dynamodb/compression/node: zstd needs Node >= 22.15 (zlib.zstdCompressSync), " +
+      "effect-dynamodb/compression/zlib: zstd needs Node >= 22.15 (zlib.zstdCompressSync), " +
         "which this runtime does not have. Use gzip() or brotli(), or available() to register " +
         "what this runtime supports.",
     )

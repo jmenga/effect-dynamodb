@@ -245,7 +245,7 @@ The typed `PathBuilder` also rejects these at compile time: a packed field's pat
 
 ## Registering compressors
 
-Compressors are pluggable. Each one implements a small synchronous interface, `Compressor { codec, compress, decompress }`, on `Uint8Array`. The library core never imports `node:zlib`. Node implementations come from a separate entry point, `effect-dynamodb/compression/node`:
+Compressors are pluggable. Each one implements a small synchronous interface, `Compressor { codec, compress, decompress }`, on `Uint8Array`. The library core never imports `node:zlib` and does not assume a runtime. Implementations backed by the `node:zlib` API (available in Node and in runtimes that provide `node:zlib`) come from a separate entry point, `effect-dynamodb/compression/zlib`; any runtime can register its own `Compressor` instead:
 
 ```typescript region="compressors" example="guide-packed-storage.ts"
 const ClientLayer = DynamoClient.layerConfig({
@@ -254,8 +254,8 @@ const ClientLayer = DynamoClient.layerConfig({
   credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
 })
 
-// Every codec a reader may meet. zstd needs Node >= 22.15.
-const CompressionLayer = Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()])
+// Every codec a reader may meet. zstd needs zlib.zstdCompressSync (Node >= 22.15).
+const CompressionLayer = Compression.layer([ZlibCompression.zstd(), ZlibCompression.gzip()])
 
 // Merged beside the client, so every layer and every program sees it
 const AppLayer = Layer.mergeAll(
@@ -270,11 +270,11 @@ const AppLayer = Layer.mergeAll(
 |---|---|
 | `gzip({ level?, maxOutputLength? })` | `zlib.gzipSync` |
 | `brotli({ quality?, maxOutputLength? })` | `zlib.brotliCompressSync`, text mode |
-| `zstd({ level?, maxOutputLength? })` | `zlib.zstdCompressSync`, level 3 by default. **Needs Node 22.15 or later**: on older Node it throws when it's created. |
-| `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this Node has it |
-| `hasZstd()` | `true` when this Node has zstd |
+| `zstd({ level?, maxOutputLength? })` | `zlib.zstdCompressSync`, level 3 by default. **Needs Node 22.15 or later**: where `node:zlib` lacks it, it throws when it's created. |
+| `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this runtime's `node:zlib` has it |
+| `hasZstd()` | `true` when this runtime's `node:zlib` has zstd (`zstdCompressSync`; Node >= 22.15) |
 
-`maxOutputLength` caps the decompressed size of one value, as a guard against decompression bombs. It defaults to 64 MiB (`NodeCompression.DEFAULT_MAX_OUTPUT_LENGTH`): a packed value lives in one item of at most 400 KB, and JSON compresses about 5 to 20 times, so a real value inflates to a few MB. Going over the cap fails the read with a `ValidationError`. Pass a larger number to raise it, or `Infinity` to leave only Node's own limit.
+`maxOutputLength` caps the decompressed size of one value, as a guard against decompression bombs. It defaults to 64 MiB (`ZlibCompression.DEFAULT_MAX_OUTPUT_LENGTH`): a packed value lives in one item of at most 400 KB, and JSON compresses about 5 to 20 times, so a real value inflates to a few MB. Going over the cap fails the read with a `ValidationError`. Pass a larger number to raise it, or `Infinity` to leave only Node's own limit.
 
 zstd is the recommended codec: it has the cheapest writes and about the same ratio as the others. The codec is **required** in the config, with no default, because zstd isn't available before Node 22.15.
 
@@ -297,7 +297,7 @@ const TracedClient = Layer.effect(
     return withTracing(yield* DynamoClient)
   }),
 ).pipe(
-  Layer.provide(DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })),
+  Layer.provide(DynamoClient.layer({ region: "us-east-1", compressors: [ZlibCompression.zstd()] })),
 )
 ```
 
@@ -312,7 +312,7 @@ None of these adds a requirement (`R`) or an error type to entity or EventStore 
 // A reader that registered only gzip meets the zstd-compressed snapshot state.
 // The failure is the usual ValidationError; its cause names the missing codec.
 const outcome = yield* StorageEncoding.decode(snapshotItem.state).pipe(
-  Effect.provideService(Compression, Compression.make([NodeCompression.gzip()])),
+  Effect.provideService(Compression, Compression.make([ZlibCompression.gzip()])),
   Effect.as("decoded"),
   Effect.catchTag("ValidationError", (error) =>
     error.cause instanceof CompressorNotRegistered
@@ -483,7 +483,7 @@ const asZstdSync = StorageEncoding.valueBytesSync({
   schema: LedgerState,
   value: latest,
   storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
-  compressors: [NodeCompression.zstd()],
+  compressors: [ZlibCompression.zstd()],
 })
 ```
 

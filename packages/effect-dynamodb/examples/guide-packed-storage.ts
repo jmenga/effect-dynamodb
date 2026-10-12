@@ -2,7 +2,7 @@
  * Packed Storage Guide Example — effect-dynamodb
  *
  * Demonstrates `DynamoModel.Packed({ format: "json", compression? })`:
- *   - Registering Node compressors as a Compression layer merged into the app layer
+ *   - Registering node:zlib compressors as a Compression layer merged into the app layer
  *   - A missing codec, reported as a ValidationError with a CompressorNotRegistered cause
  *   - An entity field stored as one JSON string (S)
  *   - An entity field compressed to binary (B) over a threshold
@@ -25,8 +25,8 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Config, Console, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 
-// Import from source (use "effect-dynamodb" and "effect-dynamodb/compression/node" when published)
-import * as NodeCompression from "../src/compression/node.js"
+// Import from source (use "effect-dynamodb" and "effect-dynamodb/compression/zlib" when published)
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -197,8 +197,8 @@ const ClientLayer = DynamoClient.layerConfig({
   credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
 })
 
-// Every codec a reader may meet. zstd needs Node >= 22.15.
-const CompressionLayer = Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()])
+// Every codec a reader may meet. zstd needs zlib.zstdCompressSync (Node >= 22.15).
+const CompressionLayer = Compression.layer([ZlibCompression.zstd(), ZlibCompression.gzip()])
 
 // Merged beside the client, so every layer and every program sees it
 const AppLayer = Layer.mergeAll(
@@ -428,7 +428,7 @@ const program = Effect.gen(function* () {
   // A reader that registered only gzip meets the zstd-compressed snapshot state.
   // The failure is the usual ValidationError; its cause names the missing codec.
   const outcome = yield* StorageEncoding.decode(snapshotItem.state).pipe(
-    Effect.provideService(Compression, Compression.make([NodeCompression.gzip()])),
+    Effect.provideService(Compression, Compression.make([ZlibCompression.gzip()])),
     Effect.as("decoded"),
     Effect.catchTag("ValidationError", (error) =>
       error.cause instanceof CompressorNotRegistered
@@ -496,7 +496,7 @@ const program = Effect.gen(function* () {
     schema: LedgerState,
     value: latest,
     storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
-    compressors: [NodeCompression.zstd()],
+    compressors: [ZlibCompression.zstd()],
   })
   // #endregion
   assertEq(fits, true, "append fits")
