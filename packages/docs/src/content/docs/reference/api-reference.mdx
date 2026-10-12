@@ -1304,7 +1304,8 @@ import { StorageEncoding } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `encode` | `(storedAs, wire) => Effect<AttributeValue \| undefined, ValidationError \| CompressorNotRegistered>` | The `AttributeValue` a wire (encoded) value is stored as: `S`, `B`, `NULL`, or `undefined` for no attribute |
-| `decode` | `(stored) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | Read a stored value by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
+| `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
+| `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged |
 | `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError \| CompressorNotRegistered>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
 | `limits` | `{ item: 409_600, transaction: 4_194_304 }` | DynamoDB's item and `TransactWriteItems` size limits, in bytes |
 

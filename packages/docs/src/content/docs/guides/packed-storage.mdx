@@ -404,7 +404,8 @@ const asZstd = yield* StorageEncoding.valueBytes({
 | `stream.measureSnapshot(streamId, state, asOfVersion)` | the item size of the snapshot `writeSnapshot` would write |
 | `StorageEncoding.valueBytes({ schema, value, storedAs? })` | the size of one attribute **value** as stored, packed under `storedAs`, or as a native map if `storedAs` is omitted. An item's size is the sum, over its attributes, of the name's UTF-8 bytes plus the value's bytes. |
 | `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304 }` |
-| `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` |
+| `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` (`decode` takes DynamoDB JSON) |
+| `StorageEncoding.decodeUnmarshalled(stored)` | one already-unmarshalled stored value (a JSON string, bytes or base64, or a native value) to its wire form |
 
 `measureAppend` doesn't accept `additionalItems`, because building a guarded put reads the table. Add their sizes yourself. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
 

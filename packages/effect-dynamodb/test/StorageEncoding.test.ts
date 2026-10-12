@@ -56,26 +56,44 @@ describe("StorageEncoding.encode / decode", () => {
     }).pipe(Effect.provide(compression)),
   )
 
-  it.effect("decode accepts an AttributeValue, an unmarshalled value, and base64 B", () =>
+  it.effect("decode reads an AttributeValue, with B as bytes or base64", () =>
     Effect.gen(function* () {
       const s = yield* StorageEncoding.encode(json, wire)
       const b = yield* StorageEncoding.encode(brotli, wire)
       expect(yield* StorageEncoding.decode(s)).toEqual(wire)
       expect(yield* StorageEncoding.decode(b)).toEqual(wire)
-      expect(yield* StorageEncoding.decode(s?.S)).toEqual(wire)
-      expect(yield* StorageEncoding.decode(b?.B)).toEqual(wire)
       const text = Buffer.from(b!.B!).toString("base64")
-      expect(yield* StorageEncoding.decode(text)).toEqual(wire)
       expect(yield* StorageEncoding.decode({ B: text })).toEqual(wire)
     }).pipe(Effect.provide(compression)),
   )
 
-  it.effect("decode returns legacy native values unchanged", () =>
+  it.effect("decodeUnmarshalled reads a JSON string, bytes, and base64 B", () =>
+    Effect.gen(function* () {
+      const s = yield* StorageEncoding.encode(json, wire)
+      const b = yield* StorageEncoding.encode(brotli, wire)
+      expect(yield* StorageEncoding.decodeUnmarshalled(s?.S)).toEqual(wire)
+      expect(yield* StorageEncoding.decodeUnmarshalled(b?.B)).toEqual(wire)
+      const text = Buffer.from(b!.B!).toString("base64")
+      expect(yield* StorageEncoding.decodeUnmarshalled(text)).toEqual(wire)
+    }).pipe(Effect.provide(compression)),
+  )
+
+  it.effect("decode returns legacy native AttributeValues unmarshalled", () =>
     Effect.gen(function* () {
       expect(yield* StorageEncoding.decode({ M: { a: { N: "1" } } })).toEqual({ a: 1 })
-      expect(yield* StorageEncoding.decode({ a: 1 })).toEqual({ a: 1 })
-      expect(yield* StorageEncoding.decode(null)).toBeNull()
+      expect(yield* StorageEncoding.decode({ NULL: true })).toBeNull()
       expect(yield* StorageEncoding.decode(undefined)).toBeUndefined()
+    }),
+  )
+
+  it.effect("decodeUnmarshalled returns legacy native values unchanged", () =>
+    Effect.gen(function* () {
+      expect(yield* StorageEncoding.decodeUnmarshalled({ a: 1 })).toEqual({ a: 1 })
+      // One-key maps named like an AttributeValue tag are values, not DynamoDB JSON.
+      expect(yield* StorageEncoding.decodeUnmarshalled({ L: [1, 2] })).toEqual({ L: [1, 2] })
+      expect(yield* StorageEncoding.decodeUnmarshalled({ N: "5" })).toEqual({ N: "5" })
+      expect(yield* StorageEncoding.decodeUnmarshalled(null)).toBeNull()
+      expect(yield* StorageEncoding.decodeUnmarshalled(undefined)).toBeUndefined()
     }),
   )
 

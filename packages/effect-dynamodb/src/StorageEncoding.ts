@@ -6,7 +6,8 @@
  *   by the same codec entity fields and EventStore `data` / `state` use. `decode`
  *   dispatches on the stored form, so it reads native, `S` and `B` values alike,
  *   and accepts `B` as bytes or base64 text (DynamoDB Streams via Lambda or
- *   EventBridge Pipes).
+ *   EventBridge Pipes). {@link decodeUnmarshalled} does the same for a value
+ *   already unmarshalled.
  * - {@link valueBytes}: the DynamoDB size of a value as it would be stored —
  *   packed under a config, or native — for caller-side planning against
  *   {@link limits}. An item's size is the sum, over its attributes, of the
@@ -31,7 +32,6 @@ import { Effect, Schema } from "effect"
 import { attributeBytes, ITEM_MAX_BYTES, TRANSACT_WRITE_MAX_BYTES } from "./internal/ItemSize.js"
 import {
   currentRegistry,
-  isAttributeValueShape,
   normalizeImage,
   type StreamImage,
   storedToAttributeValue,
@@ -75,27 +75,44 @@ export const encode = (
   )
 
 /**
- * Read a stored value by its form, returning its wire (encoded) form as plain
- * JSON — not schema-decoded.
+ * Read a stored `AttributeValue` (DynamoDB JSON) by its form, returning its wire
+ * (encoded) form as plain JSON — not schema-decoded: `S` is JSON, `B` (bytes, or
+ * base64 text as Lambda and EventBridge Pipes deliver it) is a header plus a
+ * payload, and any other type (a legacy native `M`, say) is unmarshalled
+ * unchanged. `undefined` (no attribute) returns `undefined`.
  *
- * Accepts an `AttributeValue` (`B` as bytes or base64 text), or an
- * unmarshalled value: a string is JSON unless it is base64 of a `B` value
- * (it then starts with `I`–`P`, which JSON text never does), bytes are `B`,
- * anything else is a native value returned unchanged.
+ * For a value already unmarshalled (`@aws-sdk/util-dynamodb`'s `unmarshall`, or
+ * a `DocumentClient` row), use {@link decodeUnmarshalled}: the two forms cannot
+ * be told apart by shape (`{ N: "5" }` is both a number and a one-key map).
  */
 export const decode = (
-  stored: AttributeValue | unknown,
+  stored: AttributeValue | { readonly B: string } | undefined,
 ): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
   Effect.gen(function* () {
+    if (stored === undefined) return undefined
     const ctx = { entityType: ENTITY_TYPE, operation: "StorageEncoding.decode" }
     const registry = yield* currentRegistry
-    if (isAttributeValueShape(stored)) {
-      // DynamoDB JSON: the S / B tag is unambiguous, so no base64 sniffing.
-      const raw = yield* normalizeImage({ value: stored } as StreamImage, ctx, {
-        form: "attributeValues",
-      })
-      return yield* unpackValue(raw.value, registry, { ...ctx, attribute: "value" })
-    }
+    // DynamoDB JSON: the S / B tag is unambiguous, so no base64 sniffing.
+    const raw = yield* normalizeImage({ value: stored } as StreamImage, ctx, {
+      form: "attributeValues",
+    })
+    return yield* unpackValue(raw.value, registry, { ...ctx, attribute: "value" })
+  })
+
+/**
+ * Read an already-unmarshalled stored value by its form, returning its wire
+ * (encoded) form as plain JSON — not schema-decoded: a string is JSON unless it
+ * is base64 of a `B` value (it then starts with `I`–`P`, which JSON text never
+ * does), bytes are `B`, and anything else is a native value returned unchanged.
+ *
+ * For an `AttributeValue` (DynamoDB JSON), use {@link decode}.
+ */
+export const decodeUnmarshalled = (
+  stored: unknown,
+): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+  Effect.gen(function* () {
+    const ctx = { entityType: ENTITY_TYPE, operation: "StorageEncoding.decodeUnmarshalled" }
+    const registry = yield* currentRegistry
     const raw: Record<string, unknown> = { value: stored }
     yield* unpackImageItem(raw, ["value"], registry, ctx)
     return raw.value

@@ -302,8 +302,11 @@ and brotli to Node's defaults. The subpath is the only file in the package that 
 /** The AttributeValue a packed attribute is stored as (S, B, NULL for null; undefined for undefined — no attribute). */
 export const encode: (storedAs: PackedConfig, wire: unknown) =>
   Effect<AttributeValue | undefined, ValidationError | CompressorNotRegistered>
-/** Stored-form dispatch (§4.1). Accepts an AttributeValue, an unmarshalled value, or B as base64. */
-export const decode: (stored: AttributeValue | unknown) =>
+/** Stored-form dispatch (§4.1) on an AttributeValue (DynamoDB JSON), B as bytes or base64. */
+export const decode: (stored: AttributeValue | { readonly B: string } | undefined) =>
+  Effect<unknown, ValidationError | CompressorNotRegistered>
+/** The same on an already-unmarshalled value: a JSON string, bytes or base64 B, or a native value. */
+export const decodeUnmarshalled: (stored: unknown) =>
   Effect<unknown, ValidationError | CompressorNotRegistered>
 /** R1: DynamoDB size of the attribute VALUE as stored (excl. the attribute name). */
 export const valueBytes: <S extends Schema.Top>(options: {
@@ -314,6 +317,10 @@ export const valueBytes: <S extends Schema.Top>(options: {
 /** DynamoDB limits, in bytes: { item: 409_600, transaction: 4_194_304 }. */
 export const limits: { readonly item: number; readonly transaction: number }
 ```
+
+The two forms are separate functions because they cannot be told apart by shape: an
+unmarshalled one-key map `{ N: "5" }` or `{ L: [1, 2] }` is also a valid-looking
+`AttributeValue`, so the caller states which form it passes.
 
 `valueBytes` encodes through the schema (encode, with the `decode → encode` fallback
 EventStore uses), packs, and measures with `internal/ItemSize.ts`'s `attributeBytes` —
@@ -949,7 +956,7 @@ and streams that do not use the feature beyond the eligibility check.
 
 - `test/compression-node.test.ts`: gzip/brotli/zstd round-trip, `available()`,
   `maxOutputLength` enforcement, `zstd()` error when unavailable (stubbed).
-- `test/StorageEncoding.test.ts`: `encode` / `decode` / `valueBytes` (equals
+- `test/StorageEncoding.test.ts`: `encode` / `decode` / `decodeUnmarshalled` / `valueBytes` (equals
   `attributeBytes` of the stored value; native vs packed), `limits`.
 - `test/Entity.packed.test.ts`, capturing requests: put/create (S and B on the wire),
   upsert, record `.set` (SET with packed `:v`), `.remove`, retain read-merge path (unnamed
