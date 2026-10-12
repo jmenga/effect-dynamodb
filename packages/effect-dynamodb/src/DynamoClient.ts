@@ -1626,6 +1626,7 @@ const makeFromConfig = (config: {
           schema: entityLike._schema,
           tableTag: entityLike._tableTag,
           decode: (raw) => entityLike._decodeRecord(raw),
+          unpackRaw: entityLike._unpackFields,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
         }

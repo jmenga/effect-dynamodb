@@ -1350,4 +1350,15 @@ describe("Entity packed fields — vector index source", () => {
       expect((yield* db.entities.VRetained.get({ noteId: "n-1" })).details).toEqual(details)
     }).pipe(Effect.provide(VLayer)),
   )
+
+  it.effect("a .select() projection of a packed field returns its parsed value", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { VNotes, VRetained }, tables: { VTable } })
+      yield* db.entities.VNotes.put({ noteId: "n-1", title: "T", details })
+      const hits = yield* db.entities.VNotes.search("anything")
+        .select(["noteId", "details"])
+        .collect()
+      expect(hits.map((hit) => hit.item)).toEqual([{ noteId: "n-1", details }])
+    }).pipe(Effect.provide(VLayer)),
+  )
 })

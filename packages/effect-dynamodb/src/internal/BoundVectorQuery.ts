@@ -150,6 +150,17 @@ export interface BoundVectorQueryConfig {
   ) => Effect.Effect<any, ValidationError | CompressorNotRegistered>
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
   /**
+   * Read, in place, the packed attributes of a stored-name row by their stored
+   * form (parsed JSON, not schema-decoded) — what a `.select()` projection
+   * returns for a packed field, as every other projection path does. Absent
+   * for an entity with no packed (or once-packed) fields.
+   */
+  readonly unpackRaw?:
+    | ((
+        raw: Record<string, unknown>,
+      ) => Effect.Effect<void, ValidationError | CompressorNotRegistered>)
+    | undefined
+  /**
    * Domain field name → stored DynamoDB attribute name. Filter attributes,
    * projections and the emitted `SearchSchema` must all use STORED names —
    * items are written after `renameToDynamo`, so a `storedAs`-renamed field
@@ -236,6 +247,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       schema,
       tableTag,
       decode,
+      unpackRaw,
       resolveDbName,
       keyForm,
     } = this._config
@@ -371,6 +383,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         // score — drop it instead.
         if (result.Score === undefined || result.Score === null) continue
         const raw = fromAttributeMap(result.Item) as Record<string, unknown>
+        if (state.projection !== undefined && unpackRaw !== undefined) yield* unpackRaw(raw)
         const decoded =
           state.projection === undefined
             ? yield* decode(raw)
