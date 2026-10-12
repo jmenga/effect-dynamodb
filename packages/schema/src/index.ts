@@ -19,6 +19,8 @@
 
 export type { AggregateDefinition, BoundAggregate } from "./Aggregate.js"
 export * as Aggregate from "./Aggregate.js"
+export type { CompressionCodec, CompressionRegistry, Compressor } from "./Compression.js"
+export { Compression } from "./Compression.js"
 export * as DynamoModel from "./DynamoModel.js"
 export type { Casing, DynamoSchema as DynamoSchemaType } from "./DynamoSchema.js"
 export * as DynamoSchema from "./DynamoSchema.js"
@@ -39,6 +41,7 @@ export {
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
+  CompressorNotRegistered,
   ConcurrentModification,
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,

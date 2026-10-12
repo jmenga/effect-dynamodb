@@ -9,6 +9,8 @@
  * - `storedAs` modifier — overrides DynamoDB storage format via annotation
  * - `SparseMap()` — opt a `Schema.Record` field into flattened storage (one
  *                   top-level attribute per entry)
+ * - `Packed()` — store an object/array-shaped field (or EventStore data/state)
+ *                as one JSON string, optionally compressed over a threshold
  *
  * See docs/design-dynamo-model.md for the three-layer model (wire → domain → storage).
  */
@@ -535,6 +537,185 @@ export const isSparseMapConfig = (value: unknown): value is SparseMapConfig =>
   value !== null &&
   (value as globalThis.Record<symbol, unknown>)[SparseMapTag] === true
 
+// ---------------------------------------------------------------------------
+// Packed storage (JSON string, optional compression) — DESIGN.md §7 "Packed Storage"
+// ---------------------------------------------------------------------------
+
+/**
+ * The serialisation of a packed value. Only `"json"` is accepted; `"binary"`
+ * (a future SchemaBinary encoding) is reserved in the stored header and refused
+ * here until it is implemented.
+ */
+export type PackedFormat = "json"
+
+/** A compression codec a packed value may be stored with. */
+export type CompressionCodec = "gzip" | "brotli" | "zstd"
+
+/** Every {@link CompressionCodec}, in header-code order. */
+export const compressionCodecs: ReadonlyArray<CompressionCodec> = ["gzip", "brotli", "zstd"]
+
+/**
+ * Default `compression.threshold`: 1,024 bytes of UTF-8 JSON. DynamoDB rounds
+ * write capacity per item at 1 KB, so compressing a smaller value saves no WCU
+ * and costs a decompression on every read.
+ */
+export const DEFAULT_COMPRESSION_THRESHOLD = 1024
+
+/** Options accepted by {@link Packed}. */
+export interface PackedOptions {
+  readonly format: PackedFormat
+  readonly compression?:
+    | {
+        readonly codec: CompressionCodec
+        /**
+         * UTF-8 byte length of the JSON at or above which compression is tried.
+         * A non-negative safe integer; `0` always tries. Default 1024.
+         */
+        readonly threshold?: number | undefined
+      }
+    | undefined
+}
+
+/** Brand symbol identifying a {@link PackedConfig} produced by {@link Packed}. */
+const PackedTag: unique symbol = Symbol.for("effect-dynamodb/Packed")
+
+/**
+ * The validated, frozen storage config returned by {@link Packed} — the value
+ * of an entity field's `storedAs`, an EventStore stream's `storedAs.data`, or a
+ * snapshot's `storedAs`.
+ */
+export interface PackedConfig {
+  readonly [PackedTag]: true
+  readonly format: PackedFormat
+  readonly compression: { readonly codec: CompressionCodec; readonly threshold: number } | undefined
+}
+
+const packedError = (message: string): Error =>
+  new Error(`[EDD-9071] DynamoModel.Packed: ${message}`)
+
+/**
+ * Store a value packed into one attribute: its wire form as a JSON string
+ * (`S`), or — when `compression` is set, the JSON is at least `threshold`
+ * UTF-8 bytes long, and the compressed bytes plus a one-byte header are
+ * smaller — as compressed binary (`B`).
+ *
+ * The stored form is self-describing: readers dispatch on what is stored (a
+ * native map, `S`, or `B` with its header), never on the current config, so
+ * switching a field or stream between native, packed and compressed storage
+ * needs no rewrite.
+ *
+ * Compression codecs are pluggable: register implementations through the
+ * `Compression` service (for Node, `effect-dynamodb/compression/node`).
+ *
+ * @example
+ * ```ts
+ * DynamoModel.configure(Order, {
+ *   lines: { storedAs: DynamoModel.Packed({ format: "json" }) },
+ *   details: {
+ *     storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+ *   },
+ * })
+ * ```
+ *
+ * @throws `[EDD-9071]` on invalid options: a `format` other than `"json"`, an
+ *   unknown `compression.codec`, a `threshold` that is not a non-negative safe
+ *   integer, or an unknown option key.
+ */
+export const Packed = (options: PackedOptions): PackedConfig => {
+  if (typeof options !== "object" || options === null) {
+    throw packedError('options must be an object, e.g. { format: "json" }')
+  }
+  for (const key of Object.keys(options)) {
+    if (key !== "format" && key !== "compression") {
+      throw packedError(`unknown option "${key}" (expected "format" and optional "compression")`)
+    }
+  }
+  const format = (options as { readonly format?: unknown }).format
+  if (format === "binary") {
+    throw packedError(
+      `format "binary" is reserved for a future SchemaBinary encoding and is not supported ` +
+        `by this version — use format: "json"`,
+    )
+  }
+  if (format !== "json") {
+    throw packedError(`unknown format ${JSON.stringify(format)} — the supported format is "json"`)
+  }
+  const compression = (options as { readonly compression?: unknown }).compression
+  if (compression === undefined) {
+    return Object.freeze({ [PackedTag]: true as const, format, compression: undefined })
+  }
+  if (typeof compression !== "object" || compression === null) {
+    throw packedError('compression must be an object, e.g. { codec: "zstd" }')
+  }
+  for (const key of Object.keys(compression)) {
+    if (key !== "codec" && key !== "threshold") {
+      throw packedError(
+        `unknown compression option "${key}" (expected "codec" and optional "threshold")`,
+      )
+    }
+  }
+  const { codec, threshold } = compression as {
+    readonly codec?: unknown
+    readonly threshold?: unknown
+  }
+  if (!compressionCodecs.includes(codec as CompressionCodec)) {
+    throw packedError(
+      `unknown compression codec ${JSON.stringify(codec)} — expected one of ` +
+        compressionCodecs.map((c) => `"${c}"`).join(", "),
+    )
+  }
+  if (
+    threshold !== undefined &&
+    (typeof threshold !== "number" || !Number.isSafeInteger(threshold) || threshold < 0)
+  ) {
+    throw packedError(
+      `compression.threshold must be a non-negative safe integer (bytes of UTF-8 JSON), ` +
+        `got ${String(threshold)}`,
+    )
+  }
+  return Object.freeze({
+    [PackedTag]: true as const,
+    format,
+    compression: Object.freeze({
+      codec: codec as CompressionCodec,
+      threshold: (threshold as number | undefined) ?? DEFAULT_COMPRESSION_THRESHOLD,
+    }),
+  })
+}
+
+/** Type guard — returns true iff `value` is a {@link PackedConfig}. */
+export const isPackedConfig = (value: unknown): value is PackedConfig =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as globalThis.Record<symbol, unknown>)[PackedTag] === true
+
+/**
+ * Resolve the packed storage config for every field on a model configured
+ * `storedAs: DynamoModel.Packed(...)` via {@link configure}.
+ *
+ * Returns `Record<domainFieldName, PackedConfig>` — empty when the model is not
+ * a `ConfiguredModel` or configures no packed field. Like sparse maps, packing
+ * is a storage concern: it is read from `ConfiguredModel.attributes` only.
+ */
+export const getPackedFields = (
+  model: Schema.Top | ConfiguredModel<any, any>,
+): globalThis.Record<string, PackedConfig> => {
+  if (!isConfiguredModel(model)) return {}
+  const out: globalThis.Record<string, PackedConfig> = {}
+  for (const [name, attr] of Object.entries(model.attributes)) {
+    if (attr.packed) out[name] = attr.packed
+  }
+  return out
+}
+
+/** The domain field names a `ConfiguredModel` stores packed (`never` when none). */
+export type ExtractPackedFields<Model> =
+  Model extends ConfiguredModel<any, infer A>
+    ? {
+        [K in keyof A & string]: A[K] extends { readonly storedAs: PackedConfig } ? K : never
+      }[keyof A & string]
+    : never
+
 /**
  * A model wrapped with DynamoDB-specific attribute overrides.
  *
@@ -543,7 +724,9 @@ export const isSparseMapConfig = (value: unknown): value is SparseMapConfig =>
  * - `storedAs` — override DynamoDB storage encoding (resolved to DynamoEncoding)
  *               OR a {@link SparseMapConfig} (via {@link SparseMap}) to
  *               flatten a `Schema.Record` field into per-entry top-level
- *               attributes (see {@link SparseConfig}).
+ *               attributes (see {@link SparseConfig})
+ *               OR a {@link PackedConfig} (via {@link Packed}) to store the
+ *               field as one JSON string / compressed binary value.
  * - `immutable` — mark field as read-only after creation (excluded from Entity.Update)
  * - `identifier` — mark field as the identity field for ref resolution
  * - `ref` — mark field as a denormalized reference to another entity
@@ -564,6 +747,7 @@ export interface ConfiguredModel<
       readonly identifier?: boolean
       readonly ref?: boolean
       readonly sparse?: SparseConfig
+      readonly packed?: PackedConfig
     }
   >
 }
@@ -593,7 +777,9 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
  * Walks `ConfiguredModel.attributes` only — schema-level annotations are not
  * supported for sparse (it's a deployment concern, not a domain one).
  */
-export const getSparseFields = (model: Schema.Top): globalThis.Record<string, SparseConfig> => {
+export const getSparseFields = (
+  model: Schema.Top | ConfiguredModel<any, any>,
+): globalThis.Record<string, SparseConfig> => {
   if (!isConfiguredModel(model)) return {}
   const out: globalThis.Record<string, SparseConfig> = {}
   for (const [name, attr] of Object.entries(model.attributes)) {
@@ -636,6 +822,9 @@ export const isRecordAst = (valueAst: unknown): boolean =>
  * - `identifier` — Mark as the identity field for ref resolution.
  * - `ref` — Mark as a denormalized reference field.
  *
+ *   Or {@link Packed}(...) to store an object/array-shaped field as one JSON
+ *   string or compressed binary value.
+ *
  * Note: the `prefix` option moved into the {@link SparseMap} config in 1.6 —
  * pass `storedAs: DynamoModel.SparseMap({ prefix })` instead of declaring
  * `prefix` as a sibling here. The sibling form had no meaning for non-sparse
@@ -643,11 +832,23 @@ export const isRecordAst = (valueAst: unknown): boolean =>
  */
 type AttributeConfig<A> = {
   readonly field?: string
-  readonly storedAs?: Schema.Schema<A> | SparseMapConfig
+  readonly storedAs?: Schema.Schema<A> | SparseMapConfig | PackableStorage<A>
   readonly immutable?: boolean
   readonly identifier?: boolean
   readonly ref?: boolean
 }
+
+/**
+ * `PackedConfig` is admitted only on fields whose domain type is object- or
+ * array-shaped (or `unknown`); a scalar field is a compile error. The runtime
+ * shape rule at `Entity.make()` (EDD-9073), which inspects the encoded side,
+ * stays authoritative.
+ */
+type PackableStorage<A> = unknown extends A
+  ? PackedConfig
+  : [NonNullable<A>] extends [object]
+    ? PackedConfig
+    : never
 
 /**
  * Type-safe attribute overrides map: keys constrained to model fields,
@@ -705,6 +906,7 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       readonly identifier?: boolean
       readonly ref?: boolean
       readonly sparse?: SparseConfig
+      readonly packed?: PackedConfig
     }
   > = {}
   for (const [key, config] of Object.entries(
@@ -717,6 +919,7 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       identifier?: boolean
       ref?: boolean
       sparse?: SparseConfig
+      packed?: PackedConfig
     } = {}
     if (config.field) entry.field = config.field
     if (config.immutable) entry.immutable = true
@@ -740,6 +943,12 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
         )
       }
       entry.sparse = { prefix }
+    } else if (isPackedConfig(config.storedAs)) {
+      // Packed storage: the field is stored as one JSON string (S) or
+      // compressed binary (B). Shape, key, unique and ref guards run at
+      // Entity.make() time (EDD-9072–9075), where the model and its indexes
+      // are known.
+      entry.packed = config.storedAs
     } else if (config.storedAs !== undefined) {
       const encoding = getEncoding(config.storedAs as Schema.Top)
       if (!encoding) {
