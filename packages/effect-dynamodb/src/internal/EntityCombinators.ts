@@ -36,7 +36,8 @@ import {
   type ReturnValuesMode,
   type UpdateReturn,
 } from "./EntityOps.js"
-import { type Expr, nonEmptyCondition } from "./Expr.js"
+import { type Expr, nonEmptyCondition, toExpr } from "./Expr.js"
+import { type PackedAttributeGuard, packedExprRefusal, packedProjectionRefusal } from "./Packed.js"
 
 // ---------------------------------------------------------------------------
 // Terminal functions — select decode mode for EntityOp intermediates
@@ -210,6 +211,14 @@ export const project: {
     attributes: ReadonlyArray<string>,
   ): EntityGet<globalThis.Record<string, unknown>, globalThis.Record<string, unknown>, E, R> => {
     const impl = self as unknown as EntityGetImpl<A, Rec, E, R>
+    // A packed field may be projected only whole (`[EDD-9076]`, #147).
+    const guards = (impl._entity as { readonly _packedGuards?: unknown } | undefined)
+      ?._packedGuards as ReadonlyArray<PackedAttributeGuard> | undefined
+    const refused = packedProjectionRefusal(
+      attributes.map((attribute) => [attribute]),
+      guards ?? [],
+    )
+    if (refused !== undefined) throw new Error(refused)
     return new EntityGetImpl<
       globalThis.Record<string, unknown>,
       globalThis.Record<string, unknown>,
@@ -296,6 +305,13 @@ export const condition: {
   // An empty condition (`{}`, `and()`) is no condition (#133): like any later
   // `.condition()`, it replaces an earlier one — with none.
   const cond = nonEmptyCondition(given)
+  // A condition may test a packed field only as a whole (`[EDD-9076]`, #147).
+  const guards = (self as unknown as { readonly _entity?: { readonly _packedGuards?: unknown } })
+    ._entity?._packedGuards as ReadonlyArray<PackedAttributeGuard> | undefined
+  if (cond !== undefined && guards !== undefined && guards.length > 0) {
+    const refused = packedExprRefusal(toExpr(cond), guards, "condition")
+    if (refused !== undefined) throw new Error(refused)
+  }
   if (EntityDeleteTypeId in self) {
     // EntityDelete. `deleteIfExists`'s existence check is the op's own guard
     // (`_mustExist`), never its condition: it stays, ANDed with this one.

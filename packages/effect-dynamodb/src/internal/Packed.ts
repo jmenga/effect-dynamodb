@@ -572,3 +572,92 @@ export const packedProjectionRefusal = (
   }
   return undefined
 }
+
+// ---------------------------------------------------------------------------
+// Entity / collection query wiring
+// ---------------------------------------------------------------------------
+
+/** The packed-storage surface of an entity a query is built over. */
+export interface PackedEntityLike {
+  readonly entityType: string
+  readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  readonly _unpackFields?:
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, PackedError>)
+    | undefined
+}
+
+/** `Query.make` options for the queries of one entity: guards + raw-row unpack. */
+export const entityPackedQueryOptions = (
+  entity: PackedEntityLike,
+): {
+  readonly packed: ReadonlyArray<PackedAttributeGuard>
+  readonly rawRow:
+    | ((raw: Record<string, unknown>) => Effect.Effect<Record<string, unknown>, PackedError>)
+    | undefined
+} => {
+  const unpack = entity._unpackFields
+  return {
+    packed: entity._packedGuards ?? [],
+    rawRow: unpack === undefined ? undefined : (raw) => Effect.as(unpack(raw), raw),
+  }
+}
+
+/**
+ * `Query.make` options for a query over several entities (a collection): every
+ * member's guards (a path packed in any member is refused, naming it), and a
+ * raw-row unpack by the member the row's `__edd_e__` names.
+ */
+export const collectionPackedQueryOptions = (
+  members: ReadonlyArray<PackedEntityLike>,
+): ReturnType<typeof entityPackedQueryOptions> => {
+  const byType = new Map(members.map((m) => [m.entityType, m]))
+  return {
+    packed: members.flatMap((m) => m._packedGuards ?? []),
+    rawRow: (raw) => {
+      const member = byType.get(raw.__edd_e__ as string)
+      const unpack = member?._unpackFields
+      return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
+    },
+  }
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+/**
+ * {@link packedExprRefusal} for an already-compiled expression
+ * (`Transaction.check`'s `ExpressionResult`): every placeholder naming a packed
+ * attribute must appear as the whole operand of `attribute_exists(...)` /
+ * `attribute_not_exists(...)` — never with a path below it or under another
+ * operator. A placeholder used as a nested segment (`#a.#b`) is another
+ * attribute's path, and is left alone.
+ */
+export const packedCompiledRefusal = (
+  expression: string,
+  names: Readonly<Record<string, string>>,
+  guards: ReadonlyArray<PackedAttributeGuard>,
+  usage: string,
+): string | undefined => {
+  if (guards.length === 0) return undefined
+  for (const [placeholder, name] of Object.entries(names)) {
+    const guard = guards.find((g) => g.attribute === name)
+    if (guard === undefined) continue
+    const occurrences = new RegExp(`${escapeRegExp(placeholder)}(?![A-Za-z0-9_])`, "g")
+    for (const match of expression.matchAll(occurrences)) {
+      const start = match.index
+      const before = expression.slice(0, start)
+      if (/[.\]]\s*$/.test(before)) continue // a nested segment of another path
+      const after = expression.slice(start + placeholder.length)
+      if (/^\s*[.[]/.test(after)) {
+        return refusal(guard, usage, name, `addresses a path inside "${name}"`)
+      }
+      if (/attribute_(?:not_)?exists\(\s*$/.test(before) && /^\s*\)/.test(after)) continue
+      return refusal(
+        guard,
+        usage,
+        name,
+        `applies an operator other than attribute_exists to "${name}"`,
+      )
+    }
+  }
+  return undefined
+}

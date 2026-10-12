@@ -18,6 +18,12 @@ import {
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
+import {
+  collectionPackedQueryOptions,
+  entityPackedQueryOptions,
+  type PackedAttributeGuard,
+  type PackedError,
+} from "./internal/Packed.js"
 import * as Query from "./Query.js"
 import type { TableConfig } from "./Table.js"
 
@@ -41,8 +47,15 @@ interface CollectionEntity {
     raw: globalThis.Record<string, unknown>,
   ) => import("effect").Effect.Effect<
     any,
-    import("@effect-dynamodb/schema/Errors.js").ValidationError
+    | import("@effect-dynamodb/schema/Errors.js").ValidationError
+    | import("@effect-dynamodb/schema/Errors.js").CompressorNotRegistered
   >
+  /** Packed attributes an expression may not look inside (EDD-9076, #147). */
+  readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** Read packed attributes of a raw row by their stored form (#147). */
+  readonly _unpackFields?:
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, PackedError>)
+    | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -320,8 +333,9 @@ export const make = <
       decoder: (raw) => {
         // This decoder gets called per-item, but Query.collect collects all items
         // We need to tag each item with its entity key so the caller can group
-        return collectionDecoder(raw) as Effect.Effect<any, ValidationError>
+        return collectionDecoder(raw) as Effect.Effect<any, Query.QueryDecodeError>
       },
+      ...collectionPackedQueryOptions(entityEntries.map(([, entity]) => entity)),
       keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
@@ -355,6 +369,7 @@ export const make = <
         skField: sharedSkField,
         entityTypes: [entity.entityType],
         decoder: (raw) => entity._decodeRecord(raw),
+        ...entityPackedQueryOptions(entity),
         resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
         keyFields: [
           sharedPkField,

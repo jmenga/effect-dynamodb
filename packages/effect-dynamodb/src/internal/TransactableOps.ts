@@ -6,7 +6,7 @@
  */
 
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { type CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
@@ -320,7 +320,7 @@ export const validateAndBuildPutItem = (
     /** Whether the input supplied `createdAt` (a replacing put keeps the stored one otherwise). */
     readonly createdAtSupplied: boolean
   },
-  ValidationError
+  ValidationError | CompressorNotRegistered
 > =>
   Effect.gen(function* () {
     // Clock-backed time source resolved once per op; threaded into the sync
@@ -402,6 +402,9 @@ export const validateAndBuildPutItem = (
         cause: e instanceof Error ? e.message : String(e),
       })
     }
+
+    // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
+    yield* entity._packFields(item, operation)
 
     return { item, marshalled: toAttributeMap(item), now, createdAtSupplied }
   })

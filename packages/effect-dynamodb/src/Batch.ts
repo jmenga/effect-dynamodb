@@ -10,6 +10,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import {
+  type CompressorNotRegistered,
   DynamoError,
   isAwsTransactionCancelled,
   TRANSACT_WRITE_ITEMS_LIMIT,
@@ -91,7 +92,7 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
   config?: BatchRetryConfig,
 ): Effect.Effect<
   BatchGetResult<T>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | CompressorNotRegistered,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -284,7 +285,11 @@ const committedBeforeRequest = (
 export const write = (
   operations: ReadonlyArray<BatchWriteOp>,
   config?: BatchRetryConfig,
-): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+): Effect.Effect<
+  void,
+  DynamoClientError | ValidationError | CompressorNotRegistered,
+  DynamoClient | TableConfig
+> =>
   Effect.gen(function* () {
     if (operations.length === 0) return
     const maxRetries = config?.maxRetries ?? MAX_RETRIES

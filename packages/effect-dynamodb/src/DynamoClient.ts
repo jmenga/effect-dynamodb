@@ -169,7 +169,13 @@ import {
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
-import { createPathBuilder } from "./internal/PathBuilder.js"
+import {
+  collectionPackedQueryOptions,
+  entityPackedQueryOptions,
+  type PackedAttributeGuard,
+  type PackedError,
+} from "./internal/Packed.js"
+import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
   diagnoseFailure,
   explainDiagnosis,
@@ -775,17 +781,18 @@ export type TypedClient<
       any,
       infer TS,
       infer GenId,
-      infer VI
+      infer VI,
+      infer P
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-              Schema.Schema.Type<M>,
+              PathModel<Schema.Schema.Type<M>, P>,
               never,
               Schema.Schema.Type<M>
             >
-          } & EntityIndexAccessors<M, I, R> &
+          } & EntityIndexAccessors<M, I, R, P> &
             EntityVectorAccessors<M, VI>
         >
       : TEntities[K] extends EntityDefinition<
@@ -800,17 +807,18 @@ export type TypedClient<
             any,
             infer TS,
             infer GenId,
-            infer VI
+            infer VI,
+            infer P
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
-                Schema.Schema.Type<M>,
+                PathModel<Schema.Schema.Type<M>, P>,
                 never,
                 Schema.Schema.Type<M>
               >
-            } & EntityIndexAccessors<M, I, R> &
+            } & EntityIndexAccessors<M, I, R, P> &
               EntityVectorAccessors<M, VI>
           >
         : never
@@ -891,11 +899,12 @@ type EntityIndexAccessors<
   M extends Schema.Top,
   I extends Record<string, IndexDefinition>,
   R = undefined,
+  P extends string = never,
 > = {
   readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
   ) => import("./internal/BoundQuery.js").BoundQuery<
-    Schema.Schema.Type<M>,
+    PathModel<Schema.Schema.Type<M>, P>,
     ResolveSkFields<M, I, K, Provided, R>,
     Schema.Schema.Type<M>
   >
@@ -958,6 +967,7 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           number,
           | DynamoClientError
           | import("@effect-dynamodb/schema/Errors.js").ValidationError
+          | import("@effect-dynamodb/schema/Errors.js").CompressorNotRegistered
           | import("@effect-dynamodb/schema/Errors.js").EmbeddingError,
           never
         >
@@ -1066,6 +1076,12 @@ interface EntityLike {
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
+  /** Packed attributes an expression may not look inside (EDD-9076, #147). */
+  readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** Read packed attributes of a raw row by their stored form (#147). */
+  readonly _unpackFields?:
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, PackedError>)
+    | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
@@ -1260,6 +1276,7 @@ const makeFromConfig = (config: {
           skField: indexDef.sk.field,
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
+          ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
             indexDef.pk.field,
@@ -1626,6 +1643,7 @@ const makeFromConfig = (config: {
           indexName: undefined,
           entityTypes: [entityLike.entityType],
           decoder: (raw) => entityLike._decodeRecord(raw),
+          ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
           liveRows: entityLike._liveRows?.(),
@@ -1718,6 +1736,7 @@ const makeFromConfig = (config: {
           skField: indexDef.sk.field,
           entityTypes,
           decoder: collDecoder as any,
+          ...collectionPackedQueryOptions(members.map((m) => m.entityLike)),
           resolveTableName: firstMember.entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
             indexDef.pk.field,
