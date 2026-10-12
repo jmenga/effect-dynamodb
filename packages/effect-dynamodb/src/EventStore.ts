@@ -1723,7 +1723,9 @@ interface AppendParts {
  * `storedAs: { data: DynamoModel.Packed(...) }` stores event `data` packed, and
  * `snapshot.storedAs` the snapshot `state` — see {@link StreamStorageConfig}.
  * Register the codecs a compressed config names through the `Compression`
- * service (`DynamoClient.layer({ compressors })`).
+ * service (`Compression.layer([...])` merged into the application layer): a
+ * bound stream refuses to bind without them, and an unbound one to run its
+ * first operation (`[EDD-9078]`).
  */
 export const makeStream = <
   const TEvents extends ReadonlyArray<Schema.Top>,

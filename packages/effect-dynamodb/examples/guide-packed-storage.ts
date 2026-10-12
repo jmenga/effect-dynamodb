@@ -2,7 +2,7 @@
  * Packed Storage Guide Example — effect-dynamodb
  *
  * Demonstrates `DynamoModel.Packed({ format: "json", compression? })`:
- *   - Registering Node compressors on the DynamoClient layer
+ *   - Registering Node compressors as a Compression layer merged into the app layer
  *   - An entity field stored as one JSON string (S)
  *   - An entity field compressed to binary (B) over a threshold
  *   - What conditions and updates a packed field accepts
@@ -27,6 +27,7 @@ import { Base64 } from "effect/encoding"
 // Import from source (use "effect-dynamodb" and "effect-dynamodb/compression/node" when published)
 import * as NodeCompression from "../src/compression/node.js"
 import { DynamoClient } from "../src/DynamoClient.js"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
@@ -184,7 +185,7 @@ const ledgerDecider: EventStore.Decider<
 const NativeTable = Table.make({ schema: AppSchema, entities: { NativeOrders } })
 
 // =============================================================================
-// 3. Layers — register compressors where DynamoClient is
+// 3. Layers — the compressors as their own layer, merged into the app layer
 // =============================================================================
 
 // #region compressors
@@ -192,16 +193,19 @@ const ClientLayer = DynamoClient.layerConfig({
   region: Config.succeed("us-east-1"),
   endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
   credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
-  // Every codec a reader may meet. zstd needs Node >= 22.15.
-  compressors: [NodeCompression.zstd(), NodeCompression.gzip()],
 })
-// #endregion
 
+// Every codec a reader may meet. zstd needs Node >= 22.15.
+const CompressionLayer = Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()])
+
+// Merged beside the client, so every layer and every program sees it
 const AppLayer = Layer.mergeAll(
   ClientLayer,
+  CompressionLayer,
   EventsTable.layer({ name: TABLE_NAME }),
   NativeTable.layer({ name: TABLE_NAME }),
 )
+// #endregion
 
 // =============================================================================
 // 4. Helpers (not shown in the guide)

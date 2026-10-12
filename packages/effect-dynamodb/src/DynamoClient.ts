@@ -492,12 +492,21 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.credentials - Optional static credentials
    * @param config.compressors - Optional compressors for packed storage
    *   (`DynamoModel.Packed` with `compression`). When given, the layer also
-   *   provides the `Compression` service built from them, so they are available
-   *   wherever `DynamoClient` is.
+   *   provides the `Compression` service built from them. That reaches whatever
+   *   this layer is merged with — but not past a wrapper that consumes it
+   *   through `Layer.provide` (a decorated client, say), whose output is only
+   *   `DynamoClient`. Prefer a separate `Compression.layer([...])` merged into
+   *   the application layer, which works however the client is composed.
    *
    * @example
    * ```typescript
    * import * as NodeCompression from "effect-dynamodb/compression/node"
+   * // Recommended: the compressors as their own layer, beside the client
+   * const AppLayer = Layer.mergeAll(
+   *   DynamoClient.layer({ region: "us-east-1" }),
+   *   Compression.layer([NodeCompression.zstd()]),
+   * )
+   * // Also works, when this layer is used directly:
    * const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
    * ```
    */
@@ -523,7 +532,8 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials
    * @param config.compressors - Optional compressors for packed storage; when
-   *   given, the layer also provides the `Compression` service (see {@link layer}).
+   *   given, the layer also provides the `Compression` service (see {@link layer}
+   *   for why a separate `Compression.layer([...])` is the recommended form).
    */
   static readonly layerConfig: {
     (

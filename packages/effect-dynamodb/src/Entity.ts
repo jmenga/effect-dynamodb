@@ -10878,9 +10878,8 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
  * Accepts DynamoDB JSON (`{ pk: { S: "…" }, … }`, `B` as bytes or base64) or
  * an already-unmarshalled item. Fails with `ValidationError` if the item does
  * not match the schema, or when a compressed value's codec is not registered —
- * its `cause` is then a `CompressorNotRegistered` (register the codec with
- * `DynamoClient.layer({ compressors })`, or a `Compression` layer, provided
- * where the decode runs).
+ * its `cause` is then a `CompressorNotRegistered` (register the codec with a
+ * `Compression.layer([...])` provided where the decode runs).
  *
  * Note: {@link itemSchema} is a pure schema over unmarshalled items and does
  * not unpack — use this for entities with packed fields.

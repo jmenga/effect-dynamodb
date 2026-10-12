@@ -86,18 +86,21 @@ export const empty: CompressionRegistry = make([])
  * Effect `Context.Service` carrying the {@link CompressionRegistry} packed
  * storage reads and writes with.
  *
- * Provide it with `DynamoClient.layer({ compressors })` /
- * `DynamoClient.layerConfig({ compressors })` (one line, beside the client),
- * pass `compressors` to `DynamoClient.make` (bundled into every bound
- * operation), or provide {@link Compression.layer} yourself.
+ * Provide it with {@link Compression.layer} merged into the application layer
+ * beside the client (recommended: it reaches every layer and program however
+ * the client layer is composed), pass `compressors` to `DynamoClient.make`
+ * (bundled into every bound operation), or use `DynamoClient.layer({
+ * compressors })` — whose `Compression` output does not survive a wrapper
+ * layer that consumes it through `Layer.provide`.
  *
  * @example
  * ```typescript
  * import * as NodeCompression from "effect-dynamodb/compression/node"
  *
- * const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
- * // or, independently of the client:
- * const compression = Compression.layer([NodeCompression.gzip(), NodeCompression.zstd()])
+ * const AppLayer = Layer.mergeAll(
+ *   DynamoClient.layer({ region: "us-east-1" }),
+ *   Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+ * )
  * ```
  */
 export class Compression extends Context.Service<Compression, CompressionRegistry>()(

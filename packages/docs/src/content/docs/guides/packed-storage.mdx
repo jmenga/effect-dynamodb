@@ -226,9 +226,18 @@ const ClientLayer = DynamoClient.layerConfig({
   region: Config.succeed("us-east-1"),
   endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
   credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
-  // Every codec a reader may meet. zstd needs Node >= 22.15.
-  compressors: [NodeCompression.zstd(), NodeCompression.gzip()],
 })
+
+// Every codec a reader may meet. zstd needs Node >= 22.15.
+const CompressionLayer = Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()])
+
+// Merged beside the client, so every layer and every program sees it
+const AppLayer = Layer.mergeAll(
+  ClientLayer,
+  CompressionLayer,
+  EventsTable.layer({ name: TABLE_NAME }),
+  NativeTable.layer({ name: TABLE_NAME }),
+)
 ```
 
 | Export | Notes |
@@ -246,8 +255,27 @@ zstd is the recommended codec: it has the cheapest writes and about the same rat
 Compressors can be registered in three ways. This list is in order of precedence:
 
 1. `DynamoClient.make({ entities, ..., compressors: [...] })`, bound into every operation of that client.
-2. A `Compression` service in context when the client or stream is bound. `DynamoClient.layer({ compressors })` and `DynamoClient.layerConfig({ compressors })`, as above, provide one beside the client. `Compression.layer([...])` provides one on its own.
+2. A `Compression` service in context when the client or stream is bound. `Compression.layer([...])` merged into the application layer, as above, is the recommended way to provide one.
 3. A `Compression` service in context when an unbound operation or decode helper runs.
+
+### Why a layer of its own
+
+`DynamoClient.layer({ compressors })` and `DynamoClient.layerConfig({ compressors })` also provide a `Compression` service, from the same layer as the client. That works when the application layer uses that layer directly. But `Layer.provide` hands a layer's outputs only to the layer it's provided to, so they don't reach the rest of the application. A wrapper that decorates the client is the common case:
+
+```typescript
+// An instrumented client. Only DynamoClient comes out of this layer: the
+// Compression service the inner layer provides is used up inside it.
+const TracedClient = Layer.effect(
+  DynamoClient,
+  Effect.gen(function* () {
+    return withTracing(yield* DynamoClient)
+  }),
+).pipe(
+  Layer.provide(DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })),
+)
+```
+
+Clients and streams built on `TracedClient` don't see the compressors. Binding them fails with `[EDD-9078]` (see below), rather than reads failing later. A `Compression.layer([...])` merged into the application layer next to the client works however the client layer is composed.
 
 None of these adds a requirement (`R`) or an error type to entity or EventStore operations: their error channels are the same whether or not anything is packed. Without a registry, uncompressed JSON is read and written as normal. Only a value that needs a codec fails, with the operation's usual `ValidationError`. Its `cause` is a `CompressorNotRegistered { codec, direction, entityType, attribute, operation }`, so you can tell a missing codec apart from an undecodable value:
 

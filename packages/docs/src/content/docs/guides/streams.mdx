@@ -197,7 +197,7 @@ const decodeImage = (image: EventStore.StreamImage) =>
   })
 ```
 
-Compressors come from a `Compression` service in context (for example `DynamoClient.layer({ compressors })`), as for table reads. See [DynamoDB Streams images](/effect-dynamodb/guides/packed-storage/#dynamodb-streams-images) in the Packed Storage guide.
+Compressors come from a `Compression` service in context (for example `Compression.layer([...])` merged into the application layer), as for table reads. See [DynamoDB Streams images](/effect-dynamodb/guides/packed-storage/#dynamodb-streams-images) in the Packed Storage guide.
 
 ## What's Next?
 

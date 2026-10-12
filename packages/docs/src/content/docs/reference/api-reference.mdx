@@ -986,7 +986,7 @@ import { DynamoClient } from "effect-dynamodb"
 | `DynamoClient` | `Context.Service` | Effect service class |
 | `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials |
 | `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values |
-| `compressors` option | `ReadonlyArray<Compressor>` | On `layer` / `layerConfig`: also provide a `Compression` registry for [packed storage](/effect-dynamodb/guides/packed-storage/) (the layer's output becomes `DynamoClient \| Compression`). On `DynamoClient.make({ ..., compressors })`: bind the registry into every operation of that client, ahead of any ambient `Compression` |
+| `compressors` option | `ReadonlyArray<Compressor>` | On `layer` / `layerConfig`: also provide a `Compression` registry for [packed storage](/effect-dynamodb/guides/packed-storage/) (the layer's output becomes `DynamoClient \| Compression`); it does not survive a wrapper layer that consumes this layer through `Layer.provide`, so prefer `Compression.layer([...])` merged into the application layer. On `DynamoClient.make({ ..., compressors })`: bind the registry into every operation of that client, ahead of any ambient `Compression` |
 
 ### Service Methods
 

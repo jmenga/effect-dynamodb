@@ -10,13 +10,13 @@
  *
  * @example
  * ```typescript
- * import { DynamoClient } from "effect-dynamodb"
+ * import { Compression, DynamoClient } from "effect-dynamodb"
  * import * as NodeCompression from "effect-dynamodb/compression/node"
  *
- * const live = DynamoClient.layer({
- *   region: "us-east-1",
- *   compressors: [NodeCompression.zstd(), NodeCompression.gzip()],
- * })
+ * const AppLayer = Layer.mergeAll(
+ *   DynamoClient.layer({ region: "us-east-1" }),
+ *   Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+ * )
  * ```
  *
  * Register every codec values were written with for as long as such values

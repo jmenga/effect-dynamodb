@@ -387,9 +387,9 @@ export type CompressorNotRegisteredFields = {
  * ```
  *
  * Register the codec through the `Compression`
- * service — `DynamoClient.layer({ compressors })`,
- * `DynamoClient.make({ compressors })` or `Compression.layer([...])` — for
- * Node with `effect-dynamodb/compression/node`. Keep registering a codec for as
+ * service — `Compression.layer([...])` merged into the application layer,
+ * or `DynamoClient.make({ compressors })` — for Node with
+ * `effect-dynamodb/compression/node`. Keep registering a codec for as
  * long as values written with it exist.
  */
 export class CompressorNotRegistered extends Data.TaggedError(
@@ -401,7 +401,8 @@ export class CompressorNotRegistered extends Data.TaggedError(
       `${fields.entityType}: attribute "${fields.attribute}" needs the "${fields.codec}" ` +
       `compressor to ${fields.direction} its packed value (${fields.operation}), but none is ` +
       `registered. Register one through the Compression service — e.g. ` +
-      `DynamoClient.layer({ compressors: [...] }) with effect-dynamodb/compression/node.`
+      `Compression.layer([...]) merged into the application layer, with ` +
+      `effect-dynamodb/compression/node.`
   }
 }
 

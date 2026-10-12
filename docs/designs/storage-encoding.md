@@ -280,14 +280,29 @@ compressed values written earlier. The run-time `ValidationError` + `CompressorN
 cause remains for what bind cannot see: unbound entity operations, the `StorageEncoding`
 helpers, and stored values whose header names a codec the current config does not.
 
-Convenience: `DynamoClient.layer({ region, endpoint?, credentials?, compressors? })` and
-`DynamoClient.layerConfig({ …, compressors? })` also provide `Compression` from the same
-layer, so "registered where DynamoClient is" is one line:
+**Recommended pattern: a layer of its own.** The guide and example register compressors
+as a standalone `Compression.layer([...])` merged into the application layer beside the
+client:
 
 ```ts
 import * as NodeCompression from "effect-dynamodb/compression/node"
-const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({ region: "us-east-1" }),
+  Compression.layer([NodeCompression.zstd(), NodeCompression.gzip()]),
+)
 ```
+
+Convenience: `DynamoClient.layer({ region, endpoint?, credentials?, compressors? })` and
+`DynamoClient.layerConfig({ …, compressors? })` also provide `Compression` from the same
+layer. Kept: used directly (merged into the app layer, or provided to the program), it
+works exactly like the standalone layer. **Pitfall** (downstream review): `Layer.provide`
+hands a layer's outputs only to the layer it is provided to, so a wrapper that consumes the
+client layer that way — a decorated/instrumented client,
+`Layer.effect(DynamoClient, …).pipe(Layer.provide(DynamoClient.layer({ compressors })))` —
+outputs `DynamoClient` alone and the `Compression` is gone for everything else. The
+standalone layer does not depend on how the client is composed, which is why the docs lead
+with it; with the bind-time check above, the pitfall surfaces as `[EDD-9078]` at bind
+rather than as read failures (`test/DynamoClient.compression.test.ts` pins both).
 
 The layers are overloaded on `compressors`: given, the return type is
 `Layer<DynamoClient | Compression, …>`; omitted, it stays `Layer<DynamoClient, …>` and no
@@ -1298,6 +1313,7 @@ this design introduced. **Source** says who decided.
 | 63 | Review P2: configured codec checked at bind | **In**: `[EDD-9078]` defect from `DynamoClient.make` (entities, aggregate edges) and `EventStore.bind`, and from an unbound stream's first operation per registry (§3.4). A codec-naming member now needs its codec registered where it is bound (a run-time-only registry no longer suffices for it). Out: unbound entity operations and the `query.*` stream descriptors (no single entry point; they keep the run-time `ValidationError`) | review; design |
 | 64 | Review P3: decompression-bomb guard | **In**: 64 MiB default `maxOutputLength` in the Node compressors, configurable, `Infinity` lifts it (§3.4) | review |
 | 65 | Review P4: raw data from `decodeStreamImage` | **In**: `{ raw: true }` → `RawStreamEvent` with `rawData` (§3.5). Out: the same on `Entity.decodeMarshalledItem` — it returns the item itself, so a raw view needs a different result shape; not cheap-and-consistent | review; design |
+| 66 | Review P5: `Compression` lost behind a wrapper layer | **In**: docs, guide and example lead with a standalone `Compression.layer([...])` merged into the app layer, and explain the `Layer.provide` pitfall (§3.4). `DynamoClient.layer({ compressors })` / `layerConfig` **kept**: they work when used directly, and removing them is not needed to fix the pitfall | review; design |
 
 ---
 
