@@ -342,6 +342,13 @@ export interface Aggregate<
    */
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
 
+  /**
+   * @internal The packed attributes of each edge entity type's items (stored
+   * name → config). `DynamoClient.make()` checks the codecs they name against
+   * the registry it binds with (`[EDD-9078]`).
+   */
+  readonly _packedByType?: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>
+
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
 
@@ -1438,6 +1445,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     [TypeId]: TypeId,
     _tag: "Aggregate",
     _tableTag: config.table.Tag,
+    _packedByType: packedByType,
     schema,
     pkField: config.pk.field,
     collection: {

@@ -34,6 +34,7 @@ import type {
   LocalSecondaryIndex,
   Projection,
 } from "@aws-sdk/client-dynamodb"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import { isPackedConfig, type PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
@@ -58,6 +59,7 @@ import {
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
+  Context,
   DateTime,
   type Duration,
   Effect,
@@ -71,11 +73,15 @@ import {
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
+  type CodecRequirement,
+  codecRequirements,
   currentRegistry,
   decodeImage,
   imageEntityType,
   type PackedAttributeGuard,
+  runtimeCodecCheck,
   type StreamImage,
+  unregisteredCodecError,
   withRegistry,
 } from "./internal/Packed.js"
 import {
@@ -170,6 +176,16 @@ export type StreamMetadata<TMetadata> = [TMetadata] extends [undefined]
  *
  * @internal
  */
+/** The codecs a stream's packed `data` / `state` name (`[EDD-9078]` when unregistered). */
+const streamCodecRequirements = (
+  streamName: string,
+  storedAs: { readonly data?: PackedConfig | undefined; readonly state?: PackedConfig | undefined },
+): Array<CodecRequirement> =>
+  codecRequirements(`stream "${streamName}"`, [
+    ["data", storedAs.data],
+    ["state", storedAs.state],
+  ])
+
 /** The attributes a stream image reads by stored form: event `data` only. */
 const DATA_ATTRIBUTES: ReadonlyArray<string> = ["data"]
 
@@ -1776,6 +1792,20 @@ export const makeStream = <
    */
   const stateDispatch =
     snapshot !== undefined && (stateStoredAs !== undefined || isDispatchEligible(snapshot.schema))
+  /**
+   * The first operation run with a given compressor registry checks that it
+   * has every codec `storedAs` names (`[EDD-9078]`, a defect): the stream
+   * meets values compressed with them on every read and write. `bind` checks
+   * the registry it captures up front instead.
+   */
+  const codecCheck = runtimeCodecCheck(
+    `EventStore (first use of stream "${config.streamName}")`,
+    streamCodecRequirements(config.streamName, storage),
+  )
+  const checked = <Args extends ReadonlyArray<any>, A, E, R>(
+    op: (...args: Args) => Effect.Effect<A, E, R>,
+  ): ((...args: Args) => Effect.Effect<A, E, R>) =>
+    codecCheck === undefined ? op : (...args) => Effect.andThen(codecCheck, op(...args))
   /** The `[EDD-9076]` guard for queries of a stream whose `data` is packed. */
   const dataGuards: ReadonlyArray<PackedAttributeGuard> =
     dataStoredAs === undefined
@@ -3371,21 +3401,21 @@ export const makeStream = <
     snapshotConfig: snapshotSettings,
     storedAs: storage,
     indexes: indexSettings,
-    writeSnapshot,
-    readSnapshot,
-    append,
-    read,
-    readFrom,
-    currentVersion,
-    readLatest,
-    readIndex,
-    measureAppend,
-    measureSnapshot,
-    decodeStreamImage,
+    writeSnapshot: checked(writeSnapshot),
+    readSnapshot: checked(readSnapshot),
+    append: checked(append),
+    read: checked(read),
+    readFrom: checked(readFrom),
+    currentVersion: checked(currentVersion),
+    readLatest: checked(readLatest),
+    readIndex: checked(readIndex),
+    measureAppend: checked(measureAppend),
+    measureSnapshot: checked(measureSnapshot),
+    decodeStreamImage: checked(decodeStreamImage),
     query: queryNamespace,
     [StreamIdFormatter]: composeStreamIdString,
-    [CommandSentinelProbe]: hasCommandSentinel,
-    [HeadAboveProbe]: headAbove,
+    [CommandSentinelProbe]: checked(hasCommandSentinel),
+    [HeadAboveProbe]: checked(headAbove),
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,
@@ -3592,6 +3622,14 @@ export const bind = <
 > =>
   Effect.gen(function* () {
     const ctx = yield* Effect.context<DynamoClient | TableConfig>()
+    // The stream meets values compressed with every codec its `storedAs`
+    // names, so the registry captured here must have them (#147).
+    const codecError = unregisteredCodecError(
+      "EventStore.bind",
+      streamCodecRequirements(stream.streamName, stream.storedAs),
+      Context.getOrUndefined(ctx, Compression),
+    )
+    if (codecError !== undefined) throw codecError
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

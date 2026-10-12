@@ -22,7 +22,8 @@
  *     bytes accepted, 409,601 rejected and diagnosed with the stored size (R1/R4).
  *   - decodeStreamImage on items fetched with the raw client and rewritten into
  *     Lambda's DynamoDB-JSON shape with base64 B (R2).
- *   - a ValidationError caused by CompressorNotRegistered on a read without the codec.
+ *   - a ValidationError caused by CompressorNotRegistered on a read without the codec by a
+ *     stream that names none, and EDD-9078 from one that names it (first use and bind).
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -40,7 +41,7 @@ import { ITEM_MAX_BYTES, itemBytes } from "../src/internal/ItemSize.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import { missingCompressor } from "./helpers/MissingCompressor.js"
+import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -635,7 +636,8 @@ describeConnected("EventStore packed storage (#147)", () => {
       Effect.gen(function* () {
         const id = { ledgerId: "mix-bare" }
         yield* writeMixed(id.ledgerId).pipe(provide)
-        const error = yield* ZstdLedger.read(id, { consistentRead: true }).pipe(Effect.flip)
+        // A stream that names no codec runs without a registry, and meets gzip.
+        const error = yield* JsonLedger.read(id, { consistentRead: true }).pipe(Effect.flip)
         expect(missingCompressor(error)).toMatchObject({
           codec: "gzip",
           direction: "decompress",
@@ -646,6 +648,11 @@ describeConnected("EventStore packed storage (#147)", () => {
           yield* ZstdLedger.query.events(id).pipe(Query.limit(3), Query.collect),
           [1, 2, 3],
         )
+        // A stream that names zstd dies before its first operation, and refuses
+        // to bind, without the codec.
+        unregisteredCodecDefect(yield* Effect.exit(ZstdLedger.read(id, { consistentRead: true })))
+        const bind = unregisteredCodecDefect(yield* Effect.exit(EventStore.bind(ZstdLedger)))
+        expect(bind).toContain("[EDD-9078] EventStore.bind")
       }).pipe(provideBare),
   )
 })

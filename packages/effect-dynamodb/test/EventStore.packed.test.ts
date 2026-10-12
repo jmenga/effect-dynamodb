@@ -27,7 +27,7 @@ import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import { missingCompressor } from "./helpers/MissingCompressor.js"
+import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import {
   awsValidationException,
   DDB_ITEM_SIZE,
@@ -489,21 +489,29 @@ describe("EventStore packed storage — append (#147)", () => {
   )
 
   it.effect(
-    "a compressed append without a registered codec fails with a ValidationError caused by CompressorNotRegistered",
+    "an unbound stream whose codec is not registered dies with EDD-9078 on first use, before writing",
     () =>
       Effect.gen(function* () {
-        const error = yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.flip)
-        expect(missingCompressor(error)).toMatchObject({
-          codec: "zstd",
-          direction: "compress",
-          entityType: "ledger.event",
-          attribute: "data",
-          operation: "EventStore.append.packed",
-        })
+        // Even a value under the threshold: the stream meets zstd values on
+        // every read, so every operation needs the codec.
+        const message = unregisteredCodecDefect(
+          yield* Effect.exit(ZstdLedger.append(id, [recorded(1)], 0)),
+        )
+        expect(message).toContain('EventStore (first use of stream "Ledger")')
+        expect(message).toContain('stream "Ledger" stores "data" packed with codec "zstd"')
+        expect(message).toContain('stream "Ledger" stores "state" packed with codec "zstd"')
+        expect(message).toContain("no Compression registry is in scope")
         expect(store.size).toBe(0)
-        // Under the threshold no compressor is needed.
-        yield* ZstdLedger.append(id, [recorded(1)], 0)
-        expect(storedEvents()[0]!.data!.S).toBeDefined()
+        // A registry without the codec is refused the same way, by name.
+        const gzipOnly = unregisteredCodecDefect(
+          yield* Effect.exit(
+            ZstdLedger.read(id).pipe(Effect.provide(Compression.layer([NodeCompression.gzip()]))),
+          ),
+        )
+        expect(gzipOnly).toContain('the Compression registry in scope has "gzip"')
+        // With the codec in scope the same stream works.
+        yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.provide(Codecs))
+        expect(storedEvents()).toHaveLength(1)
       }).pipe(Effect.provide(NoCodecs)),
   )
 
@@ -625,7 +633,9 @@ describe("EventStore packed storage — every read path on a mixed M/S/B stream 
     () =>
       Effect.gen(function* () {
         yield* writeMixedStream.pipe(Effect.provide(Codecs))
-        const error = yield* ZstdLedger.read(id).pipe(Effect.flip)
+        // A stream configured with plain JSON names no codec, so it runs
+        // without a registry — and meets the gzip values written earlier.
+        const error = yield* JsonLedger.read(id).pipe(Effect.flip)
         expect(missingCompressor(error)).toMatchObject({
           codec: "gzip",
           direction: "decompress",
@@ -633,6 +643,8 @@ describe("EventStore packed storage — every read path on a mixed M/S/B stream 
         })
         // Rows that need no codec still read.
         expectMixedEvents(yield* ZstdLedger.readFrom(id, 4).pipe(Effect.provide(Codecs)), [5, 6])
+        // ZstdLedger names zstd itself: without it, it dies before reading.
+        unregisteredCodecDefect(yield* Effect.exit(ZstdLedger.readFrom(id, 4)))
         const events = yield* NativeLedger.query.events(id).pipe(Query.limit(3), Query.collect)
         expect(events.map((e) => e.version)).toEqual([1, 2, 3])
       }).pipe(Effect.provide(NoCodecs)),
@@ -852,7 +864,8 @@ describe("EventStore packed storage — snapshots (#147, R4)", () => {
     () =>
       Effect.gen(function* () {
         yield* ZstdLedger.writeSnapshot(id, bigState(1), 1).pipe(Effect.provide(Codecs))
-        const error = yield* ZstdLedger.readSnapshot(id).pipe(Effect.flip)
+        // JsonLedger names no codec: it reads without a registry and meets zstd.
+        const error = yield* JsonLedger.readSnapshot(id).pipe(Effect.flip)
         expect(missingCompressor(error)).toMatchObject({
           _tag: "CompressorNotRegistered",
           codec: "zstd",
@@ -948,14 +961,15 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
     }).pipe(Effect.provide(Layer.merge(TableLayer, Codecs))),
   )
 
-  it.effect("measureAppend needs only TableConfig, and the codec of a compressed value", () =>
+  it.effect("measureAppend needs only TableConfig, and the codecs the stream names", () =>
     Effect.gen(function* () {
-      const missing = yield* ZstdLedger.measureAppend(id, [recorded(1, LONG_NOTE)], 0).pipe(
-        Effect.flip,
+      const json = yield* JsonLedger.measureAppend(id, [recorded(1, LONG_NOTE)], 0)
+      expect(json.events).toHaveLength(1)
+      unregisteredCodecDefect(yield* Effect.exit(ZstdLedger.measureAppend(id, [recorded(1)], 0)))
+      const zstd = yield* ZstdLedger.measureAppend(id, [recorded(1, LONG_NOTE)], 0).pipe(
+        Effect.provide(Codecs),
       )
-      missingCompressor(missing)
-      const small = yield* ZstdLedger.measureAppend(id, [recorded(1)], 0)
-      expect(small.events).toHaveLength(1)
+      expect(zstd.events[0]!).toBeLessThan(json.events[0]!)
     }).pipe(Effect.provide(TableLayer)),
   )
 
@@ -1194,10 +1208,15 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
       Effect.gen(function* () {
         yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.provide(TestLayer))
         const [item] = storedEvents()
-        const error = yield* ZstdLedger.decodeStreamImage(lambdaImage(item!) as never).pipe(
+        // A decoder of a stream that names no codec meets the zstd value.
+        const error = yield* JsonLedger.decodeStreamImage(lambdaImage(item!) as never).pipe(
           Effect.flip,
         )
         missingCompressor(error)
+        // One that names zstd dies before decoding anything.
+        unregisteredCodecDefect(
+          yield* Effect.exit(ZstdLedger.decodeStreamImage(lambdaImage(item!) as never)),
+        )
       }),
   )
 })
@@ -1207,6 +1226,25 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
 // ---------------------------------------------------------------------------
 
 describe("EventStore packed storage — bound streams (#147)", () => {
+  it.effect("bind dies with EDD-9078 when the registry it captures lacks a configured codec", () =>
+    Effect.gen(function* () {
+      const none = unregisteredCodecDefect(yield* Effect.exit(EventStore.bind(ZstdLedger)))
+      expect(none).toContain("[EDD-9078] EventStore.bind")
+      expect(none).toContain('stream "Ledger" stores "data" packed with codec "zstd"')
+      const gzipOnly = unregisteredCodecDefect(
+        yield* Effect.exit(
+          EventStore.bind(ZstdLedger).pipe(
+            Effect.provide(Compression.layer([NodeCompression.gzip()])),
+          ),
+        ),
+      )
+      expect(gzipOnly).toContain('the Compression registry in scope has "gzip"')
+      // A stream that names no codec binds without a registry.
+      yield* EventStore.bind(JsonLedger)
+      yield* EventStore.bind(NativeLedger)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
+
   it.effect("bind captures the Compression registry in scope", () =>
     Effect.gen(function* () {
       const bound = yield* EventStore.bind(ZstdLedger).pipe(Effect.provide(TestLayer))

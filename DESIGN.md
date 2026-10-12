@@ -1341,7 +1341,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 
 A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
-**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `DynamoClient.layer({ compressors })`, `DynamoClient.make({ compressors })` or `Compression.layer(...)` — and read with `Effect.serviceOption`, so no operation gains an `R`. Node implementations (`node:zlib`) ship from `effect-dynamodb/compression/node`. A value that needs an unregistered codec (write over the threshold, or read of a `B`) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
+**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `DynamoClient.layer({ compressors })`, `DynamoClient.make({ compressors })` or `Compression.layer(...)` — and read with `Effect.serviceOption`, so no operation gains an `R`. Node implementations (`node:zlib`) ship from `effect-dynamodb/compression/node`. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge) and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
 **Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
 
@@ -3478,9 +3478,11 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and
   EventBridge Pipes deliver them) or unmarshalled — and `Option.none()` for any other
   item (snapshot, sentinel, foreign).
-- **Codecs.** Read from the `Compression` service with `Effect.serviceOption` (no new
-  `R`); `bind` captures it with the rest of the context. A missing codec fails with
-  the operation's existing `ValidationError`, whose `cause` is a
+- **Codecs.** Read from the `Compression` service in context (no new `R`); `bind`
+  captures it with the rest of the context and refuses a registry without the codecs
+  `storedAs` names (`[EDD-9078]`, a defect); an unbound stream checks the registry its
+  first operation runs with the same way. A stored value whose codec is missing anyway
+  fails with the operation's existing `ValidationError`, whose `cause` is a
   `CompressorNotRegistered` — no error channel changes.
 
 ### Command Handler Retry
@@ -4053,7 +4055,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9075` | `Entity.ts` (schema) | A packed field is a `DynamoModel.ref` field |
 | `EDD-9076` | `Query.ts`, `Entity.ts`, `internal/BoundCrud.ts`, `Transaction.ts` | A condition, filter or projection addresses a path inside a packed attribute, or applies anything but `attribute_exists` / `attribute_not_exists` to it (thrown when the expression is built; EventStore messages point to `Query.filterBy`) |
 | `EDD-9077` | `Entity.ts` | An update applies anything but a whole-value `.set()` / `.remove()` to a packed field (`add`, `subtract`, `append`, `deleteFromSet`, any `path*` op) — a `ValidationError` at execution |
-| `EDD-9078` | `Compression.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd` |
+| `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 
 Next free code: **`EDD-9080`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).

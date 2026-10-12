@@ -170,9 +170,11 @@ import {
 } from "./internal/BoundVectorQuery.js"
 import { createConditionOps } from "./internal/Expr.js"
 import {
+  codecRequirements,
   collectionPackedQueryOptions,
   entityPackedQueryOptions,
   type PackedAttributeGuard,
+  unregisteredCodecError,
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
@@ -1068,6 +1070,8 @@ interface EntityLike {
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
   readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** The domain fields stored packed. */
+  readonly _packedFields?: ReadonlyArray<string> | undefined
   /** Read packed attributes of a raw row by their stored form (#147). */
   readonly _unpackFields?:
     | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
@@ -1110,6 +1114,18 @@ const collectionLiveRows = (
     reads: [...new Set(["__edd_e__", ...[...byType.values()].flatMap((live) => live.reads)])],
   }
 }
+
+/**
+ * Each packed field of an entity once, by its domain name, with its config: a
+ * renamed field has a guard per name (domain and stored), both carrying it.
+ */
+const packedFieldConfigs = (
+  entity: EntityLike,
+): Array<readonly [string, PackedAttributeGuard["storedAs"] | undefined]> =>
+  (entity._packedFields ?? []).map((field) => [
+    field,
+    entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs,
+  ])
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
@@ -1155,6 +1171,25 @@ const makeFromConfig = (config: {
         : Option.isSome(ambientCompression)
           ? ambientCompression.value
           : undefined
+    // A bound member whose packed config names a codec meets values
+    // compressed with it on every read and write, so the codec must be
+    // registered here — a configuration defect (`[EDD-9078]`) at bind, not a
+    // ValidationError on the first compressed value (#147).
+    const codecError = unregisteredCodecError(
+      "DynamoClient.make",
+      [
+        ...Object.entries(config.entities).flatMap(([key, entity]) =>
+          codecRequirements(`entity "${key}"`, packedFieldConfigs(entity as unknown as EntityLike)),
+        ),
+        ...Object.entries(config.aggregates ?? {}).flatMap(([key, aggregate]) =>
+          [...(aggregate._packedByType ?? new Map())].flatMap(([edgeType, packed]) =>
+            codecRequirements(`aggregate "${key}" (edge "${edgeType}")`, Object.entries(packed)),
+          ),
+        ),
+      ],
+      compressionRegistry,
+    )
+    if (codecError !== undefined) throw codecError
     const ctx =
       compressionRegistry !== undefined
         ? Context.add(withEmbedder, Compression, compressionRegistry)

@@ -256,6 +256,16 @@ None of these adds a requirement (`R`) or an error type to entity or EventStore 
 
 Keep registering every codec your stored values were written with, for as long as such values exist. A reader needs the codec named in the value's header, whatever the writer's current config is.
 
+### Configured codecs are checked up front
+
+A store whose `Packed` config names a codec meets values compressed with it on every read and write, so the codec is checked before anything runs, not when the first compressed value turns up:
+
+- **`DynamoClient.make`** checks every bound entity and aggregate (including each aggregate's edge entities) against the registry it binds with, whether that's from `compressors` or a `Compression` in context. A codec that isn't registered, or no registry at all, fails the bind with an `[EDD-9078]` configuration defect naming the member, the field and the codec. It isn't a typed error.
+- **`EventStore.bind(stream)`** does the same for the stream's `storedAs.data` and `snapshot.storedAs`, against the context it captures.
+- **An unbound stream** (`EventStore.makeStream(...)` used with the `DynamoClient` in context) checks the registry in context on its first operation, before anything is written or read, and dies with the same `[EDD-9078]` defect. Each registry is checked once per stream.
+
+A member that packs plain JSON names no codec, so it needs no registry. The run-time `ValidationError` with a `CompressorNotRegistered` cause still covers the cases the check can't see: an unbound entity operation, the `StorageEncoding` helpers, and a value written with a codec the current config no longer names.
+
 ## What a packed value contains
 
 A packed value is the field's **wire (encoded) form**, the same value a map would hold, serialised with `JSON.stringify`:

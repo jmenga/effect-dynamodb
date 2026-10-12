@@ -33,7 +33,7 @@ import {
   type CompressionRegistry,
   empty as emptyRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
-import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { CompressionCodec, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   isBase64PackedText,
@@ -85,6 +85,85 @@ export const withRegistry = <A>(
 /** Lift a synchronous step's result (or the `ValidationError` it returned) into an Effect. */
 export const fromStep = <A>(result: A | ValidationError): Effect.Effect<A, ValidationError> =>
   result instanceof ValidationError ? Effect.fail(result) : Effect.succeed(result as A)
+
+// ---------------------------------------------------------------------------
+// Configured codecs (EDD-9078 at bind / first use)
+// ---------------------------------------------------------------------------
+
+/** A codec a store's packed config names — every reader and writer of it needs it registered. */
+export interface CodecRequirement {
+  /** Who configures it, for the message — e.g. `entity "Orders"`. */
+  readonly owner: string
+  /** The stored attribute. */
+  readonly attribute: string
+  readonly codec: CompressionCodec
+}
+
+/** The codecs `configs` (stored attribute → packed config) name. */
+export const codecRequirements = (
+  owner: string,
+  configs: Iterable<readonly [attribute: string, config: PackedConfig | undefined]>,
+): Array<CodecRequirement> => {
+  const out: Array<CodecRequirement> = []
+  for (const [attribute, config] of configs) {
+    const codec = config?.compression?.codec
+    if (codec !== undefined) out.push({ owner, attribute, codec })
+  }
+  return out
+}
+
+/**
+ * The `[EDD-9078]` configuration error for `requirements` the registry in scope
+ * (`undefined`: none) cannot meet, or `undefined` when it meets them all.
+ * `where` names the binding — `DynamoClient.make`, `EventStore.bind`, ….
+ */
+export const unregisteredCodecError = (
+  where: string,
+  requirements: ReadonlyArray<CodecRequirement>,
+  registry: CompressionRegistry | undefined,
+): Error | undefined => {
+  const missing = requirements.filter((r) => registry?.get(r.codec) === undefined)
+  if (missing.length === 0) return undefined
+  const what = missing
+    .map((r) => `${r.owner} stores "${r.attribute}" packed with codec "${r.codec}"`)
+    .join("; ")
+  const codecs = [...new Set(missing.map((r) => `"${r.codec}"`))].join(", ")
+  const scope =
+    registry === undefined
+      ? "no Compression registry is in scope"
+      : registry.codecs.length === 0
+        ? "the Compression registry in scope has no compressors"
+        : `the Compression registry in scope has ${registry.codecs.map((c) => `"${c}"`).join(", ")}`
+  return new Error(
+    `[EDD-9078] ${where}: ${what}, but ${scope}. Every reader and writer meets values ` +
+      `compressed with a configured codec, so register ${codecs} where the client or stream ` +
+      "is bound: DynamoClient.make({ compressors }), or Compression.layer([...]) merged into " +
+      "the application layer (see the packed storage guide).",
+  )
+}
+
+/**
+ * A once-per-registry check of `requirements` for code that resolves its
+ * registry at run time (an unbound `EventStream`): the first operation run
+ * with a given registry checks it; later ones cost a `WeakSet` lookup. Dies
+ * with the `[EDD-9078]` error — a configuration defect, not a typed failure.
+ * `undefined` when nothing names a codec.
+ */
+export const runtimeCodecCheck = (
+  where: string,
+  requirements: ReadonlyArray<CodecRequirement>,
+): Effect.Effect<void> | undefined => {
+  if (requirements.length === 0) return undefined
+  const passed = new WeakSet<CompressionRegistry>()
+  return Effect.withFiber((fiber) => {
+    const registry = Context.getOrUndefined(fiber.context, Compression)
+    if (registry !== undefined && passed.has(registry)) return Effect.void
+    const error = unregisteredCodecError(where, requirements, registry)
+    if (error !== undefined) return Effect.die(error)
+    passed.add(registry!)
+    return Effect.void
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Write

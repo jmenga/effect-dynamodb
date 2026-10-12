@@ -23,7 +23,8 @@
  *   - An aggregate edge whose entity has a packed field.
  *   - Entity.decodeMarshalledItem on a raw item rewritten into Lambda's
  *     DynamoDB-JSON shape (base64 B).
- *   - a ValidationError caused by CompressorNotRegistered on a read without the codec.
+ *   - a ValidationError caused by CompressorNotRegistered on an unbound read without the
+ *     codec, and EDD-9078 when binding a client without the codecs its entities name.
  *   - An unbound collection `Query.select` over a packed member (the member is
  *     looked up by a borrowed `__edd_e__`), and `DynamoClient.make({ compressors })`
  *     with nothing ambient.
@@ -48,7 +49,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { missingCompressor } from "./helpers/MissingCompressor.js"
+import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -810,10 +811,14 @@ describeConnected("Entity packed fields (#147)", () => {
     "a read without the codec fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
-        const db = yield* client
-        yield* db.entities.Orders.put(order("nc-1")).asEffect().pipe(provide)
-        const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: "nc-1" })))
+        // Unbound: the registry is the one in scope when the op runs.
+        yield* Orders.put(order("nc-1")).asEffect().pipe(provide)
+        const error = failure(yield* Effect.exit(Orders.get({ orderId: "nc-1" }).asEffect()))
         expect(missingCompressor(error)).toMatchObject({ direction: "decompress" })
+        // Bound: the client refuses to bind without the codecs its entities name.
+        const message = unregisteredCodecDefect(yield* Effect.exit(client))
+        expect(message).toContain("[EDD-9078] DynamoClient.make")
+        expect(message).toContain("no Compression registry is in scope")
       }).pipe(provideBare),
   )
 

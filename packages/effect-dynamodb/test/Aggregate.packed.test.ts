@@ -19,6 +19,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 class Venue extends Schema.Class<Venue>("Venue")({
@@ -426,6 +427,38 @@ describe("Aggregate — packed edges through DynamoClient.make({ compressors })"
       // The unbound aggregate, with no Compression in scope, cannot read it.
       const exit = yield* Effect.exit(Matches.get({ matchId: "m-1" }))
       expect(Exit.isFailure(exit)).toBe(true)
+    }).pipe(Effect.provide(Bare)),
+  )
+
+  it.effect("binding an aggregate whose edge names an unregistered codec dies with EDD-9078", () =>
+    Effect.gen(function* () {
+      // Only the aggregate is bound: its edge entity's codec is still checked.
+      const none = unregisteredCodecDefect(
+        yield* Effect.exit(
+          DynamoClient.make({ entities: {}, aggregates: { Matches }, tables: { MainTable } }),
+        ),
+      )
+      expect(none).toContain("[EDD-9078] DynamoClient.make")
+      expect(none).toContain(
+        'aggregate "Matches" (edge "MatchVenue") stores "layout" packed with codec "gzip"',
+      )
+      const brotliOnly = unregisteredCodecDefect(
+        yield* Effect.exit(
+          DynamoClient.make({
+            entities: {},
+            aggregates: { Matches },
+            tables: { MainTable },
+            compressors: [NodeCompression.brotli()],
+          }),
+        ),
+      )
+      expect(brotliOnly).toContain('the Compression registry in scope has "brotli"')
+      // With the codec ambient at bind, it binds.
+      yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Matches },
+        tables: { MainTable },
+      }).pipe(Effect.provide(Compression.layer([NodeCompression.gzip()])))
     }).pipe(Effect.provide(Bare)),
   )
 })

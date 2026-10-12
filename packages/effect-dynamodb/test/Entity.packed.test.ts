@@ -35,7 +35,7 @@ import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
-import { missingCompressor } from "./helpers/MissingCompressor.js"
+import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -555,8 +555,9 @@ describe("Entity packed fields — writes", () => {
     "a value over the threshold without its codec registered fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
-        const db = yield* client
-        const error = failure(yield* Effect.exit(db.entities.Orders.put(order()).asEffect()))
+        // Unbound: the registry is resolved when the op runs (a bound client
+        // refuses the missing codec at bind — see the DynamoClient.make tests).
+        const error = failure(yield* Effect.exit(Orders.put(order()).asEffect()))
         expect(missingCompressor(error)).toMatchObject({
           codec: "gzip",
           direction: "compress",
@@ -565,7 +566,7 @@ describe("Entity packed fields — writes", () => {
         })
         expect(store.size).toBe(0)
         // Under the threshold no codec is needed.
-        yield* db.entities.Orders.put(order({ details: smallDetails }))
+        yield* Orders.put(order({ details: smallDetails }))
         expect(stored(ORDER_KEY).d?.S).toBeDefined()
       }).pipe(Effect.provide(NoCodecs)),
   )
@@ -661,19 +662,17 @@ describe("Entity packed fields — reads", () => {
     "reading a B value without its codec fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
-        // Bound without a registry: one provided at run time still reaches the
-        // bound op (the write); the read runs without one.
-        const db = yield* client
-        yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
-        const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: "o-1" })))
+        // Unbound: written with the codec in scope, read without it.
+        yield* Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+        const error = failure(yield* Effect.exit(Orders.get({ orderId: "o-1" }).asEffect()))
         expect(missingCompressor(error)).toMatchObject({
           codec: "gzip",
           direction: "decompress",
           attribute: "d",
         })
         // A JSON (S) value needs no codec.
-        yield* db.entities.Orders.put(order({ orderId: "o-2", details: smallDetails }))
-        expect((yield* db.entities.Orders.get({ orderId: "o-2" })).details).toEqual(smallDetails)
+        yield* Orders.put(order({ orderId: "o-2", details: smallDetails }))
+        expect((yield* Orders.get({ orderId: "o-2" })).details).toEqual(smallDetails)
       }).pipe(Effect.provide(NoCodecs)),
   )
 
@@ -1260,8 +1259,7 @@ describe("Entity.decodeMarshalledItem — stream images", () => {
     "a compressed value without its codec fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
-        const db = yield* client
-        yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+        yield* Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
         const image = stored(ORDER_KEY)
         const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, image)))
         missingCompressor(error)
@@ -1496,24 +1494,87 @@ describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
     }).pipe(Effect.provide(NoCodecs)),
   )
 
-  it.effect("with nothing at bind time, a Compression provided at run time is used", () =>
+  it.effect("a bound member naming a codec the registry lacks fails at bind with EDD-9078", () =>
     Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { Orders, Docs, Readings },
-        tables: { MainTable },
+      const defect = unregisteredCodecDefect
+      // Nothing at bind time.
+      const none = defect(
+        yield* Effect.exit(DynamoClient.make({ entities: { Docs }, tables: { MainTable } })),
+      )
+      expect(none).toContain("[EDD-9078] DynamoClient.make")
+      expect(none).toContain('entity "Docs" stores "body" packed with codec "gzip"')
+      expect(none).toContain("no Compression registry is in scope")
+      // An ambient registry without the codec.
+      const ambient = defect(
+        yield* Effect.exit(
+          DynamoClient.make({ entities: { Docs }, tables: { MainTable } }).pipe(
+            Effect.provide(Brotli),
+          ),
+        ),
+      )
+      expect(ambient).toContain('the Compression registry in scope has "brotli"')
+      // Explicit compressors without the codec (they win over the ambient one).
+      const explicit = defect(
+        yield* Effect.exit(
+          DynamoClient.make({
+            entities: { Orders },
+            tables: { MainTable },
+            compressors: [NodeCompression.brotli()],
+          }).pipe(Effect.provide(Gzip)),
+        ),
+      )
+      // A renamed field is named once, by its domain name.
+      expect(explicit).toContain('entity "Orders" stores "details" packed with codec "gzip"')
+      expect(explicit).not.toContain('stores "d"')
+      // A JSON-only packed member needs no registry.
+      const JsonOrders = Entity.make({
+        model: DynamoModel.configure(Order, { lines: { storedAs: json } }),
+        entityType: "Order",
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
+        },
       })
-      const exit = yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
-        .asEffect()
-        .pipe(Effect.exit)
-      missingCompressor(failure(exit))
-      yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
-        .asEffect()
-        .pipe(Effect.provide(Gzip))
-      const read = yield* db.entities.Docs.get({ docId: "d-1" })
-        .asEffect()
-        .pipe(Effect.provide(Gzip))
-      expect(read.body).toEqual(body)
+      const JsonTable = Table.make({ schema: AppSchema, entities: { JsonOrders } })
+      yield* DynamoClient.make({ entities: { JsonOrders }, tables: { JsonTable } }).pipe(
+        Effect.provide(JsonTable.layer({ name: "packed-entity-table" })),
+      )
     }).pipe(Effect.provide(NoCodecs)),
+  )
+
+  it.effect(
+    "with nothing at bind time, a Compression provided at run time reads values of a codec the config no longer names",
+    () =>
+      Effect.gen(function* () {
+        // Written gzip-compressed while `details` was configured with gzip ...
+        yield* Orders.put(order()).asEffect().pipe(Effect.provide(Gzip))
+        // ... and read by a definition that packs it as plain JSON now: no
+        // codec is named, so binding needs no registry, and the reader's
+        // run-time registry decodes the old values.
+        const JsonOrders = Entity.make({
+          model: DynamoModel.configure(Order, {
+            lines: { storedAs: json },
+            details: { field: "d", storedAs: json },
+          }),
+          entityType: "Order",
+          primaryKey: {
+            pk: { field: "pk", composite: ["orderId"] },
+            sk: { field: "sk", composite: [] },
+          },
+        })
+        const JsonTable = Table.make({ schema: AppSchema, entities: { JsonOrders } })
+        const db = yield* DynamoClient.make({
+          entities: { JsonOrders },
+          tables: { JsonTable },
+        }).pipe(Effect.provide(JsonTable.layer({ name: "packed-entity-table" })))
+        missingCompressor(
+          failure(yield* Effect.exit(db.entities.JsonOrders.get({ orderId: "o-1" }).asEffect())),
+        )
+        const read = yield* db.entities.JsonOrders.get({ orderId: "o-1" })
+          .asEffect()
+          .pipe(Effect.provide(Gzip))
+        expect(read.details).toEqual(bigDetails)
+      }).pipe(Effect.provide(NoCodecs)),
   )
 })
 

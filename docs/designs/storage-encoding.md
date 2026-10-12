@@ -252,6 +252,34 @@ codec fails, with a `ValidationError` whose `cause` is a `CompressorNotRegistere
    captures the whole context).
 3. An ambient `Compression` at run time, for unbound operations and the decode helpers.
 
+**Configured codecs are checked at bind (`[EDD-9078]`).** A store whose `Packed` config
+names a codec meets values compressed with it on every read and write, so the codec is a
+configuration requirement, checked where the registry is first resolvable — never deferred
+to the first compressed value:
+
+- `DynamoClient.make` checks every bound entity (each packed field, by domain name) and
+  every bound aggregate (each edge entity's packed attributes) against the registry it
+  binds with (rule 1 or 2). A missing codec — or no registry at all — throws the
+  `[EDD-9078]` configuration error from the make effect (a defect, like `[EDD-9037]`),
+  naming every member, field and codec at fault and the codecs the registry has.
+- `EventStore.bind(stream)` checks `storedAs.data` / `snapshot.storedAs` against the context
+  it captures, the same way.
+- An unbound `EventStream` resolves its registry per run (rule 3), so each operation
+  (`append`, `read*`, `readSnapshot`, `writeSnapshot`, `currentVersion`, `readIndex`,
+  `measure*`, `decodeStreamImage`, and the `commandHandler` probes) first checks the
+  registry in context — once per registry (a `WeakSet`), so later operations cost a lookup
+  — and dies with `[EDD-9078]` before anything is written or read. The `query.*`
+  descriptors are not wrapped: they run through `Query.collect` / `Query.paginate`, and a
+  compressed row they cannot read still fails as a `ValidationError` caused by
+  `CompressorNotRegistered`.
+
+None of it touches an error channel: it is a defect, as every EDD configuration error is.
+A member that packs plain JSON names no codec and needs no registry, so the run-time path
+(registry rule 3) still serves it — e.g. a definition that dropped compression reading the
+compressed values written earlier. The run-time `ValidationError` + `CompressorNotRegistered`
+cause remains for what bind cannot see: unbound entity operations, the `StorageEncoding`
+helpers, and stored values whose header names a codec the current config does not.
+
 Convenience: `DynamoClient.layer({ region, endpoint?, credentials?, compressors? })` and
 `DynamoClient.layerConfig({ …, compressors? })` also provide `Compression` from the same
 layer, so "registered where DynamoClient is" is one line:
@@ -643,7 +671,7 @@ today, with the attribute named in the cause:
 | `EDD-9075` | `Entity.ts` (schema) | A packed field is a `DynamoModel.ref` field |
 | `EDD-9076` | `Query.ts`, `Entity.ts`, `internal/BoundCrud.ts`, `Transaction.ts` | A condition, filter or projection addresses a path inside a packed attribute, or applies anything but `attribute_exists` / `attribute_not_exists` to it (thrown when the expression is built) |
 | `EDD-9077` | `Entity.ts` | An update applies anything but a whole-value `.set()` / `.remove()` to a packed field (`add`, `subtract`, `append`, `deleteFromSet`, any `path*`) — `ValidationError` at execution, like the #133 path-op refusals |
-| `EDD-9078` | `Compression.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd` |
+| `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 
 Next free code after this PR: `EDD-9080`. (`9059`–`9061` stay reserved for PR #129.)
