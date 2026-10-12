@@ -695,6 +695,32 @@ describe("EventStore packed storage — raw rows return data as plain JSON (#147
     )
   }
 
+  it.effect("ignoreOwnership: another entity type's row keeps its plain string data", () =>
+    Effect.gen(function* () {
+      yield* writeMixedStream
+      // A row of another type in the stream's partition and event SK range.
+      const first = storedEvents()[0]!
+      const foreign: Item = {
+        ...first,
+        sk: { S: `${first.sk!.S}#foreign` },
+        __edd_e__: { S: "audit.note" },
+        data: { S: "plain text, not JSON" },
+      }
+      store.set(keyOf(foreign), foreign)
+      const rows = yield* ZstdLedger.query
+        .events(id)
+        .pipe(Query.ignoreOwnership, Query.select(["version", "data"]), Query.collect)
+      expect(rows).toHaveLength(7)
+      expect(rows).toContainEqual({ version: 1, data: "plain text, not JSON" })
+      // The stream's own rows are still read by their stored form, and the
+      // borrowed __edd_e__ is stripped from every row.
+      expect(
+        rows.filter((row) => row.data !== "plain text, not JSON").map((row) => row.data),
+      ).toEqual(mixedWire)
+      expect(rows.every((row) => Object.keys(row).sort().join() === "data,version")).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("a raw row that does not select data is untouched", () =>
     Effect.gen(function* () {
       yield* writeMixedStream

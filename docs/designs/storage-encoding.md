@@ -728,7 +728,20 @@ the docs point at `.set({ f: v })`.
 `[EDD-9076]`. A projected packed field comes back as its **parsed JSON wire form** (not
 schema-decoded) — the same contract as an unprojected map field in a raw projection, and
 as EventStore raw rows (§7.4). Implemented by the `QueryState.rawRow` hook (§7.4), which
-the entity query builder sets to `unpackFields`.
+the entity query builder sets to `unpackFields` **for the entity's own rows only**
+(`ownRowsRawRow`): `ignoreOwnership()` lets rows of other types through, and a plain
+string attribute of another type that shares a name with a packed or dispatch-eligible
+attribute must come back exactly as 1.25.0 returned it — never `JSON.parse`d into a
+`ValidationError`. The hook reads `__edd_e__` (borrowed into the projection and stripped
+again when not selected); a row without it is not attributable and is left as is. The
+same gate applies to scans, bound and unbound queries, `BoundQuery` and collections (a
+row of a non-member type is untouched); aggregates already pick the edge entity by
+`__edd_e__`; a vector search hit is scoped to the entity by its partition value, and is
+left untouched if it carries a different `__edd_e__`.
+
+The hook is only installed when it can matter: not on an entity with no dispatch
+attribute, and not on a projection that names none of them (`QueryRawRow.attributes`) —
+then nothing is borrowed and no row is examined.
 
 ### 6.7 Lifecycle
 
@@ -832,9 +845,12 @@ whatever `fromAttributeMap` produced — a string or bytes for a packed value. N
 `QueryState.rawRow?: (raw) => Effect<raw, ValidationError>`, set
 via `Query.make({ rawRow })`; `select`, `selectPaths` and `selectProjected` use
 `state.rawRow ?? Effect.succeed` instead of the identity. `buildEventsQuery` and
-`buildIndexQuery` set it to "unpack `data` if present". Hydrated (`"keys"` GSI) rows pass
-through the same decoder after `BatchGetItem`, so the `"keys"` path is covered without a
-separate hook.
+`buildIndexQuery` set it to "unpack `data` if present, on this stream's event rows" (a row
+whose `__edd_e__` is another type, reachable with `Query.ignoreOwnership`, is untouched; the
+hook declares `reads: ["__edd_e__"]`, `attributes: ["data"]`). Hydrated (`"keys"` GSI) rows
+pass through the same decoder after `BatchGetItem`, so the `"keys"` path is covered without
+a separate hook; what the hook borrowed into the hydrating fetch is stripped after it ran,
+as on the base-table path.
 
 Result: for a stream holding a mix of `M`, `S` and `B` items, a raw row's `data` is the
 same plain JSON value in all three cases — parsed or decompressed, **not schema-decoded** —

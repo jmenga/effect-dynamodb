@@ -195,6 +195,8 @@ const rows = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
 | Updates | `.set({ f })` and `.remove(["f"])` of the whole value | `.add`, `.subtract`, `.append`, `.deleteFromSet` and every `path*` operation on the field — **[EDD-9077]**, a `ValidationError` when the update runs |
 | Projections | the whole field, returned as its parsed JSON (wire form, not schema-decoded) | a nested path — **[EDD-9076]** |
 
+A projection reads the entity's **own** rows by stored form only. With `ignoreOwnership()`, a row of another entity type comes back exactly as stored, so a plain string attribute that happens to share a packed field's name is never parsed as JSON.
+
 The typed `PathBuilder` also rejects these at compile time: a packed field's path is a `PackedPath`, with no nested properties, `.at()` or `.size()`, and it is accepted only by `exists`, `notExists` and projections.
 
 `Entity.make()` refuses a packed field that can't work as one:
@@ -348,7 +350,7 @@ const big = yield* Ledger.query.events(id).pipe(
 )
 ```
 
-`Query.select` / `Query.selectPaths` return `data` as **plain parsed JSON**, whatever its stored form: decompressed and parsed, but not schema-decoded. This holds for `query.events` and for `query.index` with every index projection (`"all"`, `"withoutMetadata"`, and `"keys"`, which fetches each page's items). A stream that switched encoding holds a mix of map, JSON and compressed items, and a fold over raw rows sees the same shape for each.
+`Query.select` / `Query.selectPaths` return `data` as **plain parsed JSON**, whatever its stored form: decompressed and parsed, but not schema-decoded. This holds for `query.events` and for `query.index` with every index projection (`"all"`, `"withoutMetadata"`, and `"keys"`, which fetches each page's items). A stream that switched encoding holds a mix of map, JSON and compressed items, and a fold over raw rows sees the same shape for each. Only the stream's own event rows are read this way: a row of another type, reachable with `Query.ignoreOwnership`, keeps its `data` as stored.
 
 DynamoDB can't evaluate a path inside a packed value. On a stream with `storedAs.data`, a `Query.filterExpr` or projection that addresses `data.*` throws **[EDD-9076]**, and the error names the encoding and points to `Query.filterBy`:
 

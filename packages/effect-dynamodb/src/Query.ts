@@ -143,10 +143,37 @@ export type QueryRawRow = {
    * has run, so the caller sees exactly what it selected.
    */
   readonly reads?: ReadonlyArray<string> | undefined
+  /**
+   * The stored attributes the hook may rewrite. A projection that names none
+   * of them drops the hook — nothing is borrowed and no row is examined.
+   * Absent: the hook runs on every projection.
+   */
+  readonly attributes?: ReadonlyArray<string> | undefined
 }
 
-/** @internal The attributes the raw-row hook of `state` reads (see {@link QueryRawRow.reads}). */
-const rawRowReads = (state: QueryState): ReadonlyArray<string> => state.rawRow?.reads ?? []
+/**
+ * @internal The raw-row hook a projection of `paths` runs: the query's
+ * {@link QueryState.rawRow}, unless it declares the attributes it rewrites
+ * ({@link QueryRawRow.attributes}) and the projection names none of them.
+ */
+const projectedRawRow = (
+  hook: QueryRawRow | undefined,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): QueryRawRow | undefined => {
+  if (hook?.attributes === undefined) return hook
+  const rewrites = new Set(hook.attributes)
+  return paths.some((path) => rewrites.has(String(path[0]))) ? hook : undefined
+}
+
+/** @internal The raw-row hook the projection of `state` runs, if any. */
+const activeRawRow = (state: QueryState): QueryRawRow | undefined =>
+  projectedRawRow(state.rawRow, [
+    ...(state.projection ?? []).map((attribute) => [attribute]),
+    ...(state.projectionPaths ?? []),
+  ])
+
+/** @internal The attributes the active raw-row hook of `state` reads (see {@link QueryRawRow.reads}). */
+const rawRowReads = (state: QueryState): ReadonlyArray<string> => activeRawRow(state)?.reads ?? []
 
 /**
  * @internal How a query names DynamoDB's rejection of its key condition — an
@@ -508,14 +535,11 @@ export const startFrom: {
         }),
 )
 
-/**
- * @internal The decoder of a projected (raw) row: the query's
- * {@link QueryState.rawRow} hook, or the identity.
- */
+/** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
 const rawRowDecoder = (
-  state: QueryState,
+  hook: QueryRawRow | undefined,
 ): ((raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>) =>
-  state.rawRow ?? ((raw) => Effect.succeed(raw))
+  hook ?? ((raw) => Effect.succeed(raw))
 
 /** @internal Throw `[EDD-9076]` for a projection inside a packed attribute. */
 const refusePackedProjection = (
@@ -546,14 +570,12 @@ export const select: {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
-    refusePackedProjection(
-      self._state,
-      attributes.map((attribute) => [attribute]),
-    )
+    const paths = attributes.map((attribute) => [attribute])
+    refusePackedProjection(self._state, paths)
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projection: attributes,
-      decoder: rawRowDecoder(self._state),
+      decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
     })
   },
 )
@@ -573,7 +595,7 @@ export const selectProjected = <A>(
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
   refusePackedProjection(self._state, storedPaths)
-  const rawRow = rawRowDecoder(self._state)
+  const rawRow = rawRowDecoder(projectedRawRow(self._state.rawRow, storedPaths))
   return new QueryImpl<Record<string, unknown>>({
     ...self._state,
     projection: undefined,
@@ -732,7 +754,7 @@ export const selectPaths: {
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projectionPaths: paths,
-      decoder: rawRowDecoder(self._state),
+      decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
     })
   },
 )
@@ -1249,8 +1271,20 @@ const examinePage = <A>(
 > =>
   Effect.gen(function* () {
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
-    // Borrowed attributes the raw-row hook reads are stripped after it ran.
+    // Borrowed attributes the raw-row hook reads are stripped after it ran:
+    // borrowed into the request's projection, or — on a `BatchGet`-hydrated
+    // query — into the hydrating fetch's (see `hydrateRows`).
     const hookReads = new Set(rawRowReads(state))
+    const strippedAfterHook = new Set(borrowedFields.filter((field) => hookReads.has(field)))
+    if (state.hydration?._tag === "BatchGet") {
+      const projected = new Set<string>([
+        ...(state.projection ?? []),
+        ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
+      ])
+      if (projected.size > 0) {
+        for (const field of hookReads) if (!projected.has(field)) strippedAfterHook.add(field)
+      }
+    }
     const items: Array<A> = []
     let next = 0
     while (next < returned.length) {
@@ -1274,7 +1308,7 @@ const examinePage = <A>(
         const raw = fromAttributeMap(source)
         for (const field of borrowedFields) if (!hookReads.has(field)) delete raw[field]
         const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
-        for (const field of borrowedFields) if (hookReads.has(field)) delete raw[field]
+        for (const field of strippedAfterHook) delete raw[field]
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
         if (budget !== undefined && items.length >= budget) {

@@ -41,6 +41,7 @@ import {
 import { Effect, Option, Result } from "effect"
 import { Base64 } from "effect/encoding"
 import { fromAttributeMap } from "../Marshaller.js"
+import type { QueryRawRow } from "../Query.js"
 import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
@@ -580,21 +581,47 @@ export interface PackedEntityLike {
   readonly _unpackFields?:
     | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
     | undefined
+  /** The stored attributes `_unpackFields` reads by stored form (packed ∪ dispatch-eligible). */
+  readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
 }
+
+/**
+ * The raw-row hook of one entity type's projections (`Query.select` /
+ * `selectPaths`): reads `attributes` of the type's **own** rows by their stored
+ * form, and hands every other row back untouched. `ignoreOwnership()` lets
+ * rows of other types through, and their plain strings must never be parsed
+ * as packed JSON. The type is read from `__edd_e__`, borrowed into the
+ * projection (and stripped again) when the caller did not select it; a row
+ * without it is not attributable, so it is left as is. No hook when there is
+ * nothing to read, and none on a projection that names none of `attributes`.
+ */
+export const ownRowsRawRow = (
+  entityType: string,
+  attributes: ReadonlyArray<string> | undefined,
+  unpack: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>,
+): QueryRawRow | undefined =>
+  attributes !== undefined && attributes.length === 0
+    ? undefined
+    : Object.assign(
+        (raw: Record<string, unknown>) =>
+          raw.__edd_e__ === entityType ? Effect.as(unpack(raw), raw) : Effect.succeed(raw),
+        { reads: ["__edd_e__"], attributes },
+      )
 
 /** `Query.make` options for the queries of one entity: guards + raw-row unpack. */
 export const entityPackedQueryOptions = (
   entity: PackedEntityLike,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
-  readonly rawRow:
-    | ((raw: Record<string, unknown>) => Effect.Effect<Record<string, unknown>, ValidationError>)
-    | undefined
+  readonly rawRow: QueryRawRow | undefined
 } => {
   const unpack = entity._unpackFields
   return {
     packed: entity._packedGuards ?? [],
-    rawRow: unpack === undefined ? undefined : (raw) => Effect.as(unpack(raw), raw),
+    rawRow:
+      unpack === undefined
+        ? undefined
+        : ownRowsRawRow(entity.entityType, entity._dispatchAttributes, (raw) => unpack(raw)),
   }
 }
 
@@ -607,24 +634,27 @@ export const collectionPackedQueryOptions = (
   members: ReadonlyArray<PackedEntityLike>,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
-  readonly rawRow:
-    | {
-        (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, ValidationError>
-        readonly reads: ReadonlyArray<string>
-      }
-    | undefined
+  readonly rawRow: QueryRawRow | undefined
 } => {
   const byType = new Map(members.map((m) => [m.entityType, m]))
   const packed = members.flatMap((m) => m._packedGuards ?? [])
-  if (members.every((m) => m._unpackFields === undefined)) return { packed, rawRow: undefined }
+  const unpacking = members.filter(
+    (m) => m._unpackFields !== undefined && m._dispatchAttributes?.length !== 0,
+  )
+  if (unpacking.length === 0) return { packed, rawRow: undefined }
+  // A row of a type that is not a member is never read (`ignoreOwnership()`).
   const rawRow = (raw: Record<string, unknown>) => {
     const member = byType.get(raw.__edd_e__ as string)
     const unpack = member?._unpackFields
     return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
   }
   // The member is named by `__edd_e__`, so a projection that does not select
-  // it still reads it (borrowed, then stripped — see `Query.QueryRawRow`).
-  return { packed, rawRow: Object.assign(rawRow, { reads: ["__edd_e__"] }) }
+  // it still reads it (borrowed, then stripped — see `Query.QueryRawRow`); a
+  // projection naming none of the members' read attributes runs no hook.
+  const attributes = unpacking.every((m) => m._dispatchAttributes !== undefined)
+    ? [...new Set(unpacking.flatMap((m) => m._dispatchAttributes ?? []))]
+    : undefined
+  return { packed, rawRow: Object.assign(rawRow, { reads: ["__edd_e__"], attributes }) }
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")

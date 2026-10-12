@@ -438,6 +438,46 @@ describeConnected("EventStore packed storage (#147)", () => {
     }).pipe(provide),
   )
 
+  it.effect("ignoreOwnership raw rows: a foreign row's string data is untouched", () =>
+    Effect.gen(function* () {
+      const id = { ledgerId: "mix-foreign" }
+      yield* writeMixed(id.ledgerId)
+      // A row of another type in the stream's partition and event SK range.
+      const [first] = yield* rawItems(id.ledgerId)
+      const client = yield* DynamoClient
+      yield* client.putItem({
+        TableName: tableName,
+        Item: {
+          ...first!,
+          sk: { S: `${first!.sk!.S}#foreign` },
+          __edd_e__: { S: "audit.note" },
+          data: { S: "plain text, not JSON" },
+        },
+      })
+      const rows = yield* ZstdLedger.query
+        .events(id)
+        .pipe(
+          Query.consistentRead,
+          Query.ignoreOwnership,
+          Query.select(["version", "data"]),
+          Query.collect,
+        )
+      expect(rows).toHaveLength(7)
+      expect(rows).toContainEqual({ version: 1, data: "plain text, not JSON" })
+      expect(
+        rows.filter((row) => row.data !== "plain text, not JSON").map((row) => row.data),
+      ).toEqual(mixedWire)
+      // __edd_e__ is borrowed for the type check and never handed back — on
+      // the base table and through a hydrated ("keys") index alike.
+      const keys = yield* ZstdLedger.query
+        .index("byDayKeys", id)
+        .pipe(Query.select(["version", "data"]), Query.collect)
+      for (const row of [...rows, ...keys]) {
+        expect(Object.keys(row).sort()).toEqual(["data", "version"])
+      }
+    }).pipe(provide),
+  )
+
   it.effect("a compressed ~48 KB state rides inline and as an async snapshot (R4)", () =>
     Effect.gen(function* () {
       const id = { ledgerId: "big-state" }

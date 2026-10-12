@@ -54,6 +54,8 @@ interface CollectionEntity {
   readonly _unpackFields?:
     | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
     | undefined
+  /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
+  readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
 }
 
 // ---------------------------------------------------------------------------

@@ -150,6 +150,11 @@ const store = new Map<string, Item>()
 const sentPuts: Array<Item> = []
 const sentUpdates: Array<UpdateItemCommandInput> = []
 const sentTransactions: Array<ReadonlyArray<TransactWriteItem>> = []
+/** Query and Scan requests, in order. */
+const sentReads: Array<{
+  readonly ProjectionExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+}> = []
 
 const keyOf = (item: Item) => `${item.pk?.S}|${item.sk?.S}`
 
@@ -354,20 +359,24 @@ const InMemoryClient = mockDynamoClientLayer({
       store.delete(keyOf(input.Key!))
       return { Attributes: current } as never
     }),
-  query: (input) => Effect.sync(() => runQuery(input) as never),
+  query: (input) =>
+    Effect.sync(() => {
+      sentReads.push(input)
+      return runQuery(input) as never
+    }),
   scan: (input) =>
-    Effect.sync(
-      () =>
-        ({
-          Items: ownership(
-            [...store.values()],
-            input.FilterExpression,
-            input.ExpressionAttributeValues ?? {},
-          ).map((item) =>
-            project(item, input.ProjectionExpression, input.ExpressionAttributeNames ?? {}),
-          ),
-        }) as never,
-    ),
+    Effect.sync(() => {
+      sentReads.push(input)
+      return {
+        Items: ownership(
+          [...store.values()],
+          input.FilterExpression,
+          input.ExpressionAttributeValues ?? {},
+        ).map((item) =>
+          project(item, input.ProjectionExpression, input.ExpressionAttributeNames ?? {}),
+        ),
+      } as never
+    }),
   batchGetItem: (input) =>
     Effect.sync(() => {
       const Responses: Record<string, Array<Item>> = {}
@@ -431,6 +440,7 @@ beforeEach(() => {
   sentPuts.length = 0
   sentUpdates.length = 0
   sentTransactions.length = 0
+  sentReads.length = 0
 })
 
 // ---------------------------------------------------------------------------
@@ -732,6 +742,142 @@ describe("Entity packed fields — reads", () => {
 // ---------------------------------------------------------------------------
 // Update
 // ---------------------------------------------------------------------------
+
+describe("Entity packed fields — raw rows of other entity types", () => {
+  /**
+   * A row of another entity type in the same partition (and on the same GSI),
+   * whose plain string attributes share names with Orders' packed (`lines`,
+   * `d`) and dispatch-eligible (`notes`) attributes. Only `ignoreOwnership()`
+   * lets it through; a projection must return it exactly as 1.25.0 did.
+   */
+  const writeForeign = Effect.gen(function* () {
+    const db = yield* client
+    yield* db.entities.Orders.put(order())
+    const own = stored(ORDER_KEY)
+    const foreign: Item = {
+      ...own,
+      sk: { S: "$packed#v1#memo" },
+      __edd_e__: { S: "Memo" },
+      lines: { S: "plain text, not JSON" },
+      d: { S: "{also not json" },
+      notes: { S: "a note" },
+    }
+    store.set(keyOf(foreign), foreign)
+  })
+
+  const ownLines = [
+    { sku: "A", qty: 1 },
+    { sku: "B", qty: 2 },
+  ]
+
+  /** The names a request's ProjectionExpression reads. */
+  const projected = (input: (typeof sentReads)[number]): ReadonlyArray<string> =>
+    (input.ProjectionExpression ?? "")
+      .split(",")
+      .map((token) => token.trim())
+      .map((token) => input.ExpressionAttributeNames?.[token] ?? token)
+
+  it.effect("a bound query projection unpacks only the entity's own rows", () =>
+    Effect.gen(function* () {
+      yield* writeForeign
+      const db = yield* client
+      const rows = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+        .ignoreOwnership()
+        .select(["orderId", "lines", "notes", "details"])
+        .collect()
+      expect(rows).toHaveLength(2)
+      const [own, foreign] = [...rows].sort((a, b) =>
+        Array.isArray(a.lines) === Array.isArray(b.lines) ? 0 : Array.isArray(a.lines) ? -1 : 1,
+      )
+      expect(own).toEqual({
+        orderId: "o-1",
+        lines: ownLines,
+        details: { note: "x".repeat(400), placedAt: "2026-10-01T12:00:00.000Z" },
+      })
+      // Exactly the stored strings — never JSON.parsed — and no borrowed __edd_e__.
+      expect(foreign).toEqual({
+        orderId: "o-1",
+        lines: "plain text, not JSON",
+        notes: "a note",
+        details: "{also not json",
+      })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a scan projection unpacks only the entity's own rows", () =>
+    Effect.gen(function* () {
+      yield* writeForeign
+      const db = yield* client
+      const rows = yield* db.entities.Orders.scan()
+        .ignoreOwnership()
+        .select(["lines", "notes"])
+        .collect()
+      expect(rows).toEqual(
+        expect.arrayContaining([
+          { lines: ownLines },
+          { lines: "plain text, not JSON", notes: "a note" },
+        ]),
+      )
+      expect(rows).toHaveLength(2)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an unbound Query.select / selectPaths unpacks only the entity's own rows", () =>
+    Effect.gen(function* () {
+      yield* writeForeign
+      const rows = yield* Orders.query
+        .byCustomer({ customerId: "c-1" })
+        .pipe(Query.ignoreOwnership, Query.select(["lines", "notes"]), Query.collect)
+      expect(rows).toEqual(
+        expect.arrayContaining([
+          { lines: ownLines },
+          { lines: "plain text, not JSON", notes: "a note" },
+        ]),
+      )
+      const paths = yield* Orders.query
+        .byCustomer({ customerId: "c-1" })
+        .pipe(Query.ignoreOwnership, Query.selectPaths([["lines"]]), Query.collect)
+      expect(paths).toEqual(
+        expect.arrayContaining([{ lines: ownLines }, { lines: "plain text, not JSON" }]),
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("__edd_e__ is borrowed for the check and stripped, unless selected", () =>
+    Effect.gen(function* () {
+      yield* writeForeign
+      const db = yield* client
+      const selected = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+        .ignoreOwnership()
+        .select(["lines", "__edd_e__"])
+        .collect()
+      expect(selected).toEqual(
+        expect.arrayContaining([
+          { lines: ownLines, __edd_e__: "Order" },
+          { lines: "plain text, not JSON", __edd_e__: "Memo" },
+        ]),
+      )
+      expect(projected(sentReads.at(-1)!)).toContain("__edd_e__")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a projection naming no packed or dispatch attribute installs no hook", () =>
+    Effect.gen(function* () {
+      yield* writeForeign
+      const db = yield* client
+      const rows = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+        .ignoreOwnership()
+        .select(["orderId", "status"])
+        .collect()
+      expect(rows).toEqual([
+        { orderId: "o-1", status: "open" },
+        { orderId: "o-1", status: "open" },
+      ])
+      // Nothing to unpack, so nothing is borrowed into the projection.
+      expect(projected(sentReads.at(-1)!)).not.toContain("__edd_e__")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
 
 describe("Entity packed fields — update", () => {
   it.effect(".set() writes the whole packed value in its stored form; .remove() REMOVEs it", () =>
@@ -1201,6 +1347,45 @@ describe("Entity packed fields — collections", () => {
       )
       expect(paths).toEqual(expect.arrayContaining([{ thread }, {}]))
     }).pipe(Effect.provide(CollLayer)),
+  )
+
+  it.effect(
+    "a collection projection reads members only, and only when it names their attributes",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Tickets, Invoices },
+          tables: { CollTable },
+        })
+        const thread = Array.from({ length: 30 }, (_, i) => `message ${i}`)
+        yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
+        const ticket = [...store.values()].find((item) => item.__edd_e__?.S === "Ticket")!
+        // A row of a non-member type in the collection's partition.
+        const foreign: Item = {
+          ...ticket,
+          pk: { S: "foreign" },
+          __edd_e__: { S: "Memo" },
+          thread: { S: "plain text, not JSON" },
+        }
+        store.set(keyOf(foreign), foreign)
+        const TenantItems = Collection.make("TenantItems", { Tickets, Invoices })
+        const rows = yield* TenantItems.query({ tenantId: "acme" }).pipe(
+          Query.ignoreOwnership,
+          Query.select(["thread"]),
+          Query.collect,
+        )
+        expect(rows).toEqual(
+          expect.arrayContaining([{ thread }, { thread: "plain text, not JSON" }]),
+        )
+        expect(rows).toHaveLength(2)
+        // `total` is no member's packed or dispatch attribute: no hook, nothing borrowed.
+        yield* TenantItems.query({ tenantId: "acme" }).pipe(Query.select(["total"]), Query.collect)
+        const last = sentReads.at(-1)!
+        const projectedNames = (last.ProjectionExpression ?? "")
+          .split(",")
+          .map((token) => last.ExpressionAttributeNames?.[token.trim()] ?? token.trim())
+        expect(projectedNames).not.toContain("__edd_e__")
+      }).pipe(Effect.provide(CollLayer)),
   )
 
   it.effect("DynamoClient.make({ compressors }) reaches collection reads", () =>

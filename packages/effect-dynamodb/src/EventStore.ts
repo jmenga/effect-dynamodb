@@ -1928,13 +1928,23 @@ export const makeStream = <
   /**
    * A raw event row (`Query.select`) with its `data` — when projected — as
    * plain parsed JSON, whatever its stored form (R3: a stream that switched
-   * encoding holds a mix). Never schema-decoded.
+   * encoding holds a mix). Never schema-decoded. Only this stream's event
+   * rows are read: a row of another type (`Query.ignoreOwnership`) is handed
+   * back untouched, its `__edd_e__` borrowed for the check and stripped again.
+   * In place, so the strip reaches the row returned.
    */
-  const rawEventRow: Query.QueryRawRow = (raw) => {
-    const stored = raw.data
-    if (typeof stored !== "string" && !(stored instanceof Uint8Array)) return Effect.succeed(raw)
-    return Effect.map(unpackData(stored, "EventStore.select"), (data) => ({ ...raw, data }))
-  }
+  const rawEventRow: Query.QueryRawRow = Object.assign(
+    (raw: Record<string, unknown>) => {
+      const stored = raw.data
+      if (raw.__edd_e__ !== entityType) return Effect.succeed(raw)
+      if (typeof stored !== "string" && !(stored instanceof Uint8Array)) return Effect.succeed(raw)
+      return Effect.map(unpackData(stored, "EventStore.select"), (data) => {
+        raw.data = data
+        return raw
+      })
+    },
+    { reads: ["__edd_e__"], attributes: ["data"] },
+  )
 
   const decodeStreamEvent = (
     raw: Record<string, unknown>,

@@ -105,6 +105,7 @@ import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
   currentRegistry,
   decodeImage,
+  ownRowsRawRow,
   type PackedAttributeGuard,
   packAttributeValue,
   packedExprRefusal,
@@ -609,6 +610,13 @@ export interface Entity<
     raw: globalThis.Record<string, unknown>,
     operation?: string,
   ) => Effect.Effect<void, ValidationError>
+
+  /**
+   * @internal The stored attributes {@link _unpackFields} reads by stored form
+   * (packed ∪ dispatch-eligible): a projection naming none of them runs no
+   * raw-row hook.
+   */
+  readonly _dispatchAttributes: ReadonlyArray<string>
 
   /**
    * @internal The packed attributes an expression or projection may not look
@@ -2636,20 +2644,16 @@ const makeImpl = <
 
   /**
    * The `Query.make` options of this entity's queries: the packed guards, and
-   * the raw-row hook that reads packed attributes of a projected row by their
-   * stored form (parsed JSON, not schema-decoded).
+   * the raw-row hook that reads packed attributes of a projected row of THIS
+   * entity type by their stored form (parsed JSON, not schema-decoded) — rows
+   * of other types (`ignoreOwnership()`) are left untouched.
    */
   const packedQueryOptions: {
     readonly packed: ReadonlyArray<PackedAttributeGuard>
-    readonly rawRow:
-      | ((
-          raw: globalThis.Record<string, unknown>,
-        ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>)
-      | undefined
+    readonly rawRow: Query.QueryRawRow | undefined
   } = {
     packed: packedGuards,
-    rawRow:
-      dispatchAttributes.length === 0 ? undefined : (raw) => Effect.as(unpackFields(raw), raw),
+    rawRow: ownRowsRawRow(entityType, dispatchAttributes, (raw) => unpackFields(raw)),
   }
 
   /**
@@ -10009,6 +10013,7 @@ const makeImpl = <
     _packedFields: Object.keys(packedFields),
     _packFields: packFields,
     _unpackFields: unpackFields,
+    _dispatchAttributes: dispatchAttributes,
     _packedGuards: packedGuards,
     _decodeImage: decodeImageItem,
     _resolvedRefs: resolvedRefs,

@@ -156,6 +156,11 @@ export interface BoundVectorQueryConfig {
     | ((raw: Record<string, unknown>) => Effect.Effect<void, ValidationError>)
     | undefined
   /**
+   * The stored attributes {@link unpackRaw} reads. A projection naming none of
+   * them skips it. Absent: every projection runs it.
+   */
+  readonly unpackAttributes?: ReadonlyArray<string> | undefined
+  /**
    * Domain field name → stored DynamoDB attribute name. Filter attributes,
    * projections and the emitted `SearchSchema` must all use STORED names —
    * items are written after `renameToDynamo`, so a `storedAs`-renamed field
@@ -243,6 +248,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       tableTag,
       decode,
       unpackRaw,
+      unpackAttributes,
       resolveDbName,
       keyForm,
     } = this._config
@@ -370,6 +376,13 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       )
 
       // 4. Decode each hit through the entity schema and normalize the score.
+      //    A projection reads its packed attributes by stored form — only when
+      //    it names one of them.
+      const unpackProjection =
+        state.projection !== undefined &&
+        unpackRaw !== undefined &&
+        (unpackAttributes === undefined ||
+          state.projection.some((attribute) => unpackAttributes.includes(resolveDbName(attribute))))
       const hits: Array<VectorHit<A>> = []
       for (const result of output.SearchResults ?? []) {
         if (!result.Item) continue
@@ -378,7 +391,15 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         // score — drop it instead.
         if (result.Score === undefined || result.Score === null) continue
         const raw = fromAttributeMap(result.Item) as Record<string, unknown>
-        if (state.projection !== undefined && unpackRaw !== undefined) yield* unpackRaw(raw)
+        // The vector partition value bakes in the entity type, so every hit is
+        // this entity's own row; one that says otherwise is left untouched.
+        if (
+          unpackProjection &&
+          (raw.__edd_e__ === undefined || raw.__edd_e__ === entityType) &&
+          unpackRaw !== undefined
+        ) {
+          yield* unpackRaw(raw)
+        }
         const decoded =
           state.projection === undefined
             ? yield* decode(raw)

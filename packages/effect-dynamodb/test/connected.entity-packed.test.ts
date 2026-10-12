@@ -555,6 +555,48 @@ describeConnected("Entity packed fields (#147)", () => {
     }).pipe(provide),
   )
 
+  it.effect("an ignoreOwnership projection leaves another entity type's rows untouched", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(
+        order("f-own", { customerId: "cust-foreign", lines: twoLines, details: undefined }),
+      )
+      // A row of another type on the same GSI partition, whose plain string
+      // attributes share names with Orders' packed ones.
+      const own = (yield* rawItem("order", "f-own"))!
+      const raw = yield* DynamoClient
+      yield* raw.putItem({
+        TableName: tableName,
+        Item: {
+          ...own,
+          sk: { S: "$packed-ent#v1#memo" },
+          gsi1sk: { S: "memo" },
+          __edd_e__: { S: "Memo" },
+          lines: { S: "plain text, not JSON" },
+          d: { S: "{also not json" },
+        },
+      })
+      const rows = yield* db.entities.Orders.byCustomer({ customerId: "cust-foreign" })
+        .ignoreOwnership()
+        .select(["orderId", "lines", "details"])
+        .collect()
+      expect(rows).toHaveLength(2)
+      expect(rows).toContainEqual({ orderId: "f-own", lines: twoLines.map((l) => ({ ...l })) })
+      expect(rows).toContainEqual({
+        orderId: "f-own",
+        lines: "plain text, not JSON",
+        details: "{also not json",
+      })
+      // The scan path, likewise.
+      const scanned = yield* db.entities.Orders.scan()
+        .ignoreOwnership()
+        .select(["orderId", "lines"])
+        .collect()
+      expect(scanned).toContainEqual({ orderId: "f-own", lines: "plain text, not JSON" })
+      expect(scanned.every((row) => !("__edd_e__" in row))).toBe(true)
+    }).pipe(provide),
+  )
+
   it.effect("update().set writes the packed value whole; .remove drops it", () =>
     Effect.gen(function* () {
       const db = yield* client

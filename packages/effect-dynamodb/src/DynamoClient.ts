@@ -1072,6 +1072,8 @@ interface EntityLike {
   readonly _unpackFields?:
     | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
     | undefined
+  /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
+  readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
@@ -1617,6 +1619,7 @@ const makeFromConfig = (config: {
           tableTag: entityLike._tableTag,
           decode: (raw) => entityLike._decodeRecord(raw),
           unpackRaw: entityLike._unpackFields,
+          unpackAttributes: entityLike._dispatchAttributes,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
         }
