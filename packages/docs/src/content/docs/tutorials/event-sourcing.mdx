@@ -1537,7 +1537,7 @@ const Ledger = EventStore.makeStream({
 })
 ```
 
-Reading ~6,000 events is about 3× faster when `data` is JSON, and a ~48 KB state stored as zstd-compressed JSON takes about 5 write units instead of ~39. Every read path decodes each item by its stored form, so turning packing on needs no rewrite. A stream can hold a mix of map, JSON and compressed items. Metadata stays a map.
+In a downstream benchmark on Lambda, reading ~6,000 small events was about 2× faster with `data` stored as JSON, and a ~47 KB state stored as zstd-compressed JSON took 5 write units instead of 38 as a map. Compress only large values: compressing every small event made reads about 4× slower. Every read path decodes each item by its stored form, so turning packing on needs no rewrite. A stream can hold a mix of map, JSON and compressed items. Metadata stays a map.
 
 `Query.select` raw rows return `data` as parsed JSON whatever its stored form. A filter on a path inside packed `data` is refused with `[EDD-9076]`, so use `Query.filterBy`. `measureAppend` and `measureSnapshot` return the stored sizes for chunk planning, and `decodeStreamImage` decodes DynamoDB Streams records. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) for compressor registration, the stored form, sizing and rollout order.
 

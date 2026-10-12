@@ -24,17 +24,43 @@ The default stays the native map. Event metadata always stays a map.
 
 A map is the most expensive shape DynamoDB returns. The AWS SDK parses a type-wrapped node for every value (`{"M":{…}}`, `{"N":"0"}`), and unmarshalling rebuilds the object graph a second time. A JSON string is one node: one string to parse, then `JSON.parse` in native code.
 
-Measured on Lambda (arm64, Node 24) reading ~6,000 small events from one stream:
+### Measured
 
-| `data` stored as | Stored bytes/item | SDK parse | Unmarshall | Fold |
+A downstream consumer measured packed storage on AWS Lambda, reading and writing items in the form this release stores them. Times are medians. Where two are given (`a / b`), they are with Effect Schema's JIT compiler off and on.
+
+**Reading small events.** One stream index read of 5,990 small events (a ~500–600 B payload each) in 5 `Query` pages, folded to 2,021 results:
+
+| `data` stored as | Stored bytes/item | Wire | RCU | SDK parse | `select` + paginate + fold (ms) | `readIndex`, full decode (ms) | GC / allocated |
+|---|---|---|---|---|---|---|---|
+| map (default) | 713 | 5.36 MB | 1,054 | 148 ms | 261 / 224 | 789 / 426 | 61 ms / 110 MB |
+| JSON (`S`) | 849 | 4.43 MB | 1,244 | 27 ms | 121 / 110 | 374 / 287 | 7 ms / 33 MB |
+| JSON + zstd, threshold 1024 | 849 | 4.43 MB | 1,244 | 32 ms | 123 / 103 | 374 / 308 | 12 ms / 33 MB |
+| JSON + gzip, threshold 1024 | 849 | 4.43 MB | 1,244 | 28 ms | 120 / 106 | 375 / 303 | 7 ms / 33 MB |
+| JSON + zstd, threshold 0 | — | 3.46 MB | 943 | 54 ms | 474 / 469 | 566 / 444 | 38 ms / 53 MB |
+
+None of these events reaches the 1,024-byte threshold, so with compression configured at the default they're stored as plain JSON, byte for byte. Stored bytes per item weren't reported for threshold `0`.
+
+**Writing small events.** Building one event item (`measureAppend`) takes 347 / 276 µs as a map, 167 / 135 µs as JSON and 179 / 132 µs as zstd at threshold 1024. The full `append`, including the SDK's serialization, takes 840–940 µs and 1 write unit in every format.
+
+**A large value.** A ~47 KB JSON aggregate state written through `snapshot.storedAs`, 20 states, 15 runs per format:
+
+| State stored as | Stored bytes | WCU | `writeSnapshot` | `readSnapshot` |
 |---|---|---|---|---|
-| map (default) | 481 | 136 ms | 73 ms | 227 ms |
-| JSON (`S`) | 610 | 29 ms | 1.4 ms | 76 ms |
+| map (default) | 38,160 | 38 | 4.2–4.5 / 3.9 ms | 3.8–4.2 / 3.7 ms |
+| JSON (`S`) | 46,963 | 47 | 3.0–3.3 / 2.8 ms | 2.1 / 1.9–2.0 ms |
+| JSON + zstd | 4,219 | 5 | 2.6–2.9 / 2.5 ms | 2.1–2.3 / 1.8–1.9 ms |
+| JSON + gzip | 3,999 | 4 | 3.4 / 2.6–2.9 ms | 2.0–2.2 / 1.9–2.0 ms |
 
-Use packed storage when:
+<Aside type="note" title="Method">
+Lambda arm64, `nodejs24.x`, 1,769 MB. The real `@aws-sdk/client-dynamodb` (3.1121.0) ran with an in-memory request handler that replayed captured `Query` page bodies, so the SDK parsed each response as it would from DynamoDB, without the network. The pages were built from what `append` writes in each format. Medians of 20 warm runs per format (15 for the large value) over two fresh environments, two warm-ups discarded, formats rotated. The JIT was switched on with `import "effect/schema/SchemaJITCompiler/enable"`. These numbers were taken before packed values were read through a synchronous core lifted once per row, which removed a per-value overhead from the packed read paths.
+</Aside>
 
-- **You read many items and use whole values.** Folding a long event stream, or loading entities whose large nested field you always read in full, is about 3× faster as JSON.
-- **Values are large.** A ~48 KB folded state takes ~39 write units as a map, ~47 as JSON, and ~5 as zstd-compressed JSON (4.1 KB stored).
+### What the numbers say
+
+- **Bulk reads of whole values are about 2× faster as JSON.** `select` + fold is 2.1× faster with the JIT off and 2.0× with it on, and `readIndex` 2.1× and 1.5×. The SDK parses the pages in a fifth of the time and the read allocates a third of the memory.
+- **JSON is stored larger.** It's about 19% larger here (849 vs 713 bytes per item), so a read consumes about 18% more read units, even though it's 17% smaller on the wire.
+- **Large values should be compressed.** At ~47 KB, zstd stores the state in 5 write units instead of 47 as JSON (about 9× fewer) or 38 as a map. It writes faster than either, and reads as fast as JSON.
+- **Don't compress small items.** Compressing every small event (threshold `0`) cut read units by 24% and wire bytes by 22%, but the `select` + fold read was about 4× slower than plain JSON (474 vs 121 ms) and `readIndex` 1.5× slower. That's a net loss. Keep the default threshold, so small values stay JSON and only large ones are compressed.
 
 Keep the native map when you need DynamoDB to see inside the value: conditions, filters or updates on nested paths, `ADD` counters, or projections of a nested attribute. A packed value is opaque to DynamoDB.
 
@@ -71,7 +97,7 @@ Writers emit `0x21` (gzip), `0x22` (brotli) or `0x23` (zstd). Readers also accep
 
 Compression is tried only when the JSON's UTF-8 length is **at least `threshold`** (default **1024** bytes; `0` means always try). The result is stored as `B` only when **the header plus the compressed bytes are smaller** than the JSON. Otherwise the value is stored as `S`.
 
-The default threshold is 1 KB because DynamoDB rounds write units per item at 1 KB. Below about 150 bytes, compression makes the payload bigger. Between 150 bytes and 1 KB it saves no write units and costs ~20 µs per read.
+The default threshold is 1 KB because DynamoDB rounds write units per item at 1 KB, so compressing a smaller value saves no write units. It saves some read units and wire bytes, but decompressing every value costs more read time than that saves: see [threshold `0` in the benchmark](#what-the-numbers-say). A very small value can also grow when compressed, which "only when smaller" catches.
 
 ## Entity fields
 
@@ -282,6 +308,21 @@ None of these adds a requirement (`R`) or an error type to entity or EventStore 
 - **When writing:** the value's JSON reaches the threshold, and the config's codec isn't registered.
 - **When reading:** a `B` value's header names a codec that isn't registered.
 
+```typescript region="missing-codec" example="guide-packed-storage.ts"
+// A reader that registered only gzip meets the zstd-compressed snapshot state.
+// The failure is the usual ValidationError; its cause names the missing codec.
+const outcome = yield* StorageEncoding.decode(snapshotItem.state).pipe(
+  Effect.provideService(Compression, Compression.make([NodeCompression.gzip()])),
+  Effect.as("decoded"),
+  Effect.catchTag("ValidationError", (error) =>
+    error.cause instanceof CompressorNotRegistered
+      ? Effect.succeed(`missing ${error.cause.codec} (${error.cause.direction})`)
+      : Effect.fail(error),
+  ),
+)
+// outcome → "missing zstd (decompress)"
+```
+
 Keep registering every codec your stored values were written with, for as long as such values exist. A reader needs the codec named in the value's header, whatever the writer's current config is.
 
 ### Configured codecs are checked up front
@@ -411,7 +452,7 @@ Packing happens before the item is marshalled, so every size the library measure
 - The failure diagnosis of `append` and `writeSnapshot` reports items over 400 KB and requests over 4 MB in stored bytes, including a packed inline snapshot. Entity put/update/transaction diagnosis and `Batch.write` chunking do the same.
 - The library never refuses a write because of its measured size. DynamoDB enforces its own limits, and the diagnosis names the item at fault.
 
-JSON is often **larger** than the map it replaces: 18–27% larger in the benchmark above. An estimate made from the map is wrong once data is packed. To plan chunking yourself, measure with the helpers:
+JSON is often **larger** than the map it replaces: about 19% larger (849 vs 713 bytes per item) for the small events [measured above](#measured), and 23% larger for the large state. An estimate made from the map is wrong once data is packed. To plan chunking yourself, measure with the helpers:
 
 ```typescript region="measure" example="guide-packed-storage.ts"
 // The bytes an append would write, by DynamoDB's item-size rules, built by

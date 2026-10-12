@@ -31,7 +31,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 - **Lifecycle features (opt-in)** — automatic `createdAt`/`updatedAt`, optimistic locking via auto-incremented version, version snapshot retention, soft delete with optional TTL, restore, purge, unique constraints via sentinel transactions.
 - **Aggregates** — graph-based composite domain models that decompose into entity ops (atomic transactions) and assemble from collection queries; never touches `DynamoClient` directly.
 - **Event sourcing** — append-only `EventStore` with stream replay and snapshots.
-- **Packed storage (opt-in)** — store structured fields, event data and snapshot state as one JSON string, compressed (gzip / brotli / zstd) above a threshold, for faster bulk reads and fewer write units; readers decode each item by its stored form, so switching needs no rewrite.
+- **Packed storage (opt-in)** — store structured fields, event data and snapshot state as one JSON string, compressed (gzip / brotli / zstd) above a threshold, for ~2× faster bulk reads and far fewer write units on large values; readers decode each item by its stored form, so switching needs no rewrite.
 - **Tagged errors** — `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, and more — all `catchTag`-discriminable.
 - **Stream pagination** — `Stream<A>` from `.paginate()`; the runtime handles DynamoDB's pagination protocol.
 - **Layer-based DI** — physical table names and AWS client config injected via Effect Layers, enabling clean test isolation.

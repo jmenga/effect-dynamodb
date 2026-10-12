@@ -62,7 +62,7 @@ Values for a field's `storedAs` in `configure` that change how a structured fiel
 | Export | Type | Description |
 |--------|------|-------------|
 | `SparseMap` | `(options?: { prefix? }) => SparseMapConfig` | Store a `Schema.Record` as one top-level attribute per entry — see [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) |
-| `Packed` | `(options: { format: "json", compression?: { codec: "gzip" \| "brotli" \| "zstd", threshold? } }) => PackedConfig` | Store an object- or array-shaped field (or EventStore `data` / snapshot `state`) as one JSON string, compressed to binary at or above `threshold` (default 1024 bytes) when smaller. Throws `[EDD-9071]` on invalid options. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) |
+| `Packed` | `(options: { format: "json", compression?: { codec: "gzip" \| "brotli" \| "zstd", threshold? } }) => PackedConfig` | Store an object- or array-shaped field (or EventStore `data` / snapshot `state`) as one JSON string, compressed to binary at or above `threshold` (default 1024 bytes) when smaller. Keep the default: compressing small values (`threshold: 0`) saves read units but makes reads slower. Throws `[EDD-9071]` on invalid options. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) |
 | `isPackedConfig` | `(value) => value is PackedConfig` | Check if a value is a `Packed` config |
 | `getPackedFields` | `(model) => Record<string, PackedConfig>` | Domain field name → config, for every field configured `storedAs: Packed(...)` |
 

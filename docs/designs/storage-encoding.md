@@ -17,10 +17,11 @@ surface; the default storage is unchanged — see §14.
 `EventStream.append` stores each event's `data` as a native DynamoDB map, and an entity
 stores every structured field the same way. A map is the most expensive shape DynamoDB can
 hand back: the SDK parses a type-wrapped node per value and `unmarshall` rebuilds the graph
-a second time. The issue's measurements (Lambda, arm64, nodejs24.x) show a sub-stream read
-of ~6,000 small events is **~3× faster** when `data` is one JSON string (`S`) instead of a
-map, and a ~48 KB folded state shrinks from ~39 WCU to ~4–5 WCU when that JSON is
-compressed.
+a second time. The downstream consumer's benchmark of this implementation (Lambda, arm64,
+nodejs24.x; §2.1) reads ~6,000 small events from a stream index **~2× faster** through the
+library when `data` is one JSON string (`S`) instead of a map, at ~19% more stored bytes,
+and stores a ~47 KB state in 5 WCU as zstd-compressed JSON instead of 47 as JSON or 38 as
+a map. Compressing small values is a net read loss, hence a 1 KB default threshold.
 
 This design adds **one declarative storage config**, defined once in
 `@effect-dynamodb/schema`:
@@ -85,26 +86,54 @@ builds the graph again. An `S` attribute holding the same content as JSON is one
 SDK parses one string, `unmarshall` copies one string, and `JSON.parse` (native code) does
 the rest.
 
-Measured by the consumer (issue comment, run 1 medians, 5,990 events, 5 `Query` pages):
+Measured by the downstream consumer on this implementation (head `a71b175`, before the
+§11 read fast path removed the per-value unpack overhead). Method: Lambda arm64,
+nodejs24.x, 1,769 MB; the real `@aws-sdk/client-dynamodb` 3.1121.0 with an in-memory
+request handler replaying captured `Query` page bodies, so the SDK parses each response as
+it would from DynamoDB, without the network; pages built from what this PR's `append`
+writes; n = 20 warm runs per format over two fresh environments, two warm-ups discarded,
+formats rotated; Schema JIT off / on (`import "effect/schema/SchemaJITCompiler/enable"`).
+Medians; `a / b` is JIT off / on.
 
-| `data` encoding | Stored B/item | Wire | SDK parse | Unmarshall | Fold path | GC / alloc |
-|---|---|---|---|---|---|---|
-| map (today) | 481 | 5.36 MB | 136 ms | 73 ms | 227 ms | 46 ms / 106 MB |
-| JSON string (`S`) | 610 | 4.43 MB | 29 ms | 1.4 ms | 76 ms | 2 ms / 26 MB |
-| JSON + zstd/gzip/brotli (small items) | 367–404 | 3.15–3.45 MB | 42–46 ms | ~1.6 ms | 224–246 ms | ~40 ms |
+Read of a stream index: 5,990 small events (~500–600 B payload) in 5 `Query` pages,
+folded to 2,021 results.
 
-Large payloads (~48 KB as JSON, per item): map 38.5 KB stored / ~39 WCU; JSON 47.4 KB /
-~47 WCU; JSON + zstd 4.1 KB / 5 WCU (+0.13 ms write, +0.05 ms read).
+| `data` encoding | Stored B/item | Wire | RCU | SDK parse | select + paginate + fold | `readIndex` full decode | GC / alloc |
+|---|---|---|---|---|---|---|---|
+| map (today) | 713 | 5.36 MB | 1,054 | 148 ms | 261 / 224 ms | 789 / 426 ms | 61 ms / 110 MB |
+| JSON string (`S`) | 849 | 4.43 MB | 1,244 | 27 ms | 121 / 110 ms | 374 / 287 ms | 7 ms / 33 MB |
+| JSON + zstd @ 1024 | 849 | 4.43 MB | 1,244 | 32 ms | 123 / 103 ms | 374 / 308 ms | 12 ms / 33 MB |
+| JSON + gzip @ 1024 | 849 | 4.43 MB | 1,244 | 28 ms | 120 / 106 ms | 375 / 303 ms | 7 ms / 33 MB |
+| JSON + zstd @ 0 (every value) | — | 3.46 MB | 943 | 54 ms | 474 / 469 ms | 566 / 444 ms | 38 ms / 53 MB |
 
-Two consequences shape the design:
+At threshold 1024 none of these events compresses, so the stored bytes equal plain JSON.
+Writes of one small event: building the item (`measureAppend`) takes 347 / 276 µs as a
+map, 167 / 135 µs as JSON and 179 / 132 µs as zstd @ 1024; the full `append`, including
+SDK serialization, is 840–940 µs and 1 WCU in every format.
 
-- **JSON is stored ~18–27% larger than the map** for this data. Anything that sizes items
-  (the failure diagnosis, `Batch.write` chunking, a caller planning chunks) must count the
-  stored bytes, not estimate from the map.
-- **Compression only pays on large values.** Below ~150 B it grows the payload; between
-  150 B and 1 KB it saves no WCU (an item under 1 KB is already one WCU) and costs ~20 µs
-  per read. Hence a threshold, defaulting to 1,024 bytes, and "store compressed only when
-  smaller".
+Large value: a ~47 KB JSON aggregate state through `snapshot.storedAs` (20 states,
+n = 15 per format):
+
+| State encoding | Stored | WCU | `writeSnapshot` | `readSnapshot` |
+|---|---|---|---|---|
+| map | 38,160 B | 38 | 4.2–4.5 / 3.9 ms | 3.8–4.2 / 3.7 ms |
+| JSON (`S`) | 46,963 B | 47 | 3.0–3.3 / 2.8 ms | 2.1 / 1.9–2.0 ms |
+| JSON + zstd | 4,219 B | 5 | 2.6–2.9 / 2.5 ms | 2.1–2.3 / 1.8–1.9 ms |
+| JSON + gzip | 3,999 B | 4 | 3.4 / 2.6–2.9 ms | 2.0–2.2 / 1.9–2.0 ms |
+
+Three consequences shape the design:
+
+- **JSON reads ≈2× faster through the library** (2.1× / 2.0× select + fold, 2.1× / 1.5×
+  `readIndex`), with a fifth of the SDK parse time and a third of the allocation.
+- **JSON is stored larger than the map**: ~19% for the small events (849 vs 713 B/item,
+  so ~18% more RCU despite 17% fewer wire bytes) and ~23% for the large state. Anything
+  that sizes items (the failure diagnosis, `Batch.write` chunking, a caller planning
+  chunks) must count the stored bytes, not estimate from the map.
+- **Compression only pays on large values.** On the ~47 KB state, zstd stores ~9× fewer
+  WCU than JSON and writes faster than either map or JSON, with unchanged reads. On small
+  values it saves no WCU (an item under 1 KB is already one WCU), and compressing every
+  value (threshold 0) is a net loss: −24% RCU but ~4× slower select + fold reads. Hence a
+  threshold, defaulting to 1,024 bytes, and "store compressed only when smaller".
 
 ### 2.2 What the user fixed before this design
 
@@ -1022,8 +1051,8 @@ margin when planning on one runtime and writing on another.
 ### 8.3 Inline snapshots — R4
 
 The inline snapshot rides in the append transaction; with `snapshot.storedAs` +
-compression, its `Put` carries the compressed `B` (~48 KB state → ~4 KB per the
-benchmark), and both the 4 MB request diagnosis and the 400 KB item attribution count that
+compression, its `Put` carries the compressed `B` (~47 KB state → ~4.2 KB, 5 WCU, per the
+§2.1 benchmark), and both the 4 MB request diagnosis and the 400 KB item attribution count that
 size. `measureAppend({ snapshot })` reports it.
 
 ---
@@ -1072,6 +1101,10 @@ header byte, one sync decompress, one `TextDecoder` pass. The schema decode is u
 UTF-8 encode and one compress only when compression is configured and the JSON is over the
 threshold. No measurable cost for entities and streams that do not use the feature beyond
 the eligibility check.
+
+End-to-end costs per format, measured downstream on Lambda, are in §2.1. They were taken
+before the change below, so their packed read times still include the per-value overhead
+it removes.
 
 **No Effect per value.** The codec's core is synchronous — `packValueSync`,
 `unpackStoredSync`, `unpackBytesSync` (schema package) and the item-level
@@ -1224,7 +1257,7 @@ in §12.1 prove a packed field cannot enter a composite.
 | Artifact | Change |
 |---|---|
 | `examples/guide-packed-storage.ts` (new) | entity packed field; registering compressors (`DynamoClient.layer({ compressors })`); EventStore `storedAs` + compressed inline snapshot; raw rows; `measureAppend`; `decodeStreamImage`; migration (native → packed on one item) |
-| `guides/packed-storage.mdx` (new, sidebar under Guides) | backed by the example: when to use (bulk reads, large values), stored form and header, threshold and smaller-only, compressors and runtimes, what a packed value contains (§4.4) and the nested-storage note, guards and refusals, sizing (JSON ~18–27% larger than map; use the helpers), schema evolution, migration and rollout order |
+| `guides/packed-storage.mdx` (new, sidebar under Guides) | backed by the example: when to use (bulk reads, large values), stored form and header, threshold and smaller-only, compressors and runtimes, what a packed value contains (§4.4) and the nested-storage note, guards and refusals, sizing (JSON ~19–23% larger than map; use the helpers), the measured benchmark (§2.1) with its method, and threshold 0 as a net read loss, schema evolution, migration and rollout order |
 | `guides/streams.mdx` + `examples/guide-streams.ts` | base64 `B` in Lambda / EventBridge Pipes images; `decodeMarshalledItem` with packed fields; `EventStream.decodeStreamImage`; `itemSchema` does not unpack |
 | `tutorials/event-sourcing.mdx`, `guides/modeling.mdx`, `guides/sparse-maps.mdx` | one-paragraph pointers to the new guide (`storedAs` options list in modeling) |
 | `DESIGN.md` | §7 "Packed Storage" (short, this commit); EDD registry rows 9071–9079 (this commit); §12 EventStore paragraph, §15 error taxonomy and "Declared Errors per Operation" (implementation commits) |

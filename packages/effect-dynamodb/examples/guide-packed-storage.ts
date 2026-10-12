@@ -3,6 +3,7 @@
  *
  * Demonstrates `DynamoModel.Packed({ format: "json", compression? })`:
  *   - Registering Node compressors as a Compression layer merged into the app layer
+ *   - A missing codec, reported as a ValidationError with a CompressorNotRegistered cause
  *   - An entity field stored as one JSON string (S)
  *   - An entity field compressed to binary (B) over a threshold
  *   - What conditions and updates a packed field accepts
@@ -30,6 +31,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { CompressorNotRegistered } from "@effect-dynamodb/schema/Errors.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Query from "../src/Query.js"
@@ -421,6 +423,23 @@ const program = Effect.gen(function* () {
     `snapshot state: ${formOf(snapshotItem.state)} ${snapshotItem.state?.B?.length} bytes ` +
       `(JSON ${JSON.stringify(latest).length} bytes)`,
   )
+
+  // #region missing-codec
+  // A reader that registered only gzip meets the zstd-compressed snapshot state.
+  // The failure is the usual ValidationError; its cause names the missing codec.
+  const outcome = yield* StorageEncoding.decode(snapshotItem.state).pipe(
+    Effect.provideService(Compression, Compression.make([NodeCompression.gzip()])),
+    Effect.as("decoded"),
+    Effect.catchTag("ValidationError", (error) =>
+      error.cause instanceof CompressorNotRegistered
+        ? Effect.succeed(`missing ${error.cause.codec} (${error.cause.direction})`)
+        : Effect.fail(error),
+    ),
+  )
+  // outcome → "missing zstd (decompress)"
+  // #endregion
+  assertEq(outcome, "missing zstd (decompress)", "missing codec is a ValidationError cause")
+  yield* Console.log(`reader without zstd: ${outcome}`)
 
   // #region raw-rows
   // Raw rows carry data as plain parsed JSON — not schema-decoded — whether

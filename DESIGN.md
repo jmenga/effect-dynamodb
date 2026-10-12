@@ -1317,7 +1317,7 @@ yield* db.entities.Pages.update({ pageId: 'p1' })
 
 > Full design: [`docs/designs/storage-encoding.md`](docs/designs/storage-encoding.md).
 
-**Problem.** A native map is the most expensive shape DynamoDB returns: the SDK parses a type-wrapped node per value and `unmarshall` rebuilds the graph again. For bulk reads of structured values (event `data`, documents, folded state) a single JSON string reads ~3× faster, and large values compress ~10× (WCU and the 400 KB item limit).
+**Problem.** A native map is the most expensive shape DynamoDB returns: the SDK parses a type-wrapped node per value and `unmarshall` rebuilds the graph again. For bulk reads of structured values (event `data`, documents, folded state) a single JSON string reads ~2× faster through the library (downstream Lambda benchmark: 5,990 small events, 121 vs 261 ms select + fold, JIT off), at ~19% more stored bytes; a ~47 KB state compresses ~11× (zstd: 5 WCU vs 47 as JSON, 38 as a map), which also matters for the 400 KB item limit. Compressing small values is a net read loss (threshold 0: −24% RCU, ~4× slower reads), hence the 1 KB default threshold.
 
 **Config.** One declarative config, defined in `@effect-dynamodb/schema` and shared by Entity and EventStore:
 
