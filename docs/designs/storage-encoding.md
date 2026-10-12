@@ -750,6 +750,12 @@ the entity query builder sets to `unpackFields`.
   accessors, **not** assignable to `Path`. So comparisons, `size`, `contains` and
   `beginsWith` in PathBuilder-typed callbacks (conditions, filters) reject it at compile
   time; `exists` / `notExists` and `select` callbacks accept `Path | PackedPath`.
+- The marker check is guarded against `any` and `never` (`0 extends 1 & T`, `[T] extends
+  [never]`): a bare conditional distributes over `any`, which turned every `Schema.Any`
+  field into `PackedPath | ArrayPath | …` and broke `eq(t.anyField, 1)` even on entities
+  with no packed field. A field that is not packed maps exactly as in 1.25.0 (pinned
+  against a verbatim copy of the 1.25.0 mapping in `test/PathBuilder.types.test.ts`); a
+  packed `any` field is marked whole (`PackedValue<any>`) so it is still a `PackedPath`.
 - `Entity.Marshalled<E>` gains the `B` member.
 
 Only the PathBuilder-typed surface is guarded at the type level. The record update ops

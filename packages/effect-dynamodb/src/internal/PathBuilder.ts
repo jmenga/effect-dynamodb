@@ -131,9 +131,29 @@ export type PathModel<Model, P extends PropertyKey> = [P] extends [never]
     ? Model
     : {
         [K in keyof Model]: K extends P
-          ? PackedValue<NonNullable<Model[K]>> | Extract<Model[K], null | undefined>
+          ? // An `any` field would swallow the marker (`PackedValue<any> | any`
+            // is `any`): mark it whole.
+            0 extends 1 & Model[K]
+            ? PackedValue<any>
+            : PackedValue<NonNullable<Model[K]>> | Extract<Model[K], null | undefined>
           : Model[K]
       }
+
+/**
+ * `[V]` for a packed field's {@link PackedValue}`<V>` marker, `false` for any
+ * other field type. Guarded so it never matches by accident: `any` would
+ * distribute over the check (yielding `PackedPath | …` for every `any` field,
+ * which then fails every comparison) and `never` extends everything — both
+ * fall through to the ordinary, pre-#147 mapping. (`false`, not `never`, for
+ * "not packed": `never` would itself satisfy `extends [infer V]`.)
+ */
+type PackedValueOf<T> = 0 extends 1 & T
+  ? false
+  : [NonNullable<T>] extends [never]
+    ? false
+    : [NonNullable<T>] extends [PackedValue<infer V>]
+      ? [V]
+      : false
 
 // ---------------------------------------------------------------------------
 // PathBuilder — recursive mapped type that creates typed path accessors
@@ -150,7 +170,7 @@ export type PathModel<Model, P extends PropertyKey> = [P] extends [never]
  * with `.entry(key)` accessor.
  */
 export type PathBuilder<Root, Model, Keys extends ReadonlyArray<string | number> = []> = {
-  readonly [K in keyof Model]-?: NonNullable<Model[K]> extends PackedValue<infer PV>
+  readonly [K in keyof Model]-?: PackedValueOf<Model[K]> extends [infer PV]
     ? PackedPath<Root, PV, [...Keys, K & string]>
     : NonNullable<Model[K]> extends ReadonlyArray<infer E>
       ? ArrayPath<Root, E, [...Keys, K & string]>
