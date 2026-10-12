@@ -767,8 +767,13 @@ the edge entity's packing is applied explicitly:
 
 All decode through `entity._decodeRecord` and write through `validateAndBuildPutItem`, so
 they inherit §6.2–§6.3. A collection-level `filter` refuses a path that is packed in **any**
-member, naming the member. Vector-index source fields read domain values; filter fields
-cannot be packed (§6.1).
+member, naming the member, and an unbound collection `Query.select` borrows `__edd_e__`
+into its projection (stripped again after the raw-row hook ran) so each row's packed
+attributes are read by its member. Vector-index source fields read the value, never the
+stored form: the update paths unpack the item they read (or the read-merge item, on a
+copy that leaves the stored bytes for the write diff) before deriving the source text,
+and a vector search `.select()` returns a projected packed field as parsed JSON. Filter
+fields cannot be packed (§6.1).
 
 ---
 
