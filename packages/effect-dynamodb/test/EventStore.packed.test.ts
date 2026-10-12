@@ -24,8 +24,9 @@ import * as EventStore from "../src/EventStore.js"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { itemBytes, transactItemBytes, transactionBytes } from "../src/internal/ItemSize.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
-import { fromAttributeMap } from "../src/Marshaller.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
+import * as StorageEncoding from "../src/StorageEncoding.js"
 import * as Table from "../src/Table.js"
 import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import {
@@ -1161,6 +1162,70 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
         }
       }
     }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(
+    "{ raw: true } adds rawData: the stored data's wire form, unmodelled fields included",
+    () =>
+      Effect.gen(function* () {
+        yield* writeMixedStream
+        const read = yield* ZstdLedger.read(id)
+        // Every stored form (native map, JSON, gzip, zstd), every image form.
+        for (const [i, item] of storedEvents().entries()) {
+          const expected = read[i]!
+          for (const image of [
+            item,
+            lambdaImage(item) as EventStore.StreamImage,
+            fromAttributeMap(item),
+          ]) {
+            const event = Option.getOrThrow(
+              yield* ZstdLedger.decodeStreamImage(image, { raw: true }),
+            )
+            const { rawData, ...rest } = event
+            expect(rest).toStrictEqual(expected)
+            expect(rawData).toMatchObject({ _tag: expected.eventType })
+          }
+          // Without the option, no rawData.
+          const plain = Option.getOrThrow(yield* ZstdLedger.decodeStreamImage(item))
+          expect("rawData" in plain).toBe(false)
+        }
+
+        // A field the event schema does not model reaches rawData, not data.
+        const [first] = storedEvents()
+        const extra = {
+          _tag: "Recorded",
+          kind: "sale",
+          day: "2026-10-11",
+          amount: 7,
+          note: LONG_NOTE,
+          addedLater: { by: "v2 writer" },
+        }
+        const zstd = DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } })
+        const forms: ReadonlyArray<AttributeValue> = [
+          { S: JSON.stringify(extra) },
+          StorageEncoding.encodeSync(zstd, extra, { compressors: [NodeCompression.zstd()] })!,
+          toAttributeMap({ data: extra }).data!,
+        ]
+        expect(forms[1]!.B).toBeInstanceOf(Uint8Array)
+        for (const data of forms) {
+          const image = lambdaImage({ ...first!, data }) as EventStore.StreamImage
+          const event = Option.getOrThrow(yield* ZstdLedger.decodeStreamImage(image, { raw: true }))
+          expect(event.rawData).toEqual(extra)
+          expect(event.data).toStrictEqual(recorded(7, LONG_NOTE))
+          expect("addedLater" in (event.data as object)).toBe(false)
+        }
+
+        // Bound streams pass the option through; foreign images stay none.
+        const bound = yield* EventStore.bind(ZstdLedger)
+        const viaBound = Option.getOrThrow(yield* bound.decodeStreamImage(first!, { raw: true }))
+        expect(viaBound.rawData).toMatchObject({ _tag: "Recorded", amount: 1 })
+        expect(
+          yield* bound.decodeStreamImage(
+            { pk: { S: "x" }, __edd_e__: { S: "order" } },
+            { raw: true },
+          ),
+        ).toEqual(Option.none())
+      }).pipe(Effect.provide(TestLayer)),
   )
 
   it.effect("none for a snapshot, a sentinel, another stream or an entity image", () =>

@@ -158,6 +158,31 @@ export interface StreamEvent<A, M = Record<string, unknown> | undefined> {
 }
 
 /**
+ * A {@link StreamEvent} together with the event's stored `data` in its wire
+ * form — what `decodeStreamImage(image, { raw: true })` returns.
+ */
+export interface RawStreamEvent<A, M = Record<string, unknown> | undefined>
+  extends StreamEvent<A, M> {
+  /**
+   * The event's `data` as stored, before the event schema decoded it: the
+   * parsed JSON of a packed `data` (`{ _tag, ...fields }`), or the unmarshalled
+   * map of a native one — fields the event schema does not model included. The
+   * same object the decode read, so nothing is parsed twice.
+   */
+  readonly rawData: Readonly<Record<string, unknown>>
+}
+
+/** Options of `decodeStreamImage`. */
+export interface DecodeStreamImageOptions {
+  /**
+   * Also return the event's stored `data` in wire form (`rawData`, see
+   * {@link RawStreamEvent}) — for a consumer that needs fields the event
+   * schema does not model, without parsing the image a second time.
+   */
+  readonly raw?: boolean | undefined
+}
+
+/**
  * Metadata type carried on {@link StreamEvent} for a stream: the decoded
  * metadata schema type when the stream declares one, an untyped record
  * otherwise (events may carry metadata written outside the typed API).
@@ -1480,9 +1505,22 @@ export interface EventStream<
    * the raw image before anything is unmarshalled, so nothing in another
    * item's image (a number the SDK cannot represent, say) fails the decode.
    * An event image that does not decode fails with `ValidationError`.
+   *
+   * With `{ raw: true }`, each event also carries `rawData`: its `data` as
+   * stored, in wire form, unmodelled fields included (see
+   * {@link RawStreamEvent}).
    */
   decodeStreamImage(
     image: StreamImage,
+    options: DecodeStreamImageOptions & { readonly raw: true },
+  ): Effect.Effect<
+    Option.Option<RawStreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ValidationError,
+    never
+  >
+  decodeStreamImage(
+    image: StreamImage,
+    options?: DecodeStreamImageOptions,
   ): Effect.Effect<
     Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     ValidationError,
@@ -2791,6 +2829,7 @@ export const makeStream = <
 
   const decodeStreamImage = (
     image: StreamImage,
+    options?: DecodeStreamImageOptions,
   ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError> =>
     Effect.gen(function* () {
       const ctx = { entityType, operation: "EventStore.decodeStreamImage" }
@@ -2808,7 +2847,15 @@ export const makeStream = <
       // In DynamoDB JSON the S / B tag says what `data` is; unmarshalled, a
       // string that is base64 of a `B` value is told apart from JSON text.
       const raw = yield* decodeImage(image, DATA_ATTRIBUTES, ctx)
-      return Option.some(yield* decodeStreamEvent(raw))
+      const event = yield* decodeStreamEvent(raw)
+      if (options?.raw !== true) return Option.some(event)
+      // `raw.data` is the wire form the decode just read: the parsed JSON of a
+      // packed value, the unmarshalled map of a native one.
+      const withRaw: RawStreamEvent<TEvent> = {
+        ...event,
+        rawData: raw.data as Readonly<Record<string, unknown>>,
+      }
+      return Option.some<StreamEvent<TEvent>>(withRaw)
     })
 
   // ---------------------------------------------------------------------------
@@ -3559,6 +3606,15 @@ export interface BoundEventStream<
   /** See {@link EventStream.decodeStreamImage}. */
   decodeStreamImage(
     image: StreamImage,
+    options: DecodeStreamImageOptions & { readonly raw: true },
+  ): Effect.Effect<
+    Option.Option<RawStreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ValidationError,
+    never
+  >
+  decodeStreamImage(
+    image: StreamImage,
+    options?: DecodeStreamImageOptions,
   ): Effect.Effect<
     Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     ValidationError,
@@ -3664,7 +3720,15 @@ export const bind = <
         provide(stream.measureAppend(streamId, events, expectedVersion, options)),
       measureSnapshot: (streamId, state, asOfVersion) =>
         provide(stream.measureSnapshot(streamId, state, asOfVersion)),
-      decodeStreamImage: (image) => provide(stream.decodeStreamImage(image)),
+      decodeStreamImage: ((image: StreamImage, options?: DecodeStreamImageOptions) =>
+        provide(stream.decodeStreamImage(image, options))) as BoundEventStream<
+        TEvent,
+        TStreamIdFields,
+        TMetadata,
+        TState,
+        TIndexName,
+        TIndexProjections
+      >["decodeStreamImage"],
       query: stream.query,
       provide,
       [StreamIdFormatter]: (id: Record<string, unknown>) => formatStreamIdOf(stream, id),

@@ -1280,7 +1280,24 @@ describe("EventStore packed storage types (#147)", () => {
           Effect.Effect<EventStore.AppendMeasurement, ValidationError, never>
         >()
         expectTypeOf(bound.decodeStreamImage({})).toEqualTypeOf<typeof decoded>()
+        expectTypeOf(bound.decodeStreamImage({}, { raw: true })).toEqualTypeOf<typeof decodedRaw>()
       })
+      // { raw: true } adds rawData; { raw: false } or no option does not.
+      const decodedRaw = Packed.decodeStreamImage({ pk: { S: "x" } }, { raw: true })
+      expectTypeOf(decodedRaw).toEqualTypeOf<
+        Effect.Effect<
+          Option.Option<
+            EventStore.RawStreamEvent<Incremented, { readonly by: string } | undefined>
+          >,
+          ValidationError,
+          never
+        >
+      >()
+      expectTypeOf(Packed.decodeStreamImage({}, { raw: false })).toEqualTypeOf<typeof decoded>()
+      expectTypeOf(Packed.decodeStreamImage({}, {})).toEqualTypeOf<typeof decoded>()
+      expectTypeOf<EventStore.RawStreamEvent<Incremented>["rawData"]>().toEqualTypeOf<
+        Readonly<Record<string, unknown>>
+      >()
     })
     expect(true).toBe(true)
   })

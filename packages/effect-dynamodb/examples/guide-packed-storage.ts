@@ -521,6 +521,24 @@ const program = Effect.gen(function* () {
   const decodedEvent = yield* Ledger.decodeStreamImage(images[0] as EventStore.StreamImage)
   assertEq(Option.getOrThrow(decodedEvent).version, 40, "stream image decodes")
 
+  // #region stream-image-raw
+  // { raw: true } also returns rawData: the event's data as stored, in wire
+  // form, with fields the event schemas don't model (a newer writer's, say).
+  // It's the object the decode parsed, so nothing is parsed twice.
+  const withRaw = yield* Ledger.decodeStreamImage(images[0] as EventStore.StreamImage, {
+    raw: true,
+  })
+  if (Option.isSome(withRaw)) {
+    const { data, rawData } = withRaw.value
+    yield* Console.log(`decoded ${data._tag}; stored fields: ${Object.keys(rawData).join(", ")}`)
+  }
+  // #endregion
+  assertEq(
+    Option.getOrThrow(withRaw).rawData,
+    { _tag: "Recorded", amount: 40, note: `entry 40: ${"x".repeat(40)}` },
+    "stream image raw data",
+  )
+
   yield* client.deleteTable({ TableName: TABLE_NAME })
 })
 

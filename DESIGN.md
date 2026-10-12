@@ -3477,7 +3477,9 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
 - **Streams.** `decodeStreamImage(image)` returns the read paths' `StreamEvent` for one of
   the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and
   EventBridge Pipes deliver them) or unmarshalled — and `Option.none()` for any other
-  item (snapshot, sentinel, foreign).
+  item (snapshot, sentinel, foreign). `decodeStreamImage(image, { raw: true })` returns
+  a `RawStreamEvent`: the same event plus `rawData`, the `data` wire form the decode read
+  (unmodelled fields included), so a consumer never parses an image twice.
 - **Codecs.** Read from the `Compression` service in context (no new `R`); `bind`
   captures it with the rest of the context and refuses a registry without the codecs
   `storedAs` names (`[EDD-9078]`, a defect); an unbound stream checks the registry its

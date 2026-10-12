@@ -409,10 +409,14 @@ tell callers to add them. This is caller-side planning, not a library pre-check:
 **`EventStream.decodeStreamImage` (R2, on `EventStream` and `BoundEventStream`):**
 
 ```ts
-decodeStreamImage(image: StreamImage): Effect<
+decodeStreamImage(image: StreamImage, options?: { readonly raw?: boolean }): Effect<
   Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
   ValidationError
 >
+// overload: { raw: true } → Option<RawStreamEvent<…>>
+interface RawStreamEvent<A, M> extends StreamEvent<A, M> {
+  readonly rawData: Readonly<Record<string, unknown>>
+}
 type StreamImage =
   | Record<string, AttributeValue | LambdaAttributeValue>   // DynamoDB JSON; B/BS may be base64
   | Record<string, unknown>                                  // already unmarshalled
@@ -434,6 +438,14 @@ type StreamImage =
   attribute's `B` may arrive as a `Uint8Array` or still as base64 text — §4.3 shows the
   two are told apart from JSON text without ambiguity.
 - `R = never`.
+- `{ raw: true }` (downstream review): each event also carries `rawData` — the event's
+  `data` in wire form exactly as the decode read it (the parsed JSON of a packed value,
+  `{ _tag, ...fields }`; the unmarshalled map of a native one), fields the event schemas
+  do not model included — the same object, so a consumer that needs unmodelled fields
+  (a newer writer's, say) does not parse the image twice. The overload types it as
+  `RawStreamEvent`; without the option (or with `raw: false`) the result is unchanged.
+  Not mirrored on `Entity.decodeMarshalledItem`: it returns the decoded item itself (a
+  model instance), so a raw view there would need a different result shape (§15).
 
 **`Entity.decodeMarshalledItem` (existing, extended):** applies the same image
 normalisation (base64 `B`/`BS`), stored-form dispatch for the entity's packed and
@@ -1282,6 +1294,10 @@ this design introduced. **Source** says who decided.
 | 59 | Real DynamoDB Streams (`GetRecords`) connected test | **Out**: simulated from a fetched item; avoids a new dev dependency (§12.4) | design |
 | 60 | Canonical GSI-composite shapes | **Not applicable**: composer untouched (§12.5) | design |
 | 61 | New error codes | `EDD-9071`–`EDD-9079`, registry rows added in this commit | design |
+| 62 | Review P1: per-value unpack overhead | **In**: synchronous codec core, one Effect per row / image / partition, registry read from the fiber once per row (none for a row with nothing packed), non-fatal `TextDecoder` with a fatal re-check, `StorageEncoding.*Sync` twins, `bench/packed-decode.ts` (§11). Out: reusing a native zstd context across calls (Node exposes no sync API for it) | review; design |
+| 63 | Review P2: configured codec checked at bind | **In**: `[EDD-9078]` defect from `DynamoClient.make` (entities, aggregate edges) and `EventStore.bind`, and from an unbound stream's first operation per registry (§3.4). A codec-naming member now needs its codec registered where it is bound (a run-time-only registry no longer suffices for it). Out: unbound entity operations and the `query.*` stream descriptors (no single entry point; they keep the run-time `ValidationError`) | review; design |
+| 64 | Review P3: decompression-bomb guard | **In**: 64 MiB default `maxOutputLength` in the Node compressors, configurable, `Infinity` lifts it (§3.4) | review |
+| 65 | Review P4: raw data from `decodeStreamImage` | **In**: `{ raw: true }` → `RawStreamEvent` with `rawData` (§3.5). Out: the same on `Entity.decodeMarshalledItem` — it returns the item itself, so a raw view needs a different result shape; not cheap-and-consistent | review; design |
 
 ---
 
