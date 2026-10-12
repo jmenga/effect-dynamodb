@@ -43,6 +43,7 @@ import {
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
   extractArrayElement,
   getSchemaFields,
@@ -173,6 +174,14 @@ interface ResolvedNode {
    * IS the entity). Packed on write, read by stored form on read.
    */
   readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
+  /**
+   * The attributes of this node's items read by their stored form (#147): every
+   * packed one, plus every object- or array-shaped field of the edge entity's
+   * item. A value stored packed while the entity configured it so still reads
+   * after packing is turned off — readers dispatch on the stored value, not the
+   * current config.
+   */
+  readonly dispatch?: ReadonlyArray<string> | undefined
   readonly cardinality: "root" | "one" | "many"
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
@@ -1192,8 +1201,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     resolveRef,
   })
 
-  // Packed edge attributes by item entity type (#147).
+  // Packed edge attributes, and those read by stored form, by item entity type (#147).
   const packedByType = collectPackedByType(rootNode)
+  const dispatchByType = collectDispatchByType(rootNode)
 
   // Attribute ENCODERS for the root item: decompose works from the
   // schema-decoded domain object, so every root attribute holding a wire
@@ -1387,7 +1397,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   ) =>
     Effect.flatMap(readPartitionRaw(key, rejected), (read) =>
       // Packed edge attributes, read by their stored form (#147).
-      Effect.as(unpackAggregateItems(read.allItems, packedByType, aggregateName), read),
+      Effect.as(unpackAggregateItems(read.allItems, dispatchByType, aggregateName), read),
     )
 
   /** {@link readPartition} without unpacking — `delete` needs only the keys. */
@@ -2026,6 +2036,7 @@ interface ResolveNodeArgs {
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
   readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
+  readonly dispatch?: ReadonlyArray<string> | undefined
 }
 
 /**
@@ -2062,6 +2073,37 @@ const edgePackedFields = (
   }
   return Object.keys(packed).length > 0 ? packed : undefined
 }
+
+/**
+ * The attributes of an edge entity's items a reader dispatches on by stored
+ * form: its packed ones, plus every non-sparse field of the item whose encoded
+ * side is object- or array-shaped (a native value of it is never `S` or `B`) —
+ * the edge counterpart of an entity's `dispatchAttributes`.
+ */
+const edgeDispatchFields = (
+  entity: { readonly model: Schema.Top } | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+  packed: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined,
+): ReadonlyArray<string> | undefined => {
+  if (entity === undefined) return undefined
+  const sparse = DynamoModel.getSparseFields(entity.model)
+  const dispatch = new Set<string>(Object.keys(packed ?? {}))
+  for (const [field, schema] of Object.entries(itemFields ?? {})) {
+    if (field in sparse) continue
+    if (isDispatchEligible(schema)) dispatch.add(field)
+  }
+  return dispatch.size > 0 ? [...dispatch] : undefined
+}
+
+/** A node's packed and stored-form-dispatch attributes, as `resolveNode` args. */
+const edgeStorage = (
+  packed: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined,
+  entity: { readonly model: Schema.Top } | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+): Pick<ResolveNodeArgs, "packed" | "dispatch"> => ({
+  packed,
+  dispatch: edgeDispatchFields(entity, itemFields, packed),
+})
 
 const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
   const {
@@ -2107,14 +2149,18 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
-            packed: edgePackedFields(
-              field,
-              edge.entity as
-                | { readonly model: Schema.Top; readonly entityType: string }
-                | undefined,
+            ...edgeStorage(
+              edgePackedFields(
+                field,
+                edge.entity as
+                  | { readonly model: Schema.Top; readonly entityType: string }
+                  | undefined,
+                valueFields,
+                edge.discriminator,
+                undefined,
+              ),
+              edge.entity as { readonly model: Schema.Top } | undefined,
               valueFields,
-              edge.discriminator,
-              undefined,
             ),
           }),
         )
@@ -2146,14 +2192,18 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             refIdentifierField: edge.entity
               ? DynamoModel.getIdentifierField(edge.entity.model)?.name
               : undefined,
-            packed: edgePackedFields(
-              field,
-              edge.entity as
-                | { readonly model: Schema.Top; readonly entityType: string }
-                | undefined,
+            ...edgeStorage(
+              edgePackedFields(
+                field,
+                edge.entity as
+                  | { readonly model: Schema.Top; readonly entityType: string }
+                  | undefined,
+                elementFields,
+                discriminator,
+                edge.sk?.composite,
+              ),
+              edge.entity as { readonly model: Schema.Top } | undefined,
               elementFields,
-              discriminator,
-              edge.sk?.composite,
             ),
           }),
         )
@@ -2201,6 +2251,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
     ...(args.packed !== undefined && { packed: args.packed }),
+    ...(args.dispatch !== undefined && { dispatch: args.dispatch }),
     attrEncoders,
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
   }
@@ -2223,6 +2274,21 @@ const collectPackedByType = (
   }
   walk(root)
   return out
+}
+
+/** Every node's stored-form-dispatch attributes, by the entity type of its items. */
+const collectDispatchByType = (root: ResolvedNode): ReadonlyMap<string, ReadonlyArray<string>> => {
+  const out = new Map<string, Set<string>>()
+  const walk = (node: ResolvedNode): void => {
+    if (node.dispatch !== undefined) {
+      const attrs = out.get(node.entityType) ?? new Set<string>()
+      for (const attr of node.dispatch) attrs.add(attr)
+      out.set(node.entityType, attrs)
+    }
+    for (const child of node.children) walk(child)
+  }
+  walk(root)
+  return new Map([...out].map(([type, attrs]) => [type, [...attrs]]))
 }
 
 /** The decomposed groups with each item's packed attributes in their stored form. */
@@ -2254,21 +2320,30 @@ const packAggregateGroups = (
         ),
       )
 
-/** Read, in place, each item's packed attributes by their stored form. */
+/**
+ * Read, in place, each item's dispatch attributes by their stored form — by
+ * what is stored, whatever the edge entity configures now. A row with no
+ * string or binary value on any of them costs one `typeof` per attribute.
+ */
 const unpackAggregateItems = (
   items: ReadonlyArray<Record<string, unknown>>,
-  packedByType: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>,
+  dispatchByType: ReadonlyMap<string, ReadonlyArray<string>>,
   aggregateName: string,
 ): Effect.Effect<void, ValidationError | CompressorNotRegistered> =>
-  packedByType.size === 0
+  dispatchByType.size === 0
     ? Effect.void
     : Effect.flatMap(currentRegistry, (registry) =>
         Effect.forEach(
           items,
           (item) => {
-            const packed = packedByType.get(item.__edd_e__ as string)
-            if (packed === undefined) return Effect.void
-            return unpackItem(item, Object.keys(packed), registry, {
+            const dispatch = dispatchByType.get(item.__edd_e__ as string)
+            if (dispatch === undefined) return Effect.void
+            const stored = dispatch.some((attr) => {
+              const value = item[attr]
+              return typeof value === "string" || value instanceof Uint8Array
+            })
+            if (!stored) return Effect.void
+            return unpackItem(item, dispatch, registry, {
               entityType: `${aggregateName}.${String(item.__edd_e__)}`,
               operation: "aggregate.decode",
             })

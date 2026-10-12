@@ -11,10 +11,11 @@ import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as NodeCompression from "../src/compression/node.js"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
@@ -45,7 +46,21 @@ const Venues = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Venues } })
+class Stop extends Schema.Class<Stop>("Stop")({
+  stopId: Schema.String.pipe(DynamoModel.identifier),
+  plan: Schema.Struct({ steps: Schema.Array(Schema.String) }),
+}) {}
+
+const Stops = Entity.make({
+  model: DynamoModel.configure(Stop, { plan: { storedAs: gzip0 } }),
+  entityType: "Stop",
+  primaryKey: {
+    pk: { field: "pk", composite: ["stopId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Venues, Stops } })
 
 const Matches = Aggregate.make(Match, {
   table: MainTable,
@@ -75,8 +90,11 @@ const InMemoryClient = mockDynamoClientLayer({
     }),
   query: (input) =>
     Effect.sync(() => {
+      // The partition attribute the key condition names: the table's `pk`, or
+      // a list index's partition key.
+      const field = input.ExpressionAttributeNames?.["#pk"] ?? "pk"
       const pk = input.ExpressionAttributeValues![":pk"]!.S
-      return { Items: [...store.values()].filter((item) => item.pk?.S === pk) } as never
+      return { Items: [...store.values()].filter((item) => item[field]?.S === pk) } as never
     }),
   batchGetItem: (input) =>
     Effect.sync(() => {
@@ -224,4 +242,46 @@ describe("Aggregate — packed edge fields", () => {
       }),
     ).toThrow(/\[EDD-9072\].*sort-key composite "layout"/)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Packing turned off: edge items written packed still read (stored-form dispatch)
+// ---------------------------------------------------------------------------
+
+describe("Aggregate — packed edge fields after packing is turned off", () => {
+  const PlainVenues = Entity.make({
+    model: Venue,
+    entityType: "Venue",
+    primaryKey: {
+      pk: { field: "pk", composite: ["venueId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
+  const PlainTable = Table.make({ schema: AppSchema, entities: { PlainVenues } })
+  const PlainMatches = Aggregate.make(Match, {
+    table: PlainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["matchId"] },
+    collection: { name: "match" },
+    root: { entityType: "MatchItem" },
+    edges: {
+      venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: PlainVenues }),
+    },
+  })
+  const PlainLayer = Layer.mergeAll(TestLayer, PlainTable.layer({ name: "agg-table" }))
+
+  it.effect("get reads edge items stored packed (S and B) by their stored form", () =>
+    Effect.gen(function* () {
+      yield* seedVenue
+      yield* Matches.create({ matchId: "m-1", name: "Final", venueId: "v-1" } as never)
+      expect(venueItems()[0]!.layout?.B).toBeInstanceOf(Uint8Array)
+      // Packing is off for this configuration of the same edge entity.
+      expect((yield* PlainMatches.get({ matchId: "m-1" })).venue.layout).toEqual(layout)
+
+      // A JSON (S) value written under another config reads too.
+      const [edge] = venueItems()
+      store.set(keyOf(edge!), { ...edge!, layout: { S: JSON.stringify(layout) } })
+      expect((yield* PlainMatches.get({ matchId: "m-1" })).venue.layout).toEqual(layout)
+    }).pipe(Effect.provide(PlainLayer)),
+  )
 })
