@@ -103,6 +103,11 @@ import {
   UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from "@aws-sdk/client-dynamodb"
+import {
+  Compression,
+  type Compressor,
+  make as makeCompressionRegistry,
+} from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -427,6 +432,36 @@ export interface DynamoClientService {
   ) => Effect.Effect<ListTagsOfResourceCommandOutput, DynamoClientError>
 }
 
+/** Static client configuration accepted by {@link DynamoClient.layer}. */
+type ClientConfig = {
+  readonly region: string
+  readonly endpoint?: string | undefined
+  readonly credentials?:
+    | { readonly accessKeyId: string; readonly secretAccessKey: string }
+    | undefined
+}
+
+/** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
+type ClientConfigFromConfig = {
+  readonly region: Config.Config<string>
+  readonly endpoint?: Config.Config<string> | undefined
+  readonly credentials?:
+    | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
+    | undefined
+}
+
+/**
+ * Add the `Compression` service built from `compressors` beside a client
+ * layer. The registry is validated (EDD-9078) when the layer is constructed.
+ */
+const withCompressors = <E>(
+  client: Layer.Layer<DynamoClient, E>,
+  compressors: ReadonlyArray<Compressor> | undefined,
+): Layer.Layer<DynamoClient, E> | Layer.Layer<DynamoClient | Compression, E> =>
+  compressors === undefined
+    ? client
+    : Layer.merge(client, Layer.succeed(Compression, makeCompressionRegistry(compressors)))
+
 /**
  * Effect Context.Service for the DynamoDB client service.
  *
@@ -448,15 +483,30 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
    * @param config.credentials - Optional static credentials
+   * @param config.compressors - Optional compressors for packed storage
+   *   (`DynamoModel.Packed` with `compression`). When given, the layer also
+   *   provides the `Compression` service built from them, so they are available
+   *   wherever `DynamoClient` is.
+   *
+   * @example
+   * ```typescript
+   * import * as NodeCompression from "effect-dynamodb/compression/node"
+   * const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
+   * ```
    */
-  static readonly layer = (config: {
-    readonly region: string
-    readonly endpoint?: string | undefined
-    readonly credentials?:
-      | { readonly accessKeyId: string; readonly secretAccessKey: string }
-      | undefined
-  }): Layer.Layer<DynamoClient> =>
-    Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials))
+  static readonly layer: {
+    (
+      config: ClientConfig & { readonly compressors: ReadonlyArray<Compressor> },
+    ): Layer.Layer<DynamoClient | Compression>
+    (config: ClientConfig & { readonly compressors?: undefined }): Layer.Layer<DynamoClient>
+    (
+      config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined },
+    ): Layer.Layer<DynamoClient>
+  } = (config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined }) =>
+    withCompressors(
+      Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials)),
+      config.compressors,
+    ) as never
 
   /**
    * Create a live Layer that reads configuration from Effect Config providers
@@ -465,29 +515,44 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials
+   * @param config.compressors - Optional compressors for packed storage; when
+   *   given, the layer also provides the `Compression` service (see {@link layer}).
    */
-  static readonly layerConfig = (config: {
-    readonly region: Config.Config<string>
-    readonly endpoint?: Config.Config<string> | undefined
-    readonly credentials?:
-      | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
-      | undefined
-  }): Layer.Layer<DynamoClient, Config.ConfigError> =>
-    Layer.effect(
-      DynamoClient,
-      Effect.gen(function* () {
-        const region = yield* config.region
-        const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-        const credentials = config.credentials
-          ? yield* Config.option(config.credentials)
-          : undefined
-        return yield* buildService(
-          region,
-          endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-          credentials && credentials._tag === "Some" ? credentials.value : undefined,
-        )
-      }),
-    )
+  static readonly layerConfig: {
+    (
+      config: ClientConfigFromConfig & { readonly compressors: ReadonlyArray<Compressor> },
+    ): Layer.Layer<DynamoClient | Compression, Config.ConfigError>
+    (
+      config: ClientConfigFromConfig & { readonly compressors?: undefined },
+    ): Layer.Layer<DynamoClient, Config.ConfigError>
+    (
+      config: ClientConfigFromConfig & {
+        readonly compressors?: ReadonlyArray<Compressor> | undefined
+      },
+    ): Layer.Layer<DynamoClient, Config.ConfigError>
+  } = (
+    config: ClientConfigFromConfig & {
+      readonly compressors?: ReadonlyArray<Compressor> | undefined
+    },
+  ) =>
+    withCompressors(
+      Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const region = yield* config.region
+          const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
+          const credentials = config.credentials
+            ? yield* Config.option(config.credentials)
+            : undefined
+          return yield* buildService(
+            region,
+            endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
+            credentials && credentials._tag === "Some" ? credentials.value : undefined,
+          )
+        }),
+      ),
+      config.compressors,
+    ) as never
 
   /**
    * Create a typed client gateway from entities, aggregates, and (optionally) tables.
@@ -521,6 +586,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -535,6 +601,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly aggregates: TAggregates
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -549,6 +616,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly tables: TTables
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -559,6 +627,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly crypto?: Crypto.Crypto
       readonly embedder?: EmbedderService
+      readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -1040,6 +1109,7 @@ const makeFromConfig = (config: {
   readonly tables?: Record<string, TableLike>
   readonly crypto?: Crypto.Crypto
   readonly embedder?: EmbedderService
+  readonly compressors?: ReadonlyArray<Compressor>
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // 1. Resolve the provide function from context.
@@ -1062,10 +1132,25 @@ const makeFromConfig = (config: {
     const ambientEmbedder = Context.getOption(baseCtx, Embedder)
     const embedderService =
       config.embedder ?? (Option.isSome(ambientEmbedder) ? ambientEmbedder.value : undefined)
-    const ctx =
+    const withEmbedder =
       embedderService !== undefined
         ? Context.add(withCrypto, Embedder, embedderService)
         : withCrypto
+    // Bundle the compressor registry for packed storage the same way: explicit
+    // `compressors` win, then an ambient `Compression` at bind time. Without
+    // either nothing is added, so a `Compression` provided at run time still
+    // reaches bound operations (they read it with `Effect.serviceOption`).
+    const ambientCompression = Context.getOption(baseCtx, Compression)
+    const compressionRegistry =
+      config.compressors !== undefined
+        ? makeCompressionRegistry(config.compressors)
+        : Option.isSome(ambientCompression)
+          ? ambientCompression.value
+          : undefined
+    const ctx =
+      compressionRegistry !== undefined
+        ? Context.add(withEmbedder, Compression, compressionRegistry)
+        : withEmbedder
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

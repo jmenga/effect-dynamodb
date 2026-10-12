@@ -231,6 +231,8 @@ export class Compression extends Context.Service<Compression, CompressionRegistr
   "@effect-dynamodb/Compression",
 ) {
   static readonly layer: (compressors: ReadonlyArray<Compressor>) => Layer.Layer<Compression>
+  static readonly make: typeof make     // so `Compression.make([...])` works from the class export
+  static readonly empty: CompressionRegistry
 }
 ```
 
@@ -259,8 +261,13 @@ import * as NodeCompression from "effect-dynamodb/compression/node"
 const live = DynamoClient.layer({ region: "us-east-1", compressors: [NodeCompression.zstd()] })
 ```
 
-The declared return type becomes `Layer<DynamoClient | Compression, …>` (assignable to
-every existing `Layer<DynamoClient, …>` position, since a layer's output is contravariant).
+The layers are overloaded on `compressors`: given, the return type is
+`Layer<DynamoClient | Compression, …>`; omitted, it stays `Layer<DynamoClient, …>` and no
+`Compression` is provided, so an ambient registry provided beside the client is never
+shadowed by an empty one. (A layer's output is not contravariant —
+`Layer<DynamoClient | Compression>` is not assignable to `Layer<DynamoClient>` — so a single
+widened return type would have broken existing annotations.) The registry is validated
+(`[EDD-9078]`) when the layer is constructed.
 
 `Compression` is a `Context.Service` (gate 9), not a `Context.Reference`: both avoid an
 `R`, but the service + `serviceOption` matches the `Embedder` precedent and keeps "no
@@ -274,7 +281,9 @@ export const gzip:   (options?: { readonly level?: number; readonly maxOutputLen
 export const brotli: (options?: { readonly quality?: number; readonly maxOutputLength?: number }) => Compressor
 export const zstd:   (options?: { readonly level?: number; readonly maxOutputLength?: number }) => Compressor
 /** gzip + brotli, plus zstd when this runtime has it. */
-export const available: () => ReadonlyArray<Compressor>
+export const available: (options?: { readonly maxOutputLength?: number }) => ReadonlyArray<Compressor>
+/** True iff this runtime has zstd (Node ≥ 22.15). */
+export const hasZstd: () => boolean
 ```
 
 `gzipSync`/`gunzipSync`, `brotliCompressSync`/`brotliDecompressSync`,
@@ -1044,8 +1053,9 @@ in §12.1 prove a packed field cannot enter a composite.
   keep compiling; exact-type assertions in user tests may need updating — called out in
   the changelog).
 - `Entity` / `EntityDefinition` gain a trailing defaulted type parameter.
-- `DynamoClient.layer` / `layerConfig` return `Layer<DynamoClient | Compression, …>`;
-  existing annotations `Layer<DynamoClient>` remain valid.
+- `DynamoClient.layer` / `layerConfig` return `Layer<DynamoClient | Compression, …>` only
+  when given `compressors` (overloads); calls without it keep `Layer<DynamoClient, …>`, so
+  existing annotations remain valid.
 - `Entity.decodeMarshalledItem` now honours renames, sparse maps and base64 `B` — images
   that failed before now decode (behaviour fix, changelog).
 - Reading: any version without this feature cannot read packed values (§10 rollout).
