@@ -285,3 +285,147 @@ describe("Aggregate — packed edge fields after packing is turned off", () => {
     }).pipe(Effect.provide(PlainLayer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// many edges whose element is the packed entity, in sub-aggregate groups
+// ---------------------------------------------------------------------------
+
+describe("Aggregate — packed many-edge elements", () => {
+  class Leg extends Schema.Class<Leg>("Leg")({
+    label: Schema.String,
+    stops: Schema.Array(Stop),
+  }) {}
+  class Tour extends Schema.Class<Tour>("Tour")({
+    tourId: Schema.String,
+    region: Schema.String,
+    name: Schema.String,
+    leg1: Leg,
+    leg2: Leg,
+  }) {}
+  const LegAggregate = Aggregate.make(Leg, {
+    root: { entityType: "TourLeg" },
+    edges: {
+      stops: Aggregate.many("stops", {
+        entityType: "TourStop",
+        entity: Stops,
+        sk: { composite: ["stopId"] },
+      }),
+    },
+  })
+  const Tours = Aggregate.make(Tour, {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["tourId"] },
+    collection: { name: "tour" },
+    list: {
+      index: "gsi1",
+      name: "tours",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: { field: "gsi1sk", composite: ["tourId"] },
+    },
+    root: { entityType: "TourItem" },
+    edges: {
+      leg1: LegAggregate.with({ discriminator: { legNo: 1 } }),
+      leg2: LegAggregate.with({ discriminator: { legNo: 2 } }),
+    },
+  })
+
+  const plan = (n: number) => ({ steps: Array.from({ length: 20 }, (_, i) => `step ${n}.${i}`) })
+  const tour = {
+    tourId: "t-1",
+    region: "apac",
+    name: "Spring",
+    leg1: { label: "North", stops: ["s-1"] },
+    leg2: { label: "South", stops: ["s-2", "s-3"] },
+  }
+  // The many edge's elements ARE the entity: create takes their ids and
+  // hydrates each from the (packed) entity item.
+  const seedStops = Effect.forEach(
+    [1, 2, 3],
+    (n) => Stops.put({ stopId: `s-${n}`, plan: plan(n) }).asEffect(),
+    { discard: true },
+  )
+  const stopItems = () => [...store.values()].filter((item) => item.__edd_e__?.S === "TourStop")
+  const stopPuts = () =>
+    transactions
+      .flat()
+      .flatMap((entry) =>
+        entry.Put?.Item !== undefined && entry.Put.Item.__edd_e__?.S === "TourStop"
+          ? [entry.Put.Item]
+          : [],
+      )
+
+  it.effect("create packs each element; get and list assemble them", () =>
+    Effect.gen(function* () {
+      yield* seedStops
+      yield* Tours.create(tour as never)
+      expect(stopItems()).toHaveLength(3)
+      for (const item of stopItems()) {
+        expect(item.plan?.B).toBeInstanceOf(Uint8Array)
+        expect(item.plan!.B![0]).toBe(0x21)
+      }
+      const read = yield* Tours.get({ tourId: "t-1" })
+      expect(read.leg2.stops.map((stop) => stop.plan)).toEqual([plan(2), plan(3)])
+      const listed = yield* Tours.list({ region: "apac" })
+      expect(listed.data).toHaveLength(1)
+      expect(listed.data[0]!.leg1.stops[0]!.plan).toEqual(plan(1))
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an update rewrites only the changed group's packed elements", () =>
+    Effect.gen(function* () {
+      yield* seedStops
+      yield* Tours.create(tour as never)
+      const stored = new Map(stopItems().map((item) => [item.stopId!.S!, item.plan!.B!]))
+      // A root-only change: neither leg group is rewritten.
+      transactions.length = 0
+      yield* Tours.update({ tourId: "t-1" }, ({ state }) => ({ ...state, name: "Autumn" }))
+      expect(stopPuts()).toEqual([])
+
+      // A change in leg 1's group: its element is rewritten, packed (the same
+      // bytes — it was diffed before packing); leg 2's elements are not.
+      transactions.length = 0
+      yield* Tours.update({ tourId: "t-1" }, ({ state }) => ({
+        ...state,
+        leg1: { ...state.leg1, label: "Far North" },
+      }))
+      const puts = stopPuts()
+      expect(puts.map((item) => item.stopId?.S)).toEqual(["s-1"])
+      expect(puts[0]!.plan?.B).toEqual(stored.get("s-1"))
+      const read = yield* Tours.get({ tourId: "t-1" })
+      expect(read.leg1.label).toBe("Far North")
+      expect(read.leg1.stops[0]!.plan).toEqual(plan(1))
+      expect(read.leg2.stops.map((stop) => stop.plan)).toEqual([plan(2), plan(3)])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// DynamoClient.make({ compressors }) reaches bound aggregates
+// ---------------------------------------------------------------------------
+
+describe("Aggregate — packed edges through DynamoClient.make({ compressors })", () => {
+  const Bare = Layer.mergeAll(InMemoryClient, MainTable.layer({ name: "agg-table" }))
+
+  it.effect("explicit compressors reach a bound aggregate with nothing ambient", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Venues },
+        aggregates: { Matches },
+        tables: { MainTable },
+        compressors: [NodeCompression.gzip()],
+      })
+      yield* db.entities.Venues.put({ venueId: "v-1", name: "MCG", layout })
+      yield* db.aggregates.Matches.create({
+        matchId: "m-1",
+        name: "Final",
+        venueId: "v-1",
+      } as never)
+      expect(venueItems()[0]!.layout?.B).toBeInstanceOf(Uint8Array)
+      expect((yield* db.aggregates.Matches.get({ matchId: "m-1" })).venue.layout).toEqual(layout)
+      // The unbound aggregate, with no Compression in scope, cannot read it.
+      const exit = yield* Effect.exit(Matches.get({ matchId: "m-1" }))
+      expect(Exit.isFailure(exit)).toBe(true)
+    }).pipe(Effect.provide(Bare)),
+  )
+})
