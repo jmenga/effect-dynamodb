@@ -37,7 +37,6 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
-import { packedIndexRefusal, resolvePackedPlan } from "./internal/EntityPacked.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -48,6 +47,7 @@ import type {
   UniqueConstraintDef,
   VersionedConfig,
 } from "./internal/EntityConfig.js"
+import { packedIndexRefusal, resolvePackedPlan } from "./internal/EntityPacked.js"
 import {
   allCompositeAttributes,
   buildDerivedSchemas,

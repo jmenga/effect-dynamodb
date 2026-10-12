@@ -22,7 +22,7 @@
  */
 
 import type { Schema } from "effect"
-import { type PackedConfig, isRefField } from "../DynamoModel.js"
+import { isRefField, type PackedConfig } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import type { VectorIndexConfig } from "../VectorIndex.js"
 import type { TimeSeriesConfig, UniqueConfig } from "./EntityConfig.js"
