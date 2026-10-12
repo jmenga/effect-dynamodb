@@ -29,12 +29,25 @@ import type { Compressor } from "@effect-dynamodb/schema/Compression.js"
 
 export type { Compressor } from "@effect-dynamodb/schema/Compression.js"
 
+/**
+ * The default bound on one value's decompressed size: 64 MiB.
+ *
+ * A packed attribute lives in one DynamoDB item (at most 400 KB stored), and
+ * JSON compresses roughly 5–20× with these codecs, so a legitimate value
+ * decompresses to a few MB at most. 64 MiB leaves an order of magnitude of
+ * headroom for unusually repetitive data while refusing a decompression bomb —
+ * a few hundred KB that would otherwise inflate to gigabytes on a reader.
+ */
+export const DEFAULT_MAX_OUTPUT_LENGTH = 64 * 1024 * 1024
+
 /** Options shared by every Node compressor. */
 export interface DecompressOptions {
   /**
    * Upper bound, in bytes, on one value's decompressed size — a guard against
    * decompression bombs. Decompressing past it throws, which the library
-   * reports as a `ValidationError`. Default: Node's own limit.
+   * reports as a `ValidationError` on the read (the operation's `.decode`).
+   * Default: {@link DEFAULT_MAX_OUTPUT_LENGTH} (64 MiB). `Infinity` lifts the
+   * library's bound and leaves only Node's own (`buffer.constants.MAX_LENGTH`).
    */
   readonly maxOutputLength?: number | undefined
 }
@@ -43,8 +56,17 @@ export interface DecompressOptions {
 const view = (buffer: Uint8Array): Uint8Array =>
   new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
 
-const decompressOptions = (options: DecompressOptions): { maxOutputLength?: number } =>
-  options.maxOutputLength === undefined ? {} : { maxOutputLength: options.maxOutputLength }
+const decompressOptions = (options: DecompressOptions): { maxOutputLength?: number } => {
+  const limit = options.maxOutputLength ?? DEFAULT_MAX_OUTPUT_LENGTH
+  if (limit === Number.POSITIVE_INFINITY) return {}
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error(
+      `effect-dynamodb/compression/node: maxOutputLength must be a positive integer number of ` +
+        `bytes, or Infinity — got ${String(limit)}`,
+    )
+  }
+  return { maxOutputLength: limit }
+}
 
 /** gzip (`zlib.gzipSync` / `zlib.gunzipSync`). */
 export const gzip = (

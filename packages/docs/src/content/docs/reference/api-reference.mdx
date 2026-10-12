@@ -1329,9 +1329,10 @@ import * as NodeCompression from "effect-dynamodb/compression/node"
 | `brotli({ quality?, maxOutputLength? })` | brotli `Compressor` (text mode) |
 | `zstd({ level?, maxOutputLength? })` | zstd `Compressor`, level 3 by default. Needs Node 22.15 or later; throws when created on older Node |
 | `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this runtime has it |
+| `DEFAULT_MAX_OUTPUT_LENGTH` | `67_108_864` (64 MiB), the default `maxOutputLength` |
 | `hasZstd()` | `true` when this runtime has zstd |
 
-`maxOutputLength` caps one value's decompressed size; going over it fails the read with a `ValidationError`.
+`maxOutputLength` caps one value's decompressed size: 64 MiB by default (`DEFAULT_MAX_OUTPUT_LENGTH`), any positive integer to change it, `Infinity` for Node's own limit only. Going over it fails the read with a `ValidationError`.
 
 ## Errors
 

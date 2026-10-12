@@ -239,7 +239,7 @@ const ClientLayer = DynamoClient.layerConfig({
 | `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this Node has it |
 | `hasZstd()` | `true` when this Node has zstd |
 
-`maxOutputLength` caps the decompressed size of one value, as a guard against decompression bombs. Going over it fails the read with a `ValidationError`.
+`maxOutputLength` caps the decompressed size of one value, as a guard against decompression bombs. It defaults to 64 MiB (`NodeCompression.DEFAULT_MAX_OUTPUT_LENGTH`): a packed value lives in one item of at most 400 KB, and JSON compresses about 5 to 20 times, so a real value inflates to a few MB. Going over the cap fails the read with a `ValidationError`. Pass a larger number to raise it, or `Infinity` to leave only Node's own limit.
 
 zstd is the recommended codec: it has the cheapest writes and about the same ratio as the others. The codec is **required** in the config, with no default, because zstd isn't available before Node 22.15.
 

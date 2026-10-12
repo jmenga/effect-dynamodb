@@ -318,7 +318,14 @@ export const hasZstd: () => boolean
 `zstdCompressSync`/`zstdDecompressSync`. `zstd()` throws at construction (a plain `Error`
 naming the Node ≥ 22.15 requirement) when `zlib.zstdCompressSync` is absent.
 `maxOutputLength` passes through to Node to bound decompression output (decompression
-bombs); default is Node's own. zstd defaults to level 3 (the benchmark's setting), gzip
+bombs). It is bounded **by default** at `DEFAULT_MAX_OUTPUT_LENGTH` = 64 MiB (exported):
+a packed value lives in one item (≤ 400 KB stored) and JSON compresses ~5–20× with these
+codecs, so a real value inflates to a few MB at most, while a bomb of a few hundred KB
+would otherwise inflate to gigabytes on every reader. Going over it makes `decompress`
+throw, which the read reports as a `ValidationError` (`<op>.decode`, "the "<codec>"
+decompressor failed"). A caller raises it with any positive integer, or lifts it with
+`Infinity` (Node's own `buffer.constants.MAX_LENGTH` remains); anything else throws when
+the compressor is built. zstd defaults to level 3 (the benchmark's setting), gzip
 and brotli to Node's defaults. The subpath is the only file in the package that imports
 `node:zlib`; the main entry stays runtime-neutral.
 
@@ -1088,7 +1095,10 @@ isolation, and the remaining difference moves with GC timing, not with the libra
 ### 12.2 Unit — effect-dynamodb (mocked `DynamoClient`)
 
 - `test/compression-node.test.ts`: gzip/brotli/zstd round-trip, `available()`,
-  `maxOutputLength` enforcement, `zstd()` error when unavailable (stubbed).
+  `maxOutputLength` enforcement, the 64 MiB default bound (a bomb one byte over it is
+  refused by every codec, exactly the bound reads, `Infinity` lifts it, and a packed value
+  over it reads as a `ValidationError`), invalid `maxOutputLength` refused at construction,
+  `zstd()` error when unavailable (stubbed).
 - `test/StorageEncoding.test.ts`: `encode` / `decode` / `decodeUnmarshalled` / `valueBytes` (equals
   `attributeBytes` of the stored value; native vs packed), `limits`.
 - `test/Entity.packed.test.ts`, capturing requests: put/create (S and B on the wire),
@@ -1264,7 +1274,7 @@ this design introduced. **Source** says who decided.
 | 51 | Fail-fast check at `DynamoClient.make` that every configured codec is registered | **Not added**: a read-only process would be forced to register codecs it never writes; the op-time tagged error is the single failure mode | design: your call |
 | 52 | Unregistered codec → tagged error naming the codec | **Changed**: `CompressorNotRegistered` names it, as the `cause` of a `ValidationError` — not a new error-channel member, which broke never-packing consumers (§5.3) | user |
 | 53 | Corrupt / unsupported packed values | **`ValidationError`** (§5.3), like any undecodable row | design |
-| 54 | Node compressors from a subpath (`effect-dynamodb/compression/node`) | **In**; `maxOutputLength` option added for decompression bombs | user; option: design |
+| 54 | Node compressors from a subpath (`effect-dynamodb/compression/node`) | **In**; `maxOutputLength` option added for decompression bombs, bounded at 64 MiB by default (downstream review) | user; option: design; default: review |
 | 55 | Compressor tuning in the config (level, quality) | **Out of the config**: on the compressor factory (§3.1) | design |
 | 56 | `Entity.decodeMarshalledItem` ignores renames and sparse maps (found while designing R2) | **In — adjacent debt** fixed in the same change (§3.5) | design (golden rule) |
 | 57 | `Entity.itemSchema` unpacking | **Out**: a pure schema cannot decompress; documented (§3.5) | design |
