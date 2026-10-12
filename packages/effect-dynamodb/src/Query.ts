@@ -13,12 +13,17 @@ import type {
   QueryCommandOutput,
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { type CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
+import {
+  type PackedAttributeGuard,
+  packedExprRefusal,
+  packedProjectionRefusal,
+} from "./internal/Packed.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
@@ -73,7 +78,19 @@ interface QueryState {
   readonly isScan: boolean
   readonly projection: ReadonlyArray<string> | undefined
   readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
+  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, QueryDecodeError>
+  /**
+   * How a raw row ({@link select} / {@link selectPaths}) is handed back: the
+   * identity, unless the query's items store attributes packed — then each
+   * packed attribute present is read by its stored form to its parsed JSON
+   * (not schema-decoded). See {@link QueryRawRow}.
+   */
+  readonly rawRow: QueryRawRow | undefined
+  /**
+   * The packed attributes of the query's items: a filter or projection that
+   * looks inside one is refused when it is added (`[EDD-9076]`).
+   */
+  readonly packed: ReadonlyArray<PackedAttributeGuard>
   /** Optional effect to resolve table name at execution time (for deferred resolution) */
   readonly resolveTableName: Effect.Effect<string, never, any> | undefined
   /**
@@ -111,6 +128,18 @@ interface QueryState {
   /** See {@link KeyConditionDiagnosis}. */
   readonly keyConditionDiagnosis: KeyConditionDiagnosis | undefined
 }
+
+/** What a query's row decoder can fail with: an undecodable row, or a packed value whose codec is not registered. */
+export type QueryDecodeError = ValidationError | CompressorNotRegistered
+
+/**
+ * @internal Turns a raw row into the plain row {@link select} returns: each
+ * packed attribute it carries read by its stored form (`S` → JSON, `B` →
+ * header + payload, native → unchanged), never schema-decoded.
+ */
+export type QueryRawRow = (
+  raw: Record<string, unknown>,
+) => Effect.Effect<Record<string, unknown>, QueryDecodeError>
 
 /**
  * @internal How a query names DynamoDB's rejection of its key condition — an
@@ -220,7 +249,7 @@ export const make = <A>(config: {
   readonly pkValue: string
   readonly skField: string | undefined
   readonly entityTypes: ReadonlyArray<string>
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, QueryDecodeError>
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -232,8 +261,14 @@ export const make = <A>(config: {
   readonly hydration?: QueryHydration | undefined
   /** See {@link KeyConditionDiagnosis}. */
   readonly keyConditionDiagnosis?: KeyConditionDiagnosis | undefined
+  /** See {@link QueryState.rawRow}. */
+  readonly rawRow?: QueryRawRow | undefined
+  /** See {@link QueryState.packed}. */
+  readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    rawRow: config.rawRow,
+    packed: config.packed ?? [],
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -260,7 +295,7 @@ export const make = <A>(config: {
     projectionPaths: undefined,
     decoder: config.decoder as (
       raw: Record<string, unknown>,
-    ) => Effect.Effect<unknown, ValidationError>,
+    ) => Effect.Effect<unknown, QueryDecodeError>,
     resolveTableName: config.resolveTableName,
     keyFields: normalizeKeyFields(config.keyFields),
   })
@@ -274,7 +309,7 @@ export const makeScan = <A>(config: {
   readonly tableName: string
   readonly indexName: string | undefined
   readonly entityTypes: ReadonlyArray<string>
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, QueryDecodeError>
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -282,8 +317,14 @@ export const makeScan = <A>(config: {
   readonly liveRows?: LiveRows | undefined
   /** See {@link QueryState.prepare}. */
   readonly prepare?: QueryPrepare | undefined
+  /** See {@link QueryState.rawRow}. */
+  readonly rawRow?: QueryRawRow | undefined
+  /** See {@link QueryState.packed}. */
+  readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
 }): Query<A> =>
   new QueryImpl<A>({
+    rawRow: config.rawRow,
+    packed: config.packed ?? [],
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -310,7 +351,7 @@ export const makeScan = <A>(config: {
     projectionPaths: undefined,
     decoder: config.decoder as (
       raw: Record<string, unknown>,
-    ) => Effect.Effect<unknown, ValidationError>,
+    ) => Effect.Effect<unknown, QueryDecodeError>,
     resolveTableName: config.resolveTableName,
     keyFields: normalizeKeyFields(config.keyFields),
   })
@@ -461,10 +502,33 @@ export const startFrom: {
 )
 
 /**
+ * @internal The decoder of a projected (raw) row: the query's
+ * {@link QueryState.rawRow} hook, or the identity.
+ */
+const rawRowDecoder = (
+  state: QueryState,
+): ((raw: Record<string, unknown>) => Effect.Effect<unknown, QueryDecodeError>) =>
+  state.rawRow ?? ((raw) => Effect.succeed(raw))
+
+/** @internal Throw `[EDD-9076]` for a projection inside a packed attribute. */
+const refusePackedProjection = (
+  state: QueryState,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): void => {
+  const refused = packedProjectionRefusal(paths, state.packed)
+  if (refused !== undefined) throw new Error(refused)
+}
+
+/**
  * Select specific attributes to return (ProjectionExpression).
  * Reduces read capacity and network transfer. When projection is active,
  * items are returned as raw `Record<string, unknown>` instead of decoded
  * schema instances, since projected items may be partial.
+ *
+ * An attribute stored packed (`DynamoModel.Packed` — an EventStore stream's
+ * `data`, for one) comes back as its parsed JSON, whatever its stored form
+ * (a native map, a JSON string, or compressed bytes), and may only be
+ * selected whole: a path inside it throws `[EDD-9076]`.
  */
 export const select: {
   (attributes: ReadonlyArray<string>): <A>(self: Query<A>) => Query<Record<string, unknown>>
@@ -475,10 +539,14 @@ export const select: {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
+    refusePackedProjection(
+      self._state,
+      attributes.map((attribute) => [attribute]),
+    )
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projection: attributes,
-      decoder: (raw) => Effect.succeed(raw),
+      decoder: rawRowDecoder(self._state),
     })
   },
 )
@@ -497,11 +565,17 @@ export const selectProjected = <A>(
   if (self._state.predicates.length > 0) {
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
+  refusePackedProjection(self._state, storedPaths)
+  const rawRow = rawRowDecoder(self._state)
   return new QueryImpl<Record<string, unknown>>({
     ...self._state,
     projection: undefined,
     projectionPaths: storedPaths,
-    decoder: (raw) => Effect.succeed(decode(raw) as Record<string, unknown>),
+    decoder: (raw) =>
+      Effect.map(
+        rawRow(raw),
+        (row) => decode(row as Record<string, unknown>) as Record<string, unknown>,
+      ),
   })
 }
 
@@ -534,6 +608,12 @@ export const selectRenamed = <A>(
 /**
  * Add an Expr-based filter expression to the query.
  * Multiple filterExpr calls are ANDed together.
+ *
+ * On a query whose items store an attribute packed (`DynamoModel.Packed` — an
+ * EventStore stream with `storedAs.data`, for one), a filter that addresses a
+ * path inside it, or applies anything but `attribute_exists` /
+ * `attribute_not_exists` to it, throws `[EDD-9076]`: DynamoDB sees one opaque
+ * value. Use {@link filterBy}, which runs on the decoded item.
  */
 export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
@@ -545,6 +625,8 @@ export const filterExpr: {
   // `or()` with no parts — is kept, and refused when the query runs
   // (`emptyPartProblem`).
   if (isEmptyExpr(expr)) return self
+  const refused = packedExprRefusal(expr, self._state.packed, "filter")
+  if (refused !== undefined) throw new Error(refused)
   return new QueryImpl<A>({
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
@@ -639,10 +721,11 @@ export const selectPaths: {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
+    refusePackedProjection(self._state, paths)
     return new QueryImpl<Record<string, unknown>>({
       ...self._state,
       projectionPaths: paths,
-      decoder: (raw) => Effect.succeed(raw),
+      decoder: rawRowDecoder(self._state),
     })
   },
 )
@@ -1146,7 +1229,7 @@ const examinePage = <A>(
   borrowedFields: ReadonlyArray<string>,
 ): Effect.Effect<
   { readonly items: Array<A>; readonly stoppedAt: number },
-  DynamoClientError | ValidationError
+  DynamoClientError | QueryDecodeError
 > =>
   Effect.gen(function* () {
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
@@ -1172,7 +1255,7 @@ const examinePage = <A>(
         if (source === undefined) continue
         const raw = fromAttributeMap(source)
         for (const field of borrowedFields) delete raw[field]
-        const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
+        const item = yield* state.decoder(raw) as Effect.Effect<A, QueryDecodeError>
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
         if (budget !== undefined && items.length >= budget) {
@@ -1208,7 +1291,7 @@ export interface Page<A> {
  */
 export const collect = <A>(
   self: Query<A>,
-): Effect.Effect<Array<A>, DynamoClientError | ValidationError, DynamoClient> =>
+): Effect.Effect<Array<A>, DynamoClientError | QueryDecodeError, DynamoClient> =>
   Effect.gen(function* () {
     const stream = yield* paginateInternal(self)
     const pages = yield* Stream.runCollect(stream)
@@ -1235,7 +1318,7 @@ export const collect = <A>(
  */
 export const execute = <A>(
   self: Query<A>,
-): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
+): Effect.Effect<Page<A>, DynamoClientError | QueryDecodeError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
     const tableName = self._state.resolveTableName
@@ -1320,7 +1403,7 @@ export const execute = <A>(
 export const paginate = <A>(
   self: Query<A>,
 ): Effect.Effect<
-  Stream.Stream<Array<A>, DynamoClientError | ValidationError>,
+  Stream.Stream<Array<A>, DynamoClientError | QueryDecodeError>,
   never,
   DynamoClient
 > => paginateInternal(self)
@@ -1328,7 +1411,7 @@ export const paginate = <A>(
 const paginateInternal = <A>(
   self: Query<A>,
 ): Effect.Effect<
-  Stream.Stream<Array<A>, DynamoClientError | ValidationError>,
+  Stream.Stream<Array<A>, DynamoClientError | QueryDecodeError>,
   never,
   DynamoClient
 > =>
@@ -1350,10 +1433,10 @@ const pageStream = <A>(
   client: DynamoClientService,
   tableName: string,
   state: QueryState,
-): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+): Stream.Stream<Array<A>, DynamoClientError | QueryDecodeError> => {
   const limitValue = state.limitValue
   if (limitValue !== undefined && limitValue <= 0) {
-    return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
+    return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | QueryDecodeError>
   }
 
   // Cursor state travels through Stream.paginate rather than a closure, so
@@ -1427,7 +1510,7 @@ const pageStream = <A>(
  */
 export const count = <A>(
   self: Query<A>,
-): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
+): Effect.Effect<number, DynamoClientError | QueryDecodeError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* DynamoClient
     const tableName = self._state.resolveTableName

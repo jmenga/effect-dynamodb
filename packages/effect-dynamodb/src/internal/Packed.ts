@@ -42,6 +42,7 @@ import {
 import { Effect, Option, Result } from "effect"
 import { Base64 } from "effect/encoding"
 import { fromAttributeMap } from "../Marshaller.js"
+import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 
@@ -395,3 +396,179 @@ export const decodeImage = (
     else yield* unpackImageItem(raw, attributes, registry, ctx)
     return raw
   })
+
+// ---------------------------------------------------------------------------
+// Expression and projection guards (EDD-9076)
+// ---------------------------------------------------------------------------
+
+/**
+ * A packed attribute an expression or projection may not look inside: DynamoDB
+ * sees one opaque `S` or `B` value, so a path below it, or any operator but
+ * `attribute_exists` / `attribute_not_exists` on it as a whole, can never
+ * match what the reader means.
+ */
+export interface PackedAttributeGuard {
+  /** The stored (top-level) attribute name. */
+  readonly attribute: string
+  /** Who stores it, for the message — e.g. `EventStream "Ledger"`. */
+  readonly owner: string
+  /** Its storage config (the message names the format). */
+  readonly storedAs: PackedConfig
+  /** What to do instead, given the refused path as written (`data.amount`). */
+  readonly alternative: (path: string) => string
+}
+
+/** Render path segments as written: `data.items[0].sku`. */
+export const formatPath = (segments: ReadonlyArray<string | number>): string =>
+  segments
+    .map((segment, i) =>
+      typeof segment === "number" ? `[${segment}]` : i === 0 ? segment : `.${segment}`,
+    )
+    .join("")
+
+const OPERATOR_NAMES: Readonly<Record<string, string>> = {
+  eq: "=",
+  ne: "<>",
+  lt: "<",
+  lte: "<=",
+  gt: ">",
+  gte: ">=",
+  between: "BETWEEN",
+  in: "IN",
+  type: "attribute_type",
+  beginsWith: "begins_with",
+  contains: "contains",
+}
+
+const refusal = (
+  guard: PackedAttributeGuard,
+  usage: string,
+  path: string,
+  problem: string,
+): string =>
+  `[EDD-9076] ${guard.owner}: the ${usage} ${problem}, but \`${guard.attribute}\` is stored packed ` +
+  `(format "${guard.storedAs.format}"): DynamoDB sees one opaque string or binary value and ` +
+  "cannot evaluate a path inside it, or compare it — only attribute_exists / " +
+  `attribute_not_exists apply to it as a whole. ${guard.alternative(path)}`
+
+/**
+ * Why `expr` cannot be sent against an item with these packed attributes, or
+ * `undefined` when it can: it addresses a path inside one, or applies anything
+ * but `attribute_exists` / `attribute_not_exists` to one (`size()` included).
+ * `usage` names the expression in the message (`"filter"`, `"condition"`).
+ */
+export const packedExprRefusal = (
+  expr: Expr,
+  guards: ReadonlyArray<PackedAttributeGuard>,
+  usage: string,
+): string | undefined => {
+  if (guards.length === 0) return undefined
+  const guardFor = (segments: ReadonlyArray<string | number>) => {
+    const head = segments[0]
+    return typeof head === "string" ? guards.find((g) => g.attribute === head) : undefined
+  }
+  const check = (operand: Operand, operator: string): string | undefined => {
+    if (operand._tag === "value") return undefined
+    const guard = guardFor(operand.segments)
+    if (guard === undefined) return undefined
+    const path = formatPath(operand.segments)
+    if (operand._tag === "size") {
+      return refusal(guard, usage, path, `applies size() to "${path}"`)
+    }
+    if (operand.segments.length > 1) {
+      return refusal(guard, usage, path, `addresses "${path}"`)
+    }
+    return refusal(guard, usage, path, `applies ${operator} to "${path}"`)
+  }
+  const walk = (node: Expr): string | undefined => {
+    switch (node._tag) {
+      case "and":
+      case "or": {
+        for (const part of node.exprs) {
+          const found = walk(part)
+          if (found !== undefined) return found
+        }
+        return undefined
+      }
+      case "not":
+        return walk(node.expr)
+      case "exists":
+      case "notExists": {
+        const operand = node.operand
+        // The whole attribute: whether it is stored at all is answerable.
+        if (operand._tag === "path" && operand.segments.length === 1) return undefined
+        return check(operand, node._tag === "exists" ? "attribute_exists" : "attribute_not_exists")
+      }
+      case "eq":
+      case "ne":
+      case "lt":
+      case "lte":
+      case "gt":
+      case "gte":
+        return (
+          check(node.left, OPERATOR_NAMES[node._tag]!) ??
+          check(node.right, OPERATOR_NAMES[node._tag]!)
+        )
+      case "between":
+        return (
+          check(node.operand, "BETWEEN") ??
+          check(node.low, "BETWEEN") ??
+          check(node.high, "BETWEEN")
+        )
+      case "in": {
+        const found = check(node.operand, "IN")
+        if (found !== undefined) return found
+        for (const value of node.values) {
+          const inner = check(value, "IN")
+          if (inner !== undefined) return inner
+        }
+        return undefined
+      }
+      case "type":
+        return check(node.operand, "attribute_type")
+      case "beginsWith":
+        return check(node.operand, "begins_with") ?? check(node.prefix, "begins_with")
+      case "contains":
+        return check(node.operand, "contains") ?? check(node.value, "contains")
+    }
+  }
+  return walk(expr)
+}
+
+/**
+ * Why a projection cannot be sent against an item with these packed
+ * attributes, or `undefined` when it can: a packed attribute may be projected
+ * only whole. `paths` are segment lists (`selectPaths`); a dotted or indexed
+ * name given to `select` (`"data.amount"`, `"data[0]"`) is read as the path it
+ * spells.
+ */
+export const packedProjectionRefusal = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  guards: ReadonlyArray<PackedAttributeGuard>,
+): string | undefined => {
+  if (guards.length === 0) return undefined
+  for (const segments of paths) {
+    const head = segments[0]
+    if (typeof head !== "string") continue
+    let guard: PackedAttributeGuard | undefined
+    let nested = segments.length > 1
+    if (segments.length === 1) {
+      // `select(["data.amount"])` — the name as a path.
+      guard = guards.find(
+        (g) => head.startsWith(`${g.attribute}.`) || head.startsWith(`${g.attribute}[`),
+      )
+      nested = guard !== undefined
+    } else {
+      guard = guards.find((g) => g.attribute === head)
+    }
+    if (guard === undefined || !nested) continue
+    const path = segments.length === 1 ? head : formatPath(segments)
+    return (
+      `[EDD-9076] ${guard.owner}: the projection names "${path}", but \`${guard.attribute}\` is ` +
+      `stored packed (format "${guard.storedAs.format}"): DynamoDB holds it as one opaque string or ` +
+      `binary value and cannot project a path inside it. Select "${guard.attribute}" whole — a ` +
+      "projected packed attribute comes back as its parsed JSON."
+    )
+  }
+  return undefined
+}

@@ -9,6 +9,7 @@
 
 import { type Context, Effect, type Schema } from "effect"
 import type {
+  CompressorNotRegistered,
   ConcurrentModification,
   DynamoClient,
   DynamoClientError,
@@ -85,7 +86,7 @@ export interface GeoIndex<A, P> {
     options: NearbyOptions,
   ) => Effect.Effect<
     Array<NearbyResult<A>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | Table.TableConfig
   >
   /** Compute geo fields for an input (for use with transactions/batch writes). */
@@ -196,7 +197,11 @@ export interface BoundGeoIndex<A> {
   /** Search for items near a geographic point. R = never. */
   readonly nearby: (
     options: NearbyOptions,
-  ) => Effect.Effect<Array<NearbyResult<A>>, DynamoClientError | ValidationError, never>
+  ) => Effect.Effect<
+    Array<NearbyResult<A>>,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    never
+  >
   /** Compute geo fields for an input (pure — same as GeoIndex.enrich). */
   readonly enrich: (input: A) => A
   /** Provide escape hatch for complex pipe chains. */

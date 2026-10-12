@@ -17,6 +17,11 @@
  *   event, all but its metadata, or only its keys — `readIndex`,
  *   `query.index`, and `indexDefinitions` for the `CreateTable` fragments
  * - `fold` / `foldFrom` helpers for state reconstruction
+ * - Packed storage (`makeStream({ storedAs: { data } })`, `snapshot.storedAs`):
+ *   event data and snapshot state as one JSON string, optionally compressed —
+ *   read by the stored form, so a stream may mix native, JSON and compressed
+ *   items; `measureAppend` / `measureSnapshot` for caller-side size planning,
+ *   and `decodeStreamImage` for DynamoDB Streams records
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
  * DynamoClient, Marshaller).
@@ -29,11 +34,13 @@ import type {
   LocalSecondaryIndex,
   Projection,
 } from "@aws-sdk/client-dynamodb"
+import { isPackedConfig, type PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
   AdditionalItemConditionFailed,
   AppendTooLarge,
+  type CompressorNotRegistered,
   type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
@@ -44,6 +51,12 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  isDispatchEligible,
+  packedShape,
+  packValue,
+  unpackValue,
+} from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   DateTime,
@@ -57,6 +70,16 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
+import {
+  currentRegistry,
+  isAttributeValueImage,
+  normalizeImage,
+  type PackedAttributeGuard,
+  type StreamImage,
+  unpackImageItem,
+  unpackItem,
+} from "./internal/Packed.js"
 import {
   type BuiltTransactWriteItems,
   buildTransactWriteItems,
@@ -223,7 +246,78 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
   readonly schema: TSchema
   readonly mode?: SnapshotMode | undefined
   readonly every?: number | undefined
+  /**
+   * How the snapshot's `state` is stored: a native map (omitted, the default)
+   * or packed — `DynamoModel.Packed({ format: "json", compression? })`, one
+   * JSON string, compressed to binary at or over the threshold when that is
+   * smaller. Packing shrinks a large state the most: an inline snapshot rides
+   * in every append's transaction, and DynamoDB's item and transaction size
+   * limits count its **stored** bytes.
+   *
+   * The state schema's encoded side must be object- or array-shaped
+   * (`[EDD-9073]`). Reads go by the stored form, so changing this setting
+   * needs no rewrite: a snapshot written before still decodes.
+   */
+  readonly storedAs?: PackedConfig | undefined
 }
+
+/**
+ * How a stream stores event `data` (`makeStream({ storedAs })`). `data` is a
+ * native map by default; `DynamoModel.Packed({ format: "json", compression? })`
+ * stores it as one JSON string (`S`), compressed to binary (`B`) at or over the
+ * threshold when that is smaller. Metadata always stays a map.
+ *
+ * Reads go by each item's stored form, never by this setting, so a stream may
+ * hold a mix — events appended before packing was turned on still decode, and
+ * so do packed events after it is turned off.
+ */
+export interface StreamStorageConfig {
+  readonly data?: PackedConfig | undefined
+}
+
+/** The resolved storage settings exposed on a stream (`stream.storedAs`). */
+export interface StreamStorageSettings {
+  /** Event `data` (`makeStream({ storedAs: { data } })`); `undefined` = native map. */
+  readonly data: PackedConfig | undefined
+  /** Snapshot `state` (`snapshot.storedAs`); `undefined` = native map. */
+  readonly state: PackedConfig | undefined
+}
+
+/**
+ * The bytes an {@link EventStream.append} would write, by DynamoDB's own size
+ * accounting — {@link EventStream.measureAppend}. Every number counts stored
+ * bytes: packed (and compressed) `data` and `state` as they would be sent.
+ */
+export interface AppendMeasurement {
+  /**
+   * The item size of each event `Put`, in order — what DynamoDB's 400 KB
+   * (409,600-byte) item limit measures.
+   */
+  readonly events: ReadonlyArray<number>
+  /** The item size of the idempotency sentinel `Put`, when `idempotency` is given. */
+  readonly sentinel: number | undefined
+  /** The item size of the inline snapshot `Put`, when `snapshot` is given. */
+  readonly snapshot: number | undefined
+  /**
+   * What the stream's own actions (the contiguity check, the event puts, the
+   * sentinel and the inline snapshot) add to the `TransactWriteItems` request
+   * — its 4 MB (4,194,304-byte) limit counts items, keys and expressions.
+   * Caller `additionalItems` are not included: add their size yourself.
+   */
+  readonly transactionBytes: number
+}
+
+/**
+ * The options {@link EventStream.measureAppend} accepts: those of
+ * {@link EventStream.append} except `additionalItems`.
+ */
+export type MeasureAppendOptions<TMetadata, TState = never> = Omit<
+  AppendOptionsBase<TState>,
+  "additionalItems"
+> &
+  AppendMetadataOptions<TMetadata>
+
+export type { LambdaAttributeValue, StreamImage } from "./internal/Packed.js"
 
 /**
  * How {@link commandHandler} writes snapshots.
@@ -401,6 +495,7 @@ export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState>
 
 /** Error channel of {@link EventStream.append}. */
 export type AppendError =
+  | CompressorNotRegistered
   | VersionConflict
   | DuplicateCommand
   | AdditionalItemConditionFailed
@@ -912,6 +1007,79 @@ const resolveStreamIndexes = (
   return resolved
 }
 
+/**
+ * @internal Validate `makeStream({ storedAs })` and `snapshot.storedAs` at
+ * definition time (#147).
+ *
+ * @throws `[EDD-9079]` for a `storedAs` that is not an object, a key other
+ *   than `data`, or a value that is not a `DynamoModel.Packed(...)` config.
+ * @throws `[EDD-9073]` for a packed snapshot whose state schema's encoded side
+ *   is not object- or array-shaped.
+ */
+const resolveStreamStorage = (
+  streamName: string,
+  storedAs: unknown,
+  snapshot: SnapshotConfig | undefined,
+): StreamStorageSettings => {
+  const fail = (code: string, message: string): never => {
+    throw new Error(`[${code}] EventStream "${streamName}": ${message}`)
+  }
+  const describe = (value: unknown): string =>
+    value === null
+      ? "null"
+      : typeof value === "object"
+        ? "an object that is not a DynamoModel.Packed(...) config"
+        : `${typeof value} ${JSON.stringify(value)}`
+  let data: PackedConfig | undefined
+  if (storedAs !== undefined) {
+    if (typeof storedAs !== "object" || storedAs === null || Array.isArray(storedAs)) {
+      fail(
+        "EDD-9079",
+        `storedAs must be an object { data?: DynamoModel.Packed(...) }; received ${describe(storedAs)}.`,
+      )
+    }
+    for (const [key, value] of Object.entries(storedAs as Record<string, unknown>)) {
+      if (key !== "data") {
+        fail(
+          "EDD-9079",
+          `storedAs declares "${key}", but only "data" can be stored packed` +
+            (key === "metadata" ? " — event metadata always stays a map" : "") +
+            (key === "state" ? " — pack snapshot state with snapshot.storedAs" : "") +
+            ".",
+        )
+      }
+      if (value !== undefined && !isPackedConfig(value)) {
+        fail(
+          "EDD-9079",
+          `storedAs.data must be a DynamoModel.Packed(...) config; received ${describe(value)}.`,
+        )
+      }
+      data = value as PackedConfig | undefined
+    }
+  }
+  let state: PackedConfig | undefined
+  const snapshotStoredAs: unknown = snapshot?.storedAs
+  if (snapshot !== undefined && snapshotStoredAs !== undefined) {
+    if (!isPackedConfig(snapshotStoredAs)) {
+      fail(
+        "EDD-9079",
+        `snapshot.storedAs must be a DynamoModel.Packed(...) config; received ` +
+          `${describe(snapshotStoredAs)}.`,
+      )
+    }
+    const shape = packedShape(snapshot.schema)
+    if (shape._tag === "Refused") {
+      fail(
+        "EDD-9073",
+        `snapshot.storedAs packs the snapshot state, but the state schema cannot be packed: ` +
+          `${shape.reason}. Packed storage holds object- or array-shaped JSON.`,
+      )
+    }
+    state = snapshotStoredAs as PackedConfig
+  }
+  return { data, state }
+}
+
 // ---------------------------------------------------------------------------
 // StreamIdInput — maps composite field names to a required record
 // ---------------------------------------------------------------------------
@@ -983,7 +1151,11 @@ type HeadAboveProbeFn = (
   streamId: Record<string, unknown>,
   floorVersion: number,
   options?: ReadOptions | undefined,
-) => Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+) => Effect.Effect<
+  number,
+  DynamoClientError | ValidationError | CompressorNotRegistered,
+  DynamoClient | TableConfig
+>
 
 /** @internal */
 const headAboveProbeOf = (stream: object): HeadAboveProbeFn | undefined =>
@@ -1094,6 +1266,12 @@ export interface EventStream<
   readonly snapshotConfig: SnapshotSettings | undefined
 
   /**
+   * How the stream stores event `data` and snapshot `state` — see
+   * {@link StreamStorageConfig} and {@link SnapshotConfig.storedAs}.
+   */
+  readonly storedAs: StreamStorageSettings
+
+  /**
    * Write (or overwrite) this stream's snapshot.
    *
    * Monotonic: a snapshot at an equal or newer `asOfVersion` already present is
@@ -1114,7 +1292,11 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ): Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClient | TableConfig
+  >
 
   /**
    * Read this stream's snapshot, if one has been written.
@@ -1127,7 +1309,7 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
     Option.Option<Snapshot<TState>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -1153,7 +1335,7 @@ export interface EventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -1167,7 +1349,7 @@ export interface EventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -1179,7 +1361,11 @@ export interface EventStream<
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ): Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClient | TableConfig
+  >
 
   /**
    * The stream's snapshot (if any), the events after it, and its head — in
@@ -1213,7 +1399,7 @@ export interface EventStream<
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -1236,8 +1422,65 @@ export interface EventStream<
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
+  >
+
+  /**
+   * The bytes {@link EventStream.append} would write for these arguments, by
+   * DynamoDB's own size accounting — for planning chunks against the 400 KB
+   * item and 4 MB transaction limits without re-implementing the stream's
+   * item layout or packing. The items are built by the same code `append`
+   * uses (envelope, keys, packed and compressed `data`, metadata, stream-index
+   * attributes, the sentinel, the inline snapshot), so the numbers are exact
+   * for the request `append` would send now with this runtime's compressors.
+   *
+   * Nothing is read or written, and nothing is refused for its size: this is
+   * caller-side planning, not a pre-check. `additionalItems` are not accepted
+   * — add their size yourself. Fails as `append` would on invalid options
+   * (`ValidationError`), and with `CompressorNotRegistered` when a value
+   * crosses its compression threshold without a registered compressor.
+   */
+  measureAppend(
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, TableConfig>
+
+  /**
+   * The item size, in bytes, of the snapshot {@link EventStream.writeSnapshot}
+   * (or an inline snapshot at `asOfVersion`) would write — packed `state` as
+   * stored. Caller-side planning, like {@link EventStream.measureAppend}. Dies
+   * with `[EDD-9026]` on a stream without a `snapshot` config.
+   */
+  measureSnapshot(
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: TState,
+    asOfVersion: number,
+  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, TableConfig>
+
+  /**
+   * Decode a DynamoDB Streams record image (`NewImage` / `OldImage`) of one
+   * of this stream's events into exactly the {@link StreamEvent} the read
+   * paths return — `data` decoded through the event schemas (by its stored
+   * form: native map, JSON string or compressed binary), `metadata` through
+   * the metadata schema when the stream declares one.
+   *
+   * Accepts DynamoDB JSON as Lambda and EventBridge Pipes deliver it (`B` /
+   * `BS` members as base64 text, or as bytes), or an already-unmarshalled
+   * item (a packed `data` as bytes or base64 text). `Option.none()` for an
+   * image that is not one of this stream's events — its snapshot, an
+   * idempotency sentinel, another stream's or an entity's item — so one
+   * handler can fan a table's records across decoders. An event image that
+   * does not decode fails with `ValidationError`.
+   */
+  decodeStreamImage(
+    image: StreamImage,
+  ): Effect.Effect<
+    Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ValidationError | CompressorNotRegistered,
+    never
   >
 
   readonly query: {
@@ -1298,6 +1541,20 @@ interface AppendTransaction {
   readonly sentinelIndex: number
   /** The version the events are appended after. */
   readonly expectedVersion: number
+}
+
+/**
+ * @internal The stream's own items of one append, built by `buildAppend` —
+ * everything but the caller's `additionalItems`. `append` lays them out (see
+ * {@link AppendTransaction}); `measureAppend` measures them.
+ */
+interface AppendParts {
+  readonly tableName: string
+  readonly streamIdStr: string
+  readonly contiguityCheck: TransactWriteItem | undefined
+  readonly eventItems: ReadonlyArray<TransactWriteItem>
+  readonly sentinelPut: TransactWriteItem | undefined
+  readonly snapshotPut: TransactWriteItem | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,6 +1670,16 @@ interface AppendTransaction {
  *   with `ValidationError`.
  * @throws `[EDD-9065]` when two indexes share a physical index name or an
  *   attribute (or a GSI's `pk` and `sk` are the same attribute).
+ * @throws `[EDD-9079]` when `storedAs` declares a key other than `data`
+ *   (metadata always stays a map), or a `storedAs.data` / `snapshot.storedAs`
+ *   value is not a `DynamoModel.Packed(...)` config.
+ * @throws `[EDD-9073]` when `snapshot.storedAs` is set and the state schema's
+ *   encoded side is not object- or array-shaped.
+ *
+ * `storedAs: { data: DynamoModel.Packed(...) }` stores event `data` packed, and
+ * `snapshot.storedAs` the snapshot `state` — see {@link StreamStorageConfig}.
+ * Register the codecs a compressed config names through the `Compression`
+ * service (`DynamoClient.layer({ compressors })`).
  */
 export const makeStream = <
   const TEvents extends ReadonlyArray<Schema.Top>,
@@ -1433,6 +1700,8 @@ export const makeStream = <
   readonly snapshot?: TSnapshot
   readonly casing?: DynamoSchema.Casing | undefined
   readonly indexes?: TIndexes & StreamIndexesConfig<TIndexes, Schema.Schema.Type<TEvents[number]>>
+  /** How event `data` is stored — see {@link StreamStorageConfig}. */
+  readonly storedAs?: StreamStorageConfig | undefined
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
@@ -1502,6 +1771,35 @@ export const makeStream = <
     snapshot === undefined
       ? undefined
       : { mode: snapshot.mode ?? "after-append", every: snapshot.every }
+
+  // Packed storage (EDD-9079, EDD-9073) — validated at definition time.
+  const storage = resolveStreamStorage(config.streamName, config.storedAs, snapshot)
+  /** Event `data` packing, or `undefined` for the native map. */
+  const dataStoredAs = storage.data
+  /** Snapshot `state` packing, or `undefined` for the native map. */
+  const stateStoredAs = storage.state
+  /**
+   * Whether a snapshot's stored `state` is read by its stored form: when it is
+   * configured packed, or when its schema's encoded side is object- or
+   * array-shaped (a native state is then never `S` / `B`), so a stream that
+   * turned packing off still reads its packed snapshot.
+   */
+  const stateDispatch =
+    snapshot !== undefined && (stateStoredAs !== undefined || isDispatchEligible(snapshot.schema))
+  /** The `[EDD-9076]` guard for queries of a stream whose `data` is packed. */
+  const dataGuards: ReadonlyArray<PackedAttributeGuard> =
+    dataStoredAs === undefined
+      ? []
+      : [
+          {
+            attribute: "data",
+            owner: `EventStream "${config.streamName}"`,
+            storedAs: dataStoredAs,
+            alternative: (path) =>
+              `Use Query.filterBy((event) => /* test event.${path} */), which runs on the ` +
+              "decoded event inside the same paging loop.",
+          },
+        ]
 
   // Stream indexes (#140) — validated at definition time (EDD-9063..9065).
   const streamIndexes = resolveStreamIndexes(
@@ -1627,9 +1925,34 @@ export const makeStream = <
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
 
+  /**
+   * An event's stored `data` → its wire form (plain JSON), by the stored
+   * form. A native value costs one `typeof` check.
+   */
+  const unpackData = (
+    stored: unknown,
+    operation: string,
+  ): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+    typeof stored === "string" || stored instanceof Uint8Array
+      ? Effect.flatMap(currentRegistry, (registry) =>
+          unpackValue(stored, registry, { entityType, attribute: "data", operation }),
+        )
+      : Effect.succeed(stored)
+
+  /**
+   * A raw event row (`Query.select`) with its `data` — when projected — as
+   * plain parsed JSON, whatever its stored form (R3: a stream that switched
+   * encoding holds a mix). Never schema-decoded.
+   */
+  const rawEventRow: Query.QueryRawRow = (raw) => {
+    const stored = raw.data
+    if (typeof stored !== "string" && !(stored instanceof Uint8Array)) return Effect.succeed(raw)
+    return Effect.map(unpackData(stored, "EventStore.select"), (data) => ({ ...raw, data }))
+  }
+
   const decodeStreamEvent = (
     raw: Record<string, unknown>,
-  ): Effect.Effect<StreamEvent<TEvent>, ValidationError> =>
+  ): Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered> =>
     Effect.gen(function* () {
       const toValidationError = (operation: string) => (cause: unknown) =>
         new ValidationError({ entityType, operation, cause })
@@ -1638,8 +1961,12 @@ export const makeStream = <
         Effect.mapError(toValidationError("EventStore.decode")),
       )
 
+      // `data` is read by its stored form (#147): a native map as it is, a
+      // JSON string (`S`) parsed, compressed binary (`B`) decompressed and
+      // parsed — whatever the stream's current `storedAs` says.
+      const wireData = yield* unpackData(raw.data, "EventStore.decode")
       const decoder = Schema.decodeUnknownEffect(eventUnion as Schema.Schema<TEvent>)
-      const data = yield* (decoder(raw.data) as Effect.Effect<TEvent, unknown>).pipe(
+      const data = yield* (decoder(wireData) as Effect.Effect<TEvent, unknown>).pipe(
         Effect.mapError(toValidationError("EventStore.decode")),
       )
 
@@ -1663,7 +1990,7 @@ export const makeStream = <
         metadata,
         timestamp: envelope.timestamp,
       }
-    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError>
+    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered>
 
   // ---------------------------------------------------------------------------
   // append
@@ -1902,12 +2229,58 @@ export const makeStream = <
     })
   }
 
-  const append = (
+  /**
+   * The snapshot item for `state` at `asOfVersion`: the state encoded through
+   * the state schema, then packed per `snapshot.storedAs` (#147) — so every
+   * size measured afterwards is the stored size. Shared by `writeSnapshot`,
+   * the inline snapshot of `append`, and `measureSnapshot` / `measureAppend`.
+   */
+  const buildSnapshotItem = (
+    pk: string,
+    streamIdStr: string,
+    state: unknown,
+    asOfVersion: number,
+    now: string,
+    operation: string,
+  ): Effect.Effect<Record<string, AttributeValue>, ValidationError | CompressorNotRegistered> =>
+    Effect.gen(function* () {
+      const encoded = yield* encodeSnapshotState(state, operation)
+      const stored =
+        stateStoredAs === undefined
+          ? encoded
+          : yield* packValue(stateStoredAs, encoded, yield* currentRegistry, {
+              entityType: snapshotEntityType,
+              attribute: "state",
+              operation: `${operation}.packed`,
+            })
+      return toAttributeMap({
+        pk,
+        sk: snapshotSk,
+        __edd_e__: snapshotEntityType,
+        streamId: streamIdStr,
+        asOfVersion,
+        state: stored,
+        timestamp: now,
+      })
+    })
+
+  /**
+   * The stream's own items of an append — everything but the caller's
+   * `additionalItems` — validated and built exactly as `append` sends them.
+   * Shared by `append` and `measureAppend`, so a measurement is the size of
+   * the request `append` would send. `undefined` for an append with nothing
+   * to write (the historical no-op).
+   */
+  const buildAppend = (
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<unknown, unknown> | undefined,
-  ) =>
+    options: AppendOptions<unknown, unknown> | undefined,
+  ): Effect.Effect<
+    AppendParts | undefined,
+    ValidationError | CompressorNotRegistered,
+    TableConfig
+  > =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
@@ -1972,7 +2345,7 @@ export const makeStream = <
         idempotency === undefined &&
         snapshotState === undefined
       ) {
-        return { version: expectedVersion, events: [] }
+        return undefined
       }
 
       // Resolve stream ID string for storage (join composites)
@@ -1997,7 +2370,6 @@ export const makeStream = <
       // reported as `AppendTooLarge`, with the expanded item count.
       const needsContiguityCheck = expectedVersion > 0 && events.length > 0
 
-      const client = yield* DynamoClient
       const tableConfig = yield* config.table.Tag
       const tableName = tableConfig.name
 
@@ -2020,6 +2392,8 @@ export const makeStream = <
       // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
       const nowDateTime = yield* DateTime.now
       const now = DateTime.formatIso(nowDateTime)
+      // The compressor registry in scope, for packed `data` / `state` (#147).
+      const registry = yield* currentRegistry
 
       // Validate and encode metadata to wire form if schema provided. Shared
       // by every event; per-event `eventMetadata` is encoded in the loop below.
@@ -2061,6 +2435,18 @@ export const makeStream = <
             // events already carry _tag in their encoded form, which wins.
             const eventData = { _tag: evtType, ...(wire as Record<string, unknown>) }
 
+            // Packed `data` (#147): one JSON string, or compressed binary at
+            // or over the threshold when that is smaller — packed here, before
+            // marshalling, so every size measured afterwards is stored bytes.
+            const storedData =
+              dataStoredAs === undefined
+                ? eventData
+                : yield* packValue(dataStoredAs, eventData, registry, {
+                    entityType,
+                    attribute: "data",
+                    operation: "EventStore.append.packed",
+                  })
+
             // This event's own metadata entry (#144), encoded as `metadata`
             // is; an `undefined` entry writes no metadata attribute.
             let itemMetadata = encodedMetadata
@@ -2092,7 +2478,7 @@ export const makeStream = <
               streamId: streamIdStr,
               version,
               eventType: evtType,
-              data: eventData,
+              data: storedData,
               timestamp: eventTimestamp === undefined ? now : DateTime.formatIso(eventTimestamp),
             }
             const item: Record<string, unknown> = { ...envelope }
@@ -2142,8 +2528,7 @@ export const makeStream = <
                 cause,
               }),
           })
-          sentinel[resolveTtlAttributeName(tableConfig)] =
-            DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
+          sentinel[ttlAttribute] = DateTime.toEpochSeconds(nowDateTime) + ttlSeconds
         }
         sentinelPut = {
           Put: {
@@ -2155,21 +2540,21 @@ export const makeStream = <
       }
 
       // The inline snapshot (#138): unconditional — see AppendOptions.snapshot.
+      // Packed per `snapshot.storedAs` (#147), so the transaction-size and
+      // item-size diagnosis count its stored bytes.
       let snapshotPut: TransactWriteItem | undefined
       if (snapshotState !== undefined) {
-        const encoded = yield* encodeSnapshotState(snapshotState, "EventStore.append.snapshot")
         snapshotPut = {
           Put: {
             TableName: tableName,
-            Item: toAttributeMap({
+            Item: yield* buildSnapshotItem(
               pk,
-              sk: snapshotSk,
-              __edd_e__: snapshotEntityType,
-              streamId: streamIdStr,
-              asOfVersion: expectedVersion + events.length,
-              state: encoded,
-              timestamp: now,
-            }),
+              streamIdStr,
+              snapshotState,
+              expectedVersion + events.length,
+              now,
+              "EventStore.append.snapshot",
+            ),
           },
         }
       }
@@ -2195,6 +2580,38 @@ export const makeStream = <
             },
           }
         : undefined
+
+      const parts: AppendParts = {
+        tableName,
+        streamIdStr,
+        contiguityCheck,
+        eventItems,
+        sentinelPut,
+        snapshotPut,
+      }
+      return parts
+    }) as Effect.Effect<
+      AppendParts | undefined,
+      ValidationError | CompressorNotRegistered,
+      TableConfig
+    >
+
+  const append = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: AppendOptions<unknown, unknown> | undefined,
+  ) =>
+    Effect.gen(function* () {
+      const additionalOps = options?.additionalItems ?? []
+      const idempotency = options?.idempotency
+
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
+      if (parts === undefined) return { version: expectedVersion, events: [] }
+      const { tableName, streamIdStr, contiguityCheck, eventItems, sentinelPut, snapshotPut } =
+        parts
+
+      const client = yield* DynamoClient
 
       /**
        * Lay out the append's one transaction — see {@link AppendTransaction}:
@@ -2264,7 +2681,9 @@ export const makeStream = <
         // repeating an event, the contiguity check, the idempotency sentinel
         // or the inline snapshot, or another additional item), 100 items,
         // 4 MB, 400 KB per item, 1024-byte sort keys — are not pre-checked:
-        // `sendAppendTransaction` diagnoses DynamoDB's rejection (#144).
+        // `sendAppendTransaction` diagnoses DynamoDB's rejection (#144). The
+        // items carry packed `data` / `state` as stored (#147), so the
+        // diagnosis attributes stored bytes.
         const outcome = yield* sendAppendTransaction(
           client,
           tx,
@@ -2280,6 +2699,99 @@ export const makeStream = <
     })
 
   // ---------------------------------------------------------------------------
+  // measureAppend / measureSnapshot — caller-side size planning (#147, R1)
+  // ---------------------------------------------------------------------------
+
+  const measureAppend = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: MeasureAppendOptions<unknown, unknown> | undefined,
+  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, TableConfig> =>
+    Effect.gen(function* () {
+      if ((options as { additionalItems?: unknown } | undefined)?.additionalItems !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.measureAppend",
+          cause:
+            "measureAppend does not measure additionalItems (building a guarded put reads the " +
+            "table): measure the stream's own items without them, and add the size of your " +
+            "own items.",
+        })
+      }
+      const parts = yield* buildAppend(
+        streamId,
+        events,
+        expectedVersion,
+        options as AppendOptions<unknown, unknown> | undefined,
+      )
+      if (parts === undefined) {
+        return { events: [], sentinel: undefined, snapshot: undefined, transactionBytes: 0 }
+      }
+      const putBytes = (item: TransactWriteItem): number => itemBytes(item.Put?.Item ?? {})
+      const owned = [
+        ...(parts.contiguityCheck === undefined ? [] : [parts.contiguityCheck]),
+        ...parts.eventItems,
+        ...(parts.sentinelPut === undefined ? [] : [parts.sentinelPut]),
+        ...(parts.snapshotPut === undefined ? [] : [parts.snapshotPut]),
+      ]
+      const measurement: AppendMeasurement = {
+        events: parts.eventItems.map(putBytes),
+        sentinel: parts.sentinelPut === undefined ? undefined : putBytes(parts.sentinelPut),
+        snapshot: parts.snapshotPut === undefined ? undefined : putBytes(parts.snapshotPut),
+        transactionBytes: owned.reduce((sum, item) => sum + transactItemBytes(item), 0),
+      }
+      return measurement
+    })
+
+  const measureSnapshot = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: unknown,
+    asOfVersion: number,
+  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, TableConfig> =>
+    Effect.gen(function* () {
+      if (snapshot === undefined) return yield* snapshotUnavailable("measureSnapshot")
+      const now = DateTime.formatIso(yield* DateTime.now)
+      const item = yield* buildSnapshotItem(
+        composeStreamPk(streamId as Record<string, unknown>),
+        composeStreamIdString(streamId as Record<string, unknown>),
+        state,
+        asOfVersion,
+        now,
+        "EventStore.measureSnapshot",
+      )
+      return itemBytes(item)
+    })
+
+  // ---------------------------------------------------------------------------
+  // decodeStreamImage — DynamoDB Streams records (#147, R2)
+  // ---------------------------------------------------------------------------
+
+  const decodeStreamImage = (
+    image: StreamImage,
+  ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError | CompressorNotRegistered> =>
+    Effect.gen(function* () {
+      const ctx = { entityType, operation: "EventStore.decodeStreamImage" }
+      const form =
+        typeof image === "object" &&
+        image !== null &&
+        !Array.isArray(image) &&
+        isAttributeValueImage(image)
+          ? ("attributeValues" as const)
+          : ("unmarshalled" as const)
+      const raw = yield* normalizeImage(image, ctx, { form })
+      // Not one of this stream's events: its snapshot, a sentinel, another
+      // stream's or an entity's item.
+      if (raw.__edd_e__ !== entityType) return Option.none<StreamEvent<TEvent>>()
+      const registry = yield* currentRegistry
+      // In DynamoDB JSON the S / B tag says what `data` is; unmarshalled, a
+      // string that is base64 of a `B` value is told apart from JSON text.
+      if (form === "attributeValues") yield* unpackItem(raw, ["data"], registry, ctx)
+      else yield* unpackImageItem(raw, ["data"], registry, ctx)
+      return Option.some(yield* decodeStreamEvent(raw))
+    })
+
+  // ---------------------------------------------------------------------------
   // read
   // ---------------------------------------------------------------------------
 
@@ -2292,7 +2804,7 @@ export const makeStream = <
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2310,7 +2822,7 @@ export const makeStream = <
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2334,7 +2846,11 @@ export const makeStream = <
   const currentVersion = (
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       // Single page, not `collect`: with `Limit: 1` DynamoDB returns a
       // `LastEvaluatedKey` on every truncated page, so `collect` would walk the
@@ -2356,7 +2872,11 @@ export const makeStream = <
     streamId: Record<string, unknown>,
     floorVersion: number,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       // Reverse, `Limit: 1`, bounded below by `floorVersion + 1`: an empty range
       // (the common case — nothing appended past the snapshot) reads no items;
@@ -2390,7 +2910,11 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     state: unknown,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("writeSnapshot")
 
@@ -2398,21 +2922,20 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
       const now = DateTime.formatIso(yield* DateTime.now)
 
-      const encoded = yield* encodeSnapshotState(state, "EventStore.writeSnapshot")
-
-      const item: Record<string, unknown> = {
-        pk: composeStreamPk(streamId as Record<string, unknown>),
-        sk: snapshotSk,
-        __edd_e__: snapshotEntityType,
-        streamId: composeStreamIdString(streamId as Record<string, unknown>),
+      // Packed per `snapshot.storedAs` (#147): the diagnosis below measures
+      // the stored bytes.
+      const item = yield* buildSnapshotItem(
+        composeStreamPk(streamId as Record<string, unknown>),
+        composeStreamIdString(streamId as Record<string, unknown>),
+        state,
         asOfVersion,
-        state: encoded,
-        timestamp: now,
-      }
+        now,
+        "EventStore.writeSnapshot",
+      )
 
       const put = {
         TableName: tableName,
-        Item: toAttributeMap(item),
+        Item: item,
         // Monotonic: never regress the cache. Losing this race is a no-op,
         // not an error — the events it summarises are already durable.
         ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
@@ -2446,7 +2969,11 @@ export const makeStream = <
             }),
         }),
       )
-    }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+    }) as Effect.Effect<
+      void,
+      DynamoClientError | ValidationError | CompressorNotRegistered,
+      DynamoClient | TableConfig
+    >
 
   /**
    * Decode a stored snapshot item. A snapshot that fails to decode through the
@@ -2455,12 +2982,27 @@ export const makeStream = <
   const decodeSnapshotItem = (
     raw: Record<string, unknown>,
     operation: string,
-  ): Effect.Effect<Snapshot<unknown>, ValidationError> =>
-    Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
-      raw.state,
+  ): Effect.Effect<Snapshot<unknown>, ValidationError | CompressorNotRegistered> =>
+    // `state` is read by its stored form (#147) when it may be packed — see
+    // `stateDispatch` — then decoded through the state schema as before.
+    (stateDispatch && (typeof raw.state === "string" || raw.state instanceof Uint8Array)
+      ? Effect.flatMap(currentRegistry, (registry) =>
+          unpackValue(raw.state, registry, {
+            entityType: snapshotEntityType,
+            attribute: "state",
+            operation,
+          }),
+        )
+      : Effect.succeed(raw.state)
     ).pipe(
-      Effect.mapError(
-        (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
+      Effect.flatMap((state) =>
+        Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
+          state,
+        ).pipe(
+          Effect.mapError(
+            (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
+          ),
+        ),
       ),
       Effect.map(
         (state): Snapshot<unknown> => ({
@@ -2502,7 +3044,7 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
     Option.Option<Snapshot<unknown>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2512,7 +3054,7 @@ export const makeStream = <
       return Option.some(yield* decodeSnapshotItem(raw, "EventStore.readSnapshot"))
     }) as Effect.Effect<
       Option.Option<Snapshot<unknown>>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | CompressorNotRegistered,
       DynamoClient | TableConfig
     >
 
@@ -2525,7 +3067,7 @@ export const makeStream = <
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<unknown, TEvent>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2635,7 +3177,7 @@ export const makeStream = <
       }
     }) as Effect.Effect<
       LatestState<unknown, TEvent>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | CompressorNotRegistered,
       DynamoClient | TableConfig
     >
 
@@ -2676,6 +3218,10 @@ export const makeStream = <
       skField: "sk",
       entityTypes: [entityType],
       decoder: (raw) => decodeStreamEvent(raw),
+      // Raw rows (`Query.select`) carry `data` as parsed JSON, whatever its
+      // stored form, and a filter inside a packed `data` is refused (#147).
+      rawRow: rawEventRow,
+      packed: dataGuards,
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
       keyFields: ["pk", "sk"],
       // Bound to the event SK range so non-event items in the stream partition
@@ -2718,6 +3264,10 @@ export const makeStream = <
       skField: idx.sk,
       entityTypes: [entityType],
       decoder: indexDecoder(idx),
+      // As for `query.events` (#147) — the `"keys"` hydration path decodes
+      // its fetched rows through the same hooks.
+      rawRow: rawEventRow,
+      packed: dataGuards,
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
       // DynamoDB's rejection of the key condition (an empty bound, a reversed
       // `between`) is named against the stream index; so, as for every
@@ -2756,7 +3306,9 @@ export const makeStream = <
    */
   const indexDecoder =
     (idx: ResolvedStreamIndex) =>
-    (raw: Record<string, unknown>): Effect.Effect<StreamEvent<TEvent>, ValidationError> => {
+    (
+      raw: Record<string, unknown>,
+    ): Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered> => {
       if (idx.projection === "keys") return decodeStreamEvent(raw)
       let row = raw
       if (idx.projection === "withoutMetadata" && raw.metadata !== undefined) {
@@ -2788,7 +3340,7 @@ export const makeStream = <
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2816,7 +3368,7 @@ export const makeStream = <
       return yield* Query.collect(query)
     }) as Effect.Effect<
       ReadonlyArray<StreamEvent<TEvent>>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | CompressorNotRegistered,
       DynamoClient | TableConfig
     >
 
@@ -2844,6 +3396,7 @@ export const makeStream = <
     streamName: config.streamName,
     eventSchema: eventUnion,
     snapshotConfig: snapshotSettings,
+    storedAs: storage,
     indexes: indexSettings,
     writeSnapshot,
     readSnapshot,
@@ -2853,6 +3406,9 @@ export const makeStream = <
     currentVersion,
     readLatest,
     readIndex,
+    measureAppend,
+    measureSnapshot,
+    decodeStreamImage,
     query: queryNamespace,
     [StreamIdFormatter]: composeStreamIdString,
     [CommandSentinelProbe]: hasCommandSentinel,
@@ -2908,6 +3464,9 @@ export interface BoundEventStream<
   /** See {@link EventStream.snapshotConfig}. */
   readonly snapshotConfig: SnapshotSettings | undefined
 
+  /** See {@link EventStream.storedAs}. */
+  readonly storedAs: StreamStorageSettings
+
   /** See {@link EventStream.indexes}. */
   readonly indexes: { readonly [K in TIndexName]: StreamIndexSettings }
 
@@ -2916,12 +3475,16 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<void, DynamoClientError | ValidationError | CompressorNotRegistered, never>
 
   /** See {@link EventStream.readSnapshot}. */
   readSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
-  ): Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<
+    Option.Option<Snapshot<TState>>,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    never
+  >
 
   /** See {@link EventStream.append}. */
   append(
@@ -2937,7 +3500,7 @@ export interface BoundEventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -2948,7 +3511,7 @@ export interface BoundEventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -2956,7 +3519,7 @@ export interface BoundEventStream<
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<number, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<number, DynamoClientError | ValidationError | CompressorNotRegistered, never>
 
   /** See {@link EventStream.readLatest}. */
   readLatest(
@@ -2964,7 +3527,7 @@ export interface BoundEventStream<
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -2975,7 +3538,31 @@ export interface BoundEventStream<
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | CompressorNotRegistered,
+    never
+  >
+
+  /** See {@link EventStream.measureAppend}. */
+  measureAppend(
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, never>
+
+  /** See {@link EventStream.measureSnapshot}. */
+  measureSnapshot(
+    streamId: StreamIdInput<TStreamIdFields>,
+    state: TState,
+    asOfVersion: number,
+  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, never>
+
+  /** See {@link EventStream.decodeStreamImage}. */
+  decodeStreamImage(
+    image: StreamImage,
+  ): Effect.Effect<
+    Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -3051,6 +3638,7 @@ export const bind = <
       streamName: stream.streamName,
       eventSchema: stream.eventSchema,
       snapshotConfig: stream.snapshotConfig,
+      storedAs: stream.storedAs,
       indexes: stream.indexes,
       writeSnapshot: (streamId, state, asOfVersion) =>
         provide(stream.writeSnapshot(streamId, state, asOfVersion)),
@@ -3063,6 +3651,13 @@ export const bind = <
       currentVersion: (streamId, options) => provide(stream.currentVersion(streamId, options)),
       readLatest: (streamId, options) => provide(stream.readLatest(streamId, options)),
       readIndex: (name, streamId, options) => provide(stream.readIndex(name, streamId, options)),
+      // The captured context carries a `Compression` registry provided where
+      // the stream was bound (#147).
+      measureAppend: (streamId, events, expectedVersion, options) =>
+        provide(stream.measureAppend(streamId, events, expectedVersion, options)),
+      measureSnapshot: (streamId, state, asOfVersion) =>
+        provide(stream.measureSnapshot(streamId, state, asOfVersion)),
+      decodeStreamImage: (image) => provide(stream.decodeStreamImage(image)),
       query: stream.query,
       provide,
       [StreamIdFormatter]: (id: Record<string, unknown>) => formatStreamIdOf(stream, id),
@@ -3644,6 +4239,7 @@ type CommandOptionsArgs<
 
 type CommandHandlerErrors<E> =
   | E
+  | CompressorNotRegistered
   | VersionConflict
   | DuplicateCommand
   | AdditionalItemConditionFailed

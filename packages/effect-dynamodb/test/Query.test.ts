@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
@@ -1808,5 +1809,90 @@ describe("filterBy (#122)", () => {
         expect(page.items.map((i) => i.id)).toEqual(["0", "1"])
         expect(JSON.parse(atob(page.cursor!)).sk.S).toBe("s-1")
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Packed attributes (#147): the raw-row hook and the EDD-9076 guards
+// ---------------------------------------------------------------------------
+
+describe("Query packed attributes (#147)", () => {
+  const packedQuery = () =>
+    Query.make<{ id: string }>({
+      tableName: "TestTable",
+      indexName: undefined,
+      pkField: "pk",
+      pkValue: "p",
+      skField: "sk",
+      entityTypes: ["Doc"],
+      decoder: (raw) => Effect.succeed({ id: raw.id as string }),
+      // Stands in for an owner's stored-form read: parse a JSON `doc`.
+      rawRow: (raw) =>
+        Effect.succeed(
+          typeof raw.doc === "string" ? { ...raw, doc: JSON.parse(raw.doc) as unknown } : raw,
+        ),
+      packed: [
+        {
+          attribute: "doc",
+          owner: 'Entity "Doc"',
+          storedAs: DynamoModel.Packed({ format: "json" }),
+          alternative: (path) => `Use filterBy on ${path}.`,
+        },
+      ],
+    })
+
+  const rows = { Items: [toAttributeMap({ pk: "p", sk: "s", id: "1", doc: '{"a":1}' })] }
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it("select, selectPaths and selectProjected hand rows to the raw-row hook", () =>
+    Effect.gen(function* () {
+      mockQuery.mockResolvedValue(rows)
+      const selected = yield* packedQuery().pipe(Query.select(["id", "doc"]), Query.collect)
+      // (The mock returns whole rows; the hook is what is under test.)
+      expect(selected[0]!.doc).toEqual({ a: 1 })
+      const paths = yield* packedQuery().pipe(Query.selectPaths([["doc"]]), Query.collect)
+      expect(paths[0]!.doc).toEqual({ a: 1 })
+      const projected = yield* Query.collect(
+        Query.selectProjected(packedQuery(), [["doc"]], (raw) => ({ document: raw.doc })),
+      )
+      expect(projected).toEqual([{ document: { a: 1 } }])
+      // Without a hook a raw row is returned as stored.
+      const plain = yield* makeTestQuery().pipe(Query.select(["doc"]), Query.collect)
+      expect(plain[0]!.doc).toBe('{"a":1}')
+    }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+  it("filterExpr refuses a path inside a packed attribute, or an operator on it", () => {
+    const docOps = createConditionOps<{ doc: { a: number }; id: string }>()
+    const doc = createPathBuilder<{ doc: { a: number }; id: string }>()
+    expect(() => packedQuery().pipe(Query.filterExpr(docOps.eq(doc.doc.a, 1)))).toThrow(
+      /\[EDD-9076\] Entity "Doc": the filter addresses "doc\.a".*Use filterBy on doc\.a\./,
+    )
+    expect(() =>
+      packedQuery().pipe(
+        Query.filterExpr(docOps.or(docOps.eq(doc.id, "x"), docOps.contains(doc.doc as never, 1))),
+      ),
+    ).toThrow(/applies contains to "doc"/)
+    expect(() => packedQuery().pipe(Query.filterExpr(docOps.attributeType(doc.doc, "M")))).toThrow(
+      /applies attribute_type to "doc"/,
+    )
+    expect(() =>
+      packedQuery().pipe(
+        Query.filterExpr(docOps.and(docOps.exists(doc.doc), docOps.eq(doc.id, "x"))),
+      ),
+    ).not.toThrow()
+    // Without guards nothing is refused.
+    expect(() => makeTestQuery().pipe(Query.filterExpr(docOps.eq(doc.doc.a, 1)))).not.toThrow()
+  })
+
+  it("select / selectPaths refuse a path inside a packed attribute", () => {
+    expect(() => packedQuery().pipe(Query.select(["doc.a"]))).toThrow(/\[EDD-9076\].*"doc\.a"/)
+    expect(() => packedQuery().pipe(Query.select(["doc[0]"]))).toThrow(/\[EDD-9076\]/)
+    expect(() => packedQuery().pipe(Query.selectPaths([["doc", 0, "a"]]))).toThrow(
+      /\[EDD-9076\].*"doc\[0\]\.a"/,
+    )
+    expect(() => packedQuery().pipe(Query.select(["doc", "document"]))).not.toThrow()
   })
 })
