@@ -1089,3 +1089,82 @@ describe("Entity.decodeMarshalledItem — stream images", () => {
     }).pipe(Effect.provide(NoCodecs)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Collections
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — collections", () => {
+  class Ticket extends Schema.Class<Ticket>("Ticket")({
+    ticketId: Schema.String,
+    tenantId: Schema.String,
+    thread: Schema.Array(Schema.String),
+  }) {}
+  class Invoice extends Schema.Class<Invoice>("Invoice")({
+    invoiceId: Schema.String,
+    tenantId: Schema.String,
+    total: Schema.Number,
+  }) {}
+  const byTenant = {
+    collection: "TenantItems",
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["tenantId"] },
+    sk: { field: "gsi2sk", composite: [] },
+  } as const
+  const Tickets = Entity.make({
+    model: DynamoModel.configure(Ticket, { thread: { storedAs: gzip0 } }),
+    entityType: "Ticket",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ticketId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: { byTenant },
+  })
+  const Invoices = Entity.make({
+    model: Invoice,
+    entityType: "Invoice",
+    primaryKey: {
+      pk: { field: "pk", composite: ["invoiceId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: { byTenant },
+  })
+  const CollTable = Table.make({ schema: AppSchema, entities: { Tickets, Invoices } })
+  const CollLayer = Layer.mergeAll(
+    InMemoryClient,
+    CollTable.layer({ name: "packed-entity-table" }),
+    Codecs,
+  )
+
+  it.effect("decodes each member by its own stored form; a packed member's path is refused", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Tickets, Invoices },
+        tables: { CollTable },
+      })
+      const thread = Array.from({ length: 30 }, (_, i) => `message ${i}`)
+      yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
+      yield* db.entities.Invoices.put({ invoiceId: "i-1", tenantId: "acme", total: 10 })
+      const ticket = [...store.values()].find((item) => item.__edd_e__?.S === "Ticket")!
+      expect(ticket.thread?.B).toBeInstanceOf(Uint8Array)
+
+      const grouped = (yield* db.collections.TenantItems!({ tenantId: "acme" }).collect()) as {
+        readonly Tickets: ReadonlyArray<Ticket>
+        readonly Invoices: ReadonlyArray<Invoice>
+      }
+      expect(grouped.Tickets[0]!.thread).toEqual(thread)
+      expect(grouped.Invoices[0]!.total).toBe(10)
+
+      expect(() =>
+        db.collections.TenantItems!({ tenantId: "acme" }).filter({ thread: [] }),
+      ).toThrow(/\[EDD-9076\] Entity "Ticket"/)
+      // A whole-field projection comes back as parsed JSON.
+      const rows = yield* db.collections.TenantItems!({ tenantId: "acme" })
+        .select(["thread", "total"])
+        .collect()
+      expect(
+        (rows as unknown as Record<string, ReadonlyArray<{ thread?: unknown }>>).Tickets,
+      ).toEqual([{ thread }])
+    }).pipe(Effect.provide(CollLayer)),
+  )
+})
