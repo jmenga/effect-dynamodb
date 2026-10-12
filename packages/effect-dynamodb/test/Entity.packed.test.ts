@@ -1167,4 +1167,103 @@ describe("Entity packed fields — collections", () => {
       ).toEqual([{ thread }])
     }).pipe(Effect.provide(CollLayer)),
   )
+
+  it.effect("DynamoClient.make({ compressors }) reaches collection reads", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Tickets, Invoices },
+        tables: { CollTable },
+        compressors: [NodeCompression.gzip()],
+      })
+      const thread = Array.from({ length: 30 }, (_, i) => `message ${i}`)
+      yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
+      const grouped = (yield* db.collections.TenantItems!({ tenantId: "acme" }).collect()) as {
+        readonly Tickets: ReadonlyArray<Ticket>
+      }
+      expect(grouped.Tickets[0]!.thread).toEqual(thread)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(InMemoryClient, CollTable.layer({ name: "packed-entity-table" })),
+      ),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// DynamoClient.make({ compressors }) — registration precedence (design §3.4)
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
+  const body = { text: "y".repeat(200) }
+  const origin = { source: "s", tags: ["a"] }
+  const Brotli = Compression.layer([NodeCompression.brotli()])
+  const Gzip = Compression.layer([NodeCompression.gzip()])
+
+  it.effect("explicit compressors reach bound CRUD and query accessors with nothing ambient", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Orders, Docs, Readings },
+        tables: { MainTable },
+        compressors: [NodeCompression.gzip()],
+      })
+      yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
+      const doc = [...store.values()].find((item) => item.__edd_e__?.S === "Doc")!
+      expect(doc.body?.B).toBeInstanceOf(Uint8Array)
+      expect((yield* db.entities.Docs.get({ docId: "d-1" })).body).toEqual(body)
+
+      yield* db.entities.Orders.put(order())
+      const stored = [...store.values()].find((item) => item.__edd_e__?.S === "Order")!
+      expect(stored.d?.B).toBeInstanceOf(Uint8Array)
+      const found = yield* db.entities.Orders.byCustomer({ customerId: "c-1" }).collect()
+      expect(found[0]!.details?.note).toBe(bigDetails.note)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
+
+  it.effect("explicit compressors win over an ambient Compression at bind time", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Orders, Docs, Readings },
+        tables: { MainTable },
+        compressors: [NodeCompression.gzip()],
+      })
+      yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
+      expect((yield* db.entities.Docs.get({ docId: "d-1" })).body).toEqual(body)
+    }).pipe(Effect.provide(Layer.mergeAll(NoCodecs, Brotli))),
+  )
+
+  it.effect("an ambient Compression at bind time wins over one at run time", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Orders, Docs, Readings },
+        tables: { MainTable },
+      }).pipe(Effect.provide(Gzip))
+      yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
+        .asEffect()
+        .pipe(Effect.provide(Brotli))
+      const read = yield* db.entities.Docs.get({ docId: "d-1" })
+        .asEffect()
+        .pipe(Effect.provide(Brotli))
+      expect(read.body).toEqual(body)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
+
+  it.effect("with nothing at bind time, a Compression provided at run time is used", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Orders, Docs, Readings },
+        tables: { MainTable },
+      })
+      const exit = yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
+        .asEffect()
+        .pipe(Effect.exit)
+      expect(failure(exit)).toBeInstanceOf(CompressorNotRegistered)
+      yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
+        .asEffect()
+        .pipe(Effect.provide(Gzip))
+      const read = yield* db.entities.Docs.get({ docId: "d-1" })
+        .asEffect()
+        .pipe(Effect.provide(Gzip))
+      expect(read.body).toEqual(body)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
 })

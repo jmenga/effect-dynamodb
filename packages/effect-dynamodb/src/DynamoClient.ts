@@ -1575,16 +1575,13 @@ const makeFromConfig = (config: {
         typeof (rawEntity as { get?: unknown }).get === "function"
           ? rawEntity
           : entityFromDefinition(rawEntity as unknown as EntityDefinition)
-      // Provide the resolved Crypto service into the bind so the bound `put`
-      // (which yields `Crypto.Crypto` when `generatedId` is configured) resolves
-      // it from context — keeping the bound method at `R = never`. `bind`
-      // respects an already-present Crypto and only fills its own default when
-      // absent, so this override is honored.
-      const bound = yield* Effect.provideService(
-        entityBind(entity as EntityType),
-        Crypto.Crypto,
-        cryptoService,
-      )
+      // Provide the resolved services (Crypto, Embedder, Compression) into the
+      // bind: `bind` captures its context at bind time, so the bound CRUD
+      // methods resolve the explicit `crypto`, `embedder` and `compressors`
+      // given here — keeping them at `R = never`. `bind` respects an
+      // already-present Crypto and only fills its own default when absent, so
+      // the override is honored.
+      const bound = yield* provide(entityBind(entity as EntityType))
       const entityLike = entity as unknown as EntityLike
       const accessors: Record<string, unknown> = {}
 
@@ -1815,7 +1812,9 @@ const makeFromConfig = (config: {
     const boundAggregates: Record<string, unknown> = {}
     if (config.aggregates) {
       for (const [key, aggregate] of Object.entries(config.aggregates)) {
-        boundAggregates[key] = yield* aggregateBind(aggregate)
+        // Same as entities: the aggregate captures the resolved services
+        // (notably `Compression`, for packed edge entity fields) at bind time.
+        boundAggregates[key] = yield* provide(aggregateBind(aggregate))
       }
     }
 
