@@ -55,6 +55,17 @@ All date schemas carry a `DynamoEncoding` annotation that controls how the field
 | `configure` | `(model, attributes) => ConfiguredModel<M>` | Wrap a model with per-field DynamoDB overrides (field renaming, storage encoding, immutable) |
 | `isConfiguredModel` | `(value) => boolean` | Check if a value is a `ConfiguredModel` |
 
+### Storage Layouts
+
+Values for a field's `storedAs` in `configure` that change how a structured field is laid out on the item.
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `SparseMap` | `(options?: { prefix? }) => SparseMapConfig` | Store a `Schema.Record` as one top-level attribute per entry — see [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) |
+| `Packed` | `(options: { format: "json", compression?: { codec: "gzip" \| "brotli" \| "zstd", threshold? } }) => PackedConfig` | Store an object- or array-shaped field (or EventStore `data` / snapshot `state`) as one JSON string, compressed to binary at or above `threshold` (default 1024 bytes) when smaller. Throws `[EDD-9071]` on invalid options. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) |
+| `isPackedConfig` | `(value) => value is PackedConfig` | Check if a value is a `Packed` config |
+| `getPackedFields` | `(model) => Record<string, PackedConfig>` | Domain field name → config, for every field configured `storedAs: Packed(...)` |
+
 ### Encoding Utilities
 
 | Export | Type | Description |
@@ -371,7 +382,7 @@ Control what type an operation returns:
 | `keyFieldNames(entity)` | List physical field names for all keys |
 | `compositeAttributes(entity)` | List all composite attribute names across indexes |
 | `itemSchema(entity)` | Get the item-level decode schema |
-| `decodeMarshalledItem(entity, item)` | Decode a marshalled DynamoDB item through entity schema |
+| `decodeMarshalledItem(entity, item)` | Decode a DynamoDB item (DynamoDB JSON with `B` as bytes or base64, or already unmarshalled) as a table read does: packed fields by stored form, sparse maps rebuilt, renames reversed. Fails with `ValidationError` or `CompressorNotRegistered` |
 
 ### Usage
 
@@ -975,6 +986,7 @@ import { DynamoClient } from "effect-dynamodb"
 | `DynamoClient` | `Context.Service` | Effect service class |
 | `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials |
 | `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values |
+| `compressors` option | `ReadonlyArray<Compressor>` | On `layer` / `layerConfig`: also provide a `Compression` registry for [packed storage](/effect-dynamodb/guides/packed-storage/) (the layer's output becomes `DynamoClient \| Compression`). On `DynamoClient.make({ ..., compressors })`: bind the registry into every operation of that client, ahead of any ambient `Compression` |
 
 ### Service Methods
 
@@ -1124,7 +1136,7 @@ import { EventStore } from "effect-dynamodb"
 
 | Export | Description |
 |--------|-------------|
-| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, casing?, indexes? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>` bound to a `Table`. `events` is an array of `Schema.TaggedClass` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. Optional `snapshot` is `{ schema, mode?, every? }` — `mode` is `"after-append"` (default) or `"inline"` (see [Inline snapshots](/effect-dynamodb/tutorials/event-sourcing/#step-17-inline-snapshots-and-readlatest)). Optional `casing` sets the key casing for the stream (stream name, stream ids, command ids); omitted, the stream name is lower-cased and the rest follows the schema — see [Stream key casing](/effect-dynamodb/tutorials/event-sourcing/#stream-key-casing). Optional `indexes` declares stream indexes: `{ [name]: { type?: "lsi" \| "gsi", index, sk, pk?, key: (event, version) => string \| undefined, projection?: "all" \| "withoutMetadata" \| "keys" } }` — see [Stream indexes](/effect-dynamodb/tutorials/event-sourcing/#step-19-stream-indexes). `projection` (default `"all"`) is the DynamoDB index projection, what the index copies from each event (unrelated to inline read-model projections) — see [Index projection](/effect-dynamodb/tutorials/event-sourcing/#index-projection); it must match the deployed index. A malformed entry, an unknown `projection` or a member an entry does not declare (a misspelled `projection`, also a type error) throws `[EDD-9063]`. |
+| `EventStore.makeStream({ table, streamName, events, streamId, metadata?, snapshot?, casing?, indexes? })` | Create an `EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>` bound to a `Table`. `events` is an array of `Schema.TaggedClass` event types, `streamId.composite` lists the stream-id composite fields, optional `metadata` is a Schema. Optional `snapshot` is `{ schema, mode?, every? }` — `mode` is `"after-append"` (default) or `"inline"` (see [Inline snapshots](/effect-dynamodb/tutorials/event-sourcing/#step-17-inline-snapshots-and-readlatest)). Optional `casing` sets the key casing for the stream (stream name, stream ids, command ids); omitted, the stream name is lower-cased and the rest follows the schema — see [Stream key casing](/effect-dynamodb/tutorials/event-sourcing/#stream-key-casing). Optional `indexes` declares stream indexes: `{ [name]: { type?: "lsi" \| "gsi", index, sk, pk?, key: (event, version) => string \| undefined, projection?: "all" \| "withoutMetadata" \| "keys" } }` — see [Stream indexes](/effect-dynamodb/tutorials/event-sourcing/#step-19-stream-indexes). `projection` (default `"all"`) is the DynamoDB index projection, what the index copies from each event (unrelated to inline read-model projections) — see [Index projection](/effect-dynamodb/tutorials/event-sourcing/#index-projection); it must match the deployed index. A malformed entry, an unknown `projection` or a member an entry does not declare (a misspelled `projection`, also a type error) throws `[EDD-9063]`. Optional `storedAs: { data: DynamoModel.Packed(...) }` stores event data packed, and `snapshot.storedAs` the snapshot state — see [Packed Storage](/effect-dynamodb/guides/packed-storage/#eventstore-streams); any other `storedAs` key throws `[EDD-9079]`. |
 | `EventStore.bind(stream)` | Resolve `DynamoClient` and `TableConfig` from context and return a `BoundEventStream` whose operations have `R = never`. Use inside `Context.Service` make effects. |
 | `EventStore.indexDefinitions(...streams)` | `CreateTable` fragments for the streams' indexes: `{ AttributeDefinitions, LocalSecondaryIndexes?, GlobalSecondaryIndexes? }`, to merge into your own `CreateTable` input (the table's `pk` / `sk` are not included). Each index's `Projection` follows its `projection`: `"all"` → `ALL`; `"withoutMetadata"` → `INCLUDE` of `__edd_e__`, `data`, `eventType`, `streamId`, `timestamp`, `version`; `"keys"` → `INCLUDE ["__edd_e__"]` (**not** `KEYS_ONLY`: every read filters on `__edd_e__`). Tables deployed with CDK or Terraform must copy this `Projection` exactly; the library migrates nothing. An LSI must be created with the table and caps every partition key value's item collection at 10 GB. Throws `[EDD-9067]` for conflicting definitions of one physical index, including two streams declaring it with different projections. |
 
@@ -1169,6 +1181,10 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | `query.events(streamId)` | `Query<StreamEvent<TEvent>>` — raw query handle for use with `Query` combinators. |
 | `query.index(name, streamId)` | `Query<StreamEvent<TEvent, M>>` — raw query handle over a stream index, typed and read as `readIndex` is (a `"keys"` index hydrates; `Query.count` never fetches). A `Query.filter` on a `"withoutMetadata"` or `"keys"` index may name only projected attributes; use `Query.filterBy`. |
 | `indexes` | `{ [name]: StreamIndexSettings }` — each index's `{ type, index, pk, sk, projection }` (`projection` resolved, `"all"` when omitted). |
+| `measureAppend(streamId, events, expectedVersion, options?)` | `Effect<AppendMeasurement, ValidationError \| CompressorNotRegistered, TableConfig>` — the bytes `append` would write, by DynamoDB's item-size rules: `{ events, sentinel, snapshot, transactionBytes }`. Built by `append`'s own item builder; nothing is read or written. `additionalItems` are not accepted. See [Sizing](/effect-dynamodb/guides/packed-storage/#sizing) |
+| `measureSnapshot(streamId, state, asOfVersion)` | `Effect<number, ValidationError \| CompressorNotRegistered, TableConfig>` — the item size of the snapshot `writeSnapshot` would write |
+| `decodeStreamImage(image)` | `Effect<Option<StreamEvent<TEvent, M>>, ValidationError \| CompressorNotRegistered>` — decode a DynamoDB Streams `NewImage` / `OldImage` (DynamoDB JSON with `B` as bytes or base64, or unmarshalled) into the `StreamEvent` the read paths return; `Option.none()` for an image that is not one of this stream's events |
+| `storedAs` | `{ data: PackedConfig \| undefined, state: PackedConfig \| undefined }` — the stream's resolved storage settings |
 
 `BoundEventStream` additionally exposes `provide(effect)` as an escape hatch to push services into an arbitrary effect.
 
@@ -1277,6 +1293,44 @@ See [Event Sourcing](/effect-dynamodb/tutorials/event-sourcing/) for a complete 
 
 ---
 
+## StorageEncoding
+
+Helpers for [packed storage](/effect-dynamodb/guides/packed-storage/). Compressors come from the `Compression` service in context; none of these adds a requirement.
+
+```typescript
+import { StorageEncoding } from "effect-dynamodb"
+```
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `encode` | `(storedAs, wire) => Effect<AttributeValue \| undefined, ValidationError \| CompressorNotRegistered>` | The `AttributeValue` a wire (encoded) value is stored as: `S`, `B`, `NULL`, or `undefined` for no attribute |
+| `decode` | `(stored) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | Read a stored value by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
+| `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError \| CompressorNotRegistered>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
+| `limits` | `{ item: 409_600, transaction: 4_194_304 }` | DynamoDB's item and `TransactWriteItems` size limits, in bytes |
+
+## Compression
+
+| Export | Description |
+|--------|-------------|
+| `Compressor` | `{ codec: "gzip" \| "brotli" \| "zstd", compress(input: Uint8Array): Uint8Array, decompress(input: Uint8Array): Uint8Array }` — a synchronous codec implementation |
+| `Compression` | `Context.Service` holding a `CompressionRegistry` (`get(codec)`, `codecs`). `Compression.layer(compressors)` provides one; `Compression.make(compressors)` builds one (throws `[EDD-9078]` on two compressors for one codec or an unknown codec); `Compression.empty` has none |
+
+Node implementations, from the `effect-dynamodb/compression/node` entry point (the only module that imports `node:zlib`):
+
+```typescript
+import * as NodeCompression from "effect-dynamodb/compression/node"
+```
+
+| Export | Description |
+|--------|-------------|
+| `gzip({ level?, maxOutputLength? })` | gzip `Compressor` |
+| `brotli({ quality?, maxOutputLength? })` | brotli `Compressor` (text mode) |
+| `zstd({ level?, maxOutputLength? })` | zstd `Compressor`, level 3 by default. Needs Node 22.15 or later; throws when created on older Node |
+| `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this runtime has it |
+| `hasZstd()` | `true` when this runtime has zstd |
+
+`maxOutputLength` caps one value's decompressed size; going over it fails the read with a `ValidationError`.
+
 ## Errors
 
 Tagged error types for precise error handling with `catchTag`.
@@ -1295,6 +1349,7 @@ import {
   AggregateDecompositionError, AggregateTransactionOverflow,
   CascadePartialFailure, VersionConflict, AppendTooLarge,
   AdditionalItemConditionFailed, DuplicateCommand,
+  CompressorNotRegistered,
 } from "effect-dynamodb"
 ```
 
@@ -1328,6 +1383,7 @@ import {
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch: an append's version guard failed, or a command handler call's `expectedVersion` did not match the loaded version (`streamName`, `streamId`, `expectedVersion`, `actualVersion?` — set by the pre-decide If-Match check and when a `verifySnapshot: false` If-Match decision is checked against the head, unset on any other append-time conflict) |
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
+| `CompressorNotRegistered` | `"CompressorNotRegistered"` | A [packed](/effect-dynamodb/guides/packed-storage/) value needs a compression codec that is not registered: writing a value over its threshold, or reading a `B` value whose header names the codec (`codec`, `direction: "compress" \| "decompress"`, `entityType`, `attribute`, `operation`) |
 
 ### Errors by operation
 
