@@ -24,6 +24,11 @@
  *   - Entity.decodeMarshalledItem on a raw item rewritten into Lambda's
  *     DynamoDB-JSON shape (base64 B).
  *   - CompressorNotRegistered on a read without the codec.
+ *   - An unbound collection `Query.select` over a packed member (the member is
+ *     looked up by a borrowed `__edd_e__`), and `DynamoClient.make({ compressors })`
+ *     with nothing ambient.
+ *   - An aggregate edge read after packing is turned off, and `many`-edge
+ *     elements of a packed entity through create / get / list / update.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -35,10 +40,12 @@ import { Config, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
+import * as Collection from "../src/Collection.js"
 import * as NodeCompression from "../src/compression/node.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 
@@ -222,12 +229,91 @@ class Match extends Schema.Class<Match>("Match")({
   venue: Venue,
 }) {}
 
+class Ticket extends Schema.Class<Ticket>("Ticket")({
+  ticketId: Schema.String,
+  tenantId: Schema.String,
+  thread: Schema.Array(Schema.String),
+}) {}
+class Invoice extends Schema.Class<Invoice>("Invoice")({
+  invoiceId: Schema.String,
+  tenantId: Schema.String,
+  total: Schema.Number,
+}) {}
+const byTenant = {
+  collection: "TenantItems",
+  name: "gsi2",
+  pk: { field: "gsi2pk", composite: ["tenantId"] },
+  sk: { field: "gsi2sk", composite: [] },
+} as const
+const Tickets = Entity.make({
+  model: DynamoModel.configure(Ticket, {
+    thread: {
+      storedAs: DynamoModel.Packed({
+        format: "json",
+        compression: { codec: "gzip", threshold: 0 },
+      }),
+    },
+  }),
+  entityType: "Ticket",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ticketId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: { byTenant },
+})
+const Invoices = Entity.make({
+  model: Invoice,
+  entityType: "Invoice",
+  primaryKey: {
+    pk: { field: "pk", composite: ["invoiceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: { byTenant },
+})
+
+class Stop extends Schema.Class<Stop>("Stop")({
+  stopId: Schema.String.pipe(DynamoModel.identifier),
+  plan: Schema.Struct({ steps: Schema.Array(Schema.String) }),
+}) {}
+const Stops = Entity.make({
+  model: DynamoModel.configure(Stop, {
+    plan: {
+      storedAs: DynamoModel.Packed({
+        format: "json",
+        compression: { codec: "zstd", threshold: 0 },
+      }),
+    },
+  }),
+  entityType: "Stop",
+  primaryKey: {
+    pk: { field: "pk", composite: ["stopId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+class Leg extends Schema.Class<Leg>("Leg")({ label: Schema.String, stops: Schema.Array(Stop) }) {}
+class Tour extends Schema.Class<Tour>("Tour")({
+  tourId: Schema.String,
+  region: Schema.String,
+  name: Schema.String,
+  leg1: Leg,
+  leg2: Leg,
+}) {}
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Orders, Docs, Readings, ZstdBlobs, Venues },
+  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops },
 })
 /** Alternate configurations of the same entity types, over the same physical table. */
-const NativeTable = Table.make({ schema: AppSchema, entities: { NativeOrders } })
+/** Venues with packing turned off: the same entity type, unpacked. */
+const PlainVenues = Entity.make({
+  model: Venue,
+  entityType: "Venue",
+  primaryKey: {
+    pk: { field: "pk", composite: ["venueId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+const NativeTable = Table.make({ schema: AppSchema, entities: { NativeOrders, PlainVenues } })
 const JsonTable = Table.make({ schema: AppSchema, entities: { JsonOrders, JsonBlobs } })
 
 const Matches = Aggregate.make(Match, {
@@ -238,6 +324,46 @@ const Matches = Aggregate.make(Match, {
   root: { entityType: "MatchItem" },
   edges: {
     venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+  },
+})
+
+/** The same aggregate over the edge entity with packing turned off. */
+const PlainMatches = Aggregate.make(Match, {
+  table: NativeTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "match" },
+  root: { entityType: "MatchItem" },
+  edges: {
+    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: PlainVenues }),
+  },
+})
+
+const LegAggregate = Aggregate.make(Leg, {
+  root: { entityType: "TourLeg" },
+  edges: {
+    stops: Aggregate.many("stops", {
+      entityType: "TourStop",
+      entity: Stops,
+      sk: { composite: ["stopId"] },
+    }),
+  },
+})
+const Tours = Aggregate.make(Tour, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["tourId"] },
+  collection: { name: "tour" },
+  list: {
+    index: "gsi1",
+    name: "tours",
+    pk: { field: "gsi1pk", composite: ["region"] },
+    sk: { field: "gsi1sk", composite: ["tourId"] },
+  },
+  root: { entityType: "TourItem" },
+  edges: {
+    leg1: LegAggregate.with({ discriminator: { legNo: 1 } }),
+    leg2: LegAggregate.with({ discriminator: { legNo: 2 } }),
   },
 })
 
@@ -258,8 +384,8 @@ const provide = Effect.provide(Layer.mergeAll(ClientLayer, Tables))
 const provideBare = Effect.provide(Layer.mergeAll(BareClientLayer, Tables))
 
 const client = DynamoClient.make({
-  entities: { Orders, Docs, Readings, ZstdBlobs, Venues },
-  aggregates: { Matches },
+  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops },
+  aggregates: { Matches, Tours },
   tables: { MainTable },
 })
 const nativeClient = DynamoClient.make({
@@ -607,5 +733,101 @@ describeConnected("Entity packed fields (#147)", () => {
       expect(error).toBeInstanceOf(CompressorNotRegistered)
       expect(error).toMatchObject({ direction: "decompress" })
     }).pipe(provideBare),
+  )
+
+  it.effect("an unbound collection Query.select returns packed members as parsed JSON", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const thread = Array.from({ length: 40 }, (_, i) => `message ${i}`)
+      yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
+      yield* db.entities.Invoices.put({ invoiceId: "i-1", tenantId: "acme", total: 10 })
+      expect(formOf((yield* rawItem("ticket", "t-1"))!.thread)).toBe("B33")
+      const grouped = (yield* db.collections.TenantItems!({ tenantId: "acme" }).collect()) as {
+        readonly Tickets: ReadonlyArray<Ticket>
+      }
+      expect(grouped.Tickets[0]!.thread).toEqual(thread)
+      // `__edd_e__` is borrowed into the projection for the member lookup, then stripped.
+      const TenantItems = Collection.make("TenantItems", { Tickets, Invoices })
+      const rows = yield* TenantItems.query({ tenantId: "acme" }).pipe(
+        Query.select(["thread", "total"]),
+        Query.collect,
+      )
+      expect(rows).toHaveLength(2)
+      expect(rows).toEqual(expect.arrayContaining([{ thread }, { total: 10 }]))
+    }).pipe(provide),
+  )
+
+  it.effect("DynamoClient.make({ compressors }) packs and reads with nothing ambient", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Orders },
+        tables: { MainTable },
+        compressors: [NodeCompression.gzip(), NodeCompression.zstd()],
+      })
+      yield* db.entities.Orders.put(order("explicit-1"))
+      const stored = (yield* rawItem("order", "explicit-1"))!
+      expect(formOf(stored.lines)).toBe("B33")
+      expect(formOf(stored.d)).toBe("B35")
+      const read = yield* db.entities.Orders.get({ orderId: "explicit-1" })
+      expect(read.lines).toEqual(manyLines)
+      const queried = yield* db.entities.Orders.byCustomer({ customerId: "cust-1" }).collect()
+      expect(queried.find((o) => o.orderId === "explicit-1")?.details?.note).toBe(LONG)
+    }).pipe(provideBare),
+  )
+
+  it.effect("an aggregate edge written packed reads after packing is turned off", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const layout = { stands: ["a", "b"], capacity: 7 }
+      yield* db.entities.Venues.put({ venueId: "off", name: "Off", layout })
+      yield* db.aggregates.Matches.create({
+        matchId: "m-off",
+        name: "Off",
+        venueId: "off",
+      } as never)
+      const match = yield* PlainMatches.get({ matchId: "m-off" })
+      expect(match.venue.layout).toEqual(layout)
+    }).pipe(provide),
+  )
+
+  it.effect("many-edge elements of a packed entity: create, get, list, group-level update", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const plan = (n: number) => ({
+        steps: Array.from({ length: 30 }, (_, i) => `step ${n}.${i}`),
+      })
+      for (const n of [1, 2, 3]) yield* db.entities.Stops.put({ stopId: `s-${n}`, plan: plan(n) })
+      yield* db.aggregates.Tours.create({
+        tourId: "tour-1",
+        region: "apac",
+        name: "Spring",
+        leg1: { label: "North", stops: ["s-1"] },
+        leg2: { label: "South", stops: ["s-2", "s-3"] },
+      } as never)
+      const raw = yield* DynamoClient
+      const partition = yield* raw.query({
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: toAttributeMap({ ":pk": "$packed-ent#v1#tour#tour-1" }),
+        ConsistentRead: true,
+      })
+      const stops = (partition.Items ?? []).filter((item) => item.__edd_e__?.S === "TourStop")
+      expect(stops.map((item) => formOf(item.plan))).toEqual(["B35", "B35", "B35"])
+
+      const read = yield* db.aggregates.Tours.get({ tourId: "tour-1" })
+      expect(read.leg2.stops.map((stop) => stop.plan)).toEqual([plan(2), plan(3)])
+      const listed = yield* db.aggregates.Tours.list({ region: "apac" })
+      expect(listed.data.map((tour) => tour.leg1.stops[0]!.plan)).toEqual([plan(1)])
+
+      yield* db.aggregates.Tours.update({ tourId: "tour-1" }, ({ state }) => ({
+        ...state,
+        leg1: { ...state.leg1, label: "Far North" },
+      }))
+      const updated = yield* db.aggregates.Tours.get({ tourId: "tour-1" })
+      expect(updated.leg1.label).toBe("Far North")
+      expect(updated.leg1.stops[0]!.plan).toEqual(plan(1))
+      expect(updated.leg2.stops.map((stop) => stop.plan)).toEqual([plan(2), plan(3)])
+    }).pipe(provide),
   )
 })
