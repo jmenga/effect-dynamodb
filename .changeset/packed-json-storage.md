@@ -22,6 +22,6 @@ Compatibility notes:
 - `Entity` / `EntityDefinition` gain a trailing, defaulted `TPackedFields` type parameter.
 - `DynamoClient.layer` / `layerConfig` return `Layer<DynamoClient | Compression, …>` only when given `compressors`.
 - `Entity.decodeMarshalledItem` now applies field renames, sparse maps and base64 `B` values, so stream images that failed to decode before now decode.
-- `DynamoClient.make({ crypto, embedder, compressors })` now reaches bound entity CRUD and bound aggregates, not only query accessors and collections.
+- An explicit `DynamoClient.make({ embedder })` now reaches bound entity CRUD and bound aggregates, not only query accessors and collections (as `compressors` does).
 - A `Table.make` that throws no longer rebinds its member entities to the rejected table.
 - A version without this feature cannot read packed values: deploy readers before writers turn packing on.
