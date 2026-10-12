@@ -1347,6 +1347,8 @@ A packed value is the attribute's wire form exactly as map storage would write i
 
 **EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` give callers the exact stored sizes for chunk planning. Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
 
+**Entity.** Packing runs after renames and sparse flattening, before marshalling (put / create / upsert / update `.set()` / `Batch.write` / `Transaction.transactWrite` / time-series `append`, which packs once and writes the same value on the current and event item); unpacking runs after unmarshalling, before sparse rebuild and renames, in every decoder (get, queries, scans, collections, batch and transactional reads, versions, history, soft-deleted reads, `ReturnValues`). Reads also dispatch on every object/array-shaped field that is not configured packed, so turning packing off needs no rewrite. `asNative` returns the stored `S` / `B`; raw projections (`select`, `Entity.project`) return a packed field whole as its parsed JSON. The read-merge update path (retain, unique, computed composites) carries packed values the update does not name byte-identical, and a restated immutable packed field is compared by its unpacked JSON. At the type level an entity carries its packed field names (`TPackedFields`): their `PathBuilder` paths are `PackedPath`s, accepted only by `exists` / `notExists` and projections. `Entity.decodeMarshalledItem` decodes DynamoDB Streams images by stored form (`B` as bytes or base64, DynamoDB JSON or unmarshalled) and now also applies renames and sparse maps. Aggregate edges store their edge entity's packed fields packed (a `one` edge's flattened entity, a `many` element that is the entity); a packed field cannot be an edge discriminator or `many` sort-key composite (EDD-9072).
+
 ### Hierarchical Key Truncation
 
 Hierarchical truncation — leaf composites being *refinements* that should *demote* the item, not *evict* it — is the unifying property across many real-world domains:
@@ -3892,19 +3894,28 @@ configuration: a `put` declares `UniqueConstraintViolation` even on an entity
 without unique constraints. Every union also includes `DynamoClientError`,
 plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 
+Every entity, batch, transaction, collection and aggregate operation that
+writes or decodes an item also declares `CompressorNotRegistered` (#147): a
+packed field (`storedAs: DynamoModel.Packed`) compressed with a codec the
+process has not registered — on write over the threshold, or on read of a value
+an earlier writer compressed. It is listed in each row below.
+
 | Operation | Declared errors (besides `DynamoClientError`) |
 |-----------|-----------------------------------------------|
-| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow`, `CompressorNotRegistered` |
 | `create` | as `put`, plus `ConditionalCheckFailed` |
 | `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
-| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow`, `CompressorNotRegistered` |
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
-| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable`, `CompressorNotRegistered` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
-| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
-| `purge` | `ValidationError` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
-| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `CompressorNotRegistered` |
+| `get` / `getVersion` / `deleted.get` / `Batch.get` / `Transaction.transactGet` / `Entity.decodeMarshalledItem` | `ValidationError`, `CompressorNotRegistered` (plus `ItemNotFound` for the single-item reads) |
+| `purge` | `ValidationError`, `CompressorNotRegistered` |
+| `Batch.write` | `ValidationError`, `CompressorNotRegistered` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `CompressorNotRegistered` |
+| Aggregate `create` | `AggregateWriteError` (which includes `CompressorNotRegistered`) plus `ConditionalCheckFailed` |
+| Aggregate `get` / `list` | `AggregateAssemblyError`, `ValidationError`, `CompressorNotRegistered` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `CompressorNotRegistered` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` / `readSnapshot` / `writeSnapshot` | `ValidationError`, `CompressorNotRegistered` |
 | `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage` (no `DynamoClientError`: nothing is read or written) | `ValidationError`, `CompressorNotRegistered` |
