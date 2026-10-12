@@ -158,13 +158,6 @@ export const make = <
   const entities = (config.entities ?? {}) as TEntities
   const aggregates = (config.aggregates ?? {}) as TAggregates
 
-  // Configure all entities with this table's schema and tag
-  for (const entity of Object.values(entities)) {
-    if (typeof entity._configure === "function") {
-      entity._configure(config.schema, Tag)
-    }
-  }
-
   // Cross-entity vector index agreement. `Dimensions` and `DistanceFunction` are
   // immutable at the DynamoDB level, so two entities sharing a physical vector
   // index cannot disagree — catch it at definition time rather than on the
@@ -176,6 +169,15 @@ export const make = <
   // so tables deployed with CDK or Terraform — which never call
   // `Table.definition` — fail at definition time too.
   mergeSecondaryIndexes(entities, aggregates, resolvePrimaryKey(entities))
+
+  // Configure all entities with this table's schema and tag — only once the
+  // table is valid, so a rejected `Table.make` leaves its members bound to
+  // whatever table they were registered on before.
+  for (const entity of Object.values(entities)) {
+    if (typeof entity._configure === "function") {
+      entity._configure(config.schema, Tag)
+    }
+  }
 
   return {
     _tag: "Table" as const,
