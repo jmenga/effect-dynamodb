@@ -1172,8 +1172,10 @@ const makeFromConfig = (config: {
         : withCrypto
     // Bundle the compressor registry for packed storage the same way: explicit
     // `compressors` win, then an ambient `Compression` at bind time. Without
-    // either nothing is added, so a `Compression` provided at run time still
-    // reaches bound operations (they read it with `Effect.serviceOption`).
+    // either nothing is added. A `Compression` provided only at run time then
+    // reaches bound operations (they read it with `Effect.serviceOption`), but
+    // only when no bound member's `Packed` config names a codec: such a member
+    // fails the bind-time [EDD-9078] check below before any operation runs.
     const ambientCompression = Context.getOption(baseCtx, Compression)
     const compressionRegistry =
       config.compressors !== undefined

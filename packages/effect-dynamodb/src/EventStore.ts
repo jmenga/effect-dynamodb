@@ -1509,6 +1509,15 @@ export interface EventStream<
    * With `{ raw: true }`, each event also carries `rawData`: its `data` as
    * stored, in wire form, unmodelled fields included (see
    * {@link RawStreamEvent}).
+   *
+   * The compressor registry is not in the type (`R = never`): this unbound
+   * method reads the `Compression` service from the running fiber. When the
+   * stream's `storedAs.data` or `snapshot.storedAs` names a codec that
+   * registry does not hold — including no `Compression` at all, for example
+   * one lost behind `Layer.provide` — it dies with the `[EDD-9078]`
+   * configuration defect on first use, whatever the image, rather than
+   * failing with a typed error. Provide `Compression` where the handler runs,
+   * or decode through {@link EventStore.bind}, which captures it.
    */
   decodeStreamImage(
     image: StreamImage,
@@ -3625,7 +3634,10 @@ export interface BoundEventStream<
 
   /**
    * The stream's query builders — unbound: run them with {@link provide}, or
-   * where `DynamoClient` and `TableConfig` are provided.
+   * where `DynamoClient` and `TableConfig` are provided. They do not use the
+   * context this bound stream captured unless run through {@link provide}:
+   * run directly, raw-row unpacking (`Query.select`) and decoding read the
+   * `Compression` registry of the caller's context, not the bound one.
    */
   readonly query: {
     events(

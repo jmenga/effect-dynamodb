@@ -344,6 +344,21 @@ describe("packValue", () => {
       expect(causeMessage(error)).toContain("did not return a Uint8Array")
     }),
   )
+
+  it.effect("a decompressor returning a non-Uint8Array fails with ValidationError", () =>
+    Effect.gen(function* () {
+      const wrong = {
+        codec: "gzip",
+        compress: (b: Uint8Array) => b,
+        decompress: () => "nope" as unknown as Uint8Array,
+      } satisfies Compression.Compressor
+      const error = failure(
+        yield* Effect.exit(unpack(new Uint8Array([0x21, 1, 2, 3]), Compression.make([wrong]))),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(causeMessage(error)).toContain('"gzip" decompressor did not return a Uint8Array')
+    }),
+  )
 })
 
 describe("round trips", () => {

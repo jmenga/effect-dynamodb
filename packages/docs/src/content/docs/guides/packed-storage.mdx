@@ -331,7 +331,11 @@ A store whose `Packed` config names a codec meets values compressed with it on e
 
 - **`DynamoClient.make`** checks every bound entity and aggregate (including each aggregate's edge entities) against the registry it binds with, whether that's from `compressors` or a `Compression` in context. A codec that isn't registered, or no registry at all, fails the bind with an `[EDD-9078]` configuration defect naming the member, the field and the codec. It isn't a typed error.
 - **`EventStore.bind(stream)`** does the same for the stream's `storedAs.data` and `snapshot.storedAs`, against the context it captures.
-- **An unbound stream** (`EventStore.makeStream(...)` used with the `DynamoClient` in context) checks the registry in context on its first operation, before anything is written or read, and dies with the same `[EDD-9078]` defect. Each registry is checked once per stream.
+- **An unbound stream** (`EventStore.makeStream(...)` used with the `DynamoClient` in context) checks the registry in context on its first operation, before anything is written or read, and dies with the same `[EDD-9078]` defect. Each registry is checked once per stream. This includes `stream.decodeStreamImage`: its type has no `Compression` requirement (`R = never`), but it reads the service from the running fiber, so a handler whose context lost `Compression` (for example behind `Layer.provide`, above) dies on its first image — even an image of another item. Provide `Compression` where the handler runs, or decode through `EventStore.bind(stream)`.
+
+All three checks are **defects**, not typed errors: a missing codec is a deployment mistake, so they fail fast at startup or on first use instead of surfacing per row.
+
+A bound stream's `query.events` / `query.index` builders are the exception to the captured context: run directly, they read the `Compression` registry of the caller's context. Run them through the bound stream's `provide` to use the one it captured.
 
 A member that packs plain JSON names no codec, so it needs no registry. The run-time `ValidationError` with a `CompressorNotRegistered` cause still covers the cases the check can't see: an unbound entity operation, the `StorageEncoding` helpers, and a value written with a codec the current config no longer names.
 

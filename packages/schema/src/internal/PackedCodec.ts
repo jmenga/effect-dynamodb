@@ -408,6 +408,13 @@ export const unpackBytesSync = (
     } catch (cause) {
       return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
     }
+    if (!(payload instanceof Uint8Array)) {
+      return invalid(
+        ctx,
+        attribute,
+        `the "${header.codec}" decompressor did not return a Uint8Array`,
+      )
+    }
   }
   let text = looseDecoder.decode(payload)
   if (text.includes("\uFFFD")) {
