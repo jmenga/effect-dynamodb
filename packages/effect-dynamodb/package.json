@@ -38,6 +38,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./compression/node": {
+      "types": "./dist/compression/node.d.ts",
+      "import": "./dist/compression/node.js"
     }
   },
   "files": [
