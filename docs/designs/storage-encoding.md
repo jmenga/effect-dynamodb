@@ -290,9 +290,9 @@ and brotli to Node's defaults. The subpath is the only file in the package that 
 **`StorageEncoding` (new core module, `effect-dynamodb`):**
 
 ```ts
-/** The AttributeValue a packed attribute is stored as (S, B, or NULL for null). */
+/** The AttributeValue a packed attribute is stored as (S, B, NULL for null; undefined for undefined — no attribute). */
 export const encode: (storedAs: PackedConfig, wire: unknown) =>
-  Effect<AttributeValue, ValidationError | CompressorNotRegistered>
+  Effect<AttributeValue | undefined, ValidationError | CompressorNotRegistered>
 /** Stored-form dispatch (§4.1). Accepts an AttributeValue, an unmarshalled value, or B as base64. */
 export const decode: (stored: AttributeValue | unknown) =>
   Effect<unknown, ValidationError | CompressorNotRegistered>

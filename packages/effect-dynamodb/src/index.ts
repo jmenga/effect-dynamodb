@@ -1,3 +1,9 @@
+export type {
+  CompressionCodec,
+  CompressionRegistry,
+  Compressor,
+} from "@effect-dynamodb/schema/Compression.js"
+export { Compression } from "@effect-dynamodb/schema/Compression.js"
 export * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 export type {
   Casing,
@@ -15,6 +21,7 @@ export {
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
+  CompressorNotRegistered,
   ConcurrentModification,
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
@@ -148,6 +155,7 @@ export type {
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
 export * as Marshaller from "./Marshaller.js"
 export * as Query from "./Query.js"
+export * as StorageEncoding from "./StorageEncoding.js"
 export type { Table as TableType, TableConfig } from "./Table.js"
 export * as Table from "./Table.js"
 export type { ConditionCheckOp } from "./Transaction.js"
