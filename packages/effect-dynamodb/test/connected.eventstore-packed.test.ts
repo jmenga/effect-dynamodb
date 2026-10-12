@@ -501,6 +501,31 @@ describeConnected("EventStore packed storage (#147)", () => {
     }).pipe(provide),
   )
 
+  it.effect(
+    "a compressed (B) inline snapshot over the item limit is diagnosed by its stored bytes (R4)",
+    () =>
+      Effect.gen(function* () {
+        const id = { ledgerId: "big-b-snapshot" }
+        // ~600 KB of incompressible text: zstd packs it to more than 400 KB.
+        const noise = Base64.encode(
+          Uint8Array.from({ length: 450_000 }, () => Math.floor(Math.random() * 256)),
+        )
+        const state = { total: 1, entries: [{ amount: 1, note: noise }] }
+        const events = [recorded(1)]
+        const measured = yield* ZstdLedger.measureAppend(id, events, 0, { snapshot: state })
+        expect(measured.snapshot!).toBeGreaterThan(ITEM_MAX_BYTES)
+        expect(measured.snapshot!).toBeLessThan(JSON.stringify(state).length)
+        const error = yield* ZstdLedger.append(id, events, 0, { snapshot: state }).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(ValidationError)
+        expect(String((error as ValidationError).cause)).toContain(
+          `the inline snapshot, at pk=$packed-es#v1#ledger#big-b-snapshot, ` +
+            `sk=$packed-es#v1#ledger.snapshot, ${measured.snapshot} bytes by DynamoDB's item-size rules`,
+        )
+        // Nothing was written.
+        expect(yield* rawItems(id.ledgerId)).toEqual([])
+      }).pipe(provide),
+  )
+
   it.effect("decodeStreamImage on Lambda-shaped images equals the read result (R2)", () =>
     Effect.gen(function* () {
       const id = { ledgerId: "mix-image" }

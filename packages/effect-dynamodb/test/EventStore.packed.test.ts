@@ -959,7 +959,7 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("the 4 MB diagnosis counts the compressed inline snapshot's stored bytes", () =>
+  it.effect("the 4 MB diagnosis counts the JSON inline snapshot's stored bytes", () =>
     Effect.gen(function* () {
       const events = Array.from({ length: 11 }, (_, i) => recorded(i + 1, "y".repeat(390_000)))
       const snapshotState = {
@@ -985,6 +985,52 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
       })
       expect(zstdMeasured.snapshot!).toBeLessThan(measured.snapshot! / 20)
     }).pipe(Effect.provide(TestLayer)),
+  )
+  it.effect(
+    "the 400 KB and 4 MB diagnoses attribute a compressed (B) inline snapshot by its stored bytes",
+    () =>
+      Effect.gen(function* () {
+        // ~48 KB of folded state, compressed by zstd to a few KB.
+        const snapshotState = {
+          total: 1,
+          notes: Array.from(
+            { length: 18 },
+            (_, i) =>
+              `${LONG_NOTE}${Array.from({ length: 60 }, (_, k) => (k * 7919 + i * 104_729) % 9973).join(",")}`,
+          ),
+        }
+        expect(JSON.stringify(snapshotState).length).toBeGreaterThan(45_000)
+        const events = [recorded(1)]
+        const measured = yield* ZstdLedger.measureAppend(id, events, 0, { snapshot: snapshotState })
+        expect(measured.snapshot!).toBeLessThan(JSON.stringify(snapshotState).length / 5)
+        // The largest item, so the 400 KB diagnosis names it.
+        expect(measured.snapshot!).toBeGreaterThan(measured.events[0]!)
+        const snapshotAt = `the inline snapshot, at pk=$ledger#v1#ledger#l-1, sk=$ledger#v1#ledger.snapshot`
+
+        rejectNextWrite = awsValidationException(ddbPayloadTooLarge(4_300_000))
+        const tooLarge = yield* ZstdLedger.append(id, events, 0, { snapshot: snapshotState }).pipe(
+          Effect.flip,
+        )
+        const tooLargeText = String((tooLarge as ValidationError).cause)
+        expect(tooLargeText).toContain(
+          `the library measures the request at ${measured.transactionBytes} bytes`,
+        )
+        expect(tooLargeText).toContain(`${snapshotAt} (${measured.snapshot} bytes)`)
+        const sent = sentTransactions[0]!
+        const snapshotPut = sent[sent.length - 1]!
+        expect(snapshotPut.Put!.Item!.state!.B).toBeInstanceOf(Uint8Array)
+        expect(transactItemBytes(snapshotPut)).toBe(measured.snapshot)
+        expect(transactionBytes(sent)).toBe(measured.transactionBytes)
+
+        rejectNextWrite = awsValidationException(DDB_ITEM_SIZE)
+        const itemTooLarge = yield* ZstdLedger.append(id, events, 0, {
+          snapshot: snapshotState,
+        }).pipe(Effect.flip)
+        expect(String((itemTooLarge as ValidationError).cause)).toContain(
+          `the item of ${snapshotAt}, ${measured.snapshot} bytes by DynamoDB's item-size rules`,
+        )
+        expect(sentTransactions[1]!.at(-1)!.Put!.Item!.state!.B).toBeInstanceOf(Uint8Array)
+      }).pipe(Effect.provide(TestLayer)),
   )
 })
 
