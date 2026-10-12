@@ -376,6 +376,12 @@ export const encodeSync: (storedAs: PackedConfig, wire: unknown, options?: SyncO
 export const decodeSync: (stored: AttributeValue | { readonly B: string } | undefined,
   options?: SyncOptions) => unknown
 export const decodeUnmarshalledSync: (stored: unknown, options?: SyncOptions) => unknown
+/** valueBytes for pure planning code (downstream review): same number, explicit compressors. */
+export const valueBytesSync: <S extends Schema.Top>(options: {
+  readonly schema: S
+  readonly value: Schema.Schema.Type<S>
+  readonly storedAs?: PackedConfig | undefined
+} & SyncOptions) => number
 ```
 
 The Effect forms cost one Effect per call: a native value or JSON text never looks the
@@ -386,6 +392,12 @@ decoding many values with no Effect per value resolves the registry once and loo
 The two forms are separate functions because they cannot be told apart by shape: an
 unmarshalled one-key map `{ N: "5" }` or `{ L: [1, 2] }` is also a valid-looking
 `AttributeValue`, so the caller states which form it passes.
+
+`valueBytesSync` is the same computation with `Schema.encodeUnknownSync` (so a schema
+whose encoding is effectful or needs a service cannot be measured that way) and the
+compressors passed in; `test/StorageEncoding.test.ts` asserts it equals `valueBytes` for
+every config (native, JSON, zstd, brotli, gzip at threshold 0), value form (domain and
+encoded) and registry form (list or `Compression.make`), and throws the same failures.
 
 `valueBytes` encodes through the schema (encode, with the `decode → encode` fallback
 EventStore uses), packs, and measures with `internal/ItemSize.ts`'s `attributeBytes` —
@@ -1314,6 +1326,7 @@ this design introduced. **Source** says who decided.
 | 64 | Review P3: decompression-bomb guard | **In**: 64 MiB default `maxOutputLength` in the Node compressors, configurable, `Infinity` lifts it (§3.4) | review |
 | 65 | Review P4: raw data from `decodeStreamImage` | **In**: `{ raw: true }` → `RawStreamEvent` with `rawData` (§3.5). Out: the same on `Entity.decodeMarshalledItem` — it returns the item itself, so a raw view needs a different result shape; not cheap-and-consistent | review; design |
 | 66 | Review P5: `Compression` lost behind a wrapper layer | **In**: docs, guide and example lead with a standalone `Compression.layer([...])` merged into the app layer, and explain the `Layer.provide` pitfall (§3.4). `DynamoClient.layer({ compressors })` / `layerConfig` **kept**: they work when used directly, and removing them is not needed to fix the pitfall | review; design |
+| 67 | Review P6: synchronous `valueBytes` | **In**: `StorageEncoding.valueBytesSync({ schema, value, storedAs?, compressors? })` — the options object of `valueBytes` plus explicit compressors, rather than the reviewer's sketched `(value, config, { compressor })`, so the two read alike and the schema encode (dates, renames inside the value) is the same (§3.5) | review; design |
 
 ---
 
@@ -1327,7 +1340,8 @@ this design introduced. **Source** says who decided.
 2. **Names:** `DynamoModel.Packed({ format: "json", compression?: { codec, threshold? } })`
    → `PackedConfig`; entity `storedAs`; stream `storedAs: { data }` and
    `snapshot.storedAs`; `Compressor { codec, compress, decompress }`; `StorageEncoding`
-   module (`encode`, `decode`, `valueBytes`, `limits`); stream methods `measureAppend`,
+   module (`encode`, `decode`, `decodeUnmarshalled`, `valueBytes`, each with a `*Sync` twin;
+   `limits`); stream methods `measureAppend`,
    `measureSnapshot`, `decodeStreamImage`; Node factories `gzip`, `brotli`, `zstd`,
    `available` from `effect-dynamodb/compression/node`.
 3. **Header:** one byte, `vvv ff ccc`: version `001`; format `00` json, `01` binary

@@ -471,10 +471,19 @@ const program = Effect.gen(function* () {
     value: latest,
     storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
   })
+
+  // The same, synchronously, for pure planning code: compressors are passed in
+  const asZstdSync = StorageEncoding.valueBytesSync({
+    schema: LedgerState,
+    value: latest,
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+    compressors: [NodeCompression.zstd()],
+  })
   // #endregion
   assertEq(fits, true, "append fits")
   assertEq(plan.events.length, 1, "one event measured")
   assertEq(asZstd < asMap, true, "compressed state smaller than map")
+  assertEq(asZstdSync, asZstd, "valueBytesSync equals valueBytes")
   yield* Console.log(
     `measureAppend: events=${JSON.stringify(plan.events)} snapshot=${plan.snapshot} ` +
       `transaction=${plan.transactionBytes}; state as map=${asMap} as zstd=${asZstd}`,

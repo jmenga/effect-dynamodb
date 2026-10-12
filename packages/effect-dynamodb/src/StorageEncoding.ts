@@ -18,9 +18,9 @@
  * work and a value that needs a codec fails with a `ValidationError` whose
  * `cause` is a `CompressorNotRegistered`.
  *
- * Each decode/encode helper has a synchronous twin — {@link encodeSync},
- * {@link decodeSync}, {@link decodeUnmarshalledSync} — for pure code (a
- * hand-rolled Lambda loop): it takes its compressors explicitly
+ * Each helper has a synchronous twin — {@link encodeSync}, {@link decodeSync},
+ * {@link decodeUnmarshalledSync}, {@link valueBytesSync} — for pure code (chunk
+ * planning, a hand-rolled Lambda loop): it takes its compressors explicitly
  * (`{ compressors }`, none by default) and throws the `ValidationError` the
  * Effect form fails with. The Effect forms cost one Effect per call and look
  * the registry up only when a value is compressed; to decode many values with
@@ -293,4 +293,49 @@ const packedBytes = (
   if (stored instanceof ValidationError) return stored
   const av = storedToAttributeValue(stored)
   return av === undefined ? 0 : attributeBytes(av)
+}
+
+/**
+ * {@link valueBytes}, synchronously — for pure planning code. The value is
+ * encoded through `schema` synchronously (a schema whose encoding is
+ * effectful, or needs a service, cannot be measured this way: use
+ * `valueBytes`), then packed with the compressors given in `compressors` (see
+ * {@link SyncOptions}; none by default, enough for an uncompressed config and
+ * for any value under its threshold). Returns exactly what `valueBytes` returns
+ * for the same input and compressors; throws the `ValidationError` it fails
+ * with.
+ *
+ * @example
+ * ```typescript
+ * const bytes = StorageEncoding.valueBytesSync({
+ *   schema: LedgerState,
+ *   value: state,
+ *   storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+ *   compressors: [NodeCompression.zstd()],
+ * })
+ * ```
+ */
+export const valueBytesSync = <S extends Schema.Top>(
+  options: {
+    readonly schema: S
+    readonly value: Schema.Schema.Type<S>
+    readonly storedAs?: PackedConfig | undefined
+  } & SyncOptions,
+): number => {
+  const codec = options.schema as unknown as Schema.Codec<unknown, unknown>
+  let wire: unknown
+  try {
+    wire = Schema.encodeUnknownSync(codec)(options.value)
+  } catch (primaryCause) {
+    // A value given in its encoded form (as EventStore accepts) still measures.
+    try {
+      wire = Schema.encodeUnknownSync(codec)(Schema.decodeUnknownSync(codec)(options.value))
+    } catch {
+      throw measureError(primaryCause)
+    }
+  }
+  const storedAs = options.storedAs
+  return orThrow(
+    storedAs === undefined ? nativeBytes(wire) : packedBytes(storedAs, wire, registryFrom(options)),
+  )
 }

@@ -1308,6 +1308,7 @@ import { StorageEncoding } from "effect-dynamodb"
 | `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
 | `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged |
 | `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
+| `valueBytesSync` | `({ schema, value, storedAs?, compressors? }) => number` | `valueBytes`, synchronously, for pure planning code: the schema encode runs synchronously, compressors are passed in (none by default), and a failure throws the `ValidationError` `valueBytes` fails with |
 | `encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | `(…, options?: { compressors? }) => …` | Synchronous twins of `encode` / `decode` / `decodeUnmarshalled` for pure code: compressors are passed explicitly (a `Compression.make(...)` registry or a list; none by default) and a failure **throws** the `ValidationError` the Effect form fails with |
 | `limits` | `{ item: 409_600, transaction: 4_194_304 }` | DynamoDB's item and `TransactWriteItems` size limits, in bytes |
 

@@ -436,6 +436,14 @@ const asZstd = yield* StorageEncoding.valueBytes({
   value: latest,
   storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
 })
+
+// The same, synchronously, for pure planning code: compressors are passed in
+const asZstdSync = StorageEncoding.valueBytesSync({
+  schema: LedgerState,
+  value: latest,
+  storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+  compressors: [NodeCompression.zstd()],
+})
 ```
 
 | Helper | Returns |
@@ -443,6 +451,7 @@ const asZstd = yield* StorageEncoding.valueBytes({
 | `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the stream's own actions add to the `TransactWriteItems` request. The items are built by the same code `append` uses. Nothing is read or written. |
 | `stream.measureSnapshot(streamId, state, asOfVersion)` | the item size of the snapshot `writeSnapshot` would write |
 | `StorageEncoding.valueBytes({ schema, value, storedAs? })` | the size of one attribute **value** as stored, packed under `storedAs`, or as a native map if `storedAs` is omitted. An item's size is the sum, over its attributes, of the name's UTF-8 bytes plus the value's bytes. |
+| `StorageEncoding.valueBytesSync({ schema, value, storedAs?, compressors? })` | the same number, synchronously, for pure planning code. Compressors are passed in (a registry or a list; none by default, which is enough for an uncompressed config or a value under its threshold), and a failure throws the `ValidationError` `valueBytes` fails with. |
 | `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304 }` |
 | `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` (`decode` takes DynamoDB JSON) |
 | `StorageEncoding.decodeUnmarshalled(stored)` | one already-unmarshalled stored value (a JSON string, bytes or base64, or a native value) to its wire form |

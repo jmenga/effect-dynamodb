@@ -273,3 +273,72 @@ describe("StorageEncoding.valueBytes", () => {
     }),
   )
 })
+
+describe("StorageEncoding.valueBytesSync", () => {
+  const compressors = NodeCompression.available()
+  const gzip0 = DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 0 } })
+  const small = { lines: [new Line({ sku: "A", qty: 1, at })] }
+  const empty = { lines: [] }
+
+  it.effect("equals valueBytes for every config, value and form", () =>
+    Effect.gen(function* () {
+      for (const storedAs of [undefined, json, zstd, brotli, gzip0]) {
+        for (const value of [state, small, empty, wire as never, { ...state, note: "n" }]) {
+          const expected = yield* StorageEncoding.valueBytes({ schema: State, value, storedAs })
+          expect(
+            StorageEncoding.valueBytesSync({ schema: State, value, storedAs, compressors }),
+          ).toBe(expected)
+          // A registry works as well as a list.
+          expect(
+            StorageEncoding.valueBytesSync({
+              schema: State,
+              value,
+              storedAs,
+              compressors: Compression.make(compressors),
+            }),
+          ).toBe(expected)
+        }
+      }
+    }).pipe(Effect.provide(compression)),
+  )
+
+  it.effect("without compressors: uncompressed configs and values under the threshold", () =>
+    Effect.gen(function* () {
+      expect(StorageEncoding.valueBytesSync({ schema: State, value: state })).toBe(
+        yield* StorageEncoding.valueBytes({ schema: State, value: state }),
+      )
+      expect(StorageEncoding.valueBytesSync({ schema: State, value: state, storedAs: json })).toBe(
+        yield* StorageEncoding.valueBytes({ schema: State, value: state, storedAs: json }),
+      )
+      expect(StorageEncoding.valueBytesSync({ schema: State, value: small, storedAs: zstd })).toBe(
+        yield* StorageEncoding.valueBytes({ schema: State, value: small, storedAs: zstd }),
+      )
+    }),
+  )
+
+  it("throws the ValidationError valueBytes fails with", () => {
+    const thrown = (run: () => unknown): ValidationError => {
+      try {
+        run()
+      } catch (error) {
+        expect(error).toBeInstanceOf(ValidationError)
+        return error as ValidationError
+      }
+      throw new Error("expected a throw")
+    }
+    // A codec the value needs, not given.
+    const missing = thrown(() =>
+      StorageEncoding.valueBytesSync({ schema: State, value: state, storedAs: zstd }),
+    )
+    expect(missingCompressor(missing)).toMatchObject({ codec: "zstd", direction: "compress" })
+    // An invalid value.
+    const invalid = thrown(() =>
+      StorageEncoding.valueBytesSync({
+        schema: State,
+        value: { lines: 1 } as never,
+        storedAs: json,
+      }),
+    )
+    expect(invalid).toMatchObject({ operation: "StorageEncoding.valueBytes" })
+  })
+})
