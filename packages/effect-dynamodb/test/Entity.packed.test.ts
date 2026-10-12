@@ -1,0 +1,1091 @@
+/**
+ * Entity packed fields (#147): `DynamoModel.configure(model, { field: {
+ * storedAs: DynamoModel.Packed(...) } })` stores the field as one JSON string
+ * (`S`), or — with compression, over the threshold, when smaller — as
+ * header-prefixed compressed binary (`B`).
+ *
+ * Runs against an in-memory `DynamoClient` that applies the requests the
+ * entity sends (puts, updates, deletes, key-condition queries, scans, batch and
+ * transaction requests), so every write and read path round-trips through the
+ * stored form — and a table holding a MIX of native-map, JSON and compressed
+ * values (a field that switched encoding) is read back exactly.
+ */
+
+import type {
+  AttributeValue,
+  TransactWriteItem,
+  UpdateItemCommandInput,
+} from "@aws-sdk/client-dynamodb"
+import { describe, expect, it } from "@effect/vitest"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import {
+  CompressorNotRegistered,
+  DynamoError,
+  ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
+import { DateTime, Effect, Exit, Layer, Schema } from "effect"
+import { beforeEach } from "vitest"
+import * as Batch from "../src/Batch.js"
+import * as NodeCompression from "../src/compression/node.js"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
+import * as Expression from "../src/Expression.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
+import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+const AppSchema = DynamoSchema.make({ name: "packed", version: 1 })
+
+class Line extends Schema.Class<Line>("Line")({ sku: Schema.String, qty: Schema.Number }) {}
+
+const Details = Schema.Struct({
+  note: Schema.String,
+  // A nested self date: its wire form (ISO) is what the packed JSON holds,
+  // exactly as a native map stores it.
+  placedAt: Schema.DateTimeUtc,
+})
+
+class Order extends Schema.Class<Order>("Order")({
+  orderId: Schema.String,
+  customerId: Schema.String,
+  status: Schema.String,
+  lines: Schema.Array(Line),
+  details: Schema.optional(Details),
+  // Not packed, but object/array-shaped: read by stored form too, so values
+  // written while it WAS packed still read after packing is turned off.
+  notes: Schema.optional(Schema.Array(Schema.String)),
+}) {}
+
+const json = DynamoModel.Packed({ format: "json" })
+const gzip64 = DynamoModel.Packed({
+  format: "json",
+  compression: { codec: "gzip", threshold: 64 },
+})
+
+const OrderModel = DynamoModel.configure(Order, {
+  lines: { storedAs: json },
+  details: { field: "d", storedAs: gzip64 },
+})
+
+const Orders = Entity.make({
+  model: OrderModel,
+  entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byCustomer: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["customerId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  },
+})
+
+class Doc extends Schema.Class<Doc>("Doc")({
+  docId: Schema.String,
+  title: Schema.String,
+  body: Schema.Struct({ text: Schema.String }),
+  origin: Schema.Struct({ source: Schema.String, tags: Schema.Array(Schema.String) }),
+}) {}
+
+const gzip0 = DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 0 } })
+
+const Docs = Entity.make({
+  model: DynamoModel.configure(Doc, {
+    body: { storedAs: gzip0 },
+    origin: { storedAs: json, immutable: true },
+  }),
+  entityType: "Doc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["docId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+class Reading extends Schema.Class<Reading>("Reading")({
+  deviceId: Schema.String,
+  at: Schema.String,
+  payload: Schema.Struct({ values: Schema.Array(Schema.Number) }),
+  label: Schema.optional(Schema.String),
+}) {}
+
+const Readings = Entity.make({
+  model: DynamoModel.configure(Reading, { payload: { storedAs: gzip0 } }),
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      deviceId: Schema.String,
+      at: Schema.String,
+      payload: Schema.Struct({ values: Schema.Array(Schema.Number) }),
+    }),
+  },
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Orders, Docs, Readings } })
+
+// ---------------------------------------------------------------------------
+// In-memory DynamoClient
+// ---------------------------------------------------------------------------
+
+type Item = Record<string, AttributeValue>
+
+const store = new Map<string, Item>()
+const sentPuts: Array<Item> = []
+const sentUpdates: Array<UpdateItemCommandInput> = []
+const sentTransactions: Array<ReadonlyArray<TransactWriteItem>> = []
+
+const keyOf = (item: Item) => `${item.pk?.S}|${item.sk?.S}`
+
+const conditionFailed = (operation: string, item?: Item) =>
+  new DynamoError({
+    operation,
+    cause: Object.assign(new Error("The conditional request failed"), {
+      name: "ConditionalCheckFailedException",
+      ...(item !== undefined && { Item: item }),
+    }),
+  })
+
+/** Enforce the existence parts of a condition — all the entity paths here need. */
+const conditionHolds = (
+  expression: string | undefined,
+  names: Record<string, string>,
+  current: Item | undefined,
+): boolean => {
+  if (expression === undefined) return true
+  for (const match of expression.matchAll(/attribute_not_exists\((#\w+)\)/g)) {
+    const name = names[match[1]!]
+    if ((name === "pk" || name === "sk") && current !== undefined && !/ OR /.test(expression)) {
+      return false
+    }
+  }
+  for (const match of expression.matchAll(/attribute_exists\((#\w+)\)/g)) {
+    const name = names[match[1]!]
+    if ((name === "pk" || name === "sk") && current === undefined) return false
+  }
+  return true
+}
+
+/** Split on commas outside parentheses. */
+const splitTopLevel = (body: string): Array<string> => {
+  const out: Array<string> = []
+  let depth = 0
+  let current = ""
+  for (const ch of body) {
+    if (ch === "(") depth++
+    if (ch === ")") depth--
+    if (ch === "," && depth === 0) {
+      out.push(current.trim())
+      current = ""
+    } else current += ch
+  }
+  if (current.trim() !== "") out.push(current.trim())
+  return out
+}
+
+const applyUpdateExpression = (
+  current: Item | undefined,
+  key: Item,
+  input: {
+    readonly UpdateExpression?: string | undefined
+    readonly ExpressionAttributeNames?: Record<string, string> | undefined
+    readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+  },
+): Item => {
+  const names = input.ExpressionAttributeNames ?? {}
+  const values = input.ExpressionAttributeValues ?? {}
+  const next: Item = { ...(current ?? key) }
+  const sections = (input.UpdateExpression ?? "").split(/\b(SET|REMOVE|ADD|DELETE)\b/).slice(1)
+  for (let i = 0; i + 1 < sections.length; i += 2) {
+    const action = sections[i]!
+    for (const clause of splitTopLevel(sections[i + 1]!)) {
+      if (action === "REMOVE") {
+        delete next[names[clause]!]
+        continue
+      }
+      if (action !== "SET") continue
+      const [target, source] = clause.split(/ = (.*)/s) as [string, string]
+      const name = names[target.trim()]!
+      const ifNotExistsPlus = /^if_not_exists\((#\w+), (:\w+)\) \+ (:\w+)$/.exec(source)
+      const ifNotExists = /^if_not_exists\((#\w+), (:\w+)\)$/.exec(source)
+      const plus = /^(#\w+) \+ (:\w+)$/.exec(source)
+      if (ifNotExistsPlus) {
+        const base = Number(next[name]?.N ?? values[ifNotExistsPlus[2]!]!.N)
+        next[name] = { N: String(base + Number(values[ifNotExistsPlus[3]!]!.N)) }
+      } else if (ifNotExists) {
+        if (next[name] === undefined) next[name] = values[ifNotExists[2]!]!
+      } else if (plus) {
+        next[name] = { N: String(Number(next[name]?.N ?? 0) + Number(values[plus[2]!]!.N)) }
+      } else if (source.startsWith(":")) {
+        next[name] = values[source]!
+      } else {
+        throw new Error(`mock: unsupported SET ${clause}`)
+      }
+    }
+  }
+  return next
+}
+
+const project = (
+  item: Item,
+  expression: string | undefined,
+  names: Record<string, string>,
+): Item => {
+  if (expression === undefined) return item
+  const out: Item = {}
+  for (const token of expression.split(",").map((t) => t.trim())) {
+    const name = token.startsWith("#") ? names[token]! : token
+    if (item[name] !== undefined) out[name] = item[name]!
+  }
+  return out
+}
+
+const ownership = (
+  rows: Array<Item>,
+  filter: string | undefined,
+  values: Record<string, AttributeValue>,
+): Array<Item> => {
+  const owner = /#eddE IN \(([^)]*)\)/.exec(filter ?? "")
+  if (!owner) return rows
+  const allowed = owner[1]!.split(",").map((p) => values[p.trim()]!.S)
+  return rows.filter((item) => allowed.includes(item.__edd_e__?.S))
+}
+
+const runQuery = (input: {
+  readonly ScanIndexForward?: boolean | undefined
+  readonly Limit?: number | undefined
+  readonly KeyConditionExpression?: string | undefined
+  readonly FilterExpression?: string | undefined
+  readonly ProjectionExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+}) => {
+  const names = input.ExpressionAttributeNames ?? {}
+  const values = input.ExpressionAttributeValues ?? {}
+  const kc = /^(#\w+) = (:\w+)(?: AND (.*))?$/.exec(input.KeyConditionExpression ?? "")!
+  const pkAttr = names[kc[1]!]!
+  let rows = [...store.values()].filter((item) => item[pkAttr]?.S === values[kc[2]!]!.S)
+  const condition = kc[3]
+  if (condition !== undefined) {
+    const skName = /(#\w+)/.exec(condition)![1]!
+    const skAttr = names[skName]!
+    const sk = (item: Item) => item[skAttr]?.S ?? ""
+    rows = rows.filter((item) => item[skAttr] !== undefined)
+    rows.sort((a, b) => (sk(a) < sk(b) ? -1 : sk(a) > sk(b) ? 1 : 0))
+    const v = (name: string) => values[name]!.S!
+    const begins = /^begins_with\(#\w+, (:\w+)\)$/.exec(condition)
+    const between = /^#\w+ BETWEEN (:\w+) AND (:\w+)$/.exec(condition)
+    const compare = /^#\w+ (=|<|<=|>|>=) (:\w+)$/.exec(condition)
+    if (begins) rows = rows.filter((item) => sk(item).startsWith(v(begins[1]!)))
+    else if (between) {
+      rows = rows.filter((item) => sk(item) >= v(between[1]!) && sk(item) <= v(between[2]!))
+    } else if (compare) {
+      const op = compare[1]!
+      const y = v(compare[2]!)
+      rows = rows.filter((item) => {
+        const x = sk(item)
+        return op === "="
+          ? x === y
+          : op === "<"
+            ? x < y
+            : op === "<="
+              ? x <= y
+              : op === ">"
+                ? x > y
+                : x >= y
+      })
+    } else throw new Error(`mock: unsupported key condition ${condition}`)
+  }
+  if (input.ScanIndexForward === false) rows.reverse()
+  rows = ownership(rows, input.FilterExpression, values)
+  if (input.Limit !== undefined) rows = rows.slice(0, input.Limit)
+  return { Items: rows.map((item) => project(item, input.ProjectionExpression, names)) }
+}
+
+const InMemoryClient = mockDynamoClientLayer({
+  putItem: (input) =>
+    Effect.suspend(() => {
+      const current = store.get(keyOf(input.Item!))
+      if (!conditionHolds(input.ConditionExpression, input.ExpressionAttributeNames ?? {}, current))
+        return Effect.fail(conditionFailed("PutItem", current))
+      sentPuts.push(input.Item!)
+      store.set(keyOf(input.Item!), input.Item!)
+      return Effect.succeed({} as never)
+    }),
+  getItem: (input) =>
+    Effect.sync(() => {
+      const item = store.get(keyOf(input.Key!))
+      if (item === undefined) return {} as never
+      return {
+        Item: project(item, input.ProjectionExpression, input.ExpressionAttributeNames ?? {}),
+      } as never
+    }),
+  updateItem: (input) =>
+    Effect.suspend(() => {
+      sentUpdates.push(input)
+      const current = store.get(keyOf(input.Key!))
+      if (!conditionHolds(input.ConditionExpression, input.ExpressionAttributeNames ?? {}, current))
+        return Effect.fail(conditionFailed("UpdateItem", current))
+      const next = applyUpdateExpression(current, input.Key!, input)
+      store.set(keyOf(next), next)
+      return Effect.succeed({
+        Attributes: input.ReturnValues === "ALL_OLD" ? current : next,
+      } as never)
+    }),
+  deleteItem: (input) =>
+    Effect.sync(() => {
+      const current = store.get(keyOf(input.Key!))
+      store.delete(keyOf(input.Key!))
+      return { Attributes: current } as never
+    }),
+  query: (input) => Effect.sync(() => runQuery(input) as never),
+  scan: (input) =>
+    Effect.sync(
+      () =>
+        ({
+          Items: ownership(
+            [...store.values()],
+            input.FilterExpression,
+            input.ExpressionAttributeValues ?? {},
+          ).map((item) =>
+            project(item, input.ProjectionExpression, input.ExpressionAttributeNames ?? {}),
+          ),
+        }) as never,
+    ),
+  batchGetItem: (input) =>
+    Effect.sync(() => {
+      const Responses: Record<string, Array<Item>> = {}
+      for (const [table, request] of Object.entries(input.RequestItems ?? {})) {
+        Responses[table] = (request.Keys ?? []).flatMap((key) => {
+          const item = store.get(keyOf(key))
+          return item === undefined ? [] : [item]
+        })
+      }
+      return { Responses } as never
+    }),
+  batchWriteItem: (input) =>
+    Effect.sync(() => {
+      for (const requests of Object.values(input.RequestItems ?? {})) {
+        for (const request of requests) {
+          if (request.PutRequest?.Item !== undefined) {
+            sentPuts.push(request.PutRequest.Item)
+            store.set(keyOf(request.PutRequest.Item), request.PutRequest.Item)
+          }
+          if (request.DeleteRequest?.Key !== undefined) {
+            store.delete(keyOf(request.DeleteRequest.Key))
+          }
+        }
+      }
+      return {} as never
+    }),
+  transactGetItems: (input) =>
+    Effect.sync(
+      () =>
+        ({
+          Responses: (input.TransactItems ?? []).map((entry) => {
+            const item = store.get(keyOf(entry.Get!.Key!))
+            return item === undefined ? {} : { Item: item }
+          }),
+        }) as never,
+    ),
+  transactWriteItems: (input) =>
+    Effect.sync(() => {
+      const items = input.TransactItems ?? []
+      sentTransactions.push(items)
+      for (const entry of items) {
+        if (entry.Put?.Item !== undefined) store.set(keyOf(entry.Put.Item), entry.Put.Item)
+        if (entry.Update !== undefined) {
+          const current = store.get(keyOf(entry.Update.Key!))
+          const next = applyUpdateExpression(current, entry.Update.Key!, entry.Update)
+          store.set(keyOf(next), next)
+        }
+        if (entry.Delete?.Key !== undefined) store.delete(keyOf(entry.Delete.Key))
+      }
+      return {} as never
+    }),
+})
+
+const TableLayer = MainTable.layer({ name: "packed-entity-table" })
+const Codecs = Compression.layer([NodeCompression.gzip(), NodeCompression.brotli()])
+const TestLayer = Layer.mergeAll(InMemoryClient, TableLayer, Codecs)
+const NoCodecs = Layer.mergeAll(InMemoryClient, TableLayer)
+
+beforeEach(() => {
+  store.clear()
+  sentPuts.length = 0
+  sentUpdates.length = 0
+  sentTransactions.length = 0
+})
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const placedAt = DateTime.makeUnsafe("2026-10-01T12:00:00.000Z")
+const smallDetails = { note: "hi", placedAt }
+const bigDetails = { note: "x".repeat(400), placedAt }
+const lines = [new Line({ sku: "A", qty: 1 }), new Line({ sku: "B", qty: 2 })]
+
+const order = (overrides: Partial<Order> = {}) =>
+  new Order({
+    orderId: "o-1",
+    customerId: "c-1",
+    status: "open",
+    lines,
+    details: bigDetails,
+    ...overrides,
+  })
+
+const client = DynamoClient.make({ entities: { Orders, Docs, Readings }, tables: { MainTable } })
+
+const failure = <E>(exit: Exit.Exit<unknown, E>): E => {
+  if (Exit.isSuccess(exit)) throw new Error("expected a failure")
+  const reason = exit.cause.reasons.find((r) => r._tag === "Fail")
+  if (reason === undefined || reason._tag !== "Fail") throw new Error("expected a Fail reason")
+  return reason.error
+}
+
+/** The live item whose partition key ends in `_<id>` (not a snapshot, tombstone or event). */
+const stored = (id: string): Item =>
+  [...store.values()].find(
+    (item) => item.pk?.S?.endsWith(`_${id}`) === true && !/#(v|deleted|e)#/.test(item.sk?.S ?? ""),
+  )!
+const ORDER_KEY = "o-1"
+
+// ---------------------------------------------------------------------------
+// Write: put / create / upsert
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — writes", () => {
+  it.effect("put stores JSON as S, compressed JSON as B under its renamed attribute", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const item = stored(ORDER_KEY)
+      // `lines`: uncompressed config → JSON string.
+      expect(item.lines?.S).toBe(
+        JSON.stringify([
+          { sku: "A", qty: 1 },
+          { sku: "B", qty: 2 },
+        ]),
+      )
+      // `details` → stored as `d`: over 64 bytes, gzip pays → B with header 0x21.
+      expect(item.details).toBeUndefined()
+      expect(item.d?.B).toBeInstanceOf(Uint8Array)
+      expect(item.d!.B![0]).toBe(0x21)
+      // The wire form inside: the nested self date as its ISO string.
+      const roundTrip = yield* db.entities.Orders.get({ orderId: "o-1" })
+      expect(roundTrip).toEqual(order())
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a value under the threshold is stored as S even with compression", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order({ details: smallDetails }))
+      const item = stored(ORDER_KEY)
+      expect(item.d?.S).toBe(JSON.stringify({ note: "hi", placedAt: "2026-10-01T12:00:00.000Z" }))
+      expect((yield* db.entities.Orders.get({ orderId: "o-1" })).details).toEqual(smallDetails)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an absent optional packed field stays absent", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const { details: _, ...rest } = order()
+      yield* db.entities.Orders.put(new Order(rest))
+      expect(stored(ORDER_KEY).d).toBeUndefined()
+      expect((yield* db.entities.Orders.get({ orderId: "o-1" })).details).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("create and upsert pack too", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.create(order())
+      expect(stored(ORDER_KEY).d?.B).toBeInstanceOf(Uint8Array)
+      store.clear()
+      yield* db.entities.Orders.upsert(order({ details: smallDetails }))
+      const upsert = sentUpdates.at(-1)!
+      const valueOf = (attr: string) => {
+        const placeholder = Object.entries(upsert.ExpressionAttributeNames!).find(
+          ([, name]) => name === attr,
+        )![0]
+        const clause = upsert.UpdateExpression!.split(", ").find((c) => c.includes(placeholder))!
+        return upsert.ExpressionAttributeValues![clause.split(" = ")[1]!]!
+      }
+      expect(valueOf("lines").S).toBe(
+        JSON.stringify([
+          { sku: "A", qty: 1 },
+          { sku: "B", qty: 2 },
+        ]),
+      )
+      expect(valueOf("d").S).toContain('"note":"hi"')
+      expect((yield* db.entities.Orders.get({ orderId: "o-1" })).details).toEqual(smallDetails)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(
+    "a value over the threshold without its codec registered fails CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        const error = failure(yield* Effect.exit(db.entities.Orders.put(order()).asEffect()))
+        expect(error).toBeInstanceOf(CompressorNotRegistered)
+        expect(error).toMatchObject({
+          codec: "gzip",
+          direction: "compress",
+          entityType: "Order",
+          attribute: "d",
+        })
+        expect(store.size).toBe(0)
+        // Under the threshold no codec is needed.
+        yield* db.entities.Orders.put(order({ details: smallDetails }))
+        expect(stored(ORDER_KEY).d?.S).toBeDefined()
+      }).pipe(Effect.provide(NoCodecs)),
+  )
+
+  it.effect("a non-JSON value is refused with a ValidationError naming the path", () =>
+    Effect.gen(function* () {
+      class Bad extends Schema.Class<Bad>("Bad")({
+        id: Schema.String,
+        data: Schema.Struct({ big: Schema.BigInt }),
+      }) {}
+      const Bads = Entity.make({
+        model: DynamoModel.configure(Bad, { data: { storedAs: json } }),
+        entityType: "Bad",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      })
+      const T = Table.make({ schema: AppSchema, entities: { Bads } })
+      const db = yield* DynamoClient.make({ entities: { Bads }, tables: { T } }).pipe(
+        Effect.provide(T.layer({ name: "packed-entity-table" })),
+      )
+      const error = failure(
+        yield* Effect.exit(db.entities.Bads.put({ id: "b", data: { big: 1n } }).asEffect()),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect((error as ValidationError).operation).toBe("put.packed")
+      expect(String((error as ValidationError).cause)).toMatch(/data\.big is a bigint/)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Read: stored-form dispatch
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — reads", () => {
+  /**
+   * The item `put` writes, with the packed fields rewritten as an earlier
+   * writer stored them: native maps / lists (before packing was configured),
+   * and an unpacked list field holding JSON (written while it WAS packed).
+   */
+  const writeLegacy = (orderId: string) =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order({ orderId }))
+      const live = stored(orderId)
+      store.set(keyOf(live), {
+        ...live,
+        ...toAttributeMap({
+          lines: [
+            { sku: "A", qty: 1 },
+            { sku: "B", qty: 2 },
+          ],
+          d: { note: "legacy", placedAt: "2026-10-01T12:00:00.000Z" },
+          notes: JSON.stringify(["written-while-packed"]),
+        }),
+      })
+    })
+
+  it.effect("a legacy native-map item still decodes after the field is configured packed", () =>
+    Effect.gen(function* () {
+      yield* writeLegacy("o-1")
+      const db = yield* client
+      const read = yield* db.entities.Orders.get({ orderId: "o-1" })
+      expect(read.lines).toEqual(lines)
+      expect(read.details).toEqual({ note: "legacy", placedAt })
+      // An unpacked object/array field holding a JSON string (written while it
+      // was packed) reads too.
+      expect(read.notes).toEqual(["written-while-packed"])
+      // A put re-packs it — the natural migrate-on-write.
+      yield* db.entities.Orders.put(read)
+      expect(stored(ORDER_KEY).lines?.S).toBeDefined()
+      expect(stored(ORDER_KEY).notes?.L).toBeDefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("asNative returns the stored S / B; asRecord / asItem decode", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const native = yield* Entity.asNative(Orders.get({ orderId: "o-1" }))
+      expect(native.lines?.S).toBeDefined()
+      expect(native.d?.B).toBeInstanceOf(Uint8Array)
+      const record = yield* Entity.asRecord(Orders.get({ orderId: "o-1" }))
+      expect(record.details).toEqual(bigDetails)
+      const item = yield* Entity.asItem(Orders.get({ orderId: "o-1" }))
+      expect(item.lines).toEqual([
+        { sku: "A", qty: 1 },
+        { sku: "B", qty: 2 },
+      ])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("reading a B value without its codec fails CompressorNotRegistered", () =>
+    Effect.gen(function* () {
+      // Bound without a registry: one provided at run time still reaches the
+      // bound op (the write); the read runs without one.
+      const db = yield* client
+      yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+      const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: "o-1" })))
+      expect(error).toBeInstanceOf(CompressorNotRegistered)
+      expect(error).toMatchObject({ codec: "gzip", direction: "decompress", attribute: "d" })
+      // A JSON (S) value needs no codec.
+      yield* db.entities.Orders.put(order({ orderId: "o-2", details: smallDetails }))
+      expect((yield* db.entities.Orders.get({ orderId: "o-2" })).details).toEqual(smallDetails)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
+
+  it.effect("queries and scans read a mix of native, JSON and compressed rows", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* writeLegacy("o-1")
+      yield* db.entities.Orders.put(order({ orderId: "o-2", details: smallDetails }))
+      yield* db.entities.Orders.put(order({ orderId: "o-3" }))
+      const byCustomer = yield* db.entities.Orders.byCustomer({ customerId: "c-1" }).collect()
+      expect(byCustomer.map((o) => o.details?.note).sort()).toEqual([
+        "hi",
+        "legacy",
+        "x".repeat(400),
+      ])
+      const scanned = yield* db.entities.Orders.scan().collect()
+      expect(scanned).toHaveLength(3)
+      expect(scanned.every((o) => o.lines.length === 2)).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a projection returns a packed field whole, as its parsed JSON", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const rows = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+        .select(["status", "lines", "details"])
+        .collect()
+      expect(rows).toEqual([
+        {
+          status: "open",
+          lines: [
+            { sku: "A", qty: 1 },
+            { sku: "B", qty: 2 },
+          ],
+          // Parsed JSON — the wire form, not schema-decoded (the date stays ISO).
+          details: { note: "x".repeat(400), placedAt: "2026-10-01T12:00:00.000Z" },
+        },
+      ])
+      const projected = yield* Orders.get({ orderId: "o-1" }).pipe(
+        Entity.project(["lines", "d"]),
+        Entity.asRecord,
+      )
+      expect(projected.lines).toEqual([
+        { sku: "A", qty: 1 },
+        { sku: "B", qty: 2 },
+      ])
+      expect((projected.d as { note: string }).note).toBe("x".repeat(400))
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("Batch.get and Transaction.transactGet decode packed fields", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const [viaBatch] = yield* Batch.get([db.entities.Orders.get({ orderId: "o-1" })])
+      expect(viaBatch?.details).toEqual(bigDetails)
+      const [viaTransaction] = yield* Transaction.transactGet([
+        db.entities.Orders.get({ orderId: "o-1" }),
+      ])
+      expect(viaTransaction?.lines).toEqual(lines)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — update", () => {
+  it.effect(".set() writes the whole packed value in its stored form; .remove() REMOVEs it", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order({ details: smallDetails }))
+      yield* db.entities.Orders.update({ orderId: "o-1" }).set({ details: bigDetails })
+      const update = sentUpdates.at(-1)!
+      const dValue = Object.entries(update.ExpressionAttributeNames!).find(
+        ([, name]) => name === "d",
+      )![0]
+      expect(update.UpdateExpression).toContain(`${dValue} = :`)
+      expect(stored(ORDER_KEY).d?.B).toBeInstanceOf(Uint8Array)
+      expect((yield* db.entities.Orders.get({ orderId: "o-1" })).details).toEqual(bigDetails)
+
+      yield* db.entities.Orders.update({ orderId: "o-1" }).remove(["details"])
+      expect(sentUpdates.at(-1)!.UpdateExpression).toMatch(/REMOVE/)
+      expect(stored(ORDER_KEY).d).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(
+    "refuses add / subtract / append / deleteFromSet / path ops on a packed field (EDD-9077)",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* db.entities.Orders.put(order())
+        const refused = (op: Effect.Effect<unknown, unknown>) =>
+          Effect.map(Effect.exit(op), (exit) => {
+            const error = failure(exit) as ValidationError
+            expect(error).toBeInstanceOf(ValidationError)
+            expect(String(error.cause)).toMatch(/\[EDD-9077\]/)
+            return String(error.cause)
+          })
+        const update = () => db.entities.Orders.update({ orderId: "o-1" })
+        expect(yield* refused(update().add({ lines: 1 }).asEffect())).toMatch(
+          /\.add\(\) on "lines"/,
+        )
+        yield* refused(update().subtract({ details: 1 }).asEffect())
+        yield* refused(
+          update()
+            .append({ lines: [{ sku: "C", qty: 3 }] })
+            .asEffect(),
+        )
+        yield* refused(
+          update()
+            .deleteFromSet({ lines: new Set(["x"]) })
+            .asEffect(),
+        )
+        expect(
+          yield* refused(
+            update()
+              .pathSet({ segments: ["lines", 0, "qty"], value: 9, isPath: false })
+              .asEffect(),
+          ),
+        ).toMatch(/pathSet on "lines"/)
+        yield* refused(
+          update()
+            .pathSet({ segments: ["details"], value: smallDetails, isPath: false })
+            .asEffect(),
+        )
+        yield* refused(update().pathRemove(["details", "note"]).asEffect())
+        yield* refused(
+          update()
+            .pathAppend({ segments: ["lines"], value: [] })
+            .asEffect(),
+        )
+        yield* refused(update().removeEntries("lines", ["0"]).asEffect())
+        // Nothing was written.
+        expect(sentUpdates).toHaveLength(0)
+      }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("the read-merge (retain) path carries unnamed packed values byte-identical", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Docs.put({
+        docId: "d-1",
+        title: "v1",
+        body: { text: "lorem ".repeat(50) },
+        origin: { source: "import", tags: ["a"] },
+      })
+      const before = stored("d-1")
+      expect(before.body?.B).toBeInstanceOf(Uint8Array)
+      sentTransactions.length = 0
+      yield* db.entities.Docs.update({ docId: "d-1" }).set({ title: "v2" })
+      // The live-item Update writes only what changed: not `body` / `origin`.
+      const write = sentTransactions[0]!.find((entry) => entry.Update !== undefined)!.Update!
+      expect(Object.values(write.ExpressionAttributeNames ?? {})).not.toContain("body")
+      expect(Object.values(write.ExpressionAttributeNames ?? {})).not.toContain("origin")
+      // The version snapshot copies the stored bytes as they were.
+      const snapshot = sentTransactions[0]!.find((entry) => entry.Put !== undefined)!.Put!.Item!
+      expect(snapshot.body?.B).toEqual(before.body?.B)
+      expect(snapshot.origin?.S).toBe(before.origin?.S)
+      const after = yield* db.entities.Docs.get({ docId: "d-1" })
+      expect(after.title).toBe("v2")
+      expect(after.body.text).toBe("lorem ".repeat(50))
+      const v1 = yield* db.entities.Docs.getVersion({ docId: "d-1" }, 1)
+      expect(v1.title).toBe("v1")
+      expect(v1.body.text).toBe("lorem ".repeat(50))
+      // A named packed field on the same path is packed fresh.
+      yield* db.entities.Docs.update({ docId: "d-1" }).set({ body: { text: "short" } })
+      expect(stored("d-1").body?.S).toBe('{"text":"short"}')
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an immutable packed field is compared by its unpacked JSON, not its bytes", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Docs.put({
+        docId: "d-2",
+        title: "t",
+        body: { text: "b" },
+        origin: { source: "import", tags: ["a"] },
+      })
+      // Same JSON, stored by an older writer as compressed binary: still equal.
+      const live = stored("d-2")
+      const gz = NodeCompression.gzip().compress(
+        new TextEncoder().encode(JSON.stringify({ source: "import", tags: ["a"] })),
+      )
+      store.set(keyOf(live), { ...live, origin: { B: new Uint8Array([0x21, ...gz]) } })
+      yield* db.entities.Docs.update({ docId: "d-2" }).set({
+        title: "t2",
+        origin: { source: "import", tags: ["a"] },
+      })
+      expect((yield* db.entities.Docs.get({ docId: "d-2" })).title).toBe("t2")
+      const error = failure(
+        yield* Effect.exit(
+          db.entities.Docs.update({ docId: "d-2" })
+            .set({ origin: { source: "other", tags: [] } })
+            .asEffect(),
+        ),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(String((error as ValidationError).cause)).toMatch(/"origin" is immutable/)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Expressions and projections (EDD-9076)
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — expression guards", () => {
+  it.effect("conditions: exists / notExists on the whole field pass; anything else throws", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      yield* db.entities.Orders.update({ orderId: "o-1" })
+        .set({ status: "paid" })
+        .condition((t, { exists }) => exists(t.lines))
+      expect(sentUpdates.at(-1)!.ConditionExpression).toMatch(/attribute_exists/)
+
+      expect(() => db.entities.Orders.update({ orderId: "o-1" }).condition({ lines: [] })).toThrow(
+        /\[EDD-9076\] Entity "Order".*applies = to "lines"/,
+      )
+      expect(() =>
+        db.entities.Orders.put(order()).condition((t, { eq }) =>
+          // @ts-expect-error — a packed field's path is not a comparable Path
+          eq(t.details, smallDetails),
+        ),
+      ).toThrow(/\[EDD-9076\]/)
+      expect(() =>
+        db.entities.Orders.delete({ orderId: "o-1" }).condition((t, { eq }) =>
+          // @ts-expect-error — a packed field exposes no nested paths
+          eq(t.details.note, "x"),
+        ),
+      ).toThrow(/addresses "details\.note"/)
+      expect(() =>
+        db.entities.Orders.put(order()).condition((t, { gt }) =>
+          // @ts-expect-error — no size() on a packed field
+          gt(t.lines.size(), 1),
+        ),
+      ).toThrow(/\[EDD-9076\]/)
+      // Unbound Entity.condition is guarded too.
+      expect(() => Orders.condition({ lines: [] })).toThrow(/\[EDD-9076\]/)
+      expect(() =>
+        Orders.update({ orderId: "o-1" }).pipe(Orders.condition({ notExists: "lines" })),
+      ).not.toThrow()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("filters and projections: whole-field only, with a filterBy hint", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const query = () => db.entities.Orders.byCustomer({ customerId: "c-1" })
+      expect(() => query().filter({ lines: [] })).toThrow(/\[EDD-9076\].*filterBy/)
+      expect(() =>
+        // @ts-expect-error — no nested path on a packed field
+        query().filter((t, { eq }) => eq(t.details.note, "x")),
+      ).toThrow(/\[EDD-9076\]/)
+      // The stored (renamed) name is guarded as well.
+      expect(() => query().filter({ d: 1 })).toThrow(/\[EDD-9076\]/)
+      expect(() => query().select(["details.note"])).toThrow(/\[EDD-9076\].*projection/)
+      expect(() => Orders.get({ orderId: "o-1" }).pipe(Entity.project(["d.note"]))).toThrow(
+        /\[EDD-9076\]/,
+      )
+      // Allowed: exists on the whole field, a non-packed filter, whole-field select.
+      yield* db.entities.Orders.put(order())
+      const kept = yield* query()
+        .filter((t, { exists, eq, and }) => and(exists(t.details), eq(t.status, "open")))
+        .collect()
+      expect(kept).toHaveLength(1)
+      const selected = yield* query()
+        .select((t) => [t.lines, t.status])
+        .collect()
+      expect(selected[0]!.status).toBe("open")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it("Transaction.check refuses a compiled condition looking inside a packed field", () => {
+    const get = Orders.get({ orderId: "o-1" })
+    expect(() => Transaction.check(get, Expression.condition({ eq: { lines: [] } }))).toThrow(
+      /\[EDD-9076\]/,
+    )
+    expect(() =>
+      Transaction.check(get, Expression.condition({ attributeExists: "lines" })),
+    ).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Batch / Transaction writes
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — batch and transaction writes", () => {
+  it.effect("Batch.write and Transaction.transactWrite pack like put", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* Batch.write([db.entities.Orders.put(order({ orderId: "o-b" }))])
+      expect(stored("o-b").d?.B).toBeInstanceOf(Uint8Array)
+      yield* Transaction.transactWrite([db.entities.Orders.put(order({ orderId: "o-t" }))])
+      const tx = sentTransactions.at(-1)![0]!.Put!.Item!
+      expect(tx.lines?.S).toBeDefined()
+      expect(tx.d?.B).toBeInstanceOf(Uint8Array)
+      const back = yield* db.entities.Orders.get({ orderId: "o-t" })
+      expect(back.details).toEqual(bigDetails)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Lifecycle: soft delete / restore, time series
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — lifecycle", () => {
+  it.effect("soft delete copies stored values onto the tombstone; restore writes them back", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Docs.put({
+        docId: "d-3",
+        title: "t",
+        body: { text: "z".repeat(300) },
+        origin: { source: "s", tags: [] },
+      })
+      const live = stored("d-3")
+      yield* db.entities.Docs.delete({ docId: "d-3" })
+      const tombstone = [...store.values()].find((item) => item.sk?.S?.includes("#deleted#"))!
+      expect(tombstone.body?.B).toEqual(live.body?.B)
+      const deleted = yield* db.entities.Docs.deleted.get({ docId: "d-3" })
+      expect(deleted.body.text).toBe("z".repeat(300))
+      const listed = yield* db.entities.Docs.deleted.list({ docId: "d-3" }).collect()
+      expect(listed[0]!.body.text).toBe("z".repeat(300))
+      const restored = yield* db.entities.Docs.restore({ docId: "d-3" })
+      expect(restored.body.text).toBe("z".repeat(300))
+      expect(stored("d-3").body?.B).toEqual(live.body?.B)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("time-series append writes the same packed value on the current and event item", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      const payload = { values: Array.from({ length: 50 }, (_, i) => i) }
+      yield* db.entities.Readings.append({ deviceId: "dev", at: "2026-10-01", payload })
+      const transaction = sentTransactions.at(-1)!
+      const update = transaction[0]!.Update!
+      const event = transaction[1]!.Put!.Item!
+      const placeholder = Object.entries(update.ExpressionAttributeNames!).find(
+        ([, name]) => name === "payload",
+      )![0]
+      const clause = update.UpdateExpression!.split(", ").find((c) => c.startsWith(placeholder))!
+      const setValue = update.ExpressionAttributeValues![clause.split(" = ")[1]!]!
+      expect(setValue.B).toBeInstanceOf(Uint8Array)
+      expect(event.payload?.B).toEqual(setValue.B)
+      const current = yield* db.entities.Readings.get({ deviceId: "dev" })
+      expect(current.payload).toEqual(payload)
+      const history = yield* db.entities.Readings.history({ deviceId: "dev" }).collect()
+      expect(history.map((r) => r.payload)).toEqual([payload])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// DynamoDB Streams images
+// ---------------------------------------------------------------------------
+
+describe("Entity.decodeMarshalledItem — stream images", () => {
+  const base64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64")
+
+  it.effect("decodes DynamoDB JSON with B as bytes or base64, and unmarshalled images", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const image = stored(ORDER_KEY)
+      const expected = yield* Entity.asItem(Orders.get({ orderId: "o-1" }))
+
+      // DynamoDB JSON, B as bytes (an SDK GetRecords response).
+      expect(yield* Entity.decodeMarshalledItem(Orders, image)).toEqual(expected)
+      // DynamoDB JSON, B as base64 text (Lambda / EventBridge Pipes).
+      const lambda = { ...image, d: { B: base64(image.d!.B!) } }
+      expect(yield* Entity.decodeMarshalledItem(Orders, lambda)).toEqual(expected)
+      // Already unmarshalled, B still base64 text.
+      const unmarshalled = { ...fromAttributeMap(image), d: base64(image.d!.B!) }
+      expect(yield* Entity.decodeMarshalledItem(Orders, unmarshalled)).toEqual(expected)
+      // Already unmarshalled, B as bytes.
+      expect(yield* Entity.decodeMarshalledItem(Orders, fromAttributeMap(image))).toEqual(expected)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("honours field renames and sparse maps (previously undecodable images)", () =>
+    Effect.gen(function* () {
+      class Page extends Schema.Class<Page>("Page")({
+        pageId: Schema.String,
+        title: Schema.String,
+        metrics: Schema.Record(Schema.String, Schema.Number),
+      }) {}
+      const Pages = Entity.make({
+        model: DynamoModel.configure(Page, {
+          title: { field: "t" },
+          metrics: { storedAs: DynamoModel.SparseMap() },
+        }),
+        entityType: "Page",
+        primaryKey: {
+          pk: { field: "pk", composite: ["pageId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      })
+      const decoded = yield* Entity.decodeMarshalledItem(Pages, {
+        pk: { S: "$packed#v1#page#p" },
+        sk: { S: "$packed#v1#page" },
+        __edd_e__: { S: "Page" },
+        pageId: { S: "p" },
+        t: { S: "Hello" },
+        "metrics#2026-01": { N: "3" },
+      })
+      expect(decoded).toMatchObject({ pageId: "p", title: "Hello", metrics: { "2026-01": 3 } })
+    }),
+  )
+
+  it.effect("a compressed value without its codec fails CompressorNotRegistered", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+      const image = stored(ORDER_KEY)
+      const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, image)))
+      expect(error).toBeInstanceOf(CompressorNotRegistered)
+      // With the codec provided where the decode runs, it decodes.
+      const decoded = yield* Entity.decodeMarshalledItem(Orders, image).pipe(Effect.provide(Codecs))
+      expect((decoded as { details: unknown }).details).toEqual(bigDetails)
+    }).pipe(Effect.provide(NoCodecs)),
+  )
+})

@@ -5,7 +5,11 @@
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type { ItemNotFound, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type {
+  CompressorNotRegistered,
+  ItemNotFound,
+  ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import type { IndexPkInput } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { type DateTime, Effect, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
@@ -1077,7 +1081,9 @@ describe("Entity types — bound get() is still an Effect", () => {
   >
   type BoundGetOfUser = ReturnType<UserBound["get"]>
   type UnboundGetOfUser = ReturnType<typeof UserEntity.get>
-  type GetErrors = ItemNotFound | DynamoClientError | ValidationError
+  // Packed storage (#147) adds `CompressorNotRegistered`: a stored value may be
+  // compressed with a codec the reading process has not registered.
+  type GetErrors = ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered
 
   // `users` is a type-level stand-in and the functions below are never called.
   // The COMPILE is the assertion: these are the exact call shapes callers
@@ -1317,6 +1323,81 @@ describe("Entity types — update returnValues", () => {
     const full = UserEntity.update({ userId: "u-1" })
     expectTypeOf<Native<ReturnType<typeof Entity.asNative<typeof full>>>>().toEqualTypeOf<
       Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    >()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Packed fields (#147) — PathBuilder typing
+// ---------------------------------------------------------------------------
+
+describe("packed fields — type level", () => {
+  class Shipment extends Schema.Class<Shipment>("Shipment")({
+    shipmentId: Schema.String,
+    carrier: Schema.String,
+    parcels: Schema.Array(Schema.Struct({ weight: Schema.Number })),
+    address: Schema.Struct({ city: Schema.String }),
+  }) {}
+
+  const Shipments = Entity.make({
+    model: DynamoModel.configure(Shipment, {
+      parcels: { storedAs: DynamoModel.Packed({ format: "json" }) },
+      address: {
+        storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+      },
+    }),
+    entityType: "Shipment",
+    primaryKey: {
+      pk: { field: "pk", composite: ["shipmentId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
+
+  it("carries the packed field names", () => {
+    expectTypeOf(Shipments._packedFields).toEqualTypeOf<ReadonlyArray<"parcels" | "address">>()
+    expectTypeOf(UserEntity._packedFields).toEqualTypeOf<ReadonlyArray<never>>()
+  })
+
+  it("a packed field's path is a PackedPath: exists / notExists / select only", () => {
+    Shipments.condition((t, { exists, notExists, and, eq }) =>
+      and(exists(t.parcels), notExists(t.address), eq(t.carrier, "dhl")),
+    )
+    Shipments.select((t) => [t.parcels, t.carrier])
+    // Each refused at runtime too ([EDD-9076]) — the throw is not the point here.
+    expect(() =>
+      Shipments.condition((t, { eq }) =>
+        // @ts-expect-error — a packed field is not a comparable Path
+        eq(t.parcels, []),
+      ),
+    ).toThrow()
+    expect(() =>
+      Shipments.filter((t, { beginsWith }) =>
+        // @ts-expect-error — no nested property on a packed field
+        beginsWith(t.address.city, "M"),
+      ),
+    ).toThrow()
+    expect(() =>
+      Shipments.filter((t, { contains }) =>
+        // @ts-expect-error — contains() needs a Path
+        contains(t.parcels, 1),
+      ),
+    ).toThrow()
+    // @ts-expect-error — no .at() on a packed array field
+    expect(() => Shipments.select((t) => [t.parcels.at(0)])).toThrow()
+    // A non-packed entity's object field keeps its nested paths.
+    UserEntity.condition((t, { eq }) => eq(t.email, "x"))
+  })
+
+  it("configure refuses Packed on a scalar field", () => {
+    DynamoModel.configure(Shipment, {
+      // @ts-expect-error — a scalar field cannot be packed
+      carrier: { storedAs: DynamoModel.Packed({ format: "json" }) },
+    })
+  })
+
+  it("Entity.Marshalled admits binary (a compressed packed value)", () => {
+    expectTypeOf<Entity.Marshalled<typeof Shipments>[string]["B"]>().toEqualTypeOf<
+      Uint8Array | undefined
     >()
   })
 })
