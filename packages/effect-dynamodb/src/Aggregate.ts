@@ -20,6 +20,7 @@ import {
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
+  type CompressorNotRegistered,
   ConditionalCheckFailed,
   DynamoError,
   DynamoValidationError,
@@ -72,6 +73,7 @@ import {
   isEmptyExpr,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
+import { currentRegistry, packItem, unpackItem } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import {
@@ -164,6 +166,13 @@ export type TypeId = typeof SchemaAggregateTypeId
 interface ResolvedNode {
   readonly fieldName: string | null // null for root
   readonly entityType: string
+  /**
+   * Edge attributes stored packed (#147): the edge entity's
+   * `storedAs: DynamoModel.Packed` fields that are top-level attributes of this
+   * node's items (a `one` edge's flattened entity, a `many` edge element that
+   * IS the entity). Packed on write, read by stored form on read.
+   */
+  readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
   readonly cardinality: "root" | "one" | "many"
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
@@ -295,6 +304,7 @@ export type AggregateWriteError =
   | AggregateTransactionOverflow
   | DynamoClientError
   | ValidationError
+  | CompressorNotRegistered
   | RefNotFound
   | ItemNotFound
   | TransactionCancelled
@@ -354,7 +364,7 @@ export interface Aggregate<
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -418,7 +428,7 @@ export interface Aggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
     DynamoClient | TableConfig
   >
 
@@ -468,7 +478,7 @@ export interface BoundAggregate<
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -492,7 +502,7 @@ export interface BoundAggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
     never
   >
 
@@ -1182,6 +1192,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     resolveRef,
   })
 
+  // Packed edge attributes by item entity type (#147).
+  const packedByType = collectPackedByType(rootNode)
+
   // Attribute ENCODERS for the root item: decompose works from the
   // schema-decoded domain object, so every root attribute holding a wire
   // transform — a date, a transformed scalar, or a container of either — is
@@ -1372,6 +1385,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
     key: Record<string, unknown>,
     rejected: (diagnosis: Diagnosis, original: unknown) => E,
   ) =>
+    Effect.flatMap(readPartitionRaw(key, rejected), (read) =>
+      // Packed edge attributes, read by their stored form (#147).
+      Effect.as(unpackAggregateItems(read.allItems, packedByType, aggregateName), read),
+    )
+
+  /** {@link readPartition} without unpacking — `delete` needs only the keys. */
+  const readPartitionRaw = <E>(
+    key: Record<string, unknown>,
+    rejected: (diagnosis: Diagnosis, original: unknown) => E,
+  ) =>
     Effect.gen(function* () {
       const client = yield* DynamoClient
       const tableConfig: TableConfig = yield* config.table.Tag
@@ -1500,7 +1523,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         //    Every row is new, so `created` has nothing to carry forward.
         const now = yield* DateTime.now
         const dynamoGroups = buildDynamoItems(
-          groups,
+          yield* packAggregateGroups(groups, packedByType, aggregateName, "create"),
           config,
           pkValue,
           collectionSkComposites,
@@ -1629,8 +1652,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
         //    PUTs and would otherwise clobber it. The old set is only mined for
         //    (pk, sk) delete keys, so it is never stamped.
         const now = yield* DateTime.now
+        // Packed AFTER the group diff above compared the decomposed values, so
+        // an unchanged packed value is never rewritten (#147).
         const newDynamo = buildDynamoItems(
-          newGroups,
+          yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
           config,
           pkValue,
           KeyComposer.extractComposites(
@@ -1705,7 +1730,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     delete: (key) =>
       Effect.gen(function* () {
-        const { client, tableConfig, allItems } = yield* readPartition(
+        const { client, tableConfig, allItems } = yield* readPartitionRaw(
           key,
           // `delete` declares no `ValidationError`: a rejected read keeps
           // DynamoDB's own tag, its message explained.
@@ -2000,6 +2025,42 @@ interface ResolveNodeArgs {
   readonly keyAttrEncoders?: AttrEncoders | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
+  readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
+}
+
+/**
+ * The edge entity's packed fields that are top-level attributes of the node's
+ * items (`itemFields`), refusing one that is a discriminator or a declared
+ * sort-key composite (`[EDD-9072]`): those are compared and composed as scalar
+ * stored values.
+ */
+const edgePackedFields = (
+  edgeName: string,
+  entity: { readonly model: Schema.Top; readonly entityType: string } | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+  discriminator: Record<string, unknown> | undefined,
+  skComposite: ReadonlyArray<string> | undefined,
+): Readonly<Record<string, DynamoModel.PackedConfig>> | undefined => {
+  if (entity === undefined) return undefined
+  const configured = DynamoModel.getPackedFields(entity.model)
+  const packed: Record<string, DynamoModel.PackedConfig> = {}
+  for (const [field, storedAs] of Object.entries(configured)) {
+    if (itemFields !== undefined && !(field in itemFields)) continue
+    if (discriminator !== undefined && field in discriminator) {
+      throw new Error(
+        `[EDD-9072] Aggregate edge "${edgeName}": discriminator "${field}" is a packed field of ` +
+          `entity "${entity.entityType}". A discriminator is matched as a scalar stored value.`,
+      )
+    }
+    if ((skComposite ?? []).some((path) => path.split(".")[0] === field)) {
+      throw new Error(
+        `[EDD-9072] Aggregate edge "${edgeName}": sort-key composite "${field}" is a packed field ` +
+          `of entity "${entity.entityType}". Key composites must be scalar model values.`,
+      )
+    }
+    packed[field] = storedAs
+  }
+  return Object.keys(packed).length > 0 ? packed : undefined
 }
 
 const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
@@ -2046,6 +2107,15 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
+            packed: edgePackedFields(
+              field,
+              edge.entity as
+                | { readonly model: Schema.Top; readonly entityType: string }
+                | undefined,
+              valueFields,
+              edge.discriminator,
+              undefined,
+            ),
           }),
         )
       } else if (edge._tag === "ManyEdge") {
@@ -2076,6 +2146,15 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             refIdentifierField: edge.entity
               ? DynamoModel.getIdentifierField(edge.entity.model)?.name
               : undefined,
+            packed: edgePackedFields(
+              field,
+              edge.entity as
+                | { readonly model: Schema.Top; readonly entityType: string }
+                | undefined,
+              elementFields,
+              discriminator,
+              edge.sk?.composite,
+            ),
           }),
         )
       } else if (edge._tag === "BoundSubAggregate") {
@@ -2121,10 +2200,82 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(decompose !== undefined && { decompose }),
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
+    ...(args.packed !== undefined && { packed: args.packed }),
     attrEncoders,
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
   }
 }
+
+// ---------------------------------------------------------------------------
+// Internal: packed edge attributes (#147)
+// ---------------------------------------------------------------------------
+
+/** Every node's packed attributes, by the entity type of its items. */
+const collectPackedByType = (
+  root: ResolvedNode,
+): ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>> => {
+  const out = new Map<string, Record<string, DynamoModel.PackedConfig>>()
+  const walk = (node: ResolvedNode): void => {
+    if (node.packed !== undefined) {
+      out.set(node.entityType, { ...(out.get(node.entityType) ?? {}), ...node.packed })
+    }
+    for (const child of node.children) walk(child)
+  }
+  walk(root)
+  return out
+}
+
+/** The decomposed groups with each item's packed attributes in their stored form. */
+const packAggregateGroups = (
+  groups: ReadonlyArray<TransactionGroup>,
+  packedByType: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>,
+  aggregateName: string,
+  operation: string,
+): Effect.Effect<ReadonlyArray<TransactionGroup>, ValidationError | CompressorNotRegistered> =>
+  packedByType.size === 0
+    ? Effect.succeed(groups)
+    : Effect.flatMap(currentRegistry, (registry) =>
+        Effect.forEach(groups, (group) =>
+          Effect.map(
+            Effect.forEach(group.items, (item) => {
+              const packed = packedByType.get(item.entityType)
+              if (packed === undefined) return Effect.succeed(item)
+              const attributes = { ...item.attributes }
+              return Effect.as(
+                packItem(attributes, packed, registry, {
+                  entityType: `${aggregateName}.${item.member}`,
+                  operation: `aggregate.${operation}.packed`,
+                }),
+                { ...item, attributes },
+              )
+            }),
+            (items) => ({ ...group, items }),
+          ),
+        ),
+      )
+
+/** Read, in place, each item's packed attributes by their stored form. */
+const unpackAggregateItems = (
+  items: ReadonlyArray<Record<string, unknown>>,
+  packedByType: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>,
+  aggregateName: string,
+): Effect.Effect<void, ValidationError | CompressorNotRegistered> =>
+  packedByType.size === 0
+    ? Effect.void
+    : Effect.flatMap(currentRegistry, (registry) =>
+        Effect.forEach(
+          items,
+          (item) => {
+            const packed = packedByType.get(item.__edd_e__ as string)
+            if (packed === undefined) return Effect.void
+            return unpackItem(item, Object.keys(packed), registry, {
+              entityType: `${aggregateName}.${String(item.__edd_e__)}`,
+              operation: "aggregate.decode",
+            })
+          },
+          { discard: true },
+        ),
+      )
 
 // ---------------------------------------------------------------------------
 // Internal: Query all items in the aggregate partition
@@ -2411,7 +2562,7 @@ const hydrateAggregateRefs = (
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
-  RefNotFound | DynamoClientError | ValidationError,
+  RefNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
