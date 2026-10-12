@@ -83,6 +83,59 @@ export interface SparsePath<
 }
 
 // ---------------------------------------------------------------------------
+// PackedPath — Path for a packed attribute (`storedAs: DynamoModel.Packed`)
+// ---------------------------------------------------------------------------
+
+export const PackedPathTag: unique symbol = Symbol.for("effect-dynamodb/PackedPath")
+export type PackedPathTag = typeof PackedPathTag
+
+/**
+ * Path to a field stored packed (`storedAs: DynamoModel.Packed(...)`). DynamoDB
+ * holds the field as one opaque JSON string or compressed binary value, so the
+ * path has no property, `.at`, `.entry` or `.size` accessors and is **not** a
+ * {@link Path}: comparisons, `size`, `contains`, `beginsWith` and path update
+ * operations reject it at compile time. It is accepted by `exists` /
+ * `notExists` and by projections, which address the field as a whole.
+ */
+export interface PackedPath<
+  Root = unknown,
+  Value = unknown,
+  Keys extends ReadonlyArray<string | number> = ReadonlyArray<string | number>,
+> {
+  readonly [PathTag]: PathTag
+  readonly [PackedPathTag]: PackedPathTag
+  readonly segments: ReadonlyArray<string | number>
+  /** Phantom */ readonly _Root: (_: never) => Root
+  /** Phantom */ readonly _Value: (_: never) => Value
+  /** Phantom */ readonly _Keys: (_: never) => Keys
+}
+
+declare const PackedValueTag: unique symbol
+
+/**
+ * @internal Marker a path model ({@link PathModel}) puts on a packed field so
+ * the {@link PathBuilder} produces a {@link PackedPath} for it.
+ */
+export interface PackedValue<V> {
+  readonly [PackedValueTag]: (_: never) => V
+}
+
+/**
+ * The model a path builder walks for an entity with packed fields `P`: each
+ * packed top-level field is marked {@link PackedValue}. `Model` unchanged when
+ * there are none.
+ */
+export type PathModel<Model, P extends PropertyKey> = [P] extends [never]
+  ? Model
+  : unknown extends Model
+    ? Model
+    : {
+        [K in keyof Model]: K extends P
+          ? PackedValue<NonNullable<Model[K]>> | Extract<Model[K], null | undefined>
+          : Model[K]
+      }
+
+// ---------------------------------------------------------------------------
 // PathBuilder — recursive mapped type that creates typed path accessors
 // ---------------------------------------------------------------------------
 
@@ -97,19 +150,21 @@ export interface SparsePath<
  * with `.entry(key)` accessor.
  */
 export type PathBuilder<Root, Model, Keys extends ReadonlyArray<string | number> = []> = {
-  readonly [K in keyof Model]-?: NonNullable<Model[K]> extends ReadonlyArray<infer E>
-    ? ArrayPath<Root, E, [...Keys, K & string]>
-    : NonNullable<Model[K]> extends globalThis.Record<infer KK, infer V>
-      ? string extends KK
-        ? // String-indexed Record — treat as a sparse-map candidate. The
-          // runtime decides whether `.entry()` is actually wired (driven by
-          // the sparseFields map). For non-sparse Records, callers won't
-          // typically reach for `.entry`; for sparse ones, `.entry` is the
-          // expected entry point.
-          SparsePath<Root, V, [...Keys, K & string]>
-        : PathBuilder<Root, NonNullable<Model[K]>, [...Keys, K & string]> &
-            Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
-      : Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
+  readonly [K in keyof Model]-?: NonNullable<Model[K]> extends PackedValue<infer PV>
+    ? PackedPath<Root, PV, [...Keys, K & string]>
+    : NonNullable<Model[K]> extends ReadonlyArray<infer E>
+      ? ArrayPath<Root, E, [...Keys, K & string]>
+      : NonNullable<Model[K]> extends globalThis.Record<infer KK, infer V>
+        ? string extends KK
+          ? // String-indexed Record — treat as a sparse-map candidate. The
+            // runtime decides whether `.entry()` is actually wired (driven by
+            // the sparseFields map). For non-sparse Records, callers won't
+            // typically reach for `.entry`; for sparse ones, `.entry` is the
+            // expected entry point.
+            SparsePath<Root, V, [...Keys, K & string]>
+          : PathBuilder<Root, NonNullable<Model[K]>, [...Keys, K & string]> &
+              Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
+        : Path<Root, NonNullable<Model[K]>, [...Keys, K & string]>
 }
 
 // ---------------------------------------------------------------------------
@@ -287,4 +342,5 @@ export type DeepPick<
 > = UnionToIntersection<{ [K in keyof Paths]: DeepPickOne<T, Paths[K]> }[number]>
 
 /** Extract the Keys tuple from a Path type */
-export type PathKeys<P> = P extends Path<any, any, infer K> ? K : never
+export type PathKeys<P> =
+  P extends Path<any, any, infer K> ? K : P extends PackedPath<any, any, infer K> ? K : never

@@ -59,7 +59,7 @@ import type {
 } from "./EntityOps.js"
 import type { ConditionOps, Expr } from "./Expr.js"
 import { parseSimpleShorthand } from "./Expr.js"
-import type { PathBuilder } from "./PathBuilder.js"
+import type { PathBuilder, PathModel } from "./PathBuilder.js"
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -106,9 +106,16 @@ export interface BoundWriteOp {
   readonly _boundOpType: "put" | "delete"
 }
 
-/** Condition input accepted by `.condition()` — callback or shorthand record. */
-export type ConditionArg<Model> =
-  | ((t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr)
+/**
+ * Condition input accepted by `.condition()` — callback or shorthand record.
+ * `P` names the entity's packed fields: their paths are {@link PackedPath}s,
+ * usable only with `exists` / `notExists` (see `PathModel`).
+ */
+export type ConditionArg<Model, P extends PropertyKey = never> =
+  | ((
+      t: PathBuilder<PathModel<Model, P>, PathModel<Model, P>, never>,
+      ops: ConditionOps<PathModel<Model, P>>,
+    ) => Expr)
   | globalThis.Record<string, unknown>
 
 /** Execution wiring shared by all bound-CRUD builders. */
@@ -140,7 +147,8 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
  * yield* db.entities.Users.create(input).condition((t, { eq }) => eq(t.status, "active"))
  * ```
  */
-export interface BoundPut<Model, A, E, VN extends string = string> extends Pipeable.Pipeable {
+export interface BoundPut<Model, A, E, VN extends string = string, P extends PropertyKey = never>
+  extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "put"
   /**
@@ -151,14 +159,14 @@ export interface BoundPut<Model, A, E, VN extends string = string> extends Pipea
    * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
    */
   readonly condition: (
-    cond: ConditionArg<Model>,
-  ) => BoundPut<Model, A, E | ConditionalCheckFailed, VN>
+    cond: ConditionArg<Model, P>,
+  ) => BoundPut<Model, A, E | ConditionalCheckFailed, VN, P>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
    * name declared on `Entity.make({ vectorIndexes })`.
    */
-  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundPut<Model, A, E, VN>
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundPut<Model, A, E, VN, P>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -214,7 +222,8 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * yield* db.entities.Tasks.delete({ taskId }).returnValues("allOld")
  * ```
  */
-export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
+export interface BoundDelete<Model, E, A = void, P extends PropertyKey = never>
+  extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "delete"
   /**
@@ -225,8 +234,8 @@ export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
    * `Effect.catchTag("ConditionalCheckFailed", ...)` type-checks downstream.
    */
   readonly condition: (
-    cond: ConditionArg<Model>,
-  ) => BoundDelete<Model, E | ConditionalCheckFailed, A>
+    cond: ConditionArg<Model, P>,
+  ) => BoundDelete<Model, E | ConditionalCheckFailed, A, P>
   /**
    * Set ReturnValues mode: `"allOld"` returns the item the delete removed
    * (`undefined` when there was none); `"none"` returns nothing. DynamoDB has no
@@ -235,7 +244,7 @@ export interface BoundDelete<Model, E, A = void> extends Pipeable.Pipeable {
    */
   readonly returnValues: <M extends ReturnValuesMode>(
     mode: M,
-  ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void>
+  ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void, P>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -295,27 +304,36 @@ export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E
  *   .remove(["temporaryFlag"])
  * ```
  */
-export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends Pipeable.Pipeable {
+export interface BoundUpdate<
+  Model,
+  A,
+  U,
+  E,
+  VN extends string = string,
+  P extends PropertyKey = never,
+> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "update"
   /** Set the fields to update (record-based SET). */
-  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN>
+  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN, P>
   /** Remove attributes (REMOVE clause). */
-  readonly remove: (fields: ReadonlyArray<string>) => BoundUpdate<Model, A, U, E, VN>
+  readonly remove: (fields: ReadonlyArray<string>) => BoundUpdate<Model, A, U, E, VN, P>
   /** Atomic numeric ADD. */
-  readonly add: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN>
+  readonly add: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN, P>
   /** Numeric SET subtraction (synthesized as `SET #f = #f - :v`). */
-  readonly subtract: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN>
+  readonly subtract: (
+    values: globalThis.Record<string, number>,
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /** List append (synthesized as `SET #f = list_append(#f, :v)`). */
   readonly append: (
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ) => BoundUpdate<Model, A, U, E, VN>
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /** Delete elements from a set attribute. */
   readonly deleteFromSet: (
     values: globalThis.Record<string, unknown>,
-  ) => BoundUpdate<Model, A, U, E, VN>
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /** Optimistic concurrency — expected version. */
-  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN>
+  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN, P>
   /**
    * Add a condition expression. Callback or shorthand.
    *
@@ -329,14 +347,17 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
    * a failed condition a `ConditionalCheckFailed`.
    */
   readonly condition: (
-    cond: ConditionArg<Model>,
-  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN>
+    cond: ConditionArg<Model, P>,
+  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN, P>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
    * name declared on `Entity.make({ vectorIndexes })`.
    */
-  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundUpdate<Model, A, U, E, VN>
+  readonly withVector: (
+    name: VN,
+    vector: ReadonlyArray<number>,
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /**
    * What the update returns. `"allNew"` (the default) / `"allOld"`: the whole
    * item after / before it. `"updatedNew"` / `"updatedOld"`: only the
@@ -345,29 +366,31 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
    */
   readonly returnValues: <M extends ReturnValuesMode>(
     mode: M,
-  ) => BoundUpdate<Model, UpdateReturn<Model, M>, U, E, VN>
+  ) => BoundUpdate<Model, UpdateReturn<Model, M>, U, E, VN, P>
   /** Configure cascade updates to denormalized target entities. */
   readonly cascade: (config: {
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }) => BoundUpdate<Model, A, U, E, VN>
+  }) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based SET. */
-  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based REMOVE. */
-  readonly pathRemove: (segments: ReadonlyArray<string | number>) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathRemove: (
+    segments: ReadonlyArray<string | number>,
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based ADD. */
-  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based SUBTRACT. */
-  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based APPEND. */
-  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based PREPEND. */
-  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based if_not_exists. */
-  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN, P>
   /** Path-based DELETE (set removal). */
-  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN>
+  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN, P>
   /**
    * Remove specific entries from a sparse-map field. Compiles to
    * `REMOVE <prefix>#k1, <prefix>#k2, ...`. Removing an entry that doesn't
@@ -376,14 +399,14 @@ export interface BoundUpdate<Model, A, U, E, VN extends string = string> extends
   readonly removeEntries: (
     field: string,
     keys: ReadonlyArray<string>,
-  ) => BoundUpdate<Model, A, U, E, VN>
+  ) => BoundUpdate<Model, A, U, E, VN, P>
   /**
    * Clear all entries of a sparse-map field. Two-op helper: reads the current
    * item, then folds REMOVE clauses for the discovered `<prefix>#*` attrs into
    * the same final UpdateItem. Atomic via the version CAS for `versioned`
    * entities; best-effort for non-versioned.
    */
-  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN>
+  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN, P>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -685,9 +708,10 @@ export const makeBoundUpdate = <Model, A, U, E, VN extends string = string>(
  * yield* db.entities.Telemetry.append(input).condition(c).skipFollowUp() // → void
  * ```
  */
-export interface BoundAppend<Model, A, E, ESkip> extends Pipeable.Pipeable {
+export interface BoundAppend<Model, A, E, ESkip, P extends PropertyKey = never>
+  extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model>) => BoundAppend<Model, A, E, ESkip>
+  readonly condition: (cond: ConditionArg<Model, P>) => BoundAppend<Model, A, E, ESkip, P>
   /**
    * Emit REMOVE clauses for `appendInput` attributes the caller wants cleared
    * on the current item. Cleared attributes also cascade-drop any GSI half
@@ -706,9 +730,9 @@ export interface BoundAppend<Model, A, E, ESkip> extends Pipeable.Pipeable {
    *
    * Chained `.remove()` calls accumulate.
    */
-  readonly remove: (attrs: ReadonlyArray<string>) => BoundAppend<Model, A, E, ESkip>
+  readonly remove: (attrs: ReadonlyArray<string>) => BoundAppend<Model, A, E, ESkip, P>
   /** Skip the follow-up GetItem; success becomes `void`. */
-  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip>
+  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */

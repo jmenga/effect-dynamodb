@@ -8,7 +8,13 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ConditionInput } from "../Expression.js"
 import { toAttributeValue } from "../Marshaller.js"
-import { compilePath, type Path, PathTag, type SizeOperand } from "./PathBuilder.js"
+import {
+  compilePath,
+  type PackedPath,
+  type Path,
+  PathTag,
+  type SizeOperand,
+} from "./PathBuilder.js"
 
 // ---------------------------------------------------------------------------
 // Operand — either a path reference, a literal value, or a size() function
@@ -148,8 +154,10 @@ export interface ConditionOps<Model> {
   readonly gte: <V>(left: Path<Model, V> | SizeOperand<Model>, right: V | Path<Model, V>) => Expr
   readonly between: <V>(operand: Path<Model, V>, low: V, high: V) => Expr
   readonly isIn: <V>(operand: Path<Model, V>, values: ReadonlyArray<V>) => Expr
-  readonly exists: (operand: Path<Model, any>) => Expr
-  readonly notExists: (operand: Path<Model, any>) => Expr
+  /** `attribute_exists` — also accepts a packed field ({@link PackedPath}) as a whole. */
+  readonly exists: (operand: Path<Model, any> | PackedPath<Model, any>) => Expr
+  /** `attribute_not_exists` — also accepts a packed field ({@link PackedPath}) as a whole. */
+  readonly notExists: (operand: Path<Model, any> | PackedPath<Model, any>) => Expr
   readonly attributeType: (operand: Path<Model, any>, type: string) => Expr
   readonly beginsWith: (operand: Path<Model, string>, prefix: string) => Expr
   readonly contains: (operand: Path<Model, string | ReadonlyArray<any>>, value: unknown) => Expr
