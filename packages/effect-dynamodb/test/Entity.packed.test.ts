@@ -29,11 +29,13 @@ import {
 import { DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Batch from "../src/Batch.js"
+import * as Collection from "../src/Collection.js"
 import * as NodeCompression from "../src/compression/node.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
@@ -1167,6 +1169,32 @@ describe("Entity packed fields — collections", () => {
       expect(
         (rows as unknown as Record<string, ReadonlyArray<{ thread?: unknown }>>).Tickets,
       ).toEqual([{ thread }])
+    }).pipe(Effect.provide(CollLayer)),
+  )
+
+  it.effect("an unbound collection Query.select reads each packed member by __edd_e__", () =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Tickets, Invoices },
+        tables: { CollTable },
+      })
+      const thread = Array.from({ length: 30 }, (_, i) => `message ${i}`)
+      yield* db.entities.Tickets.put({ ticketId: "t-1", tenantId: "acme", thread })
+      yield* db.entities.Invoices.put({ invoiceId: "i-1", tenantId: "acme", total: 10 })
+      const TenantItems = Collection.make("TenantItems", { Tickets, Invoices })
+      // `__edd_e__` is not selected: it is borrowed for the member lookup and
+      // stripped again, so each row holds exactly what was selected.
+      const rows = yield* TenantItems.query({ tenantId: "acme" }).pipe(
+        Query.select(["thread", "total"]),
+        Query.collect,
+      )
+      expect(rows).toEqual(expect.arrayContaining([{ thread }, { total: 10 }]))
+      expect(rows).toHaveLength(2)
+      const paths = yield* TenantItems.query({ tenantId: "acme" }).pipe(
+        Query.selectPaths([["thread"]]),
+        Query.collect,
+      )
+      expect(paths).toEqual(expect.arrayContaining([{ thread }, {}]))
     }).pipe(Effect.provide(CollLayer)),
   )
 

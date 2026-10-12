@@ -137,9 +137,19 @@ export type QueryDecodeError = ValidationError | CompressorNotRegistered
  * packed attribute it carries read by its stored form (`S` → JSON, `B` →
  * header + payload, native → unchanged), never schema-decoded.
  */
-export type QueryRawRow = (
-  raw: Record<string, unknown>,
-) => Effect.Effect<Record<string, unknown>, QueryDecodeError>
+export type QueryRawRow = {
+  (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, QueryDecodeError>
+  /**
+   * Attributes the hook reads to decide how to read a row — a collection's
+   * `__edd_e__`, which names the member whose packed attributes to read. They
+   * are borrowed into an active projection and stripped again once the hook
+   * has run, so the caller sees exactly what it selected.
+   */
+  readonly reads?: ReadonlyArray<string> | undefined
+}
+
+/** @internal The attributes the raw-row hook of `state` reads (see {@link QueryRawRow.reads}). */
+const rawRowReads = (state: QueryState): ReadonlyArray<string> => state.rawRow?.reads ?? []
 
 /**
  * @internal How a query names DynamoDB's rejection of its key condition — an
@@ -954,9 +964,16 @@ const hydrateRows = (
     const borrowed =
       projected.size === 0
         ? []
-        : [pkName, skName, ...(ownership ? ["__edd_e__"] : [])].filter(
-            (field) => !projected.has(field),
-          )
+        : [
+            ...new Set([
+              pkName,
+              skName,
+              ...(ownership ? ["__edd_e__"] : []),
+              ...rawRowReads(state),
+            ]),
+          ].filter((field) => !projected.has(field))
+    // What the raw-row hook reads survives until it has run (see `examinePage`).
+    const keptForRawRow = new Set(rawRowReads(state))
     const expression = buildProjection(state, names, borrowed)
     const fetched = yield* batchGetRaw(client, requests, {
       projection: expression === undefined ? undefined : { expression, names },
@@ -987,7 +1004,7 @@ const hydrateRows = (
         continue
       }
       const stripped = { ...item }
-      for (const field of borrowed) delete stripped[field]
+      for (const field of borrowed) if (!keptForRawRow.has(field)) delete stripped[field]
       hydrated.push(stripped)
     }
     return hydrated
@@ -1206,6 +1223,8 @@ const cursorProjectionFields = (
   // A query that drops rows reads what it judges them by (#133).
   if (state.keepRow !== undefined && state.skField !== undefined) borrowed.add(state.skField)
   for (const attr of state.liveRows?.reads ?? []) borrowed.add(attr)
+  // …and a raw-row hook reads what it dispatches on (a collection's `__edd_e__`).
+  for (const attr of rawRowReads(state)) borrowed.add(attr)
   return [...borrowed].filter((field) => !projected.has(field))
 }
 
@@ -1233,6 +1252,8 @@ const examinePage = <A>(
 > =>
   Effect.gen(function* () {
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+    // Borrowed attributes the raw-row hook reads are stripped after it ran.
+    const hookReads = new Set(rawRowReads(state))
     const items: Array<A> = []
     let next = 0
     while (next < returned.length) {
@@ -1254,8 +1275,9 @@ const examinePage = <A>(
         const source = sources[k]
         if (source === undefined) continue
         const raw = fromAttributeMap(source)
-        for (const field of borrowedFields) delete raw[field]
+        for (const field of borrowedFields) if (!hookReads.has(field)) delete raw[field]
         const item = yield* state.decoder(raw) as Effect.Effect<A, QueryDecodeError>
+        for (const field of borrowedFields) if (hookReads.has(field)) delete raw[field]
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
         if (budget !== undefined && items.length >= budget) {

@@ -609,16 +609,26 @@ export const entityPackedQueryOptions = (
  */
 export const collectionPackedQueryOptions = (
   members: ReadonlyArray<PackedEntityLike>,
-): ReturnType<typeof entityPackedQueryOptions> => {
+): {
+  readonly packed: ReadonlyArray<PackedAttributeGuard>
+  readonly rawRow:
+    | {
+        (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, PackedError>
+        readonly reads: ReadonlyArray<string>
+      }
+    | undefined
+} => {
   const byType = new Map(members.map((m) => [m.entityType, m]))
-  return {
-    packed: members.flatMap((m) => m._packedGuards ?? []),
-    rawRow: (raw) => {
-      const member = byType.get(raw.__edd_e__ as string)
-      const unpack = member?._unpackFields
-      return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
-    },
+  const packed = members.flatMap((m) => m._packedGuards ?? [])
+  if (members.every((m) => m._unpackFields === undefined)) return { packed, rawRow: undefined }
+  const rawRow = (raw: Record<string, unknown>) => {
+    const member = byType.get(raw.__edd_e__ as string)
+    const unpack = member?._unpackFields
+    return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
   }
+  // The member is named by `__edd_e__`, so a projection that does not select
+  // it still reads it (borrowed, then stripped — see `Query.QueryRawRow`).
+  return { packed, rawRow: Object.assign(rawRow, { reads: ["__edd_e__"] }) }
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
