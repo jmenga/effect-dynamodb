@@ -20,7 +20,6 @@ import {
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
-  type CompressorNotRegistered,
   ConditionalCheckFailed,
   DynamoError,
   DynamoValidationError,
@@ -313,7 +312,6 @@ export type AggregateWriteError =
   | AggregateTransactionOverflow
   | DynamoClientError
   | ValidationError
-  | CompressorNotRegistered
   | RefNotFound
   | ItemNotFound
   | TransactionCancelled
@@ -373,7 +371,7 @@ export interface Aggregate<
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
+    AggregateAssemblyError | DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -437,7 +435,7 @@ export interface Aggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
+    AggregateAssemblyError | DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -487,7 +485,7 @@ export interface BoundAggregate<
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
+    AggregateAssemblyError | DynamoClientError | ValidationError,
     never
   >
 
@@ -511,7 +509,7 @@ export interface BoundAggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError | CompressorNotRegistered,
+    AggregateAssemblyError | DynamoClientError | ValidationError,
     never
   >
 
@@ -2297,7 +2295,7 @@ const packAggregateGroups = (
   packedByType: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>,
   aggregateName: string,
   operation: string,
-): Effect.Effect<ReadonlyArray<TransactionGroup>, ValidationError | CompressorNotRegistered> =>
+): Effect.Effect<ReadonlyArray<TransactionGroup>, ValidationError> =>
   packedByType.size === 0
     ? Effect.succeed(groups)
     : Effect.flatMap(currentRegistry, (registry) =>
@@ -2329,7 +2327,7 @@ const unpackAggregateItems = (
   items: ReadonlyArray<Record<string, unknown>>,
   dispatchByType: ReadonlyMap<string, ReadonlyArray<string>>,
   aggregateName: string,
-): Effect.Effect<void, ValidationError | CompressorNotRegistered> =>
+): Effect.Effect<void, ValidationError> =>
   dispatchByType.size === 0
     ? Effect.void
     : Effect.flatMap(currentRegistry, (registry) =>
@@ -2637,7 +2635,7 @@ const hydrateAggregateRefs = (
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
-  RefNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
+  RefNotFound | DynamoClientError | ValidationError,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {

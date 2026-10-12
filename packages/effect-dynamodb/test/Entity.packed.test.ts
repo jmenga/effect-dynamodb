@@ -21,11 +21,7 @@ import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
-import {
-  CompressorNotRegistered,
-  DynamoError,
-  ValidationError,
-} from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Batch from "../src/Batch.js"
@@ -39,6 +35,7 @@ import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
+import { missingCompressor } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -545,13 +542,12 @@ describe("Entity packed fields — writes", () => {
   )
 
   it.effect(
-    "a value over the threshold without its codec registered fails CompressorNotRegistered",
+    "a value over the threshold without its codec registered fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
         const db = yield* client
         const error = failure(yield* Effect.exit(db.entities.Orders.put(order()).asEffect()))
-        expect(error).toBeInstanceOf(CompressorNotRegistered)
-        expect(error).toMatchObject({
+        expect(missingCompressor(error)).toMatchObject({
           codec: "gzip",
           direction: "compress",
           entityType: "Order",
@@ -651,19 +647,24 @@ describe("Entity packed fields — reads", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("reading a B value without its codec fails CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      // Bound without a registry: one provided at run time still reaches the
-      // bound op (the write); the read runs without one.
-      const db = yield* client
-      yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
-      const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: "o-1" })))
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-      expect(error).toMatchObject({ codec: "gzip", direction: "decompress", attribute: "d" })
-      // A JSON (S) value needs no codec.
-      yield* db.entities.Orders.put(order({ orderId: "o-2", details: smallDetails }))
-      expect((yield* db.entities.Orders.get({ orderId: "o-2" })).details).toEqual(smallDetails)
-    }).pipe(Effect.provide(NoCodecs)),
+  it.effect(
+    "reading a B value without its codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        // Bound without a registry: one provided at run time still reaches the
+        // bound op (the write); the read runs without one.
+        const db = yield* client
+        yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+        const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: "o-1" })))
+        expect(missingCompressor(error)).toMatchObject({
+          codec: "gzip",
+          direction: "decompress",
+          attribute: "d",
+        })
+        // A JSON (S) value needs no codec.
+        yield* db.entities.Orders.put(order({ orderId: "o-2", details: smallDetails }))
+        expect((yield* db.entities.Orders.get({ orderId: "o-2" })).details).toEqual(smallDetails)
+      }).pipe(Effect.provide(NoCodecs)),
   )
 
   it.effect("queries and scans read a mix of native, JSON and compressed rows", () =>
@@ -1080,17 +1081,21 @@ describe("Entity.decodeMarshalledItem — stream images", () => {
     }),
   )
 
-  it.effect("a compressed value without its codec fails CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      const db = yield* client
-      yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
-      const image = stored(ORDER_KEY)
-      const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, image)))
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-      // With the codec provided where the decode runs, it decodes.
-      const decoded = yield* Entity.decodeMarshalledItem(Orders, image).pipe(Effect.provide(Codecs))
-      expect((decoded as { details: unknown }).details).toEqual(bigDetails)
-    }).pipe(Effect.provide(NoCodecs)),
+  it.effect(
+    "a compressed value without its codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* db.entities.Orders.put(order()).asEffect().pipe(Effect.provide(Codecs))
+        const image = stored(ORDER_KEY)
+        const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, image)))
+        missingCompressor(error)
+        // With the codec provided where the decode runs, it decodes.
+        const decoded = yield* Entity.decodeMarshalledItem(Orders, image).pipe(
+          Effect.provide(Codecs),
+        )
+        expect((decoded as { details: unknown }).details).toEqual(bigDetails)
+      }).pipe(Effect.provide(NoCodecs)),
   )
 })
 
@@ -1286,7 +1291,7 @@ describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
       const exit = yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
         .asEffect()
         .pipe(Effect.exit)
-      expect(failure(exit)).toBeInstanceOf(CompressorNotRegistered)
+      missingCompressor(failure(exit))
       yield* db.entities.Docs.put({ docId: "d-1", title: "T", body, origin })
         .asEffect()
         .pipe(Effect.provide(Gzip))

@@ -10,6 +10,7 @@
  * - Terminals: `fetch`, `collect`, `paginate`, `count`.
  */
 
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
@@ -261,17 +262,13 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   readonly ignoreOwnership: () => BoundQuery<Model, SkRemaining, A>
 
   /** Execute a single page. Returns items + opaque cursor. */
-  readonly fetch: () => Effect.Effect<
-    Query.Page<A>,
-    DynamoClientError | Query.QueryDecodeError,
-    never
-  >
+  readonly fetch: () => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
 
   /** Execute and collect all pages into a single array. */
-  readonly collect: () => Effect.Effect<Array<A>, DynamoClientError | Query.QueryDecodeError, never>
+  readonly collect: () => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
 
   /** Execute and return a lazy Stream of items. Automatically paginates. */
-  readonly paginate: () => Stream.Stream<A, DynamoClientError | Query.QueryDecodeError, never>
+  readonly paginate: () => Stream.Stream<A, DynamoClientError | ValidationError, never>
 
   /**
    * Execute a count-only query (no items returned).
@@ -281,7 +278,7 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
    * read and the accepted ones counted. Correct, but it pays for the read;
    * that is why the error channel carries `ValidationError` (decode can fail).
    */
-  readonly count: () => Effect.Effect<number, DynamoClientError | Query.QueryDecodeError, never>
+  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
 }
 
 // ---------------------------------------------------------------------------
@@ -612,33 +609,29 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   // --- terminals ---
-  fetch(): Effect.Effect<Query.Page<A>, DynamoClientError | Query.QueryDecodeError, never> {
+  fetch(): Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never> {
     const page = this._config.provide(Query.execute(this._query))
     const group = this._config.groupCollected
     return group === undefined
       ? page
       : (page.pipe(
           Effect.map((p) => ({ ...p, items: group(p.items) })),
-        ) as unknown as Effect.Effect<
-          Query.Page<A>,
-          DynamoClientError | Query.QueryDecodeError,
-          never
-        >)
+        ) as unknown as Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>)
   }
 
-  collect(): Effect.Effect<Array<A>, DynamoClientError | Query.QueryDecodeError, never> {
+  collect(): Effect.Effect<Array<A>, DynamoClientError | ValidationError, never> {
     const collected = this._config.provide(Query.collect(this._query))
     const group = this._config.groupCollected
     return group === undefined
       ? collected
       : (collected.pipe(Effect.map((items) => group(items))) as unknown as Effect.Effect<
           Array<A>,
-          DynamoClientError | Query.QueryDecodeError,
+          DynamoClientError | ValidationError,
           never
         >)
   }
 
-  paginate(): Stream.Stream<A, DynamoClientError | Query.QueryDecodeError, never> {
+  paginate(): Stream.Stream<A, DynamoClientError | ValidationError, never> {
     const tag = this._config.tagStreamed
     const items = Stream.unwrap(this._config.provide(Query.paginate(this._query))).pipe(
       Stream.flatMap((page: Array<A>) => Stream.fromIterable(page)),
@@ -648,10 +641,10 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
       : (items.pipe(
           Stream.map((item) => tag(item)),
           Stream.filter((item) => item !== undefined),
-        ) as unknown as Stream.Stream<A, DynamoClientError | Query.QueryDecodeError, never>)
+        ) as unknown as Stream.Stream<A, DynamoClientError | ValidationError, never>)
   }
 
-  count(): Effect.Effect<number, DynamoClientError | Query.QueryDecodeError, never> {
+  count(): Effect.Effect<number, DynamoClientError | ValidationError, never> {
     return this._config.provide(Query.count(this._query))
   }
 }

@@ -173,7 +173,6 @@ import {
   collectionPackedQueryOptions,
   entityPackedQueryOptions,
   type PackedAttributeGuard,
-  type PackedError,
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
@@ -674,28 +673,25 @@ export type CollectionSelected<TResult> = {
 /**
  * Collection query — returned by `db.collections.Name(composites)`.
  * `.collect()` and `.fetch()` return the grouped result (not an array);
- * `.paginate()` streams each item tagged with its member. Like a `BoundQuery`,
- * every terminal can fail with `CompressorNotRegistered` (in
- * `Query.QueryDecodeError`): a member's packed field may be stored compressed
- * with a codec this process has not registered.
+ * `.paginate()` streams each item tagged with its member.
  */
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
-  readonly collect: () => Effect.Effect<TResult, DynamoClientError | Query.QueryDecodeError, never>
+  readonly collect: () => Effect.Effect<TResult, DynamoClientError | ValidationError, never>
   /** Execute a single page, grouped like `collect()`. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
-    DynamoClientError | Query.QueryDecodeError,
+    DynamoClientError | ValidationError,
     never
   >
   /** Stream every item, page by page, each tagged with its member. */
   readonly paginate: () => Stream.Stream<
     CollectionStreamItem<TResult>,
-    DynamoClientError | Query.QueryDecodeError,
+    DynamoClientError | ValidationError,
     never
   >
   /** Count the members' items (every member's, together). */
-  readonly count: () => Effect.Effect<number, DynamoClientError | Query.QueryDecodeError, never>
+  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
   /**
    * Project attributes — by domain name, per member: each member's items come
    * back as partial records under its key.
@@ -962,7 +958,6 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           number,
           | DynamoClientError
           | import("@effect-dynamodb/schema/Errors.js").ValidationError
-          | import("@effect-dynamodb/schema/Errors.js").CompressorNotRegistered
           | import("@effect-dynamodb/schema/Errors.js").EmbeddingError,
           never
         >
@@ -1075,7 +1070,7 @@ interface EntityLike {
   readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
   /** Read packed attributes of a raw row by their stored form (#147). */
   readonly _unpackFields?:
-    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, PackedError>)
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
     | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined

@@ -22,14 +22,14 @@
  *     bytes accepted, 409,601 rejected and diagnosed with the stored size (R1/R4).
  *   - decodeStreamImage on items fetched with the raw client and rewritten into
  *     Lambda's DynamoDB-JSON shape with base64 B (R2).
- *   - CompressorNotRegistered on a read without the codec.
+ *   - a ValidationError caused by CompressorNotRegistered on a read without the codec.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Config, Effect, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 import { afterAll, beforeAll, describe, expect } from "vitest"
@@ -40,6 +40,7 @@ import { ITEM_MAX_BYTES, itemBytes } from "../src/internal/ItemSize.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -545,18 +546,23 @@ describeConnected("EventStore packed storage (#147)", () => {
     }).pipe(provide),
   )
 
-  it.effect("reading compressed items without the codec fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      const id = { ledgerId: "mix-bare" }
-      yield* writeMixed(id.ledgerId).pipe(provide)
-      const error = yield* ZstdLedger.read(id, { consistentRead: true }).pipe(Effect.flip)
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-      expect(error).toMatchObject({ codec: "gzip", direction: "decompress", attribute: "data" })
-      // Native and JSON items need no codec.
-      expectEvents(
-        yield* ZstdLedger.query.events(id).pipe(Query.limit(3), Query.collect),
-        [1, 2, 3],
-      )
-    }).pipe(provideBare),
+  it.effect(
+    "reading compressed items without the codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        const id = { ledgerId: "mix-bare" }
+        yield* writeMixed(id.ledgerId).pipe(provide)
+        const error = yield* ZstdLedger.read(id, { consistentRead: true }).pipe(Effect.flip)
+        expect(missingCompressor(error)).toMatchObject({
+          codec: "gzip",
+          direction: "decompress",
+          attribute: "data",
+        })
+        // Native and JSON items need no codec.
+        expectEvents(
+          yield* ZstdLedger.query.events(id).pipe(Query.limit(3), Query.collect),
+          [1, 2, 3],
+        )
+      }).pipe(provideBare),
   )
 })

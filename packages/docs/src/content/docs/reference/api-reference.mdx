@@ -382,7 +382,7 @@ Control what type an operation returns:
 | `keyFieldNames(entity)` | List physical field names for all keys |
 | `compositeAttributes(entity)` | List all composite attribute names across indexes |
 | `itemSchema(entity)` | Get the item-level decode schema |
-| `decodeMarshalledItem(entity, item)` | Decode a DynamoDB item (DynamoDB JSON with `B` as bytes or base64, or already unmarshalled) as a table read does: packed fields by stored form, sparse maps rebuilt, renames reversed. Fails with `ValidationError` or `CompressorNotRegistered` |
+| `decodeMarshalledItem(entity, item)` | Decode a DynamoDB item (DynamoDB JSON with `B` as bytes or base64, or already unmarshalled) as a table read does: packed fields by stored form, sparse maps rebuilt, renames reversed. Fails with `ValidationError` (a missing compressor's `cause` is `CompressorNotRegistered`) |
 
 ### Usage
 
@@ -1181,9 +1181,9 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | `query.events(streamId)` | `Query<StreamEvent<TEvent>>` — raw query handle for use with `Query` combinators. |
 | `query.index(name, streamId)` | `Query<StreamEvent<TEvent, M>>` — raw query handle over a stream index, typed and read as `readIndex` is (a `"keys"` index hydrates; `Query.count` never fetches). A `Query.filter` on a `"withoutMetadata"` or `"keys"` index may name only projected attributes; use `Query.filterBy`. |
 | `indexes` | `{ [name]: StreamIndexSettings }` — each index's `{ type, index, pk, sk, projection }` (`projection` resolved, `"all"` when omitted). |
-| `measureAppend(streamId, events, expectedVersion, options?)` | `Effect<AppendMeasurement, ValidationError \| CompressorNotRegistered, TableConfig>` — the bytes `append` would write, by DynamoDB's item-size rules: `{ events, sentinel, snapshot, transactionBytes }`. Built by `append`'s own item builder; nothing is read or written. `additionalItems` are not accepted. See [Sizing](/effect-dynamodb/guides/packed-storage/#sizing) |
-| `measureSnapshot(streamId, state, asOfVersion)` | `Effect<number, ValidationError \| CompressorNotRegistered, TableConfig>` — the item size of the snapshot `writeSnapshot` would write |
-| `decodeStreamImage(image)` | `Effect<Option<StreamEvent<TEvent, M>>, ValidationError \| CompressorNotRegistered>` — decode a DynamoDB Streams `NewImage` / `OldImage` (DynamoDB JSON with `B` as bytes or base64, or unmarshalled) into the `StreamEvent` the read paths return; `Option.none()` for an image that is not one of this stream's events |
+| `measureAppend(streamId, events, expectedVersion, options?)` | `Effect<AppendMeasurement, ValidationError, TableConfig>` — the bytes `append` would write, by DynamoDB's item-size rules: `{ events, sentinel, snapshot, transactionBytes }`. Built by `append`'s own item builder; nothing is read or written. `additionalItems` are not accepted. See [Sizing](/effect-dynamodb/guides/packed-storage/#sizing) |
+| `measureSnapshot(streamId, state, asOfVersion)` | `Effect<number, ValidationError, TableConfig>` — the item size of the snapshot `writeSnapshot` would write |
+| `decodeStreamImage(image)` | `Effect<Option<StreamEvent<TEvent, M>>, ValidationError>` — decode a DynamoDB Streams `NewImage` / `OldImage` (DynamoDB JSON with `B` as bytes or base64, or unmarshalled) into the `StreamEvent` the read paths return; `Option.none()` for an image that is not one of this stream's events |
 | `storedAs` | `{ data: PackedConfig \| undefined, state: PackedConfig \| undefined }` — the stream's resolved storage settings |
 
 `BoundEventStream` additionally exposes `provide(effect)` as an escape hatch to push services into an arbitrary effect.
@@ -1303,10 +1303,10 @@ import { StorageEncoding } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `encode` | `(storedAs, wire) => Effect<AttributeValue \| undefined, ValidationError \| CompressorNotRegistered>` | The `AttributeValue` a wire (encoded) value is stored as: `S`, `B`, `NULL`, or `undefined` for no attribute |
-| `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
-| `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError \| CompressorNotRegistered>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged |
-| `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError \| CompressorNotRegistered>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
+| `encode` | `(storedAs, wire) => Effect<AttributeValue \| undefined, ValidationError>` | The `AttributeValue` a wire (encoded) value is stored as: `S`, `B`, `NULL`, or `undefined` for no attribute |
+| `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
+| `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged |
+| `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
 | `limits` | `{ item: 409_600, transaction: 4_194_304 }` | DynamoDB's item and `TransactWriteItems` size limits, in bytes |
 
 ## Compression
@@ -1384,7 +1384,7 @@ import {
 | `VersionConflict` | `"VersionConflict"` | Event store version mismatch: an append's version guard failed, or a command handler call's `expectedVersion` did not match the loaded version (`streamName`, `streamId`, `expectedVersion`, `actualVersion?` — set by the pre-decide If-Match check and when a `verifySnapshot: false` If-Match decision is checked against the head, unset on any other append-time conflict) |
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
-| `CompressorNotRegistered` | `"CompressorNotRegistered"` | A [packed](/effect-dynamodb/guides/packed-storage/) value needs a compression codec that is not registered: writing a value over its threshold, or reading a `B` value whose header names the codec (`codec`, `direction: "compress" \| "decompress"`, `entityType`, `attribute`, `operation`) |
+| `CompressorNotRegistered` | `"CompressorNotRegistered"` | Never in an error channel — the `cause` of the `ValidationError` a [packed](/effect-dynamodb/guides/packed-storage/) value fails with when it needs a compression codec that is not registered: writing a value over its threshold, or reading a `B` value whose header names the codec (`codec`, `direction: "compress" \| "decompress"`, `entityType`, `attribute`, `operation`) |
 
 ### Errors by operation
 

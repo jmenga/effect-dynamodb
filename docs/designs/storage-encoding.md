@@ -241,7 +241,7 @@ export class Compression extends Context.Service<Compression, CompressionRegistr
 types are unchanged; `R` stays `DynamoClient | TableConfig` for unbound ops and `never`
 for bound ones. An absent service behaves as an empty registry: packing without
 compression and reading `S` values work everywhere; only a value that actually needs a
-codec fails, with `CompressorNotRegistered` (§5.3).
+codec fails, with a `ValidationError` whose `cause` is a `CompressorNotRegistered` (§5.3).
 
 **Registration** — any of, in this precedence (mirrors `embedder`, `DESIGN.md §14`):
 
@@ -301,19 +301,19 @@ and brotli to Node's defaults. The subpath is the only file in the package that 
 ```ts
 /** The AttributeValue a packed attribute is stored as (S, B, NULL for null; undefined for undefined — no attribute). */
 export const encode: (storedAs: PackedConfig, wire: unknown) =>
-  Effect<AttributeValue | undefined, ValidationError | CompressorNotRegistered>
+  Effect<AttributeValue | undefined, ValidationError>
 /** Stored-form dispatch (§4.1) on an AttributeValue (DynamoDB JSON), B as bytes or base64. */
 export const decode: (stored: AttributeValue | { readonly B: string } | undefined) =>
-  Effect<unknown, ValidationError | CompressorNotRegistered>
+  Effect<unknown, ValidationError>
 /** The same on an already-unmarshalled value: a JSON string, bytes or base64 B, or a native value. */
 export const decodeUnmarshalled: (stored: unknown) =>
-  Effect<unknown, ValidationError | CompressorNotRegistered>
+  Effect<unknown, ValidationError>
 /** R1: DynamoDB size of the attribute VALUE as stored (excl. the attribute name). */
 export const valueBytes: <S extends Schema.Top>(options: {
   readonly schema: S
   readonly value: Schema.Schema.Type<S>
   readonly storedAs?: PackedConfig | undefined      // omitted → native map size
-}) => Effect<number, ValidationError | CompressorNotRegistered>
+}) => Effect<number, ValidationError>
 /** DynamoDB limits, in bytes: { item: 409_600, transaction: 4_194_304 }. */
 export const limits: { readonly item: number; readonly transaction: number }
 ```
@@ -332,9 +332,9 @@ say so.
 
 ```ts
 measureAppend(streamId, events, expectedVersion, options?: Omit<AppendOptions<…>, "additionalItems">):
-  Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, TableConfig>
+  Effect<AppendMeasurement, ValidationError, TableConfig>
 measureSnapshot(streamId, state, asOfVersion):
-  Effect<number, ValidationError | CompressorNotRegistered, TableConfig>
+  Effect<number, ValidationError, TableConfig>
 
 interface AppendMeasurement {
   /** Item bytes of each event Put, in order — what DynamoDB's 400 KB item limit measures. */
@@ -361,7 +361,7 @@ tell callers to add them. This is caller-side planning, not a library pre-check:
 ```ts
 decodeStreamImage(image: StreamImage): Effect<
   Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-  ValidationError | CompressorNotRegistered
+  ValidationError
 >
 type StreamImage =
   | Record<string, AttributeValue | LambdaAttributeValue>   // DynamoDB JSON; B/BS may be base64
@@ -388,7 +388,7 @@ normalisation (base64 `B`/`BS`), stored-form dispatch for the entity's packed an
 dispatch-eligible fields (§4.6), sparse rebuild and field renames before the item-schema
 decode. The last two fix **adjacent debt**: today it decodes the unmarshalled image
 straight through `itemSchema`, so an entity with a `field:` rename or a `SparseMap` field
-fails to decode its own stream images. Its error type gains `CompressorNotRegistered`.
+fails to decode its own stream images. Its error type is unchanged (`ValidationError`).
 `Entity.itemSchema(entity)` stays a pure schema over unmarshalled items and does **not**
 unpack (it cannot decompress); the streams guide says to use `decodeMarshalledItem` for
 entities with packed fields.
@@ -539,7 +539,7 @@ packValue(config, wire, registry):
   if config.compression === undefined → S json
   bytes = utf8(json)
   if bytes.length < config.compression.threshold → S json
-  c = registry.get(codec) ?? fail CompressorNotRegistered(codec, direction: "compress")
+  c = registry.get(codec) ?? fail ValidationError(cause: CompressorNotRegistered(codec, "compress"))
   z = c.compress(bytes)                              // throw → ValidationError (§5.3)
   if 1 + z.length < bytes.length → B [header(codec), ...z]
   else                            → S json           // compression did not pay
@@ -560,7 +560,7 @@ unpackValue(stored, registry):
   stored instanceof Uint8Array → h = parseHeader(stored[0])            // §4.2
                                  payload = stored.subarray(1)
                                  if h.codec !== none:
-                                   c = registry.get(h.codec) ?? fail CompressorNotRegistered(h.codec, "decompress")
+                                   c = registry.get(h.codec) ?? fail ValidationError(cause: CompressorNotRegistered(h.codec, "decompress"))
                                    payload = c.decompress(payload)
                                  JSON.parse(utf8DecodeFatal(payload))
   otherwise                    → stored                                 // legacy native / null / absent
@@ -583,13 +583,26 @@ export class CompressorNotRegistered extends Data.TaggedError("CompressorNotRegi
 }> {}
 ```
 
-It joins the error channel of every operation that packs or unpacks: entity
-put/create/upsert/update/get/delete-with-return/query/scan/batch/transaction/collection
-reads and writes, aggregate reads and writes, every EventStream operation that writes or
-decodes events or snapshots, `Query` terminals (the decoder type widens to
-`ValidationError | CompressorNotRegistered`), `StorageEncoding.*`, and the decode helpers.
-`DESIGN.md §15` "Declared Errors per Operation" is updated. It follows the `EmbeddingError`
-precedent: a deployment misconfiguration surfaced as a tagged failure, catchable by tag.
+It is **never a member of an error channel**. A missing compressor fails the operation
+with its existing `ValidationError` (same `entityType` and `operation`), whose `cause` is
+a `CompressorNotRegistered` value naming the codec, direction and attribute. Packing is
+opt-in, so this is what keeps the release minor: every public error type — entity,
+aggregate, batch, transaction, collection, `Query` terminals and decoder, EventStream,
+geo `nearby` — is exactly its 1.25.0 type, and a consumer that never packs (annotated
+error unions, exhaustive `catchTags`) compiles unchanged. A caller that wants to react
+to a misconfigured deployment inspects the cause:
+
+```ts
+Effect.catchTag("ValidationError", (e) =>
+  e.cause instanceof CompressorNotRegistered ? alertOps(e.cause) : Effect.fail(e))
+```
+
+(The first cut of this PR added `CompressorNotRegistered` to every union, following the
+`EmbeddingError` precedent; downstream review found that broke a never-packing monorepo's
+`tsc` with 263 errors, so it was reverted to the cause form. `EmbeddingError` differs: an
+entity with vector indexes declares it only through `VectorErrors<TVectorIndexes>`, i.e.
+only when the feature is configured.) `test/ErrorChannels.types.test.ts` pins the 1.25.0
+types for a packed and an unpacked entity alike.
 
 **Everything else is `ValidationError`**, as any undecodable row or unencodable input is
 today, with the attribute named in the cause:
@@ -653,8 +666,8 @@ The key composer is untouched: a packed field can never be a composite, so no
 
 ### 6.2 Write paths
 
-New closure helpers in `Entity.ts`: `packFields(item): Effect<void, ValidationError |
-CompressorNotRegistered>` (in place, stored names) and `packAttribute(attr, wire)` (one
+New closure helpers in `Entity.ts`: `packFields(item): Effect<void, ValidationError>`
+(in place, stored names) and `packAttribute(attr, wire)` (one
 value → `AttributeValue`), resolving the registry with `Effect.serviceOption(Compression)`.
 Exposed to siblings as `entity._packFields` (beside `_serializeSparseFields`).
 
@@ -810,7 +823,7 @@ stored bytes (§8).
 
 `select` replaces a query's decoder with the identity, so today a raw row's `data` is
 whatever `fromAttributeMap` produced — a string or bytes for a packed value. New
-`QueryState.rawRow?: (raw) => Effect<raw, ValidationError | CompressorNotRegistered>`, set
+`QueryState.rawRow?: (raw) => Effect<raw, ValidationError>`, set
 via `Query.make({ rawRow })`; `select`, `selectPaths` and `selectProjected` use
 `state.rawRow ?? Effect.succeed` instead of the identity. `buildEventsQuery` and
 `buildIndexQuery` set it to "unpack `data` if present". Hydrated (`"keys"` GSI) rows pass
@@ -976,7 +989,8 @@ and streams that do not use the feature beyond the eligibility check.
   scan, batch get, transactGet, collection, history, versions, deleted list; `asNative`
   returns stored `S`/`B`; projections return parsed JSON, nested projection `EDD-9076`;
   condition/filter refusals (`EDD-9076`, each operator, nested path, shorthand and
-  callback); update refusals (`EDD-9077`, each op); `CompressorNotRegistered` on write over
+  callback); update refusals (`EDD-9077`, each op); a `ValidationError` caused by
+  `CompressorNotRegistered` on write over
   threshold without a registry, on read of a `B` with an unregistered codec, and not raised
   under threshold; registry precedence (explicit `DynamoClient.make({ compressors })` >
   ambient at bind > ambient at run time); dispatch-eligible native field reads a packed
@@ -1008,7 +1022,7 @@ and streams that do not use the feature beyond the eligibility check.
   admits `B`. (The record and `path*` update ops are untyped, so their `[EDD-9077]`
   refusals are tested at run time in `Entity.packed.test.ts`, §6.8.)
 - `test/EventStore.types.test.ts`: `storedAs` admits only `data`; `snapshot.storedAs`
-  only a `PackedConfig`; error channels include `CompressorNotRegistered`; `measureAppend`
+  only a `PackedConfig`; error channels are exactly 1.25.0's; `measureAppend`
   / `decodeStreamImage` signatures on bound and unbound streams.
 
 ### 12.4 Connected (`test/connected.test.ts`, mandatory — gate 4)
@@ -1066,9 +1080,9 @@ in §12.1 prove a packed field cannot enter a composite.
 
 - Default storage stays native; no attribute is added to any item.
 - `R` of every operation is unchanged (`Effect.serviceOption`).
-- Error channels gain `CompressorNotRegistered` (additive; exhaustive `catchTags` handlers
-  keep compiling; exact-type assertions in user tests may need updating — called out in
-  the changelog).
+- Error channels are unchanged: a missing compressor is a `ValidationError` whose `cause`
+  is `CompressorNotRegistered` (§5.3), so annotated error unions and exact-type assertions
+  written against 1.25.0 keep compiling.
 - `Entity` / `EntityDefinition` gain a trailing defaulted type parameter.
 - `DynamoClient.layer` / `layerConfig` return `Layer<DynamoClient | Compression, …>` only
   when given `compressors` (overloads); calls without it keep `Layer<DynamoClient, …>`, so
@@ -1137,7 +1151,7 @@ this design introduced. **Source** says who decided.
 | 49 | Type-level guards where PathBuilder is typed | **In** for PathBuilder-typed conditions, filters and projections: `TPackedFields` type parameter, `PackedPath` (§6.8). The untyped record and `path*` update ops are guarded at run time only (`[EDD-9077]`) | user |
 | 50 | Compressor registration mechanism | `Compression` `Context.Service`, resolved with `Effect.serviceOption` (no new `R`); `DynamoClient.layer/layerConfig({ compressors })`, `DynamoClient.make({ compressors })`, `Compression.layer` (§3.4) | user (recommended DynamoClient); mechanism: design |
 | 51 | Fail-fast check at `DynamoClient.make` that every configured codec is registered | **Not added**: a read-only process would be forced to register codecs it never writes; the op-time tagged error is the single failure mode | design: your call |
-| 52 | Unregistered codec → tagged error naming the codec | **In**: `CompressorNotRegistered` (§5.3) | user |
+| 52 | Unregistered codec → tagged error naming the codec | **Changed**: `CompressorNotRegistered` names it, as the `cause` of a `ValidationError` — not a new error-channel member, which broke never-packing consumers (§5.3) | user |
 | 53 | Corrupt / unsupported packed values | **`ValidationError`** (§5.3), like any undecodable row | design |
 | 54 | Node compressors from a subpath (`effect-dynamodb/compression/node`) | **In**; `maxOutputLength` option added for decompression bombs | user; option: design |
 | 55 | Compressor tuning in the config (level, quality) | **Out of the config**: on the compressor factory (§3.1) | design |
@@ -1167,7 +1181,8 @@ this design introduced. **Source** says who decided.
    (reserved); codec `000` none, `001` gzip, `010` brotli, `011` zstd. Writers emit
    `0x21`/`0x22`/`0x23`.
 4. **Errors:** `CompressorNotRegistered { codec, direction, entityType, attribute,
-   operation }` (new tagged error); corrupt values and non-JSON input are `ValidationError`.
+   operation }` (new tagged error), carried as the `cause` of a `ValidationError` — never
+   added to an error channel; corrupt values and non-JSON input are `ValidationError`.
 5. **EDD codes:** 9071 Packed options; 9072 key/index source; 9073 shape (incl. TTL/dates);
    9074 unique; 9075 ref; 9076 expression/projection; 9077 update op; 9078 registry; 9079
    stream `storedAs` config.

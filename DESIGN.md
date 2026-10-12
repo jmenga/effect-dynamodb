@@ -1341,7 +1341,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 
 A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
-**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `DynamoClient.layer({ compressors })`, `DynamoClient.make({ compressors })` or `Compression.layer(...)` — and read with `Effect.serviceOption`, so no operation gains an `R`. Node implementations (`node:zlib`) ship from `effect-dynamodb/compression/node`. A value that needs an unregistered codec (write over the threshold, or read of a `B`) fails with the tagged `CompressorNotRegistered`.
+**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `DynamoClient.layer({ compressors })`, `DynamoClient.make({ compressors })` or `Compression.layer(...)` — and read with `Effect.serviceOption`, so no operation gains an `R`. Node implementations (`node:zlib`) ship from `effect-dynamodb/compression/node`. A value that needs an unregistered codec (write over the threshold, or read of a `B`) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
 **Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
 
@@ -3480,8 +3480,8 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   item (snapshot, sentinel, foreign).
 - **Codecs.** Read from the `Compression` service with `Effect.serviceOption` (no new
   `R`); `bind` captures it with the rest of the context. A missing codec fails with
-  `CompressorNotRegistered`, which joins `AppendError`, the read operations' errors and
-  the `Query` terminals' (`QueryDecodeError`).
+  the operation's existing `ValidationError`, whose `cause` is a
+  `CompressorNotRegistered` — no error channel changes.
 
 ### Command Handler Retry
 
@@ -3884,7 +3884,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and by an unverified-snapshot If-Match whose decision is confirmed against the head (the head read), and unset on any other append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
-| `CompressorNotRegistered` | A packed value needs a compression codec with no registered `Compressor`: a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
+| `CompressorNotRegistered` | Never in an error channel: the `cause` of the `ValidationError` a packed value fails with when it needs a compression codec with no registered `Compressor` — a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
 | `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
 
 ### Declared Errors per Operation
@@ -3894,32 +3894,30 @@ configuration: a `put` declares `UniqueConstraintViolation` even on an entity
 without unique constraints. Every union also includes `DynamoClientError`,
 plus `RefErrors` / `VectorErrors` where the entity has refs or vector indexes.
 
-Every entity, batch, transaction, collection and aggregate operation that
-writes or decodes an item also declares `CompressorNotRegistered` (#147): a
-packed field (`storedAs: DynamoModel.Packed`) compressed with a codec the
-process has not registered — on write over the threshold, or on read of a value
-an earlier writer compressed. It is listed in each row below.
+Packed storage (#147) adds no member to any union: a packed value that needs a
+compression codec the process has not registered — on write over the
+threshold, or on read of a value an earlier writer compressed — fails with the
+operation's existing `ValidationError`, whose `cause` is a
+`CompressorNotRegistered` (`codec`, `direction`, `entityType`, `attribute`,
+`operation`). Packing is opt-in, so a caller that never packs sees exactly the
+pre-#147 unions.
 
 | Operation | Declared errors (besides `DynamoClientError`) |
 |-----------|-----------------------------------------------|
-| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow`, `CompressorNotRegistered` |
+| `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
 | `create` | as `put`, plus `ConditionalCheckFailed` |
 | `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
-| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow`, `CompressorNotRegistered` |
+| `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
-| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable`, `CompressorNotRegistered` |
+| `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
-| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `CompressorNotRegistered` |
-| `get` / `getVersion` / `deleted.get` / `Batch.get` / `Transaction.transactGet` / `Entity.decodeMarshalledItem` | `ValidationError`, `CompressorNotRegistered` (plus `ItemNotFound` for the single-item reads) |
-| `purge` | `ValidationError`, `CompressorNotRegistered` |
-| `Batch.write` | `ValidationError`, `CompressorNotRegistered` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `CompressorNotRegistered` |
-| Aggregate `create` | `AggregateWriteError` (which includes `CompressorNotRegistered`) plus `ConditionalCheckFailed` |
-| Aggregate `get` / `list` | `AggregateAssemblyError`, `ValidationError`, `CompressorNotRegistered` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `CompressorNotRegistered` |
-| `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` / `readSnapshot` / `writeSnapshot` | `ValidationError`, `CompressorNotRegistered` |
-| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage` (no `DynamoClientError`: nothing is read or written) | `ValidationError`, `CompressorNotRegistered` |
-| `Query` terminals (`collect`, `execute`, `paginate`, `count`) and `BoundQuery` terminals | `QueryDecodeError`: `ValidationError`, `CompressorNotRegistered` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `purge` | `ValidationError` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
+| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 

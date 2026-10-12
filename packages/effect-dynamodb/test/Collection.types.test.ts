@@ -1,7 +1,7 @@
 /**
  * Type tests for a collection query: what each terminal returns (#133).
  */
-import type { CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { Effect, Stream } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import type {
@@ -60,11 +60,11 @@ describe("CollectionQuery types", () => {
     }>()
   })
 
-  it("every terminal's error channel carries CompressorNotRegistered (#147)", () => {
+  it("every terminal's error channel is unchanged by packed storage (#147)", () => {
     if (query === null) return
-    // A member's packed field may be stored compressed with a codec this
-    // process has not registered.
-    type Errors = DynamoClientError | ValidationError | CompressorNotRegistered
+    // A member's packed field compressed with a codec this process has not
+    // registered fails with a ValidationError (cause: CompressorNotRegistered).
+    type Errors = DynamoClientError | ValidationError
     expectTypeOf<Effect.Error<ReturnType<typeof query.collect>>>().toEqualTypeOf<Errors>()
     expectTypeOf<Effect.Error<ReturnType<typeof query.fetch>>>().toEqualTypeOf<Errors>()
     expectTypeOf<Stream.Error<ReturnType<typeof query.paginate>>>().toEqualTypeOf<Errors>()

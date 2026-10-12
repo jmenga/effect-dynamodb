@@ -5,11 +5,7 @@
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type {
-  CompressorNotRegistered,
-  ItemNotFound,
-  ValidationError,
-} from "@effect-dynamodb/schema/Errors.js"
+import type { ItemNotFound, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexPkInput } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { type DateTime, Effect, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
@@ -1081,9 +1077,9 @@ describe("Entity types — bound get() is still an Effect", () => {
   >
   type BoundGetOfUser = ReturnType<UserBound["get"]>
   type UnboundGetOfUser = ReturnType<typeof UserEntity.get>
-  // Packed storage (#147) adds `CompressorNotRegistered`: a stored value may be
-  // compressed with a codec the reading process has not registered.
-  type GetErrors = ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered
+  // Unchanged by packed storage (#147): a missing compressor is a
+  // ValidationError whose cause is CompressorNotRegistered.
+  type GetErrors = ItemNotFound | DynamoClientError | ValidationError
 
   // `users` is a type-level stand-in and the functions below are never called.
   // The COMPILE is the assertion: these are the exact call shapes callers

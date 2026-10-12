@@ -29,7 +29,6 @@ import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
   CascadePartialFailure,
-  type CompressorNotRegistered,
   ConcurrentModification,
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
@@ -107,7 +106,6 @@ import {
   currentRegistry,
   decodeImage,
   type PackedAttributeGuard,
-  type PackedError,
   packAttributeValue,
   packedExprRefusal,
   packedProjectionRefusal,
@@ -600,7 +598,7 @@ export interface Entity<
     item: globalThis.Record<string, unknown>,
     operation: string,
     only?: ReadonlySet<string>,
-  ) => Effect.Effect<void, ValidationError | CompressorNotRegistered>
+  ) => Effect.Effect<void, ValidationError>
 
   /**
    * @internal Read, in place, every dispatch-eligible attribute of an
@@ -610,7 +608,7 @@ export interface Entity<
   readonly _unpackFields: (
     raw: globalThis.Record<string, unknown>,
     operation?: string,
-  ) => Effect.Effect<void, ValidationError | CompressorNotRegistered>
+  ) => Effect.Effect<void, ValidationError>
 
   /**
    * @internal The packed attributes an expression or projection may not look
@@ -623,9 +621,7 @@ export interface Entity<
    * or base64, or an unmarshalled item) into an item record — the
    * implementation of {@link decodeMarshalledItem}.
    */
-  readonly _decodeImage: (
-    image: StreamImage,
-  ) => Effect.Effect<unknown, ValidationError | CompressorNotRegistered>
+  readonly _decodeImage: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -638,7 +634,7 @@ export interface Entity<
   /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
-  ) => Effect.Effect<any, ValidationError | CompressorNotRegistered>
+  ) => Effect.Effect<any, ValidationError>
 
   /** @internal Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName: (domainName: string) => string
@@ -815,7 +811,7 @@ export interface Entity<
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
+    ItemNotFound | DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -841,7 +837,6 @@ export interface Entity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation
     | OptimisticLockError
     | ConcurrentModification
@@ -868,7 +863,6 @@ export interface Entity<
     | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
-    | CompressorNotRegistered
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
@@ -887,7 +881,6 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | CompressorNotRegistered
     | DeleteAppliedButUnreadable,
     DynamoClient | TableConfig,
     void,
@@ -911,7 +904,6 @@ export interface Entity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation
     | OptimisticLockError
     | ConcurrentModification
@@ -939,7 +931,6 @@ export interface Entity<
     | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
-    | CompressorNotRegistered
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -959,7 +950,6 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | CompressorNotRegistered
     | DeleteAppliedButUnreadable
     | ConditionalCheckFailed,
     DynamoClient | TableConfig,
@@ -993,7 +983,6 @@ export interface Entity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | ItemNotFound
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -1013,7 +1002,7 @@ export interface Entity<
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
+    ItemNotFound | DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1033,7 +1022,6 @@ export interface Entity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation,
     DynamoClient | TableConfig
   >
@@ -1046,10 +1034,7 @@ export interface Entity<
    */
   readonly purge: (
     key: EntityKeyType<TModel, TIndexes>,
-  ) => EntityDelete<
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  >
+  ) => EntityDelete<DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -1059,7 +1044,7 @@ export interface Entity<
     ) => EntityGet<
       ModelType<TModel>,
       EntityRecordType<TModel, TTimestamps, TVersioned>,
-      ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
+      ItemNotFound | DynamoClientError | ValidationError,
       DynamoClient | TableConfig
     >
     /** List soft-deleted items within a partition. */
@@ -1098,11 +1083,7 @@ export interface Entity<
           removeAttrs?: ReadonlyArray<string>,
         ): Effect.Effect<
           { readonly current: ModelType<TModel> },
-          | DynamoClientError
-          | ValidationError
-          | CompressorNotRegistered
-          | StaleAppend
-          | ConditionalCheckFailed,
+          DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
           DynamoClient | TableConfig
         >
         (
@@ -1112,7 +1093,7 @@ export interface Entity<
           removeAttrs?: ReadonlyArray<string>,
         ): Effect.Effect<
           void,
-          DynamoClientError | ValidationError | CompressorNotRegistered | StaleAppend,
+          DynamoClientError | ValidationError | StaleAppend,
           DynamoClient | TableConfig
         >
       }
@@ -1340,7 +1321,7 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundGet<
     ModelType<TModel>,
-    ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered
+    ItemNotFound | DynamoClientError | ValidationError
   >
 
   /**
@@ -1363,7 +1344,6 @@ export interface BoundEntity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation
     | OptimisticLockError
     | ConcurrentModification
@@ -1388,7 +1368,6 @@ export interface BoundEntity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation
     | OptimisticLockError
     | ConcurrentModification
@@ -1422,7 +1401,6 @@ export interface BoundEntity<
     | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
-    | CompressorNotRegistered
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
     VectorIndexNames<TVectorIndexes>,
@@ -1448,7 +1426,6 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | CompressorNotRegistered
     | DeleteAppliedButUnreadable,
     void,
     TPackedFields
@@ -1472,7 +1449,6 @@ export interface BoundEntity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | ItemNotFound
     | UniqueConstraintViolation
     | OptimisticLockError
@@ -1506,7 +1482,6 @@ export interface BoundEntity<
     | UpdateAppliedButUnreadable
     | UniqueConstraintViolation
     | ValidationError
-    | CompressorNotRegistered
     | ConditionalCheckFailed
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
@@ -1525,7 +1500,6 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | CompressorNotRegistered
     | DeleteAppliedButUnreadable
     | ConditionalCheckFailed,
     void,
@@ -1538,11 +1512,7 @@ export interface BoundEntity<
   readonly getVersion: (
     key: TKey,
     version: number,
-  ) => Effect.Effect<
-    ModelType<TModel>,
-    ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
-    never
-  >
+  ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
 
   /**
    * List all version snapshots for an item as a fluent BoundQuery.
@@ -1575,7 +1545,6 @@ export interface BoundEntity<
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
-    | CompressorNotRegistered
     | UniqueConstraintViolation,
     never
   >
@@ -1586,20 +1555,14 @@ export interface BoundEntity<
    * backoff; not atomic, so a failure says exactly how many items it had
    * already deleted.
    */
-  readonly purge: (
-    key: TKey,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError | CompressorNotRegistered, never>
+  readonly purge: (key: TKey) => Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
     /** Get a specific soft-deleted item. */
     readonly get: (
       key: TKey,
-    ) => Effect.Effect<
-      ModelType<TModel>,
-      ItemNotFound | DynamoClientError | ValidationError | CompressorNotRegistered,
-      never
-    >
+    ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
     /**
      * List all soft-deleted items in this partition as a fluent BoundQuery.
      * Requires `softDelete` on the entity definition.
@@ -1649,12 +1612,8 @@ export interface BoundEntity<
       ) => import("./internal/BoundCrud.js").BoundAppend<
         ModelType<TModel>,
         { readonly current: ModelType<TModel> },
-        | DynamoClientError
-        | ValidationError
-        | CompressorNotRegistered
-        | StaleAppend
-        | ConditionalCheckFailed,
-        DynamoClientError | ValidationError | CompressorNotRegistered | StaleAppend,
+        DynamoClientError | ValidationError | StaleAppend | ConditionalCheckFailed,
+        DynamoClientError | ValidationError | StaleAppend,
         TPackedFields
       >
     : never
@@ -1691,7 +1650,7 @@ export interface BoundEntity<
   readonly paginate: <A>(
     query: Query.Query<A>,
     ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Stream.Stream<A, DynamoClientError | ValidationError | CompressorNotRegistered, never>
+  ) => Stream.Stream<A, DynamoClientError | ValidationError, never>
 
   /**
    * Execute a query and collect all pages into a single array.
@@ -1704,7 +1663,7 @@ export interface BoundEntity<
   readonly collect: <A>(
     query: Query.Query<A>,
     ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError | CompressorNotRegistered, never>
+  ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
 
   /**
    * Execute a single DynamoDB page and return a {@link Query.Page} with an opaque cursor.
@@ -1721,11 +1680,7 @@ export interface BoundEntity<
   readonly fetch: <A>(
     query: Query.Query<A>,
     ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Effect.Effect<
-    Query.Page<A>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    never
-  >
+  ) => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
 
   /**
    * Execute a single DynamoDB scan page and return a {@link Query.Page} with an opaque cursor.
@@ -1743,11 +1698,7 @@ export interface BoundEntity<
     ...combinators: ReadonlyArray<
       (q: Query.Query<ModelType<TModel>>) => Query.Query<ModelType<TModel>>
     >
-  ) => Effect.Effect<
-    Query.Page<ModelType<TModel>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    never
-  >
+  ) => Effect.Effect<Query.Page<ModelType<TModel>>, DynamoClientError | ValidationError, never>
 }
 
 /**
@@ -2494,7 +2445,7 @@ const makeImpl = <
   const packedImmutableMismatch = (
     asserted: ReadonlyArray<AssertedImmutable>,
     stored: Readonly<globalThis.Record<string, AttributeValue>>,
-  ): Effect.Effect<string | undefined, PackedError> =>
+  ): Effect.Effect<string | undefined, ValidationError> =>
     Effect.gen(function* () {
       for (const { field, attr, wire, packed } of asserted) {
         if (!packed) continue
@@ -2590,7 +2541,7 @@ const makeImpl = <
     item: globalThis.Record<string, unknown>,
     operation: string,
     only?: ReadonlySet<string>,
-  ): Effect.Effect<void, PackedError> => {
+  ): Effect.Effect<void, ValidationError> => {
     if (!hasPackedFields) return Effect.void
     const targets =
       only === undefined
@@ -2607,7 +2558,7 @@ const makeImpl = <
     attribute: string,
     wire: unknown,
     operation: string,
-  ): Effect.Effect<AttributeValue | undefined, PackedError> =>
+  ): Effect.Effect<AttributeValue | undefined, ValidationError> =>
     Effect.flatMap(currentRegistry, (registry) =>
       packAttributeValue(packedAttributes[attribute]!, wire, registry, {
         entityType,
@@ -2624,7 +2575,7 @@ const makeImpl = <
   const unpackFields = (
     raw: globalThis.Record<string, unknown>,
     operation = "decode",
-  ): Effect.Effect<void, PackedError> => {
+  ): Effect.Effect<void, ValidationError> => {
     if (dispatchAttributes.length === 0) return Effect.void
     let stored = false
     for (const attr of dispatchAttributes) {
@@ -2650,7 +2601,7 @@ const makeImpl = <
   const unpackedDomainCopy = (
     record: globalThis.Record<string, unknown>,
     operation: string,
-  ): Effect.Effect<globalThis.Record<string, unknown>, PackedError> => {
+  ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError> => {
     if (dispatchAttributes.length === 0) return Effect.succeed(record)
     const stored = { ...record }
     renameToDynamo(stored)
@@ -2693,7 +2644,7 @@ const makeImpl = <
     readonly rawRow:
       | ((
           raw: globalThis.Record<string, unknown>,
-        ) => Effect.Effect<globalThis.Record<string, unknown>, PackedError>)
+        ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>)
       | undefined
   } = {
     packed: packedGuards,
@@ -3154,7 +3105,7 @@ const makeImpl = <
 
   const decodeRecord = (
     raw: globalThis.Record<string, unknown>,
-  ): Effect.Effect<any, ValidationError | CompressorNotRegistered> => {
+  ): Effect.Effect<any, ValidationError> => {
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
     return Effect.flatMap(unpackFields(raw), () => {
@@ -3224,9 +3175,7 @@ const makeImpl = <
    * its dispatch-eligible attributes read by stored form, then sparse rebuild,
    * renames and the item-schema decode — exactly what a table read applies.
    */
-  const decodeImageItem = (
-    image: StreamImage,
-  ): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+  const decodeImageItem = (image: StreamImage): Effect.Effect<unknown, ValidationError> =>
     Effect.gen(function* () {
       const raw = yield* decodeImage(
         image,
@@ -3618,7 +3567,7 @@ const makeImpl = <
     uState: UpdateState,
   ): Effect.Effect<
     VectorWriteResult,
-    EmbeddingError | DynamoClientError | PackedError,
+    EmbeddingError | DynamoClientError | ValidationError,
     DynamoClient
   > =>
     Effect.gen(function* () {
@@ -4146,7 +4095,7 @@ const makeImpl = <
     written: ReadonlySet<string>,
     mode: DecodeMode,
     encodedKey: globalThis.Record<string, unknown>,
-  ): Effect.Effect<unknown, ValidationError | CompressorNotRegistered | ItemNotFound> => {
+  ): Effect.Effect<unknown, ValidationError | ItemNotFound> => {
     switch (rv) {
       case "none":
         return Effect.succeed(undefined)
@@ -10294,11 +10243,7 @@ export const bind = <
      */
     const reembed = (options?: {
       readonly concurrency?: number | undefined
-    }): Effect.Effect<
-      number,
-      DynamoClientError | ValidationError | CompressorNotRegistered | EmbeddingError,
-      never
-    > => {
+    }): Effect.Effect<number, DynamoClientError | ValidationError | EmbeddingError, never> => {
       const vectorDefs = Object.entries(entity._vectorIndexes)
       const boundSchema = entity._schema
       const primary = entity.indexes.primary as IndexDefinition
@@ -10931,9 +10876,10 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
  *
  * Accepts DynamoDB JSON (`{ pk: { S: "…" }, … }`, `B` as bytes or base64) or
  * an already-unmarshalled item. Fails with `ValidationError` if the item does
- * not match the schema, or `CompressorNotRegistered` when a compressed value's
- * codec is not registered (`DynamoClient.layer({ compressors })`, or a
- * `Compression` layer, provided where the decode runs).
+ * not match the schema, or when a compressed value's codec is not registered —
+ * its `cause` is then a `CompressorNotRegistered` (register the codec with
+ * `DynamoClient.layer({ compressors })`, or a `Compression` layer, provided
+ * where the decode runs).
  *
  * Note: {@link itemSchema} is a pure schema over unmarshalled items and does
  * not unpack — use this for entities with packed fields.
@@ -10941,12 +10887,10 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
 export const decodeMarshalledItem = (
   entity: EntityWithSchemas & {
     readonly entityType: string
-    readonly _decodeImage?: (
-      image: StreamImage,
-    ) => Effect.Effect<unknown, ValidationError | CompressorNotRegistered>
+    readonly _decodeImage?: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
   },
   marshalledItem: StreamImage,
-): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> => {
+): Effect.Effect<unknown, ValidationError> => {
   if (entity._decodeImage !== undefined) return entity._decodeImage(marshalledItem)
   const corruption = entity._versionCorruption?.(
     marshalledItem as Readonly<globalThis.Record<string, unknown>>,

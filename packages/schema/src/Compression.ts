@@ -12,8 +12,8 @@
  * Every pack/unpack site reads the service with `Effect.serviceOption`, so no
  * operation gains a requirement. An absent service behaves as an empty
  * registry: uncompressed packed values (`S`) read and write everywhere, and
- * only a value that needs a codec fails, with the tagged
- * `CompressorNotRegistered`.
+ * only a value that needs a codec fails — with the operation's existing
+ * `ValidationError`, whose `cause` is the tagged `CompressorNotRegistered`.
  *
  * See `DESIGN.md §7 "Packed Storage"`.
  */

@@ -148,6 +148,31 @@ const invalid = (ctx: PackedContext, message: string, cause?: unknown): Validati
         : new Error(`Packed attribute "${ctx.attribute}": ${message}`, { cause }),
   })
 
+/**
+ * A missing compressor, surfaced as a `ValidationError` whose `cause` is a
+ * {@link CompressorNotRegistered} naming the codec, the direction and the
+ * attribute. Packed storage is opt-in, so it never widens an operation's error
+ * channel: a caller inspects `cause` (`error.cause instanceof
+ * CompressorNotRegistered`) to tell a misconfigured deployment from an
+ * undecodable value.
+ */
+export const notRegistered = (
+  ctx: PackedContext,
+  codec: CompressionCodec,
+  direction: "compress" | "decompress",
+): ValidationError =>
+  new ValidationError({
+    entityType: ctx.entityType,
+    operation: ctx.operation,
+    cause: new CompressorNotRegistered({
+      codec,
+      direction,
+      entityType: ctx.entityType,
+      attribute: ctx.attribute,
+      operation: ctx.operation,
+    }),
+  })
+
 // ---------------------------------------------------------------------------
 // Strict JSON serialisation
 // ---------------------------------------------------------------------------
@@ -262,16 +287,17 @@ export type PackedStored = string | Uint8Array | null | undefined
  *   compressed bytes are kept only when strictly smaller than the JSON (`B`);
  *   otherwise the JSON string.
  *
- * Fails with `CompressorNotRegistered` (direction `"compress"`) when the value
- * crosses the threshold and `registry` has no compressor for the codec, and
- * with `ValidationError` on non-JSON input or a throwing compressor.
+ * Fails with `ValidationError` on non-JSON input or a throwing compressor, and
+ * when the value crosses the threshold and `registry` has no compressor for the
+ * codec — then its `cause` is a `CompressorNotRegistered` (direction
+ * `"compress"`).
  */
 export const packValue = (
   config: PackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<PackedStored, ValidationError | CompressorNotRegistered> => {
+): Effect.Effect<PackedStored, ValidationError> => {
   if (wire === undefined) return Effect.succeed(undefined)
   if (wire === null) return Effect.succeed(null)
   let json: string
@@ -291,15 +317,7 @@ export const packValue = (
   if (bytes.length < compression.threshold) return Effect.succeed(json)
   const compressor = registry.get(compression.codec)
   if (compressor === undefined) {
-    return Effect.fail(
-      new CompressorNotRegistered({
-        codec: compression.codec,
-        direction: "compress",
-        entityType: ctx.entityType,
-        attribute: ctx.attribute,
-        operation: ctx.operation,
-      }),
-    )
+    return Effect.fail(notRegistered(ctx, compression.codec, "compress"))
   }
   let compressed: Uint8Array
   try {
@@ -334,7 +352,7 @@ export const unpackBytes = (
   stored: Uint8Array,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> => {
+): Effect.Effect<unknown, ValidationError> => {
   if (stored.length === 0) return Effect.fail(invalid(ctx, "the stored binary value is empty"))
   const header = parseHeader(stored[0]!)
   if (typeof header === "string") return Effect.fail(invalid(ctx, header))
@@ -342,15 +360,7 @@ export const unpackBytes = (
   if (header.codec !== "none") {
     const compressor = registry.get(header.codec)
     if (compressor === undefined) {
-      return Effect.fail(
-        new CompressorNotRegistered({
-          codec: header.codec,
-          direction: "decompress",
-          entityType: ctx.entityType,
-          attribute: ctx.attribute,
-          operation: ctx.operation,
-        }),
-      )
+      return Effect.fail(notRegistered(ctx, header.codec, "decompress"))
     }
     try {
       payload = compressor.decompress(payload)
@@ -376,7 +386,7 @@ export const unpackValue = (
   stored: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> => {
+): Effect.Effect<unknown, ValidationError> => {
   if (typeof stored === "string") return parseJson(stored, ctx)
   if (stored instanceof Uint8Array) return unpackBytes(stored, registry, ctx)
   return Effect.succeed(stored)

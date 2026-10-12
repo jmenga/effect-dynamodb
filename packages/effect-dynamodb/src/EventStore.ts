@@ -40,7 +40,6 @@ import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
   AdditionalItemConditionFailed,
   AppendTooLarge,
-  type CompressorNotRegistered,
   type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
@@ -495,7 +494,6 @@ export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState>
 
 /** Error channel of {@link EventStream.append}. */
 export type AppendError =
-  | CompressorNotRegistered
   | VersionConflict
   | DuplicateCommand
   | AdditionalItemConditionFailed
@@ -1151,11 +1149,7 @@ type HeadAboveProbeFn = (
   streamId: Record<string, unknown>,
   floorVersion: number,
   options?: ReadOptions | undefined,
-) => Effect.Effect<
-  number,
-  DynamoClientError | ValidationError | CompressorNotRegistered,
-  DynamoClient | TableConfig
->
+) => Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
 /** @internal */
 const headAboveProbeOf = (stream: object): HeadAboveProbeFn | undefined =>
@@ -1292,11 +1286,7 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<
-    void,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  >
+  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
    * Read this stream's snapshot, if one has been written.
@@ -1309,7 +1299,7 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
     Option.Option<Snapshot<TState>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1335,7 +1325,7 @@ export interface EventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1349,7 +1339,7 @@ export interface EventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1361,11 +1351,7 @@ export interface EventStream<
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<
-    number,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  >
+  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
    * The stream's snapshot (if any), the events after it, and its head — in
@@ -1399,7 +1385,7 @@ export interface EventStream<
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1422,7 +1408,7 @@ export interface EventStream<
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 
@@ -1438,15 +1424,15 @@ export interface EventStream<
    * Nothing is read or written, and nothing is refused for its size: this is
    * caller-side planning, not a pre-check. `additionalItems` are not accepted
    * — add their size yourself. Fails as `append` would on invalid options
-   * (`ValidationError`), and with `CompressorNotRegistered` when a value
-   * crosses its compression threshold without a registered compressor.
+   * (`ValidationError`), and — with a `CompressorNotRegistered` cause — when a
+   * value crosses its compression threshold without a registered compressor.
    */
   measureAppend(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: MeasureAppendOptions<TMetadata, TState> | undefined,
-  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, TableConfig>
+  ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig>
 
   /**
    * The item size, in bytes, of the snapshot {@link EventStream.writeSnapshot}
@@ -1458,7 +1444,7 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, TableConfig>
+  ): Effect.Effect<number, ValidationError, TableConfig>
 
   /**
    * Decode a DynamoDB Streams record image (`NewImage` / `OldImage`) of one
@@ -1479,7 +1465,7 @@ export interface EventStream<
     image: StreamImage,
   ): Effect.Effect<
     Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    ValidationError | CompressorNotRegistered,
+    ValidationError,
     never
   >
 
@@ -1932,7 +1918,7 @@ export const makeStream = <
   const unpackData = (
     stored: unknown,
     operation: string,
-  ): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+  ): Effect.Effect<unknown, ValidationError> =>
     typeof stored === "string" || stored instanceof Uint8Array
       ? Effect.flatMap(currentRegistry, (registry) =>
           unpackValue(stored, registry, { entityType, attribute: "data", operation }),
@@ -1952,7 +1938,7 @@ export const makeStream = <
 
   const decodeStreamEvent = (
     raw: Record<string, unknown>,
-  ): Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered> =>
+  ): Effect.Effect<StreamEvent<TEvent>, ValidationError> =>
     Effect.gen(function* () {
       const toValidationError = (operation: string) => (cause: unknown) =>
         new ValidationError({ entityType, operation, cause })
@@ -1990,7 +1976,7 @@ export const makeStream = <
         metadata,
         timestamp: envelope.timestamp,
       }
-    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered>
+    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError>
 
   // ---------------------------------------------------------------------------
   // append
@@ -2242,7 +2228,7 @@ export const makeStream = <
     asOfVersion: number,
     now: string,
     operation: string,
-  ): Effect.Effect<Record<string, AttributeValue>, ValidationError | CompressorNotRegistered> =>
+  ): Effect.Effect<Record<string, AttributeValue>, ValidationError> =>
     Effect.gen(function* () {
       const encoded = yield* encodeSnapshotState(state, operation)
       const stored =
@@ -2276,11 +2262,7 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options: AppendOptions<unknown, unknown> | undefined,
-  ): Effect.Effect<
-    AppendParts | undefined,
-    ValidationError | CompressorNotRegistered,
-    TableConfig
-  > =>
+  ): Effect.Effect<AppendParts | undefined, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
@@ -2590,11 +2572,7 @@ export const makeStream = <
         snapshotPut,
       }
       return parts
-    }) as Effect.Effect<
-      AppendParts | undefined,
-      ValidationError | CompressorNotRegistered,
-      TableConfig
-    >
+    }) as Effect.Effect<AppendParts | undefined, ValidationError, TableConfig>
 
   const append = (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -2707,7 +2685,7 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: MeasureAppendOptions<unknown, unknown> | undefined,
-  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, TableConfig> =>
+  ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       if ((options as { additionalItems?: unknown } | undefined)?.additionalItems !== undefined) {
         return yield* new ValidationError({
@@ -2748,7 +2726,7 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     state: unknown,
     asOfVersion: number,
-  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, TableConfig> =>
+  ): Effect.Effect<number, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("measureSnapshot")
       const now = DateTime.formatIso(yield* DateTime.now)
@@ -2769,7 +2747,7 @@ export const makeStream = <
 
   const decodeStreamImage = (
     image: StreamImage,
-  ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError | CompressorNotRegistered> =>
+  ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError> =>
     Effect.gen(function* () {
       const ctx = { entityType, operation: "EventStore.decodeStreamImage" }
       const form =
@@ -2804,7 +2782,7 @@ export const makeStream = <
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2822,7 +2800,7 @@ export const makeStream = <
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -2846,11 +2824,7 @@ export const makeStream = <
   const currentVersion = (
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<
-    number,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  > =>
+  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       // Single page, not `collect`: with `Limit: 1` DynamoDB returns a
       // `LastEvaluatedKey` on every truncated page, so `collect` would walk the
@@ -2872,11 +2846,7 @@ export const makeStream = <
     streamId: Record<string, unknown>,
     floorVersion: number,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<
-    number,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  > =>
+  ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       // Reverse, `Limit: 1`, bounded below by `floorVersion + 1`: an empty range
       // (the common case — nothing appended past the snapshot) reads no items;
@@ -2910,11 +2880,7 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     state: unknown,
     asOfVersion: number,
-  ): Effect.Effect<
-    void,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    DynamoClient | TableConfig
-  > =>
+  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("writeSnapshot")
 
@@ -2969,11 +2935,7 @@ export const makeStream = <
             }),
         }),
       )
-    }) as Effect.Effect<
-      void,
-      DynamoClientError | ValidationError | CompressorNotRegistered,
-      DynamoClient | TableConfig
-    >
+    }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
    * Decode a stored snapshot item. A snapshot that fails to decode through the
@@ -2982,7 +2944,7 @@ export const makeStream = <
   const decodeSnapshotItem = (
     raw: Record<string, unknown>,
     operation: string,
-  ): Effect.Effect<Snapshot<unknown>, ValidationError | CompressorNotRegistered> =>
+  ): Effect.Effect<Snapshot<unknown>, ValidationError> =>
     // `state` is read by its stored form (#147) when it may be packed — see
     // `stateDispatch` — then decoded through the state schema as before.
     (stateDispatch && (typeof raw.state === "string" || raw.state instanceof Uint8Array)
@@ -3044,7 +3006,7 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
     Option.Option<Snapshot<unknown>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -3054,7 +3016,7 @@ export const makeStream = <
       return Option.some(yield* decodeSnapshotItem(raw, "EventStore.readSnapshot"))
     }) as Effect.Effect<
       Option.Option<Snapshot<unknown>>,
-      DynamoClientError | ValidationError | CompressorNotRegistered,
+      DynamoClientError | ValidationError,
       DynamoClient | TableConfig
     >
 
@@ -3067,7 +3029,7 @@ export const makeStream = <
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<unknown, TEvent>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -3177,7 +3139,7 @@ export const makeStream = <
       }
     }) as Effect.Effect<
       LatestState<unknown, TEvent>,
-      DynamoClientError | ValidationError | CompressorNotRegistered,
+      DynamoClientError | ValidationError,
       DynamoClient | TableConfig
     >
 
@@ -3306,9 +3268,7 @@ export const makeStream = <
    */
   const indexDecoder =
     (idx: ResolvedStreamIndex) =>
-    (
-      raw: Record<string, unknown>,
-    ): Effect.Effect<StreamEvent<TEvent>, ValidationError | CompressorNotRegistered> => {
+    (raw: Record<string, unknown>): Effect.Effect<StreamEvent<TEvent>, ValidationError> => {
       if (idx.projection === "keys") return decodeStreamEvent(raw)
       let row = raw
       if (idx.projection === "withoutMetadata" && raw.metadata !== undefined) {
@@ -3340,7 +3300,7 @@ export const makeStream = <
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -3368,7 +3328,7 @@ export const makeStream = <
       return yield* Query.collect(query)
     }) as Effect.Effect<
       ReadonlyArray<StreamEvent<TEvent>>,
-      DynamoClientError | ValidationError | CompressorNotRegistered,
+      DynamoClientError | ValidationError,
       DynamoClient | TableConfig
     >
 
@@ -3475,16 +3435,12 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError | CompressorNotRegistered, never>
+  ): Effect.Effect<void, DynamoClientError | ValidationError, never>
 
   /** See {@link EventStream.readSnapshot}. */
   readSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
-  ): Effect.Effect<
-    Option.Option<Snapshot<TState>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
-    never
-  >
+  ): Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
 
   /** See {@link EventStream.append}. */
   append(
@@ -3500,7 +3456,7 @@ export interface BoundEventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     never
   >
 
@@ -3511,7 +3467,7 @@ export interface BoundEventStream<
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     never
   >
 
@@ -3519,7 +3475,7 @@ export interface BoundEventStream<
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
-  ): Effect.Effect<number, DynamoClientError | ValidationError | CompressorNotRegistered, never>
+  ): Effect.Effect<number, DynamoClientError | ValidationError, never>
 
   /** See {@link EventStream.readLatest}. */
   readLatest(
@@ -3527,7 +3483,7 @@ export interface BoundEventStream<
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     never
   >
 
@@ -3538,7 +3494,7 @@ export interface BoundEventStream<
     options?: ReadIndexOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError | CompressorNotRegistered,
+    DynamoClientError | ValidationError,
     never
   >
 
@@ -3548,21 +3504,21 @@ export interface BoundEventStream<
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: MeasureAppendOptions<TMetadata, TState> | undefined,
-  ): Effect.Effect<AppendMeasurement, ValidationError | CompressorNotRegistered, never>
+  ): Effect.Effect<AppendMeasurement, ValidationError, never>
 
   /** See {@link EventStream.measureSnapshot}. */
   measureSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<number, ValidationError | CompressorNotRegistered, never>
+  ): Effect.Effect<number, ValidationError, never>
 
   /** See {@link EventStream.decodeStreamImage}. */
   decodeStreamImage(
     image: StreamImage,
   ): Effect.Effect<
     Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    ValidationError | CompressorNotRegistered,
+    ValidationError,
     never
   >
 
@@ -4239,7 +4195,6 @@ type CommandOptionsArgs<
 
 type CommandHandlerErrors<E> =
   | E
-  | CompressorNotRegistered
   | VersionConflict
   | DuplicateCommand
   | AdditionalItemConditionFailed

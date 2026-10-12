@@ -93,7 +93,7 @@ const MainTable = Table.make({
 
 ## Decoding from AttributeValue Format
 
-For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes it as a table read does, in a single step: `field:` renames are reversed, [sparse maps](/effect-dynamodb/guides/sparse-maps/) are rebuilt, and [packed fields](/effect-dynamodb/guides/packed-storage/) are decoded by their stored form. It returns an `Effect` that fails with `ValidationError` on schema mismatch, or `CompressorNotRegistered` when a compressed value's codec isn't registered:
+For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes it as a table read does, in a single step: `field:` renames are reversed, [sparse maps](/effect-dynamodb/guides/sparse-maps/) are rebuilt, and [packed fields](/effect-dynamodb/guides/packed-storage/) are decoded by their stored form. It returns an `Effect` that fails with `ValidationError` on schema mismatch, or when a compressed value's codec isn't registered (the error's `cause` is then a `CompressorNotRegistered`):
 
 ```typescript region="decode-marshalled" example="guide-streams.ts"
 const handleEmployeeStream = (event: DynamoDBStreamEvent) =>

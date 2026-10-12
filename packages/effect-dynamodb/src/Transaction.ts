@@ -10,7 +10,6 @@
  */
 
 import {
-  type CompressorNotRegistered,
   type ConcurrentModification,
   DynamoError,
   isAwsTransactionCancelled,
@@ -129,7 +128,7 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
 ): Effect.Effect<
   TransactGetResult<T>,
-  DynamoClientError | ValidationError | CompressorNotRegistered | TransactionCancelled,
+  DynamoClientError | ValidationError | TransactionCancelled,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -284,7 +283,6 @@ export const transactWrite = (
   void,
   | DynamoClientError
   | ValidationError
-  | CompressorNotRegistered
   | TransactionCancelled
   | UniqueConstraintViolation
   | OptimisticLockError

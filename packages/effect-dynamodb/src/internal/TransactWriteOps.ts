@@ -18,7 +18,7 @@ import type {
   OptimisticLockError,
   UniqueConstraintViolation,
 } from "@effect-dynamodb/schema/Errors.js"
-import { type CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
@@ -231,7 +231,7 @@ export const buildTransactWriteItems = (
   operation: string,
 ): Effect.Effect<
   BuiltTransactWriteItems,
-  ValidationError | CompressorNotRegistered | DynamoClientError,
+  ValidationError | DynamoClientError,
   TableConfig | DynamoClient
 > =>
   Effect.gen(function* () {

@@ -376,8 +376,17 @@ export type CompressorNotRegisteredFields = {
  * `Compressor`: a write whose JSON crossed its `compression.threshold`, or a
  * read of a `B` value whose header names the codec.
  *
- * A deployment misconfiguration surfaced as a tagged failure (like
- * {@link EmbeddingError}): register the codec through the `Compression`
+ * Never a member of an operation's error channel: packed storage is opt-in, so
+ * it surfaces as the `cause` of the operation's existing `ValidationError`
+ * (whose `entityType` and `operation` match). Inspect it to tell a deployment
+ * misconfiguration from an undecodable value:
+ *
+ * ```ts
+ * Effect.catchTag("ValidationError", (e) =>
+ *   e.cause instanceof CompressorNotRegistered ? alertOps(e.cause) : Effect.fail(e))
+ * ```
+ *
+ * Register the codec through the `Compression`
  * service — `DynamoClient.layer({ compressors })`,
  * `DynamoClient.make({ compressors })` or `Compression.layer([...])` — for
  * Node with `effect-dynamodb/compression/node`. Keep registering a codec for as

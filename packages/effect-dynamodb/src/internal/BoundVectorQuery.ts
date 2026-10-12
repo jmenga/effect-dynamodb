@@ -19,7 +19,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
-import type { CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   EmbeddingError,
   ValidationError as ValidationErrorClass,
@@ -59,7 +59,6 @@ export interface VectorHit<A> {
 export type VectorSearchError =
   | DynamoClientError
   | ValidationError
-  | CompressorNotRegistered
   | EmbeddingError
   | VectorIndexBackfilling
 
@@ -145,9 +144,7 @@ export interface BoundVectorQueryConfig {
   readonly definition: VectorIndexDefinition
   readonly schema: DynamoSchema.DynamoSchema
   readonly tableTag: import("effect").Context.Service<TableConfig, TableConfig>
-  readonly decode: (
-    raw: Record<string, unknown>,
-  ) => Effect.Effect<any, ValidationError | CompressorNotRegistered>
+  readonly decode: (raw: Record<string, unknown>) => Effect.Effect<any, ValidationError>
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
   /**
    * Read, in place, the packed attributes of a stored-name row by their stored
@@ -156,9 +153,7 @@ export interface BoundVectorQueryConfig {
    * for an entity with no packed (or once-packed) fields.
    */
   readonly unpackRaw?:
-    | ((
-        raw: Record<string, unknown>,
-      ) => Effect.Effect<void, ValidationError | CompressorNotRegistered>)
+    | ((raw: Record<string, unknown>) => Effect.Effect<void, ValidationError>)
     | undefined
   /**
    * Domain field name → stored DynamoDB attribute name. Filter attributes,

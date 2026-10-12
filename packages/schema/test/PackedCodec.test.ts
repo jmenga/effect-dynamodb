@@ -14,6 +14,20 @@ import * as DynamoModel from "../src/DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../src/Errors.js"
 import * as PackedCodec from "../src/internal/PackedCodec.js"
 
+/**
+ * A missing compressor is a `ValidationError` whose `cause` is a
+ * `CompressorNotRegistered` (#147) — never a new member of an error channel.
+ */
+const missingCompressor = (error: unknown): CompressorNotRegistered => {
+  expect(error).toBeInstanceOf(ValidationError)
+  const validation = error as ValidationError
+  expect(validation.cause).toBeInstanceOf(CompressorNotRegistered)
+  const cause = validation.cause as CompressorNotRegistered
+  expect(validation.entityType).toBe(cause.entityType)
+  expect(validation.operation).toBe(cause.operation)
+  return cause
+}
+
 const gzip: Compression.Compressor = {
   codec: "gzip",
   compress: (b) => zlib.gzipSync(b),
@@ -274,8 +288,7 @@ describe("packValue", () => {
       const error = failure(
         yield* Effect.exit(pack(withCodec("brotli"), payloadOfBytes(2000), none)),
       )
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-      expect(error).toMatchObject({
+      expect(missingCompressor(error)).toMatchObject({
         _tag: "CompressorNotRegistered",
         codec: "brotli",
         direction: "compress",
@@ -283,7 +296,7 @@ describe("packValue", () => {
         attribute: "lines",
         operation: "put.packed",
       })
-      expect((error as CompressorNotRegistered).message).toContain('"brotli" compressor')
+      expect(missingCompressor(error).message).toContain('"brotli" compressor')
     }),
   )
 
@@ -439,19 +452,21 @@ describe("unpackValue dispatch", () => {
     }),
   )
 
-  it.effect("an unregistered codec on read fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      const stored = yield* pack(withCodec("gzip"), payloadOfBytes(3000))
-      const error = failure(yield* Effect.exit(unpack(stored, Compression.make([brotli]))))
-      expect(error).toMatchObject({
-        _tag: "CompressorNotRegistered",
-        codec: "gzip",
-        direction: "decompress",
-        entityType: "Order",
-        attribute: "lines",
-        operation: "decode",
-      })
-    }),
+  it.effect(
+    "an unregistered codec on read fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        const stored = yield* pack(withCodec("gzip"), payloadOfBytes(3000))
+        const error = failure(yield* Effect.exit(unpack(stored, Compression.make([brotli]))))
+        expect(missingCompressor(error)).toMatchObject({
+          _tag: "CompressorNotRegistered",
+          codec: "gzip",
+          direction: "decompress",
+          entityType: "Order",
+          attribute: "lines",
+          operation: "decode",
+        })
+      }),
   )
 
   const invalidStored: ReadonlyArray<readonly [string, unknown, string]> = [

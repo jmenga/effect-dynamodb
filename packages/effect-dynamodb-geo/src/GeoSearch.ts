@@ -9,13 +9,7 @@
 
 import { type Context, Effect, Schema } from "effect"
 import type { DynamoClientError, DynamoSchema, Table } from "effect-dynamodb"
-import {
-  type CompressorNotRegistered,
-  type DynamoClient,
-  KeyComposer,
-  Query,
-  ValidationError,
-} from "effect-dynamodb"
+import { type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import type { Coordinates, GeoFields, NearbyOptions, NearbyResult } from "./GeoIndex.js"
 import * as H3 from "./H3.js"
@@ -60,7 +54,7 @@ export const nearby = <A>(
   options: NearbyOptions,
 ): Effect.Effect<
   Array<NearbyResult<A>>,
-  DynamoClientError | ValidationError | CompressorNotRegistered,
+  DynamoClientError | ValidationError,
   DynamoClient | Table.TableConfig
 > =>
   Effect.gen(function* () {

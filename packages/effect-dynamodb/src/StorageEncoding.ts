@@ -15,7 +15,8 @@
  *
  * Compressors come from the `Compression` service in scope (read with
  * `Effect.serviceOption`, so `R = never`). Without one, uncompressed values
- * work and a value that needs a codec fails with `CompressorNotRegistered`.
+ * work and a value that needs a codec fails with a `ValidationError` whose
+ * `cause` is a `CompressorNotRegistered`.
  *
  * Nothing here is a pre-check: the library never refuses a write by its
  * measured size — DynamoDB enforces its limits, and the failure diagnosis
@@ -26,7 +27,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
-import { type CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { packValue, unpackValue } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Effect, Schema } from "effect"
 import { attributeBytes, ITEM_MAX_BYTES, TRANSACT_WRITE_MAX_BYTES } from "./internal/ItemSize.js"
@@ -62,7 +63,7 @@ export const limits: { readonly item: number; readonly transaction: number } = O
 export const encode = (
   storedAs: PackedConfig,
   wire: unknown,
-): Effect.Effect<AttributeValue | undefined, ValidationError | CompressorNotRegistered> =>
+): Effect.Effect<AttributeValue | undefined, ValidationError> =>
   Effect.flatMap(currentRegistry, (registry) =>
     Effect.map(
       packValue(storedAs, wire, registry, {
@@ -87,7 +88,7 @@ export const encode = (
  */
 export const decode = (
   stored: AttributeValue | { readonly B: string } | undefined,
-): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+): Effect.Effect<unknown, ValidationError> =>
   Effect.gen(function* () {
     if (stored === undefined) return undefined
     const ctx = { entityType: ENTITY_TYPE, operation: "StorageEncoding.decode" }
@@ -107,9 +108,7 @@ export const decode = (
  *
  * For an `AttributeValue` (DynamoDB JSON), use {@link decode}.
  */
-export const decodeUnmarshalled = (
-  stored: unknown,
-): Effect.Effect<unknown, ValidationError | CompressorNotRegistered> =>
+export const decodeUnmarshalled = (stored: unknown): Effect.Effect<unknown, ValidationError> =>
   Effect.gen(function* () {
     const ctx = { entityType: ENTITY_TYPE, operation: "StorageEncoding.decodeUnmarshalled" }
     const registry = yield* currentRegistry
@@ -142,7 +141,7 @@ export const valueBytes = <S extends Schema.Top>(options: {
   readonly schema: S
   readonly value: Schema.Schema.Type<S>
   readonly storedAs?: PackedConfig | undefined
-}): Effect.Effect<number, ValidationError | CompressorNotRegistered> =>
+}): Effect.Effect<number, ValidationError> =>
   Effect.gen(function* () {
     const operation = "StorageEncoding.valueBytes"
     const codec = options.schema as unknown as Schema.Codec<unknown, unknown>

@@ -4,12 +4,13 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
-import { CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { DateTime, Effect, Exit, Schema } from "effect"
 import * as NodeCompression from "../src/compression/node.js"
 import { attributeBytes } from "../src/internal/ItemSize.js"
 import { toAttributeValue } from "../src/Marshaller.js"
 import * as StorageEncoding from "../src/StorageEncoding.js"
+import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 const compression = Compression.layer(NodeCompression.available())
 
@@ -97,15 +98,20 @@ describe("StorageEncoding.encode / decode", () => {
     }),
   )
 
-  it.effect("without a registry: S works, a codec fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      expect(yield* StorageEncoding.encode(zstd, { a: 1 })).toEqual({ S: '{"a":1}' })
-      const writeError = failure(yield* Effect.exit(StorageEncoding.encode(zstd, wire)))
-      expect(writeError).toBeInstanceOf(CompressorNotRegistered)
-      const stored = yield* StorageEncoding.encode(zstd, wire).pipe(Effect.provide(compression))
-      const readError = failure(yield* Effect.exit(StorageEncoding.decode(stored)))
-      expect(readError).toMatchObject({ codec: "zstd", direction: "decompress" })
-    }),
+  it.effect(
+    "without a registry: S works, a codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        expect(yield* StorageEncoding.encode(zstd, { a: 1 })).toEqual({ S: '{"a":1}' })
+        const writeError = failure(yield* Effect.exit(StorageEncoding.encode(zstd, wire)))
+        missingCompressor(writeError)
+        const stored = yield* StorageEncoding.encode(zstd, wire).pipe(Effect.provide(compression))
+        const readError = failure(yield* Effect.exit(StorageEncoding.decode(stored)))
+        expect(missingCompressor(readError)).toMatchObject({
+          codec: "zstd",
+          direction: "decompress",
+        })
+      }),
   )
 
   it.effect("encode refuses non-JSON wire values", () =>
@@ -202,7 +208,7 @@ describe("StorageEncoding.valueBytes", () => {
           StorageEncoding.valueBytes({ schema: State, value: state, storedAs: zstd }),
         ),
       )
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
+      missingCompressor(error)
     }),
   )
 })

@@ -247,7 +247,7 @@ Compressors can be registered in three ways. This list is in order of precedence
 2. A `Compression` service in context when the client or stream is bound. `DynamoClient.layer({ compressors })` and `DynamoClient.layerConfig({ compressors })`, as above, provide one beside the client. `Compression.layer([...])` provides one on its own.
 3. A `Compression` service in context when an unbound operation or decode helper runs.
 
-None of these adds a requirement (`R`) to entity or EventStore operations. Without a registry, uncompressed JSON is read and written as normal. Only a value that needs a codec fails, with the tagged error `CompressorNotRegistered { codec, direction, entityType, attribute, operation }`:
+None of these adds a requirement (`R`) or an error type to entity or EventStore operations: their error channels are the same whether or not anything is packed. Without a registry, uncompressed JSON is read and written as normal. Only a value that needs a codec fails, with the operation's usual `ValidationError`. Its `cause` is a `CompressorNotRegistered { codec, direction, entityType, attribute, operation }`, so you can tell a missing codec apart from an undecodable value:
 
 - **When writing:** the value's JSON reaches the threshold, and the config's codec isn't registered.
 - **When reading:** a `B` value's header names a codec that isn't registered.

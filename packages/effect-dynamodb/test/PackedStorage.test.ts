@@ -8,7 +8,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
-import { CompressorNotRegistered, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Exit } from "effect"
 import * as NodeCompression from "../src/compression/node.js"
 import {
@@ -22,6 +22,7 @@ import {
   unpackItem,
 } from "../src/internal/Packed.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 const registry = Compression.make(NodeCompression.available())
 const ctx = { entityType: "Order", operation: "put.packed" }
@@ -122,8 +123,7 @@ describe("packItem / unpackItem through marshalling", () => {
       const writeError = failure(
         yield* Effect.exit(packItem({ d: big }, { d: zstd }, Compression.empty, ctx)),
       )
-      expect(writeError).toBeInstanceOf(CompressorNotRegistered)
-      expect(writeError).toMatchObject({
+      expect(missingCompressor(writeError)).toMatchObject({
         attribute: "d",
         direction: "compress",
         operation: ctx.operation,
@@ -134,7 +134,7 @@ describe("packItem / unpackItem through marshalling", () => {
       const readError = failure(
         yield* Effect.exit(unpackItem(stored, ["d"], Compression.empty, readCtx)),
       )
-      expect(readError).toMatchObject({
+      expect(missingCompressor(readError)).toMatchObject({
         _tag: "CompressorNotRegistered",
         codec: "zstd",
         attribute: "d",
@@ -262,15 +262,17 @@ describe("stream images", () => {
     }),
   )
 
-  it.effect("an unregistered codec in an image fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      const image = yield* packedImage
-      const error = failure(yield* Effect.exit(decodeImage(image, ["b"], readCtx)))
-      expect(error).toMatchObject({
-        _tag: "CompressorNotRegistered",
-        codec: "gzip",
-        attribute: "b",
-      })
-    }),
+  it.effect(
+    "an unregistered codec in an image fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        const image = yield* packedImage
+        const error = failure(yield* Effect.exit(decodeImage(image, ["b"], readCtx)))
+        expect(missingCompressor(error)).toMatchObject({
+          _tag: "CompressorNotRegistered",
+          codec: "gzip",
+          attribute: "b",
+        })
+      }),
   )
 })

@@ -29,7 +29,6 @@ import {
   empty as emptyRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
 import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
-import type { CompressorNotRegistered } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   isBase64PackedText,
@@ -45,9 +44,6 @@ import { fromAttributeMap } from "../Marshaller.js"
 import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-
-/** Error channel of every pack/unpack. */
-export type PackedError = ValidationError | CompressorNotRegistered
 
 /** Who is packing/unpacking an item; the attribute is filled in per value. */
 export interface ItemContext {
@@ -79,7 +75,7 @@ export const packItem = (
   packed: Readonly<Record<string, PackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
-): Effect.Effect<void, PackedError> =>
+): Effect.Effect<void, ValidationError> =>
   Effect.forEach(
     Object.entries(packed),
     ([attribute, config]) => {
@@ -112,7 +108,7 @@ export const packAttributeValue = (
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<AttributeValue | undefined, PackedError> =>
+): Effect.Effect<AttributeValue | undefined, ValidationError> =>
   Effect.map(packValue(config, wire, registry, ctx), storedToAttributeValue)
 
 // ---------------------------------------------------------------------------
@@ -128,7 +124,7 @@ export const unpackItem = (
   attributes: Iterable<string>,
   registry: CompressionRegistry,
   ctx: ItemContext,
-): Effect.Effect<void, PackedError> => {
+): Effect.Effect<void, ValidationError> => {
   const pending: Array<string> = []
   for (const attribute of attributes) {
     const value = raw[attribute]
@@ -341,7 +337,7 @@ export const unpackImageItem = (
   attributes: Iterable<string>,
   registry: CompressionRegistry,
   ctx: ItemContext,
-): Effect.Effect<void, PackedError> =>
+): Effect.Effect<void, ValidationError> =>
   Effect.forEach(
     [...attributes],
     (attribute) => {
@@ -383,7 +379,7 @@ export const decodeImage = (
   attributes: Iterable<string>,
   ctx: ItemContext,
   options?: ImageOptions,
-): Effect.Effect<Record<string, unknown>, PackedError> =>
+): Effect.Effect<Record<string, unknown>, ValidationError> =>
   Effect.gen(function* () {
     const form =
       options?.form ??
@@ -582,7 +578,7 @@ export interface PackedEntityLike {
   readonly entityType: string
   readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
   readonly _unpackFields?:
-    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, PackedError>)
+    | ((raw: Record<string, unknown>, operation?: string) => Effect.Effect<void, ValidationError>)
     | undefined
 }
 
@@ -592,7 +588,7 @@ export const entityPackedQueryOptions = (
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow:
-    | ((raw: Record<string, unknown>) => Effect.Effect<Record<string, unknown>, PackedError>)
+    | ((raw: Record<string, unknown>) => Effect.Effect<Record<string, unknown>, ValidationError>)
     | undefined
 } => {
   const unpack = entity._unpackFields
@@ -613,7 +609,7 @@ export const collectionPackedQueryOptions = (
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow:
     | {
-        (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, PackedError>
+        (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, ValidationError>
         readonly reads: ReadonlyArray<string>
       }
     | undefined

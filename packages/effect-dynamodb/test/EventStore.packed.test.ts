@@ -15,11 +15,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import {
-  CompressorNotRegistered,
-  DynamoError,
-  ValidationError,
-} from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 import { beforeEach } from "vitest"
@@ -31,6 +27,7 @@ import { createPathBuilder } from "../src/internal/PathBuilder.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { missingCompressor } from "./helpers/MissingCompressor.js"
 import {
   awsValidationException,
   DDB_ITEM_SIZE,
@@ -492,12 +489,11 @@ describe("EventStore packed storage — append (#147)", () => {
   )
 
   it.effect(
-    "a compressed append without a registered codec fails with CompressorNotRegistered",
+    "a compressed append without a registered codec fails with a ValidationError caused by CompressorNotRegistered",
     () =>
       Effect.gen(function* () {
         const error = yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.flip)
-        expect(error).toBeInstanceOf(CompressorNotRegistered)
-        expect(error).toMatchObject({
+        expect(missingCompressor(error)).toMatchObject({
           codec: "zstd",
           direction: "compress",
           entityType: "ledger.event",
@@ -624,17 +620,22 @@ describe("EventStore packed storage — every read path on a mixed M/S/B stream 
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("reading a B value without its codec fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      yield* writeMixedStream.pipe(Effect.provide(Codecs))
-      const error = yield* ZstdLedger.read(id).pipe(Effect.flip)
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-      expect(error).toMatchObject({ codec: "gzip", direction: "decompress", attribute: "data" })
-      // Rows that need no codec still read.
-      expectMixedEvents(yield* ZstdLedger.readFrom(id, 4).pipe(Effect.provide(Codecs)), [5, 6])
-      const events = yield* NativeLedger.query.events(id).pipe(Query.limit(3), Query.collect)
-      expect(events.map((e) => e.version)).toEqual([1, 2, 3])
-    }).pipe(Effect.provide(NoCodecs)),
+  it.effect(
+    "reading a B value without its codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        yield* writeMixedStream.pipe(Effect.provide(Codecs))
+        const error = yield* ZstdLedger.read(id).pipe(Effect.flip)
+        expect(missingCompressor(error)).toMatchObject({
+          codec: "gzip",
+          direction: "decompress",
+          attribute: "data",
+        })
+        // Rows that need no codec still read.
+        expectMixedEvents(yield* ZstdLedger.readFrom(id, 4).pipe(Effect.provide(Codecs)), [5, 6])
+        const events = yield* NativeLedger.query.events(id).pipe(Query.limit(3), Query.collect)
+        expect(events.map((e) => e.version)).toEqual([1, 2, 3])
+      }).pipe(Effect.provide(NoCodecs)),
   )
 
   it.effect("a corrupt packed value is a ValidationError naming data", () =>
@@ -820,18 +821,20 @@ describe("EventStore packed storage — snapshots (#147, R4)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("a packed snapshot without its codec fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      yield* ZstdLedger.writeSnapshot(id, bigState(1), 1).pipe(Effect.provide(Codecs))
-      const error = yield* ZstdLedger.readSnapshot(id).pipe(Effect.flip)
-      expect(error).toMatchObject({
-        _tag: "CompressorNotRegistered",
-        codec: "zstd",
-        direction: "decompress",
-        entityType: "ledger.snapshot",
-        attribute: "state",
-      })
-    }).pipe(Effect.provide(NoCodecs)),
+  it.effect(
+    "a packed snapshot without its codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        yield* ZstdLedger.writeSnapshot(id, bigState(1), 1).pipe(Effect.provide(Codecs))
+        const error = yield* ZstdLedger.readSnapshot(id).pipe(Effect.flip)
+        expect(missingCompressor(error)).toMatchObject({
+          _tag: "CompressorNotRegistered",
+          codec: "zstd",
+          direction: "decompress",
+          entityType: "ledger.snapshot",
+          attribute: "state",
+        })
+      }).pipe(Effect.provide(NoCodecs)),
   )
 
   it.effect("commandHandler with a packed inline snapshot: append, load, append again", () =>
@@ -924,7 +927,7 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
       const missing = yield* ZstdLedger.measureAppend(id, [recorded(1, LONG_NOTE)], 0).pipe(
         Effect.flip,
       )
-      expect(missing).toBeInstanceOf(CompressorNotRegistered)
+      missingCompressor(missing)
       const small = yield* ZstdLedger.measureAppend(id, [recorded(1)], 0)
       expect(small.events).toHaveLength(1)
     }).pipe(Effect.provide(TableLayer)),
@@ -1118,15 +1121,17 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("a compressed image without its codec fails with CompressorNotRegistered", () =>
-    Effect.gen(function* () {
-      yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.provide(TestLayer))
-      const [item] = storedEvents()
-      const error = yield* ZstdLedger.decodeStreamImage(lambdaImage(item!) as never).pipe(
-        Effect.flip,
-      )
-      expect(error).toBeInstanceOf(CompressorNotRegistered)
-    }),
+  it.effect(
+    "a compressed image without its codec fails with a ValidationError caused by CompressorNotRegistered",
+    () =>
+      Effect.gen(function* () {
+        yield* ZstdLedger.append(id, [recorded(1, LONG_NOTE)], 0).pipe(Effect.provide(TestLayer))
+        const [item] = storedEvents()
+        const error = yield* ZstdLedger.decodeStreamImage(lambdaImage(item!) as never).pipe(
+          Effect.flip,
+        )
+        missingCompressor(error)
+      }),
   )
 })
 
