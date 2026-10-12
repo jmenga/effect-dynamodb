@@ -2640,6 +2640,26 @@ const makeImpl = <
     )
   }
 
+  /**
+   * A domain-named copy of `record` with its packed (or once-packed) attributes
+   * read by their stored form. The update paths derive vector source text from
+   * it: an untouched packed field still holds its stored value there (a JSON
+   * string or compressed bytes), not the value the source `compose` expects.
+   * `record` itself is left as is, so the write still carries the stored bytes.
+   */
+  const unpackedDomainCopy = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<globalThis.Record<string, unknown>, PackedError> => {
+    if (dispatchAttributes.length === 0) return Effect.succeed(record)
+    const stored = { ...record }
+    renameToDynamo(stored)
+    return Effect.map(unpackFields(stored, operation), () => {
+      renameFromDynamo(stored)
+      return stored
+    })
+  }
+
   /** The packed attributes an expression or projection may not look inside (EDD-9076). */
   const packedGuards: ReadonlyArray<PackedAttributeGuard> = Object.entries(packedFields).flatMap(
     ([field, storedAs]) => {
@@ -3596,7 +3616,11 @@ const makeImpl = <
     tableName: string,
     updatePayload: globalThis.Record<string, unknown>,
     uState: UpdateState,
-  ): Effect.Effect<VectorWriteResult, EmbeddingError | DynamoClientError, DynamoClient> =>
+  ): Effect.Effect<
+    VectorWriteResult,
+    EmbeddingError | DynamoClientError | PackedError,
+    DynamoClient
+  > =>
     Effect.gen(function* () {
       if (!hasVectorIndexes) return { sets: {}, removes: [] }
       const withVectors = uState.withVectors
@@ -3622,6 +3646,9 @@ const makeImpl = <
         const current = yield* client.getItem({ TableName: tableName, Key: marshalledKey })
         if (current.Item) {
           const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
+          // Packed fields are read by their stored form: the source text is
+          // derived from the value, not its JSON string or compressed bytes.
+          yield* unpackFields(currentDomain, "update.vector")
           renameFromDynamo(currentDomain)
           merged = { ...currentDomain, ...merged }
         }
@@ -6135,7 +6162,14 @@ const makeImpl = <
           )
           // `newItem` is the fully merged post-update item (removals already
           // applied above), so a put-style recompute is exact.
-          const vectorWrite = yield* computeVectorAttributes(newItem, uState.withVectors, embedFor)
+          // Untouched packed fields still hold their stored form on `newItem`
+          // (kept byte-identical for the write diff), so the source text is
+          // derived from an unpacked copy.
+          const vectorWrite = yield* computeVectorAttributes(
+            yield* unpackedDomainCopy(newItem, "update.vector"),
+            uState.withVectors,
+            embedFor,
+          )
           Object.assign(newItem, vectorWrite.sets)
           for (const field of vectorWrite.removes) delete newItem[field]
         }

@@ -20,6 +20,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
   CompressorNotRegistered,
   DynamoError,
@@ -35,6 +36,7 @@ import * as Expression from "../src/Expression.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -1265,5 +1267,87 @@ describe("Entity packed fields — DynamoClient.make({ compressors })", () => {
         .pipe(Effect.provide(Gzip))
       expect(read.body).toEqual(body)
     }).pipe(Effect.provide(NoCodecs)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Vector indexes whose source includes a packed field
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — vector index source", () => {
+  class Note extends Schema.Class<Note>("Note")({
+    noteId: Schema.String,
+    title: Schema.String,
+    details: Schema.Struct({ summary: Schema.String }),
+  }) {}
+  const source = {
+    fields: ["title", "details"],
+    compose: (picked: Record<string, unknown>) =>
+      `${String(picked.title ?? "")} ${(picked.details as { summary?: string } | undefined)?.summary ?? ""}`,
+  }
+  const noteModel = DynamoModel.configure(Note, { details: { storedAs: gzip0 } })
+  const VNotes = Entity.make({
+    model: noteModel,
+    entityType: "VNote",
+    primaryKey: {
+      pk: { field: "pk", composite: ["noteId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    vectorIndexes: { search: { name: "vecn", dimensions: 2, source } },
+  })
+  const VRetained = Entity.make({
+    model: noteModel,
+    entityType: "VRetained",
+    primaryKey: {
+      pk: { field: "pk", composite: ["noteId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    versioned: { retain: true },
+    vectorIndexes: { search: { name: "vecr", dimensions: 2, source } },
+  })
+  const VTable = Table.make({ schema: AppSchema, entities: { VNotes, VRetained } })
+  const embedded: Array<string> = []
+  const RecordingEmbedder = Layer.succeed(Embedder, {
+    dimensions: 2,
+    embed: (text: string) =>
+      Effect.sync(() => {
+        embedded.push(text)
+        return [1, 0]
+      }),
+  })
+  const VLayer = Layer.mergeAll(
+    VectorSearchEmulation.layer(InMemoryClient, { tables: { VTable } }),
+    VTable.layer({ name: "packed-entity-table" }),
+    Codecs,
+    RecordingEmbedder,
+  )
+  const details = { summary: "s".repeat(200) }
+
+  it.effect("an update re-embeds from the packed field's value, not its stored bytes", () =>
+    Effect.gen(function* () {
+      embedded.length = 0
+      const db = yield* DynamoClient.make({ entities: { VNotes, VRetained }, tables: { VTable } })
+      yield* db.entities.VNotes.put({ noteId: "n-1", title: "T", details })
+      const stored = [...store.values()].find((item) => item.__edd_e__?.S === "VNote")!
+      expect(stored.details?.B).toBeInstanceOf(Uint8Array)
+      yield* db.entities.VNotes.update({ noteId: "n-1" }).set({ title: "T2" })
+      expect(embedded).toEqual([`T ${details.summary}`, `T2 ${details.summary}`])
+    }).pipe(Effect.provide(VLayer)),
+  )
+
+  it.effect("the retain update path re-embeds from the packed field's value too", () =>
+    Effect.gen(function* () {
+      embedded.length = 0
+      const db = yield* DynamoClient.make({ entities: { VNotes, VRetained }, tables: { VTable } })
+      yield* db.entities.VRetained.put({ noteId: "n-1", title: "T", details })
+      yield* db.entities.VRetained.update({ noteId: "n-1" }).set({ title: "T2" })
+      expect(embedded).toEqual([`T ${details.summary}`, `T2 ${details.summary}`])
+      // The untouched packed field is still written byte-identical (not rewritten).
+      const current = [...store.values()].find(
+        (item) => item.__edd_e__?.S === "VRetained" && item.title?.S === "T2",
+      )!
+      expect(current.details?.B).toBeInstanceOf(Uint8Array)
+      expect((yield* db.entities.VRetained.get({ noteId: "n-1" })).details).toEqual(details)
+    }).pipe(Effect.provide(VLayer)),
   )
 })
