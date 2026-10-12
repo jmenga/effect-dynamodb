@@ -674,33 +674,28 @@ export type CollectionSelected<TResult> = {
 /**
  * Collection query — returned by `db.collections.Name(composites)`.
  * `.collect()` and `.fetch()` return the grouped result (not an array);
- * `.paginate()` streams each item tagged with its member.
+ * `.paginate()` streams each item tagged with its member. Like a `BoundQuery`,
+ * every terminal can fail with `CompressorNotRegistered` (in
+ * `Query.QueryDecodeError`): a member's packed field may be stored compressed
+ * with a codec this process has not registered.
  */
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
-  readonly collect: () => Effect.Effect<
-    TResult,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
-    never
-  >
+  readonly collect: () => Effect.Effect<TResult, DynamoClientError | Query.QueryDecodeError, never>
   /** Execute a single page, grouped like `collect()`. */
   readonly fetch: () => Effect.Effect<
     { items: TResult; cursor: string | null },
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    DynamoClientError | Query.QueryDecodeError,
     never
   >
   /** Stream every item, page by page, each tagged with its member. */
   readonly paginate: () => Stream.Stream<
     CollectionStreamItem<TResult>,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
+    DynamoClientError | Query.QueryDecodeError,
     never
   >
   /** Count the members' items (every member's, together). */
-  readonly count: () => Effect.Effect<
-    number,
-    DynamoClientError | import("@effect-dynamodb/schema/Errors.js").ValidationError,
-    never
-  >
+  readonly count: () => Effect.Effect<number, DynamoClientError | Query.QueryDecodeError, never>
   /**
    * Project attributes — by domain name, per member: each member's items come
    * back as partial records under its key.
