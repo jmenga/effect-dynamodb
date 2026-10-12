@@ -17,16 +17,24 @@
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type {
+  AdditionalItemConditionFailed,
   AggregateAssemblyError,
+  AggregateDecompositionError,
+  AggregateTransactionOverflow,
+  AppendTooLarge,
   ConcurrentModification,
+  ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
+  DuplicateCommand,
   ItemNotFound,
   OptimisticLockError,
+  RefNotFound,
   TransactionCancelled,
   TransactionOverflow,
   UniqueConstraintViolation,
   UpdateAppliedButUnreadable,
   ValidationError,
+  VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import { type Effect, Schema, type Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
@@ -153,6 +161,14 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
       >()
       const tw = Transaction.transactWrite([Packed.put({ orderId: "o", lines: [] })])
       expectTypeOf<Leaked<Effect.Error<typeof tw>>>().toBeNever()
+      expectTypeOf<Effect.Error<typeof tw>>().toEqualTypeOf<
+        | DynamoClientError
+        | ValidationError
+        | TransactionCancelled
+        | UniqueConstraintViolation
+        | OptimisticLockError
+        | ConcurrentModification
+      >()
     })
     expect(true).toBe(true)
   })
@@ -160,6 +176,19 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
   it("Aggregate", () => {
     expectTypeOf<Leaked<AggregateWriteError>>().toBeNever()
     expectTypeOf<Leaked<AggregateCreateError>>().toBeNever()
+    expectTypeOf<AggregateWriteError>().toEqualTypeOf<
+      | AggregateAssemblyError
+      | AggregateDecompositionError
+      | AggregateTransactionOverflow
+      | DynamoClientError
+      | ValidationError
+      | RefNotFound
+      | ItemNotFound
+      | TransactionCancelled
+    >()
+    expectTypeOf<AggregateCreateError>().toEqualTypeOf<
+      AggregateWriteError | ConditionalCheckFailed
+    >()
     type Get = ReturnType<Aggregate.Aggregate<any, any>["get"]>
     expectTypeOf<Effect.Error<Get>>().toEqualTypeOf<
       AggregateAssemblyError | DynamoClientError | ValidationError
@@ -168,6 +197,18 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
 
   it("EventStore", () => {
     expectTypeOf<Leaked<EventStore.AppendError>>().toBeNever()
+    expectTypeOf<EventStore.AppendError>().toEqualTypeOf<
+      | VersionConflict
+      | DuplicateCommand
+      | AdditionalItemConditionFailed
+      | AppendTooLarge
+      | DynamoClientError
+      | ValidationError
+      | TransactionCancelled
+      | UniqueConstraintViolation
+      | OptimisticLockError
+      | ConcurrentModification
+    >()
   })
 
   it("StorageEncoding helpers fail with ValidationError only", () => {
