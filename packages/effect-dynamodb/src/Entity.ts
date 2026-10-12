@@ -103,17 +103,17 @@ import {
 import { countOperators, expressionFits } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
-  currentRegistry,
   decodeImage,
   imageEntityType,
   ownRowsRawRow,
   type PackedAttributeGuard,
-  packAttributeValue,
+  packAttributeValueSync,
   packedExprRefusal,
   packedProjectionRefusal,
-  packItem,
+  packItemSync,
   type StreamImage,
-  unpackItem,
+  unpackRow,
+  withRegistry,
 } from "./internal/Packed.js"
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
@@ -2557,8 +2557,8 @@ const makeImpl = <
         ? packedAttributes
         : Object.fromEntries(Object.entries(packedAttributes).filter(([attr]) => only.has(attr)))
     if (Object.keys(targets).length === 0) return Effect.void
-    return Effect.flatMap(currentRegistry, (registry) =>
-      packItem(item, targets, registry, { entityType, operation: `${operation}.packed` }),
+    return withRegistry((registry) =>
+      packItemSync(item, targets, registry, { entityType, operation: `${operation}.packed` }),
     )
   }
 
@@ -2568,12 +2568,14 @@ const makeImpl = <
     wire: unknown,
     operation: string,
   ): Effect.Effect<AttributeValue | undefined, ValidationError> =>
-    Effect.flatMap(currentRegistry, (registry) =>
-      packAttributeValue(packedAttributes[attribute]!, wire, registry, {
-        entityType,
+    withRegistry((registry) =>
+      packAttributeValueSync(
+        packedAttributes[attribute]!,
+        wire,
+        registry,
+        { entityType, operation: `${operation}.packed` },
         attribute,
-        operation: `${operation}.packed`,
-      }),
+      ),
     )
 
   /**
@@ -2584,21 +2586,10 @@ const makeImpl = <
   const unpackFields = (
     raw: globalThis.Record<string, unknown>,
     operation = "decode",
-  ): Effect.Effect<void, ValidationError> => {
-    if (dispatchAttributes.length === 0) return Effect.void
-    let stored = false
-    for (const attr of dispatchAttributes) {
-      const value = raw[attr]
-      if (typeof value === "string" || value instanceof Uint8Array) {
-        stored = true
-        break
-      }
-    }
-    if (!stored) return Effect.void
-    return Effect.flatMap(currentRegistry, (registry) =>
-      unpackItem(raw, dispatchAttributes, registry, { entityType, operation }),
-    )
-  }
+  ): Effect.Effect<void, ValidationError> =>
+    dispatchAttributes.length === 0
+      ? Effect.void
+      : unpackRow(raw, dispatchAttributes, { entityType, operation })
 
   /**
    * A domain-named copy of `record` with its packed (or once-packed) attributes

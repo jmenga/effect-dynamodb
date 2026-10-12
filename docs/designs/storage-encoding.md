@@ -316,7 +316,22 @@ export const valueBytes: <S extends Schema.Top>(options: {
 }) => Effect<number, ValidationError>
 /** DynamoDB limits, in bytes: { item: 409_600, transaction: 4_194_304 }. */
 export const limits: { readonly item: number; readonly transaction: number }
+
+/** Synchronous twins: explicit compressors (none by default); throw the ValidationError. */
+export interface SyncOptions {
+  readonly compressors?: CompressionRegistry | ReadonlyArray<Compressor> | undefined
+}
+export const encodeSync: (storedAs: PackedConfig, wire: unknown, options?: SyncOptions) =>
+  AttributeValue | undefined
+export const decodeSync: (stored: AttributeValue | { readonly B: string } | undefined,
+  options?: SyncOptions) => unknown
+export const decodeUnmarshalledSync: (stored: unknown, options?: SyncOptions) => unknown
 ```
+
+The Effect forms cost one Effect per call: a native value or JSON text never looks the
+registry up, and only a compressed value reads it from the fiber's context. A caller
+decoding many values with no Effect per value resolves the registry once and loops over a
+`*Sync` twin (§11).
 
 The two forms are separate functions because they cannot be told apart by shape: an
 unmarshalled one-key map `{ N: "5" }` or `{ L: [1, 2] }` is also a valid-looking
@@ -981,8 +996,45 @@ Read: per eligible attribute, one `typeof`; per packed `S`, one `JSON.parse`; pe
 header byte, one sync decompress, one `TextDecoder` pass. The schema decode is unchanged
 (a fold over raw rows skips it entirely, R3). Write: one strict serialisation pass; one
 UTF-8 encode and one compress only when compression is configured and the JSON is over the
-threshold. The registry lookup is per op, not per value. No measurable cost for entities
-and streams that do not use the feature beyond the eligibility check.
+threshold. No measurable cost for entities and streams that do not use the feature beyond
+the eligibility check.
+
+**No Effect per value.** The codec's core is synchronous — `packValueSync`,
+`unpackStoredSync`, `unpackBytesSync` (schema package) and the item-level
+`packItemSync` / `unpackItemSync` / `normalizeImageSync` / `decodeImageSync`
+(`internal/Packed.ts`) are plain functions that return their result or the
+`ValidationError` they fail with (never throw), and build no context object per value (the
+attribute is passed separately; an error is built only on failure). The read paths lift
+that work into **one** Effect per row (`unpackRow`: a row with nothing stored packed runs
+no Effect and no registry lookup at all), per image, or per aggregate partition
+(`withRegistry` reads the registry straight from the fiber's context, once). UTF-8 is
+decoded with a non-fatal `TextDecoder` (the runtime's fast path); only a payload that
+decodes with a U+FFFD is re-decoded fatally, so invalid UTF-8 still fails and a payload
+that legitimately holds U+FFFD reads.
+
+`packages/effect-dynamodb/bench/packed-decode.ts` (not run in CI;
+`node --expose-gc --import tsx bench/packed-decode.ts`) measures 5,990 values / rows.
+Downstream review measured, on Lambda (arm64, nodejs24.x), the first cut's
+`decodeUnmarshalled` at 28 ms for map passthrough (bare loop 0.1 ms), 67 ms for JSON
+(`JSON.parse` 30 ms) and 253 ms for zstd (decompress + parse 141 ms). On a development
+machine (Apple silicon, Node 24.21, `--expose-gc`, medians of 15 runs):
+
+| Case (5,990) | Bare work | Before | After (Effect) | After (`*Sync`) |
+|---|---|---|---|---|
+| `decodeUnmarshalled`, native map | 0.01 ms (loop) | 6.9 ms | 0.8 ms | 0.13 ms |
+| `decodeUnmarshalled`, JSON `S` | 9.3 ms (`JSON.parse`) | 15.9 ms | 9.9 ms | 9.2 ms |
+| `decodeUnmarshalled`, zstd `B` | 37.5 ms (decompress + parse) | 46.4 ms | 40.0 ms | 38.0 ms |
+| `decodeStreamImage`, packed JSON `data` | — | 56.2 ms | 37.5 ms | — |
+| entity scan `.collect()`, native map field | 33.4 ms (`unmarshall` only) | 50.0 ms | 49.8 ms | — |
+| entity scan `.collect()`, packed JSON field | — | 33.4 ms | 27.9 ms | — |
+| entity scan `.collect()`, packed zstd field | — | 55.4 ms | 58.3 ms | — |
+
+The per-value overhead is gone: every value-level case is within a few percent of the bare
+work, and the sync twins match it.
+The zstd row case is dominated by Node's sync zstd API, which builds a native decompression
+context per call (the `Zstd` constructor and `processChunkSync` are ~40% of its profile,
+`JSON.parse` ~15%); the unpack itself measures within 1 ms of decompress + parse in
+isolation, and the remaining difference moves with GC timing, not with the library's work.
 
 ---
 

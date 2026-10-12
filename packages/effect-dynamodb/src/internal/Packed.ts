@@ -18,8 +18,13 @@
  *   unmarshalled item with real bytes, and {@link unpackImageItem} additionally
  *   reads base64 text on a dispatch-eligible attribute as `B`.
  *
- * The registry is read with `Effect.serviceOption(Compression)`, so nothing
- * here adds a requirement; an absent service is the empty registry.
+ * The registry is read from the fiber's context (as `Effect.serviceOption`
+ * would), so nothing here adds a requirement; an absent service is the empty
+ * registry. Every per-value step is synchronous — a plain function returning
+ * its result or the `ValidationError` it fails with — and is lifted into an
+ * Effect once per item (or per operation), not once per value: a read of
+ * thousands of rows pays for `JSON.parse` / decompression, not for Effect
+ * plumbing around each value.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -32,13 +37,14 @@ import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   isBase64PackedText,
+  type OperationContext,
   type PackedContext,
   type PackedStored,
-  packValue,
-  unpackBytes,
-  unpackValue,
+  packValueSync,
+  unpackBytesSync,
+  unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Effect, Option, Result } from "effect"
+import { Context, Effect, Result } from "effect"
 import { Base64 } from "effect/encoding"
 import { fromAttributeMap } from "../Marshaller.js"
 import type { QueryRawRow } from "../Query.js"
@@ -46,21 +52,39 @@ import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 
-/** Who is packing/unpacking an item; the attribute is filled in per value. */
-export interface ItemContext {
-  readonly entityType: string
-  readonly operation: string
-}
+/** Who is packing/unpacking an item; the attribute is named per value only on failure. */
+export type ItemContext = OperationContext
 
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
+/** The compressor registry in a context — the empty registry when none is provided. */
+export const registryOf = (context: Context.Context<never>): CompressionRegistry =>
+  Context.getOrUndefined(context, Compression) ?? emptyRegistry
+
 /** The compressor registry in scope — the empty registry when none is provided. */
-export const currentRegistry: Effect.Effect<CompressionRegistry> = Effect.map(
-  Effect.serviceOption(Compression),
-  (registry) => Option.getOrElse(registry, () => emptyRegistry),
+export const currentRegistry: Effect.Effect<CompressionRegistry> = Effect.withFiber((fiber) =>
+  Effect.succeed(registryOf(fiber.context)),
 )
+
+/**
+ * Run a synchronous pack/unpack step with the registry in scope, as ONE
+ * Effect: `step` returns its result, or the `ValidationError` it fails with.
+ * (`step` must never succeed with a `ValidationError` value — none of the
+ * steps here can: they return parsed JSON, stored values or `undefined`.)
+ */
+export const withRegistry = <A>(
+  step: (registry: CompressionRegistry) => A | ValidationError,
+): Effect.Effect<A, ValidationError> =>
+  Effect.withFiber((fiber) => {
+    const result = step(registryOf(fiber.context))
+    return result instanceof ValidationError ? Effect.fail(result) : Effect.succeed(result as A)
+  })
+
+/** Lift a synchronous step's result (or the `ValidationError` it returned) into an Effect. */
+export const fromStep = <A>(result: A | ValidationError): Effect.Effect<A, ValidationError> =>
+  result instanceof ValidationError ? Effect.fail(result) : Effect.succeed(result as A)
 
 // ---------------------------------------------------------------------------
 // Write
@@ -69,28 +93,36 @@ export const currentRegistry: Effect.Effect<CompressionRegistry> = Effect.map(
 /**
  * Pack, in place, every attribute of `item` (keyed by **stored** name) that
  * `packed` configures. An attribute the item does not carry is left absent; a
- * wire value of `undefined` removes it.
+ * wire value of `undefined` removes it. Returns the `ValidationError` of the
+ * first attribute that fails (the item is then partly packed — discard it), or
+ * `undefined`.
  */
+export const packItemSync = (
+  item: Record<string, unknown>,
+  packed: Readonly<Record<string, PackedConfig>>,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+): ValidationError | undefined => {
+  for (const attribute in packed) {
+    if (!(attribute in item)) continue
+    const stored = packValueSync(packed[attribute]!, item[attribute], registry, ctx, attribute)
+    if (stored instanceof ValidationError) return stored
+    if (stored === undefined) delete item[attribute]
+    else item[attribute] = stored
+  }
+  return undefined
+}
+
+/** {@link packItemSync} as an Effect. */
 export const packItem = (
   item: Record<string, unknown>,
   packed: Readonly<Record<string, PackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
-): Effect.Effect<void, ValidationError> =>
-  Effect.forEach(
-    Object.entries(packed),
-    ([attribute, config]) => {
-      if (!(attribute in item)) return Effect.void
-      return Effect.map(
-        packValue(config, item[attribute], registry, { ...ctx, attribute }),
-        (stored) => {
-          if (stored === undefined) delete item[attribute]
-          else item[attribute] = stored
-        },
-      )
-    },
-    { discard: true },
-  )
+): Effect.Effect<void, ValidationError> => {
+  const failure = packItemSync(item, packed, registry, ctx)
+  return failure === undefined ? Effect.void : Effect.fail(failure)
+}
 
 /** The `AttributeValue` a packed stored value marshals to (`undefined`: no attribute). */
 export const storedToAttributeValue = (stored: PackedStored): AttributeValue | undefined => {
@@ -110,37 +142,84 @@ export const packAttributeValue = (
   registry: CompressionRegistry,
   ctx: PackedContext,
 ): Effect.Effect<AttributeValue | undefined, ValidationError> =>
-  Effect.map(packValue(config, wire, registry, ctx), storedToAttributeValue)
+  fromStep(packAttributeValueSync(config, wire, registry, ctx, ctx.attribute))
+
+/** {@link packAttributeValue} without an Effect: the value, or the failure (returned). */
+export const packAttributeValueSync = (
+  config: PackedConfig,
+  wire: unknown,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+  attribute: string,
+): AttributeValue | undefined | ValidationError => {
+  const stored = packValueSync(config, wire, registry, ctx, attribute)
+  return stored instanceof ValidationError ? stored : storedToAttributeValue(stored)
+}
 
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
 
 /**
+ * True iff any listed attribute of `raw` holds a string or bytes — a value
+ * read by its stored form. A native row (maps, lists, absent) is false, and
+ * costs one `typeof` per attribute.
+ */
+export const hasStoredForm = (
+  raw: Record<string, unknown>,
+  attributes: ReadonlyArray<string>,
+): boolean => {
+  for (let i = 0; i < attributes.length; i++) {
+    const value = raw[attributes[i]!]
+    if (typeof value === "string" || value instanceof Uint8Array) return true
+  }
+  return false
+}
+
+/**
  * Unpack, in place, every listed attribute of an unmarshalled item (keyed by
  * **stored** name) by its stored form. Native values cost one `typeof` check.
+ * Returns the `ValidationError` of the first value that fails, or `undefined`.
  */
+export const unpackItemSync = (
+  raw: Record<string, unknown>,
+  attributes: Iterable<string>,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+): ValidationError | undefined => {
+  for (const attribute of attributes) {
+    const value = raw[attribute]
+    if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
+    const wire = unpackStoredSync(value, registry, ctx, attribute)
+    if (wire instanceof ValidationError) return wire
+    raw[attribute] = wire
+  }
+  return undefined
+}
+
+/** {@link unpackItemSync} as an Effect. */
 export const unpackItem = (
   raw: Record<string, unknown>,
   attributes: Iterable<string>,
   registry: CompressionRegistry,
   ctx: ItemContext,
 ): Effect.Effect<void, ValidationError> => {
-  const pending: Array<string> = []
-  for (const attribute of attributes) {
-    const value = raw[attribute]
-    if (typeof value === "string" || value instanceof Uint8Array) pending.push(attribute)
-  }
-  if (pending.length === 0) return Effect.void
-  return Effect.forEach(
-    pending,
-    (attribute) =>
-      Effect.map(unpackValue(raw[attribute], registry, { ...ctx, attribute }), (wire) => {
-        raw[attribute] = wire
-      }),
-    { discard: true },
-  )
+  const failure = unpackItemSync(raw, attributes, registry, ctx)
+  return failure === undefined ? Effect.void : Effect.fail(failure)
 }
+
+/**
+ * {@link unpackItemSync} with the registry in scope, as one Effect — and no
+ * registry lookup at all for a row with nothing stored packed.
+ */
+export const unpackRow = (
+  raw: Record<string, unknown>,
+  attributes: ReadonlyArray<string>,
+  ctx: ItemContext,
+): Effect.Effect<void, ValidationError> =>
+  hasStoredForm(raw, attributes)
+    ? withRegistry((registry) => unpackItemSync(raw, attributes, registry, ctx))
+    : Effect.void
 
 // ---------------------------------------------------------------------------
 // Streams images
@@ -214,82 +293,95 @@ export const imageEntityType = (image: StreamImage): string | undefined => {
   return undefined
 }
 
-/** Decode base64 text (or pass bytes through), failing with the attribute named. */
-const toBytes = (
+const imageError = (ctx: ItemContext, message: string, cause?: unknown): ValidationError =>
+  new ValidationError({
+    entityType: ctx.entityType,
+    operation: ctx.operation,
+    cause: cause === undefined ? new Error(message) : new Error(message, { cause }),
+  })
+
+/** Decode base64 text (or pass bytes through), or the failure naming the attribute. */
+const toBytesSync = (
   value: unknown,
-  ctx: PackedContext,
-): Effect.Effect<Uint8Array, ValidationError> => {
-  if (value instanceof Uint8Array) return Effect.succeed(value)
+  ctx: ItemContext,
+  attribute: string,
+): Uint8Array | ValidationError => {
+  if (value instanceof Uint8Array) return value
   if (typeof value === "string") {
     const decoded = Base64.decode(value)
-    if (Result.isSuccess(decoded)) return Effect.succeed(decoded.success)
-    return Effect.fail(
-      new ValidationError({
-        entityType: ctx.entityType,
-        operation: ctx.operation,
-        cause: new Error(`Attribute "${ctx.attribute}": a binary value is not valid base64`, {
-          cause: decoded.failure,
-        }),
-      }),
+    if (Result.isSuccess(decoded)) return decoded.success
+    return imageError(
+      ctx,
+      `Attribute "${attribute}": a binary value is not valid base64`,
+      decoded.failure,
     )
   }
-  return Effect.fail(
-    new ValidationError({
-      entityType: ctx.entityType,
-      operation: ctx.operation,
-      cause: new Error(
-        `Attribute "${ctx.attribute}": a binary value must be bytes or base64 text, got ${typeof value}`,
-      ),
-    }),
+  return imageError(
+    ctx,
+    `Attribute "${attribute}": a binary value must be bytes or base64 text, got ${typeof value}`,
   )
 }
 
 /**
- * Rebuild one DynamoDB-JSON `AttributeValue` with every `B` / `BS` member (at
- * any depth) as real bytes.
+ * One DynamoDB-JSON `AttributeValue` with every `B` / `BS` member (at any
+ * depth) as real bytes — the value itself when it holds none as text, so a
+ * typical image is not copied.
  */
-const normalizeAttributeValue = (
+const normalizeAttributeValueSync = (
   value: unknown,
-  ctx: PackedContext,
-): Effect.Effect<AttributeValue, ValidationError> => {
+  ctx: ItemContext,
+  path: string,
+): AttributeValue | ValidationError => {
   if (!isAttributeValueShape(value)) {
-    return Effect.fail(
-      new ValidationError({
-        entityType: ctx.entityType,
-        operation: ctx.operation,
-        cause: new Error(`Attribute "${ctx.attribute}": not a DynamoDB JSON attribute value`),
-      }),
-    )
+    return imageError(ctx, `Attribute "${path}": not a DynamoDB JSON attribute value`)
   }
   const av = value as Record<string, unknown>
-  if ("B" in av) return Effect.map(toBytes(av.B, ctx), (B) => ({ B }))
+  if ("B" in av) {
+    if (av.B instanceof Uint8Array) return av as unknown as AttributeValue
+    const B = toBytesSync(av.B, ctx, path)
+    return B instanceof ValidationError ? B : { B }
+  }
   if ("BS" in av) {
-    if (!Array.isArray(av.BS)) return Effect.succeed(av as unknown as AttributeValue)
-    return Effect.map(
-      Effect.forEach(av.BS as ReadonlyArray<unknown>, (element) => toBytes(element, ctx)),
-      (BS) => ({ BS }),
-    )
+    if (!Array.isArray(av.BS) || av.BS.every((element) => element instanceof Uint8Array)) {
+      return av as unknown as AttributeValue
+    }
+    const BS: Array<Uint8Array> = []
+    for (const element of av.BS as ReadonlyArray<unknown>) {
+      const bytes = toBytesSync(element, ctx, path)
+      if (bytes instanceof ValidationError) return bytes
+      BS.push(bytes)
+    }
+    return { BS }
   }
   if ("M" in av && typeof av.M === "object" && av.M !== null) {
-    return Effect.map(
-      Effect.forEach(Object.entries(av.M as Record<string, unknown>), ([name, nested]) =>
-        Effect.map(
-          normalizeAttributeValue(nested, { ...ctx, attribute: `${ctx.attribute}.${name}` }),
-          (normalized) => [name, normalized] as const,
-        ),
-      ),
-      (entries) => ({ M: Object.fromEntries(entries) }),
-    )
+    const members = av.M as Record<string, unknown>
+    let copy: Record<string, AttributeValue> | undefined
+    for (const name in members) {
+      const nested = members[name]
+      const normalized = normalizeAttributeValueSync(nested, ctx, `${path}.${name}`)
+      if (normalized instanceof ValidationError) return normalized
+      if (normalized !== nested) {
+        copy ??= { ...(members as Record<string, AttributeValue>) }
+        copy[name] = normalized
+      }
+    }
+    return copy === undefined ? (av as unknown as AttributeValue) : { M: copy }
   }
   if ("L" in av && Array.isArray(av.L)) {
-    return Effect.map(
-      Effect.forEach(av.L as ReadonlyArray<unknown>, (nested, i) =>
-        normalizeAttributeValue(nested, { ...ctx, attribute: `${ctx.attribute}[${i}]` }),
-      ),
-      (L) => ({ L }),
-    )
+    const elements = av.L as ReadonlyArray<unknown>
+    let copy: Array<AttributeValue> | undefined
+    for (let i = 0; i < elements.length; i++) {
+      const nested = elements[i]
+      const normalized = normalizeAttributeValueSync(nested, ctx, `${path}[${i}]`)
+      if (normalized instanceof ValidationError) return normalized
+      if (normalized !== nested) {
+        copy ??= [...(elements as ReadonlyArray<AttributeValue>)]
+        copy[i] = normalized
+      }
+    }
+    return copy === undefined ? (av as unknown as AttributeValue) : { L: copy }
   }
-  return Effect.succeed(av as unknown as AttributeValue)
+  return av as unknown as AttributeValue
 }
 
 /** How {@link normalizeImage} reads an image. */
@@ -298,6 +390,55 @@ export interface ImageOptions {
   readonly probe?: string | undefined
   /** Skip detection: the image is known to be DynamoDB JSON, or unmarshalled. */
   readonly form?: "attributeValues" | "unmarshalled" | undefined
+}
+
+/** The form of `image` — `options.form`, or detected (see {@link isAttributeValueImage}). */
+export const imageForm = (
+  image: StreamImage,
+  options?: ImageOptions,
+): "attributeValues" | "unmarshalled" =>
+  options?.form ??
+  (typeof image === "object" &&
+  image !== null &&
+  !Array.isArray(image) &&
+  isAttributeValueImage(image, options?.probe)
+    ? "attributeValues"
+    : "unmarshalled")
+
+/**
+ * {@link normalizeImage} without an Effect: the unmarshalled item, or the
+ * `ValidationError` it fails with (returned, never thrown).
+ */
+export const normalizeImageSync = (
+  image: StreamImage,
+  ctx: ItemContext,
+  options?: ImageOptions,
+): Record<string, unknown> | ValidationError => {
+  if (typeof image !== "object" || image === null || Array.isArray(image)) {
+    return imageError(
+      ctx,
+      "A stream image must be an object (DynamoDB JSON or an unmarshalled item)",
+    )
+  }
+  if (imageForm(image, options) === "unmarshalled") {
+    return { ...(image as Record<string, unknown>) }
+  }
+  const source = image as Record<string, unknown>
+  let normalized: Record<string, AttributeValue> | undefined
+  for (const attribute in source) {
+    const value = source[attribute]
+    const av = normalizeAttributeValueSync(value, ctx, attribute)
+    if (av instanceof ValidationError) return av
+    if (av !== value) {
+      normalized ??= { ...(source as Record<string, AttributeValue>) }
+      normalized[attribute] = av
+    }
+  }
+  try {
+    return fromAttributeMap(normalized ?? (source as Record<string, AttributeValue>))
+  } catch (cause) {
+    return new ValidationError({ entityType: ctx.entityType, operation: ctx.operation, cause })
+  }
 }
 
 /**
@@ -314,85 +455,83 @@ export const normalizeImage = (
   image: StreamImage,
   ctx: ItemContext,
   options?: ImageOptions,
-): Effect.Effect<Record<string, unknown>, ValidationError> => {
-  if (typeof image !== "object" || image === null || Array.isArray(image)) {
-    return Effect.fail(
-      new ValidationError({
-        entityType: ctx.entityType,
-        operation: ctx.operation,
-        cause: new Error(
-          "A stream image must be an object (DynamoDB JSON or an unmarshalled item)",
-        ),
-      }),
-    )
-  }
-  const form =
-    options?.form ??
-    (isAttributeValueImage(image, options?.probe) ? "attributeValues" : "unmarshalled")
-  if (form === "unmarshalled") return Effect.succeed({ ...(image as Record<string, unknown>) })
-  return Effect.flatMap(
-    Effect.forEach(Object.entries(image), ([attribute, value]) =>
-      Effect.map(
-        normalizeAttributeValue(value, { ...ctx, attribute }),
-        (normalized) => [attribute, normalized] as const,
-      ),
-    ),
-    (entries) =>
-      Effect.try({
-        try: () => fromAttributeMap(Object.fromEntries(entries)),
-        catch: (cause) =>
-          new ValidationError({ entityType: ctx.entityType, operation: ctx.operation, cause }),
-      }),
-  )
-}
+): Effect.Effect<Record<string, unknown>, ValidationError> =>
+  Effect.suspend(() => fromStep(normalizeImageSync(image, ctx, options)))
 
 /**
- * {@link unpackItem} for a normalised stream image: on a listed attribute, a
- * string that is base64 of a `B` value (it starts with `I`–`P`, which JSON text
- * never does — see `PackedCodec.isBase64PackedText`) is decoded to bytes and
- * read as `B`; any other string is JSON.
+ * {@link unpackItemSync} for a normalised **unmarshalled** stream image: on a
+ * listed attribute, a string that is base64 of a `B` value (it starts with
+ * `I`–`P`, which JSON text never does — see `PackedCodec.isBase64PackedText`)
+ * is decoded to bytes and read as `B`; any other string is JSON.
  */
+export const unpackImageItemSync = (
+  raw: Record<string, unknown>,
+  attributes: Iterable<string>,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+): ValidationError | undefined => {
+  for (const attribute of attributes) {
+    let value = raw[attribute]
+    if (typeof value === "string" && isBase64PackedText(value)) {
+      const bytes = toBytesSync(value, ctx, attribute)
+      if (bytes instanceof ValidationError) return bytes
+      const wire = unpackBytesSync(bytes, registry, ctx, attribute)
+      if (wire instanceof ValidationError) return wire
+      raw[attribute] = wire
+      continue
+    }
+    if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
+    value = unpackStoredSync(value, registry, ctx, attribute)
+    if (value instanceof ValidationError) return value
+    raw[attribute] = value
+  }
+  return undefined
+}
+
+/** {@link unpackImageItemSync} as an Effect. */
 export const unpackImageItem = (
   raw: Record<string, unknown>,
   attributes: Iterable<string>,
   registry: CompressionRegistry,
   ctx: ItemContext,
-): Effect.Effect<void, ValidationError> =>
-  Effect.forEach(
-    [...attributes],
-    (attribute) => {
-      const value = raw[attribute]
-      const valueCtx = { ...ctx, attribute }
-      if (typeof value === "string" && isBase64PackedText(value)) {
-        return toBytes(value, valueCtx).pipe(
-          Effect.flatMap((bytes) => unpackBytes(bytes, registry, valueCtx)),
-          Effect.tap((wire) =>
-            Effect.sync(() => {
-              raw[attribute] = wire
-            }),
-          ),
-          Effect.asVoid,
-        )
-      }
-      if (typeof value === "string" || value instanceof Uint8Array) {
-        return Effect.map(unpackValue(value, registry, valueCtx), (wire) => {
-          raw[attribute] = wire
-        })
-      }
-      return Effect.void
-    },
-    { discard: true },
-  )
+): Effect.Effect<void, ValidationError> => {
+  const failure = unpackImageItemSync(raw, attributes, registry, ctx)
+  return failure === undefined ? Effect.void : Effect.fail(failure)
+}
+
+/**
+ * {@link decodeImage} without an Effect, with an explicit registry: the
+ * unmarshalled item, or the `ValidationError` it fails with.
+ */
+export const decodeImageSync = (
+  image: StreamImage,
+  attributes: Iterable<string>,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+  options?: ImageOptions,
+): Record<string, unknown> | ValidationError => {
+  const form = imageForm(image, options)
+  const raw = normalizeImageSync(image, ctx, { ...options, form })
+  if (raw instanceof ValidationError) return raw
+  // In DynamoDB JSON the S / B tag says what each value is; unmarshalled, a
+  // string that is base64 of a `B` value is told apart from JSON text.
+  const failure =
+    form === "attributeValues"
+      ? unpackItemSync(raw, attributes, registry, ctx)
+      : unpackImageItemSync(raw, attributes, registry, ctx)
+  return failure ?? raw
+}
 
 /**
  * The stream-image decode primitive: normalise `image` and unpack its
  * dispatch-eligible `attributes` (stored names), returning the unmarshalled
  * item with each packed value as its JSON wire form — ready for the same
- * sparse rebuild, renames and schema decode a table read applies.
+ * sparse rebuild, renames and schema decode a table read applies. One Effect
+ * per image; the work inside is synchronous.
  *
  * In DynamoDB JSON the `S` / `B` tag says what each value is; in an
  * unmarshalled image a string on a listed attribute is read as base64 `B`
- * when it starts with `I`–`P` (see {@link unpackImageItem}).
+ * when it starts with `I`–`P` (see {@link unpackImageItemSync}).
  */
 export const decodeImage = (
   image: StreamImage,
@@ -400,18 +539,7 @@ export const decodeImage = (
   ctx: ItemContext,
   options?: ImageOptions,
 ): Effect.Effect<Record<string, unknown>, ValidationError> =>
-  Effect.gen(function* () {
-    const form =
-      options?.form ??
-      (typeof image === "object" && image !== null && isAttributeValueImage(image, options?.probe)
-        ? "attributeValues"
-        : "unmarshalled")
-    const raw = yield* normalizeImage(image, ctx, { ...options, form })
-    const registry = yield* currentRegistry
-    if (form === "attributeValues") yield* unpackItem(raw, attributes, registry, ctx)
-    else yield* unpackImageItem(raw, attributes, registry, ctx)
-    return raw
-  })
+  withRegistry((registry) => decodeImageSync(image, attributes, registry, ctx, options))
 
 // ---------------------------------------------------------------------------
 // Expression and projection guards (EDD-9076)

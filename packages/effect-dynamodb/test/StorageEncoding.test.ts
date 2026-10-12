@@ -123,6 +123,67 @@ describe("StorageEncoding.encode / decode", () => {
   )
 })
 
+describe("StorageEncoding sync twins", () => {
+  const compressors = NodeCompression.available()
+
+  it.effect("encodeSync / decodeSync / decodeUnmarshalledSync match the Effect forms", () =>
+    Effect.gen(function* () {
+      for (const config of [json, zstd, brotli]) {
+        const stored = yield* StorageEncoding.encode(config, wire)
+        expect(StorageEncoding.encodeSync(config, wire, { compressors })).toEqual(stored)
+        expect(StorageEncoding.decodeSync(stored, { compressors })).toEqual(
+          yield* StorageEncoding.decode(stored),
+        )
+        const unmarshalled = stored?.S ?? stored?.B
+        expect(StorageEncoding.decodeUnmarshalledSync(unmarshalled, { compressors })).toEqual(
+          yield* StorageEncoding.decodeUnmarshalled(unmarshalled),
+        )
+      }
+      // Native values pass through, as the Effect forms return them.
+      expect(StorageEncoding.decodeSync({ M: { a: { N: "1" } } })).toEqual({ a: 1 })
+      expect(StorageEncoding.decodeUnmarshalledSync({ N: "5" })).toEqual({ N: "5" })
+      expect(StorageEncoding.decodeSync(undefined)).toBeUndefined()
+      // A registry works as well as a list of compressors.
+      const b = StorageEncoding.encodeSync(brotli, wire, { compressors })
+      expect(
+        StorageEncoding.decodeSync(b, {
+          compressors: Compression.make([NodeCompression.brotli()]),
+        }),
+      ).toEqual(wire)
+    }).pipe(Effect.provide(compression)),
+  )
+
+  it("without compressors: S works, a codec throws a ValidationError caused by CompressorNotRegistered", () => {
+    expect(StorageEncoding.encodeSync(zstd, { a: 1 })).toEqual({ S: '{"a":1}' })
+    expect(() => StorageEncoding.encodeSync(zstd, wire)).toThrow(ValidationError)
+    try {
+      StorageEncoding.encodeSync(zstd, wire)
+    } catch (error) {
+      expect(missingCompressor(error)).toMatchObject({ codec: "zstd", direction: "compress" })
+    }
+    const stored = StorageEncoding.encodeSync(zstd, wire, { compressors })
+    try {
+      StorageEncoding.decodeUnmarshalledSync(stored?.B)
+      throw new Error("expected a failure")
+    } catch (error) {
+      expect(missingCompressor(error)).toMatchObject({ codec: "zstd", direction: "decompress" })
+    }
+    expect(() => StorageEncoding.decodeSync({ S: "{nope" })).toThrow(ValidationError)
+  })
+
+  it.effect("the Effect decoders need no Compression service for S and native values", () =>
+    Effect.gen(function* () {
+      expect(yield* StorageEncoding.decode({ S: '{"a":1}' })).toEqual({ a: 1 })
+      expect(yield* StorageEncoding.decodeUnmarshalled('{"a":1}')).toEqual({ a: 1 })
+      const error = failure(yield* Effect.exit(StorageEncoding.decodeUnmarshalled("{nope")))
+      expect(error).toMatchObject({
+        _tag: "ValidationError",
+        operation: "StorageEncoding.decodeUnmarshalled",
+      })
+    }),
+  )
+})
+
 describe("StorageEncoding.valueBytes", () => {
   it.effect("native: the marshalled map's size", () =>
     Effect.gen(function* () {

@@ -73,7 +73,7 @@ import {
   isEmptyExpr,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
-import { currentRegistry, packItem, unpackItem } from "./internal/Packed.js"
+import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
 import {
@@ -2298,30 +2298,34 @@ const packAggregateGroups = (
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, ValidationError> =>
   packedByType.size === 0
     ? Effect.succeed(groups)
-    : Effect.flatMap(currentRegistry, (registry) =>
-        Effect.forEach(groups, (group) =>
-          Effect.map(
-            Effect.forEach(group.items, (item) => {
-              const packed = packedByType.get(item.entityType)
-              if (packed === undefined) return Effect.succeed(item)
-              const attributes = { ...item.attributes }
-              return Effect.as(
-                packItem(attributes, packed, registry, {
-                  entityType: `${aggregateName}.${item.member}`,
-                  operation: `aggregate.${operation}.packed`,
-                }),
-                { ...item, attributes },
-              )
-            }),
-            (items) => ({ ...group, items }),
-          ),
-        ),
-      )
+    : withRegistry((registry) => {
+        const packedGroups: Array<TransactionGroup> = []
+        for (const group of groups) {
+          const items: Array<DecomposedItem> = []
+          for (const item of group.items) {
+            const packed = packedByType.get(item.entityType)
+            if (packed === undefined) {
+              items.push(item)
+              continue
+            }
+            const attributes = { ...item.attributes }
+            const failure = packItemSync(attributes, packed, registry, {
+              entityType: `${aggregateName}.${item.member}`,
+              operation: `aggregate.${operation}.packed`,
+            })
+            if (failure !== undefined) return failure
+            items.push({ ...item, attributes })
+          }
+          packedGroups.push({ ...group, items })
+        }
+        return packedGroups
+      })
 
 /**
  * Read, in place, each item's dispatch attributes by their stored form — by
  * what is stored, whatever the edge entity configures now. A row with no
  * string or binary value on any of them costs one `typeof` per attribute.
+ * One Effect for the whole partition; the work inside is synchronous.
  */
 const unpackAggregateItems = (
   items: ReadonlyArray<Record<string, unknown>>,
@@ -2330,25 +2334,18 @@ const unpackAggregateItems = (
 ): Effect.Effect<void, ValidationError> =>
   dispatchByType.size === 0
     ? Effect.void
-    : Effect.flatMap(currentRegistry, (registry) =>
-        Effect.forEach(
-          items,
-          (item) => {
-            const dispatch = dispatchByType.get(item.__edd_e__ as string)
-            if (dispatch === undefined) return Effect.void
-            const stored = dispatch.some((attr) => {
-              const value = item[attr]
-              return typeof value === "string" || value instanceof Uint8Array
-            })
-            if (!stored) return Effect.void
-            return unpackItem(item, dispatch, registry, {
-              entityType: `${aggregateName}.${String(item.__edd_e__)}`,
-              operation: "aggregate.decode",
-            })
-          },
-          { discard: true },
-        ),
-      )
+    : withRegistry((registry) => {
+        for (const item of items) {
+          const dispatch = dispatchByType.get(item.__edd_e__ as string)
+          if (dispatch === undefined || !hasStoredForm(item, dispatch)) continue
+          const failure = unpackItemSync(item, dispatch, registry, {
+            entityType: `${aggregateName}.${String(item.__edd_e__)}`,
+            operation: "aggregate.decode",
+          })
+          if (failure !== undefined) return failure
+        }
+        return undefined
+      })
 
 // ---------------------------------------------------------------------------
 // Internal: Query all items in the aggregate partition

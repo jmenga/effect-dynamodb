@@ -469,6 +469,42 @@ describe("unpackValue dispatch", () => {
       }),
   )
 
+  it.effect("B whose JSON legitimately holds U+FFFD reads (only invalid UTF-8 fails)", () =>
+    Effect.gen(function* () {
+      const bytes = new Uint8Array([0x20, ...encoder.encode('{"r":"\uFFFD"}')])
+      expect(yield* unpack(bytes, none)).toEqual({ r: "\uFFFD" })
+    }),
+  )
+
+  it("the sync core returns the value, or the ValidationError it fails with (never throws)", () => {
+    const readOp = { entityType: "Order", operation: "decode" }
+    expect(PackedCodec.unpackStoredSync('{"a":1}', all, readOp, "lines")).toEqual({ a: 1 })
+    const bad = PackedCodec.unpackStoredSync("{nope", all, readOp, "lines")
+    expect(bad).toBeInstanceOf(ValidationError)
+    expect(causeMessage(bad)).toContain('Packed attribute "lines"')
+    const stored = PackedCodec.packValueSync(
+      withCodec("gzip", 0),
+      payloadOfBytes(3000),
+      all,
+      ctx,
+      "lines",
+    )
+    expect(stored).toBeInstanceOf(Uint8Array)
+    expect(PackedCodec.unpackStoredSync(stored as Uint8Array, all, readOp, "lines")).toEqual(
+      payloadOfBytes(3000),
+    )
+    const missing = PackedCodec.unpackBytesSync(stored as Uint8Array, none, readOp, "lines")
+    expect(missing).toBeInstanceOf(ValidationError)
+    expect((missing as ValidationError).cause).toMatchObject({
+      _tag: "CompressorNotRegistered",
+      codec: "gzip",
+      direction: "decompress",
+      attribute: "lines",
+    })
+    const notJson = PackedCodec.packValueSync(json, { at: new Date(0) }, all, ctx, "lines")
+    expect(notJson).toBeInstanceOf(ValidationError)
+  })
+
   const invalidStored: ReadonlyArray<readonly [string, unknown, string]> = [
     ["empty B", new Uint8Array(0), "stored binary value is empty"],
     ["layout version 0", new Uint8Array([0x01, 1]), "layout version 0"],

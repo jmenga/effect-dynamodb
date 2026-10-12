@@ -81,7 +81,7 @@ packages/effect-dynamodb/src/
 ├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
-├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), limits
+├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value (+ *Sync twins), valueBytes (stored size), limits
 ├── compression/node.ts # Subpath `effect-dynamodb/compression/node` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals

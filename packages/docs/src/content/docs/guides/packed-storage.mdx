@@ -408,6 +408,7 @@ const asZstd = yield* StorageEncoding.valueBytes({
 | `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304 }` |
 | `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` (`decode` takes DynamoDB JSON) |
 | `StorageEncoding.decodeUnmarshalled(stored)` | one already-unmarshalled stored value (a JSON string, bytes or base64, or a native value) to its wire form |
+| `StorageEncoding.encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | the same, synchronously, for pure code or a hand-rolled loop over many values: pass `{ compressors }` (a registry or a list; none by default) and catch the thrown `ValidationError` |
 
 `measureAppend` doesn't accept `additionalItems`, because building a guarded put reads the table. Add their sizes yourself. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
 

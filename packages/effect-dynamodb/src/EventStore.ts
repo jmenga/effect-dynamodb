@@ -54,7 +54,7 @@ import {
   isDispatchEligible,
   packedShape,
   packValue,
-  unpackValue,
+  unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
@@ -72,13 +72,11 @@ import { DynamoClient, type DynamoClientError, type DynamoClientService } from "
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
   currentRegistry,
+  decodeImage,
   imageEntityType,
-  isAttributeValueImage,
-  normalizeImage,
   type PackedAttributeGuard,
   type StreamImage,
-  unpackImageItem,
-  unpackItem,
+  withRegistry,
 } from "./internal/Packed.js"
 import {
   type BuiltTransactWriteItems,
@@ -172,6 +170,9 @@ export type StreamMetadata<TMetadata> = [TMetadata] extends [undefined]
  *
  * @internal
  */
+/** The attributes a stream image reads by stored form: event `data` only. */
+const DATA_ATTRIBUTES: ReadonlyArray<string> = ["data"]
+
 const EventEnvelope = Schema.Struct({
   streamId: Schema.String,
   version: Schema.Number,
@@ -1923,8 +1924,8 @@ export const makeStream = <
     operation: string,
   ): Effect.Effect<unknown, ValidationError> =>
     typeof stored === "string" || stored instanceof Uint8Array
-      ? Effect.flatMap(currentRegistry, (registry) =>
-          unpackValue(stored, registry, { entityType, attribute: "data", operation }),
+      ? withRegistry((registry) =>
+          unpackStoredSync(stored, registry, { entityType, operation }, "data"),
         )
       : Effect.succeed(stored)
 
@@ -2774,19 +2775,9 @@ export const makeStream = <
       ) {
         return Option.none<StreamEvent<TEvent>>()
       }
-      const form =
-        typeof image === "object" &&
-        image !== null &&
-        !Array.isArray(image) &&
-        isAttributeValueImage(image)
-          ? ("attributeValues" as const)
-          : ("unmarshalled" as const)
-      const raw = yield* normalizeImage(image, ctx, { form })
-      const registry = yield* currentRegistry
       // In DynamoDB JSON the S / B tag says what `data` is; unmarshalled, a
       // string that is base64 of a `B` value is told apart from JSON text.
-      if (form === "attributeValues") yield* unpackItem(raw, ["data"], registry, ctx)
-      else yield* unpackImageItem(raw, ["data"], registry, ctx)
+      const raw = yield* decodeImage(image, DATA_ATTRIBUTES, ctx)
       return Option.some(yield* decodeStreamEvent(raw))
     })
 
@@ -2969,12 +2960,13 @@ export const makeStream = <
     // `state` is read by its stored form (#147) when it may be packed — see
     // `stateDispatch` — then decoded through the state schema as before.
     (stateDispatch && (typeof raw.state === "string" || raw.state instanceof Uint8Array)
-      ? Effect.flatMap(currentRegistry, (registry) =>
-          unpackValue(raw.state, registry, {
-            entityType: snapshotEntityType,
-            attribute: "state",
-            operation,
-          }),
+      ? withRegistry((registry) =>
+          unpackStoredSync(
+            raw.state as string | Uint8Array,
+            registry,
+            { entityType: snapshotEntityType, operation },
+            "state",
+          ),
         )
       : Effect.succeed(raw.state)
     ).pipe(

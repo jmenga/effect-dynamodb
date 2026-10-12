@@ -132,20 +132,33 @@ export const isBase64PackedText = (text: string): boolean => {
  * verbatim — by convention `<op>.packed` on writes and `<op>.decode` (or the
  * store's decode operation) on reads.
  */
-export interface PackedContext {
-  readonly entityType: string
+export interface PackedContext extends OperationContext {
   readonly attribute: string
+}
+
+/**
+ * Who is reading or writing, without the attribute: the synchronous codec
+ * takes the attribute separately so a hot read loop builds no context object
+ * per value — one is built only when a value fails.
+ */
+export interface OperationContext {
+  readonly entityType: string
   readonly operation: string
 }
 
-const invalid = (ctx: PackedContext, message: string, cause?: unknown): ValidationError =>
+const invalid = (
+  ctx: OperationContext,
+  attribute: string,
+  message: string,
+  cause?: unknown,
+): ValidationError =>
   new ValidationError({
     entityType: ctx.entityType,
     operation: ctx.operation,
     cause:
       cause === undefined
-        ? new Error(`Packed attribute "${ctx.attribute}": ${message}`)
-        : new Error(`Packed attribute "${ctx.attribute}": ${message}`, { cause }),
+        ? new Error(`Packed attribute "${attribute}": ${message}`)
+        : new Error(`Packed attribute "${attribute}": ${message}`, { cause }),
   })
 
 /**
@@ -157,7 +170,8 @@ const invalid = (ctx: PackedContext, message: string, cause?: unknown): Validati
  * undecodable value.
  */
 export const notRegistered = (
-  ctx: PackedContext,
+  ctx: OperationContext,
+  attribute: string,
   codec: CompressionCodec,
   direction: "compress" | "decompress",
 ): ValidationError =>
@@ -168,7 +182,7 @@ export const notRegistered = (
       codec,
       direction,
       entityType: ctx.entityType,
-      attribute: ctx.attribute,
+      attribute,
       operation: ctx.operation,
     }),
   })
@@ -272,10 +286,71 @@ export const stringifyStrict = (value: unknown, root = "value"): string => {
 // ---------------------------------------------------------------------------
 
 const encoder = new TextEncoder()
-const decoder = new TextDecoder("utf-8", { fatal: true })
+// Non-fatal decoding takes the runtime's fast UTF-8 path; a payload that
+// decodes with a replacement character is re-decoded fatally, so invalid
+// UTF-8 still fails (and a payload that legitimately holds U+FFFD reads).
+const looseDecoder = new TextDecoder("utf-8")
+const fatalDecoder = new TextDecoder("utf-8", { fatal: true })
 
 /** The JS value a packed attribute marshals to: `S`, `B`, `NULL`, or absent. */
 export type PackedStored = string | Uint8Array | null | undefined
+
+/**
+ * {@link packValue} without an Effect: the stored value, or the
+ * `ValidationError` it fails with (a returned value, never thrown). The
+ * synchronous core every pack site runs, wrapped in an Effect once per item or
+ * operation by the caller.
+ */
+export const packValueSync = (
+  config: PackedConfig,
+  wire: unknown,
+  registry: CompressionRegistry,
+  ctx: OperationContext,
+  attribute: string,
+): PackedStored | ValidationError => {
+  if (wire === undefined) return undefined
+  if (wire === null) return null
+  let json: string
+  try {
+    json = stringifyStrict(wire, attribute)
+  } catch (cause) {
+    return invalid(
+      ctx,
+      attribute,
+      cause instanceof NotJson ? cause.message : "cannot be serialised",
+      cause,
+    )
+  }
+  const compression = config.compression
+  if (compression === undefined) return json
+  // UTF-8 is at most 3 bytes per UTF-16 code unit: skip the encode when the
+  // value is certainly under the threshold.
+  if (json.length * 3 < compression.threshold) return json
+  const bytes = encoder.encode(json)
+  if (bytes.length < compression.threshold) return json
+  const compressor = registry.get(compression.codec)
+  if (compressor === undefined) {
+    return notRegistered(ctx, attribute, compression.codec, "compress")
+  }
+  let compressed: Uint8Array
+  try {
+    compressed = compressor.compress(bytes)
+  } catch (cause) {
+    return invalid(ctx, attribute, `the "${compression.codec}" compressor failed`, cause)
+  }
+  if (!(compressed instanceof Uint8Array)) {
+    return invalid(
+      ctx,
+      attribute,
+      `the "${compression.codec}" compressor did not return a Uint8Array`,
+    )
+  }
+  if (1 + compressed.length >= bytes.length) return json
+  const out = new Uint8Array(1 + compressed.length)
+  out[0] = headerByte(compression.codec)
+  out.set(compressed, 1)
+  return out
+}
 
 /**
  * Pack an attribute's wire form per `config` (see the module header).
@@ -298,52 +373,72 @@ export const packValue = (
   registry: CompressionRegistry,
   ctx: PackedContext,
 ): Effect.Effect<PackedStored, ValidationError> => {
-  if (wire === undefined) return Effect.succeed(undefined)
-  if (wire === null) return Effect.succeed(null)
-  let json: string
-  try {
-    json = stringifyStrict(wire, ctx.attribute)
-  } catch (cause) {
-    return Effect.fail(
-      invalid(ctx, cause instanceof NotJson ? cause.message : "cannot be serialised", cause),
-    )
-  }
-  const compression = config.compression
-  if (compression === undefined) return Effect.succeed(json)
-  // UTF-8 is at most 3 bytes per UTF-16 code unit: skip the encode when the
-  // value is certainly under the threshold.
-  if (json.length * 3 < compression.threshold) return Effect.succeed(json)
-  const bytes = encoder.encode(json)
-  if (bytes.length < compression.threshold) return Effect.succeed(json)
-  const compressor = registry.get(compression.codec)
-  if (compressor === undefined) {
-    return Effect.fail(notRegistered(ctx, compression.codec, "compress"))
-  }
-  let compressed: Uint8Array
-  try {
-    compressed = compressor.compress(bytes)
-  } catch (cause) {
-    return Effect.fail(invalid(ctx, `the "${compression.codec}" compressor failed`, cause))
-  }
-  if (!(compressed instanceof Uint8Array)) {
-    return Effect.fail(
-      invalid(ctx, `the "${compression.codec}" compressor did not return a Uint8Array`),
-    )
-  }
-  if (1 + compressed.length >= bytes.length) return Effect.succeed(json)
-  const out = new Uint8Array(1 + compressed.length)
-  out[0] = headerByte(compression.codec)
-  out.set(compressed, 1)
-  return Effect.succeed(out)
+  const stored = packValueSync(config, wire, registry, ctx, ctx.attribute)
+  return stored instanceof ValidationError ? Effect.fail(stored) : Effect.succeed(stored)
 }
 
-const parseJson = (text: string, ctx: PackedContext): Effect.Effect<unknown, ValidationError> => {
+const parseJsonSync = (text: string, ctx: OperationContext, attribute: string): unknown => {
   try {
-    return Effect.succeed(JSON.parse(text))
+    return JSON.parse(text)
   } catch (cause) {
-    return Effect.fail(invalid(ctx, "the stored value is not valid JSON", cause))
+    return invalid(ctx, attribute, "the stored value is not valid JSON", cause)
   }
 }
+
+/**
+ * {@link unpackBytes} without an Effect: the JSON wire form, or the
+ * `ValidationError` it fails with (returned, never thrown). A parsed JSON value
+ * is never a `ValidationError`, so `instanceof ValidationError` tells them apart.
+ */
+export const unpackBytesSync = (
+  stored: Uint8Array,
+  registry: CompressionRegistry,
+  ctx: OperationContext,
+  attribute: string,
+): unknown => {
+  if (stored.length === 0) return invalid(ctx, attribute, "the stored binary value is empty")
+  const header = parseHeader(stored[0]!)
+  if (typeof header === "string") return invalid(ctx, attribute, header)
+  let payload = stored.subarray(1)
+  if (header.codec !== "none") {
+    const compressor = registry.get(header.codec)
+    if (compressor === undefined) return notRegistered(ctx, attribute, header.codec, "decompress")
+    try {
+      payload = compressor.decompress(payload)
+    } catch (cause) {
+      return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
+    }
+  }
+  let text = looseDecoder.decode(payload)
+  if (text.includes("\uFFFD")) {
+    try {
+      text = fatalDecoder.decode(payload)
+    } catch (cause) {
+      return invalid(ctx, attribute, "the stored payload is not valid UTF-8", cause)
+    }
+  }
+  return parseJsonSync(text, ctx, attribute)
+}
+
+/**
+ * {@link unpackValue} of a stored `S` (JSON text) or `B` (header + payload)
+ * without an Effect: the JSON wire form, or the `ValidationError` it fails with
+ * (returned, never thrown — tell them apart with `instanceof ValidationError`).
+ * Callers pass only strings and bytes; every other stored value is native and
+ * read as is, without a call.
+ */
+export const unpackStoredSync = (
+  stored: string | Uint8Array,
+  registry: CompressionRegistry,
+  ctx: OperationContext,
+  attribute: string,
+): unknown =>
+  typeof stored === "string"
+    ? parseJsonSync(stored, ctx, attribute)
+    : unpackBytesSync(stored, registry, ctx, attribute)
+
+const lift = (value: unknown): Effect.Effect<unknown, ValidationError> =>
+  value instanceof ValidationError ? Effect.fail(value) : Effect.succeed(value)
 
 /**
  * Decode a `B` value (header byte + payload) to its JSON wire form.
@@ -352,30 +447,8 @@ export const unpackBytes = (
   stored: Uint8Array,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<unknown, ValidationError> => {
-  if (stored.length === 0) return Effect.fail(invalid(ctx, "the stored binary value is empty"))
-  const header = parseHeader(stored[0]!)
-  if (typeof header === "string") return Effect.fail(invalid(ctx, header))
-  let payload = stored.subarray(1)
-  if (header.codec !== "none") {
-    const compressor = registry.get(header.codec)
-    if (compressor === undefined) {
-      return Effect.fail(notRegistered(ctx, header.codec, "decompress"))
-    }
-    try {
-      payload = compressor.decompress(payload)
-    } catch (cause) {
-      return Effect.fail(invalid(ctx, `the "${header.codec}" decompressor failed`, cause))
-    }
-  }
-  let text: string
-  try {
-    text = decoder.decode(payload)
-  } catch (cause) {
-    return Effect.fail(invalid(ctx, "the stored payload is not valid UTF-8", cause))
-  }
-  return parseJson(text, ctx)
-}
+): Effect.Effect<unknown, ValidationError> =>
+  lift(unpackBytesSync(stored, registry, ctx, ctx.attribute))
 
 /**
  * Unpack a stored (unmarshalled) value by its form — see the module header.
@@ -386,11 +459,10 @@ export const unpackValue = (
   stored: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
-): Effect.Effect<unknown, ValidationError> => {
-  if (typeof stored === "string") return parseJson(stored, ctx)
-  if (stored instanceof Uint8Array) return unpackBytes(stored, registry, ctx)
-  return Effect.succeed(stored)
-}
+): Effect.Effect<unknown, ValidationError> =>
+  typeof stored === "string" || stored instanceof Uint8Array
+    ? lift(unpackStoredSync(stored, registry, ctx, ctx.attribute))
+    : Effect.succeed(stored)
 
 // ---------------------------------------------------------------------------
 // Shape rule (EDD-9073) and dispatch eligibility

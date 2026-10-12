@@ -43,6 +43,7 @@
       "packages/**/src/**",
       "packages/**/test/**",
       "packages/**/examples/**",
+      "packages/**/bench/**",
       "*.json",
       "*.ts",
       "!!**/packages/docs"
