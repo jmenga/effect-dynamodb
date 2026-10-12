@@ -195,6 +195,25 @@ export const isAttributeValueImage = (image: StreamImage, probe = "pk"): boolean
   return values.length > 0 && values.every(isAttributeValueShape)
 }
 
+/**
+ * The entity type (`__edd_e__`) a stream image names, read straight off the
+ * image — `{ S }` in DynamoDB JSON, a string when unmarshalled — so a decoder
+ * can turn away an image of another type **before** unmarshalling it: an
+ * attribute the SDK cannot unmarshall (a number beyond what it represents,
+ * say) in some other entity's image must not fail the decode of a batch.
+ * `undefined` when the image names none.
+ */
+export const imageEntityType = (image: StreamImage): string | undefined => {
+  if (typeof image !== "object" || image === null || Array.isArray(image)) return undefined
+  const value = (image as Record<string, unknown>).__edd_e__
+  if (typeof value === "string") return value
+  if (typeof value === "object" && value !== null) {
+    const s = (value as { readonly S?: unknown }).S
+    if (typeof s === "string") return s
+  }
+  return undefined
+}
+
 /** Decode base64 text (or pass bytes through), failing with the attribute named. */
 const toBytes = (
   value: unknown,

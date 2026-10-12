@@ -373,8 +373,10 @@ type StreamImage =
   declared, envelope validated).
 - `Option.none()` when the image is not one of this stream's events (`__edd_e__ !==
   <stream>.event`: its snapshot, an idempotency sentinel, another stream, an entity), so
-  a handler can fan one table's records across decoders. An image that *is* this
-  stream's event but does not decode fails with `ValidationError`.
+  a handler can fan one table's records across decoders. The type is read off the raw
+  image before anything is unmarshalled (§7.7), so nothing in a foreign image can fail
+  the decode. An image that *is* this stream's event but does not decode fails with
+  `ValidationError`.
 - Input detection: DynamoDB JSON when the `pk` attribute is an object with a string `S`
   member; otherwise unmarshalled. `B` and `BS` members given as strings are base64-decoded
   (Lambda and EventBridge Pipes deliver them that way; `@aws-sdk/util-dynamodb`'s
@@ -887,9 +889,16 @@ updated in place.
 
 ### 7.7 DynamoDB Streams — R2
 
-`decodeStreamImage` (§3.5) normalises the image (DynamoDB JSON vs unmarshalled; base64
-`B`/`BS` at any depth), checks `__edd_e__`, and calls `decodeStreamEvent` — so its output is
-the read paths' `StreamEvent`, by construction. Snapshot images return `Option.none()`
+`decodeStreamImage` (§3.5) first reads `__edd_e__` straight off the raw image (`{ S }` in
+DynamoDB JSON, a string unmarshalled) and returns `Option.none()` for any other type
+**before** unmarshalling anything — so a foreign image holding an attribute the SDK cannot
+unmarshall (`N: "12345678901234567890.5"`, an invalid base64 `B`) is skipped, not a
+`ValidationError` that fails a whole Lambda batch. Only then does it normalise the image
+(DynamoDB JSON vs unmarshalled; base64 `B`/`BS` at any depth) and call `decodeStreamEvent`
+— so its output is the read paths' `StreamEvent`, by construction. The same raw-image
+check gates `Entity.decodeMarshalledItem`: an image naming another entity type is decoded as
+1.25.0 decoded it, its attributes never read as packed values (it still fails the schema
+decode with a `ValidationError`, now never a thrown defect). Snapshot images return `Option.none()`
 (a snapshot-image decoder is out of scope, §15).
 
 ---

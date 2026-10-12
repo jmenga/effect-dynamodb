@@ -105,6 +105,7 @@ import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
   currentRegistry,
   decodeImage,
+  imageEntityType,
   ownRowsRawRow,
   type PackedAttributeGuard,
   packAttributeValue,
@@ -3181,9 +3182,13 @@ const makeImpl = <
    */
   const decodeImageItem = (image: StreamImage): Effect.Effect<unknown, ValidationError> =>
     Effect.gen(function* () {
+      // An image of another entity type is decoded as 1.25.0 decoded it: its
+      // attributes are never read as packed values (a plain string of that
+      // type is not this entity's JSON). The type is read off the raw image.
+      const owner = imageEntityType(image)
       const raw = yield* decodeImage(
         image,
-        dispatchAttributes,
+        owner === undefined || owner === entityType ? dispatchAttributes : [],
         { entityType, operation: "decodeMarshalledItem" },
         { probe: config.indexes.primary.pk.field },
       )

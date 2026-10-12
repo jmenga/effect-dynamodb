@@ -1177,6 +1177,35 @@ describe("Entity packed fields — lifecycle", () => {
 describe("Entity.decodeMarshalledItem — stream images", () => {
   const base64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64")
 
+  it.effect("another entity type's image is not read by stored form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const image = stored(ORDER_KEY)
+      // An Order-shaped image of another type whose dispatch-eligible
+      // attribute is a plain string that happens to be valid JSON: decoded as
+      // 1.25.0 decoded it — the string is not an array, so it fails.
+      const foreign = { ...image, __edd_e__: { S: "Memo" }, notes: { S: '["a"]' } }
+      const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, foreign)))
+      expect(error).toBeInstanceOf(ValidationError)
+      // The entity's own image still reads `notes` by its stored form.
+      const own = { ...image, notes: { S: '["a"]' } }
+      expect(
+        ((yield* Entity.decodeMarshalledItem(Orders, own)) as { notes?: unknown }).notes,
+      ).toEqual(["a"])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an unrepresentable number is a ValidationError, not a defect", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order())
+      const image = { ...stored(ORDER_KEY), extra: { N: "12345678901234567890.5" } }
+      const exit = yield* Effect.exit(Entity.decodeMarshalledItem(Orders, image))
+      expect(failure(exit)).toBeInstanceOf(ValidationError)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("decodes DynamoDB JSON with B as bytes or base64, and unmarshalled images", () =>
     Effect.gen(function* () {
       const db = yield* client

@@ -72,6 +72,7 @@ import { DynamoClient, type DynamoClientError, type DynamoClientService } from "
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
   currentRegistry,
+  imageEntityType,
   isAttributeValueImage,
   normalizeImage,
   type PackedAttributeGuard,
@@ -1458,8 +1459,10 @@ export interface EventStream<
    * item (a packed `data` as bytes or base64 text). `Option.none()` for an
    * image that is not one of this stream's events — its snapshot, an
    * idempotency sentinel, another stream's or an entity's item — so one
-   * handler can fan a table's records across decoders. An event image that
-   * does not decode fails with `ValidationError`.
+   * handler can fan a table's records across decoders. The type is read off
+   * the raw image before anything is unmarshalled, so nothing in another
+   * item's image (a number the SDK cannot represent, say) fails the decode.
+   * An event image that does not decode fails with `ValidationError`.
    */
   decodeStreamImage(
     image: StreamImage,
@@ -2760,6 +2763,17 @@ export const makeStream = <
   ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError> =>
     Effect.gen(function* () {
       const ctx = { entityType, operation: "EventStore.decodeStreamImage" }
+      // Not one of this stream's events — its snapshot, a sentinel, another
+      // stream's or an entity's item: none, decided from the raw image before
+      // anything is unmarshalled, so nothing in a foreign image can fail it.
+      if (
+        typeof image === "object" &&
+        image !== null &&
+        !Array.isArray(image) &&
+        imageEntityType(image) !== entityType
+      ) {
+        return Option.none<StreamEvent<TEvent>>()
+      }
       const form =
         typeof image === "object" &&
         image !== null &&
@@ -2768,9 +2782,6 @@ export const makeStream = <
           ? ("attributeValues" as const)
           : ("unmarshalled" as const)
       const raw = yield* normalizeImage(image, ctx, { form })
-      // Not one of this stream's events: its snapshot, a sentinel, another
-      // stream's or an entity's item.
-      if (raw.__edd_e__ !== entityType) return Option.none<StreamEvent<TEvent>>()
       const registry = yield* currentRegistry
       // In DynamoDB JSON the S / B tag says what `data` is; unmarshalled, a
       // string that is base64 of a `B` value is told apart from JSON text.

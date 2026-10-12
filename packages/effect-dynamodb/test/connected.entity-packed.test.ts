@@ -597,6 +597,44 @@ describeConnected("Entity packed fields (#147)", () => {
     }).pipe(provide),
   )
 
+  it.effect("decodeMarshalledItem: another type's image is not read by stored form", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order("img-own", { lines: twoLines }))
+      const own = (yield* rawItem("order", "img-own"))!
+      const raw = yield* DynamoClient
+      const foreignKey = { pk: own.pk!, sk: { S: "$packed-ent#v1#memo" } }
+      // An Order-shaped item of another type whose `lines` is a plain string
+      // that happens to be valid JSON, plus a number the SDK cannot unmarshall.
+      yield* raw.putItem({
+        TableName: tableName,
+        Item: {
+          ...own,
+          ...foreignKey,
+          __edd_e__: { S: "Memo" },
+          lines: { S: '[{"sku":"A","qty":1}]' },
+        },
+      })
+      const foreign = (yield* raw.getItem({
+        TableName: tableName,
+        Key: foreignKey,
+        ConsistentRead: true,
+      })).Item!
+      // Decoded as 1.25.0 decoded it: a string is not a list of lines.
+      const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, foreign)))
+      expect(error).toBeInstanceOf(ValidationError)
+      const withNumber = { ...foreign, extra: { N: "12345678901234567890.5" } }
+      const numberError = failure(
+        yield* Effect.exit(Entity.decodeMarshalledItem(Orders, withNumber)),
+      )
+      expect(numberError).toBeInstanceOf(ValidationError)
+      // The entity's own image still decodes by stored form.
+      expect((yield* Entity.decodeMarshalledItem(Orders, own)) as { lines: unknown }).toMatchObject(
+        { lines: twoLines },
+      )
+    }).pipe(provide),
+  )
+
   it.effect("update().set writes the packed value whole; .remove drops it", () =>
     Effect.gen(function* () {
       const db = yield* client

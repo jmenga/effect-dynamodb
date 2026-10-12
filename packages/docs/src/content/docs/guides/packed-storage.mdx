@@ -430,7 +430,7 @@ const decodeImage = (image: EventStore.StreamImage) =>
   })
 ```
 
-- **`stream.decodeStreamImage(image)`** returns exactly the `StreamEvent` the read paths return: `data` decoded through the event schemas, and `metadata` through the metadata schema when the stream declares one. It returns `Option.none()` for an image that isn't one of this stream's events: its snapshot, an idempotency sentinel, another stream's item or an entity's. So one handler can pass a table's records through several decoders. An event image that doesn't decode fails with a `ValidationError`.
+- **`stream.decodeStreamImage(image)`** returns exactly the `StreamEvent` the read paths return: `data` decoded through the event schemas, and `metadata` through the metadata schema when the stream declares one. It returns `Option.none()` for an image that isn't one of this stream's events: its snapshot, an idempotency sentinel, another stream's item or an entity's. So one handler can pass a table's records through several decoders. The type is read from the raw image before anything is unmarshalled, so another item's attributes, even a number the SDK can't unmarshall, never fail the decode. An event image that doesn't decode fails with a `ValidationError`.
 - **`Entity.decodeMarshalledItem(entity, image)`** decodes an entity image. It also applies `field:` renames and rebuilds sparse maps.
 
 Both accept DynamoDB JSON (`B` as bytes or base64) or an already-unmarshalled item. In an unmarshalled item, a packed attribute's `B` value may still be base64 text. That text always starts with `I`–`P`, which JSON text never does, so the two can be told apart. `Entity.itemSchema(entity)` is a pure schema and **does not unpack**: use `decodeMarshalledItem` for entities with packed fields.

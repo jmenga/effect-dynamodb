@@ -1081,6 +1081,47 @@ const lambdaImage = (item: Item) =>
   Object.fromEntries(Object.entries(item).map(([k, v]) => [k, toLambdaJson(v)]))
 
 describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
+  /** A number DynamoDB stores but the SDK's `unmarshall` cannot represent. */
+  const UNREPRESENTABLE_N = "12345678901234567890.5"
+
+  it.effect("a foreign image is none before anything is unmarshalled", () =>
+    Effect.gen(function* () {
+      // Another entity's DynamoDB JSON image in the same table: one bad record
+      // must not fail a whole Lambda batch.
+      const foreign = {
+        pk: { S: "$packed#v1#order#orderid_o-1" },
+        sk: { S: "$packed#v1#order" },
+        __edd_e__: { S: "Order" },
+        total: { N: UNREPRESENTABLE_N },
+        totals: { M: { day: { N: UNREPRESENTABLE_N } } },
+        blob: { B: "!!! not base64 !!!" },
+        data: { S: "plain text, not JSON" },
+      }
+      expect(Option.isNone(yield* ZstdLedger.decodeStreamImage(foreign as never))).toBe(true)
+      expect(Option.isNone(yield* NativeLedger.decodeStreamImage(foreign as never))).toBe(true)
+      // An unmarshalled foreign image, and one without __edd_e__ at all.
+      expect(
+        Option.isNone(
+          yield* ZstdLedger.decodeStreamImage({ __edd_e__: "Order", data: "plain text" }),
+        ),
+      ).toBe(true)
+      const { __edd_e__: _, ...untyped } = foreign
+      expect(Option.isNone(yield* ZstdLedger.decodeStreamImage(untyped as never))).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("this stream's own image with an unrepresentable number is a ValidationError", () =>
+    Effect.gen(function* () {
+      yield* ZstdLedger.append(id, [recorded(1)], 0)
+      const [item] = storedEvents()
+      const error = yield* ZstdLedger.decodeStreamImage({
+        ...item!,
+        extra: { N: UNREPRESENTABLE_N },
+      }).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ValidationError)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("returns exactly the StreamEvent read returns, for every image form", () =>
     Effect.gen(function* () {
       yield* writeMixedStream

@@ -586,6 +586,49 @@ describeConnected("EventStore packed storage (#147)", () => {
     }).pipe(provide),
   )
 
+  it.effect("decodeStreamImage: a foreign image with an unrepresentable number is none", () =>
+    Effect.gen(function* () {
+      const id = { ledgerId: "foreign-image" }
+      yield* writeMixed(id.ledgerId)
+      const [first] = yield* rawItems(id.ledgerId)
+      const client = yield* DynamoClient
+      // DynamoDB stores 38 significant digits; the SDK's unmarshall cannot
+      // represent this one. Written and read back with the raw client.
+      const N = "12345678901234567890.5"
+      const foreignKey = { pk: first!.pk!, sk: { S: `${first!.sk!.S}#foreign` } }
+      yield* client.putItem({
+        TableName: tableName,
+        Item: { ...foreignKey, __edd_e__: { S: "audit.note" }, amount: { N } },
+      })
+      const ownKey = { pk: first!.pk!, sk: first!.sk! }
+      yield* client.updateItem({
+        TableName: tableName,
+        Key: ownKey,
+        UpdateExpression: "SET #x = :x",
+        ExpressionAttributeNames: { "#x": "extra" },
+        ExpressionAttributeValues: { ":x": { N } },
+      })
+      const get = (Key: Record<string, AttributeValue>) =>
+        Effect.map(
+          client.getItem({ TableName: tableName, Key, ConsistentRead: true }),
+          (result) => result.Item as Record<string, AttributeValue>,
+        )
+      const foreign = yield* get(foreignKey)
+      expect(foreign.amount).toEqual({ N })
+      const lambda = Object.fromEntries(
+        Object.entries(foreign).map(([name, value]) => [name, toLambdaJson(value)]),
+      )
+      for (const image of [foreign, lambda]) {
+        const decoded = yield* ZstdLedger.decodeStreamImage(image as EventStore.StreamImage)
+        expect(Option.isNone(decoded)).toBe(true)
+      }
+      // The stream's own event with that number is not decodable: a ValidationError.
+      const own = yield* get(ownKey)
+      const error = yield* ZstdLedger.decodeStreamImage(own).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ValidationError)
+    }).pipe(provide),
+  )
+
   it.effect(
     "reading compressed items without the codec fails with a ValidationError caused by CompressorNotRegistered",
     () =>
