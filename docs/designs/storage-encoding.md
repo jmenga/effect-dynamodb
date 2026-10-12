@@ -734,15 +734,19 @@ the entity query builder sets to `unpackFields`.
   `ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>` (as `ExtractIdentifier` is).
 - `PathBuilder<Root, Model, Keys, TPacked>` maps a top-level key in `TPacked` to
   `PackedPath<Root, V>`: a branded leaf with no property, `.at`, `.entry` or `.size`
-  accessors, **not** assignable to `Path`. So comparisons, `size`, `contains`,
-  `beginsWith`, and every `path*` update op reject it at compile time; `exists` /
-  `notExists` and `select` callbacks accept `Path | PackedPath`.
-- The record update-op parameter types (`add`, `subtract`, `append`, `deleteFromSet`)
-  exclude `TPackedFields`.
+  accessors, **not** assignable to `Path`. So comparisons, `size`, `contains` and
+  `beginsWith` in PathBuilder-typed callbacks (conditions, filters) reject it at compile
+  time; `exists` / `notExists` and `select` callbacks accept `Path | PackedPath`.
 - `Entity.Marshalled<E>` gains the `B` member.
 
-The runtime guards stay authoritative for shorthand conditions, untyped callers, and every
-`Query`-level path (EventStore).
+Only the PathBuilder-typed surface is guarded at the type level. The record update ops
+(`add`, `subtract`, `append`, `deleteFromSet`) take an untyped `Record<string, …>` for
+every entity, and the `path*` update ops take raw `segments`, so neither can see
+`TPackedFields`; typing them per entity would change their signatures for every entity,
+which is out of scope here. They are refused at run time with `[EDD-9077]` (§6.5).
+
+The runtime guards stay authoritative for shorthand conditions, the record and `path*`
+update ops, untyped callers, and every `Query`-level path (EventStore).
 
 ### 6.9 Aggregates
 
@@ -994,9 +998,10 @@ and streams that do not use the feature beyond the eligibility check.
 ### 12.3 Types
 
 - `test/Entity.types.test.ts`: `storedAs: Packed` on a scalar field is a compile error;
-  `PackedPath` rejected by `eq`, `gt`, `size`, `contains`, `beginsWith`, `pathSet`,
-  `pathAdd`, …; accepted by `exists`, `notExists`, `select`; record `.add` / `.append` exclude
-  packed keys; `Entity.Marshalled` admits `B`.
+  `PackedPath` rejected by `eq`, `gt`, `.size()`, `contains`, `beginsWith`, nested
+  properties and `.at()`; accepted by `exists`, `notExists`, `select`; `Entity.Marshalled`
+  admits `B`. (The record and `path*` update ops are untyped, so their `[EDD-9077]`
+  refusals are tested at run time in `Entity.packed.test.ts`, §6.8.)
 - `test/EventStore.types.test.ts`: `storedAs` admits only `data`; `snapshot.storedAs`
   only a `PackedConfig`; error channels include `CompressorNotRegistered`; `measureAppend`
   / `decodeStreamImage` signatures on bound and unbound streams.
@@ -1124,7 +1129,7 @@ this design introduced. **Source** says who decided.
 | 46 | Versioned snapshots / softDelete / timeSeries copy stored values as-is | **In** (§6.7) | user |
 | 47 | Retain read-merge update carries unnamed packed values byte-identical | **In** (§6.2) — avoids rewriting values on unrelated updates | design |
 | 48 | Immutable packed fields compared by unpacked JSON, not bytes | **In** (§6.2) | design |
-| 49 | Type-level guards where PathBuilder is typed | **In**: `TPackedFields` type parameter, `PackedPath` (§6.8) | user |
+| 49 | Type-level guards where PathBuilder is typed | **In** for PathBuilder-typed conditions, filters and projections: `TPackedFields` type parameter, `PackedPath` (§6.8). The untyped record and `path*` update ops are guarded at run time only (`[EDD-9077]`) | user |
 | 50 | Compressor registration mechanism | `Compression` `Context.Service`, resolved with `Effect.serviceOption` (no new `R`); `DynamoClient.layer/layerConfig({ compressors })`, `DynamoClient.make({ compressors })`, `Compression.layer` (§3.4) | user (recommended DynamoClient); mechanism: design |
 | 51 | Fail-fast check at `DynamoClient.make` that every configured codec is registered | **Not added**: a read-only process would be forced to register codecs it never writes; the op-time tagged error is the single failure mode | design: your call |
 | 52 | Unregistered codec → tagged error naming the codec | **In**: `CompressorNotRegistered` (§5.3) | user |

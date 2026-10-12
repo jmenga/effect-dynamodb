@@ -1382,6 +1382,18 @@ describe("packed fields — type level", () => {
         contains(t.parcels, 1),
       ),
     ).toThrow()
+    expect(() =>
+      Shipments.condition((t, { gt }) =>
+        // @ts-expect-error — a packed field is not an ordered Path
+        gt(t.parcels, 1),
+      ),
+    ).toThrow()
+    expect(() =>
+      Shipments.condition((t, { gt }) =>
+        // @ts-expect-error — no .size() on a packed field
+        gt(t.parcels.size(), 1),
+      ),
+    ).toThrow()
     // @ts-expect-error — no .at() on a packed array field
     expect(() => Shipments.select((t) => [t.parcels.at(0)])).toThrow()
     // A non-packed entity's object field keeps its nested paths.
