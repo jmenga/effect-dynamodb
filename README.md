@@ -14,6 +14,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 | Package | Description |
 |---|---|
 | [`effect-dynamodb`](./packages/effect-dynamodb) | Core ORM — entities, single-table design, queries, transactions, lifecycle |
+| [`@effect-dynamodb/schema`](./packages/schema) | The pure, AWS-free modeling layer — `DynamoModel`, `DynamoSchema`, and definition-only `Entity.make` / `Aggregate.make` (re-exported by `effect-dynamodb`) |
 | [`@effect-dynamodb/geo`](./packages/effect-dynamodb-geo) | Geospatial index and proximity search using H3 hexagons |
 | [`@effect-dynamodb/language-service`](./packages/language-service) | TypeScript language-service plugin — DynamoDB op details on hover |
 
@@ -30,6 +31,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 - **Lifecycle features (opt-in)** — automatic `createdAt`/`updatedAt`, optimistic locking via auto-incremented version, version snapshot retention, soft delete with optional TTL, restore, purge, unique constraints via sentinel transactions.
 - **Aggregates** — graph-based composite domain models that decompose into entity ops (atomic transactions) and assemble from collection queries; never touches `DynamoClient` directly.
 - **Event sourcing** — append-only `EventStore` with stream replay and snapshots.
+- **Packed storage (opt-in)** — store structured fields, event data and snapshot state as one JSON string, compressed (gzip / brotli / zstd) above a threshold, for faster bulk reads and fewer write units; readers decode each item by its stored form, so switching needs no rewrite.
 - **Tagged errors** — `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, and more — all `catchTag`-discriminable.
 - **Stream pagination** — `Stream<A>` from `.paginate()`; the runtime handles DynamoDB's pagination protocol.
 - **Layer-based DI** — physical table names and AWS client config injected via Effect Layers, enabling clean test isolation.
@@ -205,6 +207,7 @@ npx tsx packages/effect-dynamodb/examples/starter.ts
 | `shopping-mall.ts` | Multi-tenant e-commerce, index overloading |
 | `cricket.ts` | Aggregate CRUD with ref hydration and cascade updates |
 | `event-sourcing.ts` | EventStore with the decider pattern |
+| `guide-packed-storage.ts` | JSON and compressed storage for entity fields and EventStore data |
 
 ## vs ElectroDB
 
