@@ -1,0 +1,497 @@
+---
+title: "Packed Storage"
+description: "Store structured fields, event data and snapshot state as one JSON string, compressed above a threshold — faster bulk reads and fewer write units, with no rewrite to switch."
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+By default, an entity's structured field (a struct, class, array or record) and an EventStore event's `data` are stored as a native DynamoDB map (`M`) or list (`L`). `DynamoModel.Packed` stores the value as **one JSON string** (`S`) instead, and can compress it to **binary** (`B`) once it reaches a size threshold.
+
+```typescript
+DynamoModel.Packed({ format: "json" })                                       // JSON string (S)
+DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } })       // + zstd from 1 KB
+DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 4096 } })
+```
+
+The same config is used in two places:
+
+- **Entity fields:** `DynamoModel.configure(model, { field: { storedAs: DynamoModel.Packed(...) } })`, a sibling of the [`SparseMap`](/effect-dynamodb/guides/sparse-maps/) storage layout. Aggregate edges are entities, so their fields can be packed too.
+- **EventStore streams:** `makeStream({ storedAs: { data: DynamoModel.Packed(...) } })` for event data, and `snapshot: { storedAs: DynamoModel.Packed(...) }` for snapshot state.
+
+The default stays the native map. Event metadata always stays a map.
+
+## When to use it
+
+A map is the most expensive shape DynamoDB returns. The AWS SDK parses a type-wrapped node for every value (`{"M":{…}}`, `{"N":"0"}`), and unmarshalling rebuilds the object graph a second time. A JSON string is one node: one string to parse, then `JSON.parse` in native code.
+
+Measured on Lambda (arm64, Node 24) reading ~6,000 small events from one stream:
+
+| `data` stored as | Stored bytes/item | SDK parse | Unmarshall | Fold |
+|---|---|---|---|---|
+| map (default) | 481 | 136 ms | 73 ms | 227 ms |
+| JSON (`S`) | 610 | 29 ms | 1.4 ms | 76 ms |
+
+Use packed storage when:
+
+- **You read many items and use whole values.** Folding a long event stream, or loading entities whose large nested field you always read in full, is about 3× faster as JSON.
+- **Values are large.** A ~48 KB folded state takes ~39 write units as a map, ~47 as JSON, and ~5 as zstd-compressed JSON (4.1 KB stored).
+
+Keep the native map when you need DynamoDB to see inside the value: conditions, filters or updates on nested paths, `ADD` counters, or projections of a nested attribute. A packed value is opaque to DynamoDB.
+
+<Aside type="caution" title="Upgrade every reader before any writer packs">
+A version of effect-dynamodb without packed storage can't read a packed value. It fails with a `ValidationError`. Before you turn packing on for any writer, upgrade every reader, including DynamoDB Streams consumers (see [Streams images](#dynamodb-streams-images)).
+</Aside>
+
+## Stored form
+
+Each stored value says how it is encoded. A reader looks at **what is stored**, not at the current config:
+
+| Stored as | Read as |
+|---|---|
+| absent / `NULL` | absent / `null` |
+| `M`, `L` or another native type | the native value, as before packing (written before the field was packed) |
+| `S` | `JSON.parse` of the string |
+| `B` | header byte, then decompress, then `JSON.parse` |
+
+So a field or stream can hold a mix of native, JSON and compressed values, and every one decodes. Turning packing on, off, or changing the codec needs no rewrite. No marker attribute is added to the item. This matters for EventStore stream indexes with the `"withoutMetadata"` projection: their `INCLUDE` list is fixed when the index is created and can't be changed in place.
+
+### The `B` header
+
+Byte 0 of a `B` value is a header. The compressed UTF-8 JSON follows it.
+
+| Bits | Field | Values |
+|---|---|---|
+| 7–5 | layout version | `001` = v1. `000` is invalid. Other values are reserved for future layouts. |
+| 4–3 | format | `00` = JSON. `01` is reserved for a future binary format. `10` and `11` are reserved. |
+| 2–0 | codec | `000` none, `001` gzip, `010` brotli, `011` zstd. Other values are reserved. |
+
+Writers emit `0x21` (gzip), `0x22` (brotli) or `0x23` (zstd). Readers also accept `0x20` (uncompressed JSON in `B`). Any other header fails with a `ValidationError` that names the attribute and the byte, so a value written by a newer version is reported, not misread.
+
+### Threshold, and only when smaller
+
+Compression is tried only when the JSON's UTF-8 length is **at least `threshold`** (default **1024** bytes; `0` means always try). The result is stored as `B` only when **the header plus the compressed bytes are smaller** than the JSON. Otherwise the value is stored as `S`.
+
+The default threshold is 1 KB because DynamoDB rounds write units per item at 1 KB. Below about 150 bytes, compression makes the payload bigger. Between 150 bytes and 1 KB it saves no write units and costs ~20 µs per read.
+
+## Entity fields
+
+```typescript region="model" example="guide-packed-storage.ts"
+class Line extends Schema.Class<Line>("Line")({
+  sku: Schema.String,
+  qty: Schema.Number,
+  price: Schema.Number,
+}) {}
+
+class Order extends Schema.Class<Order>("Order")({
+  orderId: Schema.String,
+  customerId: Schema.String,
+  status: Schema.String,
+  lines: Schema.Array(Line),
+  details: Schema.optional(
+    Schema.Struct({
+      note: Schema.String,
+      // Stored inside the JSON as its wire form: an ISO string
+      placedAt: Schema.DateTimeUtc,
+    }),
+  ),
+}) {}
+
+const OrderModel = DynamoModel.configure(Order, {
+  // One JSON string (S), however many lines
+  lines: { storedAs: DynamoModel.Packed({ format: "json" }) },
+  // JSON, compressed with zstd when it is 512 bytes or more and that is smaller.
+  // Renamed to "d" like any other field.
+  details: {
+    field: "d",
+    storedAs: DynamoModel.Packed({
+      format: "json",
+      compression: { codec: "zstd", threshold: 512 },
+    }),
+  },
+})
+```
+
+```typescript region="entity" example="guide-packed-storage.ts"
+const Orders = Entity.make({
+  model: OrderModel,
+  entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byCustomer: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["customerId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  },
+})
+```
+
+`field` renames and `immutable` work with `Packed`. A field has one `storedAs`, so it can't be both packed and a sparse map.
+
+### Writing and reading
+
+```typescript region="entity-put" example="guide-packed-storage.ts"
+const placedAt = DateTime.makeUnsafe("2026-10-11T08:00:00.000Z")
+
+yield* db.entities.Orders.put({
+  orderId: "o-1",
+  customerId: "c-1",
+  status: "open",
+  lines: [
+    { sku: "A-100", qty: 2, price: 9.5 },
+    { sku: "B-200", qty: 1, price: 24 },
+  ],
+  details: { note: "Short note", placedAt },
+})
+
+// Reads are transparent: the domain value comes back
+const order = yield* db.entities.Orders.get({ orderId: "o-1" })
+// order.lines → [Line { sku: "A-100", ... }, Line { sku: "B-200", ... }]
+```
+
+On the table, `lines` is the `S` value `[{"sku":"A-100","qty":2,"price":9.5},{"sku":"B-200","qty":1,"price":24}]`, and `d` is a short JSON string. Every read path decodes packed fields: `get`, queries, scans, collections, `Batch.get`, `Transaction.transactGet`, `versions()`, `history()`, soft-deleted reads and `ReturnValues`.
+
+```typescript region="entity-compressed" example="guide-packed-storage.ts"
+// details over the threshold: stored as B — header byte 0x23 (v1, json, zstd)
+// followed by the zstd-compressed JSON
+yield* db.entities.Orders.update({ orderId: "o-1" }).set({
+  details: { note: LONG_NOTE, placedAt },
+})
+```
+
+In this example the 1,399-byte JSON of `details` is stored as 103 bytes of `B`.
+
+### What a packed field accepts
+
+```typescript region="entity-rules" example="guide-packed-storage.ts"
+// Whole-field existence checks work in conditions and filters
+yield* db.entities.Orders.update({ orderId: "o-1" })
+  .set({ status: "confirmed" })
+  .condition((t, { exists }) => exists(t.lines))
+
+// Whole-value .set() and .remove() are the only updates
+yield* db.entities.Orders.update({ orderId: "o-1" }).set({
+  lines: [{ sku: "A-100", qty: 3, price: 9.5 }],
+})
+
+// Projections return the packed field as parsed JSON (its wire form)
+const rows = yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+  .select(["orderId", "lines", "details"])
+  .collect()
+// rows[0].details → { note: "...", placedAt: "2026-10-11T08:00:00.000Z" }
+
+// A path inside the field is refused when the expression is built:
+// .filter((t, { gt }) => gt(t.lines.at(0).qty, 1))   → compile error + [EDD-9076]
+// .filter({ lines: [] })                              → [EDD-9076]
+// .update(key).add({ lines: 1 })                      → [EDD-9077]
+```
+
+| Operation | Allowed on a packed field | Refused |
+|---|---|---|
+| Conditions, filters | `exists(t.f)` / `notExists(t.f)` (`attribute_exists` / `attribute_not_exists`) on the whole field | any nested path, comparison, `between`, `in`, `beginsWith`, `contains`, `size`, `attributeType` — **[EDD-9076]**, thrown when the expression is built |
+| Updates | `.set({ f })` and `.remove(["f"])` of the whole value | `.add`, `.subtract`, `.append`, `.deleteFromSet` and every `path*` operation on the field — **[EDD-9077]**, a `ValidationError` when the update runs |
+| Projections | the whole field, returned as its parsed JSON (wire form, not schema-decoded) | a nested path — **[EDD-9076]** |
+
+The typed `PathBuilder` also rejects these at compile time: a packed field's path is a `PackedPath`, with no nested properties, `.at()` or `.size()`, and it is accepted only by `exists`, `notExists` and projections.
+
+`Entity.make()` refuses a packed field that can't work as one:
+
+| Code | Rule |
+|---|---|
+| `EDD-9071` | `DynamoModel.Packed(...)` options are invalid: a `format` other than `"json"` (`"binary"` is reserved), an unknown codec, a threshold that isn't a non-negative safe integer, or an unknown option. |
+| `EDD-9072` | The field is a primary-key or index composite (including collection indexes), `timeSeries.orderBy`, a vector index filter field, or an aggregate discriminator or `many` sort-key composite. |
+| `EDD-9073` | The field's encoded form isn't an object or array: a string, number, boolean, literal, date (so a packed field is never the TTL attribute), binary, set, or a union with any of those. Also raised for a packed field that isn't on the model. |
+| `EDD-9074` | A unique constraint names the field. |
+| `EDD-9075` | The field is a `DynamoModel.ref`. |
+
+### Lifecycle and aggregates
+
+- **Version snapshots** (`versioned: { retain: true }`), **soft-delete tombstones** and **time-series event items** copy the stored value as it is: `S` stays `S`, `B` stays the same bytes. `restore` writes it back unchanged.
+- An update that reads the item first (retain, unique constraints) carries packed values it doesn't name byte for byte, so an unrelated update doesn't re-encode them.
+- An `immutable` packed field is compared by its unpacked JSON, not by its bytes, so the same value under a different codec or threshold still matches.
+- **Aggregate** edge entities store their packed fields packed. An aggregate `update` writes only the edges whose values changed.
+- A `DynamoModel.ref` copy of an entity stores the referenced entity's fields natively inside the copy. Packing belongs to the owning entity's storage.
+
+## Registering compressors
+
+Compressors are pluggable. Each one implements a small synchronous interface, `Compressor { codec, compress, decompress }`, on `Uint8Array`. The library core never imports `node:zlib`. Node implementations come from a separate entry point, `effect-dynamodb/compression/node`:
+
+```typescript region="compressors" example="guide-packed-storage.ts"
+const ClientLayer = DynamoClient.layerConfig({
+  region: Config.succeed("us-east-1"),
+  endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+  credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
+  // Every codec a reader may meet. zstd needs Node >= 22.15.
+  compressors: [NodeCompression.zstd(), NodeCompression.gzip()],
+})
+```
+
+| Export | Notes |
+|---|---|
+| `gzip({ level?, maxOutputLength? })` | `zlib.gzipSync` |
+| `brotli({ quality?, maxOutputLength? })` | `zlib.brotliCompressSync`, text mode |
+| `zstd({ level?, maxOutputLength? })` | `zlib.zstdCompressSync`, level 3 by default. **Needs Node 22.15 or later**: on older Node it throws when it's created. |
+| `available({ maxOutputLength? })` | gzip and brotli, plus zstd when this Node has it |
+| `hasZstd()` | `true` when this Node has zstd |
+
+`maxOutputLength` caps the decompressed size of one value, as a guard against decompression bombs. Going over it fails the read with a `ValidationError`.
+
+zstd is the recommended codec: it has the cheapest writes and about the same ratio as the others. The codec is **required** in the config, with no default, because zstd isn't available before Node 22.15.
+
+Compressors can be registered in three ways. This list is in order of precedence:
+
+1. `DynamoClient.make({ entities, ..., compressors: [...] })`, bound into every operation of that client.
+2. A `Compression` service in context when the client or stream is bound. `DynamoClient.layer({ compressors })` and `DynamoClient.layerConfig({ compressors })`, as above, provide one beside the client. `Compression.layer([...])` provides one on its own.
+3. A `Compression` service in context when an unbound operation or decode helper runs.
+
+None of these adds a requirement (`R`) to entity or EventStore operations. Without a registry, uncompressed JSON is read and written as normal. Only a value that needs a codec fails, with the tagged error `CompressorNotRegistered { codec, direction, entityType, attribute, operation }`:
+
+- **When writing:** the value's JSON reaches the threshold, and the config's codec isn't registered.
+- **When reading:** a `B` value's header names a codec that isn't registered.
+
+Keep registering every codec your stored values were written with, for as long as such values exist. A reader needs the codec named in the value's header, whatever the writer's current config is.
+
+## What a packed value contains
+
+A packed value is the field's **wire (encoded) form**, the same value a map would hold, serialised with `JSON.stringify`:
+
+- **Entity field:** the field after the entity's encode. A `Schema.DateTimeUtc` becomes its ISO string, `Redacted` is unwrapped, and a transform schema writes its own wire form.
+- **Event data:** `{ _tag, ...encoded event fields }`.
+- **Snapshot state:** the state encoded through the snapshot schema.
+
+Native, JSON and compressed values of the same field therefore decode through the same schema to the same result.
+
+<Aside type="note" title="Date storage inside a packed value">
+`DynamoModel.configure` storage overrides apply only to top-level fields, and the packed field's own `storedAs` is `Packed`. So no `configure` override reaches a date inside a packed value. A self date nested in it (`Schema.DateTimeUtc`) is stored as its default ISO string. A storage annotation on the nested schema itself is part of the field's schema, so it still applies: `Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))` is a number in the JSON, as it would be in a map. DynamoDB-specific storage doesn't apply inside a packed value either: no set or binary marshalling, and no sparse-map flattening.
+</Aside>
+
+**JSON only.** A value that isn't JSON is refused when it's written, with a `ValidationError` that names the field, the path inside it and the type. That covers `bigint`, `Uint8Array` and other binary, `Set`, `Map`, a `Date` or other class instance, non-finite numbers, `undefined` inside an array, symbols and functions. An `undefined` property is omitted, as it is from a map. A field that needs one of these should stay native, or use a JSON-shaped schema such as `Schema.BigIntFromString`, `Schema.Uint8ArrayFromBase64` or an array instead of a set.
+
+## EventStore streams
+
+```typescript region="stream" example="guide-packed-storage.ts"
+class Recorded extends Schema.TaggedClass<Recorded>()("Recorded", {
+  amount: Schema.Number,
+  note: Schema.String,
+}) {}
+
+class Voided extends Schema.TaggedClass<Voided>()("Voided", {
+  reason: Schema.String,
+}) {}
+
+type LedgerEvent = Recorded | Voided
+
+const LedgerState = Schema.Struct({
+  total: Schema.Number,
+  entries: Schema.Array(Schema.Struct({ amount: Schema.Number, note: Schema.String })),
+})
+type LedgerState = typeof LedgerState.Type
+
+const EventsTable = Table.make({ schema: AppSchema, entities: { Orders } })
+
+const Ledger = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Ledger",
+  events: [Recorded, Voided],
+  streamId: { composite: ["ledgerId"] },
+  metadata: Schema.Struct({ correlationId: Schema.String }),
+  // Event data as JSON (S); metadata always stays a map
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+  snapshot: {
+    schema: LedgerState,
+    mode: "inline",
+    // Snapshot state as JSON, zstd-compressed from 1 KB (the default threshold)
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+  },
+})
+```
+
+`storedAs` takes only `data`. To pack the snapshot state, use `snapshot.storedAs`. Any other key fails with **[EDD-9079]** at `makeStream`. The snapshot state schema's encoded form must be an object or array (**[EDD-9073]**). Event data always is one. The resolved settings are on `stream.storedAs` (`{ data, state }`).
+
+```typescript region="stream-append" example="guide-packed-storage.ts"
+const handle = EventStore.commandHandler(ledgerDecider, Ledger)
+const id = { ledgerId: "L-1" }
+
+// Each event's data is stored as JSON; the inline snapshot rides in the
+// same transaction, compressed once the state's JSON reaches 1 KB
+let latest: LedgerState = ledgerDecider.initialState
+for (let i = 1; i <= 40; i++) {
+  const result = yield* handle(id, { amount: i, note: `entry ${i}: ${"x".repeat(40)}` })
+  latest = result.state
+}
+
+// Reads decode every stored form: map, JSON string, compressed binary
+const events = yield* Ledger.read(id)
+const { snapshot, version } = yield* Ledger.readLatest(id)
+```
+
+`append` and `commandHandler` encode each event, and compress it when that's configured. Every read path decodes by stored form: `read`, `readFrom`, `currentVersion`, `readLatest` (including snapshot replay), `readSnapshot`, `readIndex`, `query.events` and `query.index`. In this example the 2,967-byte JSON of the inline snapshot's state is stored as 213 bytes.
+
+### Raw rows and filters
+
+```typescript region="raw-rows" example="guide-packed-storage.ts"
+// Raw rows carry data as plain parsed JSON — not schema-decoded — whether
+// the item stores it as a map, a JSON string or compressed binary
+const raw = yield* Ledger.query
+  .events(id)
+  .pipe(Query.select(["version", "data"]), Query.limit(2), Query.collect)
+// raw[0] → { version: 1, data: { _tag: "Recorded", amount: 1, note: "entry 1: ..." } }
+
+// A filter on a path inside packed data is refused ([EDD-9076]);
+// filter the decoded events instead
+const big = yield* Ledger.query.events(id).pipe(
+  Query.filterBy((event) => event.data._tag === "Recorded" && event.data.amount > 35),
+  Query.collect,
+)
+```
+
+`Query.select` / `Query.selectPaths` return `data` as **plain parsed JSON**, whatever its stored form: decompressed and parsed, but not schema-decoded. This holds for `query.events` and for `query.index` with every index projection (`"all"`, `"withoutMetadata"`, and `"keys"`, which fetches each page's items). A stream that switched encoding holds a mix of map, JSON and compressed items, and a fold over raw rows sees the same shape for each.
+
+DynamoDB can't evaluate a path inside a packed value. On a stream with `storedAs.data`, a `Query.filterExpr` or projection that addresses `data.*` throws **[EDD-9076]**, and the error names the encoding and points to `Query.filterBy`:
+
+```text
+[EDD-9076] EventStream "Ledger": the filter addresses "data.amount", but `data` is stored
+packed (format "json"): DynamoDB sees one opaque string or binary value and cannot evaluate
+a path inside it, or compare it — only attribute_exists / attribute_not_exists apply to it
+as a whole. Use Query.filterBy((event) => /* test event.data.amount */), which runs on the
+decoded event inside the same paging loop.
+```
+
+`select(["data"])` (the whole attribute) is allowed. A stream *without* `storedAs.data` still accepts `data.*` filters, but they don't match the packed items in a stream that was packed earlier.
+
+Stream indexes don't change. `data` is never part of an index key. `"all"` and `"withoutMetadata"` project it whatever its type, and `"keys"` fetches it from the table.
+
+## Sizing
+
+Packing happens before the item is marshalled, so every size the library measures is the **stored** size:
+
+- The failure diagnosis of `append` and `writeSnapshot` reports items over 400 KB and requests over 4 MB in stored bytes, including a packed inline snapshot. Entity put/update/transaction diagnosis and `Batch.write` chunking do the same.
+- The library never refuses a write because of its measured size. DynamoDB enforces its own limits, and the diagnosis names the item at fault.
+
+JSON is often **larger** than the map it replaces: 18–27% larger in the benchmark above. An estimate made from the map is wrong once data is packed. To plan chunking yourself, measure with the helpers:
+
+```typescript region="measure" example="guide-packed-storage.ts"
+// The bytes an append would write, by DynamoDB's item-size rules, built by
+// the same code append uses: packed data, metadata, keys, inline snapshot
+const next = new Recorded({ amount: 41, note: "entry 41" })
+const plan = yield* Ledger.measureAppend(id, [next], 40, {
+  metadata: { correlationId: "batch-7" },
+  snapshot: ledgerDecider.evolve(latest, next),
+})
+// plan.events      → [bytes of each event item]
+// plan.snapshot    → bytes of the inline snapshot item (compressed)
+// plan.transactionBytes → what the append adds to the 4 MB request
+
+const fits =
+  plan.events.every((bytes) => bytes <= StorageEncoding.limits.item) &&
+  plan.transactionBytes <= StorageEncoding.limits.transaction
+
+// One value under a config, or as a native map (storedAs omitted)
+const asMap = yield* StorageEncoding.valueBytes({ schema: LedgerState, value: latest })
+const asZstd = yield* StorageEncoding.valueBytes({
+  schema: LedgerState,
+  value: latest,
+  storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
+})
+```
+
+| Helper | Returns |
+|---|---|
+| `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the stream's own actions add to the `TransactWriteItems` request. The items are built by the same code `append` uses. Nothing is read or written. |
+| `stream.measureSnapshot(streamId, state, asOfVersion)` | the item size of the snapshot `writeSnapshot` would write |
+| `StorageEncoding.valueBytes({ schema, value, storedAs? })` | the size of one attribute **value** as stored, packed under `storedAs`, or as a native map if `storedAs` is omitted. An item's size is the sum, over its attributes, of the name's UTF-8 bytes plus the value's bytes. |
+| `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304 }` |
+| `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` |
+
+`measureAppend` doesn't accept `additionalItems`, because building a guarded put reads the table. Add their sizes yourself. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
+
+## DynamoDB Streams images
+
+Lambda and EventBridge Pipes deliver stream records as DynamoDB JSON, with `B` values as **base64 text**. `@aws-sdk/util-dynamodb`'s `unmarshall` doesn't decode them. Two helpers decode images by stored form:
+
+```typescript region="stream-image" example="guide-packed-storage.ts"
+// One handler for a table's NewImage records. decodeStreamImage returns
+// Option.none() for anything that is not one of the stream's events.
+const decodeImage = (image: EventStore.StreamImage) =>
+  Effect.gen(function* () {
+    const event = yield* Ledger.decodeStreamImage(image)
+    if (Option.isSome(event)) {
+      // Exactly the StreamEvent Ledger.read returns
+      return `ledger ${event.value.version}: ${event.value.data._tag}`
+    }
+    const order = (yield* Entity.decodeMarshalledItem(Orders, image)) as Order
+    return `order ${order.orderId}: ${order.lines.length} line(s)`
+  })
+```
+
+- **`stream.decodeStreamImage(image)`** returns exactly the `StreamEvent` the read paths return: `data` decoded through the event schemas, and `metadata` through the metadata schema when the stream declares one. It returns `Option.none()` for an image that isn't one of this stream's events: its snapshot, an idempotency sentinel, another stream's item or an entity's. So one handler can pass a table's records through several decoders. An event image that doesn't decode fails with a `ValidationError`.
+- **`Entity.decodeMarshalledItem(entity, image)`** decodes an entity image. It also applies `field:` renames and rebuilds sparse maps.
+
+Both accept DynamoDB JSON (`B` as bytes or base64) or an already-unmarshalled item. In an unmarshalled item, a packed attribute's `B` value may still be base64 text. That text always starts with `I`–`P`, which JSON text never does, so the two can be told apart. `Entity.itemSchema(entity)` is a pure schema and **does not unpack**: use `decodeMarshalledItem` for entities with packed fields.
+
+Neither helper adds a requirement. Compressors come from a `Compression` service in context, or from the bound stream's context.
+
+## Migrating
+
+### Map to packed
+
+```typescript region="native-entity" example="guide-packed-storage.ts"
+const NativeOrders = Entity.make({
+  model: DynamoModel.configure(Order, { details: { field: "d" } }),
+  entityType: "Order",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byCustomer: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["customerId"] },
+      sk: { field: "gsi1sk", composite: ["status"] },
+    },
+  },
+})
+```
+
+```typescript region="migration" example="guide-packed-storage.ts"
+// Written before packing was configured: lines is a native list (L)
+yield* nativeDb.entities.NativeOrders.put({
+  orderId: "o-legacy",
+  customerId: "c-1",
+  status: "open",
+  lines: [{ sku: "C-300", qty: 1, price: 5 }],
+})
+
+// The packed definition reads it: readers go by the stored form
+const legacy = yield* db.entities.Orders.get({ orderId: "o-legacy" })
+
+// The next write of the field stores it packed
+yield* db.entities.Orders.update({ orderId: "o-legacy" }).set({ lines: legacy.lines })
+
+// And the native definition still reads the packed value back
+const rolledBack = yield* nativeDb.entities.NativeOrders.get({ orderId: "o-legacy" })
+```
+
+1. **Upgrade every reader**, including Streams consumers.
+2. **Register the compressors** on every reader and writer, if you compress.
+3. **Add `storedAs`.** New writes are packed. Existing items stay native and keep decoding. Nothing is rewritten, no stream records are produced, and no write units are spent.
+4. **Optionally re-encode entities:** a `put`, or an `update().set()` of the field, rewrites it packed. Events are immutable. The library doesn't re-encode them, and mixed streams read correctly.
+
+### Changing codec, or going back to native
+
+- **Changing the codec** only affects new writes. Keep registering the old codec while values written with it exist.
+- **Removing `storedAs`** goes back to native writes. Packed values already written still decode, because readers check the stored form of every object- or array-shaped field (and of event `data`, and of a snapshot `state` whose schema is object-shaped). The exception is a field typed `Schema.Unknown`, `Schema.Any` or `Schema.Json`: once `storedAs` is removed it isn't checked, so its packed values read back as raw strings or bytes. The same applies the other way: if you switch an existing field of one of those types to `Packed`, any string it held natively is read as JSON.
+
+### Schema evolution
+
+A packed value is decoded through the current schema, as a map is, so the same rules apply to `M`, `S` and `B` values. An optional field added later decodes on old values. A removed field is ignored. A required field added without a default fails, and so does a type change. A nested date that moves from ISO to epoch storage changes only new values, and the date decoders read both.
+
+## What's next?
+
+- [Modeling](/effect-dynamodb/guides/modeling/): `DynamoModel.configure` and the other `storedAs` options
+- [Sparse Maps](/effect-dynamodb/guides/sparse-maps/): the other storage layout, for per-key access to a record
+- [Event Sourcing](/effect-dynamodb/tutorials/event-sourcing/): streams, snapshots and stream indexes
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/): decoding stream records
