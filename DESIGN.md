@@ -3381,9 +3381,9 @@ EventStore.indexDefinitions(...streams)             // CreateTable fragments
 // A GSI with a derived partition, shared by several streams, with snapshots (#149)
 byOrder: {
   type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk",
-  partition: (streamId, event) => `ORDER#${streamId.orderId}`,          // string | undefined
+  partition: (event, version, streamId) => `ORDER#${streamId.orderId}`,          // string | undefined
   key: (event, version, streamId) => `LINE#${streamId.lineId}#EVT#…`,   // string | undefined
-  snapshot: (state, streamId, asOfVersion) => ({ partition, key }),     // | undefined
+  snapshot: (state, asOfVersion, streamId) => ({ partition, key }),     // | undefined
 }
 stream.readIndex("byOrder", streamId, { partition: "ORDER#o-1", … })  // partition required
 stream.query.index("byOrder", streamId, { partition: "ORDER#o-1" })
@@ -3444,7 +3444,7 @@ by the stream, `[EDD-9065]` indexes sharing a physical index or attribute.
   index added to a stream that already holds events (a GSI added by `UpdateTable`), or
   a changed `key`, covers only events appended from then on. The library does not
   backfill.
-- **Derived partition (#149).** A GSI's optional `partition(streamId, event)` replaces
+- **Derived partition (#149).** A GSI's optional `partition(event, version, streamId)` replaces
   the stream's partition key with a derived value, stored raw, so several streams
   declaring the same GSI write one partition of it (an order's line, payment and
   shipment streams under `ORDER#<orderId>`) and one `Query` of it reads the group. The
@@ -3462,7 +3462,7 @@ by the stream, `[EDD-9065]` indexes sharing a physical index or attribute.
   `ValidationError` from `readIndex` and `[EDD-9080]` from `query.index`; the types keep
   `partition` optional on stream-scoped indexes so that a stream with derived partitions
   stays assignable to a plain `EventStream<E, F, M, S>`.
-- **Snapshot entry (#149).** `snapshot(state, streamId, asOfVersion)` (requires
+- **Snapshot entry (#149).** `snapshot(state, asOfVersion, streamId)` (requires
   `partition` and a stream `snapshot` config, else `[EDD-9063]`) returns the snapshot
   item's `{ partition, key }`, written on the item by the same `Put` — `writeSnapshot`,
   the inline snapshot of `append` / `commandHandler`, and counted by `measureSnapshot` /
@@ -4103,7 +4103,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 | `EDD-9080` | `EventStore.ts` | `query.index` without `partition` for an index that derives its partition, or with one for a stream-scoped index (a defect; the first is unreachable from typed code) |
 
-Next free code: **`EDD-9080`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9081`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

@@ -428,11 +428,11 @@ const SeriesMatches = EventStore.makeStream({
       pk: "gsi1pk",
       sk: "gsi1sk",
       // Written raw: no prefix, no casing.
-      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      partition: (_event, _version, streamId) => `SERIES#${streamId.seriesId}`,
       key: (_event, version, streamId) => `MATCH#${streamId.matchId}#EVT#${pad(version)}`,
       // Each match's snapshot is in the partition too, written in the same
       // transaction as the events (an inline snapshot).
-      snapshot: (_state, streamId) => ({
+      snapshot: (_state, _asOfVersion, streamId) => ({
         partition: `SERIES#${streamId.seriesId}`,
         key: `MATCH#${streamId.matchId}#STATE`,
       }),
@@ -451,7 +451,7 @@ const SeriesSquads = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      partition: (_event, _version, streamId) => `SERIES#${streamId.seriesId}`,
       key: (_event, version, streamId) => `SQUAD#${streamId.team}#EVT#${pad(version)}`,
     },
   },
@@ -470,7 +470,7 @@ const Umpires = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (_streamId, event) => `SERIES#${event.seriesId}`,
+      partition: (event) => `SERIES#${event.seriesId}`,
       key: (_event, version, streamId) => `UMPIRE#${streamId.umpireId}#EVT#${pad(version)}`,
     },
   },

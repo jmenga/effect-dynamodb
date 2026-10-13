@@ -7244,9 +7244,9 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
         index: "gsi1",
         pk: "gsi1pk",
         sk: "gsi1sk",
-        partition: (streamId) => `ORDER#${streamId.orderId}`,
+        partition: (_event, _version, streamId) => `ORDER#${streamId.orderId}`,
         key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${pad(version)}`,
-        snapshot: (state, streamId, asOfVersion) =>
+        snapshot: (state, asOfVersion, streamId) =>
           state.quantity === 0
             ? undefined
             : {
@@ -7268,7 +7268,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
         index: "gsi1",
         pk: "gsi1pk",
         sk: "gsi1sk",
-        partition: (streamId) => `ORDER#${streamId.orderId}`,
+        partition: (_event, _version, streamId) => `ORDER#${streamId.orderId}`,
         key: (_event, version, streamId) => `PAY#${streamId.paymentId}#EVT#${pad(version)}`,
       },
     },
@@ -7287,7 +7287,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
         index: "gsi1",
         pk: "gsi1pk",
         sk: "gsi1sk",
-        partition: (_streamId, event) => {
+        partition: (event) => {
           partitionCalls.push(event)
           return event instanceof CommentPosted ? `ORDER#${event.orderId}` : undefined
         },
@@ -7448,7 +7448,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
               index: "gsi1",
               pk: "gsi1pk",
               sk: "gsi1sk",
-              partition: (streamId) => `ORDER#${streamId.orderId}`,
+              partition: (_event, _version, streamId) => `ORDER#${streamId.orderId}`,
               key: () => "EVT",
               snapshot: (state) => ({ partition: `SKU#${state.sku}`, key: "STATE" }),
             },
@@ -7561,7 +7561,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
                 index: "gsi1",
                 pk: "gsi1pk",
                 sk: "gsi1sk",
-                partition: (_streamId, event) => event.orderId,
+                partition: (event) => event.orderId,
                 key: () => "K",
               },
             },
@@ -7910,7 +7910,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
               pk: "gsi1pk",
               sk: "gsi1sk",
               projection: "withoutMetadata",
-              partition: (streamId) => streamId.orderId,
+              partition: (_event, _version, streamId) => streamId.orderId,
               key: () => "K",
               ...(snapshot ? { snapshot: () => undefined } : {}),
             },
@@ -7952,7 +7952,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
             pk: "gsi1pk",
             sk: "gsi1sk",
             projection: "keys",
-            partition: (streamId) => streamId.orderId,
+            partition: (_event, _version, streamId) => streamId.orderId,
             key: () => "K",
           },
         },

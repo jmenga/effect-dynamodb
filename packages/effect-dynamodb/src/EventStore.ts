@@ -661,9 +661,9 @@ export type StreamIndexKey<TEvent, TStreamId = StreamIndexStreamId> = (
 
 /**
  * Derives an event's partition in a GSI stream index (`partition` on a
- * {@link GlobalStreamIndexConfig}, #149) from the stream id it is appended to
- * and the domain event. Called for every appended event, with the index's
- * `key`.
+ * {@link GlobalStreamIndexConfig}, #149) from the domain event, the version it
+ * is appended at and the stream id — the arguments of the index's `key`, in
+ * the same order. Called for every appended event, with `key`.
  *
  * - A string is the event's partition key in the index, stored **raw** (no
  *   casing, no prefix) in the index's `pk` attribute. Several streams may
@@ -682,15 +682,17 @@ export type StreamIndexKey<TEvent, TStreamId = StreamIndexStreamId> = (
  *   event.
  */
 export type StreamIndexPartition<TEvent, TStreamId = StreamIndexStreamId> = (
-  streamId: TStreamId,
   event: TEvent,
+  version: number,
+  streamId: TStreamId,
 ) => string | undefined
 
 /**
  * Puts a stream's snapshot in a GSI stream index with a derived partition
  * (`snapshot` on a {@link GlobalStreamIndexConfig}, #149): from the state
- * being written (before it is encoded), the stream id and the snapshot's
- * `asOfVersion`, the snapshot item's partition and sort key in the index —
+ * being written (before it is encoded), the snapshot's `asOfVersion` and the
+ * stream id — in the order of the events' `key` and `partition` — the
+ * snapshot item's partition and sort key in the index —
  * both stored **raw** — or `undefined` to leave it out.
  *
  * Every snapshot write derives it — `writeSnapshot`, the inline snapshot of
@@ -713,8 +715,8 @@ export type StreamIndexPartition<TEvent, TStreamId = StreamIndexStreamId> = (
  */
 export type StreamIndexSnapshotEntry<TState, TStreamId = StreamIndexStreamId> = (
   state: TState,
-  streamId: TStreamId,
   asOfVersion: number,
+  streamId: TStreamId,
 ) => { readonly partition: string; readonly key: string } | undefined
 
 /**
@@ -784,6 +786,13 @@ export interface LocalStreamIndexConfig<TEvent, TStreamId = StreamIndexStreamId>
  * - `snapshot` — optional, requires `partition` and a stream `snapshot`
  *   config; see {@link StreamIndexSnapshotEntry}.
  * - `projection` — see {@link StreamIndexProjection}.
+ *
+ * Write `type: "gsi"` in the entry itself. TypeScript infers the parameter
+ * types of `partition` and `snapshot` from the GSI member of the entry union,
+ * which it selects by the literal `type`: an entry whose `type` comes from an
+ * object spread (`{ ...shared, partition: (event) => … }`) gets implicit-`any`
+ * parameters there, although `key` still infers. Annotate them, or give the
+ * shared fragment a {@link GlobalStreamIndexConfig} type.
  */
 export interface GlobalStreamIndexConfig<
   TEvent,
@@ -860,11 +869,15 @@ export interface StreamIndexSettings {
   /**
    * Where the index's partition comes from: `"stream"` — the stream's own
    * partition key (every LSI, and a GSI without `partition`) — or
-   * `"derived"`, a GSI's `partition` function (#149).
+   * `"derived"`, a GSI's `partition` function (#149). A stream always sets
+   * it; absent (a settings object built by hand) reads as `"stream"`.
    */
-  readonly partition: "stream" | "derived"
-  /** Whether the stream's snapshot is in the index (a GSI's `snapshot`, #149). */
-  readonly snapshot: boolean
+  readonly partition?: "stream" | "derived" | undefined
+  /**
+   * Whether the stream's snapshot is in the index (a GSI's `snapshot`, #149).
+   * A stream always sets it; absent reads as `false`.
+   */
+  readonly snapshot?: boolean | undefined
 }
 
 /**
@@ -965,22 +978,28 @@ export type ReadIndexOptions = {
  * assignable to one whose indexes do not, as every stream is to
  * `EventStream<E, F, M, S>`).
  */
-export type ReadIndexArgs<N extends string, TPartitionedIndexName extends string> = [N] extends [
+export type ReadIndexArgs<N extends string, TPartitionedIndexName extends string> = [
   TPartitionedIndexName,
-]
-  ? [options: ReadIndexOptions & { readonly partition: string }]
-  : [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+] extends [never]
+  ? // No index derives its partition: resolved even while `N` is a type
+    // parameter, so a generic wrapper over a stream's indexes type-checks.
+    [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+  : [N] extends [TPartitionedIndexName]
+    ? [options: ReadIndexOptions & { readonly partition: string }]
+    : [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
 
 /**
  * The options argument of `query.index` for index `N` — `partition`, required
  * for an index that derives its partition, as for {@link ReadIndexArgs}; on
  * any other index, one passed throws `[EDD-9080]`.
  */
-export type IndexQueryArgs<N extends string, TPartitionedIndexName extends string> = [N] extends [
+export type IndexQueryArgs<N extends string, TPartitionedIndexName extends string> = [
   TPartitionedIndexName,
-]
-  ? [options: { readonly partition: string }]
-  : [options?: { readonly partition?: string | undefined } | undefined]
+] extends [never]
+  ? [options?: { readonly partition?: string | undefined } | undefined]
+  : [N] extends [TPartitionedIndexName]
+    ? [options: { readonly partition: string }]
+    : [options?: { readonly partition?: string | undefined } | undefined]
 
 /**
  * @internal Why a {@link ReadIndexOptions} key condition cannot be sent, or
@@ -1027,6 +1046,8 @@ interface IndexPartitionOrigin {
  * derivation.
  */
 interface ResolvedStreamIndex extends StreamIndexSettings {
+  readonly partition: "stream" | "derived"
+  readonly snapshot: boolean
   readonly name: string
   readonly key: StreamIndexKey<unknown>
   /** The derived partition (#149); `undefined` for a stream-scoped index. */
@@ -1189,7 +1210,7 @@ const resolveStreamIndexes = (
       if (typeof entry.partition !== "function") {
         fail(
           "EDD-9063",
-          `index "${name}": partition must be a function (streamId, event) => string | undefined.`,
+          `index "${name}": partition must be a function (event, version, streamId) => string | undefined.`,
         )
       }
     }
@@ -1197,7 +1218,7 @@ const resolveStreamIndexes = (
       if (typeof entry.snapshot !== "function") {
         fail(
           "EDD-9063",
-          `index "${name}": snapshot must be a function (state, streamId, asOfVersion) => ` +
+          `index "${name}": snapshot must be a function (state, asOfVersion, streamId) => ` +
             "{ partition, key } | undefined.",
         )
       }
@@ -1954,9 +1975,9 @@ interface AppendParts {
  *       index: "gsi1",
  *       pk: "gsi1pk",
  *       sk: "gsi1sk",
- *       partition: (streamId) => `ORDER#${streamId.orderId}`,
+ *       partition: (_event, _version, streamId) => `ORDER#${streamId.orderId}`,
  *       key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${pad(version)}`,
- *       snapshot: (_state, streamId) => ({
+ *       snapshot: (_state, _asOfVersion, streamId) => ({
  *         partition: `ORDER#${streamId.orderId}`,
  *         key: `LINE#${streamId.lineId}#STATE`,
  *       }),
@@ -2436,7 +2457,7 @@ export const makeStream = <
     ValidationError
   > =>
     Effect.try({
-      try: () => entry(state, streamId, asOfVersion),
+      try: () => entry(state, asOfVersion, streamId),
       catch: (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
     }).pipe(
       Effect.flatMap((derived: unknown) => {
@@ -2999,7 +3020,7 @@ export const makeStream = <
               if (idx.derivePartition !== undefined) {
                 const derivePartition = idx.derivePartition
                 partition = yield* deriveIndexValue(idx, "partition", subject, () =>
-                  derivePartition(streamId, event),
+                  derivePartition(event, version, streamId),
                 )
                 if (partition !== undefined) {
                   const first = eventPartitions.get(idx.name)

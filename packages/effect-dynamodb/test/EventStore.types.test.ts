@@ -32,8 +32,10 @@
  *   neither channel) or an `Effect` of it, whose error / requirements join as a
  *   separate `E4` / `R4` — so it infers next to an `eventMetadata` effect with a
  *   different error type, the case one shared `E3` / `R3` pair would break.
- * - Shared stream indexes (#149): a GSI's `partition` receives the typed stream
- *   id and event, `key` the stream id too, and `snapshot` the stream's state;
+ * - Shared stream indexes (#149): a GSI's `partition` receives the event, its
+ *   version and the typed stream id (as `key` now does), and `snapshot` the
+ *   stream's state, `asOfVersion` and stream id; a generic wrapper over a
+ *   stream's index names (no derived partition) still type-checks;
  *   an index with a `partition` is a `TPartitionedIndexName`, so `readIndex` /
  *   `query.index` require `partition` for it, on unbound and bound streams,
  *   and such a stream stays assignable to a plain `EventStream`; `snapshot`
@@ -1327,7 +1329,8 @@ describe("EventStore shared stream index types (#149)", () => {
             index: "gsi1",
             pk: "gsi1pk",
             sk: "gsi1sk",
-            partition: (streamId, event) => {
+            partition: (event, version, streamId) => {
+              expectTypeOf(version).toEqualTypeOf<number>()
               expectTypeOf(streamId).toEqualTypeOf<{
                 readonly groupId: string
                 readonly counterId: string
@@ -1339,7 +1342,7 @@ describe("EventStore shared stream index types (#149)", () => {
               expectTypeOf(streamId.counterId).toEqualTypeOf<string>()
               return `C#${streamId.counterId}#${version}`
             },
-            snapshot: (state, streamId, asOfVersion) => {
+            snapshot: (state, asOfVersion, streamId) => {
               expectTypeOf(state).toEqualTypeOf<{ readonly total: number }>()
               expectTypeOf(asOfVersion).toEqualTypeOf<number>()
               return { partition: `G#${streamId.groupId}`, key: `C#${streamId.counterId}#S` }
@@ -1416,6 +1419,28 @@ describe("EventStore shared stream index types (#149)", () => {
       const handled = EventStore.commandHandler(decider, GroupedCounter)(key, command)
       expectTypeOf<Effect.Services<typeof handled>>().toEqualTypeOf<Base>()
       EventStore.indexDefinitions(Grouped, GroupedCounter, Counter)
+
+      // A generic wrapper over a stream's index names (the 1.26 shape)
+      // type-checks: with no index deriving its partition, the options stay
+      // optional while the name is still a type parameter.
+      const readAny = <F extends ReadonlyArray<string>, I extends string>(
+        stream: EventStore.EventStream<Incremented, F, undefined, never, I>,
+        name: I,
+        streamId: { readonly [K in F[number]]: string },
+        options?: EventStore.ReadIndexOptions,
+      ) => {
+        const read = stream.readIndex(name, streamId, options)
+        const query = stream.query.index(name, streamId)
+        return { read, query }
+      }
+      const Indexed = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Wrapped",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: { byAmount: { index: "lsi1", sk: "lsi1sk", key: (e) => `${e.by}` } },
+      })
+      readAny(Indexed, "byAmount", key, { limit: 1 })
 
       EventStore.makeStream({
         table: AppTable,

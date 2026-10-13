@@ -1574,11 +1574,11 @@ const SeriesMatches = EventStore.makeStream({
       pk: "gsi1pk",
       sk: "gsi1sk",
       // Written raw: no prefix, no casing.
-      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      partition: (_event, _version, streamId) => `SERIES#${streamId.seriesId}`,
       key: (_event, version, streamId) => `MATCH#${streamId.matchId}#EVT#${pad(version)}`,
       // Each match's snapshot is in the partition too, written in the same
       // transaction as the events (an inline snapshot).
-      snapshot: (_state, streamId) => ({
+      snapshot: (_state, _asOfVersion, streamId) => ({
         partition: `SERIES#${streamId.seriesId}`,
         key: `MATCH#${streamId.matchId}#STATE`,
       }),
@@ -1597,7 +1597,7 @@ const SeriesSquads = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      partition: (_event, _version, streamId) => `SERIES#${streamId.seriesId}`,
       key: (_event, version, streamId) => `SQUAD#${streamId.team}#EVT#${pad(version)}`,
     },
   },
@@ -1616,16 +1616,16 @@ const Umpires = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (_streamId, event) => `SERIES#${event.seriesId}`,
+      partition: (event) => `SERIES#${event.seriesId}`,
       key: (_event, version, streamId) => `UMPIRE#${streamId.umpireId}#EVT#${pad(version)}`,
     },
   },
 })
 ```
 
-- `partition(streamId, event)` returns the event's partition in the index, stored **raw** (no casing, no prefix). It can come from the event, as the umpire stream's does. `undefined` leaves the event out of the index, as an `undefined` `key` does: an event is indexed only when both return a string. Both functions run for every appended event.
+- `partition(event, version, streamId)` returns the event's partition in the index, stored **raw** (no casing, no prefix). It can come from the event, as the umpire stream's does. `undefined` leaves the event out of the index, as an `undefined` `key` does: an event is indexed only when both return a string. Both functions run for every appended event.
 - Within one append, every event's partition (where it is a string) must be the same, and the inline snapshot's must match it; otherwise the append fails with `ValidationError` before anything is written. A non-string or a function that throws fails it the same way. An empty partition, or one over DynamoDB's 2048-byte limit, is DynamoDB's to reject; the `ValidationError` names the index and the event.
-- `snapshot(state, streamId, asOfVersion)` puts the stream's snapshot item in the index too, as `{ partition, key }`, or leaves it out with `undefined`. The attributes are on the snapshot item itself, written by the same `Put`: an inline snapshot enters the index in the append's own transaction, and `writeSnapshot` and `commandHandler`'s snapshots carry it too. The `Put` replaces the item, so returning `undefined` takes a snapshot that was in the index out of it. `snapshot` requires `partition` and a stream `snapshot` config.
+- `snapshot(state, asOfVersion, streamId)` puts the stream's snapshot item in the index too, as `{ partition, key }`, or leaves it out with `undefined`. The attributes are on the snapshot item itself, written by the same `Put`: an inline snapshot enters the index in the append's own transaction, and `writeSnapshot` and `commandHandler`'s snapshots carry it too. The `Put` replaces the item, so returning `undefined` takes a snapshot that was in the index out of it. `snapshot` requires `partition` and a stream `snapshot` config.
 - A snapshot is the state **as of** its `asOfVersion`. It is current after every append only with `mode: "inline"` and no `every`; otherwise a reader of the index folds the stream's events after `asOfVersion` onto it.
 
 `indexDefinitions` emits an index that several streams declare alike once:

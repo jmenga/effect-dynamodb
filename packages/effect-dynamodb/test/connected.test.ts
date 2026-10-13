@@ -10572,9 +10572,9 @@ const EsGrpLine = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (streamId) => esGrpOrder(streamId.orderId),
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
       key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
-      snapshot: (state, streamId) =>
+      snapshot: (state, _asOfVersion, streamId) =>
         state.quantity === 0
           ? undefined
           : { partition: esGrpOrder(streamId.orderId), key: `LINE#${streamId.lineId}#STATE` },
@@ -10585,7 +10585,7 @@ const EsGrpLine = EventStore.makeStream({
       pk: "gsi2pk",
       sk: "gsi2sk",
       projection: "keys",
-      partition: (streamId) => esGrpOrder(streamId.orderId),
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
       key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
     },
     byOrderSlim: {
@@ -10594,9 +10594,9 @@ const EsGrpLine = EventStore.makeStream({
       pk: "gsi3pk",
       sk: "gsi3sk",
       projection: "withoutMetadata",
-      partition: (streamId) => esGrpOrder(streamId.orderId),
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
       key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
-      snapshot: (state, streamId) => ({
+      snapshot: (state, _asOfVersion, streamId) => ({
         partition: esGrpOrder(streamId.orderId),
         key: `LINE#${streamId.lineId}#STATE#${state.sku}`,
       }),
@@ -10617,7 +10617,7 @@ const EsGrpPayment = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (streamId) => esGrpOrder(streamId.orderId),
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
       key: (_event, version, streamId) => `PAY#${streamId.paymentId}#EVT#${esGrpPad(version)}`,
     },
   },
@@ -10635,7 +10635,7 @@ const EsGrpComment = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (_streamId, event) =>
+      partition: (event) =>
         event._tag === "EsGrpCommentPosted" ? esGrpOrder(event.orderId) : undefined,
       key: (_event, version, streamId) => `COMMENT#${streamId.commentId}#EVT#${esGrpPad(version)}`,
     },
@@ -10654,7 +10654,7 @@ const EsGrpBareComment = EventStore.makeStream({
       index: "gsi1",
       pk: "gsi1pk",
       sk: "gsi1sk",
-      partition: (_streamId, event) => event.orderId,
+      partition: (event) => event.orderId,
       key: () => "K",
     },
   },
