@@ -10506,6 +10506,394 @@ describeConnected("EventStore stream indexes (#140)", () => {
 })
 
 // ===========================================================================
+// EventStore shared stream indexes — a derived partition several streams
+// write, with each stream's snapshot (#149)
+// ===========================================================================
+
+const esGrpSchema = DynamoSchema.make({ name: "es-grp", version: 1 })
+const esGrpTableName = `es-grp-${Date.now()}`
+
+class EsGrpNoteModel extends Schema.Class<EsGrpNoteModel>("EsGrpNoteModel")({
+  noteId: Schema.String,
+  text: Schema.String,
+}) {}
+
+/** An entity overloading the streams' `gsi1` with its own composed keys. */
+const EsGrpNotes = Entity.make({
+  model: EsGrpNoteModel,
+  entityType: "EsGrpNote",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byText: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["noteId"] },
+      sk: { field: "gsi1sk", composite: ["text"] },
+    },
+  },
+})
+
+const EsGrpTable = Table.make({ schema: esGrpSchema, entities: { EsGrpNotes } })
+
+class EsGrpLineAdded extends Schema.TaggedClass<EsGrpLineAdded>()("EsGrpLineAdded", {
+  sku: Schema.String,
+  quantity: Schema.Number,
+}) {}
+class EsGrpLineRemoved extends Schema.TaggedClass<EsGrpLineRemoved>()("EsGrpLineRemoved", {}) {}
+class EsGrpPaid extends Schema.TaggedClass<EsGrpPaid>()("EsGrpPaid", { amount: Schema.Number }) {}
+class EsGrpCommentPosted extends Schema.TaggedClass<EsGrpCommentPosted>()("EsGrpCommentPosted", {
+  orderId: Schema.String,
+}) {}
+class EsGrpDraft extends Schema.TaggedClass<EsGrpDraft>()("EsGrpDraft", {}) {}
+
+type EsGrpLineEvent = EsGrpLineAdded | EsGrpLineRemoved
+const EsGrpLineState = Schema.Struct({ sku: Schema.String, quantity: Schema.Number })
+
+const esGrpPad = (n: number) => String(n).padStart(10, "0")
+const esGrpOrder = (orderId: string) => `ORDER#${orderId}`
+
+/**
+ * Order lines: on `gsi1` (ALL) with their snapshot, `gsi2` ("keys") and
+ * `gsi3` ("withoutMetadata", snapshot too). A removed line's snapshot leaves
+ * the indexes.
+ */
+const EsGrpLine = EventStore.makeStream({
+  table: EsGrpTable,
+  streamName: "OrderLine",
+  events: [EsGrpLineAdded, EsGrpLineRemoved],
+  streamId: { composite: ["orderId", "lineId"] },
+  metadata: Schema.Struct({ source: Schema.String }),
+  snapshot: { schema: EsGrpLineState, mode: "inline" },
+  indexes: {
+    byOrder: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
+      key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
+      snapshot: (state, _asOfVersion, streamId) =>
+        state.quantity === 0
+          ? undefined
+          : { partition: esGrpOrder(streamId.orderId), key: `LINE#${streamId.lineId}#STATE` },
+    },
+    byOrderKeys: {
+      type: "gsi",
+      index: "gsi2",
+      pk: "gsi2pk",
+      sk: "gsi2sk",
+      projection: "keys",
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
+      key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
+    },
+    byOrderSlim: {
+      type: "gsi",
+      index: "gsi3",
+      pk: "gsi3pk",
+      sk: "gsi3sk",
+      projection: "withoutMetadata",
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
+      key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${esGrpPad(version)}`,
+      snapshot: (state, _asOfVersion, streamId) => ({
+        partition: esGrpOrder(streamId.orderId),
+        key: `LINE#${streamId.lineId}#STATE#${state.sku}`,
+      }),
+    },
+  },
+})
+
+/** Payments: `gsi1` only, `data` stored packed (JSON) (#147). */
+const EsGrpPayment = EventStore.makeStream({
+  table: EsGrpTable,
+  streamName: "OrderPayment",
+  events: [EsGrpPaid],
+  streamId: { composite: ["orderId", "paymentId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+  indexes: {
+    byOrder: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (_event, _version, streamId) => esGrpOrder(streamId.orderId),
+      key: (_event, version, streamId) => `PAY#${streamId.paymentId}#EVT#${esGrpPad(version)}`,
+    },
+  },
+})
+
+/** Comments are keyed by `commentId` alone: the order comes from each event. */
+const EsGrpComment = EventStore.makeStream({
+  table: EsGrpTable,
+  streamName: "OrderComment",
+  events: [EsGrpCommentPosted, EsGrpDraft],
+  streamId: { composite: ["commentId"] },
+  indexes: {
+    byOrder: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (event) =>
+        event._tag === "EsGrpCommentPosted" ? esGrpOrder(event.orderId) : undefined,
+      key: (_event, version, streamId) => `COMMENT#${streamId.commentId}#EVT#${esGrpPad(version)}`,
+    },
+  },
+})
+
+/** Derives an empty partition for an empty order id: DynamoDB's to reject. */
+const EsGrpBareComment = EventStore.makeStream({
+  table: EsGrpTable,
+  streamName: "BareComment",
+  events: [EsGrpCommentPosted],
+  streamId: { composite: ["commentId"] },
+  indexes: {
+    byOrder: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (event) => event.orderId,
+      key: () => "K",
+    },
+  },
+})
+
+const esGrpLineDecider: EventStore.Decider<
+  { readonly sku: string; readonly quantity: number },
+  { readonly sku: string; readonly quantity: number },
+  EsGrpLineEvent
+> = {
+  initialState: { sku: "", quantity: 0 },
+  decide: (command) =>
+    Effect.succeed(
+      command.quantity === 0 ? [new EsGrpLineRemoved()] : [new EsGrpLineAdded(command)],
+    ),
+  evolve: (state, event) =>
+    event._tag === "EsGrpLineAdded"
+      ? { sku: event.sku, quantity: event.quantity }
+      : { sku: state.sku, quantity: 0 },
+}
+
+const EsGrpLayer = Layer.mergeAll(ClientLayer, EsGrpTable.layer({ name: esGrpTableName }))
+const provideEsGrp = Effect.provide(EsGrpLayer)
+
+/** Every item of one partition of a physical index, raw. */
+const esGrpRawIndex = (index: string, pkField: string, pk: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const result = yield* client.query({
+      TableName: esGrpTableName,
+      IndexName: index,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": pkField },
+      ExpressionAttributeValues: toAttributeMap({ ":pk": pk }),
+    })
+    return (result.Items ?? []).map((item) => fromAttributeMap(item))
+  })
+
+describeConnected("EventStore shared stream indexes (#149)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const fragments = EventStore.indexDefinitions(EsGrpLine, EsGrpPayment, EsGrpComment)
+        yield* client.createTable({
+          TableName: esGrpTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "sk", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: "sk", AttributeType: "S" },
+            ...fragments.AttributeDefinitions,
+          ],
+          GlobalSecondaryIndexes: fragments.GlobalSecondaryIndexes,
+        })
+      }).pipe(provideEsGrp, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: esGrpTableName })
+      }).pipe(
+        provideEsGrp,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.effect("#149 indexDefinitions creates each shared GSI once, with its projection", () =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const described = yield* client.describeTable({ TableName: esGrpTableName })
+      const gsis = described.Table?.GlobalSecondaryIndexes ?? []
+      const byName = Object.fromEntries(gsis.map((gsi) => [gsi.IndexName, gsi.Projection]))
+      expect(Object.keys(byName).sort()).toEqual(["gsi1", "gsi2", "gsi3"])
+      expect(byName.gsi1?.ProjectionType).toBe("ALL")
+      expect(byName.gsi2?.NonKeyAttributes).toEqual(["__edd_e__"])
+      expect([...(byName.gsi3?.NonKeyAttributes ?? [])].sort()).toEqual([
+        "__edd_e__",
+        "asOfVersion",
+        "data",
+        "eventType",
+        "state",
+        "streamId",
+        "timestamp",
+        "version",
+      ])
+    }).pipe(provideEsGrp),
+  )
+
+  it.effect(
+    "#149 one raw query of the partition reads every stream's events and the snapshots",
+    () =>
+      Effect.gen(function* () {
+        const handle = EventStore.commandHandler(esGrpLineDecider, EsGrpLine)
+        yield* handle({ orderId: "o-1", lineId: "l-1" }, { sku: "S-1", quantity: 2 })
+        yield* handle({ orderId: "o-1", lineId: "l-2" }, { sku: "S-2", quantity: 5 })
+        // An append with per-event metadata and timestamps and an entity
+        // overloading gsi1 in the same transaction.
+        yield* EsGrpLine.append(
+          { orderId: "o-1", lineId: "l-1" },
+          [new EsGrpLineAdded({ sku: "S-1", quantity: 3 })],
+          1,
+          {
+            eventMetadata: [{ source: "api" }],
+            eventTimestamps: [DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")],
+            additionalItems: [EsGrpNotes.put({ noteId: "n-1", text: "hello" })],
+            snapshot: { sku: "S-1", quantity: 3 },
+          },
+        )
+        yield* EsGrpPayment.append(
+          { orderId: "o-1", paymentId: "p-1" },
+          [new EsGrpPaid({ amount: 9 })],
+          0,
+        )
+        // A comment on order o-1, and a draft out of the index.
+        yield* EsGrpComment.append(
+          { commentId: "c-1" },
+          [new EsGrpCommentPosted({ orderId: "o-1" }), new EsGrpDraft()],
+          0,
+        )
+        // Another order's items stay in their own partition.
+        yield* handle({ orderId: "o-2", lineId: "l-1" }, { sku: "S-9", quantity: 1 })
+
+        const rows = yield* esGrpRawIndex("gsi1", "gsi1pk", "ORDER#o-1")
+        expect(rows.map((row) => row.gsi1sk)).toEqual([
+          `COMMENT#c-1#EVT#${esGrpPad(1)}`,
+          `LINE#l-1#EVT#${esGrpPad(1)}`,
+          `LINE#l-1#EVT#${esGrpPad(2)}`,
+          "LINE#l-1#STATE",
+          `LINE#l-2#EVT#${esGrpPad(1)}`,
+          "LINE#l-2#STATE",
+          `PAY#p-1#EVT#${esGrpPad(1)}`,
+        ])
+        const snapshot = rows.find((row) => row.gsi1sk === "LINE#l-1#STATE")!
+        expect(snapshot).toMatchObject({
+          __edd_e__: "orderline.snapshot",
+          asOfVersion: 2,
+          state: { sku: "S-1", quantity: 3 },
+        })
+        expect(rows.find((row) => row.gsi1sk === `LINE#l-1#EVT#${esGrpPad(2)}`)).toMatchObject({
+          metadata: { source: "api" },
+          timestamp: "2026-01-02T03:04:05.000Z",
+        })
+        // Packed payment data is copied as stored.
+        const payment = rows.find((row) => String(row.gsi1sk).startsWith("PAY#"))!
+        expect(typeof payment.data).toBe("string")
+        // The entity's own gsi1 item is in its own composed partition.
+        const notes = yield* EsGrpNotes.query.byText({ noteId: "n-1" }).pipe(Query.collect)
+        expect(notes.map((note) => note.text)).toEqual(["hello"])
+      }).pipe(provideEsGrp),
+  )
+
+  it.effect(
+    "#149 readIndex keeps the stream id's events of the partition, for each projection",
+    () =>
+      Effect.gen(function* () {
+        const line = { orderId: "o-1", lineId: "l-1" }
+        for (const name of ["byOrder", "byOrderKeys", "byOrderSlim"] as const) {
+          const events = yield* EsGrpLine.readIndex(name, line, { partition: "ORDER#o-1" })
+          expect(events.map((event) => [event.streamId, event.version])).toEqual([
+            ["o-1#l-1", 1],
+            ["o-1#l-1", 2],
+          ])
+        }
+        const page = yield* EsGrpLine.query
+          .index("byOrder", { orderId: "o-1", lineId: "l-2" }, { partition: "ORDER#o-1" })
+          .pipe(Query.where({ beginsWith: "LINE#l-2#EVT#" }), Query.collect)
+        expect(page.map((event) => event.data)).toEqual([
+          new EsGrpLineAdded({ sku: "S-2", quantity: 5 }),
+        ])
+        const payments = yield* EsGrpPayment.readIndex(
+          "byOrder",
+          { orderId: "o-1", paymentId: "p-1" },
+          { partition: "ORDER#o-1" },
+        )
+        expect(payments.map((event) => event.data)).toEqual([new EsGrpPaid({ amount: 9 })])
+        // The withoutMetadata index holds each snapshot with its state.
+        const slim = yield* esGrpRawIndex("gsi3", "gsi3pk", "ORDER#o-1")
+        const slimSnapshot = slim.find((row) => row.__edd_e__ === "orderline.snapshot")!
+        expect(slimSnapshot).toMatchObject({ asOfVersion: 2, state: { sku: "S-1", quantity: 3 } })
+      }).pipe(provideEsGrp),
+  )
+
+  it.effect("#149 a snapshot written without an entry leaves the index", () =>
+    Effect.gen(function* () {
+      const handle = EventStore.commandHandler(esGrpLineDecider, EsGrpLine)
+      yield* handle({ orderId: "o-3", lineId: "l-1" }, { sku: "S-1", quantity: 1 })
+      const before = yield* esGrpRawIndex("gsi1", "gsi1pk", "ORDER#o-3")
+      expect(before.map((row) => row.gsi1sk)).toContain("LINE#l-1#STATE")
+      yield* handle({ orderId: "o-3", lineId: "l-1" }, { sku: "S-1", quantity: 0 })
+      const after = yield* esGrpRawIndex("gsi1", "gsi1pk", "ORDER#o-3")
+      expect(after.map((row) => row.gsi1sk)).not.toContain("LINE#l-1#STATE")
+      expect(after).toHaveLength(2)
+      // A standalone writeSnapshot (monotonic: a newer version) puts it back.
+      const id = { orderId: "o-3", lineId: "l-1" }
+      yield* EsGrpLine.append(id, [new EsGrpLineAdded({ sku: "S-1", quantity: 4 })], 2)
+      yield* EsGrpLine.writeSnapshot(id, { sku: "S-1", quantity: 4 }, 3)
+      const restored = yield* esGrpRawIndex("gsi1", "gsi1pk", "ORDER#o-3")
+      expect(restored.map((row) => row.gsi1sk)).toContain("LINE#l-1#STATE")
+    }).pipe(provideEsGrp),
+  )
+
+  it.effect("#149 an append whose events disagree on the partition writes nothing", () =>
+    Effect.gen(function* () {
+      const error = yield* EsGrpComment.append(
+        { commentId: "c-split" },
+        [new EsGrpCommentPosted({ orderId: "o-1" }), new EsGrpCommentPosted({ orderId: "o-2" })],
+        0,
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(yield* EsGrpComment.read({ commentId: "c-split" })).toEqual([])
+    }).pipe(provideEsGrp),
+  )
+
+  it.effect("#149 an empty partition is DynamoDB's to reject, named by index and event", () =>
+    Effect.gen(function* () {
+      const error = yield* EsGrpBareComment.append(
+        { commentId: "c-empty" },
+        [new EsGrpCommentPosted({ orderId: "" })],
+        0,
+      ).pipe(Effect.flip)
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as ValidationError).cause)).toContain(
+        'The partition of index "byOrder" for the event at version 1 is an empty string',
+      )
+      expect(yield* EsGrpBareComment.read({ commentId: "c-empty" })).toEqual([])
+    }).pipe(provideEsGrp),
+  )
+})
+
+// ===========================================================================
 // EventStore per-event metadata — `eventMetadata` on append and
 // commandHandler (#144)
 // ===========================================================================

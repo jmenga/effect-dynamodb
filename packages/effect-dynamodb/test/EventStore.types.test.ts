@@ -32,6 +32,14 @@
  *   neither channel) or an `Effect` of it, whose error / requirements join as a
  *   separate `E4` / `R4` — so it infers next to an `eventMetadata` effect with a
  *   different error type, the case one shared `E3` / `R3` pair would break.
+ * - Shared stream indexes (#149): a GSI's `partition` receives the event, its
+ *   version and the typed stream id (as `key` now does), and `snapshot` the
+ *   stream's state, `asOfVersion` and stream id; a generic wrapper over a
+ *   stream's index names (no derived partition) still type-checks;
+ *   an index with a `partition` is a `TPartitionedIndexName`, so `readIndex` /
+ *   `query.index` require `partition` for it, on unbound and bound streams,
+ *   and such a stream stays assignable to a plain `EventStream`; `snapshot`
+ *   and `partition` are refused on an LSI.
  * - Packed storage (#147): `storedAs` admits only `data`, and it and
  *   `snapshot.storedAs` only a `DynamoModel.Packed` config; error channels
  *   are unchanged (a missing compressor is a `ValidationError` whose cause is
@@ -1298,6 +1306,171 @@ describe("EventStore packed storage types (#147)", () => {
       expectTypeOf<EventStore.RawStreamEvent<Incremented>["rawData"]>().toEqualTypeOf<
         Readonly<Record<string, unknown>>
       >()
+    })
+    expect(true).toBe(true)
+  })
+})
+
+describe("EventStore shared stream index types (#149)", () => {
+  class Placed extends Schema.TaggedClass<Placed>()("Placed", { groupId: Schema.String }) {}
+  const State = Schema.Struct({ total: Schema.Number })
+
+  it("types the partition, key and snapshot functions, and the partition of a read", () => {
+    typeOnly(() => {
+      const Grouped = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Grouped",
+        events: [Incremented, Placed],
+        streamId: { composite: ["groupId", "counterId"] },
+        snapshot: { schema: State, mode: "inline" },
+        indexes: {
+          byGroup: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            partition: (event, version, streamId) => {
+              expectTypeOf(version).toEqualTypeOf<number>()
+              expectTypeOf(streamId).toEqualTypeOf<{
+                readonly groupId: string
+                readonly counterId: string
+              }>()
+              expectTypeOf(event).toEqualTypeOf<Incremented | Placed>()
+              return event._tag === "Placed" ? `G#${event.groupId}` : `G#${streamId.groupId}`
+            },
+            key: (_event, version, streamId) => {
+              expectTypeOf(streamId.counterId).toEqualTypeOf<string>()
+              return `C#${streamId.counterId}#${version}`
+            },
+            snapshot: (state, asOfVersion, streamId) => {
+              expectTypeOf(state).toEqualTypeOf<{ readonly total: number }>()
+              expectTypeOf(asOfVersion).toEqualTypeOf<number>()
+              return { partition: `G#${streamId.groupId}`, key: `C#${streamId.counterId}#S` }
+            },
+          },
+          byAmount: { index: "lsi1", sk: "lsi1sk", key: (event) => event._tag },
+        },
+      })
+      expectTypeOf(Grouped).toEqualTypeOf<
+        EventStore.EventStream<
+          Incremented | Placed,
+          readonly ["groupId", "counterId"],
+          undefined,
+          { readonly total: number },
+          "byGroup" | "byAmount",
+          { readonly byGroup: "all"; readonly byAmount: "all" },
+          "byGroup"
+        >
+      >()
+
+      const id = { groupId: "g-1", counterId: "c-1" }
+      const read = Grouped.readIndex("byGroup", id, { partition: "G#g-1", beginsWith: "C#c-1" })
+      expectTypeOf<Effect.Success<typeof read>[number]["data"]>().toEqualTypeOf<
+        Incremented | Placed
+      >()
+      // @ts-expect-error — the index derives its partition: it is required
+      Grouped.readIndex("byGroup", id)
+      // @ts-expect-error — the index derives its partition: it is required
+      Grouped.readIndex("byGroup", id, { beginsWith: "C#" })
+      Grouped.readIndex("byAmount", id)
+      // A stream whose indexes derive their partition is still an EventStream
+      // of its events, state and stream id (a scoped index's `partition` is
+      // refused at runtime instead).
+      const plain: EventStore.EventStream<
+        Incremented | Placed,
+        readonly ["groupId", "counterId"],
+        undefined,
+        { readonly total: number }
+      > = Grouped
+      expectTypeOf(plain.streamName).toEqualTypeOf<string>()
+      Grouped.query.index("byGroup", id, { partition: "G#g-1" })
+      // @ts-expect-error — the index derives its partition: it is required
+      Grouped.query.index("byGroup", id)
+      Grouped.query.index("byAmount", id)
+
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Grouped)
+        const boundRead = bound.readIndex("byGroup", id, { partition: "G#g-1" })
+        expectTypeOf<Effect.Services<typeof boundRead>>().toEqualTypeOf<never>()
+        // @ts-expect-error — the index derives its partition: it is required
+        bound.readIndex("byGroup", id)
+      })
+
+      // Streams with a derived partition flow through commandHandler and
+      // indexDefinitions.
+      const GroupedCounter = EventStore.makeStream({
+        table: AppTable,
+        streamName: "GroupedCounter",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        snapshot: { schema: State, mode: "inline" },
+        indexes: {
+          byGroup: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            partition: () => "G",
+            key: () => "K",
+            snapshot: () => undefined,
+          },
+        },
+      })
+      const handled = EventStore.commandHandler(decider, GroupedCounter)(key, command)
+      expectTypeOf<Effect.Services<typeof handled>>().toEqualTypeOf<Base>()
+      EventStore.indexDefinitions(Grouped, GroupedCounter, Counter)
+
+      // A generic wrapper over a stream's index names (the 1.26 shape)
+      // type-checks: with no index deriving its partition, the options stay
+      // optional while the name is still a type parameter.
+      const readAny = <F extends ReadonlyArray<string>, I extends string>(
+        stream: EventStore.EventStream<Incremented, F, undefined, never, I>,
+        name: I,
+        streamId: { readonly [K in F[number]]: string },
+        options?: EventStore.ReadIndexOptions,
+      ) => {
+        const read = stream.readIndex(name, streamId, options)
+        const query = stream.query.index(name, streamId)
+        return { read, query }
+      }
+      const Indexed = EventStore.makeStream({
+        table: AppTable,
+        streamName: "Wrapped",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: { byAmount: { index: "lsi1", sk: "lsi1sk", key: (e) => `${e.by}` } },
+      })
+      readAny(Indexed, "byAmount", key, { limit: 1 })
+
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadLsi",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        indexes: {
+          // @ts-expect-error — an lsi is partitioned by the stream
+          lsi: { index: "lsi1", sk: "lsi1sk", key: () => "K", partition: () => "P" },
+        },
+      })
+      EventStore.makeStream({
+        table: AppTable,
+        streamName: "BadEntry",
+        events: [Incremented],
+        streamId: { composite: ["counterId"] },
+        snapshot: { schema: State },
+        indexes: {
+          byGroup: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            partition: () => "P",
+            key: () => "K",
+            // @ts-expect-error — the entry is { partition, key }
+            snapshot: () => ({ partition: "P" }),
+          },
+        },
+      })
     })
     expect(true).toBe(true)
   })

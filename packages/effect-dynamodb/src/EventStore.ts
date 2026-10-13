@@ -15,7 +15,9 @@
  * - Stream indexes (`makeStream({ indexes })`): sub-streams ordered by a key
  *   derived from each event, on an LSI or GSI, each projecting all of the
  *   event, all but its metadata, or only its keys — `readIndex`,
- *   `query.index`, and `indexDefinitions` for the `CreateTable` fragments
+ *   `query.index`, and `indexDefinitions` for the `CreateTable` fragments.
+ *   A GSI may derive its partition too, so several streams share one
+ *   partition of it, snapshots included (#149)
  * - `fold` / `foldFrom` helpers for state reconstruction
  * - Packed storage (`makeStream({ storedAs: { data } })`, `snapshot.storedAs`):
  *   event data and snapshot state as one JSON string, optionally compressed —
@@ -71,6 +73,7 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
   type CodecRequirement,
@@ -84,6 +87,7 @@ import {
   unregisteredCodecError,
   withRegistry,
 } from "./internal/Packed.js"
+import { createPathBuilder } from "./internal/PathBuilder.js"
 import {
   type BuiltTransactWriteItems,
   buildTransactWriteItems,
@@ -621,19 +625,25 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
 // ---------------------------------------------------------------------------
 
 /**
+ * The stream id as a stream's index functions receive it: the value of each
+ * `streamId.composite` field, by name.
+ */
+export type StreamIndexStreamId = { readonly [field: string]: string }
+
+/**
  * Derives an event's key in a stream index from the domain event (before it is
- * encoded) and the version it is appended at.
+ * encoded), the version it is appended at — its version in the stream — and
+ * the stream id it is appended to.
  *
  * - A string is the event's sort key in the index. It is stored **raw**: no
  *   casing and no prefixing is applied, so compose it to sort the way you
  *   query (zero-pad numbers, for example).
  * - `undefined` leaves the event out of the index (a sparse index).
- * - An empty string (or any other value) fails the append with
- *   `ValidationError` before anything is written — DynamoDB rejects empty key
- *   values — as does a `key` that throws. A key over DynamoDB's 1024-byte
- *   sort-key limit is sent and rejected by DynamoDB; the append then fails
- *   with `ValidationError` naming the index and the event (#144), and nothing
- *   is written.
+ * - Any other value, or a `key` that throws, fails the append with
+ *   `ValidationError` before anything is written. An empty string or a key
+ *   over DynamoDB's 1024-byte sort-key limit is sent and rejected by
+ *   DynamoDB; the append then fails with `ValidationError` naming the index
+ *   and the event (#144), and nothing is written.
  *
  * The key is derived only when an event is appended. Events are never
  * rewritten, so changing `key` later leaves events already stored under their
@@ -643,7 +653,71 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
  * existing events is the application's decision (see `indexes` on
  * {@link makeStream}).
  */
-export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string | undefined
+export type StreamIndexKey<TEvent, TStreamId = StreamIndexStreamId> = (
+  event: TEvent,
+  version: number,
+  streamId: TStreamId,
+) => string | undefined
+
+/**
+ * Derives an event's partition in a GSI stream index (`partition` on a
+ * {@link GlobalStreamIndexConfig}, #149) from the domain event, the version it
+ * is appended at and the stream id — the arguments of the index's `key`, in
+ * the same order. Called for every appended event, with `key`.
+ *
+ * - A string is the event's partition key in the index, stored **raw** (no
+ *   casing, no prefix) in the index's `pk` attribute. Several streams may
+ *   derive the same value, so one query of the index reads a group of
+ *   streams — `ORDER#<orderId>` for an order's line, payment and shipment
+ *   streams, say.
+ * - `undefined` leaves the event out of the index, as an `undefined` `key`
+ *   does. An event is indexed only when both return a string.
+ * - Within one append, every event whose partition is a string must have the
+ *   same one, and so must the inline snapshot's entry (see
+ *   {@link StreamIndexSnapshotEntry}); otherwise the append fails with
+ *   `ValidationError` and nothing is written. Another value, or a function
+ *   that throws, fails it the same way. An empty string, or one over
+ *   DynamoDB's 2048-byte partition-key limit, is DynamoDB's to reject: the
+ *   rejection is reported as a `ValidationError` naming the index and the
+ *   event.
+ */
+export type StreamIndexPartition<TEvent, TStreamId = StreamIndexStreamId> = (
+  event: TEvent,
+  version: number,
+  streamId: TStreamId,
+) => string | undefined
+
+/**
+ * Puts a stream's snapshot in a GSI stream index with a derived partition
+ * (`snapshot` on a {@link GlobalStreamIndexConfig}, #149): from the state
+ * being written (before it is encoded), the snapshot's `asOfVersion` and the
+ * stream id — in the order of the events' `key` and `partition` — the
+ * snapshot item's partition and sort key in the index —
+ * both stored **raw** — or `undefined` to leave it out.
+ *
+ * Every snapshot write derives it — `writeSnapshot`, the inline snapshot of
+ * `append` and `commandHandler` (`mode: "inline"` or `"after-append"`) — and
+ * the attributes are part of the snapshot item itself, so an inline snapshot
+ * enters the index in the append's own transaction. The snapshot `Put`
+ * replaces the whole item, so returning `undefined` takes a snapshot already
+ * in the index out of it.
+ *
+ * The inline snapshot of an append must have the partition of the append's
+ * events in the index (when they have one); a standalone `writeSnapshot` has
+ * no events to compare with. Another value than an object of two strings, or
+ * a function that throws, fails the write with `ValidationError` before
+ * anything is written.
+ *
+ * A snapshot is the state **as of** `asOfVersion`: it is current after every
+ * append only with `snapshot: { mode: "inline" }` and no `every`. A reader of
+ * the index that needs the head folds the stream's indexed events after
+ * `asOfVersion` onto it.
+ */
+export type StreamIndexSnapshotEntry<TState, TStreamId = StreamIndexStreamId> = (
+  state: TState,
+  asOfVersion: number,
+  streamId: TStreamId,
+) => { readonly partition: string; readonly key: string } | undefined
 
 /**
  * A stream index on a **local** secondary index (the default `type`). An LSI
@@ -661,13 +735,17 @@ export type StreamIndexKey<TEvent> = (event: TEvent, version: number) => string 
  * the index copies from each event is its `projection` — see
  * {@link StreamIndexProjection}.
  */
-export interface LocalStreamIndexConfig<TEvent> {
+export interface LocalStreamIndexConfig<TEvent, TStreamId = StreamIndexStreamId> {
   readonly type?: "lsi" | undefined
   readonly index: string
   readonly sk: string
   /** An LSI uses the table partition key; supplying `pk` is refused (`[EDD-9063]`). */
   readonly pk?: undefined
-  readonly key: StreamIndexKey<TEvent>
+  readonly key: StreamIndexKey<TEvent, TStreamId>
+  /** An LSI's partition is the stream's; supplying `partition` is refused (`[EDD-9063]`). */
+  readonly partition?: undefined
+  /** Only a GSI with a derived `partition` indexes snapshots (`[EDD-9063]`). */
+  readonly snapshot?: undefined
   /**
    * What the index copies from each event — see {@link StreamIndexProjection}.
    * Default `"all"`. Must match the deployed index.
@@ -676,30 +754,60 @@ export interface LocalStreamIndexConfig<TEvent> {
 }
 
 /**
- * A stream index on a **global** secondary index. `append` writes the stream's
- * partition key value into the `pk` attribute of each indexed event, so the
- * index is scoped to the same stream: the eventually consistent equivalent of
- * an LSI, without the LSI's 10 GB item-collection cap. DynamoDB rejects a
- * strongly consistent read of it, diagnosed as a `ValidationError` naming the
- * index.
+ * A stream index on a **global** secondary index. By default `append` writes
+ * the stream's partition key value into the `pk` attribute of each indexed
+ * event, so the index is scoped to the same stream: the eventually consistent
+ * equivalent of an LSI, without the LSI's 10 GB item-collection cap. DynamoDB
+ * rejects a strongly consistent read of it, diagnosed as a `ValidationError`
+ * naming the index.
+ *
+ * With `partition` (#149), the partition is derived instead — see
+ * {@link StreamIndexPartition} — and stored raw, so several streams can write
+ * the same partition of one GSI they all declare, and one query of it reads
+ * the whole group (an order's line, payment and shipment streams under
+ * `ORDER#<orderId>`, say). {@link indexDefinitions} emits a physical index
+ * the streams declare alike once. With `snapshot` as well, each stream's
+ * snapshot item is in the index too — see {@link StreamIndexSnapshotEntry}.
+ * {@link EventStream.readIndex} then takes the partition to read, and
+ * returns the given stream's events in it.
  *
  * Unlike an LSI, the GSI itself can be added to an existing table
- * (`UpdateTable`), but that does not index the stream's existing events: the
- * index attributes are written only by `append`, so only events appended after
- * the index is declared are in it — see {@link StreamIndexKey}.
+ * (`UpdateTable`), but that does not index the stream's existing items: the
+ * index attributes are written only by `append` (and snapshot writes), so only
+ * events appended after the index is declared are in it — see
+ * {@link StreamIndexKey}.
  *
  * - `index` — the physical GSI name.
- * - `pk` — the attribute carrying the stream's partition key (the GSI's HASH key).
+ * - `pk` — the attribute carrying the partition (the GSI's HASH key): the
+ *   stream's partition key, or the derived `partition`.
  * - `sk` — the attribute carrying the derived key (the GSI's RANGE key).
  * - `key` — see {@link StreamIndexKey}.
+ * - `partition` — optional, see {@link StreamIndexPartition}.
+ * - `snapshot` — optional, requires `partition` and a stream `snapshot`
+ *   config; see {@link StreamIndexSnapshotEntry}.
  * - `projection` — see {@link StreamIndexProjection}.
+ *
+ * Write `type: "gsi"` in the entry itself. TypeScript infers the parameter
+ * types of `partition` and `snapshot` from the GSI member of the entry union,
+ * which it selects by the literal `type`: an entry whose `type` comes from an
+ * object spread (`{ ...shared, partition: (event) => … }`) gets implicit-`any`
+ * parameters there, although `key` still infers. Annotate them, or give the
+ * shared fragment a {@link GlobalStreamIndexConfig} type.
  */
-export interface GlobalStreamIndexConfig<TEvent> {
+export interface GlobalStreamIndexConfig<
+  TEvent,
+  TStreamId = StreamIndexStreamId,
+  TState = unknown,
+> {
   readonly type: "gsi"
   readonly index: string
   readonly pk: string
   readonly sk: string
-  readonly key: StreamIndexKey<TEvent>
+  readonly key: StreamIndexKey<TEvent, TStreamId>
+  /** The derived partition — see {@link StreamIndexPartition}. */
+  readonly partition?: StreamIndexPartition<TEvent, TStreamId> | undefined
+  /** The snapshot's entry — see {@link StreamIndexSnapshotEntry}. Requires `partition`. */
+  readonly snapshot?: StreamIndexSnapshotEntry<TState, TStreamId> | undefined
   /**
    * What the index copies from each event — see {@link StreamIndexProjection}.
    * Default `"all"`. Must match the deployed index.
@@ -712,9 +820,9 @@ export interface GlobalStreamIndexConfig<TEvent> {
  * ordered by a key derived from each event. See {@link LocalStreamIndexConfig}
  * and {@link GlobalStreamIndexConfig}.
  */
-export type StreamIndexConfig<TEvent> =
-  | LocalStreamIndexConfig<TEvent>
-  | GlobalStreamIndexConfig<TEvent>
+export type StreamIndexConfig<TEvent, TStreamId = StreamIndexStreamId, TState = unknown> =
+  | LocalStreamIndexConfig<TEvent, TStreamId>
+  | GlobalStreamIndexConfig<TEvent, TStreamId, TState>
 
 /**
  * What a stream index copies from each event (`projection` on an entry of
@@ -724,7 +832,7 @@ export type StreamIndexConfig<TEvent> =
  * | Value | Emitted `Projection` | Read |
  * |---|---|---|
  * | `"all"` (default) | `ALL` | one query |
- * | `"withoutMetadata"` | `INCLUDE` of every event attribute except `metadata` | one query; `metadata` is `undefined` (and typed so) |
+ * | `"withoutMetadata"` | `INCLUDE` of every event attribute except `metadata` (plus the snapshot's `asOfVersion` and `state` when a stream indexes its snapshot in it) | one query; `metadata` is `undefined` (and typed so) |
  * | `"keys"` | `INCLUDE ["__edd_e__"]` — **not** `KEYS_ONLY` | LSI: one query with `Select: ALL_ATTRIBUTES` (DynamoDB fetches each event from the table). GSI: the query, then `BatchGetItem` for the events of each page, in index order |
  *
  * `__edd_e__` is always projected because every read filters on it, and
@@ -758,6 +866,18 @@ export interface StreamIndexSettings {
   readonly pk: string
   readonly sk: string
   readonly projection: StreamIndexProjection
+  /**
+   * Where the index's partition comes from: `"stream"` — the stream's own
+   * partition key (every LSI, and a GSI without `partition`) — or
+   * `"derived"`, a GSI's `partition` function (#149). A stream always sets
+   * it; absent (a settings object built by hand) reads as `"stream"`.
+   */
+  readonly partition?: "stream" | "derived" | undefined
+  /**
+   * Whether the stream's snapshot is in the index (a GSI's `snapshot`, #149).
+   * A stream always sets it; absent reads as `false`.
+   */
+  readonly snapshot?: boolean | undefined
 }
 
 /**
@@ -784,6 +904,19 @@ export type IndexProjectionsOf<TIndexes> = {
   readonly [K in keyof TIndexes & string]: ProjectionOf<TIndexes[K]>
 }
 
+/**
+ * The names of the indexes of a `makeStream({ indexes })` config that derive
+ * their partition (`partition`, #149) — those {@link EventStream.readIndex}
+ * and `query.index` read with an explicit `partition`.
+ */
+export type PartitionedIndexesOf<TIndexes> = {
+  readonly [K in keyof TIndexes & string]: TIndexes[K] extends {
+    readonly partition: (...args: ReadonlyArray<any>) => unknown
+  }
+    ? K
+    : never
+}[keyof TIndexes & string]
+
 /** @internal The members a stream index entry may declare. */
 type StreamIndexConfigKey =
   | keyof LocalStreamIndexConfig<unknown>
@@ -796,8 +929,13 @@ type StreamIndexConfigKey =
  * `TIndexes` from the entries turns off TypeScript's own excess-property check,
  * which would otherwise catch it.
  */
-export type StreamIndexesConfig<TIndexes, TEvent> = {
-  readonly [K in keyof TIndexes]: StreamIndexConfig<TEvent> & {
+export type StreamIndexesConfig<
+  TIndexes,
+  TEvent,
+  TStreamId = StreamIndexStreamId,
+  TState = unknown,
+> = {
+  readonly [K in keyof TIndexes]: StreamIndexConfig<TEvent, TStreamId, TState> & {
     readonly [P in Exclude<keyof TIndexes[K], StreamIndexConfigKey>]: never
   }
 }
@@ -816,6 +954,9 @@ export type StreamIndexesConfig<TIndexes, TEvent> = {
  * - `consistentRead` — strongly consistent read. DynamoDB rejects it on a
  *   GSI-backed index, which it reads only eventually consistently: the read
  *   fails with a `ValidationError` naming the index.
+ *
+ * An index that derives its partition (#149) also takes `partition` — see
+ * {@link ReadIndexArgs}.
  */
 export type ReadIndexOptions = {
   readonly reverse?: boolean | undefined
@@ -825,6 +966,40 @@ export type ReadIndexOptions = {
   | { readonly beginsWith?: string | undefined; readonly between?: undefined }
   | { readonly between?: readonly [string, string] | undefined; readonly beginsWith?: undefined }
 )
+
+/**
+ * The options argument of {@link EventStream.readIndex} for index `N`. An
+ * index that derives its partition (`partition`, #149) is read one partition
+ * at a time, so `partition` — the value to read, as the index's `partition`
+ * function returns it — is required, and the read returns the events of the
+ * given stream in it. Any other index is scoped to the stream already: a
+ * `partition` passed for it fails the read with `ValidationError` (it stays
+ * in the type so that a stream whose indexes derive their partition remains
+ * assignable to one whose indexes do not, as every stream is to
+ * `EventStream<E, F, M, S>`).
+ */
+export type ReadIndexArgs<N extends string, TPartitionedIndexName extends string> = [
+  TPartitionedIndexName,
+] extends [never]
+  ? // No index derives its partition: resolved even while `N` is a type
+    // parameter, so a generic wrapper over a stream's indexes type-checks.
+    [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+  : [N] extends [TPartitionedIndexName]
+    ? [options: ReadIndexOptions & { readonly partition: string }]
+    : [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+
+/**
+ * The options argument of `query.index` for index `N` — `partition`, required
+ * for an index that derives its partition, as for {@link ReadIndexArgs}; on
+ * any other index, one passed throws `[EDD-9080]`.
+ */
+export type IndexQueryArgs<N extends string, TPartitionedIndexName extends string> = [
+  TPartitionedIndexName,
+] extends [never]
+  ? [options?: { readonly partition?: string | undefined } | undefined]
+  : [N] extends [TPartitionedIndexName]
+    ? [options: { readonly partition: string }]
+    : [options?: { readonly partition?: string | undefined } | undefined]
 
 /**
  * @internal Why a {@link ReadIndexOptions} key condition cannot be sent, or
@@ -857,12 +1032,28 @@ const invalidIndexKeyCondition = (options: ReadIndexOptions | undefined): string
 }
 
 /**
+ * @internal The partition an append's events have in an index that derives
+ * one (#149), and the first event that has it — what the other events and
+ * the inline snapshot are checked against.
+ */
+interface IndexPartitionOrigin {
+  readonly partition: string
+  readonly subject: string
+}
+
+/**
  * @internal A validated stream index: its logical name, settings and key
  * derivation.
  */
 interface ResolvedStreamIndex extends StreamIndexSettings {
+  readonly partition: "stream" | "derived"
+  readonly snapshot: boolean
   readonly name: string
   readonly key: StreamIndexKey<unknown>
+  /** The derived partition (#149); `undefined` for a stream-scoped index. */
+  readonly derivePartition: StreamIndexPartition<unknown> | undefined
+  /** The snapshot's entry (#149); `undefined` when snapshots are not indexed. */
+  readonly snapshotEntry: StreamIndexSnapshotEntry<unknown> | undefined
 }
 
 /**
@@ -924,16 +1115,28 @@ const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
   "pk",
   "sk",
   "key",
+  "partition",
+  "snapshot",
   "projection",
 ] satisfies ReadonlyArray<StreamIndexConfigKey>
+
+/**
+ * @internal `pk = <streamPk>`: keeps one stream id's items in a partition of a
+ * stream index several streams (or stream ids) share (#149). The table's `pk`
+ * is projected into every index, whatever its projection.
+ */
+const streamPkFilter = (streamPk: string): Expr =>
+  eq(createPathBuilder<{ readonly pk: string }>().pk, streamPk)
 
 /**
  * @internal Validate `makeStream({ indexes })` at definition time.
  *
  * @throws `[EDD-9063]` for a malformed entry (unknown `type`, a `gsi` without
- *   `pk`, an `lsi` with `pk`, an empty name, a `key` that is not a function,
- *   an unknown `projection`, a member the entry type does not declare — a
- *   misspelled `projection` would otherwise silently mean `"all"`).
+ *   `pk`, an `lsi` with `pk`, `partition` or `snapshot`, an empty name, a
+ *   `key` / `partition` / `snapshot` that is not a function, a `snapshot`
+ *   without `partition` or on a stream without a snapshot config, an unknown
+ *   `projection`, a member the entry type does not declare — a misspelled
+ *   `projection` would otherwise silently mean `"all"`).
  * @throws `[EDD-9064]` for an index attribute that collides with a
  *   stream-owned attribute.
  * @throws `[EDD-9065]` for two indexes sharing a physical index name or an
@@ -942,6 +1145,7 @@ const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
 const resolveStreamIndexes = (
   streamName: string,
   indexes: Readonly<Record<string, unknown>> | undefined,
+  hasSnapshotConfig: boolean,
 ): ReadonlyArray<ResolvedStreamIndex> => {
   if (indexes === undefined) return []
   const fail = (code: string, message: string): never => {
@@ -992,8 +1196,46 @@ const resolveStreamIndexes = (
     if (typeof entry.key !== "function") {
       fail(
         "EDD-9063",
-        `index "${name}": key must be a function (event, version) => string | undefined.`,
+        `index "${name}": key must be a function (event, version, streamId) => string | undefined.`,
       )
+    }
+    if (entry.partition !== undefined) {
+      if (type !== "gsi") {
+        fail(
+          "EDD-9063",
+          `index "${name}": an "lsi" index is partitioned by the stream; only a "gsi" index ` +
+            'derives its partition. Remove partition, or declare type: "gsi".',
+        )
+      }
+      if (typeof entry.partition !== "function") {
+        fail(
+          "EDD-9063",
+          `index "${name}": partition must be a function (event, version, streamId) => string | undefined.`,
+        )
+      }
+    }
+    if (entry.snapshot !== undefined) {
+      if (typeof entry.snapshot !== "function") {
+        fail(
+          "EDD-9063",
+          `index "${name}": snapshot must be a function (state, asOfVersion, streamId) => ` +
+            "{ partition, key } | undefined.",
+        )
+      }
+      if (entry.partition === undefined) {
+        fail(
+          "EDD-9063",
+          `index "${name}": snapshot requires partition — only a "gsi" index with a derived ` +
+            "partition indexes the stream's snapshot.",
+        )
+      }
+      if (!hasSnapshotConfig) {
+        fail(
+          "EDD-9063",
+          `index "${name}": snapshot requires the stream's snapshot config ` +
+            "(makeStream({ snapshot: { schema } })); the stream writes no snapshot to index.",
+        )
+      }
     }
     const projection = (entry.projection ?? "all") as StreamIndexProjection
     if (projection !== "all" && projection !== "withoutMetadata" && projection !== "keys") {
@@ -1042,7 +1284,11 @@ const resolveStreamIndexes = (
       pk,
       sk,
       projection,
+      partition: entry.partition === undefined ? "stream" : "derived",
+      snapshot: entry.snapshot !== undefined,
       key: entry.key as StreamIndexKey<unknown>,
+      derivePartition: entry.partition as StreamIndexPartition<unknown> | undefined,
+      snapshotEntry: entry.snapshot as StreamIndexSnapshotEntry<unknown> | undefined,
     })
   }
   return resolved
@@ -1128,6 +1374,10 @@ const resolveStreamStorage = (
 type StreamIdInput<T extends ReadonlyArray<string>> = {
   readonly [K in T[number]]: string
 }
+
+/** @internal The state type of a `makeStream({ snapshot })` config; `never` without one. */
+type SnapshotStateOf<TSnapshot> =
+  TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never
 
 // ---------------------------------------------------------------------------
 // EventStreamTypeId
@@ -1272,6 +1522,8 @@ const eventTimestampsProblem = (
  * `query.index` only accept a declared name. `TIndexProjections` is each
  * index's {@link StreamIndexProjection} by name, so an event read through a
  * `"withoutMetadata"` index has `metadata: undefined`.
+ * `TPartitionedIndexName` names the indexes that derive their partition
+ * (#149), which are read with an explicit `partition`.
  */
 export interface EventStream<
   TEvent,
@@ -1282,6 +1534,7 @@ export interface EventStream<
   TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
     readonly [K in TIndexName]: "all"
   },
+  TPartitionedIndexName extends string = never,
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -1444,11 +1697,17 @@ export interface EventStream<
    * `metadata: undefined`, as the type says); for `"keys"`, one query with
    * `Select: ALL_ATTRIBUTES` on an LSI, or the query followed by `BatchGetItem`
    * (unprocessed keys retried, index order kept) on a GSI.
+   *
+   * An index that derives its partition (`partition`, #149) is read one
+   * partition at a time: pass the partition as `options.partition` (required
+   * by the types — see {@link ReadIndexArgs}). The read keeps the events of
+   * `streamId` in it — not the other streams sharing the partition, nor any
+   * snapshot — by filtering on the table's `pk`, which every index projects.
    */
   readIndex<N extends TIndexName>(
     name: N,
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadIndexOptions | undefined,
+    ...options: ReadIndexArgs<N, TPartitionedIndexName>
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
@@ -1555,10 +1814,15 @@ export interface EventStream<
      * counts index entries and fetches nothing. On a `"keys"` or
      * `"withoutMetadata"` index, a `Query.filter` on an attribute the index
      * does not project is refused by DynamoDB — use `Query.filterBy`.
+     *
+     * An index that derives its partition (#149) takes the partition to read
+     * as `options.partition` (see {@link IndexQueryArgs}), and the query keeps
+     * `streamId`'s events in it, as {@link EventStream.readIndex} does.
      */
     index<N extends TIndexName>(
       name: N,
       streamId: StreamIdInput<TStreamIdFields>,
+      ...options: IndexQueryArgs<N, TPartitionedIndexName>
     ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 }
@@ -1592,6 +1856,8 @@ interface AppendTransaction {
   readonly additional: BuiltTransactWriteItems
   /** `-1` when the transaction carries no sentinel item. */
   readonly sentinelIndex: number
+  /** `-1` when the transaction carries no inline snapshot. */
+  readonly snapshotIndex: number
   /** The version the events are appended after. */
   readonly expectedVersion: number
 }
@@ -1671,11 +1937,20 @@ interface AppendParts {
  * `indexes` declares sub-streams ordered by a key derived from each event
  * (#140), on a local (default) or global secondary index. `append` writes each
  * event's derived key (and, for a GSI, the stream's partition key) on the
- * event item; snapshots and idempotency sentinels never carry them, so they
- * are never in an index. Read with {@link EventStream.readIndex} or
- * `query.index`, and create the indexes with {@link indexDefinitions}. Each
- * index's `projection` (default `"all"`) sets what it copies from each event
- * and how it is read — see {@link StreamIndexProjection}.
+ * event item. Idempotency sentinels never carry them; snapshots carry an
+ * entry only in a GSI that derives its partition and declares `snapshot`.
+ * Read with {@link EventStream.readIndex} or `query.index`, and create the
+ * indexes with {@link indexDefinitions}. Each index's `projection` (default
+ * `"all"`) sets what it copies from each event and how it is read — see
+ * {@link StreamIndexProjection}.
+ *
+ * A GSI's `partition` (#149) derives the partition from the stream id and the
+ * event instead, stored raw, so several streams declaring the same GSI write
+ * one partition of it — an order's line, payment and shipment streams under
+ * `ORDER#<orderId>`, read by one query — and its `snapshot` puts each stream's
+ * snapshot item in that partition too, in the same `Put` (so an inline
+ * snapshot enters the index in the append's own transaction). See
+ * {@link GlobalStreamIndexConfig}.
  *
  * Index attributes are written only at append time and events are never
  * rewritten. Declaring an index on a stream that already holds events, or
@@ -1684,6 +1959,36 @@ interface AppendParts {
  * indexed — without an error. The library does not backfill; whether and how
  * to re-index existing events (for example, an `UpdateItem` per event setting
  * the derived attributes) is the application's decision.
+ *
+ * @example
+ * ```typescript
+ * // Lines and payments of an order share `gsi1` under `ORDER#<orderId>`.
+ * const OrderLines = EventStore.makeStream({
+ *   table: EventsTable,
+ *   streamName: "OrderLine",
+ *   events: [LineAdded, LineRemoved],
+ *   streamId: { composite: ["orderId", "lineId"] },
+ *   snapshot: { schema: LineState, mode: "inline" },
+ *   indexes: {
+ *     byOrder: {
+ *       type: "gsi",
+ *       index: "gsi1",
+ *       pk: "gsi1pk",
+ *       sk: "gsi1sk",
+ *       partition: (_event, _version, streamId) => `ORDER#${streamId.orderId}`,
+ *       key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${pad(version)}`,
+ *       snapshot: (_state, _asOfVersion, streamId) => ({
+ *         partition: `ORDER#${streamId.orderId}`,
+ *         key: `LINE#${streamId.lineId}#STATE`,
+ *       }),
+ *     },
+ *   },
+ * })
+ *
+ * const lineEvents = yield* OrderLines.readIndex("byOrder", { orderId, lineId }, {
+ *   partition: `ORDER#${orderId}`,
+ * })
+ * ```
  *
  * @example
  * ```typescript
@@ -1711,10 +2016,12 @@ interface AppendParts {
  * @throws `[EDD-9062]` when `snapshot.mode` is neither `"after-append"` nor
  *   `"inline"`.
  * @throws `[EDD-9063]` for a malformed index: a `type` other than `"lsi"` /
- *   `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk`
- *   / `pk`, a `key` that is not a function, a `projection` other than
- *   `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does
- *   not declare (such as a misspelled `projection`, also a type error).
+ *   `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, `partition` or
+ *   `snapshot`, an empty `index` / `sk` / `pk`, a `key` / `partition` /
+ *   `snapshot` that is not a function, a `snapshot` without `partition` or on
+ *   a stream without a `snapshot` config, a `projection` other than `"all"` /
+ *   `"withoutMetadata"` / `"keys"`, or a member an index entry does not
+ *   declare (such as a misspelled `projection`, also a type error).
  * @throws `[EDD-9064]` when an index attribute is one the stream writes itself
  *   (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
  *   `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, or the
@@ -1744,7 +2051,11 @@ export const makeStream = <
   TMetadata extends Schema.Top | undefined = undefined,
   TSnapshot extends SnapshotConfig | undefined = undefined,
   const TIndexes extends {
-    readonly [K in keyof TIndexes]: StreamIndexConfig<Schema.Schema.Type<TEvents[number]>>
+    readonly [K in keyof TIndexes]: StreamIndexConfig<
+      Schema.Schema.Type<TEvents[number]>,
+      StreamIdInput<TStreamId["composite"]>,
+      SnapshotStateOf<TSnapshot>
+    >
   } = {},
 >(config: {
   readonly table: TTable
@@ -1754,16 +2065,23 @@ export const makeStream = <
   readonly metadata?: TMetadata
   readonly snapshot?: TSnapshot
   readonly casing?: DynamoSchema.Casing | undefined
-  readonly indexes?: TIndexes & StreamIndexesConfig<TIndexes, Schema.Schema.Type<TEvents[number]>>
+  readonly indexes?: TIndexes &
+    StreamIndexesConfig<
+      TIndexes,
+      Schema.Schema.Type<TEvents[number]>,
+      StreamIdInput<TStreamId["composite"]>,
+      SnapshotStateOf<TSnapshot>
+    >
   /** How event `data` is stored — see {@link StreamStorageConfig}. */
   readonly storedAs?: StreamStorageConfig | undefined
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
   TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
-  TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
+  SnapshotStateOf<TSnapshot>,
   keyof TIndexes & string,
-  IndexProjectionsOf<TIndexes>
+  IndexProjectionsOf<TIndexes>,
+  PartitionedIndexesOf<TIndexes>
 > => {
   type TEvent = Schema.Schema.Type<TEvents[number]>
   type TStreamIdFields = TStreamId["composite"]
@@ -1874,6 +2192,7 @@ export const makeStream = <
   const streamIndexes = resolveStreamIndexes(
     config.streamName,
     config.indexes as Readonly<Record<string, unknown>> | undefined,
+    snapshot !== undefined,
   )
   const indexSettings: Record<string, StreamIndexSettings> = {}
   for (const idx of streamIndexes) {
@@ -1883,8 +2202,12 @@ export const makeStream = <
       pk: idx.pk,
       sk: idx.sk,
       projection: idx.projection,
+      partition: idx.partition,
+      snapshot: idx.snapshot,
     }
   }
+  /** The indexes that hold the stream's snapshot (#149). */
+  const snapshotIndexes = streamIndexes.filter((idx) => idx.snapshotEntry !== undefined)
   /** Every attribute the indexes write on an event item. */
   const indexAttributes = streamIndexes.flatMap((idx) =>
     idx.type === "gsi" ? [idx.pk, idx.sk] : [idx.sk],
@@ -2076,43 +2399,87 @@ export const makeStream = <
   // ---------------------------------------------------------------------------
 
   /**
-   * An event's key in a stream index (#140): a string, or `undefined` to
-   * leave the event out. Another type, or a `key` that throws, is a
-   * `ValidationError`, raised before anything is written. DynamoDB's own
-   * rules on a key — not empty, at most 1024 bytes for a sort key — are not
-   * pre-checked: DynamoDB rejects the append and the rejection is diagnosed,
-   * naming the index and event (see `sendAppendTransaction`).
+   * One value an index function derives for an item (#140, #149): an event's
+   * `key` or `partition`, a string or `undefined` to leave the item out.
+   * Another type, or a function that throws, is a `ValidationError`, raised
+   * before anything is written. DynamoDB's own rules on a key — not empty, at
+   * most 1024 bytes for a sort key and 2048 for a partition key — are not
+   * pre-checked: DynamoDB rejects the write and the rejection is diagnosed,
+   * naming the index and the item (see `sendAppendTransaction`).
    */
-  const deriveIndexKey = (
+  const deriveIndexValue = (
     idx: ResolvedStreamIndex,
-    event: unknown,
-    version: number,
+    what: "key" | "partition",
+    subject: string,
+    derive: () => unknown,
   ): Effect.Effect<string | undefined, ValidationError> =>
     Effect.try({
-      try: () => idx.key(event, version),
+      try: derive,
       catch: (cause) =>
         new ValidationError({ entityType, operation: "EventStore.append.indexes", cause }),
     }).pipe(
       Effect.flatMap((derived) => {
         if (derived === undefined) return Effect.succeed(undefined)
-        const refuse = (problem: string) =>
-          Effect.fail(
-            new ValidationError({
-              entityType,
-              operation: "EventStore.append.indexes",
-              cause:
-                `The key of index "${idx.name}" for the event at version ${version} ${problem}. ` +
-                "Nothing was written.",
-            }),
-          )
         // A string, or the event is not indexed: what the stream's own key
         // contract means, which DynamoDB cannot see (a number would be sent
         // as `N`). An empty string is DynamoDB's to reject, and is diagnosed
         // from its rejection, naming the index and the event (#144).
         if (typeof derived !== "string") {
-          return refuse(`must be a string or undefined; received ${String(derived)}`)
+          return Effect.fail(
+            new ValidationError({
+              entityType,
+              operation: "EventStore.append.indexes",
+              cause:
+                `The ${what} of index "${idx.name}" for ${subject} must be a string or ` +
+                `undefined; received ${String(derived)}. Nothing was written.`,
+            }),
+          )
         }
         return Effect.succeed(derived)
+      }),
+    )
+
+  /**
+   * The snapshot's entry in a stream index (#149): its partition and key, or
+   * `undefined` to leave it out. Anything but an object of two strings, or an
+   * entry function that throws, is a `ValidationError` before anything is
+   * written; DynamoDB's rules on the values are its own, as for events.
+   */
+  const deriveSnapshotEntry = (
+    idx: ResolvedStreamIndex,
+    entry: StreamIndexSnapshotEntry<unknown>,
+    state: unknown,
+    streamId: StreamIndexStreamId,
+    asOfVersion: number,
+    operation: string,
+  ): Effect.Effect<
+    { readonly partition: string; readonly key: string } | undefined,
+    ValidationError
+  > =>
+    Effect.try({
+      try: () => entry(state, asOfVersion, streamId),
+      catch: (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
+    }).pipe(
+      Effect.flatMap((derived: unknown) => {
+        if (derived === undefined) return Effect.succeed(undefined)
+        const { partition, key } =
+          typeof derived === "object" && derived !== null
+            ? (derived as { readonly partition?: unknown; readonly key?: unknown })
+            : { partition: undefined, key: undefined }
+        if (typeof partition !== "string" || typeof key !== "string") {
+          return Effect.fail(
+            new ValidationError({
+              entityType: snapshotEntityType,
+              operation,
+              cause:
+                `The snapshot entry of index "${idx.name}" at version ${asOfVersion} must be ` +
+                "{ partition: string, key: string } or undefined; received " +
+                `${derived !== null && typeof derived === "object" ? JSON.stringify(derived) : String(derived)}. ` +
+                "Nothing was written.",
+            }),
+          )
+        }
+        return Effect.succeed({ partition, key })
       }),
     )
 
@@ -2263,44 +2630,34 @@ export const makeStream = <
 
   /**
    * A diagnosed rejection of an append (#144) other than its item count. An
-   * over-long (or empty) stream-index sort key OF AN EVENT — the value the
-   * index's `key` function returned — is named by its index and event, as
-   * the `indexes` option reports its other key problems. Only the event puts
-   * carry stream-index keys: an additional item writing the same physical
-   * attribute (single-table designs share `gsi1sk` and the like) is its own
-   * entity's key, and is named as any other item.
+   * over-long (or empty) stream-index key OF AN EVENT OR THE INLINE SNAPSHOT
+   * — a value an index function returned — is named by its index and item,
+   * as the `indexes` option reports its other key problems (see
+   * {@link indexKeyError}). Only the stream's own items carry stream-index
+   * keys: an additional item writing the same physical attribute
+   * (single-table designs share `gsi1sk` and the like) is its own entity's
+   * key, and is named as any other item.
    */
   const appendLimitError = (
     diagnosis: Diagnosis,
     original: unknown,
     tx: AppendTransaction,
   ): ValidationError => {
-    if (
-      (diagnosis._tag === "KeyTooLong" && diagnosis.kind === "sort") ||
-      diagnosis._tag === "EmptyKey"
-    ) {
+    if (diagnosis._tag === "KeyTooLong" || diagnosis._tag === "EmptyKey") {
       const position = tx.targets().indexOf(diagnosis.target)
       const isEvent = position >= tx.guardCount && position < tx.guardCount + tx.eventCount
-      const idx = isEvent
-        ? streamIndexes.find((candidate) => candidate.sk === diagnosis.attribute)
-        : undefined
-      if (idx !== undefined) {
-        return new ValidationError({
-          entityType,
-          operation: "EventStore.append.indexes",
-          cause: withCause(
-            `The key of index "${idx.name}" for ${diagnosis.target.source} ` +
-              (diagnosis._tag === "KeyTooLong"
-                ? `is ${diagnosis.bytes} bytes, longer than DynamoDB's 1024-byte limit for a ` +
-                  "sort key."
-                : "is an empty string, which DynamoDB does not accept as a key value; the " +
-                  "key function must return a non-empty string, or undefined to leave the " +
-                  "event out of the index.") +
-              " DynamoDB rejected the append. Nothing was written.",
-            original,
-          ),
-        })
-      }
+      const isSnapshot = position >= 0 && position === tx.snapshotIndex
+      const named =
+        isEvent || isSnapshot
+          ? indexKeyError(
+              diagnosis,
+              original,
+              isSnapshot,
+              "the append",
+              "EventStore.append.indexes",
+            )
+          : undefined
+      if (named !== undefined) return named
     }
     return diagnosedValidationError(diagnosis, original, {
       operation: "EventStore.append",
@@ -2309,18 +2666,73 @@ export const makeStream = <
   }
 
   /**
+   * An over-long or empty key value in a stream-index attribute of an event
+   * or snapshot item, named by its index and item, or `undefined` when the
+   * attribute is not one the item's indexes derive. An event carries each
+   * index's `key` (and a derived `partition`); a snapshot, each snapshot
+   * index's entry. A stream-scoped GSI's partition is the stream's own key,
+   * which no function returned: it is named as any key.
+   */
+  const indexKeyError = (
+    diagnosis: Extract<Diagnosis, { readonly _tag: "KeyTooLong" | "EmptyKey" }>,
+    original: unknown,
+    isSnapshot: boolean,
+    request: string,
+    operation: string,
+  ): ValidationError | undefined => {
+    const candidates = isSnapshot ? snapshotIndexes : streamIndexes
+    const kind =
+      diagnosis._tag === "KeyTooLong"
+        ? diagnosis.kind
+        : candidates.some((idx) => idx.sk === diagnosis.attribute)
+          ? "sort"
+          : "partition"
+    const idx = candidates.find((candidate) =>
+      kind === "sort"
+        ? candidate.sk === diagnosis.attribute
+        : candidate.partition === "derived" && candidate.pk === diagnosis.attribute,
+    )
+    if (idx === undefined) return undefined
+    const value = isSnapshot
+      ? `The snapshot entry's ${kind === "sort" ? "key" : "partition"}`
+      : `The ${kind === "sort" ? "key" : "partition"}`
+    const leaveOut = isSnapshot
+      ? "the snapshot function must return non-empty strings, or undefined to leave the " +
+        "snapshot out of the index."
+      : `the ${kind === "sort" ? "key" : "partition"} function must return a non-empty ` +
+        "string, or undefined to leave the event out of the index."
+    return new ValidationError({
+      entityType: isSnapshot ? snapshotEntityType : entityType,
+      operation,
+      cause: withCause(
+        `${value} of index "${idx.name}" for ${diagnosis.target.source} ` +
+          (diagnosis._tag === "KeyTooLong"
+            ? `is ${diagnosis.bytes} bytes, longer than DynamoDB's ` +
+              `${kind === "sort" ? "1024-byte limit for a sort" : "2048-byte limit for a partition"} key.`
+            : `is an empty string, which DynamoDB does not accept as a key value; ${leaveOut}`) +
+          ` DynamoDB rejected ${request}. Nothing was written.`,
+        original,
+      ),
+    })
+  }
+
+  /**
    * The snapshot item for `state` at `asOfVersion`: the state encoded through
    * the state schema, then packed per `snapshot.storedAs` (#147) — so every
-   * size measured afterwards is the stored size. Shared by `writeSnapshot`,
-   * the inline snapshot of `append`, and `measureSnapshot` / `measureAppend`.
+   * size measured afterwards is stored bytes — with its entry in each index
+   * that holds snapshots (#149). Shared by `writeSnapshot`, the inline
+   * snapshot of `append`, and `measureSnapshot` / `measureAppend`.
+   *
+   * `eventPartitions` — the partition the append's events have in each
+   * index, by index name — is what the inline snapshot's entry must match.
    */
   const buildSnapshotItem = (
-    pk: string,
-    streamIdStr: string,
+    streamId: Record<string, unknown>,
     state: unknown,
     asOfVersion: number,
     now: string,
     operation: string,
+    eventPartitions?: ReadonlyMap<string, IndexPartitionOrigin> | undefined,
   ): Effect.Effect<Record<string, AttributeValue>, ValidationError> =>
     Effect.gen(function* () {
       const encoded = yield* encodeSnapshotState(state, operation)
@@ -2332,15 +2744,43 @@ export const makeStream = <
               attribute: "state",
               operation: `${operation}.packed`,
             })
-      return toAttributeMap({
-        pk,
+      const item: Record<string, unknown> = {
+        pk: composeStreamPk(streamId),
         sk: snapshotSk,
         __edd_e__: snapshotEntityType,
-        streamId: streamIdStr,
+        streamId: composeStreamIdString(streamId),
         asOfVersion,
         state: stored,
         timestamp: now,
-      })
+      }
+      // The snapshot's index entries (#149), stored raw on the item itself,
+      // so they are written by the same `Put` and count towards its size.
+      for (const idx of snapshotIndexes) {
+        const entry = yield* deriveSnapshotEntry(
+          idx,
+          idx.snapshotEntry as StreamIndexSnapshotEntry<unknown>,
+          state,
+          streamId as StreamIndexStreamId,
+          asOfVersion,
+          operation,
+        )
+        if (entry === undefined) continue
+        const events = eventPartitions?.get(idx.name)
+        if (events !== undefined && events.partition !== entry.partition) {
+          return yield* new ValidationError({
+            entityType: snapshotEntityType,
+            operation,
+            cause:
+              `The inline snapshot's partition in index "${idx.name}" is ` +
+              `${JSON.stringify(entry.partition)}, but ${events.subject} has ` +
+              `${JSON.stringify(events.partition)}: an append's events and its inline snapshot ` +
+              "must be in the same partition of an index. Nothing was written.",
+          })
+        }
+        item[idx.pk] = entry.partition
+        item[idx.sk] = entry.key
+      }
+      return toAttributeMap(item)
     })
 
   /**
@@ -2484,6 +2924,11 @@ export const makeStream = <
         encodedMetadata = options.metadata as Record<string, unknown>
       }
 
+      // The partition the events have in each index that derives one (#149),
+      // by index name, with the first event that has it: the events and the
+      // inline snapshot of one append must agree.
+      const eventPartitions = new Map<string, IndexPartitionOrigin>()
+
       // Build the event puts — one Put per event, each with attribute_not_exists(pk).
       // Events are encoded to wire form through their schema (codec symmetry
       // with the read path, which decodes through the same schema), so this is
@@ -2562,13 +3007,41 @@ export const makeStream = <
             }
 
             // Stream indexes (#140): the derived key, stored raw, and for a
-            // GSI the stream's partition key. The attributes are part of the
-            // event item itself, so they count towards the size checks.
+            // GSI the stream's partition key — or the derived partition, raw
+            // too (#149). The attributes are part of the event item itself,
+            // so they count towards the size checks. Both functions run for
+            // every event, so each one's contract is checked on every event.
+            const subject = `the event at version ${version}`
             for (const idx of streamIndexes) {
-              const derived = yield* deriveIndexKey(idx, event, version)
-              if (derived === undefined) continue
+              const derived = yield* deriveIndexValue(idx, "key", subject, () =>
+                idx.key(event, version, streamId),
+              )
+              let partition: string | undefined = pk
+              if (idx.derivePartition !== undefined) {
+                const derivePartition = idx.derivePartition
+                partition = yield* deriveIndexValue(idx, "partition", subject, () =>
+                  derivePartition(event, version, streamId),
+                )
+                if (partition !== undefined) {
+                  const first = eventPartitions.get(idx.name)
+                  if (first === undefined) {
+                    eventPartitions.set(idx.name, { partition, subject })
+                  } else if (first.partition !== partition) {
+                    return yield* new ValidationError({
+                      entityType,
+                      operation: "EventStore.append.indexes",
+                      cause:
+                        `The partition of index "${idx.name}" for ${subject} is ` +
+                        `${JSON.stringify(partition)}, but ${first.subject} has ` +
+                        `${JSON.stringify(first.partition)}: every event of one append must be ` +
+                        "in the same partition of an index. Nothing was written.",
+                    })
+                  }
+                }
+              }
+              if (derived === undefined || partition === undefined) continue
               item[idx.sk] = derived
-              if (idx.type === "gsi") item[idx.pk] = pk
+              if (idx.type === "gsi") item[idx.pk] = partition
             }
 
             return {
@@ -2623,12 +3096,12 @@ export const makeStream = <
           Put: {
             TableName: tableName,
             Item: yield* buildSnapshotItem(
-              pk,
-              streamIdStr,
+              streamId as Record<string, unknown>,
               snapshotState,
               expectedVersion + events.length,
               now,
               "EventStore.append.snapshot",
+              eventPartitions,
             ),
           },
         }
@@ -2720,6 +3193,7 @@ export const makeStream = <
         if (sentinelPut !== undefined) {
           pushStreamItem(sentinelPut, entityType, "the idempotency sentinel")
         }
+        const snapshotIndex = snapshotPut === undefined ? -1 : items.length
         if (snapshotPut !== undefined) {
           pushStreamItem(snapshotPut, snapshotEntityType, "the inline snapshot")
         }
@@ -2732,6 +3206,7 @@ export const makeStream = <
           eventCount: eventItems.length,
           additional,
           sentinelIndex,
+          snapshotIndex,
           expectedVersion,
         }
       }
@@ -2824,8 +3299,7 @@ export const makeStream = <
       if (snapshot === undefined) return yield* snapshotUnavailable("measureSnapshot")
       const now = DateTime.formatIso(yield* DateTime.now)
       const item = yield* buildSnapshotItem(
-        composeStreamPk(streamId as Record<string, unknown>),
-        composeStreamIdString(streamId as Record<string, unknown>),
+        streamId as Record<string, unknown>,
         state,
         asOfVersion,
         now,
@@ -2991,8 +3465,7 @@ export const makeStream = <
       // Packed per `snapshot.storedAs` (#147): the diagnosis below measures
       // the stored bytes.
       const item = yield* buildSnapshotItem(
-        composeStreamPk(streamId as Record<string, unknown>),
-        composeStreamIdString(streamId as Record<string, unknown>),
+        streamId as Record<string, unknown>,
         state,
         asOfVersion,
         now,
@@ -3027,8 +3500,16 @@ export const makeStream = <
                 "the snapshot",
               ),
           }),
-          keys: () => ({ partition: ["pk"], sort: ["sk"] }),
+          keys: () => ({
+            partition: ["pk", ...snapshotIndexes.map((idx) => idx.pk)],
+            sort: ["sk", ...snapshotIndexes.map((idx) => idx.sk)],
+          }),
+          // A snapshot index entry's empty or over-long value (#149) is named
+          // by its index, as an inline snapshot's is.
           rewrite: (diagnosis, original) =>
+            (diagnosis._tag === "KeyTooLong" || diagnosis._tag === "EmptyKey"
+              ? indexKeyError(diagnosis, original, true, "the snapshot", "EventStore.writeSnapshot")
+              : undefined) ??
             diagnosedValidationError(diagnosis, original, {
               operation: "EventStore.writeSnapshot",
               entityType: snapshotEntityType,
@@ -3298,17 +3779,47 @@ export const makeStream = <
   // ---------------------------------------------------------------------------
 
   /**
-   * A query of one stream index, scoped to the stream's partition: the LSI
-   * shares the table's `pk`; a GSI's `pk` attribute carries the same value.
-   * No sort-key condition — the index holds only this stream's indexed events
-   * under that key; `Query.where` narrows the derived-key range.
+   * @internal Why `partition` cannot be passed for index `name`, or
+   * `undefined` when it can: required (a string) for an index that derives
+   * its partition (#149), refused for any other. Unreachable through the
+   * types. An unknown name is left to {@link buildIndexQuery}.
+   */
+  const invalidIndexPartition = (name: string, partition: unknown): string | undefined => {
+    const idx = streamIndexes.find((candidate) => candidate.name === name)
+    if (idx === undefined) return undefined
+    if (idx.partition === "derived") {
+      return typeof partition === "string"
+        ? undefined
+        : `Index "${name}" derives its partition: pass the partition to read as ` +
+            `options.partition (a string); received ${String(partition)}.`
+    }
+    return partition === undefined
+      ? undefined
+      : `Index "${name}" is scoped to the stream; it takes no partition.`
+  }
+
+  /**
+   * A query of one stream index. A stream-scoped index is queried in the
+   * stream's partition: the LSI shares the table's `pk`; a GSI's `pk`
+   * attribute carries the same value. No sort-key condition — the index holds
+   * only this stream's indexed events under that key; `Query.where` narrows
+   * the derived-key range.
+   *
+   * An index that derives its partition (#149) is queried in `partition`,
+   * which other streams (and this one's other stream ids, and snapshots) may
+   * share: the `__edd_e__` filter keeps this stream's events, and a filter on
+   * the table's `pk` — projected by every index — keeps `streamId`'s.
    *
    * @throws `[EDD-9066]` for a name the stream does not declare (unreachable
    *   through the types).
+   * @throws `[EDD-9080]` for a missing `partition` on an index that derives
+   *   it, or one passed to an index that does not (unreachable through the
+   *   types).
    */
   const buildIndexQuery = (
     name: string,
     streamId: StreamIdInput<TStreamIdFields>,
+    partition: string | undefined,
   ): Query.Query<StreamEvent<TEvent>> => {
     const idx = streamIndexes.find((candidate) => candidate.name === name)
     if (idx === undefined) {
@@ -3319,11 +3830,16 @@ export const makeStream = <
             : `Declared: ${streamIndexes.map((candidate) => `"${candidate.name}"`).join(", ")}.`),
       )
     }
-    return Query.make<StreamEvent<TEvent>>({
+    const partitionProblem = invalidIndexPartition(name, partition)
+    if (partitionProblem !== undefined) {
+      throw new Error(`[EDD-9080] EventStream "${config.streamName}": ${partitionProblem}`)
+    }
+    const streamPk = composeStreamPk(streamId as Record<string, unknown>)
+    const query = Query.make<StreamEvent<TEvent>>({
       tableName: "",
       indexName: idx.index,
       pkField: idx.pk,
-      pkValue: composeStreamPk(streamId as Record<string, unknown>),
+      pkValue: idx.partition === "derived" ? (partition as string) : streamPk,
       skField: idx.sk,
       entityTypes: [entityType],
       decoder: indexDecoder(idx),
@@ -3352,6 +3868,7 @@ export const makeStream = <
           }
         : {}),
     })
+    return idx.partition === "derived" ? Query.filterExpr(query, streamPkFilter(streamPk)) : query
   }
 
   /**
@@ -3398,7 +3915,7 @@ export const makeStream = <
   const readIndex = (
     name: string,
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadIndexOptions | undefined,
+    options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
     DynamoClientError | ValidationError,
@@ -3417,7 +3934,11 @@ export const makeStream = <
           `limit must be a positive integer; received ${String(limit)}. Nothing was sent.`,
         )
       }
-      let query = buildIndexQuery(name, streamId)
+      const partitionProblem = invalidIndexPartition(name, options?.partition)
+      if (partitionProblem !== undefined) {
+        return yield* refuse(`${partitionProblem} Nothing was sent.`)
+      }
+      let query = buildIndexQuery(name, streamId, options?.partition)
       if (options?.beginsWith !== undefined) {
         query = Query.where(query, { beginsWith: options.beginsWith })
       } else if (options?.between !== undefined) {
@@ -3435,8 +3956,11 @@ export const makeStream = <
 
   const queryNamespace = {
     events: (streamId: StreamIdInput<TStreamIdFields>) => buildEventsQuery(streamId),
-    index: (name: string, streamId: StreamIdInput<TStreamIdFields>) =>
-      buildIndexQuery(name, streamId),
+    index: (
+      name: string,
+      streamId: StreamIdInput<TStreamIdFields>,
+      options?: { readonly partition?: string | undefined } | undefined,
+    ) => buildIndexQuery(name, streamId, options?.partition),
   }
 
   // ---------------------------------------------------------------------------
@@ -3478,9 +4002,10 @@ export const makeStream = <
     TEvent,
     TStreamIdFields,
     TMetadata extends Schema.Top ? Schema.Schema.Type<TMetadata> : undefined,
-    TSnapshot extends SnapshotConfig<infer TStateSchema> ? Schema.Schema.Type<TStateSchema> : never,
+    SnapshotStateOf<TSnapshot>,
     keyof TIndexes & string,
-    IndexProjectionsOf<TIndexes>
+    IndexProjectionsOf<TIndexes>,
+    PartitionedIndexesOf<TIndexes>
   >
 }
 
@@ -3517,6 +4042,7 @@ export interface BoundEventStream<
   TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
     readonly [K in TIndexName]: "all"
   },
+  TPartitionedIndexName extends string = never,
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -3592,7 +4118,7 @@ export interface BoundEventStream<
   readIndex<N extends TIndexName>(
     name: N,
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadIndexOptions | undefined,
+    ...options: ReadIndexArgs<N, TPartitionedIndexName>
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
     DynamoClientError | ValidationError,
@@ -3647,6 +4173,7 @@ export interface BoundEventStream<
     index<N extends TIndexName>(
       name: N,
       streamId: StreamIdInput<TStreamIdFields>,
+      ...options: IndexQueryArgs<N, TPartitionedIndexName>
     ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
   }
 
@@ -3683,10 +4210,27 @@ export const bind = <
   TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection } = {
     readonly [K in TIndexName]: "all"
   },
+  TPartitionedIndexName extends string = never,
 >(
-  stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
+  stream: EventStream<
+    TEvent,
+    TStreamIdFields,
+    TMetadata,
+    TState,
+    TIndexName,
+    TIndexProjections,
+    TPartitionedIndexName
+  >,
 ): Effect.Effect<
-  BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
+  BoundEventStream<
+    TEvent,
+    TStreamIdFields,
+    TMetadata,
+    TState,
+    TIndexName,
+    TIndexProjections,
+    TPartitionedIndexName
+  >,
   never,
   DynamoClient | TableConfig
 > =>
@@ -3727,7 +4271,8 @@ export const bind = <
         provide(stream.readFrom(streamId, afterVersion, options)),
       currentVersion: (streamId, options) => provide(stream.currentVersion(streamId, options)),
       readLatest: (streamId, options) => provide(stream.readLatest(streamId, options)),
-      readIndex: (name, streamId, options) => provide(stream.readIndex(name, streamId, options)),
+      readIndex: (name, streamId, ...options) =>
+        provide(stream.readIndex(name, streamId, ...options)),
       // The captured context carries a `Compression` registry provided where
       // the stream was bound (#147).
       measureAppend: (streamId, events, expectedVersion, options) =>
@@ -3741,7 +4286,8 @@ export const bind = <
         TMetadata,
         TState,
         TIndexName,
-        TIndexProjections
+        TIndexProjections,
+        TPartitionedIndexName
       >["decodeStreamImage"],
       query: stream.query,
       provide,
@@ -3755,7 +4301,15 @@ export const bind = <
           ? undefined
           : (id: Record<string, unknown>, floorVersion: number, options?: ReadOptions) =>
               provide(headProbe(id, floorVersion, options)),
-    } as BoundEventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>
+    } as BoundEventStream<
+      TEvent,
+      TStreamIdFields,
+      TMetadata,
+      TState,
+      TIndexName,
+      TIndexProjections,
+      TPartitionedIndexName
+    >
   })
 
 // ---------------------------------------------------------------------------
@@ -3767,13 +4321,25 @@ export const bind = <
  * Neither list names a key attribute: table and index keys are always
  * projected.
  */
-const projectionDefinition = (projection: StreamIndexProjection): Projection =>
+const projectionDefinition = (projection: StreamIndexProjection, snapshot: boolean): Projection =>
   projection === "all"
     ? { ProjectionType: "ALL" }
     : {
         ProjectionType: "INCLUDE",
-        NonKeyAttributes: projection === "keys" ? ["__edd_e__"] : [...EVENT_ITEM_ATTRIBUTES],
+        NonKeyAttributes:
+          projection === "keys"
+            ? ["__edd_e__"]
+            : snapshot
+              ? [...EVENT_ITEM_ATTRIBUTES, ...SNAPSHOT_ONLY_ATTRIBUTES].sort()
+              : [...EVENT_ITEM_ATTRIBUTES],
       }
+
+/**
+ * @internal The snapshot item's attributes an event item does not carry: what
+ * a `"withoutMetadata"` index that holds snapshots (#149) projects besides
+ * {@link EVENT_ITEM_ATTRIBUTES}.
+ */
+const SNAPSHOT_ONLY_ATTRIBUTES = ["asOfVersion", "state"] as const
 
 /**
  * `CreateTable` fragments for the stream indexes of one or more streams — see
@@ -3801,7 +4367,7 @@ export interface StreamIndexDefinitions {
  * | `projection` | `Projection` |
  * |---|---|
  * | `"all"` (default) | `{ ProjectionType: "ALL" }` |
- * | `"withoutMetadata"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }` |
+ * | `"withoutMetadata"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"] }` — plus `"asOfVersion"` and `"state"` when a stream declaring the index puts its snapshot in it (#149) |
  * | `"keys"` | `{ ProjectionType: "INCLUDE", NonKeyAttributes: ["__edd_e__"] }` — not `KEYS_ONLY`: every read filters on `__edd_e__` |
  *
  * The deployed index must project what is declared — copy `Projection` from
@@ -3812,7 +4378,12 @@ export interface StreamIndexDefinitions {
  * table over the limit).
  *
  * An index shared by several streams with the same definition is emitted
- * once. Lists are sorted by index name, attributes by attribute name.
+ * once — the way several streams write one GSI whose partition they derive
+ * (`partition`, #149): an order's line, payment and shipment streams under
+ * `ORDER#<orderId>`, say. Whether each declaration derives its partition or
+ * indexes its snapshot is not part of the definition: the index's key schema
+ * and projection kind are. Lists are sorted by index name, attributes by
+ * attribute name.
  *
  * - An LSI can only be created with the table, and caps the item collection
  *   of every partition key value in the table at 10 GB — entity partitions
@@ -3840,42 +4411,59 @@ export interface StreamIndexDefinitions {
  *
  * @throws `[EDD-9067]` when two streams define the same physical index
  *   differently (another type, other key attributes, or another projection).
+ *   Whether a declaration derives its partition or indexes its snapshot is not
+ *   part of the index's definition: streams that differ only there share it.
  */
 export const indexDefinitions = (
   ...streams: ReadonlyArray<{
     readonly streamName: string
     readonly indexes: {
-      readonly [name: string]: Omit<StreamIndexSettings, "projection"> & {
+      readonly [name: string]: Omit<
+        StreamIndexSettings,
+        "projection" | "partition" | "snapshot"
+      > & {
         /** Read as `"all"` when absent (a hand-built settings object). */
         readonly projection?: StreamIndexProjection | undefined
+        /** Read as `"stream"` when absent (a hand-built settings object). */
+        readonly partition?: "stream" | "derived" | undefined
+        /** Read as `false` when absent (a hand-built settings object). */
+        readonly snapshot?: boolean | undefined
       }
     }
   }>
 ): StreamIndexDefinitions => {
-  const byIndex = new Map<string, StreamIndexSettings & { readonly owner: string }>()
+  /** Per physical index: its definition, its first declarer, and whether any declarer indexes snapshots. */
+  const byIndex = new Map<
+    string,
+    Omit<StreamIndexSettings, "partition"> & { readonly owner: string; snapshot: boolean }
+  >()
   for (const stream of streams) {
     for (const [name, raw] of Object.entries(stream.indexes)) {
-      const settings: StreamIndexSettings = { ...raw, projection: raw.projection ?? "all" }
+      const settings = {
+        type: raw.type,
+        index: raw.index,
+        pk: raw.pk,
+        sk: raw.sk,
+        projection: raw.projection ?? "all",
+      }
+      const snapshot = raw.snapshot === true
       const owner = `index "${name}" of stream "${stream.streamName}"`
       const existing = byIndex.get(settings.index)
       if (existing === undefined) {
-        byIndex.set(settings.index, {
-          type: settings.type,
-          index: settings.index,
-          pk: settings.pk,
-          sk: settings.sk,
-          projection: settings.projection,
-          owner,
-        })
+        byIndex.set(settings.index, { ...settings, owner, snapshot })
         continue
       }
+      // Several streams writing one GSI they derive the partition of (#149)
+      // is the point: one declaration indexing snapshots and another not
+      // still share it, and the projection covers the snapshots.
+      existing.snapshot ||= snapshot
       if (
         existing.type !== settings.type ||
         existing.pk !== settings.pk ||
         existing.sk !== settings.sk ||
         existing.projection !== settings.projection
       ) {
-        const describe = (s: StreamIndexSettings) =>
+        const describe = (s: Pick<StreamIndexSettings, "type" | "pk" | "sk" | "projection">) =>
           `${s.type} (pk "${s.pk}", sk "${s.sk}", projection "${s.projection}")`
         throw new Error(
           `[EDD-9067] EventStore.indexDefinitions: the physical index "${settings.index}" is ` +
@@ -3897,7 +4485,7 @@ export const indexDefinitions = (
         { AttributeName: settings.pk, KeyType: "HASH" as const },
         { AttributeName: settings.sk, KeyType: "RANGE" as const },
       ],
-      Projection: projectionDefinition(settings.projection),
+      Projection: projectionDefinition(settings.projection, settings.snapshot),
     }
     attributes.add(settings.sk)
     if (settings.type === "gsi") {
@@ -4396,9 +4984,9 @@ type CommandHandlerFor<
   E,
   TConfig extends CommandHandlerOptions | undefined,
 > =
-  S extends BoundEventStream<any, infer TStreamIdFields, infer TMetadata, any, any>
+  S extends BoundEventStream<any, infer TStreamIdFields, infer TMetadata, any, any, any, any>
     ? BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
-    : S extends EventStream<any, infer TStreamIdFields, infer TMetadata, any, any>
+    : S extends EventStream<any, infer TStreamIdFields, infer TMetadata, any, any, any, any>
       ? CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
       : never
 
@@ -4447,8 +5035,8 @@ const makeCommandHandlerImpl = <
 >(
   decider: Decider<State, Command, TEvent, E>,
   stream:
-    | EventStream<TEvent, TStreamIdFields, TMetadata, any, any>
-    | BoundEventStream<TEvent, TStreamIdFields, TMetadata, any, any>,
+    | EventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any>
+    | BoundEventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any>,
   options: CommandHandlerOptions | undefined,
 ) => {
   // `verifySnapshot: false` is refused up front unless the stream writes its
@@ -5028,8 +5616,8 @@ export const commandHandler: {
     options?: TConfig,
   ): <
     S extends
-      | BoundEventStream<TEvent, any, any, State, any, any>
-      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any>,
+      | BoundEventStream<TEvent, any, any, State, any, any, any>
+      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any, any>,
   >(
     stream: S,
   ) => CommandHandlerFor<S, State, Command, TEvent, E, TConfig>
@@ -5045,6 +5633,7 @@ export const commandHandler: {
     TState extends State,
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
+    TPartitionedIndexName extends string,
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
@@ -5054,7 +5643,8 @@ export const commandHandler: {
       TMetadata,
       TState,
       TIndexName,
-      TIndexProjections
+      TIndexProjections,
+      TPartitionedIndexName
     >,
     options?: TConfig,
   ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
@@ -5070,10 +5660,19 @@ export const commandHandler: {
     TState extends State,
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
+    TPartitionedIndexName extends string,
     const TConfig extends CommandHandlerOptions | undefined = undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
-    stream: EventStream<TEvent, TStreamIdFields, TMetadata, TState, TIndexName, TIndexProjections>,
+    stream: EventStream<
+      TEvent,
+      TStreamIdFields,
+      TMetadata,
+      TState,
+      TIndexName,
+      TIndexProjections,
+      TPartitionedIndexName
+    >,
     options?: TConfig,
   ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
 } = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {
