@@ -20,6 +20,7 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Stream indexes: sub-streams ordered by a key derived from each event
 - Event metadata: one value per append, or one entry per event
 - Stream index projection: keeping metadata, or everything but the keys, out of an index
+- Shared indexes: one GSI partition several streams write, snapshots included
 
 ---
 
@@ -1080,8 +1081,8 @@ const Scorecards = EventStore.makeStream({
 })
 ```
 
-- `key` receives the domain event and the version it is appended at. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. A non-string or a `key` that throws fails the append with `ValidationError` before anything is written. An empty string, or a key over DynamoDB's 1024-byte sort-key limit, is rejected by DynamoDB, so nothing is written, and the append fails with a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version.
-- Only event items carry index attributes. Snapshots and idempotency sentinels are never in an index.
+- `key` receives the domain event, the version it is appended at and the stream id. The string it returns is stored **raw**, with no casing and no prefix, so compose it to sort the way you query (zero-pad numbers). `undefined` leaves the event out of the index. A non-string or a `key` that throws fails the append with `ValidationError` before anything is written. An empty string, or a key over DynamoDB's 1024-byte sort-key limit, is rejected by DynamoDB, so nothing is written, and the append fails with a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index and the event's version.
+- Only event items carry index attributes. Idempotency sentinels are never in an index, and snapshots only in a GSI that [derives its partition](#step-22-shared-indexes-across-streams).
 - `type: "lsi"` (the default) uses the table's partition key, so the index holds exactly this stream's indexed events and can be read with strongly consistent reads. `type: "gsi"` names a `pk` attribute too; `append` writes the stream's partition key value into it, so the index is scoped to the same stream, read eventually consistently.
 
 ### Creating the table
@@ -1541,6 +1542,165 @@ In a downstream benchmark on Lambda, reading ~6,000 small events was about 2× f
 
 `Query.select` raw rows return `data` as parsed JSON whatever its stored form. A filter on a path inside packed `data` is refused with `[EDD-9076]`, so use `Query.filterBy`. `measureAppend` and `measureSnapshot` return the stored sizes for chunk planning, and `decodeStreamImage` decodes DynamoDB Streams records. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) for compressor registration, the stored form, sizing and rollout order.
 
+## Step 22: Shared Indexes Across Streams
+
+A GSI stream index is normally scoped to its stream: `append` writes the stream's own partition key into the index's `pk`. Give the index a `partition` function instead, and several streams can write **one partition** of a GSI they all declare. One query of that partition then reads a whole group of streams. Here a series groups its matches, squads and umpire appointments:
+
+```typescript title="series.ts" region="shared-index-streams" example="event-sourcing.ts"
+// A series groups its matches, squads and umpire appointments. The three
+// streams derive one partition of `gsi1` per series, so one query of it reads
+// the whole series, each match's current state included.
+const SeriesTable = Table.make({ schema: AppSchema, entities: {} })
+
+class SquadNamed extends Schema.TaggedClass<SquadNamed>()("SquadNamed", {
+  players: Schema.Array(Schema.String),
+}) {}
+
+class UmpireAppointed extends Schema.TaggedClass<UmpireAppointed>()("UmpireAppointed", {
+  seriesId: Schema.String,
+  matchId: Schema.String,
+}) {}
+
+const SeriesMatches = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "SeriesMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["seriesId", "matchId"] },
+  snapshot: { schema: MatchStateSchema, mode: "inline" },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      // Written raw: no prefix, no casing.
+      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      key: (_event, version, streamId) => `MATCH#${streamId.matchId}#EVT#${pad(version)}`,
+      // Each match's snapshot is in the partition too, written in the same
+      // transaction as the events (an inline snapshot).
+      snapshot: (_state, streamId) => ({
+        partition: `SERIES#${streamId.seriesId}`,
+        key: `MATCH#${streamId.matchId}#STATE`,
+      }),
+    },
+  },
+})
+
+const SeriesSquads = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "SeriesSquad",
+  events: [SquadNamed],
+  streamId: { composite: ["seriesId", "team"] },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      key: (_event, version, streamId) => `SQUAD#${streamId.team}#EVT#${pad(version)}`,
+    },
+  },
+})
+
+// An umpire's stream is keyed by the umpire alone: the series comes from
+// each event.
+const Umpires = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "Umpire",
+  events: [UmpireAppointed],
+  streamId: { composite: ["umpireId"] },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (_streamId, event) => `SERIES#${event.seriesId}`,
+      key: (_event, version, streamId) => `UMPIRE#${streamId.umpireId}#EVT#${pad(version)}`,
+    },
+  },
+})
+```
+
+- `partition(streamId, event)` returns the event's partition in the index, stored **raw** (no casing, no prefix). It can come from the event, as the umpire stream's does. `undefined` leaves the event out of the index, as an `undefined` `key` does: an event is indexed only when both return a string. Both functions run for every appended event.
+- Within one append, every event's partition (where it is a string) must be the same, and the inline snapshot's must match it; otherwise the append fails with `ValidationError` before anything is written. A non-string or a function that throws fails it the same way. An empty partition, or one over DynamoDB's 2048-byte limit, is DynamoDB's to reject; the `ValidationError` names the index and the event.
+- `snapshot(state, streamId, asOfVersion)` puts the stream's snapshot item in the index too, as `{ partition, key }`, or leaves it out with `undefined`. The attributes are on the snapshot item itself, written by the same `Put`: an inline snapshot enters the index in the append's own transaction, and `writeSnapshot` and `commandHandler`'s snapshots carry it too. The `Put` replaces the item, so returning `undefined` takes a snapshot that was in the index out of it. `snapshot` requires `partition` and a stream `snapshot` config.
+- A snapshot is the state **as of** its `asOfVersion`. It is current after every append only with `mode: "inline"` and no `every`; otherwise a reader of the index folds the stream's events after `asOfVersion` onto it.
+
+`indexDefinitions` emits an index that several streams declare alike once:
+
+```typescript region="shared-index-table" example="event-sourcing.ts"
+const seriesIndexes = EventStore.indexDefinitions(SeriesMatches, SeriesSquads, Umpires)
+// gsi1 once, Projection ALL: the three streams declare it alike.
+yield* client.createTable({
+  TableName: seriesConfig.name,
+  BillingMode: "PAY_PER_REQUEST",
+  KeySchema: [
+    { AttributeName: "pk", KeyType: "HASH" },
+    { AttributeName: "sk", KeyType: "RANGE" },
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "pk", AttributeType: "S" },
+    { AttributeName: "sk", AttributeType: "S" },
+    ...seriesIndexes.AttributeDefinitions,
+  ],
+  GlobalSecondaryIndexes: seriesIndexes.GlobalSecondaryIndexes,
+})
+```
+
+Whether a declaration derives its partition or indexes its snapshot is not part of the index's definition, so streams that differ only there share it. Different key attributes, type or projection still throw `[EDD-9067]`. A `"withoutMetadata"` index that any stream puts its snapshot in also projects `asOfVersion` and `state`.
+
+### Reading the partition
+
+```typescript region="shared-index-read" example="event-sourcing.ts"
+const seriesMatches = yield* EventStore.bind(SeriesMatches)
+const handleSeriesMatch = EventStore.commandHandler(matchDecider, seriesMatches)
+const firstTest = { seriesId: "ashes-25", matchId: "t1" }
+yield* handleSeriesMatch(firstTest, {
+  _tag: "StartMatch",
+  venue: "Perth",
+  homeTeam: "AUS",
+  awayTeam: "ENG",
+})
+yield* handleSeriesMatch(firstTest, { _tag: "CompleteInnings", innings: 1, runs: 172, wickets: 10 })
+
+const squads = yield* EventStore.bind(SeriesSquads)
+yield* squads.append(
+  { seriesId: "ashes-25", team: "ENG" },
+  [new SquadNamed({ players: ["Root", "Stokes", "Wood"] })],
+  0,
+)
+const umpires = yield* EventStore.bind(Umpires)
+yield* umpires.append(
+  { umpireId: "u-7" },
+  [new UmpireAppointed({ seriesId: "ashes-25", matchId: "t1" })],
+  0,
+)
+
+// Another service reading the partition directly gets every stream's
+// events, and each match's snapshot.
+const series = yield* client.query({
+  TableName: seriesConfig.name,
+  IndexName: "gsi1",
+  KeyConditionExpression: "#pk = :pk",
+  ExpressionAttributeNames: { "#pk": "gsi1pk" },
+  ExpressionAttributeValues: { ":pk": { S: "SERIES#ashes-25" } },
+})
+// → MATCH#t1#EVT#0001, MATCH#t1#EVT#0002, MATCH#t1#STATE,
+//   SQUAD#ENG#EVT#0001, UMPIRE#u-7#EVT#0001
+
+// A stream reads its own events in the partition: pass the partition.
+const t1 = yield* seriesMatches.readIndex("bySeries", firstTest, {
+  partition: "SERIES#ashes-25",
+})
+// → v1 and v2 of match t1 only
+```
+
+- Other readers can query the partition directly; items are as stored. Packed `data` and `state` (see [Step 21](#step-21-packed-storage)) stay packed.
+- `readIndex` and `query.index` read an index that derives its partition one partition at a time, so `partition` is required (a type error without it). They return the given stream id's events in that partition: the read filters on the table's `pk`, which every index projects, so the other streams, the stream's other ids and the snapshots are left out. Passing `partition` for a stream-scoped index fails with `ValidationError` (`[EDD-9080]` from `query.index`).
+- Nothing is backfilled: only items written after the index is declared are in it.
+
 ---
 
 ## Running the Example
@@ -1589,6 +1749,7 @@ const AppLayer = Layer.mergeAll(
   EventsTable.layer({ name: "event-sourcing-example" }),
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
+  SeriesTable.layer({ name: "event-sourcing-series" }),
   WebCrypto,
 )
 
@@ -1626,6 +1787,7 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Event timestamps** | `append(..., { eventTimestamps })` writes each event's own `DateTime` as its `timestamp` (`undefined` keeps the append time); on a handler, `eventTimestamps: (decision) => timestamps`. `version`, not `timestamp`, orders a stream |
 | **Index projection** | `projection: "withoutMetadata"` (`INCLUDE` without `metadata`, read in one query) or `"keys"` (`INCLUDE ["__edd_e__"]`, events fetched from the table) on a stream index; the deployed `Projection` must match `indexDefinitions` |
 | **Packed storage** | `makeStream({ storedAs: { data: DynamoModel.Packed(...) } })` and `snapshot.storedAs` store data and state as JSON, compressed above a threshold; readers decode by the stored form, so a stream can mix encodings |
+| **Shared indexes** | A GSI index's `partition` (from the stream id or the event) lets several streams write one partition, and its `snapshot` puts each stream's snapshot there too; `indexDefinitions` emits the shared GSI once; `readIndex` takes the `partition` |
 
 ## What's Next?
 

@@ -6,7 +6,8 @@
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
  * large commands as stepped commands, stream indexes, event metadata and
- * timestamps, and stream index projection.
+ * timestamps, stream index projection, and a GSI several streams share by a
+ * derived partition.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -396,7 +397,88 @@ const AuditedScorecards = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 9. Main program
+// 9. Shared indexes — one GSI partition several streams write (#149)
+// ---------------------------------------------------------------------------
+
+// #region shared-index-streams
+// A series groups its matches, squads and umpire appointments. The three
+// streams derive one partition of `gsi1` per series, so one query of it reads
+// the whole series, each match's current state included.
+const SeriesTable = Table.make({ schema: AppSchema, entities: {} })
+
+class SquadNamed extends Schema.TaggedClass<SquadNamed>()("SquadNamed", {
+  players: Schema.Array(Schema.String),
+}) {}
+
+class UmpireAppointed extends Schema.TaggedClass<UmpireAppointed>()("UmpireAppointed", {
+  seriesId: Schema.String,
+  matchId: Schema.String,
+}) {}
+
+const SeriesMatches = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "SeriesMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["seriesId", "matchId"] },
+  snapshot: { schema: MatchStateSchema, mode: "inline" },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      // Written raw: no prefix, no casing.
+      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      key: (_event, version, streamId) => `MATCH#${streamId.matchId}#EVT#${pad(version)}`,
+      // Each match's snapshot is in the partition too, written in the same
+      // transaction as the events (an inline snapshot).
+      snapshot: (_state, streamId) => ({
+        partition: `SERIES#${streamId.seriesId}`,
+        key: `MATCH#${streamId.matchId}#STATE`,
+      }),
+    },
+  },
+})
+
+const SeriesSquads = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "SeriesSquad",
+  events: [SquadNamed],
+  streamId: { composite: ["seriesId", "team"] },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (streamId) => `SERIES#${streamId.seriesId}`,
+      key: (_event, version, streamId) => `SQUAD#${streamId.team}#EVT#${pad(version)}`,
+    },
+  },
+})
+
+// An umpire's stream is keyed by the umpire alone: the series comes from
+// each event.
+const Umpires = EventStore.makeStream({
+  table: SeriesTable,
+  streamName: "Umpire",
+  events: [UmpireAppointed],
+  streamId: { composite: ["umpireId"] },
+  indexes: {
+    bySeries: {
+      type: "gsi",
+      index: "gsi1",
+      pk: "gsi1pk",
+      sk: "gsi1sk",
+      partition: (_streamId, event) => `SERIES#${event.seriesId}`,
+      key: (_event, version, streamId) => `UMPIRE#${streamId.umpireId}#EVT#${pad(version)}`,
+    },
+  },
+})
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 10. Main program
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
@@ -404,6 +486,7 @@ const program = Effect.gen(function* () {
   const tableConfig = yield* EventsTable.Tag
   const scorecardConfig = yield* ScorecardTable.Tag
   const auditedScorecardConfig = yield* AuditedScorecardTable.Tag
+  const seriesConfig = yield* SeriesTable.Tag
 
   // --- Bind event stream ---
   // #region command-handler
@@ -422,6 +505,9 @@ const program = Effect.gen(function* () {
     .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client
     .deleteTable({ TableName: auditedScorecardConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client
+    .deleteTable({ TableName: seriesConfig.name })
     .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
   yield* client.createTable({
     TableName: tableConfig.name,
@@ -1168,16 +1254,88 @@ const program = Effect.gen(function* () {
   const hydrated = byRuns.map((e) => `v${e.version} ${e.metadata?.correlationId}`)
   yield* Console.log(`Through byRuns: ${hydrated.join(", ")}`)
 
+  // --- Shared indexes ---
+  yield* Console.log("\n=== Shared indexes ===")
+  // #region shared-index-table
+  const seriesIndexes = EventStore.indexDefinitions(SeriesMatches, SeriesSquads, Umpires)
+  // gsi1 once, Projection ALL: the three streams declare it alike.
+  yield* client.createTable({
+    TableName: seriesConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [
+      { AttributeName: "pk", KeyType: "HASH" },
+      { AttributeName: "sk", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "pk", AttributeType: "S" },
+      { AttributeName: "sk", AttributeType: "S" },
+      ...seriesIndexes.AttributeDefinitions,
+    ],
+    GlobalSecondaryIndexes: seriesIndexes.GlobalSecondaryIndexes,
+  })
+  // #endregion
+  yield* Console.log(
+    `Indexes: ${(seriesIndexes.GlobalSecondaryIndexes ?? []).map((index) => index.IndexName).join(", ")}`,
+  )
+
+  // #region shared-index-read
+  const seriesMatches = yield* EventStore.bind(SeriesMatches)
+  const handleSeriesMatch = EventStore.commandHandler(matchDecider, seriesMatches)
+  const firstTest = { seriesId: "ashes-25", matchId: "t1" }
+  yield* handleSeriesMatch(firstTest, {
+    _tag: "StartMatch",
+    venue: "Perth",
+    homeTeam: "AUS",
+    awayTeam: "ENG",
+  })
+  yield* handleSeriesMatch(firstTest, { _tag: "CompleteInnings", innings: 1, runs: 172, wickets: 10 })
+
+  const squads = yield* EventStore.bind(SeriesSquads)
+  yield* squads.append(
+    { seriesId: "ashes-25", team: "ENG" },
+    [new SquadNamed({ players: ["Root", "Stokes", "Wood"] })],
+    0,
+  )
+  const umpires = yield* EventStore.bind(Umpires)
+  yield* umpires.append(
+    { umpireId: "u-7" },
+    [new UmpireAppointed({ seriesId: "ashes-25", matchId: "t1" })],
+    0,
+  )
+
+  // Another service reading the partition directly gets every stream's
+  // events, and each match's snapshot.
+  const series = yield* client.query({
+    TableName: seriesConfig.name,
+    IndexName: "gsi1",
+    KeyConditionExpression: "#pk = :pk",
+    ExpressionAttributeNames: { "#pk": "gsi1pk" },
+    ExpressionAttributeValues: { ":pk": { S: "SERIES#ashes-25" } },
+  })
+  // → MATCH#t1#EVT#0001, MATCH#t1#EVT#0002, MATCH#t1#STATE,
+  //   SQUAD#ENG#EVT#0001, UMPIRE#u-7#EVT#0001
+
+  // A stream reads its own events in the partition: pass the partition.
+  const t1 = yield* seriesMatches.readIndex("bySeries", firstTest, {
+    partition: "SERIES#ashes-25",
+  })
+  // → v1 and v2 of match t1 only
+  // #endregion
+  const sortKeys = (series.Items ?? []).map((item) => item.gsi1sk?.S)
+  yield* Console.log(`Series partition:\n  ${sortKeys.join("\n  ")}`)
+  yield* Console.log(`Match t1 through bySeries: ${t1.map((e) => `v${e.version}`).join(", ")}`)
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
   yield* client.deleteTable({ TableName: scorecardConfig.name })
   yield* client.deleteTable({ TableName: auditedScorecardConfig.name })
+  yield* client.deleteTable({ TableName: seriesConfig.name })
   yield* Console.log("Tables deleted.")
 })
 
 // ---------------------------------------------------------------------------
-// 10. Provide dependencies and run
+// 11. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region crypto-layer
@@ -1208,6 +1366,7 @@ const AppLayer = Layer.mergeAll(
   EventsTable.layer({ name: "event-sourcing-example" }),
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
+  SeriesTable.layer({ name: "event-sourcing-series" }),
   WebCrypto,
 )
 

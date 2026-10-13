@@ -3377,6 +3377,16 @@ const Entries = EventStore.makeStream({
 stream.readIndex("byEntry", streamId, { beginsWith?, between?, reverse?, limit?, consistentRead? })
 stream.query.index("byEntry", streamId)            // Query<StreamEvent<…>>
 EventStore.indexDefinitions(...streams)             // CreateTable fragments
+
+// A GSI with a derived partition, shared by several streams, with snapshots (#149)
+byOrder: {
+  type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk",
+  partition: (streamId, event) => `ORDER#${streamId.orderId}`,          // string | undefined
+  key: (event, version, streamId) => `LINE#${streamId.lineId}#EVT#…`,   // string | undefined
+  snapshot: (state, streamId, asOfVersion) => ({ partition, key }),     // | undefined
+}
+stream.readIndex("byOrder", streamId, { partition: "ORDER#o-1", … })  // partition required
+stream.query.index("byOrder", streamId, { partition: "ORDER#o-1" })
 ```
 
 A stream index is a sub-stream of the stream's events ordered by a key derived from
@@ -3386,8 +3396,9 @@ fails the append with `ValidationError` before anything is written. An empty key
 over DynamoDB's 1024-byte sort-key limit, is not pre-checked: DynamoDB rejects the append,
 so nothing is written, and the rejection is confirmed against the key sent (empty, or over
 1024 UTF-8 bytes) and reported as a `ValidationError` (`operation: "EventStore.append.indexes"`) naming the index
-and the event's version. Only event items carry index attributes — snapshots and sentinels
-are never indexed. Index names are a type parameter (`TIndexName`) inferred from
+and the event's version. Event items carry index attributes, and the snapshot item an
+entry in a GSI that derives its partition and declares `snapshot` (below) — sentinels are
+never indexed. `key` also receives the stream id (`key(event, version, streamId)`). Index names are a type parameter (`TIndexName`) inferred from
 `indexes`, with each index's `projection` alongside (`TIndexProjections`); an undeclared
 name at runtime is a defect (`[EDD-9066]`). Definition errors: `[EDD-9063]` malformed
 entry (including an unknown `projection` and a member an entry does not declare, such
@@ -3433,6 +3444,37 @@ by the stream, `[EDD-9065]` indexes sharing a physical index or attribute.
   index added to a stream that already holds events (a GSI added by `UpdateTable`), or
   a changed `key`, covers only events appended from then on. The library does not
   backfill.
+- **Derived partition (#149).** A GSI's optional `partition(streamId, event)` replaces
+  the stream's partition key with a derived value, stored raw, so several streams
+  declaring the same GSI write one partition of it (an order's line, payment and
+  shipment streams under `ORDER#<orderId>`) and one `Query` of it reads the group. The
+  partition may come from the event (a stream keyed by something other than its group). Both
+  `partition` and `key` run for every appended event; the event is indexed only when both
+  return a string. Within one append, every string `partition` must be equal, and the
+  inline snapshot's entry must have it too — otherwise `ValidationError`
+  (`"EventStore.append.indexes"` / `"EventStore.append.snapshot"`) before anything is
+  written. Non-string values and throwing functions fail the same way; an empty or
+  over-long (2048-byte) partition is DynamoDB's to reject, diagnosed naming the index and
+  the event. Names of such indexes are a type parameter (`TPartitionedIndexName`), so
+  `readIndex` / `query.index` require `options.partition` for them; the read filters on
+  the table `pk` (projected into every index) to keep the given stream id's events. A
+  missing `partition` (or one passed for a stream-scoped index) at runtime is a
+  `ValidationError` from `readIndex` and `[EDD-9080]` from `query.index`; the types keep
+  `partition` optional on stream-scoped indexes so that a stream with derived partitions
+  stays assignable to a plain `EventStream<E, F, M, S>`.
+- **Snapshot entry (#149).** `snapshot(state, streamId, asOfVersion)` (requires
+  `partition` and a stream `snapshot` config, else `[EDD-9063]`) returns the snapshot
+  item's `{ partition, key }`, written on the item by the same `Put` — `writeSnapshot`,
+  the inline snapshot of `append` / `commandHandler`, and counted by `measureSnapshot` /
+  `measureAppend`. `undefined` leaves the snapshot out; the `Put` replaces the item, so
+  that also removes it from the index. A snapshot is current only with `mode: "inline"`
+  and no `every`; readers fold the indexed events after `asOfVersion` otherwise.
+- **Sharing.** `indexDefinitions` emits a physical index several streams declare once.
+  Whether a declaration derives its partition or indexes its snapshot is not part of the
+  definition; a `"withoutMetadata"` index that any declarer indexes snapshots in also
+  projects `asOfVersion` and `state`. `[EDD-9067]` still covers type, key attributes and
+  projection kind. There is no typed cross-stream read: external readers query the
+  partition raw (items are copied as stored, packed `data` / `state` included).
 
 ### Packed Storage (#147)
 
@@ -4042,11 +4084,11 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
 | `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
 | `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
-| `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, a `key` that is not a function, a `projection` other than `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does not declare |
+| `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, `partition` or `snapshot`, an empty `index` / `sk` / `pk`, a `key` / `partition` / `snapshot` that is not a function, a `snapshot` without `partition` or on a stream without a snapshot config, a `projection` other than `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does not declare |
 | `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`) |
 | `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
 | `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
-| `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently (type, key attributes or projection) |
+| `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently (type, key attributes or projection); a derived partition or snapshot entry is not part of the definition |
 | `EDD-9068` | `EventStore.ts` | `verifySnapshot: false` on a stream whose snapshot config is not `mode: "inline"` without `every` — thrown by `commandHandler` at handler construction, a defect from `readLatest` |
 | `EDD-9069` | `Table.ts` | Table members disagree on one physical secondary index's key attributes or GSI/LSI classification (entity indexes, `_cascade_<field>` indexes, aggregate collection and list indexes), or entities declare different primary-key fields — thrown by `Table.make` and `Table.definition` |
 | `EDD-9070` | `VectorIndex.ts` | Vector index `dimensions` is not an integer — DynamoDB reads an integer member leniently, so it could create the index with another, immutable dimensionality |
@@ -4059,6 +4101,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9077` | `Entity.ts` | An update applies anything but a whole-value `.set()` / `.remove()` to a packed field (`add`, `subtract`, `append`, `deleteFromSet`, any `path*` op) — a `ValidationError` at execution |
 | `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
+| `EDD-9080` | `EventStore.ts` | `query.index` without `partition` for an index that derives its partition, or with one for a stream-scoped index (a defect; the first is unreachable from typed code) |
 
 Next free code: **`EDD-9080`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 

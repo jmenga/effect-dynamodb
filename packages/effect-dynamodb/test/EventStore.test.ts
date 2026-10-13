@@ -5972,8 +5972,24 @@ describe("EventStore stream indexes (#140)", () => {
 
     it("exposes each index's settings", () => {
       expect(IndexedMatch.indexes).toEqual({
-        byInnings: { type: "lsi", index: "lsi1", pk: "pk", sk: "lsi1sk", projection: "all" },
-        byResult: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", projection: "all" },
+        byInnings: {
+          type: "lsi",
+          index: "lsi1",
+          pk: "pk",
+          sk: "lsi1sk",
+          projection: "all",
+          partition: "stream",
+          snapshot: false,
+        },
+        byResult: {
+          type: "gsi",
+          index: "gsi1",
+          pk: "gsi1pk",
+          sk: "gsi1sk",
+          projection: "all",
+          partition: "stream",
+          snapshot: false,
+        },
       })
       expect(MatchEvents.indexes).toEqual({})
     })
@@ -7190,6 +7206,761 @@ describe("EventStore stream index projection", () => {
         expect(gsi.operation).toBe("EventStore.decode")
       }).pipe(Effect.provide(TestLayer)),
     )
+  })
+})
+
+describe("EventStore shared stream indexes with a derived partition (#149)", () => {
+  const pad = (n: number) => String(n).padStart(10, "0")
+
+  class LineAdded extends Schema.Class<LineAdded>("LineAdded")({
+    sku: Schema.String,
+    quantity: Schema.Number,
+  }) {}
+  class LineChanged extends Schema.Class<LineChanged>("LineChanged")({
+    quantity: Schema.Number,
+  }) {}
+  class PaymentTaken extends Schema.Class<PaymentTaken>("PaymentTaken")({
+    amount: Schema.Number,
+  }) {}
+  /** A comment stream is keyed by `commentId` alone: its order is in each event. */
+  class CommentPosted extends Schema.Class<CommentPosted>("CommentPosted")({
+    orderId: Schema.String,
+    body: Schema.String,
+  }) {}
+  class CommentDraft extends Schema.Class<CommentDraft>("CommentDraft")({}) {}
+
+  const LineState = Schema.Struct({ sku: Schema.String, quantity: Schema.Number })
+
+  const OrderLine = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "OrderLine",
+    events: [LineAdded, LineChanged],
+    streamId: { composite: ["orderId", "lineId"] },
+    metadata: Schema.Struct({ source: Schema.String }),
+    snapshot: { schema: LineState, mode: "inline" },
+    indexes: {
+      byOrder: {
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        partition: (streamId) => `ORDER#${streamId.orderId}`,
+        key: (_event, version, streamId) => `LINE#${streamId.lineId}#EVT#${pad(version)}`,
+        snapshot: (state, streamId, asOfVersion) =>
+          state.quantity === 0
+            ? undefined
+            : {
+                partition: `ORDER#${streamId.orderId}`,
+                key: `LINE#${streamId.lineId}#STATE#${pad(asOfVersion)}`,
+              },
+      },
+    },
+  })
+
+  const OrderPayment = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "OrderPayment",
+    events: [PaymentTaken],
+    streamId: { composite: ["orderId", "paymentId"] },
+    indexes: {
+      byOrder: {
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        partition: (streamId) => `ORDER#${streamId.orderId}`,
+        key: (_event, version, streamId) => `PAY#${streamId.paymentId}#EVT#${pad(version)}`,
+      },
+    },
+  })
+
+  const partitionCalls: Array<unknown> = []
+  const keyCalls: Array<unknown> = []
+  const OrderComment = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "OrderComment",
+    events: [CommentPosted, CommentDraft],
+    streamId: { composite: ["commentId"] },
+    indexes: {
+      byOrder: {
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        partition: (_streamId, event) => {
+          partitionCalls.push(event)
+          return event instanceof CommentPosted ? `ORDER#${event.orderId}` : undefined
+        },
+        key: (event, version, streamId) => {
+          keyCalls.push(event)
+          return `COMMENT#${streamId.commentId}#EVT#${pad(version)}`
+        },
+      },
+    },
+  })
+
+  const lineId = { orderId: "o-1", lineId: "l-1" }
+  const linePk = "$cricket#v1#orderline#o-1#l-1"
+
+  const putsOf = (call: { TransactItems: ReadonlyArray<any> }) =>
+    call.TransactItems.filter((i) => i.Put !== undefined).map((i) => fromAttributeMap(i.Put.Item))
+  const byType = (call: { TransactItems: ReadonlyArray<any> }, suffix: string) =>
+    putsOf(call).filter((item) => String(item.__edd_e__).endsWith(suffix))
+
+  describe("definition", () => {
+    const key = () => undefined
+    const partition = () => undefined
+    const make =
+      (indexes: unknown, snapshot = true) =>
+      () =>
+        EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Bad",
+          events: [LineAdded],
+          streamId: { composite: ["orderId"] },
+          ...(snapshot ? { snapshot: { schema: LineState } } : {}),
+          indexes: indexes as never,
+        })
+
+    it("exposes the derived partition and the snapshot entry in the settings", () => {
+      expect(OrderLine.indexes.byOrder).toEqual({
+        type: "gsi",
+        index: "gsi1",
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        projection: "all",
+        partition: "derived",
+        snapshot: true,
+      })
+      expect(OrderPayment.indexes.byOrder).toMatchObject({ partition: "derived", snapshot: false })
+    })
+
+    it("throws EDD-9063 for a malformed partition or snapshot entry", () => {
+      const gsi = { type: "gsi", index: "g", pk: "gpk", sk: "gsk", key }
+      expect(make({ a: { index: "i", sk: "s", key, partition } })).toThrow(
+        /EDD-9063.*only a "gsi" index derives its partition/,
+      )
+      expect(make({ a: { ...gsi, partition: "ORDER#1" } })).toThrow(
+        /EDD-9063.*partition must be a function/,
+      )
+      expect(make({ a: { ...gsi, snapshot: () => undefined } })).toThrow(
+        /EDD-9063.*snapshot requires partition/,
+      )
+      expect(make({ a: { ...gsi, partition, snapshot: {} } })).toThrow(
+        /EDD-9063.*snapshot must be a function/,
+      )
+      expect(make({ a: { ...gsi, partition, snapshot: () => undefined } }, false)).toThrow(
+        /EDD-9063.*snapshot requires the stream's snapshot config/,
+      )
+      expect(make({ a: { ...gsi, partition, snapshot: () => undefined } })).not.toThrow()
+    })
+  })
+
+  describe("append", () => {
+    it.effect(
+      "writes the raw derived partition and key on the events and the inline snapshot, in one transaction",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* OrderLine.append(
+            lineId,
+            [new LineAdded({ sku: "S-1", quantity: 2 }), new LineChanged({ quantity: 3 })],
+            0,
+            { snapshot: { sku: "S-1", quantity: 3 } },
+          )
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+          const call = mockTransactWriteItems.mock.calls[0]![0]
+          const events = byType(call, ".event")
+          expect(events.map((e) => [e.pk, e.gsi1pk, e.gsi1sk])).toEqual([
+            [linePk, "ORDER#o-1", `LINE#l-1#EVT#${pad(1)}`],
+            [linePk, "ORDER#o-1", `LINE#l-1#EVT#${pad(2)}`],
+          ])
+          const [snapshot] = byType(call, ".snapshot")
+          expect(snapshot).toMatchObject({
+            pk: linePk,
+            asOfVersion: 2,
+            gsi1pk: "ORDER#o-1",
+            gsi1sk: `LINE#l-1#STATE#${pad(2)}`,
+          })
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "derives the partition from event data, runs both functions on every event and skips an undefined one",
+      () =>
+        Effect.gen(function* () {
+          partitionCalls.length = 0
+          keyCalls.length = 0
+          mockTransactWriteItems.mockResolvedValue({})
+          const set = new CommentPosted({ orderId: "o-9", body: "hello" })
+          const draft = new CommentDraft({})
+          yield* OrderComment.append({ commentId: "c-1" }, [set, draft, set], 0)
+          expect(partitionCalls).toEqual([set, draft, set])
+          expect(keyCalls).toEqual([set, draft, set])
+          const events = byType(mockTransactWriteItems.mock.calls[0]![0], ".event")
+          expect(events[0]).toMatchObject({
+            gsi1pk: "ORDER#o-9",
+            gsi1sk: `COMMENT#c-1#EVT#${pad(1)}`,
+          })
+          // An undefined partition leaves the event out, as an undefined key does.
+          expect(events[1]).not.toHaveProperty("gsi1pk")
+          expect(events[1]).not.toHaveProperty("gsi1sk")
+          expect(events[2]).toMatchObject({
+            gsi1pk: "ORDER#o-9",
+            gsi1sk: `COMMENT#c-1#EVT#${pad(3)}`,
+          })
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses events of one append in different partitions, before writing", () =>
+      Effect.gen(function* () {
+        const error = yield* OrderComment.append(
+          { commentId: "c-1" },
+          [
+            new CommentPosted({ orderId: "o-1", body: "a" }),
+            new CommentDraft({}),
+            new CommentPosted({ orderId: "o-2", body: "b" }),
+          ],
+          0,
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const failure = error as ValidationError
+        expect(failure.operation).toBe("EventStore.append.indexes")
+        expect(String(failure.cause)).toContain(
+          'The partition of index "byOrder" for the event at version 3 is "ORDER#o-2", but the ' +
+            'event at version 1 has "ORDER#o-1"',
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses an inline snapshot in another partition than the events", () =>
+      Effect.gen(function* () {
+        const Split = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Split",
+          events: [LineAdded],
+          streamId: { composite: ["orderId", "lineId"] },
+          snapshot: { schema: LineState, mode: "inline" },
+          indexes: {
+            byOrder: {
+              type: "gsi",
+              index: "gsi1",
+              pk: "gsi1pk",
+              sk: "gsi1sk",
+              partition: (streamId) => `ORDER#${streamId.orderId}`,
+              key: () => "EVT",
+              snapshot: (state) => ({ partition: `SKU#${state.sku}`, key: "STATE" }),
+            },
+          },
+        })
+        const error = yield* Split.append(lineId, [new LineAdded({ sku: "S-1", quantity: 1 })], 0, {
+          snapshot: { sku: "S-1", quantity: 1 },
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.snapshot")
+        expect(String((error as ValidationError).cause)).toContain(
+          'The inline snapshot\'s partition in index "byOrder" is "SKU#S-1", but the event at ' +
+            'version 1 has "ORDER#o-1"',
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an undefined snapshot entry leaves the snapshot out of the index", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        yield* OrderLine.append(lineId, [new LineChanged({ quantity: 0 })], 0, {
+          snapshot: { sku: "S-1", quantity: 0 },
+        })
+        const [snapshot] = byType(mockTransactWriteItems.mock.calls[0]![0], ".snapshot")
+        expect(snapshot).not.toHaveProperty("gsi1pk")
+        expect(snapshot).not.toHaveProperty("gsi1sk")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses a malformed or throwing snapshot entry, or a non-string partition", () =>
+      Effect.gen(function* () {
+        const withEntry = (snapshot: unknown, partition: unknown = () => "P") =>
+          EventStore.makeStream({
+            table: EventsTable,
+            streamName: "EntryCheck",
+            events: [LineAdded],
+            streamId: { composite: ["orderId"] },
+            snapshot: { schema: LineState, mode: "inline" },
+            indexes: {
+              byOrder: {
+                type: "gsi",
+                index: "gsi1",
+                pk: "gsi1pk",
+                sk: "gsi1sk",
+                partition: partition as () => string,
+                key: () => "K",
+                snapshot: snapshot as () => undefined,
+              },
+            },
+          })
+        const cases: ReadonlyArray<
+          [EventStore.EventStream<any, any, any, any, any, any, any>, RegExp]
+        > = [
+          [withEntry(() => ({ partition: "P" })), /must be \{ partition: string, key: string \}/],
+          [
+            withEntry(() => "P"),
+            /must be \{ partition: string, key: string \} or undefined; received P\./,
+          ],
+          [
+            withEntry(() => {
+              throw new Error("entry boom")
+            }),
+            /entry boom/,
+          ],
+          [
+            withEntry(
+              () => undefined,
+              () => 7,
+            ),
+            /The partition of index "byOrder" for the event at version 1 must be a string or undefined; received 7/,
+          ],
+        ]
+        for (const [stream, pattern] of cases) {
+          const error = yield* stream
+            .append({ orderId: "o-1" }, [new LineAdded({ sku: "S", quantity: 1 })], 0, {
+              snapshot: { sku: "S", quantity: 1 },
+            })
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toMatch(pattern)
+        }
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "an empty partition is sent, and DynamoDB's rejection names the index and the event",
+      () =>
+        Effect.gen(function* () {
+          const rejection = awsValidationException(ddbEmptyIndexKey("gsi1", "gsi1pk"))
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const error = yield* OrderComment.append(
+            { commentId: "c-1" },
+            [new CommentPosted({ orderId: "", body: "a" })],
+            0,
+          ).pipe(Effect.flip)
+          // `ORDER#` is not empty: an empty partition needs an empty order id
+          // through a function that returns it bare.
+          expect(error._tag).toBe("DynamoError")
+
+          const Bare = EventStore.makeStream({
+            table: EventsTable,
+            streamName: "Bare",
+            events: [CommentPosted],
+            streamId: { composite: ["commentId"] },
+            indexes: {
+              byOrder: {
+                type: "gsi",
+                index: "gsi1",
+                pk: "gsi1pk",
+                sk: "gsi1sk",
+                partition: (_streamId, event) => event.orderId,
+                key: () => "K",
+              },
+            },
+          })
+          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          const named = yield* Bare.append(
+            { commentId: "c-1" },
+            [new CommentPosted({ orderId: "", body: "a" })],
+            0,
+          ).pipe(Effect.flip)
+          expect(named._tag).toBe("ValidationError")
+          const failure = named as ValidationError
+          expect(failure.operation).toBe("EventStore.append.indexes")
+          expect(String(failure.cause)).toContain(
+            'The partition of index "byOrder" for the event at version 1 is an empty string',
+          )
+          expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a partition over 2048 bytes is diagnosed, naming the index and the event", () =>
+      Effect.gen(function* () {
+        const Long = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Long",
+          events: [CommentPosted],
+          streamId: { composite: ["commentId"] },
+          indexes: {
+            byOrder: {
+              type: "gsi",
+              index: "gsi1",
+              pk: "gsi1pk",
+              sk: "gsi1sk",
+              partition: () => "p".repeat(2049),
+              key: () => "K",
+            },
+          },
+        })
+        const rejection = awsValidationException(
+          "Size of hashkey has exceeded the maximum size limit of 2048 bytes",
+        )
+        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        const error = yield* Long.append(
+          { commentId: "c-1" },
+          [new CommentPosted({ orderId: "o", body: "a" })],
+          0,
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain(
+          'The partition of index "byOrder" for the event at version 1 is 2049 bytes',
+        )
+        expect(text).toContain("2048-byte limit for a partition key")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an empty inline snapshot key is named against the snapshot entry", () =>
+      Effect.gen(function* () {
+        const EmptyState = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "EmptyState",
+          events: [LineAdded],
+          streamId: { composite: ["orderId"] },
+          snapshot: { schema: LineState, mode: "inline" },
+          indexes: {
+            byOrder: {
+              type: "gsi",
+              index: "gsi1",
+              pk: "gsi1pk",
+              sk: "gsi1sk",
+              partition: () => "P",
+              key: () => "K",
+              snapshot: () => ({ partition: "P", key: "" }),
+            },
+          },
+        })
+        mockTransactWriteItems.mockRejectedValueOnce(
+          awsValidationException(ddbEmptyIndexKey("gsi1", "gsi1sk")),
+        )
+        const error = yield* EmptyState.append(
+          { orderId: "o-1" },
+          [new LineAdded({ sku: "S", quantity: 1 })],
+          0,
+          { snapshot: { sku: "S", quantity: 1 } },
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).entityType).toBe("emptystate.snapshot")
+        expect(String((error as ValidationError).cause)).toContain(
+          'The snapshot entry\'s key of index "byOrder" for the inline snapshot is an empty string',
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("works with eventMetadata, eventTimestamps and additionalItems on the same GSI", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const at = DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")
+        yield* OrderLine.append(
+          lineId,
+          [new LineAdded({ sku: "S-1", quantity: 1 }), new LineChanged({ quantity: 2 })],
+          0,
+          {
+            eventMetadata: [{ source: "api" }, undefined],
+            eventTimestamps: [at, undefined],
+            additionalItems: [Labels.put({ labelId: "lb-1", text: "label" })],
+            snapshot: { sku: "S-1", quantity: 2 },
+          },
+        )
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        const [first, second] = byType(call, ".event")
+        expect(first).toMatchObject({
+          gsi1pk: "ORDER#o-1",
+          metadata: { source: "api" },
+          timestamp: "2026-01-02T03:04:05.000Z",
+        })
+        expect(second).toMatchObject({ gsi1pk: "ORDER#o-1" })
+        // The entity's own gsi1 keys, composed as the entity composes them.
+        const [label] = byType(call, "Label")
+        expect(label!.gsi1pk).not.toBe("ORDER#o-1")
+        expect(byType(call, ".snapshot")[0]).toMatchObject({ gsi1pk: "ORDER#o-1" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("commandHandler's inline snapshot carries its index entry", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        mockTransactWriteItems.mockResolvedValue({})
+        const decider: EventStore.Decider<
+          { readonly sku: string; readonly quantity: number },
+          { readonly sku: string; readonly quantity: number },
+          LineAdded | LineChanged
+        > = {
+          initialState: { sku: "", quantity: 0 },
+          decide: (command) => Effect.succeed([new LineAdded(command)]),
+          evolve: (_state, event) =>
+            event instanceof LineAdded
+              ? { sku: event.sku, quantity: event.quantity }
+              : { sku: _state.sku, quantity: event.quantity },
+        }
+        yield* EventStore.commandHandler(decider, OrderLine)(lineId, { sku: "S-9", quantity: 4 })
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(byType(call, ".event")[0]).toMatchObject({ gsi1pk: "ORDER#o-1" })
+        expect(byType(call, ".snapshot")[0]).toMatchObject({
+          gsi1pk: "ORDER#o-1",
+          gsi1sk: `LINE#l-1#STATE#${pad(1)}`,
+          state: { sku: "S-9", quantity: 4 },
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("writeSnapshot / measureSnapshot", () => {
+    it.effect("writeSnapshot writes the entry on the snapshot item", () =>
+      Effect.gen(function* () {
+        mockPutItem.mockResolvedValue({})
+        yield* OrderLine.writeSnapshot(lineId, { sku: "S-1", quantity: 5 }, 7)
+        const item = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+        expect(item).toMatchObject({
+          pk: linePk,
+          gsi1pk: "ORDER#o-1",
+          gsi1sk: `LINE#l-1#STATE#${pad(7)}`,
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("writeSnapshot's empty entry partition is named against the index", () =>
+      Effect.gen(function* () {
+        const EmptyPartition = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "EmptyPartition",
+          events: [LineAdded],
+          streamId: { composite: ["orderId"] },
+          snapshot: { schema: LineState },
+          indexes: {
+            byOrder: {
+              type: "gsi",
+              index: "gsi1",
+              pk: "gsi1pk",
+              sk: "gsi1sk",
+              partition: () => "P",
+              key: () => "K",
+              snapshot: () => ({ partition: "", key: "STATE" }),
+            },
+          },
+        })
+        mockPutItem.mockRejectedValueOnce(
+          awsValidationException(ddbEmptyIndexKey("gsi1", "gsi1pk")),
+        )
+        const error = yield* EmptyPartition.writeSnapshot(
+          { orderId: "o-1" },
+          { sku: "S", quantity: 1 },
+          1,
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.writeSnapshot")
+        expect(String((error as ValidationError).cause)).toContain(
+          'The snapshot entry\'s partition of index "byOrder" for the snapshot is an empty string',
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("measureSnapshot counts the entry's attributes", () =>
+      Effect.gen(function* () {
+        // The same stream (name, keys, state schema) without the index.
+        const Unindexed = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "OrderLine",
+          events: [LineAdded, LineChanged],
+          streamId: { composite: ["orderId", "lineId"] },
+          snapshot: { schema: LineState, mode: "inline" },
+        })
+        const state = { sku: "S-1", quantity: 5 }
+        const indexed = yield* OrderLine.measureSnapshot(lineId, state, 7)
+        const unindexed = yield* Unindexed.measureSnapshot(lineId, state, 7)
+        const entryBytes =
+          "gsi1pk".length + "ORDER#o-1".length + "gsi1sk".length + `LINE#l-1#STATE#${pad(7)}`.length
+        expect(indexed - unindexed).toBe(entryBytes)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("readIndex / query.index", () => {
+    const eventItem = (version: number) =>
+      toAttributeMap({
+        pk: linePk,
+        sk: DynamoSchema.composeEventVersionKey(AppSchema, "orderline.event", version),
+        __edd_e__: "orderline.event",
+        streamId: "o-1#l-1",
+        version,
+        eventType: "LineChanged",
+        data: { _tag: "LineChanged", quantity: version },
+        timestamp: "2026-03-08T12:00:00.000Z",
+        gsi1pk: "ORDER#o-1",
+        gsi1sk: `LINE#l-1#EVT#${pad(version)}`,
+      })
+
+    it.effect("reads the given partition, keeping the stream id's events", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [eventItem(2)] })
+        const events = yield* OrderLine.readIndex("byOrder", lineId, {
+          partition: "ORDER#o-1",
+          beginsWith: "LINE#l-1#",
+        })
+        expect(events.map((e) => e.data)).toEqual([new LineChanged({ quantity: 2 })])
+        const call = mockQuery.mock.calls[0]![0]
+        expect(call.IndexName).toBe("gsi1")
+        const values = fromAttributeMap(call.ExpressionAttributeValues)
+        expect(values[":pk"]).toBe("ORDER#o-1")
+        expect(Object.values(call.ExpressionAttributeNames)).toEqual(
+          expect.arrayContaining(["gsi1pk", "gsi1sk", "pk", "__edd_e__"]),
+        )
+        // The stream id's own partition key, and its events only.
+        expect(Object.values(values)).toEqual(
+          expect.arrayContaining([linePk, "orderline.event", "LINE#l-1#"]),
+        )
+        expect(call.FilterExpression).toMatch(/AND/)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("query.index takes the partition; a missing one is a defect (EDD-9080)", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [eventItem(1)] })
+        const events = yield* OrderLine.query
+          .index("byOrder", lineId, { partition: "ORDER#o-1" })
+          .pipe(Query.collect)
+        expect(events).toHaveLength(1)
+        expect(() => OrderLine.query.index("byOrder", lineId, {} as { partition: string })).toThrow(
+          /EDD-9080.*derives its partition/,
+        )
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("readIndex refuses a missing partition, or one on a stream-scoped index", () =>
+      Effect.gen(function* () {
+        // Unreachable through the types: the partition is required.
+        const missing = yield* OrderLine.readIndex(
+          "byOrder",
+          lineId,
+          {} as { partition: string },
+        ).pipe(Effect.flip)
+        expect(missing._tag).toBe("ValidationError")
+        expect(String(missing.cause)).toMatch(/derives its partition.*Nothing was sent/)
+        const Scoped = EventStore.makeStream({
+          table: EventsTable,
+          streamName: "Scoped",
+          events: [LineAdded],
+          streamId: { composite: ["orderId"] },
+          indexes: {
+            byKey: { type: "gsi", index: "gsi1", pk: "gsi1pk", sk: "gsi1sk", key: () => "K" },
+          },
+        })
+        const extra = yield* Scoped.readIndex(
+          "byKey",
+          { orderId: "o-1" },
+          {
+            partition: "ORDER#o-1",
+          },
+        ).pipe(Effect.flip)
+        expect(String(extra.cause)).toMatch(/scoped to the stream; it takes no partition/)
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound stream reads the partition too", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [eventItem(3)] })
+        const bound = yield* EventStore.bind(OrderLine)
+        const events = yield* bound.readIndex("byOrder", lineId, { partition: "ORDER#o-1" })
+        expect(events[0]!.version).toBe(3)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("indexDefinitions", () => {
+    it("emits a GSI the streams share once", () => {
+      expect(EventStore.indexDefinitions(OrderLine, OrderPayment, OrderComment)).toEqual({
+        AttributeDefinitions: [
+          { AttributeName: "gsi1pk", AttributeType: "S" },
+          { AttributeName: "gsi1sk", AttributeType: "S" },
+        ],
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "gsi1",
+            KeySchema: [
+              { AttributeName: "gsi1pk", KeyType: "HASH" },
+              { AttributeName: "gsi1sk", KeyType: "RANGE" },
+            ],
+            Projection: { ProjectionType: "ALL" },
+          },
+        ],
+      })
+    })
+
+    it("a withoutMetadata index projects the snapshot's attributes when a stream indexes it", () => {
+      const slim = (streamName: string, snapshot: boolean) =>
+        EventStore.makeStream({
+          table: EventsTable,
+          streamName,
+          events: [LineAdded],
+          streamId: { composite: ["orderId"] },
+          snapshot: { schema: LineState },
+          indexes: {
+            byOrder: {
+              type: "gsi",
+              index: "gsi1",
+              pk: "gsi1pk",
+              sk: "gsi1sk",
+              projection: "withoutMetadata",
+              partition: (streamId) => streamId.orderId,
+              key: () => "K",
+              ...(snapshot ? { snapshot: () => undefined } : {}),
+            },
+          },
+        })
+      const eventOnly = ["__edd_e__", "data", "eventType", "streamId", "timestamp", "version"]
+      expect(
+        EventStore.indexDefinitions(slim("A", false)).GlobalSecondaryIndexes![0]!.Projection,
+      ).toEqual({ ProjectionType: "INCLUDE", NonKeyAttributes: eventOnly })
+      // One declarer indexing snapshots widens the shared index.
+      expect(
+        EventStore.indexDefinitions(slim("A", false), slim("B", true)).GlobalSecondaryIndexes![0]!
+          .Projection,
+      ).toEqual({
+        ProjectionType: "INCLUDE",
+        NonKeyAttributes: [
+          "__edd_e__",
+          "asOfVersion",
+          "data",
+          "eventType",
+          "state",
+          "streamId",
+          "timestamp",
+          "version",
+        ],
+      })
+    })
+
+    it("still throws EDD-9067 for conflicting definitions of the shared GSI", () => {
+      const Conflicting = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "Conflicting",
+        events: [LineAdded],
+        streamId: { composite: ["orderId"] },
+        indexes: {
+          byOrder: {
+            type: "gsi",
+            index: "gsi1",
+            pk: "gsi1pk",
+            sk: "gsi1sk",
+            projection: "keys",
+            partition: (streamId) => streamId.orderId,
+            key: () => "K",
+          },
+        },
+      })
+      expect(() => EventStore.indexDefinitions(OrderLine, Conflicting)).toThrow(
+        /EDD-9067.*"gsi1".*projection "all".*projection "keys"/,
+      )
+    })
   })
 })
 
