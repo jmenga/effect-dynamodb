@@ -21,6 +21,7 @@
     - `changeFeed` reads with shard lineage, iterator recovery and a fallback to a full `DescribeStream`.
     - `CheckpointStore` (memory or DynamoDB) records checkpoints, with a single-consumer lease.
     - `runChangeFeed` feeds `EventStore.processBatch`.
+  - Missing shards are confirmed gone before they are written off, and reads are bounded (`maxConcurrentReads`). Invalid feed settings throw `[EDD-9083]`, and a `finishedTtl` under 28 h throws `[EDD-9084]`.
   - **Also:**
     - `readFrom(…, { toVersion })`;
     - a projection read model defined before its table registration now resolves its table lazily.
