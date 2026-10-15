@@ -281,3 +281,29 @@ added fixes and adoption asks. What changed from §§3–7:
 
 **Not changed:** `projection` still takes unbound streams and entities, bound with
 `bindProjection`. The issue's "or a bound stream plus a bound entity" is not offered.
+
+## 10. Review round 2
+
+- **Blocker:** a bound projection passed to `EventStore.processBatch` decoded through
+  the unbound stream, outside its bound context, and died with `[EDD-9078]` for a
+  stream that names a codec.
+  - A projection now carries an internal decode, which `bindProjection` wraps in the
+    captured context.
+  - Routes still group by the unbound stream, so two bound copies of one stream don't
+    look like two streams with one marker.
+  - The connected test fails without the fix.
+- **`key` may return an `Option`:**
+  - `Option.none()` acknowledges the event: no row is read or written, it is listed in
+    `ignored`, and gap reads skip it.
+  - `catchUp` walks back (paged) to the latest event that addresses a row.
+  - `apply` returns an `Option` exactly when `key`'s return type includes one; the
+    type parameter `I` on `EventProjection` carries this.
+- **`EventStore.processBatch({ streams })`** decodes streams without a projection,
+  into `unrouted: [{ position, stream, event }]`.
+- **The `[EDD-9082]` check** in a batch runs inside the effect (a defect), not when the
+  effect is built.
+- **Documented:**
+  - `onDecodeFailure: "skip"` acknowledges the record, not the stored event: the next
+    event of the row gap-fills through it and fails.
+  - A row that is never created re-reads from version 1 and re-reports its rejections
+    on each later delivery, so dedupe them by version.

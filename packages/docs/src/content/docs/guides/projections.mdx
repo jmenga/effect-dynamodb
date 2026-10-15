@@ -107,6 +107,7 @@ const OrderSummaryProjection = EventStore.projection({
 ```
 
 - **`key(streamId, event)`** is the row an event folds into. A key built from the stream id alone gives one row per stream instance; a key that also reads the event lets a stream feed several rows (see [Rows keyed by event fields](#rows-keyed-by-event-fields)). `streamId` is structured: a decoded event carries it as the composites joined with `#` (`StreamEvent.streamId`), and the projection splits it back with `stream.parseStreamId` — on a multi-field id, a value containing `#` is ambiguous and fails with `ValidationError`.
+- **An event can address no row:** return an `Option` from `key`, and `Option.none()` acknowledges the event — no row is read or written, no checkpoint moves, and `applyBatch` lists its position in `ignored`. `apply` then returns an `Option` too, and `catchUp` targets the latest event that does address a row.
 - **`initial(streamId, event)`** is the state a row starts from, before `event` — the first event folded into a row that does not exist yet.
 - **`evolve`** returns an `Effect`. Return the state unchanged to ignore an event (the checkpoint still advances). A failure fails that row only — unless `terminal` accepts it (below). `evolve` runs again on every lost-race retry, so keep it free of side effects.
 - **`checkpoint`** names a numeric field, written by the library after the fold. `{ field: "version", offset: -1 }` stores `version + offset` — for a read model that numbered versions differently (here, from 0) — with reads and conditions going through the same mapping, so stored values and their readers stay as they were.
@@ -225,6 +226,7 @@ const ZoneReadingProjection = EventStore.projection({
 ```
 
 - **`terminal`** marks the `evolve` failures that reject their event rather than fail the row. A rejected event is skipped and reported in the outcome's `rejected`; the fold continues, and rejected events alone never create a row (its `state` is `Option.none()`). On an existing row, the checkpoint advances past it. The decision must be deterministic: a rejected event of a row that doesn't exist yet is read again to fill a later gap — and rejected again.
+- **A row that is never created** has no checkpoint, so each later delivery of its events gap-reads from version 1 and reports the earlier rejections again. Dedupe `rejected` by version when you count or log them; the read grows with the stream.
 - **Without `terminal`**, a failure fails the row on every delivery: the checkpoint stays behind the failing event, so each later event of the row gap-fills it and fails the same way.
 - **`toItem`** recomputes a `Hidden` attribute other readers use, on every write.
 
@@ -242,7 +244,7 @@ The record identifier depends on who reads the response:
 - A Pipe honours partial batch responses from its target, not from an enrichment.
 - **A record shape of your own** — a Pipe input template's, say — is read with `image: (record) => …` and `identifier: (record) => …` instead of `source`.
 - **A failed record without an identifier** fails the call with `StreamRecordIdentifierMissing` (an empty identifier would fail the whole batch silently): fail the invocation, and the source redelivers the batch.
-- **A record that fails to decode** fails the same way every time, so reporting it holds its shard until the source gives up. `onDecodeFailure: "skip"` acknowledges it instead — it is still in `decodeFailures`, to log and dead-letter yourself.
+- **A record that fails to decode** fails the same way every time, so reporting it holds its shard until the source gives up. `onDecodeFailure: "skip"` acknowledges it instead — it is still in `decodeFailures`, to log and dead-letter yourself. That acknowledges the *record*, not the stored event: the next event of the same row gap-fills through it, fails to decode it, and fails the row. Skipping helps when the bad event is its stream's last, or once the stored item is repaired or removed.
 - To fail more records (a side effect that failed, say), add them to `result.failedRecords` and call `EventStore.batchResponse(records, { source })`.
 
 ## One feed, several projections
@@ -261,7 +263,7 @@ const makeFeedHandler = Effect.gen(function* () {
 })
 ```
 
-Each projection's outcomes come back under its name, with `positions` indexing the records.
+Each projection's outcomes come back under its name, with `positions` indexing the records. To act on streams that have no projection (side effects only) without decoding twice, name them in `streams: { Name: stream }`: their events come back in `unrouted`, each with its record's position. Two streams storing events under one marker make the call die with `[EDD-9082]`.
 
 ## Decoding several streams and filtering the feed
 

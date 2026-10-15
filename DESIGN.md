@@ -3554,7 +3554,9 @@ const { response } = yield* bound.processBatch(records, { source: "lambda" })
 yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source: "lambda" })
 ```
 
-- **Rows.** `key(streamId, event)` names the row an event folds into; each row is fed by
+- **Rows.** `key(streamId, event)` names the row an event folds into (an `Option`:
+  none addresses no row — acknowledged, listed in `ignored`, and `apply` then returns
+  an `Option`); each row is fed by
   one stream instance and keeps its own checkpoint, meaning every stream version up to
   it has been considered for the row. When an event addresses another row, the earlier
   row keeps what it had.
@@ -3598,8 +3600,9 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
     `dynamodb.SequenceNumber` (Lambda), `eventID` (Pipes) or an accessor; a missing
     identifier fails with `StreamRecordIdentifierMissing`.
   - `projection.processBatch` / `EventStore.processBatch({ projections })` decode
-    each record once (an `image` accessor for other shapes), route it to the
-    projections of its stream, and report the earliest record of each failed row plus
+    each record once (an `image` accessor for other shapes; a bound projection
+    decodes under its own context), route it to the projections of its stream
+    (`streams` decodes others without one, into `unrouted`), and report the earliest record of each failed row plus
     each undecodable record (`onDecodeFailure: "skip"` acknowledges those). Outcome
     `positions` index the records.
 - **Refused read models** (`[EDD-9081]`): `versioned`, `softDelete`, `timeSeries`, a
