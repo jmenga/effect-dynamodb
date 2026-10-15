@@ -138,10 +138,11 @@ yield* feed.pipe(
 
 DynamoDB Streams splits a table's feed into shards. A shard lives about four hours, then closes, and a child shard continues the same partition's records.
 
-- **Discovery.** The feed describes the stream (`DescribeStream`, paginated) when it starts and every `describeInterval` (default 30 s). When a shard is drained, its children are looked up at once with `ShardFilter` (`CHILD_SHARDS`). Where the filter is unsupported or finds nothing yet, a full describe is used instead.
+- **Discovery.** The feed describes the stream (`DescribeStream`, paginated) when it starts and every `describeInterval` (default 30 s). When a shard is drained, its children are looked up at once with `ShardFilter` (`CHILD_SHARDS`). Where the filter is unsupported or finds nothing yet, the next full describe runs straight away instead, shared by every shard drained meanwhile (at most one such describe per `pollInterval`).
 - **A parent is read to its end before its children.** A shard starts only when its parent is finished (every batch acknowledged), or when its parent has left the stream. So one item's records stay in order across a split.
 - **Closed shards** are drained, checkpointed as finished, and dropped.
-- **Shards are read concurrently**, each by one reader, which keeps within the two-readers-per-shard guidance.
+- **Shards are read concurrently**, each by its own reader. `maxConcurrentReads` (default 16) bounds the `GetShardIterator` / `GetRecords` calls in flight across all shards; a reader holds a permit for one call only, so a bound below the number of open shards slows reading without starving any shard.
+- **Readers per shard.** AWS advises at most two simultaneous readers of a shard. Every reader of the stream counts: each feed `consumer`, Lambda event source mapping or Pipe reads every shard. Keep a stream to two of them in total; more are throttled (the feed backs off), not refused.
 
 ## Positions, checkpoints and restarts
 
@@ -150,14 +151,14 @@ DynamoDB Streams splits a table's feed into shards. A shard lives about four hou
 - **`consumer`** (default `"default"`) names the application. Checkpoints and the lease are kept per consumer, so several applications can read one stream with one checkpoint table.
 - **An expired iterator** (one older than 15 minutes, because the consumer was slow) is acquired again from the shard's position.
 - **A position past the stream's 24-hour retention** fails the feed with `ChangeFeedTrimmed { streamArn, shardId, sequenceNumber }`: records were lost. Rebuild what the feed maintains, then clear the consumer's checkpoints to start over.
-- **Shards gone while the consumer was down.** At a restart, before reading anything, the feed fails with `ChangeFeedTrimmed` when a shard with a checkpoint has left the stream, or when an unread shard's parent has left it without being finished: their unread records are gone. At a fresh start, parents already gone predate the consumer; they are checkpointed as finished, so a restart does not mistake them for lost ones. A shard read to its end whose finished checkpoint was never written is reported too, as it can't be told apart once it has left the stream.
+- **Shards gone while the consumer was down.** At a restart, before reading anything, the feed fails with `ChangeFeedTrimmed` when a shard with a checkpoint has left the stream, or when an unread shard's parent has left it without being finished: their unread records are gone. At a fresh start, parents already gone predate the consumer; they are checkpointed as finished, so a restart does not mistake them for lost ones. A shard missing from the first describe is only treated as gone once a second describe still lacks it and `GetShardIterator` finds it not there (or trimmed); a shard that turns out to exist is read as usual, a parent before its children. A shard read to its end whose finished checkpoint was never written is reported too, as it can't be told apart once it has left the stream.
 - **An open shard with no iterator** is never finished: the feed refreshes the shard list and retries after a backoff.
 
 ## The lease
 
 One lease per consumer and stream, held in the checkpoint store, keeps a second process from consuming the same feed by accident:
 
-- it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends;
+- it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends. `renewEvery` must be less than half of `duration` (`changeFeed` throws `[EDD-9083]` otherwise), which leaves `duration − 2 × renewEvery` to retry a failed renewal in;
 - a second process fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or, with `lease: { onHeld: "wait" }`, retries until the lease is released or expires;
 - a renewal the checkpoint store fails to write is retried until `renewEvery` before the lease would lapse, then fails the feed with that `CheckpointStoreError`;
 - if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`;
@@ -175,8 +176,11 @@ Expiry compares the holder's clock with the taker's, so hosts need roughly synch
 | `pollInterval` | `1 second` | How long an idle open shard waits between empty reads. |
 | `batchSize` | `100` | Records per batch (`GetRecords.Limit`, at most 1000). |
 | `describeInterval` | `30 seconds` | How often the whole stream is described again for new shards. |
+| `maxConcurrentReads` | `16` | Shard reads (`GetShardIterator` / `GetRecords`) in flight at once, across all shards. |
 | `backoff` | `{ initial: 100 ms, max: 10 s }` | Jittered exponential backoff for throttling and transient errors (retried without limit) and for re-reading a failed batch. |
-| `lease` | enabled | `{ duration?, renewEvery?, onHeld?: "fail" \| "wait", owner? }`, or `false`. |
+| `lease` | enabled | `{ duration?, renewEvery?, onHeld?: "fail" \| "wait", owner? }`, or `false`. `renewEvery` < `duration / 2`. |
+
+`changeFeed` throws `[EDD-9083]` for options it can't honour: `renewEvery` of half the lease `duration` or more, a `batchSize` outside 1–1000, or a `maxConcurrentReads` that is not a positive integer. `CheckpointStore.layerDynamoDB({ tableName, finishedTtl })` throws `[EDD-9084]` for a `finishedTtl` under 28 hours: a finished shard's checkpoint must outlive the shards that depend on it (24 hours of retention plus a shard's lifetime), or a restart reports records lost that were not.
 
 Throttling (`LimitExceededException`, `ThrottlingException`) and `InternalServerError` are retried. Any other failure ends the stream with a typed error: `ChangeFeedError` is the shared client errors (`DynamoError`, `ResourceNotFoundError`, …), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`, `ChangeFeedLeaseLost` or `CheckpointStoreError`.
 

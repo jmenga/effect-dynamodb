@@ -46,16 +46,26 @@ one item are ordered within a shard and from a parent into its child.
   finds no child yet (DynamoDB Local accepts the filter and returns nothing)
   also falls back to a full describe. Either way, the result is filtered by
   `ParentShardId`, so a store that ignores the filter is safe.
+- **Shared describes.** A drained shard that falls back does not describe the
+  stream itself: it wakes the describer, which runs the next full describe at
+  once and at most once per `pollInterval` for such wake-ups, so shards drained
+  together (a disabled stream's, say) share one describe instead of one each.
 - **Pruning.** A full describe forgets finished shards that have left the
   stream, so a long-running feed does not accumulate them.
 - **Parent before child.** A shard starts only when its parent is finished,
   or its parent is not in the describe output (trimmed past retention).
   DynamoDB shards only split, never merge, so each has at most one parent.
 - **Gone shards at startup.** A parent missing from the describe output is
-  only safe to skip when this consumer owes it nothing. At a **fresh** start,
-  every missing parent of a listed shard predates the consumer: it is
-  checkpointed `Finished`, so a restart can tell it from a lost one. At a
-  restart, the feed fails with `ChangeFeedTrimmed` before reading anything
+  only safe to skip when this consumer owes it nothing, and a describe may be
+  inconsistent. So a shard missing at startup — a `Sequence`-checkpointed one,
+  or the unfinished parent of a listed shard without a checkpoint — is
+  confirmed gone first: the stream is described once more, and a shard still
+  missing is probed with `GetShardIterator(TRIM_HORIZON)`. Not found
+  (`ResourceNotFoundException`) or trimmed means gone; an iterator means it is
+  still there, and it is read like any other shard — a parent before its
+  children (from its checkpoint, or its trim horizon). At a **fresh** start, a
+  confirmed-gone parent predates the consumer: it is checkpointed `Finished`,
+  so a restart can tell it from a lost one. At a restart, the feed fails with `ChangeFeedTrimmed` before reading anything
   when a shard with a `Sequence` checkpoint is no longer listed (downtime past
   retention dropped its unread tail), or a listed shard without a checkpoint
   has a missing parent that is not `Finished`. A shard read to its end whose
@@ -98,7 +108,11 @@ A shard's reader fetches up to `batchSize` records (`GetRecords.Limit`, default
 100, at most 1000), emits them as one `ChangeFeedBatch`, and **waits for the
 batch to be acknowledged** before reading again. So each shard has at most one
 batch in flight, its batches are processed in order, and a slow consumer slows
-polling (pull-based backpressure). Shards are read concurrently.
+polling (pull-based backpressure). Shards are read concurrently: each has its
+own reader, and `maxConcurrentReads` (default 16) bounds the `GetShardIterator`
+/ `GetRecords` calls in flight across them. A permit is held for one call only
+(not across a backoff or while a batch awaits its acknowledgement), so a bound
+below the number of open shards slows reading but starves no shard.
 
 ```ts
 interface ChangeFeedBatch {
@@ -147,8 +161,7 @@ stream image decoders already accept.
 `InternalServerError` to `InternalServerError`. Every `DescribeStream`,
 `GetShardIterator` and `GetRecords` call retries those two without limit, on a
 jittered exponential backoff (`backoff: { initial: 100 ms, max: 10 s }` by
-default). One reader per shard keeps within the two-readers-per-shard
-guidance. An idle shard (an empty `GetRecords` on an open shard) polls again
+default). One reader per shard per feed. AWS advises at most two simultaneous readers of a shard, and every reader of the stream counts — each feed `consumer`, Lambda event source mapping or Pipe — so keep the stream to two of them in total; more are throttled (and back off), not refused. An idle shard (an empty `GetRecords` on an open shard) polls again
 after `pollInterval` (default 1 s).
 
 ## 6. The lease (single consumer per stream)
@@ -158,6 +171,9 @@ processes from consuming the same feed by accident:
 
 - acquired at start — conditional on no lease, an expired one, or our own;
 - renewed every `renewEvery` (default a third of `duration`, 30 s by default);
+  `renewEvery` must be less than half of `duration` — `changeFeed` throws
+  `[EDD-9083]` otherwise — so that a renewal the store fails to write has
+  `duration − 2 × renewEvery` to be retried in before the deadline below;
 - released when the stream ends;
 - a second consumer fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or
   with `lease: { onHeld: "wait" }` retries until the lease is free or expires;
@@ -206,7 +222,12 @@ option, so it is chosen by layer like every other service — a test swaps in
   | lease | `<consumer>#<streamArn>` | `lease` | `owner` (S), `expiresAt` (N, epoch ms) |
 
   `load` is a strongly consistent `Query` on the partition. `Finished` items
-  carry a `ttl` two days out (a closed shard leaves the stream after 24 h); a
+  carry a `ttl` `finishedTtl` out (default two days). `finishedTtl` must be at
+  least 28 hours — `layerDynamoDB` / `makeDynamoDB` throw `[EDD-9084]` below
+  it: a closed shard stays listed 24 h after closing, and the children of a
+  parent already gone at a fresh start stay listed for up to a shard's
+  lifetime (about 4 h) plus those 24 h; a `Finished` checkpoint expired sooner
+  would make a restart report lost records that were not lost. A
   sequence checkpoint never expires, so a consumer down past retention still
   gets `ChangeFeedTrimmed` instead of silently restarting at the trim horizon.
   Enabling TTL on `ttl` is optional. `CheckpointStore.tableDefinition(name)`

@@ -3629,15 +3629,19 @@ yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } 
   `GetShardIterator`, `GetRecords`, `ListStreams`; `layer` / `layerConfig` /
   `layerFromSdkClient`) and `CheckpointStore` (`Context.Service`; `load`, `commit`,
   `acquireLease` / `renewLease` / `releaseLease`; `layerMemory`, `layerDynamoDB({ tableName })`
-  over `DynamoClient`, `tableDefinition(name)` for its `pk`/`sk` table).
+  over `DynamoClient` (`finishedTtl` at least 28 h, `[EDD-9084]`), `tableDefinition(name)`
+  for its `pk`/`sk` table).
 - **Shards.** Full paginated `DescribeStream` at start and every `describeInterval`;
   a drained shard's children via `ShardFilter: CHILD_SHARDS`, falling back to a full
   describe where the filter is rejected (`ValidationException`, remembered) or finds none
-  (DynamoDB Local). Children are filtered by `ParentShardId`. A shard starts once its
+  (DynamoDB Local) — the describer's next describe, shared by shards drained meanwhile.
+  Children are filtered by `ParentShardId`. A shard starts once its
   parent is finished or gone from the stream — per-item order across splits. At a
   restart, a checkpointed shard or an unread shard's unfinished parent gone from the
   stream fails with `ChangeFeedTrimmed` before anything is read; a fresh start
-  checkpoints already-gone parents `Finished`. An open shard without an iterator is
+  checkpoints already-gone parents `Finished`. A shard missing at startup counts as gone
+  only after a second describe and a `GetShardIterator(TRIM_HORIZON)` probe (not found or
+  trimmed); one that exists is read, a parent first. An open shard without an iterator is
   retried after a refresh, never finished. A
   `GetRecords` without `NextShardIterator` ends a shard: after its last batch is
   acknowledged it is checkpointed `Finished` and dropped. The feed ends once the stream
@@ -3657,10 +3661,13 @@ yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } 
   failed write can be retried.
 - **Throttling.** `LimitExceededException` maps to `ThrottlingError`; it and
   `InternalServerError` retry without limit on a jittered exponential backoff (100 ms →
-  10 s). Idle open shards poll every `pollInterval` (1 s); one reader per shard.
+  10 s). Idle open shards poll every `pollInterval` (1 s). One reader per shard per feed;
+  `maxConcurrentReads` (16) bounds the reads in flight across shards, a permit per call.
+  AWS's two-readers-per-shard guidance counts every consumer name, Lambda mapping and Pipe.
 - **Lease.** One item per `(consumer, streamArn)` in the checkpoint store: conditional
-  acquire (absent, expired or ours), renewed every `duration / 3` (store failures retried
-  until `renewEvery` before it lapses), released on exit; `ChangeFeedLeaseHeld` (or
+  acquire (absent, expired or ours), renewed every `duration / 3` (`renewEvery` must be
+  below `duration / 2`, `[EDD-9083]`; store failures retried until `renewEvery` before it
+  lapses), released on exit; `ChangeFeedLeaseHeld` (or
   `onHeld: "wait"`), `ChangeFeedLeaseLost` when taken over. Once lost, acknowledgements
   fail with `ChangeFeedLeaseLost` instead of committing.
   Guards against an accidental second consumer; writes are not fenced.
