@@ -8,12 +8,12 @@
   - **Multi-source projections:** `EventStore.multiProjection` maintains rows fed by several streams.
     - Each row keeps a checkpoint per source instance, in a map keyed `<source>#<streamId>`, or in per-source legacy fields recording their owning instance.
     - A second instance moves to the map, or fails with the new `ProjectionSourceConflict`.
-    - Sources run in `fold` mode (gap-filled) or `latest` mode (newest event only, the rest `superseded`).
+    - Sources run in `fold` mode (gap-filled) or `latest` mode (newest event first, falling back past `terminal` rejections; older ones `superseded`). One instance's failure is reported as its own outcome while the row's other sources still apply.
     - It provides `catchUp`, and `rebuild(rowKey, { instances })` as the repair path. `bindProjection` and `EventStore.processBatch` accept it next to single-source projections.
-  - **`revision`:** a library-owned write counter. Every write increments it and is conditioned on it, so concurrent writers from different sources serialise and `rebuild` is race-free. It is required by multi-source projections and the outbox, and is optional on `projection`.
+  - **`revision`:** a library-owned write counter. Every write increments it and is conditioned on it, so concurrent writers from different sources serialise and `rebuild` is race-free. It can name an existing counter, with `{ field, initial }` setting a new row's first value. It is required by multi-source projections and the outbox, and is optional on `projection`.
   - **Tombstones:** with `removal`, `evolve` may return `EventStore.removeRow`.
     - The row becomes a tombstone at its own key that keeps its checkpoints (with an optional TTL).
-    - Entity `get`, `Batch.get` and `Transaction.transactGet` report the tombstone as absent.
+    - Entity `get`, `Batch.get` and `Transaction.transactGet` report the tombstone as absent, and the read model's `create` may replace it.
   - **Ordered outbox:**
     - Effects commit with the row in one `TransactWriteItems`, in the row's partition or in a separate table.
     - `drain` / `deliver` / `drainPending` deliver them strictly in order per row, at least once.
