@@ -311,6 +311,15 @@ export const makeEngine = (config: EngineConfig) => {
 
   // Resolved when it runs: an entity's table is set when it is registered on
   // one, which may come after the projection is defined.
+  // Rows may be tombstones (#154): the entity's `create` takes one's place,
+  // keeping these fields — the checkpoints — and the revision one higher.
+  if (config.removal !== undefined) {
+    ;(readModel as { _projectionTombstones?: unknown })._projectionTombstones = {
+      kept: keptFields.filter((f) => f !== config.revision?.field),
+      revision: config.revision?.field,
+    }
+  }
+
   const tableName = Effect.suspend(() =>
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )

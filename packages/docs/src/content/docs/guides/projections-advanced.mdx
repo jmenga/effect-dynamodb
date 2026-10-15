@@ -191,7 +191,7 @@ const removed = yield* ShipmentProjection.applyBatch([{ stream: "order", event: 
 ```
 
 - **A tombstone, not a deletion.** The row's key keeps a tombstone (`__edd_e__: "<entityType>#tombstone"`) with the checkpoints and revision and nothing else. A redelivery can't recreate the row.
-- **Every entity read by key reports it as absent:** `get`, `Batch.get` and `Transaction.transactGet`. Queries filter it out, and it carries no index keys. Likewise, the read model's `create` (also in a transaction) may write where a tombstone is.
+- **Every entity read by key reports it as absent:** `get`, `Batch.get` and `Transaction.transactGet`. Queries filter it out, and it carries no index keys. Likewise, the read model's `create` (also in a transaction) may write where a tombstone is. It carries the tombstone's checkpoints over (with the revision one higher), so a late redelivery is still recognised as applied and can't undo the created row.
 - **A later event** starts the row again from `initial`, from the tombstone's checkpoints.
 - **`removal: { ttl }`** lets DynamoDB expire tombstones. Choose more than the change feed's 24 hours plus any redelivery or replay window: once a tombstone expires, a very late event recreates the row.
 - **Refused** for read models with `unique` constraints, whose sentinels a tombstone write can't release.
@@ -205,6 +205,7 @@ Side effects driven from `applied` are at most once: a crash after the write los
   - A `deliver` failure leaves the effect at the head for the next drain, and is reported as `undelivered`. It never fails the record, because the effects are committed.
   - A crash leaves a claim that expires (`claimFor`, 30 s by default), so the effect is delivered again: **at least once**. Each effect carries its event's stream id and version, so consumers can deduplicate.
   - A successful delivery removes the effect, even if its claim expired meanwhile and another drainer took it over. So drainers never re-claim one another's heads in turn.
+  - **Duplicates may interleave.** A drainer whose claim expired mid-delivery can still be delivering effect *n* when the next drainer has moved on to *n + 1*. So a duplicate of *n* can land after *n + 1*. Effects reach consumers in order, at least once, with possible duplicates out of order: deduplicate on `(streamId, version)`.
 - **Order** is one sequence per row, across all its sources.
 - **Where the items live:**
   - By default, in the row's own partition (`__edd_e__: "<entityType>#outbox"`). They show in the read model table's change stream and in full-table scans, but not in entity reads.

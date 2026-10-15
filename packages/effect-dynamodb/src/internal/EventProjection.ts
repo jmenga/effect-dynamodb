@@ -865,11 +865,6 @@ export const refuseReadModel = (
   if (options.outbox && options.revision === undefined) {
     refuse("`outbox` orders a row's effects by its `revision`: declare one.")
   }
-  // Rows of this read model may be tombstones (#154): its `create` takes one
-  // for the absent row every read by key reports.
-  if (options.removal) {
-    ;(readModel as { _projectionTombstones?: boolean })._projectionTombstones = true
-  }
 }
 
 /** @internal An outbox config, resolved. */

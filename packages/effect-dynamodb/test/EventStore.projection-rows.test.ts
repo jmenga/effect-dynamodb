@@ -14,6 +14,7 @@ import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import {
   calls,
   InMemoryClient,
@@ -226,11 +227,31 @@ describe("projection removal (tombstones)", () => {
         rev: 0,
       }).asEffect()
       expect(created.total).toBe(9)
+      // The tombstone's checkpoint and revision carried over.
+      expect(rowOf("o1")).toMatchObject({ __edd_e__: "Summary", total: 9, version: 2, rev: 2 })
+      // A late redelivery of the removal is already applied: the row stays.
+      const late = yield* Removable.apply(events[1]!)
+      expect(late.applied).toEqual([])
+      expect(late.removed).toBe(false)
+      expect(rowOf("o1")!.__edd_e__).toBe("Summary")
       // A second create still finds the row.
       const again = yield* Effect.flip(
         Summaries.create({ orderId: "o1", total: 1, version: 0, rev: 0 }).asEffect(),
       )
       expect(again._tag).toBe("ConditionalCheckFailed")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a transactional create over a tombstone carries its checkpoint over too", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o2", [new Placed({ amount: 1 }), new Cancelled({})])
+      yield* Removable.applyBatch(events)
+      yield* Transaction.transactWrite([
+        Summaries.create({ orderId: "o2", total: 4, version: 0, rev: 0 }),
+      ])
+      expect(rowOf("o2")).toMatchObject({ __edd_e__: "Summary", total: 4, version: 2, rev: 2 })
+      const late = yield* Removable.apply(events[1]!)
+      expect(late.applied).toEqual([])
     }).pipe(Effect.provide(TestLayer)),
   )
 

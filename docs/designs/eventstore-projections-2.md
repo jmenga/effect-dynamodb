@@ -207,3 +207,12 @@ EventStore.multiProjection({
 - **`unrouted`:** `streams` may name a stream a projection reads. It is decoded once and returned too. The same stream bound and unbound shares its event schema; a different stream with the same marker is still `[EDD-9082]`.
 - **`create` over a tombstone:** a projection with `removal` flags its read model, and that entity's `create` guard (single-item and transactional) becomes `attribute_not_exists(pk, sk) OR __edd_e__ = <entityType>#tombstone`. Other entities' guards are unchanged.
 - **The change-feed findings** are fixed under `change-feed.md`.
+
+## 9. Review round 2
+
+- **`create` over a tombstone keeps the projection's checkpoints.**
+  - A projection with `removal` records its kept fields and revision on the read model (`_projectionTombstones`).
+  - `create` keeps its plain not-exists guard, but on such an entity it first reads the key. If the key holds the entity's tombstone, `create` copies the tombstone's kept fields over the input, sets the revision one higher, and guards on that tombstone (`__edd_e__` and `__edd_removed__`).
+  - The transactional `create` does the same, through `Entity._overTombstone`.
+  - A late redelivery is still recognised as applied, so it can't remove the created row.
+- **Outbox ordering:** a duplicate can interleave (effect *n* re-delivered after *n + 1* started), so consumers deduplicate on `(streamId, version)`. This is documented.

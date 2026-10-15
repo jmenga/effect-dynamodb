@@ -535,4 +535,35 @@ describeConnected("EventStore multi-source projections (connected)", () => {
       ).toEqual([])
     }).pipe(provide),
   )
+
+  it.effect(
+    "an entity create over a tombstone keeps its checkpoints: a late redelivery stays applied",
+    () =>
+      Effect.gen(function* () {
+        yield* Orders.append(
+          { orderId: "recreate" },
+          [
+            new LineAdded({ shipmentId: "recreate", qty: 2 }),
+            new Closed({ shipmentId: "recreate" }),
+          ],
+          0,
+        )
+        const orders = tagged("order" as const, yield* Orders.read({ orderId: "recreate" }))
+        yield* ShipmentProjection.applyBatch(orders)
+        expect((yield* shipment("recreate"))!.__edd_e__).toBe("Shipment#tombstone")
+        yield* Shipments.create({
+          ...initial({ shipmentId: "recreate" }),
+          location: "manual",
+        }).asEffect()
+        const created = (yield* shipment("recreate"))!
+        expect(created).toMatchObject({
+          __edd_e__: "Shipment",
+          location: "manual",
+          checkpoints: { "order#recreate": 2 },
+        })
+        // The removal, redelivered late, is already applied: the created row stays.
+        yield* ShipmentProjection.applyBatch(orders)
+        expect((yield* shipment("recreate"))!.__edd_e__).toBe("Shipment")
+      }).pipe(provide),
+  )
 })
