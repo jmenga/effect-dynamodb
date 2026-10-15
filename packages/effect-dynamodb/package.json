@@ -42,6 +42,10 @@
     "./compression/zlib": {
       "types": "./dist/compression/zlib.d.ts",
       "import": "./dist/compression/zlib.js"
+    },
+    "./change-feed": {
+      "types": "./dist/change-feed/index.d.ts",
+      "import": "./dist/change-feed/index.js"
     }
   },
   "files": [
@@ -64,9 +68,16 @@
     "@effect-dynamodb/schema": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^4.0.0"
+    "effect": "^4.0.0",
+    "@aws-sdk/client-dynamodb-streams": "^3.1104.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-dynamodb-streams": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@aws-sdk/client-dynamodb-streams": "^3.1104.0",
     "@effect/vitest": "4.0.0",
     "@types/node": "^25.5.0",
     "effect": "4.0.0",
