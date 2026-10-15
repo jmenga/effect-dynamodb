@@ -16,24 +16,44 @@
  */
 
 import {
-  ConcurrentModification,
+  type ConcurrentModification,
   type ConditionalCheckFailed,
   type ItemNotFound,
+  type ProjectionSourceConflict,
   StreamRecordIdentifierMissing,
-  ValidationError,
+  type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { DateTime, Effect, Option, Pipeable, Result, Schedule, type Schema, Stream } from "effect"
+import {
+  Duration,
+  Effect,
+  Option,
+  Pipeable,
+  Result,
+  type Schedule,
+  type Schema,
+  Stream,
+} from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
 import * as Query from "../Query.js"
-import type { TableConfig } from "../Table.js"
-import {
-  asItem,
-  condition as entityCondition,
-  consistentRead as entityConsistentRead,
-} from "./EntityCombinators.js"
-import type { EntityGet, EntityPut, EntityPutImpl } from "./EntityOps.js"
+import type { Table, TableConfig } from "../Table.js"
+import type { EntityGet, EntityPut } from "./EntityOps.js"
 import { imageEntityType, type StreamImage } from "./Packed.js"
+import {
+  addressed,
+  type DrainResult,
+  type EngineConfig,
+  type EngineEntity,
+  type EngineSource,
+  type InstanceWork,
+  keyId,
+  makeEngine,
+  modelFields,
+  type OutboxMeta,
+  type RemoveRow,
+  type RowResult,
+  retrySchedule,
+} from "./ProjectionEngine.js"
 
 // ---------------------------------------------------------------------------
 // Read model
@@ -105,6 +125,7 @@ export interface ProjectionConfig<
   E,
   R,
   KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
+  O = never,
 > {
   /** The source stream. One projection reads one stream. */
   readonly stream: EventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any>
@@ -137,14 +158,16 @@ export interface ProjectionConfig<
   ) => ProjectionState<RM>
   /**
    * Apply one event. Return the state unchanged to ignore an event (the
-   * checkpoint still advances). A failure fails this row only, unless
-   * `terminal` accepts it. The library sets the checkpoint field after the
-   * fold; `evolve` need not.
+   * checkpoint still advances), or `EventStore.removeRow` to remove the row
+   * (with `removal`). A failure fails this row only, unless `terminal`
+   * accepts it. The library sets the checkpoint (and revision) after the
+   * fold; `evolve` need not. It runs again on every lost-race retry, so keep
+   * it free of side effects.
    */
   readonly evolve: (
     state: ProjectionState<RM>,
     event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
-  ) => Effect.Effect<ProjectionState<RM>, E, R>
+  ) => Effect.Effect<ProjectionState<RM> | RemoveRow, E, R>
   /** See {@link ProjectionCheckpoint}. */
   readonly checkpoint: ProjectionCheckpoint<ProjectionState<RM>>
   /**
@@ -185,6 +208,59 @@ export interface ProjectionConfig<
    * the row fails with `ConcurrentModification`.
    */
   readonly retry?: number | Schedule.Schedule<unknown, ConcurrentModification> | undefined
+  /**
+   * A numeric model field the library owns: every write sets it one higher
+   * and is conditioned on the value it read (`attribute_not_exists` when the
+   * row has none). It may be an existing write counter readers already use.
+   * With it, a write is guarded by the revision instead of the checkpoint, so
+   * a `rebuild` can't be undone by a concurrent writer. Required by `outbox`.
+   */
+  readonly revision?: CheckpointField<ProjectionState<RM>> | undefined
+  /**
+   * Allow `evolve` to remove the row (`EventStore.removeRow`): the library
+   * writes a tombstone at the row's key that keeps its checkpoint and
+   * revision — read as no row, by this projection and by the entity — so a
+   * redelivery can't recreate it. `ttl` lets DynamoDB expire tombstones; it
+   * must exceed the change feed's 24 hours plus any redelivery or replay
+   * window, or a very late event recreates the row.
+   */
+  readonly removal?: { readonly ttl?: Duration.Input | undefined } | undefined
+  /** Side effects committed with the row — see {@link ProjectionOutboxConfig}. */
+  readonly outbox?:
+    | ProjectionOutboxConfig<O, StreamEvent<TEvent, StreamMetadata<TMetadata>>, ProjectionState<RM>>
+    | undefined
+}
+
+/**
+ * An ordered, at-least-once outbox (#155). `effects(event, next, context)`
+ * returns the side effects an applied event produces (`next` is the row's
+ * state after it, `undefined` when it removed the row); they are written —
+ * encoded through `schema` — as outbox items in the same transaction as the
+ * row, so state and effects commit together. `drain` (or `deliver` on
+ * `applyBatch` / `processBatch`) hands them to a `deliver` function strictly
+ * in order per row, removing each only after it succeeds.
+ *
+ * Outbox items live in the row's own partition (sort key
+ * `<row sk>#outbox#<revision>#<n>`, `__edd_e__` `<entityType>#outbox`) — or
+ * in `table` when given (keyed by `keys`, default `pk` / `sk`). In the read
+ * model's table they show in its change stream and in full-table scans (not
+ * in the entity's reads, which filter on `__edd_e__`); a separate table keeps
+ * them out of both. `index` (a sparse index whose key attributes only outbox
+ * items carry) enables `drainPending`. A claim lasts `claimFor` (default 30
+ * seconds): a drainer that crashes after delivering leaves it to expire, and
+ * the effect is delivered again.
+ */
+export interface ProjectionOutboxConfig<O, Ev, S> {
+  readonly schema: Schema.Codec<O, any>
+  readonly effects: (
+    event: Ev,
+    next: S | undefined,
+    context: { readonly source: string; readonly streamId: string },
+  ) => ReadonlyArray<O>
+  readonly table?: Table<any, any> | undefined
+  readonly keys?: { readonly pk: string; readonly sk: string } | undefined
+  readonly index?: { readonly name: string; readonly pk: string; readonly sk: string } | undefined
+  readonly claimFor?: Duration.Input | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +301,8 @@ export interface ProjectionApplied<S, A, M, K = unknown, E = unknown> {
   readonly alreadyApplied: ReadonlyArray<StreamEvent<A, M>>
   /**
    * The row as written, or as read when nothing was left to apply.
-   * `Option.none()` when there is no row: every event was rejected.
+   * `Option.none()` when there is no row: every event was rejected, or the
+   * row is removed (`removed`).
    */
   readonly state: Option.Option<S>
   /**
@@ -233,6 +310,15 @@ export interface ProjectionApplied<S, A, M, K = unknown, E = unknown> {
    * version up to it has been considered for this row.
    */
   readonly version: number
+  /** The row is removed: a tombstone keeps its checkpoint (see `removal`). */
+  readonly removed: boolean
+  /** Outbox effects committed with this write. */
+  readonly enqueued: number
+  /**
+   * With `deliver`: the effect delivery stopped at — it stays pending, at the
+   * head of the row's outbox, for the next drain. The write itself succeeded.
+   */
+  readonly undelivered: Option.Option<{ readonly meta: OutboxMeta; readonly error: unknown }>
 }
 
 /** The outcome of one row in {@link ProjectionBatchResult}. */
@@ -273,9 +359,11 @@ export interface ProjectionCaughtUp<S, A, M, K = unknown, E = unknown> {
   readonly applied: ReadonlyArray<StreamEvent<A, M>>
   /** The events `evolve` rejected, in version order. */
   readonly rejected: ReadonlyArray<ProjectionRejected<A, M, E>>
-  /** The row — `Option.none()` when there is none. */
+  /** The row — `Option.none()` when there is none, or it is removed. */
   readonly state: Option.Option<S>
   readonly version: number
+  /** The row is removed (a tombstone). */
+  readonly removed: boolean
 }
 
 /** One row re-derived by {@link EventProjection.rebuild}. */
@@ -286,6 +374,8 @@ export interface ProjectionRebuiltRow<S, A, M, K = unknown, E = unknown> {
   /** The version of the row's last event. */
   readonly version: number
   readonly rejected: ReadonlyArray<ProjectionRejected<A, M, E>>
+  /** The fold ended removed: a tombstone was written. */
+  readonly removed: boolean
 }
 
 /** Result of {@link EventProjection.rebuild}. */
@@ -306,6 +396,13 @@ export type ProjectionError<RM, E> =
 export interface ApplyBatchOptions {
   /** Rows applied concurrently. Default `10`. */
   readonly concurrency?: number | "unbounded" | undefined
+  /**
+   * Drain each row that committed outbox effects right after its write,
+   * through this function (see {@link EventProjection.drain}). A delivery
+   * failure is reported in the outcome's `undelivered`; it never fails the
+   * row — the effects are committed, and stay pending for the next drain.
+   */
+  readonly deliver?: ((effect: any, meta: OutboxMeta) => Effect.Effect<void, any, any>) | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +672,7 @@ export interface EventProjection<
   K = unknown,
   E = unknown,
   I extends boolean = false,
+  O = never,
 > extends Pipeable.Pipeable {
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
@@ -671,6 +769,33 @@ export interface EventProjection<
     records: ReadonlyArray<Rec>,
     options: ProcessBatchOptions<Rec> & (IdentifyBySource | IdentifyWith<Rec>),
   ): Effect.Effect<ProcessBatchResult<S, A, M, Err, Rec, K, E>, StreamRecordIdentifierMissing, R>
+  /**
+   * Deliver a row's pending outbox effects (see `outbox`), strictly in order:
+   * claim the head item, `deliver` it, delete it, repeat — stopping at a
+   * failure (reported in `undelivered`, the effect left pending) or at a head
+   * another drainer holds. A crash after delivering leaves a claim that
+   * expires (`claimFor`), and the effect is delivered again: at least once.
+   */
+  drain<DE, DR>(
+    key: K,
+    deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, DE, DR>,
+  ): Effect.Effect<DrainResult<DE>, DynamoClientError | ValidationError, R | DR>
+
+  /**
+   * Drain every row with pending effects, found through the outbox's sparse
+   * `index` — the sweeper for rows that receive no further events.
+   */
+  drainPending<DE, DR>(
+    deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, DE, DR>,
+  ): Effect.Effect<
+    {
+      readonly delivered: number
+      readonly undelivered: ReadonlyArray<{ readonly meta: OutboxMeta; readonly error: DE }>
+    },
+    DynamoClientError | ValidationError,
+    R | DR
+  >
+
   /** A record shape of your own, read through `image` and `identifier`. */
   processBatch<Rec>(
     records: ReadonlyArray<Rec>,
@@ -682,42 +807,65 @@ export interface EventProjection<
 
 type AnyEvent = StreamEvent<unknown, unknown>
 
-/**
- * The projection's own lost-race signal: another writer advanced the row
- * between this call's read and its conditional write. Kept apart from a
- * `ConcurrentModification` that `evolve` or the read model's own write path
- * raises, which is not retried; mapped to `ConcurrentModification` when the
- * retries run out.
- */
-class LostRace {
-  constructor(readonly key: unknown) {}
+/** @internal Refusals shared by `projection` and `multiProjection` (`[EDD-9081]`). */
+export const refuseReadModel = (
+  label: string,
+  readModel: ProjectionReadModel,
+  options: {
+    readonly fields: ReadonlyArray<string>
+    readonly removal: boolean
+    readonly outbox: boolean
+    readonly revision: string | undefined
+  },
+): void => {
+  const refuse = (problem: string): never => {
+    throw new Error(`[EDD-9081] ${label}: ${problem}`)
+  }
+  if (readModel.versioned) {
+    refuse(
+      "the read model is `versioned`. The projection's checkpoint is the row's version, and a " +
+        "versioned put adds its own lock — use a plain entity with a numeric checkpoint field " +
+        "(and `revision` for a write counter).",
+    )
+  }
+  if (readModel.softDelete) {
+    refuse("the read model has `softDelete`; projections remove rows with `removal` tombstones.")
+  }
+  if (readModel.timeSeries) {
+    refuse("the read model is a `timeSeries` entity, written by `append`, not `put`.")
+  }
+  const declared = modelFields(readModel.model)
+  for (const f of options.fields) {
+    if (declared !== undefined && !declared.includes(f)) {
+      refuse(`"${f}" is not a field of the read model.`)
+    }
+  }
+  const multiItem = (readModel as { readonly _multiItemWriteFeatures?: ReadonlyArray<string> })
+    ._multiItemWriteFeatures
+  if ((options.removal || options.outbox) && multiItem !== undefined && multiItem.length > 0) {
+    refuse(
+      `\`${options.removal ? "removal" : "outbox"}\` writes the row's item itself, which a read ` +
+        `model with ${multiItem.join(", ")} can't take (its extra items would not be maintained).`,
+    )
+  }
+  if (options.outbox && options.revision === undefined) {
+    refuse("`outbox` orders a row's effects by its `revision`: declare one.")
+  }
 }
 
-/**
- * The default lost-race policy: up to 12 retries, jittered and growing from
- * 5 ms by 1.5× (about 1.3 s in all). Each round of a race has one winner, so
- * `n` concurrent writers of one row can take `n` rounds.
- */
-const defaultRetry: Schedule.Schedule<unknown, unknown> = Schedule.max([
-  Schedule.jittered(Schedule.exponential("5 millis", 1.5)),
-  Schedule.recurs(12),
-]) as Schedule.Schedule<unknown, unknown>
-
-/** The `retry` option as a schedule. */
-const retrySchedule = (
-  retry: number | Schedule.Schedule<unknown, ConcurrentModification> | undefined,
-): Schedule.Schedule<unknown, unknown> =>
-  (retry === undefined
-    ? defaultRetry
-    : typeof retry === "number"
-      ? Schedule.recurs(retry)
-      : retry) as Schedule.Schedule<unknown, unknown>
-
-/** The model's declared fields, when its schema exposes them. */
-const modelFields = (model: Schema.Top): ReadonlyArray<string> | undefined => {
-  const fields = (model as { readonly fields?: unknown }).fields
-  return typeof fields === "object" && fields !== null ? Object.keys(fields) : undefined
-}
+/** @internal An outbox config, resolved. */
+export const resolveOutbox = (outbox: ProjectionOutboxConfig<any, any, any> | undefined) =>
+  outbox === undefined
+    ? undefined
+    : {
+        schema: outbox.schema,
+        effects: outbox.effects,
+        table: outbox.table,
+        pk: outbox.keys?.pk ?? "pk",
+        sk: outbox.keys?.sk ?? "sk",
+        index: outbox.index,
+        claimFor: Duration.fromInputUnsafe(outbox.claimFor ?? "30 seconds"),
+      }
 
 /**
  * Define a change-feed projection of `stream` into `readModel` — rows keyed by
@@ -727,9 +875,10 @@ const modelFields = (model: Schema.Top): ReadonlyArray<string> | undefined => {
  * operations.
  *
  * The read model must be a plain entity: `versioned` (the checkpoint is the
- * version), `softDelete` (rows are never deleted) and `timeSeries` read
- * models throw `[EDD-9081]`, as do a checkpoint the model has no field for and
- * a non-integer offset.
+ * version), `softDelete` (removal is `removal` tombstones) and `timeSeries`
+ * read models throw `[EDD-9081]`, as do a field the model lacks, a
+ * non-integer offset, `removal` / `outbox` on a read model with `unique`
+ * constraints, and `outbox` without `revision`.
  *
  * @example
  * ```ts
@@ -751,8 +900,9 @@ export const projection = <
   E = never,
   R = never,
   KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
+  O = never,
 >(
-  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R, KR>,
+  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R, KR, O>,
 ): EventProjection<
   ProjectionState<RM>,
   TEvent,
@@ -762,7 +912,8 @@ export const projection = <
   R | DynamoClient | TableConfig,
   ProjectionKey<RM>,
   E,
-  [Extract<KR, Option.Option<unknown>>] extends [never] ? false : true
+  [Extract<KR, Option.Option<unknown>>] extends [never] ? false : true,
+  O
 > => {
   type S = ProjectionState<RM>
   type K = ProjectionKey<RM>
@@ -770,304 +921,94 @@ export const projection = <
   type Err = ProjectionError<RM, E>
   type Req = R | DynamoClient | TableConfig
   type Id = StreamIdInput<TStreamIdFields>
-  type Rejected = ProjectionRejected<TEvent, StreamMetadata<TMetadata>, E>
   type Applied = ProjectionApplied<S, TEvent, StreamMetadata<TMetadata>, K, E>
   type Outcome = ProjectionOutcome<S, TEvent, StreamMetadata<TMetadata>, Err, K, E>
-  /** A row as read: the state `evolve` folds onto, and the `createdAt` a write carries over. */
-  type Row = { readonly state: S; readonly createdAt: unknown }
 
   const { stream, readModel } = config
   const label = `EventStore.projection("${stream.streamName}" → "${readModel.entityType}")`
-  const refuse = (problem: string): never => {
-    throw new Error(`[EDD-9081] ${label}: ${problem}`)
-  }
-  if (readModel.versioned) {
-    refuse(
-      "the read model is `versioned`. The projection's checkpoint is the row's version, and a " +
-        "versioned put adds its own lock — use a plain entity with a numeric checkpoint field.",
-    )
-  }
-  if (readModel.softDelete) {
-    refuse("the read model has `softDelete`; a projection never deletes its rows.")
-  }
-  if (readModel.timeSeries) {
-    refuse("the read model is a `timeSeries` entity, written by `append`, not `put`.")
-  }
   const field = (
     typeof config.checkpoint === "string" ? config.checkpoint : config.checkpoint.field
   ) as string
   const offset = typeof config.checkpoint === "string" ? 0 : (config.checkpoint.offset ?? 0)
-  const fields = modelFields(readModel.model)
-  if (fields !== undefined && !fields.includes(field)) {
-    refuse(`the checkpoint field "${field}" is not a field of the read model.`)
-  }
+  refuseReadModel(label, readModel, {
+    fields: [field, ...(config.revision === undefined ? [] : [config.revision as string])],
+    removal: config.removal !== undefined,
+    outbox: config.outbox !== undefined,
+    revision: config.revision as string | undefined,
+  })
   if (!Number.isInteger(offset)) {
-    refuse(`the checkpoint offset ${offset} is not an integer.`)
-  }
-  const schedule = retrySchedule(config.retry)
-  const createdAtField = readModel.systemFields.createdAt
-
-  /** A synchronous user callback, its throw this row's `ValidationError`. */
-  const call = <X>(name: string, f: () => X): Effect.Effect<X, ValidationError> =>
-    Effect.try({
-      try: f,
-      catch: (cause) =>
-        new ValidationError({
-          entityType: readModel.entityType,
-          operation: `EventStore.projection.${name}`,
-          cause,
-        }),
-    })
-
-  /**
-   * The row, read strongly consistent — with its `Hidden` fields (the default
-   * decode drops them, and the whole-row `put` needs them back) and its
-   * `createdAt`; none when there is none.
-   */
-  const readRow = (key: K): Effect.Effect<Option.Option<Row>, Err, Req> =>
-    (
-      asItem(entityConsistentRead(readModel.get(key))) as Effect.Effect<
-        Record<string, unknown>,
-        ItemNotFound | Err,
-        Req
-      >
-    ).pipe(
-      Effect.map((item) => {
-        let state: Record<string, unknown> = item
-        if (fields !== undefined) {
-          state = {}
-          for (const f of fields) if (item[f] !== undefined) state[f] = item[f]
-        }
-        return Option.some({
-          state: (readModel._attachPrototype?.(state) ?? state) as S,
-          createdAt: createdAtField === null ? undefined : item[createdAtField],
-        })
-      }),
-      Effect.catchTag("ItemNotFound", () => Effect.succeed(Option.none<Row>())),
-    ) as Effect.Effect<Option.Option<Row>, Err, Req>
-
-  /** The stream version a row is at — its checkpoint, offset removed. */
-  const versionOf = (row: Option.Option<Row>): number =>
-    Option.isSome(row) ? Number((row.value.state as Record<string, unknown>)[field]) - offset : 0
-
-  /**
-   * Write the folded state at `version`, conditioned on the row still being at
-   * the version read (`create` when there was no row), carrying its
-   * `createdAt` over. A failed condition is a lost race, which the caller's
-   * retry re-reads after.
-   */
-  const writeRow = (
-    streamId: Id,
-    key: K,
-    state: S,
-    version: number,
-    row: Option.Option<Row>,
-  ): Effect.Effect<S, Err | LostRace, Req> =>
-    Effect.gen(function* () {
-      const checkpointed = { ...(state as object), [field]: version + offset } as S
-      const written =
-        config.toItem === undefined
-          ? checkpointed
-          : yield* call("toItem", () => config.toItem!(checkpointed, { streamId, key }))
-      const item: Record<string, unknown> = { ...(written as object), [field]: version + offset }
-      if (Option.isNone(row)) {
-        return yield* (
-          readModel.create(item).asEffect() as Effect.Effect<S, Err | ConditionalCheckFailed, Req>
-        ).pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.fail(new LostRace(key))))
-      }
-      // A whole-row `put` stamps a new `createdAt` unless it is given the row's.
-      const op = entityCondition(readModel.put(item), {
-        eq: { [field]: versionOf(row) + offset },
-      }) as unknown as EntityPutImpl<S, unknown, Err | ConditionalCheckFailed, Req>
-      const createdAt = row.value.createdAt
-      return yield* op
-        ._builder("model", {
-          condition: op._condition,
-          withVectors: op._withVectors,
-          putKind: op._putKind,
-          createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
-        })
-        .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.fail(new LostRace(key))))
-    }) as Effect.Effect<S, Err | LostRace, Req>
-
-  /**
-   * Every version from `from` to the last of `events` was delivered: `events`
-   * themselves, or `delivered` (the batch's other events of the stream, which
-   * are not this row's).
-   */
-  const coveredFrom = (
-    events: ReadonlyArray<AnyEvent>,
-    from: number,
-    delivered: ReadonlySet<number>,
-  ): boolean => {
-    const own = new Set(events.map((event) => event.version))
-    const last = events[events.length - 1]!.version
-    for (let version = from; version <= last; version++) {
-      if (!own.has(version) && !delivered.has(version)) return false
-    }
-    return true
+    throw new Error(`[EDD-9081] ${label}: the checkpoint offset ${offset} is not an integer.`)
   }
 
-  /** `events` is exactly `from, from + 1, …`. */
-  const contiguousFrom = (events: ReadonlyArray<AnyEvent>, from: number): boolean =>
-    events.every((event, i) => event.version === from + i)
+  const source: EngineSource = {
+    name: "projection",
+    stream: stream as unknown as EngineSource["stream"],
+    key: config.key as EngineSource["key"],
+    evolve: (state, event) => config.evolve(state, event),
+    mode: "fold",
+    terminal: config.terminal as EngineSource["terminal"],
+  }
+  const engine = makeEngine({
+    label,
+    readModel: readModel as unknown as EngineEntity,
+    sources: [source],
+    initial: (_key, context) => config.initial(context.streamId, context.event),
+    checkpoints: { kind: "scalar", field, offset },
+    revision: config.revision as string | undefined,
+    toItem: config.toItem as EngineConfig["toItem"],
+    toItemContext: (key, work) => ({ streamId: work[0]?.streamId, key }),
+    retry: retrySchedule(config.retry),
+    removal:
+      config.removal === undefined
+        ? undefined
+        : {
+            ttl:
+              config.removal.ttl === undefined
+                ? undefined
+                : Duration.fromInputUnsafe(config.removal.ttl),
+          },
+    outbox: resolveOutbox(config.outbox),
+  })
 
-  /** Retry lost races under the policy; once it is spent, `ConcurrentModification`. */
-  const withRetry = <X>(
-    attempt: Effect.Effect<X, Err | LostRace, Req>,
-  ): Effect.Effect<X, Err, Req> =>
-    Effect.retry(attempt, {
-      schedule,
-      while: (error: unknown) => error instanceof LostRace,
-    }).pipe(
-      Effect.mapError((error) =>
-        error instanceof LostRace
-          ? new ConcurrentModification({
-              entityType: readModel.entityType,
-              key: error.key as Record<string, unknown>,
-              attributes: [field],
-              current: Option.none(),
-            })
-          : error,
-      ),
-    ) as Effect.Effect<X, Err, Req>
-
-  // Unreachable for a stream written by `append` (a contiguity-checked
-  // transaction): the store holds every version below a delivered one.
-  const gapError = (streamId: string, from: number, to: number) =>
-    Effect.fail(
-      new ValidationError({
-        entityType: stream.eventMarker,
-        operation: "EventStore.projection",
-        cause:
-          `Stream ${JSON.stringify(streamId)} is missing events between versions ${from} and ` +
-          `${to}: a strongly consistent read did not return them. Was the stream written ` +
-          "outside `append`?",
-      }),
-    )
-
-  /** A key's identity: its fields, sorted, as JSON. */
-  const keyId = (key: unknown): string =>
-    JSON.stringify(
-      Object.entries(key as Record<string, unknown>).sort(([a], [b]) =>
-        a < b ? -1 : a > b ? 1 : 0,
-      ),
-    )
-
-  /** The row an event addresses — none when `key` says it addresses none. */
   const keyOf = (streamId: Id, event: Ev): Effect.Effect<Option.Option<K>, ValidationError> =>
-    call("key", () => {
-      const key = config.key(streamId, event)
-      return Option.isOption(key) ? (key as Option.Option<K>) : Option.some(key as K)
-    })
+    engine.call("key", () => addressed<K>(config.key(streamId, event)))
 
-  /**
-   * Fold `events` onto `row` (or a new row), skipping the events `terminal`
-   * rejects. `state` stays none while no event has been applied to a new row.
-   */
-  const foldRow = (
-    streamId: Id,
-    row: Option.Option<S>,
-    events: ReadonlyArray<Ev>,
-  ): Effect.Effect<
-    { state: Option.Option<S>; applied: Array<Ev>; rejected: Array<Rejected> },
-    Err,
-    Req
-  > =>
-    Effect.gen(function* () {
-      let state = row
-      const applied: Array<Ev> = []
-      const rejected: Array<Rejected> = []
-      for (const event of events) {
-        const base = Option.isSome(state)
-          ? state.value
-          : yield* call("initial", () => config.initial(streamId, event))
-        const result = yield* Effect.result(config.evolve(base, event))
-        if (Result.isSuccess(result)) {
-          state = Option.some(result.success)
-          applied.push(event)
-        } else if (config.terminal?.(result.failure) === true) {
-          rejected.push({ event, error: result.failure })
-        } else {
-          return yield* Effect.fail(result.failure as Err)
-        }
-      }
-      return { state, applied, rejected }
-    })
-
-  /**
-   * One row. `events` are the batch's events for it, sorted and deduplicated;
-   * `undefined` for a catch-up to `top`. `delivered` holds the versions of
-   * every event of the stream instance in the batch — this row's, other rows'
-   * and those addressing no row — so a run they cover needs no read.
-   */
-  const applyRow = (
-    streamIdStr: string,
-    streamId: Id,
-    key: K,
-    events: ReadonlyArray<Ev> | undefined,
-    top: number,
-    delivered: ReadonlySet<number> = new Set(),
-  ): Effect.Effect<Applied, Err, Req> => {
-    const id = keyId(key)
-    const attempt = Effect.gen(function* () {
-      const row = yield* readRow(key)
-      const at = versionOf(row)
-      const alreadyApplied = events?.filter((e) => e.version <= at) ?? []
-      const pending = events?.filter((e) => e.version > at)
-      const done = (rejected: ReadonlyArray<Rejected>): Applied => ({
-        streamId: streamIdStr,
-        key,
-        applied: [],
-        rejected,
-        alreadyApplied,
-        state: Option.map(row, (r) => r.state),
-        version: at,
-      })
-      if (pending !== undefined ? pending.length === 0 : at >= top) return done([])
-      let run: ReadonlyArray<Ev>
-      if (pending !== undefined && coveredFrom(pending, at + 1, delivered)) {
-        run = pending
-      } else {
-        // Every version from the checkpoint to the highest one wanted — the
-        // other rows' events among them — must be there; only this row's are
-        // folded. The read stops at that version.
-        const upTo = pending === undefined ? top : pending[pending.length - 1]!.version
-        const read = (yield* stream.readFrom(streamId, at, {
-          consistentRead: true,
-          toVersion: upTo,
-        })) as Array<Ev>
-        if (!contiguousFrom(read, at + 1) || read.length < upTo - at) {
-          return yield* gapError(streamIdStr, at + 1, upTo)
-        }
-        run = []
-        for (const event of read) {
-          const key = yield* keyOf(streamId, event)
-          if (Option.isSome(key) && keyId(key.value) === id) (run as Array<Ev>).push(event)
-        }
-      }
-      if (run.length === 0) return done([])
-      const folded = yield* foldRow(
-        streamId,
-        Option.map(row, (r) => r.state),
-        run,
-      )
-      // Nothing but rejections for a row that does not exist: write nothing.
-      if (Option.isNone(folded.state)) return done(folded.rejected)
-      const version = run[run.length - 1]!.version
-      const state = yield* writeRow(streamId, key, folded.state.value, version, row)
-      return {
-        streamId: streamIdStr,
-        key,
-        applied: folded.applied,
-        rejected: folded.rejected,
-        alreadyApplied,
-        state: Option.some(state),
-        version,
-      }
-    })
-    return withRetry(attempt)
+  /** A row's engine result, as this projection reports it. */
+  const appliedOf = (streamIdStr: string, result: RowResult): Applied => {
+    const instance = result.instances[0]
+    return {
+      streamId: streamIdStr,
+      key: result.key as K,
+      applied: (instance?.applied ?? []) as Applied["applied"],
+      rejected: (instance?.rejected ?? []) as Applied["rejected"],
+      alreadyApplied: (instance?.alreadyApplied ?? []) as Applied["alreadyApplied"],
+      state: result.state as Option.Option<S>,
+      version: instance?.version ?? 0,
+      removed: result.removed,
+      enqueued: result.enqueued,
+      undelivered: Option.none(),
+    }
   }
+
+  /** After a write with effects, drain the row when the caller passed `deliver`. */
+  const deliverAfter = (
+    applied: Applied,
+    deliver: ApplyBatchOptions["deliver"],
+  ): Effect.Effect<Applied, Err, Req> =>
+    deliver === undefined || config.outbox === undefined || applied.enqueued === 0
+      ? Effect.succeed(applied)
+      : (
+          engine.drain(applied.key, deliver as never) as Effect.Effect<
+            DrainResult<unknown>,
+            Err,
+            Req
+          >
+        ).pipe(
+          Effect.map((drained) => ({
+            ...applied,
+            undelivered: drained.undelivered as Applied["undelivered"],
+          })),
+        )
 
   const applyBatch = (
     events: ReadonlyArray<Ev>,
@@ -1098,19 +1039,19 @@ export const projection = <
         // whole stream instance: its events can't be placed in rows.
         const rows = yield* Effect.result(
           Effect.gen(function* () {
-            const streamId = yield* stream.parseStreamId(streamIdStr)
+            const streamId = (yield* stream.parseStreamId(streamIdStr)) as Id
             const byRow = new Map<string, { key: K; positions: Array<number>; events: Array<Ev> }>()
             for (const [position, event] of group) {
-              const addressed = yield* keyOf(streamId, event)
-              if (Option.isNone(addressed)) {
+              const key = yield* keyOf(streamId, event)
+              if (Option.isNone(key)) {
                 ignored.push(position)
                 continue
               }
-              const key = addressed.value
-              const id = keyId(key)
+              const id = keyId(key.value)
               const row = byRow.get(id)
-              if (row === undefined) byRow.set(id, { key, positions: [position], events: [event] })
-              else {
+              if (row === undefined) {
+                byRow.set(id, { key: key.value, positions: [position], events: [event] })
+              } else {
                 row.positions.push(position)
                 row.events.push(event)
               }
@@ -1139,10 +1080,22 @@ export const projection = <
           const ordered = [...row.events]
             .sort((a, b) => a.version - b.version)
             .filter((e, i, sorted) => i === 0 || sorted[i - 1]!.version !== e.version)
+          const work: InstanceWork = {
+            source,
+            streamIdStr,
+            streamId,
+            events: ordered as ReadonlyArray<AnyEvent>,
+            top: 0,
+            delivered,
+          }
           tasks.push({
             first: row.positions[0]!,
             run: Effect.result(
-              applyRow(streamIdStr, streamId, row.key, ordered, 0, delivered),
+              (engine.applyRow(row.key, [work]) as Effect.Effect<RowResult, Err, Req>).pipe(
+                Effect.flatMap((result) =>
+                  deliverAfter(appliedOf(streamIdStr, result), options?.deliver),
+                ),
+              ),
             ).pipe(
               Effect.map(
                 (result): Outcome =>
@@ -1180,8 +1133,8 @@ export const projection = <
    */
   const apply = (event: Ev): Effect.Effect<Applied | Option.Option<Applied>, Err, Req> =>
     Effect.gen(function* () {
-      const streamId = yield* stream.parseStreamId(event.streamId)
-      const key = yield* call("key", () => config.key(streamId, event))
+      const streamId = (yield* stream.parseStreamId(event.streamId)) as Id
+      const key = yield* engine.call("key", () => config.key(streamId, event))
       const optional = Option.isOption(key)
       if (optional && Option.isNone(key)) return Option.none<Applied>()
       const { outcomes } = yield* applyBatch([event])
@@ -1216,16 +1169,34 @@ export const projection = <
         Stream.runHead,
       )
       if (Option.isNone(latest)) {
-        return { key: Option.none(), applied: [], rejected: [], state: Option.none(), version: 0 }
+        return {
+          key: Option.none(),
+          applied: [],
+          rejected: [],
+          state: Option.none(),
+          version: 0,
+          removed: false,
+        }
       }
       const [head, key] = latest.value
-      const result = yield* applyRow(joinStreamId(streamId), streamId, key, undefined, head.version)
+      const result = (yield* engine.applyRow(key, [
+        {
+          source,
+          streamIdStr: joinStreamId(streamId),
+          streamId,
+          events: undefined,
+          top: head.version,
+          delivered: new Set(),
+        },
+      ])) as RowResult
+      const applied = appliedOf(joinStreamId(streamId), result)
       return {
         key: Option.some(key),
-        applied: result.applied,
-        rejected: result.rejected,
-        state: result.state,
-        version: result.version,
+        applied: applied.applied,
+        rejected: applied.rejected,
+        state: applied.state,
+        version: applied.version,
+        removed: applied.removed,
       }
     }) as Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req>
 
@@ -1234,35 +1205,44 @@ export const projection = <
   ): Effect.Effect<ProjectionRebuilt<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
       const events = (yield* stream.read(streamId, { consistentRead: true })) as Array<Ev>
+      const delivered = new Set(events.map((e) => e.version))
       const rows = new Map<string, { key: K; events: Array<Ev> }>()
       for (const event of events) {
-        const addressed = yield* keyOf(streamId, event)
-        if (Option.isNone(addressed)) continue
-        const key = addressed.value
-        const id = keyId(key)
+        const key = yield* keyOf(streamId, event)
+        if (Option.isNone(key)) continue
+        const id = keyId(key.value)
         const row = rows.get(id)
-        if (row === undefined) rows.set(id, { key, events: [event] })
+        if (row === undefined) rows.set(id, { key: key.value, events: [event] })
         else row.events.push(event)
       }
       const rebuilt = yield* Effect.forEach(
         [...rows.values()],
         ({ key, events: rowEvents }) =>
-          withRetry(
-            Effect.gen(function* () {
-              const row = yield* readRow(key)
-              // From `initial`: the row's current state is ignored.
-              const folded = yield* foldRow(streamId, Option.none(), rowEvents)
-              if (Option.isNone(folded.state)) {
-                return {
-                  key,
-                  state: Option.map(row, (r) => r.state),
-                  version: versionOf(row),
-                  rejected: folded.rejected,
-                }
+          (
+            engine.applyRow(
+              key,
+              [
+                {
+                  source,
+                  streamIdStr: joinStreamId(streamId),
+                  streamId,
+                  events: rowEvents as ReadonlyArray<AnyEvent>,
+                  top: rowEvents[rowEvents.length - 1]!.version,
+                  delivered,
+                },
+              ],
+              { fromScratch: true },
+            ) as Effect.Effect<RowResult, Err, Req>
+          ).pipe(
+            Effect.map((result) => {
+              const applied = appliedOf(joinStreamId(streamId), result)
+              return {
+                key,
+                state: applied.state,
+                version: applied.version,
+                rejected: applied.rejected,
+                removed: applied.removed,
               }
-              const version = rowEvents[rowEvents.length - 1]!.version
-              const state = yield* writeRow(streamId, key, folded.state.value, version, row)
-              return { key, state: Option.some(state), version, rejected: folded.rejected }
             }),
           ),
         { concurrency: 10 },
@@ -1279,7 +1259,7 @@ export const projection = <
         name: "projection",
         stream: stream as unknown as DecodableStream,
         decode: (image: StreamImage) => stream.decodeStreamImage(image),
-        applyBatch,
+        applyBatch: (events, applyOptions) => applyBatch(events as ReadonlyArray<Ev>, applyOptions),
       },
     ]).pipe(
       Effect.map(
@@ -1289,6 +1269,11 @@ export const projection = <
             outcomes: outcomes.projection as ReadonlyArray<Outcome>,
           }) satisfies ProcessBatchResult<S, TEvent, StreamMetadata<TMetadata>, Err, Rec, K, E>,
       ),
+    )
+
+  const outboxRequired = (operation: string) =>
+    Effect.die(
+      new Error(`[EDD-9081] ${label}.${operation}: the projection declares no \`outbox\`.`),
     )
 
   return {
@@ -1305,6 +1290,10 @@ export const projection = <
     catchUp,
     rebuild,
     processBatch,
+    drain: (key: K, deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+      config.outbox === undefined ? outboxRequired("drain") : engine.drain(key, deliver),
+    drainPending: (deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+      config.outbox === undefined ? outboxRequired("drainPending") : engine.drainPending(deliver),
   } as unknown as EventProjection<
     S,
     TEvent,
@@ -1313,7 +1302,9 @@ export const projection = <
     Err,
     Req,
     K,
-    E
+    E,
+    [Extract<KR, Option.Option<unknown>>] extends [never] ? false : true,
+    O
   >
 }
 
@@ -1322,17 +1313,28 @@ export const projection = <
 // ---------------------------------------------------------------------------
 
 /** Any projection, bound or unbound. */
-export type AnyEventProjection = EventProjection<any, any, any, any, any, any, any, any, any>
+export type AnyEventProjection = EventProjection<any, any, any, any, any, any, any, any, any, any>
 
 /** A projection's outcomes. */
 export type ProjectionOutcomesOf<P> =
-  P extends EventProjection<infer S, infer A, any, infer M, infer Err, any, infer K, infer E, any>
+  P extends EventProjection<
+    infer S,
+    infer A,
+    any,
+    infer M,
+    infer Err,
+    any,
+    infer K,
+    infer E,
+    any,
+    any
+  >
     ? ReadonlyArray<ProjectionOutcome<S, A, M, Err, K, E>>
     : never
 
 /** A projection's requirements. */
 export type ProjectionRequirementsOf<P> =
-  P extends EventProjection<any, any, any, any, any, infer R, any, any, any> ? R : never
+  P extends EventProjection<any, any, any, any, any, infer R, any, any, any, any> ? R : never
 
 /** Result of {@link processBatch}. */
 export interface ProcessBatchesResult<

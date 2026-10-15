@@ -5893,9 +5893,10 @@ export const bindProjection = <
   K,
   E,
   I extends boolean,
+  O,
 >(
-  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I>,
-): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I>, never, R> =>
+  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I, O>,
+): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>, never, R> =>
   Effect.gen(function* () {
     const ctx = yield* Effect.context<R>()
     // The codec check `bind` makes, against the registry captured here.
@@ -5911,6 +5912,33 @@ export const bindProjection = <
       applyBatch: (events, options) => provide(projection.applyBatch(events, options)),
       apply: (event) => provide(projection.apply(event)),
       catchUp: (streamId) => provide(projection.catchUp(streamId)),
+      // `deliver`'s own requirements stay with the caller.
+      drain: ((key: K, deliver: never) =>
+        provide(projection.drain(key, deliver) as never)) as unknown as EventProjection<
+        S,
+        A,
+        TStreamIdFields,
+        M,
+        Err,
+        never,
+        K,
+        E,
+        I,
+        O
+      >["drain"],
+      drainPending: ((deliver: never) =>
+        provide(projection.drainPending(deliver) as never)) as unknown as EventProjection<
+        S,
+        A,
+        TStreamIdFields,
+        M,
+        Err,
+        never,
+        K,
+        E,
+        I,
+        O
+      >["drainPending"],
       // A multi-projection batch decodes through this, under the captured context.
       [ProjectionDecode]: (image: StreamImage) => provide(projection[ProjectionDecode](image)),
       rebuild: (streamId) => provide(projection.rebuild(streamId)),
@@ -5925,7 +5953,8 @@ export const bindProjection = <
         never,
         K,
         E,
-        I
+        I,
+        O
       >["processBatch"],
-    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I>
+    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>
   })

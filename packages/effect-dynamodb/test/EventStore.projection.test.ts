@@ -685,6 +685,7 @@ describe("EventStore.projection — catchUp and rebuild", () => {
         rejected: [],
         state: Option.none(),
         version: 0,
+        removed: false,
       })
       expect(calls.putItem).toBe(0)
     }).pipe(Effect.provide(TestLayer)),
