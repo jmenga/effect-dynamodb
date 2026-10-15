@@ -20,7 +20,7 @@ import {
 } from "@aws-sdk/client-dynamodb-streams"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { classifyStreamsError, fromSdkClient } from "../src/change-feed/DynamoStreamsClient.js"
 import {
@@ -66,6 +66,10 @@ class FakeStreams {
   readonly expireNext = new Set<string>()
   /** `GetRecords` calls to throttle (`LimitExceededException`) before serving. */
   throttle = 0
+  /** `GetShardIterator` calls, per shard, to answer without an iterator. */
+  readonly noIterator = new Map<string, number>()
+  /** Shards dropped from the stream when answered without an iterator. */
+  readonly removeOnIterator = new Set<string>()
   private seq = 0
 
   addShard(id: string, parent?: string): this {
@@ -96,6 +100,12 @@ class FakeStreams {
         },
       })
     }
+    return this
+  }
+
+  /** Drop a shard from the stream, as retention does 24 hours after it closes. */
+  remove(shardId: string): this {
+    this.shards.splice(this.shards.indexOf(this.shard(shardId)), 1)
     return this
   }
 
@@ -159,6 +169,12 @@ class FakeStreams {
       this.iteratorRequests.push(input)
       const shard = this.shard(input.ShardId!)
       this.log.push(`iterator:${shard.id}:${input.ShardIteratorType}`)
+      const misses = this.noIterator.get(shard.id) ?? 0
+      if (misses > 0) {
+        this.noIterator.set(shard.id, misses - 1)
+        if (this.removeOnIterator.delete(shard.id)) this.remove(shard.id)
+        return {}
+      }
       const seq = input.SequenceNumber === undefined ? undefined : Number(input.SequenceNumber)
       if (seq !== undefined && seq < shard.trimmedBelow) {
         throw awsError("TrimmedDataAccessException")
@@ -239,6 +255,32 @@ const collect = (options: ChangeFeedOptions, take?: number) => {
 }
 
 const feedId = { streamArn: STREAM_ARN, consumer: "default" }
+
+/** The typed failure of an exit, if any. */
+const failureOf = (exit: Exit.Exit<unknown, unknown>): unknown =>
+  Exit.isFailure(exit)
+    ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: unknown } | undefined)?.error
+    : undefined
+
+/** A store whose commits are recorded (`finished` for a `Finished` checkpoint). */
+const recording = (store: CheckpointStoreService, fail?: (n: number) => boolean) => {
+  const committed: Array<string> = []
+  let n = 0
+  const spy: CheckpointStoreService = {
+    ...store,
+    commit: (feed, shardId, checkpoint) =>
+      Effect.suspend(() => {
+        const label = checkpoint._tag === "Sequence" ? checkpoint.sequenceNumber : "finished"
+        if (fail?.(++n) === true) {
+          committed.push(`failed:${label}`)
+          return Effect.fail(new CheckpointStoreError({ operation: "commit", cause: "blip" }))
+        }
+        committed.push(label)
+        return store.commit(feed, shardId, checkpoint)
+      }),
+  }
+  return { committed, spy }
+}
 
 /** Let the fake's promises settle (they run outside the test clock). */
 const flush = Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
@@ -580,6 +622,26 @@ describe("changeFeed", () => {
       }),
     )
 
+    it.live("re-reads the whole batch when any identifier names no record", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 5).close("s1")
+        fake.status = "DISABLED"
+        const { committed, spy } = recording(CheckpointStore.makeMemory())
+        const { seen, feed } = failing((batch) => [
+          "bogus",
+          batch.records[3]!.dynamodb!.SequenceNumber!,
+          batch.records[2]!.dynamodb!.SequenceNumber!,
+        ])
+        yield* Stream.runDrain(feed).pipe(Effect.provide(layerOf(fake, spy)))
+        expect(seen).toEqual([
+          [1, 2, 3, 4, 5],
+          [1, 2, 3, 4, 5],
+        ])
+        // The checkpoint never moved to 2.
+        expect(committed).toEqual([seqOf(5), "finished"])
+      }),
+    )
+
     it.live("only the first acknowledgement of a batch counts", () =>
       Effect.gen(function* () {
         const fake = new FakeStreams().addShard("s1").put("s1", 2).close("s1")
@@ -599,6 +661,204 @@ describe("changeFeed", () => {
           Effect.provide(layerOf(fake)),
         )
         expect(sequencesOf(batches)).toEqual([1, 2])
+      }),
+    )
+  })
+
+  describe("acknowledgement failures", () => {
+    it.live("a commit whose write failed writes again when retried", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 2).close("s1")
+        fake.status = "DISABLED"
+        const store = CheckpointStore.makeMemory()
+        const { committed, spy } = recording(store, (n) => n === 1)
+        const errors: Array<string> = []
+        const batches = yield* changeFeed({ streamArn: STREAM_ARN, batchSize: 1, ...fast }).pipe(
+          Stream.mapEffect((batch) =>
+            batch.commit().pipe(
+              Effect.tapError((e) => Effect.sync(() => errors.push(e._tag))),
+              Effect.retry({ times: 2 }),
+              Effect.as(batch),
+            ),
+          ),
+          Stream.runCollect,
+          Effect.provide(layerOf(fake, spy)),
+        )
+        expect(errors).toEqual(["CheckpointStoreError"])
+        expect(sequencesOf(batches)).toEqual([1, 2])
+        expect(committed).toEqual([`failed:${seqOf(1)}`, seqOf(1), seqOf(2), "finished"])
+        expect((yield* store.load(feedId)).get("s1")).toEqual({ _tag: "Finished" })
+      }),
+    )
+
+    it.live(
+      "a failed complete() writes again when retried, then later acknowledgements are no-ops",
+      () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1").put("s1", 3).close("s1")
+          fake.status = "DISABLED"
+          const store = CheckpointStore.makeMemory()
+          const { committed, spy } = recording(store, (n) => n === 1)
+          let first = true
+          const seen: Array<Array<number>> = []
+          yield* changeFeed({ streamArn: STREAM_ARN, ...fast }).pipe(
+            Stream.mapEffect((batch) =>
+              Effect.gen(function* () {
+                seen.push(batch.records.map((r) => Number(r.dynamodb!.SequenceNumber)))
+                if (!first) return yield* batch.commit()
+                first = false
+                const response = {
+                  batchItemFailures: [
+                    { itemIdentifier: batch.records[2]!.dynamodb!.SequenceNumber! },
+                  ],
+                }
+                yield* batch.complete(response).pipe(Effect.retry({ times: 1 }))
+                // Settled: a later acknowledgement writes nothing.
+                yield* batch.commit()
+              }),
+            ),
+            Stream.runDrain,
+            Effect.provide(layerOf(fake, spy)),
+          )
+          expect(seen).toEqual([[1, 2, 3], [3]])
+          expect(committed).toEqual([`failed:${seqOf(2)}`, seqOf(2), seqOf(3), "finished"])
+        }),
+    )
+
+    it.live("a failed commit that is not retried fails the feed instead of hanging", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 2)
+        const { spy } = recording(CheckpointStore.makeMemory(), () => true)
+        const exit = yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake, spy)),
+          Effect.exit,
+        )
+        expect(failureOf(exit)).toMatchObject({ _tag: "CheckpointStoreError" })
+      }),
+    )
+  })
+
+  describe("trimmed lineage at startup", () => {
+    it.live("fails when a checkpointed shard has left the stream", () =>
+      Effect.gen(function* () {
+        // p was being read; downtime past retention dropped it, leaving c.
+        const fake = new FakeStreams().addShard("p").addShard("c", "p").put("p", 3).put("c", 2)
+        fake.close("p").remove("p")
+        const store = CheckpointStore.makeMemory()
+        yield* store.commit(feedId, "p", { _tag: "Sequence", sequenceNumber: seqOf(1) })
+        const exit = yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake, store)),
+          Effect.exit,
+        )
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ChangeFeedTrimmed",
+          shardId: "p",
+          sequenceNumber: seqOf(1),
+        })
+        expect(fake.iteratorRequests).toEqual([])
+      }),
+    )
+
+    it.live("fails when an unread shard's parent has left the stream unfinished", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams()
+          .addShard("other")
+          .addShard("p")
+          .addShard("c", "p")
+          .put("p", 1)
+          .put("c", 1)
+        fake.close("p").remove("p")
+        const store = CheckpointStore.makeMemory()
+        // The consumer has checkpoints, but none for p or c.
+        yield* store.commit(feedId, "other", { _tag: "Finished" })
+        const exit = yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake, store)),
+          Effect.exit,
+        )
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ChangeFeedTrimmed",
+          shardId: "p",
+          sequenceNumber: undefined,
+        })
+      }),
+    )
+
+    it.live("a fresh consumer owes nothing to parents already gone, and remembers so", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("p").addShard("c", "p").put("p", 1).put("c", 2)
+        fake.close("p").remove("p")
+        const store = CheckpointStore.makeMemory()
+        const first = yield* collect({ streamArn: STREAM_ARN, ...fast }, 1).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(sequencesOf(first)).toEqual([2, 3])
+        expect((yield* store.load(feedId)).get("p")).toEqual({ _tag: "Finished" })
+        // A restart is not mistaken for lost records.
+        fake.put("c", 1)
+        const again = yield* collect({ streamArn: STREAM_ARN, ...fast }, 1).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(sequencesOf(again)).toEqual([4])
+      }),
+    )
+
+    it.live("a parent finished before it left the stream is fine", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("p").addShard("c", "p").put("p", 1).put("c", 1)
+        fake.close("p").remove("p")
+        const store = CheckpointStore.makeMemory()
+        yield* store.commit(feedId, "p", { _tag: "Finished" })
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }, 1).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(sequencesOf(batches)).toEqual([2])
+      }),
+    )
+  })
+
+  describe("missing iterators", () => {
+    it.live("an open shard without an iterator is retried, not finished", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 1)
+        fake.noIterator.set("s1", 3)
+        const store = CheckpointStore.makeMemory()
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }, 1).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(sequencesOf(batches)).toEqual([1])
+        expect(fake.iteratorRequests).toHaveLength(4)
+        expect((yield* store.load(feedId)).get("s1")).toEqual({
+          _tag: "Sequence",
+          sequenceNumber: seqOf(1),
+        })
+      }),
+    )
+
+    it.live("a closed shard without an iterator is finished", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").close("s1")
+        fake.status = "DISABLED"
+        fake.noIterator.set("s1", 1)
+        const store = CheckpointStore.makeMemory()
+        yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(fake.iteratorRequests).toHaveLength(1)
+        expect((yield* store.load(feedId)).get("s1")).toEqual({ _tag: "Finished" })
+      }),
+    )
+
+    it.live("a shard gone from the stream without an iterator is trimmed", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 1)
+        fake.noIterator.set("s1", 1)
+        // Dropped from the stream as its iterator is requested.
+        fake.removeOnIterator.add("s1")
+        const exit = yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake)),
+          Effect.exit,
+        )
+        expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedTrimmed", shardId: "s1" })
       }),
     )
   })
@@ -704,6 +964,99 @@ describe("changeFeed", () => {
         expect(renewals).toBeGreaterThan(2)
         expect(fiber.pollUnsafe()).toBeUndefined()
         yield* Fiber.interrupt(fiber)
+      }),
+    )
+
+    it.effect("retries a failing renewal until the lease is about to lapse", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1")
+        const store = CheckpointStore.makeMemory()
+        let failing = true
+        let attempts = 0
+        const flaky: CheckpointStoreService = {
+          ...store,
+          renewLease: (feed, owner, duration) =>
+            Effect.suspend(() => {
+              attempts++
+              return failing
+                ? Effect.fail(new CheckpointStoreError({ operation: "renewLease", cause: "blip" }))
+                : store.renewLease(feed, owner, duration)
+            }),
+        }
+        const fiber = yield* collect({
+          streamArn: STREAM_ARN,
+          backoff: { initial: "100 millis", max: "1 second" },
+          lease: { duration: "30 seconds", renewEvery: "10 seconds" },
+        }).pipe(Effect.provide(layerOf(fake, flaky)), Effect.exit, Effect.forkChild)
+        // Renewals fail from 10 s on; the deadline is 30 - 10 = 20 s after acquiring.
+        for (let i = 0; i < 18; i++) yield* adjust("1 second")
+        expect(attempts).toBeGreaterThan(5)
+        expect(fiber.pollUnsafe()).toBeUndefined()
+        failing = false
+        yield* adjust("1 second")
+        // Renewed at about 19 s: the next deadline is 20 s after that.
+        for (let i = 0; i < 15; i++) yield* adjust("1 second")
+        expect(fiber.pollUnsafe()).toBeUndefined()
+        yield* Fiber.interrupt(fiber)
+      }),
+    )
+
+    it.effect("fails once renewals have failed up to the deadline", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1")
+        const store = CheckpointStore.makeMemory()
+        const flaky: CheckpointStoreService = {
+          ...store,
+          renewLease: () =>
+            Effect.fail(new CheckpointStoreError({ operation: "renewLease", cause: "blip" })),
+        }
+        const fiber = yield* collect({
+          streamArn: STREAM_ARN,
+          backoff: { initial: "100 millis", max: "1 second" },
+          lease: { duration: "30 seconds", renewEvery: "10 seconds" },
+        }).pipe(Effect.provide(layerOf(fake, flaky)), Effect.forkChild)
+        for (let i = 0; i < 19; i++) yield* adjust("1 second")
+        expect(fiber.pollUnsafe()).toBeUndefined()
+        for (let i = 0; i < 3; i++) yield* adjust("1 second")
+        const exit = fiber.pollUnsafe()
+        expect(exit).toBeDefined()
+        expect(failureOf(exit!)).toMatchObject({ _tag: "CheckpointStoreError" })
+      }),
+    )
+
+    it.live("a batch in flight when the lease is lost commits nothing", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 1)
+        const store = CheckpointStore.makeMemory()
+        const go = yield* Deferred.make<void>()
+        const acknowledged = yield* Deferred.make<Exit.Exit<void, unknown>>()
+        const fiber = yield* changeFeed({
+          streamArn: STREAM_ARN,
+          ...fast,
+          lease: { owner: "me", duration: "10 millis", renewEvery: "40 millis" },
+        }).pipe(
+          Stream.mapEffect((batch) =>
+            Effect.uninterruptible(
+              Deferred.await(go).pipe(
+                Effect.andThen(Effect.exit(batch.commit())),
+                Effect.flatMap((exit) => Deferred.succeed(acknowledged, exit)),
+              ),
+            ),
+          ),
+          Stream.runDrain,
+          Effect.provide(layerOf(fake, store)),
+          Effect.exit,
+          Effect.forkChild,
+        )
+        // The lease lapses; another process takes it; the next renewal finds it lost.
+        yield* Effect.sleep("20 millis")
+        yield* store.acquireLease(feedId, "other", Duration.seconds(30))
+        yield* Effect.sleep("40 millis")
+        yield* Deferred.succeed(go, undefined)
+        const exit = yield* Deferred.await(acknowledged)
+        expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
+        expect((yield* store.load(feedId)).size).toBe(0)
+        expect(failureOf(yield* Fiber.join(fiber))).toMatchObject({ _tag: "ChangeFeedLeaseLost" })
       }),
     )
 

@@ -15,14 +15,17 @@ import type {
 import type { StreamRecordIdentifierMissing } from "@effect-dynamodb/schema/Errors.js"
 import {
   Cause,
+  Clock,
   Deferred,
   Duration,
   Effect,
   Option,
   Queue,
   Random,
+  Result,
   Schedule,
   type Scope,
+  Semaphore,
   Stream,
 } from "effect"
 import {
@@ -38,7 +41,7 @@ import { CheckpointStore, type FeedId, type ShardCheckpoint } from "./Checkpoint
 import { DynamoStreamsClient, type DynamoStreamsClientError } from "./DynamoStreamsClient.js"
 import {
   type ChangeFeedLeaseHeld,
-  type ChangeFeedLeaseLost,
+  ChangeFeedLeaseLost,
   ChangeFeedTrimmed,
   type CheckpointStoreError,
   type ShardIteratorExpired,
@@ -74,9 +77,11 @@ export interface ChangeFeedBatch {
   /**
    * Acknowledge every record: commit the shard's checkpoint at
    * `lastSequenceNumber`, and let the shard read on. Only the first
-   * acknowledgement of a batch counts.
+   * acknowledgement that commits counts; one whose write failed can be
+   * retried (the shard waits meanwhile). Fails with `ChangeFeedLeaseLost`,
+   * writing nothing, once the feed has lost its lease.
    */
-  readonly commit: () => Effect.Effect<void, CheckpointStoreError>
+  readonly commit: () => Effect.Effect<void, CheckpointStoreError | ChangeFeedLeaseLost>
   /**
    * Acknowledge per a partial batch response whose identifiers are
    * `SequenceNumber`s (`source: "lambda"`): with no failures, {@link commit};
@@ -87,7 +92,7 @@ export interface ChangeFeedBatch {
    */
   readonly complete: (
     response: BatchItemFailuresResponse,
-  ) => Effect.Effect<void, CheckpointStoreError>
+  ) => Effect.Effect<void, CheckpointStoreError | ChangeFeedLeaseLost>
 }
 
 /** Where a shard without a checkpoint starts, at a consumer's first start. */
@@ -264,7 +269,21 @@ const run = (
         ),
       )
 
+    /** A jittered delay growing per consecutive failure, capped at `backoff.max`. */
+    const retryDelay = (failures: number) =>
+      Effect.map(Random.nextBetween(0.8, 1.2), (jitter) =>
+        Duration.millis(
+          Math.min(
+            Duration.toMillis(maxBackoff),
+            Duration.toMillis(initialBackoff) * 2 ** failures,
+          ) * jitter,
+        ),
+      )
+
     // -- Lease -------------------------------------------------------------
+
+    /** Set once the lease is lost: acknowledgements then fail, writing nothing. */
+    let leaseLost: ChangeFeedLeaseLost | undefined
 
     if (options.lease !== false) {
       const lease = options.lease ?? {}
@@ -282,21 +301,35 @@ const run = (
           })
         : acquire
       yield* Effect.addFinalizer(() => Effect.ignore(store.releaseLease(feed, owner)))
+      let renewedAt = yield* Clock.currentTimeMillis
+      const lost = (error: ChangeFeedLeaseLost | CheckpointStoreError) => {
+        leaseLost = new ChangeFeedLeaseLost({ streamArn, consumer: feed.consumer, owner })
+        return Effect.fail(error)
+      }
+      /**
+       * Renew the lease. A store failure is retried until the lease is about
+       * to lapse — `renewEvery` before it expires — and a lease taken over is
+       * not retried; either way the lease counts as lost.
+       */
+      const renew = Effect.gen(function* () {
+        const deadline = renewedAt + Duration.toMillis(duration) - Duration.toMillis(renewEvery)
+        for (let attempt = 0; ; attempt++) {
+          const at = yield* Clock.currentTimeMillis
+          const result = yield* Effect.result(store.renewLease(feed, owner, duration))
+          if (Result.isSuccess(result)) {
+            renewedAt = at
+            return
+          }
+          const now = yield* Clock.currentTimeMillis
+          if (result.failure._tag !== "CheckpointStoreError" || now >= deadline) {
+            return yield* lost(result.failure)
+          }
+          const delay = yield* retryDelay(attempt)
+          yield* Effect.sleep(Duration.millis(Math.min(Duration.toMillis(delay), deadline - now)))
+        }
+      })
       yield* Effect.forkIn(
-        failStream(
-          Effect.forever(
-            Effect.sleep(renewEvery).pipe(
-              Effect.andThen(
-                // A store hiccup is retried; a lease taken over is not.
-                Effect.retry(store.renewLease(feed, owner, duration), {
-                  schedule: backoff,
-                  times: 3,
-                  while: (error) => error._tag === "CheckpointStoreError",
-                }),
-              ),
-            ),
-          ),
-        ),
+        failStream(Effect.forever(Effect.sleep(renewEvery).pipe(Effect.andThen(renew)))),
         scope,
       )
     }
@@ -345,7 +378,9 @@ const run = (
       absorb(shards)
       // Forget finished shards that have left the stream (24 h after closing),
       // so a long-running feed does not accumulate them.
-      const listed = new Set(shards.map((shard) => shard.ShardId))
+      const listed = new Set(
+        shards.flatMap((shard) => (shard.ShardId === undefined ? [] : [shard.ShardId])),
+      )
       for (const shardId of [...known.keys()]) {
         if (!listed.has(shardId) && finished.has(shardId)) {
           known.delete(shardId)
@@ -353,6 +388,7 @@ const run = (
           finished.delete(shardId)
         }
       }
+      return listed as ReadonlySet<string>
     })
 
     /**
@@ -380,7 +416,7 @@ const run = (
             if (children.length > 0) return
           }
         }
-        yield* describeAll
+        yield* Effect.asVoid(describeAll)
       })
 
     const isOpen = (shardId: string): boolean =>
@@ -401,25 +437,42 @@ const run = (
         const sequences = records.map((record) => record.dynamodb?.SequenceNumber ?? "")
         const first = sequences[0]!
         const last = sequences[sequences.length - 1]!
+        // Acknowledgements run one at a time; the first whose checkpoint is
+        // written settles the batch, and a failed write leaves it unsettled, so
+        // a retry writes again.
+        const lock = yield* Semaphore.make(1)
         let settled = false
         const settle = (checkpoint: string | undefined, result: Ack) =>
-          Effect.suspend(() => {
-            if (settled) return Effect.void
-            settled = true
-            return (
-              checkpoint === undefined
-                ? Effect.void
-                : store.commit(feed, shardId, { _tag: "Sequence", sequenceNumber: checkpoint })
-            ).pipe(Effect.andThen(Deferred.succeed(ack, result)), Effect.asVoid)
-          })
+          Semaphore.withPermit(
+            lock,
+            Effect.suspend((): Effect.Effect<void, CheckpointStoreError | ChangeFeedLeaseLost> => {
+              if (settled) return Effect.void
+              if (leaseLost !== undefined) return Effect.fail(leaseLost)
+              return (
+                checkpoint === undefined
+                  ? Effect.void
+                  : store.commit(feed, shardId, { _tag: "Sequence", sequenceNumber: checkpoint })
+              ).pipe(
+                Effect.andThen(
+                  Effect.suspend(() => {
+                    settled = true
+                    return Deferred.succeed(ack, result)
+                  }),
+                ),
+                Effect.asVoid,
+              )
+            }),
+          )
         const commit = () => settle(last, { _tag: "Continue" })
         const complete = (response: BatchItemFailuresResponse) =>
           Effect.suspend(() => {
             if (response.batchItemFailures.length === 0) return commit()
             const failed = new Set(response.batchItemFailures.map((f) => f.itemIdentifier))
-            const index = sequences.findIndex((sequence) => failed.has(sequence))
+            const inBatch = new Set(sequences)
             // An identifier naming no record fails the whole batch, as Lambda does.
-            const at = index === -1 ? 0 : index
+            const at = [...failed].some((id) => !inBatch.has(id))
+              ? 0
+              : sequences.findIndex((sequence) => failed.has(sequence))
             const acknowledged = at === 0 ? undefined : sequences[at - 1]
             return settle(acknowledged, { _tag: "Retry", from: sequences[at]!, acknowledged })
           })
@@ -435,17 +488,6 @@ const run = (
         return yield* Deferred.await(ack)
       })
 
-    /** Delay before re-reading a batch with failed records, growing per consecutive failure. */
-    const retryDelay = (failures: number) =>
-      Effect.map(Random.nextBetween(0.8, 1.2), (jitter) =>
-        Duration.millis(
-          Math.min(
-            Duration.toMillis(maxBackoff),
-            Duration.toMillis(initialBackoff) * 2 ** failures,
-          ) * jitter,
-        ),
-      )
-
     /** Read one shard to its end (it closed and every record was acknowledged). */
     const readShard = (shardId: string, start: Position) =>
       Effect.gen(function* () {
@@ -453,6 +495,7 @@ const run = (
         let acknowledged = start.type === "AFTER_SEQUENCE_NUMBER" ? start.sequenceNumber : undefined
         let iterator: string | undefined
         let failures = 0
+        let misses = 0
         const trimmed = (cause: unknown) =>
           new ChangeFeedTrimmed({ streamArn, shardId, sequenceNumber: acknowledged, cause })
         while (true) {
@@ -471,8 +514,18 @@ const run = (
               Effect.catchTag("ShardIteratorExpired", (e) => Effect.die(e)),
             )
             iterator = acquired.ShardIterator
-            // No iterator: nothing left to read on the shard.
-            if (iterator === undefined) return
+            if (iterator === undefined) {
+              // No iterator. A closed shard has nothing left to read; for one
+              // the stream still lists as open, refresh the list and retry.
+              const listed = yield* describeAll
+              if (!listed.has(shardId)) {
+                return yield* trimmed(new Error(`Shard ${shardId} is no longer in the stream`))
+              }
+              if (!isOpen(shardId)) return
+              yield* Effect.sleep(yield* retryDelay(misses++))
+              continue
+            }
+            misses = 0
           }
           const page = yield* transient(
             client.getRecords({ ShardIterator: iterator, Limit: batchSize }),
@@ -546,7 +599,46 @@ const run = (
         yield* maybeEnd
       })
 
-    yield* describeAll
+    const listed = yield* describeAll
+    if (fresh) {
+      // Parents already gone from the stream predate this consumer: nothing of
+      // theirs is owed. Recorded, so a restart can tell them from lost ones.
+      for (const shard of known.values()) {
+        const parent = shard.ParentShardId
+        if (parent !== undefined && !listed.has(parent) && !finished.has(parent)) {
+          yield* store.commit(feed, parent, { _tag: "Finished" })
+          finished.add(parent)
+        }
+      }
+    } else {
+      // A shard this consumer still owes records from that has left the stream
+      // (downtime past the 24-hour retention): its unread records are lost.
+      const gone = (shardId: string, sequenceNumber: string | undefined) =>
+        new ChangeFeedTrimmed({
+          streamArn,
+          shardId,
+          sequenceNumber,
+          cause: new Error(
+            `Shard ${shardId} is no longer in the stream, and was not read to its end`,
+          ),
+        })
+      for (const [shardId, checkpoint] of checkpoints) {
+        if (checkpoint._tag === "Sequence" && !listed.has(shardId)) {
+          return yield* gone(shardId, checkpoint.sequenceNumber)
+        }
+      }
+      for (const [shardId, shard] of known) {
+        const parent = shard.ParentShardId
+        if (
+          parent !== undefined &&
+          !checkpoints.has(shardId) &&
+          !listed.has(parent) &&
+          !finished.has(parent)
+        ) {
+          return yield* gone(parent, undefined)
+        }
+      }
+    }
     if (fresh && options.startingPosition === "LATEST") {
       for (const [shardId] of known) {
         if (isOpen(shardId)) {
@@ -629,7 +721,7 @@ export const runChangeFeed = <
   options: RunChangeFeedOptions<Projections, Streams, E2, R2>,
 ): Effect.Effect<
   void,
-  E | E2 | CheckpointStoreError | StreamRecordIdentifierMissing,
+  E | E2 | CheckpointStoreError | ChangeFeedLeaseLost | StreamRecordIdentifierMissing,
   R | R2 | ProjectionRequirementsOf<Projections[keyof Projections]>
 > => {
   const { onBatch, ...processOptions } = options
