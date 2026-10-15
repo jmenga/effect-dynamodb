@@ -547,7 +547,7 @@ export const makeEngine = (config: EngineConfig) => {
     )
 
   /** A lost race, from a single write's or a transaction's failure. */
-  const lostRaceOf = (key: unknown, error: unknown, transaction: boolean): boolean => {
+  const lostRaceOf = (error: unknown, transaction: boolean): boolean => {
     const cause = (error as { readonly cause?: unknown })?.cause
     if (!transaction) return isAwsConditionalCheckFailed(cause)
     return (
@@ -646,7 +646,7 @@ export const makeEngine = (config: EngineConfig) => {
       if (enqueued.length === 0) {
         yield* client.putItem(rowPut.Put).pipe(
           Effect.catchIf(
-            (error) => lostRaceOf(key, error, false),
+            (error) => lostRaceOf(error, false),
             () => Effect.fail(new LostRace(key)),
           ),
         )
@@ -664,7 +664,7 @@ export const makeEngine = (config: EngineConfig) => {
           })
           .pipe(
             Effect.catchIf(
-              (error) => lostRaceOf(key, error, true),
+              (error) => lostRaceOf(error, true),
               () => Effect.fail(new LostRace(key)),
             ),
           )

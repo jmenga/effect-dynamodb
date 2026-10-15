@@ -78,13 +78,14 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import {
-  type EventProjection,
-  ProjectionDecode,
-  type StreamRecord,
-} from "./internal/EventProjection.js"
+import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
+import {
+  isMultiProjection,
+  type MultiProjection,
+  type MultiSource,
+} from "./internal/MultiProjection.js"
 import {
   type CodecRequirement,
   codecRequirements,
@@ -5867,6 +5868,22 @@ export {
   type StreamRecord,
 } from "./internal/EventProjection.js"
 export {
+  type MultiApplied,
+  type MultiBatchResult,
+  type MultiCheckpoints,
+  type MultiInstanceResult,
+  type MultiOutcome,
+  type MultiProjection,
+  type MultiProjectionConfig,
+  type MultiProjectionError,
+  type MultiSource,
+  type MultiSourceConfig,
+  type MultiSourceEvent,
+  multiProjection,
+  type RebuildInstances,
+  type SourceBuilder,
+} from "./internal/MultiProjection.js"
+export {
   type DrainResult,
   type EvolveContext,
   type OutboxMeta,
@@ -5891,78 +5908,59 @@ export {
  *   )
  * ```
  */
-export const bindProjection = <
-  S,
-  A,
-  TStreamIdFields extends ReadonlyArray<string>,
-  M,
-  Err,
-  R,
-  K,
-  E,
-  I extends boolean,
-  O,
->(
-  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I, O>,
-): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>, never, R> =>
+export const bindProjection: {
+  <S, A, TStreamIdFields extends ReadonlyArray<string>, M, Err, R, K, E, I extends boolean, O>(
+    projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I, O>,
+  ): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>, never, R>
+  <S, K, Sources extends Record<string, MultiSource<any, any, any, any, any>>, Err, R, O>(
+    projection: MultiProjection<S, K, Sources, Err, R, O>,
+  ): Effect.Effect<MultiProjection<S, K, Sources, Err, never, O>, never, R>
+} = (projection: any): Effect.Effect<any, never, any> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<R>()
-    // The codec check `bind` makes, against the registry captured here.
-    yield* Effect.provide(bind(projection.stream), ctx as Context.Context<any>)
-    const provide = <X, Y>(effect: Effect.Effect<X, Y, R>): Effect.Effect<X, Y, never> =>
+    const ctx = yield* Effect.context<any>()
+    // The codec check `bind` makes, for every stream, against the registry captured here.
+    const streams: ReadonlyArray<EventStream<any, any, any, any, any, any, any>> =
+      isMultiProjection(projection)
+        ? Object.values(projection.sources as Record<string, { readonly stream: any }>).map(
+            (source) => source.stream,
+          )
+        : [projection.stream]
+    for (const stream of streams) yield* Effect.provide(bind(stream), ctx)
+    const provide = <X, Y>(effect: Effect.Effect<X, Y, any>): Effect.Effect<X, Y, never> =>
       Effect.provide(effect, ctx)
-    return {
+    const bound: Record<string | symbol, unknown> = {
       ...projection,
       pipe() {
         // eslint-disable-next-line prefer-rest-params
         return Pipeable.pipeArguments(this, arguments)
       },
-      applyBatch: (events, options) => provide(projection.applyBatch(events, options)),
-      apply: (event) => provide(projection.apply(event)),
-      catchUp: (streamId) => provide(projection.catchUp(streamId)),
-      // `deliver`'s own requirements stay with the caller.
-      drain: ((key: K, deliver: never) =>
-        provide(projection.drain(key, deliver) as never)) as unknown as EventProjection<
-        S,
-        A,
-        TStreamIdFields,
-        M,
-        Err,
-        never,
-        K,
-        E,
-        I,
-        O
-      >["drain"],
-      drainPending: ((deliver: never) =>
-        provide(projection.drainPending(deliver) as never)) as unknown as EventProjection<
-        S,
-        A,
-        TStreamIdFields,
-        M,
-        Err,
-        never,
-        K,
-        E,
-        I,
-        O
-      >["drainPending"],
-      // A multi-projection batch decodes through this, under the captured context.
-      [ProjectionDecode]: (image: StreamImage) => provide(projection[ProjectionDecode](image)),
-      rebuild: (streamId) => provide(projection.rebuild(streamId)),
-      // Both overloads share one implementation.
-      processBatch: ((records: ReadonlyArray<StreamRecord>, options: never) =>
-        provide(projection.processBatch(records, options))) as EventProjection<
-        S,
-        A,
-        TStreamIdFields,
-        M,
-        Err,
-        never,
-        K,
-        E,
-        I,
-        O
-      >["processBatch"],
-    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>
+      // A multi-projection batch decodes and applies through these, under the
+      // captured context.
+      [ProjectionRoutes]: (name: string) =>
+        (projection[ProjectionRoutes](name) as ReadonlyArray<Route>).map((route) => ({
+          ...route,
+          decode: (image: StreamImage) => provide(route.decode(image)),
+          applyBatch: (
+            events: ReadonlyArray<unknown>,
+            options?: Parameters<Route["applyBatch"]>[1],
+          ) => provide(route.applyBatch(events, options)),
+        })),
+    }
+    // Every operation, with the captured context provided (`deliver`'s own
+    // requirements stay with the caller).
+    for (const name of [
+      "applyBatch",
+      "apply",
+      "catchUp",
+      "rebuild",
+      "processBatch",
+      "drain",
+      "drainPending",
+    ]) {
+      const op = projection[name]
+      if (typeof op === "function") {
+        bound[name] = (...args: ReadonlyArray<unknown>) => provide(op(...args))
+      }
+    }
+    return bound
   })

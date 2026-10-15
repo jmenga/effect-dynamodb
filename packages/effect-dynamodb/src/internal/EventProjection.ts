@@ -19,7 +19,6 @@ import {
   type ConcurrentModification,
   type ConditionalCheckFailed,
   type ItemNotFound,
-  type ProjectionSourceConflict,
   StreamRecordIdentifierMissing,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -653,8 +652,12 @@ export const eventFilterPattern = (
 const EventProjectionTypeId: unique symbol = Symbol.for("effect-dynamodb/EventProjection")
 export type EventProjectionTypeId = typeof EventProjectionTypeId
 
-/** @internal See {@link EventProjection}'s decode member. */
-export const ProjectionDecode: unique symbol = Symbol.for("effect-dynamodb/EventProjection/Decode")
+/**
+ * @internal How a projection takes part in a multi-projection batch: one
+ * route per source stream — its decode (under the bound context for a bound
+ * projection) and its `applyBatch`.
+ */
+export const ProjectionRoutes: unique symbol = Symbol.for("effect-dynamodb/EventProjection/Routes")
 
 /**
  * A change-feed projection: one source stream folded into read-model rows —
@@ -677,14 +680,8 @@ export interface EventProjection<
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
   readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
-  /**
-   * @internal The stream's image decode — under the bound context for a
-   * bound projection, so a multi-projection batch decodes as its projections
-   * would.
-   */
-  readonly [ProjectionDecode]: (
-    image: StreamImage,
-  ) => Effect.Effect<Option.Option<StreamEvent<A, M>>, ValidationError, never>
+  /** @internal See {@link ProjectionRoutes}. */
+  readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   /** The read model's entity type. */
   readonly entityType: string
 
@@ -769,6 +766,14 @@ export interface EventProjection<
     records: ReadonlyArray<Rec>,
     options: ProcessBatchOptions<Rec> & (IdentifyBySource | IdentifyWith<Rec>),
   ): Effect.Effect<ProcessBatchResult<S, A, M, Err, Rec, K, E>, StreamRecordIdentifierMissing, R>
+  /** A record shape of your own, read through `image` and `identifier`. */
+  processBatch<Rec>(
+    records: ReadonlyArray<Rec>,
+    options: ProcessBatchOptions<Rec> & {
+      readonly image: (record: Rec) => StreamImage | undefined
+    } & IdentifyWith<Rec>,
+  ): Effect.Effect<ProcessBatchResult<S, A, M, Err, Rec, K, E>, StreamRecordIdentifierMissing, R>
+
   /**
    * Deliver a row's pending outbox effects (see `outbox`), strictly in order:
    * claim the head item, `deliver` it, delete it, repeat — stopping at a
@@ -795,14 +800,6 @@ export interface EventProjection<
     DynamoClientError | ValidationError,
     R | DR
   >
-
-  /** A record shape of your own, read through `image` and `identifier`. */
-  processBatch<Rec>(
-    records: ReadonlyArray<Rec>,
-    options: ProcessBatchOptions<Rec> & {
-      readonly image: (record: Rec) => StreamImage | undefined
-    } & IdentifyWith<Rec>,
-  ): Effect.Effect<ProcessBatchResult<S, A, M, Err, Rec, K, E>, StreamRecordIdentifierMissing, R>
 }
 
 type AnyEvent = StreamEvent<unknown, unknown>
@@ -1284,7 +1281,14 @@ export const projection = <
     },
     stream,
     entityType: readModel.entityType,
-    [ProjectionDecode]: (image: StreamImage) => stream.decodeStreamImage(image),
+    [ProjectionRoutes]: (name: string): ReadonlyArray<Route> => [
+      {
+        name,
+        stream: stream as unknown as DecodableStream,
+        decode: (image: StreamImage) => stream.decodeStreamImage(image),
+        applyBatch: (events, applyOptions) => applyBatch(events as ReadonlyArray<Ev>, applyOptions),
+      },
+    ],
     applyBatch,
     apply,
     catchUp,
@@ -1312,8 +1316,13 @@ export const projection = <
 // Batches across projections
 // ---------------------------------------------------------------------------
 
-/** Any projection, bound or unbound. */
-export type AnyEventProjection = EventProjection<any, any, any, any, any, any, any, any, any, any>
+/** Any projection, bound or unbound — single-source, or multi-source. */
+export type AnyEventProjection =
+  | EventProjection<any, any, any, any, any, any, any, any, any, any>
+  | {
+      readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
+      applyBatch(events: ReadonlyArray<any>, options?: any): Effect.Effect<any, never, any>
+    }
 
 /** A projection's outcomes. */
 export type ProjectionOutcomesOf<P> =
@@ -1330,11 +1339,22 @@ export type ProjectionOutcomesOf<P> =
     any
   >
     ? ReadonlyArray<ProjectionOutcome<S, A, M, Err, K, E>>
-    : never
+    : P extends {
+          applyBatch(
+            events: any,
+            options?: any,
+          ): Effect.Effect<{ readonly outcomes: infer Outcomes }, never, any>
+        }
+      ? Outcomes
+      : never
 
 /** A projection's requirements. */
 export type ProjectionRequirementsOf<P> =
-  P extends EventProjection<any, any, any, any, any, infer R, any, any, any, any> ? R : never
+  P extends EventProjection<any, any, any, any, any, infer R, any, any, any, any>
+    ? R
+    : P extends { applyBatch(events: any, options?: any): Effect.Effect<any, never, infer R> }
+      ? R
+      : never
 
 /** Result of {@link processBatch}. */
 export interface ProcessBatchesResult<
@@ -1366,8 +1386,13 @@ export interface ProcessBatchesResult<
 }
 
 /** @internal One projection behind a feed: the stream it decodes and its `applyBatch`. */
-interface Route {
+export interface Route {
   readonly name: string
+  /**
+   * A multi-source projection's name for this stream: its events reach
+   * `applyBatch` as `{ stream: tag, event }`. Undefined: as the bare event.
+   */
+  readonly tag?: string | undefined
   /** The (unbound) stream — its identity groups the projections that read it. */
   readonly stream: DecodableStream
   /** How its images decode — under the bound context for a bound projection. */
@@ -1391,7 +1416,7 @@ const insertImage = (record: StreamRecord): StreamImage | undefined =>
  * stream, apply each projection's events, and build one partial batch
  * response — shared by {@link processBatch} and `projection.processBatch`.
  */
-const runBatch = <Rec>(
+export const runBatch = <Rec>(
   operation: string,
   records: ReadonlyArray<Rec>,
   options: ProcessBatchOptions<Rec> & (IdentifyBySource | IdentifyWith<Rec>),
@@ -1474,7 +1499,11 @@ const runBatch = <Rec>(
       } else if (Option.isSome(decoded.success)) {
         for (const route of readers!) {
           const target = routed.get(route.name)!
-          target.events.push(decoded.success.value)
+          target.events.push(
+            route.tag === undefined
+              ? decoded.success.value
+              : { stream: route.tag, event: decoded.success.value },
+          )
           target.recordOf.push(i)
         }
       }
@@ -1483,7 +1512,9 @@ const runBatch = <Rec>(
       string,
       ReadonlyArray<ProjectionOutcome<any, any, any, any, any, any>>
     > = {}
-    for (const route of routes) {
+    // One `applyBatch` per projection, however many of its sources routed here.
+    const projections = [...new Map(routes.map((route) => [route.name, route])).values()]
+    for (const route of projections) {
       const { events, recordOf } = routed.get(route.name)!
       if (events.length === 0) {
         outcomes[route.name] = []
@@ -1576,13 +1607,11 @@ export const processBatch: {
     "EventStore.processBatch",
     records,
     options,
-    Object.entries(options.projections as Record<string, AnyEventProjection>).map(
-      ([name, projection]) => ({
-        name,
-        stream: projection.stream as unknown as DecodableStream,
-        decode: (image: StreamImage) => projection[ProjectionDecode](image),
-        applyBatch: (events, applyOptions) => projection.applyBatch(events, applyOptions),
-      }),
-    ),
+    Object.entries(
+      options.projections as Record<
+        string,
+        { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
+      >,
+    ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
     Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
   )
