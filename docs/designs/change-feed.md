@@ -51,6 +51,20 @@ one item are ordered within a shard and from a parent into its child.
 - **Parent before child.** A shard starts only when its parent is finished,
   or its parent is not in the describe output (trimmed past retention).
   DynamoDB shards only split, never merge, so each has at most one parent.
+- **Gone shards at startup.** A parent missing from the describe output is
+  only safe to skip when this consumer owes it nothing. At a **fresh** start,
+  every missing parent of a listed shard predates the consumer: it is
+  checkpointed `Finished`, so a restart can tell it from a lost one. At a
+  restart, the feed fails with `ChangeFeedTrimmed` before reading anything
+  when a shard with a `Sequence` checkpoint is no longer listed (downtime past
+  retention dropped its unread tail), or a listed shard without a checkpoint
+  has a missing parent that is not `Finished`. A shard read to its end whose
+  `Finished` write was lost is reported too: once unlisted, it can't be told
+  apart.
+- **Missing iterators.** A `GetShardIterator` without an iterator refreshes the
+  shard list: a closed shard is finished; a shard still open is retried after
+  a backoff (it is never checkpointed `Finished` while open); a shard no
+  longer listed fails with `ChangeFeedTrimmed`.
 - **Closed shards.** A `GetRecords` with no `NextShardIterator` means the shard
   is closed and fully read. Once its last batch is acknowledged, the shard is
   checkpointed as `Finished` and dropped, and its children become eligible.
@@ -93,8 +107,10 @@ interface ChangeFeedBatch {
   readonly records: ReadonlyArray<ChangeFeedRecord> // non-empty, sequence order
   readonly firstSequenceNumber: string
   readonly lastSequenceNumber: string
-  readonly commit: () => Effect<void, CheckpointStoreError>
-  readonly complete: (response: BatchItemFailuresResponse) => Effect<void, CheckpointStoreError>
+  readonly commit: () => Effect<void, CheckpointStoreError | ChangeFeedLeaseLost>
+  readonly complete: (
+    response: BatchItemFailuresResponse,
+  ) => Effect<void, CheckpointStoreError | ChangeFeedLeaseLost>
 }
 ```
 
@@ -105,13 +121,19 @@ interface ChangeFeedBatch {
   the checkpoint moves to the record **before** the earliest failed record (it
   stays put when that is the first record), and the shard re-reads from the
   failed record (`AT_SEQUENCE_NUMBER`) after a backoff that grows with each
-  consecutive failure. An identifier that names no record of the batch fails
-  the whole batch — Lambda's rule.
+  consecutive failure. If any identifier names no record of the batch, the
+  whole batch fails — Lambda's rule — whatever the other identifiers say.
 - The checkpoint is committed only by the acknowledgement, so it follows the
   consumer's effect. A consumer that fails ends the stream, and the records it
   had not acknowledged are read again on restart: delivery is **at least
   once**.
-- Only the first acknowledgement of a batch counts.
+- Acknowledgements of a batch run one at a time, and the first whose
+  checkpoint write succeeds settles it; later ones are no-ops. A write that
+  fails leaves the batch unsettled and returns `CheckpointStoreError`, so a
+  retried acknowledgement writes again; the shard waits meanwhile, and a
+  consumer that lets the error fail its effect ends the feed.
+- Once the lease is lost (§6), an acknowledgement fails with
+  `ChangeFeedLeaseLost` and writes nothing.
 
 `ChangeFeedRecord` is the SDK's `GetRecords` record. It has the Lambda record's
 shape (`eventID`, `eventName`, `dynamodb.SequenceNumber`, `dynamodb.NewImage`
@@ -139,9 +161,13 @@ processes from consuming the same feed by accident:
 - released when the stream ends;
 - a second consumer fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or
   with `lease: { onHeld: "wait" }` retries until the lease is free or expires;
-- a renewal the store fails to write (`CheckpointStoreError`) is retried up to
-  three times on the backoff; a renewal refused because another owner took
-  over fails the feed with `ChangeFeedLeaseLost`.
+- a renewal the store fails to write (`CheckpointStoreError`) is retried on
+  the backoff until `renewEvery` before the lease would lapse (the last
+  successful renewal + `duration` − `renewEvery`), then fails the feed with
+  that error; a renewal refused because another owner took over fails the feed
+  with `ChangeFeedLeaseLost`;
+- either way the lease counts as lost from then on: an acknowledgement still
+  in flight fails with `ChangeFeedLeaseLost` instead of committing.
 
 Expiry compares the holder's clock with the taker's, so hosts need roughly
 synchronised clocks. The lease guards against an accidental second consumer;

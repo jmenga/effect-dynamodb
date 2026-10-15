@@ -3634,7 +3634,11 @@ yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } 
   a drained shard's children via `ShardFilter: CHILD_SHARDS`, falling back to a full
   describe where the filter is rejected (`ValidationException`, remembered) or finds none
   (DynamoDB Local). Children are filtered by `ParentShardId`. A shard starts once its
-  parent is finished or gone from the stream — per-item order across splits. A
+  parent is finished or gone from the stream — per-item order across splits. At a
+  restart, a checkpointed shard or an unread shard's unfinished parent gone from the
+  stream fails with `ChangeFeedTrimmed` before anything is read; a fresh start
+  checkpoints already-gone parents `Finished`. An open shard without an iterator is
+  retried after a refresh, never finished. A
   `GetRecords` without `NextShardIterator` ends a shard: after its last batch is
   acknowledged it is checkpointed `Finished` and dropped. The feed ends once the stream
   is `DISABLED` and every shard is finished.
@@ -3649,12 +3653,16 @@ yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } 
   response contract keyed by `SequenceNumber`: checkpoint at the record before the
   earliest failure, re-read `AT_SEQUENCE_NUMBER` it after a growing backoff; an unknown
   identifier fails the whole batch. Checkpoints follow acknowledgements — at least once.
+  Acknowledgements are serialised; the first whose write succeeds settles the batch, and a
+  failed write can be retried.
 - **Throttling.** `LimitExceededException` maps to `ThrottlingError`; it and
   `InternalServerError` retry without limit on a jittered exponential backoff (100 ms →
   10 s). Idle open shards poll every `pollInterval` (1 s); one reader per shard.
 - **Lease.** One item per `(consumer, streamArn)` in the checkpoint store: conditional
-  acquire (absent, expired or ours), renewed every `duration / 3`, released on exit;
-  `ChangeFeedLeaseHeld` (or `onHeld: "wait"`), `ChangeFeedLeaseLost` when taken over.
+  acquire (absent, expired or ours), renewed every `duration / 3` (store failures retried
+  until `renewEvery` before it lapses), released on exit; `ChangeFeedLeaseHeld` (or
+  `onHeld: "wait"`), `ChangeFeedLeaseLost` when taken over. Once lost, acknowledgements
+  fail with `ChangeFeedLeaseLost` instead of committing.
   Guards against an accidental second consumer; writes are not fenced.
 - **Errors** (`Data.TaggedError`, in the subpath): `ShardIteratorExpired`,
   `StreamDataTrimmed` (client), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`,

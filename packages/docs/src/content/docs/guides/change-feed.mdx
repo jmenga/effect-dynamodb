@@ -130,7 +130,7 @@ yield* feed.pipe(
 )
 ```
 
-- **Acknowledge every batch.** `batch.commit()` commits the shard's checkpoint at `lastSequenceNumber`. `batch.complete(response)` takes a partial batch response whose identifiers are `SequenceNumber`s, and applies the contract above. An identifier that names no record of the batch fails the whole batch, as Lambda does. Only the first acknowledgement of a batch counts.
+- **Acknowledge every batch.** `batch.commit()` commits the shard's checkpoint at `lastSequenceNumber`. `batch.complete(response)` takes a partial batch response whose identifiers are `SequenceNumber`s, and applies the contract above. If any identifier names no record of the batch, the whole batch fails, as Lambda does. The first acknowledgement whose checkpoint is written counts, and later ones do nothing. One whose write failed returns `CheckpointStoreError` and can be retried: it writes again. Once the feed has lost its lease, acknowledgements fail with `ChangeFeedLeaseLost` and write nothing.
 - **A shard waits for its acknowledgement.** It is not read again until its batch is acknowledged, so each shard has at most one batch in flight, and a slow consumer slows polling. A batch that is never acknowledged stalls its shard.
 - **Delivery is at least once.** A checkpoint moves only when a batch is acknowledged. A consumer that fails ends the stream, and what it had not acknowledged is read again on restart.
 
@@ -150,6 +150,8 @@ DynamoDB Streams splits a table's feed into shards. A shard lives about four hou
 - **`consumer`** (default `"default"`) names the application. Checkpoints and the lease are kept per consumer, so several applications can read one stream with one checkpoint table.
 - **An expired iterator** (one older than 15 minutes, because the consumer was slow) is acquired again from the shard's position.
 - **A position past the stream's 24-hour retention** fails the feed with `ChangeFeedTrimmed { streamArn, shardId, sequenceNumber }`: records were lost. Rebuild what the feed maintains, then clear the consumer's checkpoints to start over.
+- **Shards gone while the consumer was down.** At a restart, before reading anything, the feed fails with `ChangeFeedTrimmed` when a shard with a checkpoint has left the stream, or when an unread shard's parent has left it without being finished: their unread records are gone. At a fresh start, parents already gone predate the consumer; they are checkpointed as finished, so a restart does not mistake them for lost ones. A shard read to its end whose finished checkpoint was never written is reported too, as it can't be told apart once it has left the stream.
+- **An open shard with no iterator** is never finished: the feed refreshes the shard list and retries after a backoff.
 
 ## The lease
 
@@ -157,7 +159,9 @@ One lease per consumer and stream, held in the checkpoint store, keeps a second 
 
 - it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends;
 - a second process fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or, with `lease: { onHeld: "wait" }`, retries until the lease is released or expires;
-- if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`.
+- a renewal the checkpoint store fails to write is retried until `renewEvery` before the lease would lapse, then fails the feed with that `CheckpointStoreError`;
+- if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`;
+- once the lease is lost either way, a batch still in flight cannot commit: its acknowledgement fails with `ChangeFeedLeaseLost`.
 
 Expiry compares the holder's clock with the taker's, so hosts need roughly synchronised clocks. The lease guards against an accidental second consumer; checkpoint writes are not fenced by it. `lease: false` disables it. One consumer reads every shard: per-shard leases across several processes are not covered yet.
 
