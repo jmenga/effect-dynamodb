@@ -1,5 +1,11 @@
 # @effect-dynamodb/schema
 
+## 1.28.0
+
+### Minor Changes
+
+- [`f21d781`](https://github.com/jmenga/effect-dynamodb/commit/f21d78148db75528b33acab586b886b7f88e3428) - EventStore change-feed projections ([#151](https://github.com/jmenga/effect-dynamodb/issues/151)). `EventStore.projection({ stream, readModel, key, initial, evolve, checkpoint })` folds a stream's events from DynamoDB Streams into a read-model entity in version order, taking the order from the event store instead of from delivery. `applyBatch` sorts and deduplicates each stream instance's events, reads only the versions the batch lacks (one strongly consistent `readFrom`), and writes the row once, conditioned on its checkpoint; a lost race re-reads. Each outcome reports `applied` (at most once per event) and `alreadyApplied` (republish for at-least-once). Also: `apply`, `catchUp`, `rebuild`, `processBatch` (decode → apply → partial batch response), `bindProjection` (`R = never`), a checkpoint `offset`, `EventStore.decoder` across several streams, `EventStore.eventFilterPattern` for event source mapping and Pipe filters, and `EventStore.batchResponse` keyed by `dynamodb.SequenceNumber` (Lambda) or `eventID` (Pipes). Streams expose `streamIdFields`, `eventMarker` and `parseStreamId`. New codes `[EDD-9081]`–`[EDD-9083]`.
+
 ## 1.27.0
 
 ### Minor Changes
