@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 2503 core tests, 540 schema tests, 57 geo tests, 90 language-service tests, 50 doctest tests, 37 examples, 641 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 2565 core tests, 540 schema tests, 57 geo tests, 90 language-service tests, 52 doctest tests, 39 examples, 650 connected tests against DynamoDB Local.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -77,7 +77,8 @@ packages/effect-dynamodb/src/
 ├── Batch.ts            # BatchGet + BatchWrite with auto-chunking and retry
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── Aggregate.ts        # Graph-based composite domain model (decompose/assemble/diff)
-├── EventStore.ts       # Event sourcing with ordered event streams per aggregate
+├── EventStore.ts       # Event sourcing with ordered event streams per aggregate; change-feed projections (single- and multi-source, tombstones, outbox) re-exported from internal/EventProjection, MultiProjection, ProjectionEngine
+├── change-feed/        # `effect-dynamodb/change-feed` subpath: polled DynamoDB Streams feed (DynamoStreamsClient, CheckpointStore, lease) into EventStore.processBatch
 ├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
