@@ -73,6 +73,7 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import type { EventProjection } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
@@ -1371,7 +1372,7 @@ const resolveStreamStorage = (
 // StreamIdInput — maps composite field names to a required record
 // ---------------------------------------------------------------------------
 
-type StreamIdInput<T extends ReadonlyArray<string>> = {
+export type StreamIdInput<T extends ReadonlyArray<string>> = {
   readonly [K in T[number]]: string
 }
 
@@ -1394,6 +1395,32 @@ export type EventStreamTypeId = typeof EventStreamTypeId
  * attach it; a hand-built stream object falls back to joining the id's values.
  */
 const StreamIdFormatter: unique symbol = Symbol.for("effect-dynamodb/EventStream/StreamIdFormatter")
+
+/** @internal {@link EventStream.parseStreamId}, shared by `makeStream` and `bind`. */
+const parseStreamIdWith = (
+  streamName: string,
+  fields: ReadonlyArray<string>,
+  streamId: string,
+): Effect.Effect<any, ValidationError> => {
+  const parts = fields.length === 1 ? [streamId] : streamId.split("#")
+  if (parts.length !== fields.length) {
+    return Effect.fail(
+      new ValidationError({
+        entityType: `${streamName.toLowerCase()}.event`,
+        operation: "EventStore.parseStreamId",
+        cause:
+          `Stream id ${JSON.stringify(streamId)} has ${parts.length} "#"-separated parts, but ` +
+          `the stream id has ${fields.length} fields (${fields.join(", ")}): a value containing ` +
+          `"#" makes the id ambiguous.`,
+      }),
+    )
+  }
+  const id: Record<string, string> = {}
+  fields.forEach((field, i) => {
+    id[field] = parts[i]!
+  })
+  return Effect.succeed(id)
+}
 
 /** @internal */
 const formatStreamIdOf = (stream: object, streamId: Record<string, unknown>): string => {
@@ -1539,6 +1566,26 @@ export interface EventStream<
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
   readonly eventSchema: Schema.Top
+
+  /** The stream id's composite fields, in declaration order (`makeStream({ streamId })`). */
+  readonly streamIdFields: TStreamIdFields
+
+  /**
+   * The `__edd_e__` value of the stream's event items (`<streamname>.event`,
+   * lower-cased) — what a change-feed filter or {@link decoder} matches on.
+   */
+  readonly eventMarker: string
+
+  /**
+   * Recover the structured stream id from a {@link StreamEvent.streamId} —
+   * the composites joined with `#`, in declaration order. A single-field id is
+   * the whole string. A multi-field id is split on `#`; a part count other
+   * than the field count (a value that itself contains `#`) is ambiguous and
+   * fails with `ValidationError`.
+   */
+  parseStreamId(
+    streamId: string,
+  ): Effect.Effect<StreamIdInput<TStreamIdFields>, ValidationError, never>
 
   /**
    * The stream's indexes (`makeStream({ indexes })`) by name — their physical
@@ -3980,6 +4027,9 @@ export const makeStream = <
     },
     streamName: config.streamName,
     eventSchema: eventUnion,
+    streamIdFields: compositeFields,
+    eventMarker: entityType,
+    parseStreamId: (id: string) => parseStreamIdWith(config.streamName, compositeFields, id),
     snapshotConfig: snapshotSettings,
     storedAs: storage,
     indexes: indexSettings,
@@ -4047,6 +4097,17 @@ export interface BoundEventStream<
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
   readonly eventSchema: Schema.Top
+
+  /** See {@link EventStream.streamIdFields}. */
+  readonly streamIdFields: TStreamIdFields
+
+  /** See {@link EventStream.eventMarker}. */
+  readonly eventMarker: string
+
+  /** See {@link EventStream.parseStreamId}. */
+  parseStreamId(
+    streamId: string,
+  ): Effect.Effect<StreamIdInput<TStreamIdFields>, ValidationError, never>
 
   /** See {@link EventStream.snapshotConfig}. */
   readonly snapshotConfig: SnapshotSettings | undefined
@@ -4258,6 +4319,9 @@ export const bind = <
       },
       streamName: stream.streamName,
       eventSchema: stream.eventSchema,
+      streamIdFields: stream.streamIdFields,
+      eventMarker: stream.eventMarker,
+      parseStreamId: (id: string) => stream.parseStreamId(id),
       snapshotConfig: stream.snapshotConfig,
       storedAs: stream.storedAs,
       indexes: stream.indexes,
@@ -5735,3 +5799,78 @@ export const foldFrom: {
     return state
   },
 )
+
+// ---------------------------------------------------------------------------
+// Change-feed projections (#151)
+// ---------------------------------------------------------------------------
+
+export {
+  type ApplyBatchOptions,
+  type BatchItemFailuresResponse,
+  type BatchResponseSource,
+  batchResponse,
+  type CheckpointField,
+  type DecodableStream,
+  type DecodedStreamEvent,
+  decoder,
+  type EventFilterPattern,
+  type EventProjection,
+  type EventProjectionTypeId,
+  eventFilterPattern,
+  type ProcessBatchOptions,
+  type ProcessBatchResult,
+  type ProjectionApplied,
+  type ProjectionBatchResult,
+  type ProjectionCaughtUp,
+  type ProjectionCheckpoint,
+  type ProjectionConfig,
+  type ProjectionError,
+  type ProjectionKey,
+  type ProjectionOutcome,
+  type ProjectionReadModel,
+  type ProjectionReadModelError,
+  type ProjectionRebuilt,
+  type ProjectionState,
+  projection,
+  type StreamRecord,
+} from "./internal/EventProjection.js"
+
+/**
+ * Bind a projection to the services its operations need — `DynamoClient`,
+ * the `TableConfig`s of the stream's table and the read model's, `evolve`'s
+ * requirements, and a `Compression` registry for packed event data — so every
+ * operation has `R = never`. Like {@link bind}, it checks the registry holds
+ * the codecs the stream's `storedAs` names (`[EDD-9078]`).
+ *
+ * @example
+ * ```ts
+ * const summaries = yield* EventStore.bindProjection(OrderSummaryProjection)
+ * export const handler = (event: { Records: Array<EventStore.StreamRecord> }) =>
+ *   summaries.processBatch(event.Records, { source: "lambda" }).pipe(
+ *     Effect.map((result) => result.response),
+ *     Effect.runPromise,
+ *   )
+ * ```
+ */
+export const bindProjection = <S, A, TStreamIdFields extends ReadonlyArray<string>, M, Err, R>(
+  projection: EventProjection<S, A, TStreamIdFields, M, Err, R>,
+): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never>, never, R> =>
+  Effect.gen(function* () {
+    const ctx = yield* Effect.context<R>()
+    // The codec check `bind` makes, against the registry captured here.
+    yield* Effect.provide(bind(projection.stream), ctx as Context.Context<any>)
+    const provide = <X, E>(effect: Effect.Effect<X, E, R>): Effect.Effect<X, E, never> =>
+      Effect.provide(effect, ctx)
+    return {
+      ...projection,
+      pipe() {
+        // eslint-disable-next-line prefer-rest-params
+        return Pipeable.pipeArguments(this, arguments)
+      },
+      applyBatch: (events, options) => provide(projection.applyBatch(events, options)),
+      apply: (event) => provide(projection.apply(event)),
+      catchUp: (streamId) => provide(projection.catchUp(streamId)),
+      rebuild: (streamId) => provide(projection.rebuild(streamId)),
+      processBatch: (records, options) => provide(projection.processBatch(records, options)),
+    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never>
+  })
