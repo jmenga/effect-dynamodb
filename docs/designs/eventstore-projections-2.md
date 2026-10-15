@@ -197,3 +197,13 @@ EventStore.multiProjection({
   - tombstones and recreation;
   - an outbox in the read model's table and in a separate table, with ordered
     drains under concurrent drainers.
+
+## 8. Review round 1
+
+- **`latest` + `terminal`:** a `latest` instance's candidates are tried newest first. A `terminal` rejection falls back to the next older event, and only the events older than the accepted one are `superseded`. Every candidate counts toward the checkpoint.
+- **Per-instance isolation:** an instance whose `evolve` (or `initial`, `key`, gap read, or checkpoint slot) fails non-terminally is set aside. The fold re-runs without it, its checkpoint doesn't move, and it is reported in `RowResult.failed`. `multiProjection.applyBatch` turns it into its own `Failed` outcome with that instance's positions. The row fails only when every instance does, so a single-source row behaves as before.
+- **`revision: { field, initial }`:** a row without a revision is written with `initial` (default 1).
+- **Drain:** a successful delivery deletes the effect conditioned only on its existence. A claim that expired mid-delivery (and was re-claimed) no longer livelocks overlapping drainers.
+- **`unrouted`:** `streams` may name a stream a projection reads. It is decoded once and returned too. The same stream bound and unbound shares its event schema; a different stream with the same marker is still `[EDD-9082]`.
+- **`create` over a tombstone:** a projection with `removal` flags its read model, and that entity's `create` guard (single-item and transactional) becomes `attribute_not_exists(pk, sk) OR __edd_e__ = <entityType>#tombstone`. Other entities' guards are unchanged.
+- **The change-feed findings** are fixed under `change-feed.md`.

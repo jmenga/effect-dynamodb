@@ -178,8 +178,11 @@ export interface EngineConfig {
     context: { readonly source: string; readonly streamId: any; readonly event: any },
   ) => any
   readonly checkpoints: CheckpointLayout
-  /** The library-owned revision field, incremented and conditioned on by every write. */
-  readonly revision: string | undefined
+  /**
+   * The library-owned revision field, incremented and conditioned on by every
+   * write; `initial` is the value a row without one is written with.
+   */
+  readonly revision: { readonly field: string; readonly initial: number } | undefined
   readonly toItem: ((state: any, context: any) => any) | undefined
   readonly retry: Schedule.Schedule<unknown, unknown>
   readonly removal: { readonly ttl: Duration.Duration | undefined } | undefined
@@ -226,6 +229,12 @@ export interface RowResult {
   readonly revision: number | undefined
   /** Outbox effects committed with this write. */
   readonly enqueued: number
+  /** Instances that failed and were left out of the write (the others applied). */
+  readonly failed: ReadonlyArray<{
+    readonly source: string
+    readonly streamId: string
+    readonly error: unknown
+  }>
 }
 
 /** The engine's own lost-race signal. */
@@ -287,7 +296,7 @@ export const makeEngine = (config: EngineConfig) => {
   /** The checkpoint and revision fields a tombstone keeps. */
   const keptFields: ReadonlyArray<string> = (() => {
     const kept = new Set<string>()
-    if (config.revision !== undefined) kept.add(config.revision)
+    if (config.revision !== undefined) kept.add(config.revision.field)
     const layout = config.checkpoints
     if (layout.kind === "scalar") kept.add(layout.field)
     else {
@@ -396,8 +405,14 @@ export const makeEngine = (config: EngineConfig) => {
   /** The row's revision, when the projection keeps one. */
   const revisionOf = (row: Option.Option<Row>): number | undefined => {
     if (config.revision === undefined || Option.isNone(row)) return undefined
-    const v = row.value.values[config.revision]
+    const v = row.value.values[config.revision.field]
     return v === undefined ? undefined : Number(v)
+  }
+
+  /** The revision the next write stores: one higher, or `initial` for a row without one. */
+  const nextRevisionOf = (row: Option.Option<Row>): number => {
+    const current = revisionOf(row)
+    return current === undefined ? config.revision!.initial : current + 1
   }
 
   /** Write the instances' new checkpoints (and the next revision) onto `target`. */
@@ -437,7 +452,7 @@ export const makeEngine = (config: EngineConfig) => {
       }
       if (layout.map !== undefined) target[layout.map] = map
     }
-    if (config.revision !== undefined) target[config.revision] = (revisionOf(row) ?? 0) + 1
+    if (config.revision !== undefined) target[config.revision.field] = nextRevisionOf(row)
   }
 
   /** The write's condition — the revision read, else the scalar checkpoint read. */
@@ -446,14 +461,14 @@ export const makeEngine = (config: EngineConfig) => {
   ): { readonly input: Record<string, unknown> | undefined; readonly raw: RawCondition } => {
     if (config.revision !== undefined) {
       const rev = revisionOf(row)
-      const name = dbName(config.revision)
+      const name = dbName(config.revision.field)
       return rev === undefined
         ? {
-            input: Option.isSome(row) ? { attributeNotExists: config.revision } : undefined,
+            input: Option.isSome(row) ? { attributeNotExists: config.revision.field } : undefined,
             raw: { expression: "attribute_not_exists(#g)", names: { "#g": name }, values: {} },
           }
         : {
-            input: { eq: { [config.revision]: rev } },
+            input: { eq: { [config.revision.field]: rev } },
             raw: {
               expression: "#g = :g",
               names: { "#g": name },
@@ -710,7 +725,9 @@ export const makeEngine = (config: EngineConfig) => {
           ? new ConcurrentModification({
               entityType,
               key: error.key as Record<string, unknown>,
-              attributes: [config.revision ?? (config.checkpoints as { field: string }).field],
+              attributes: [
+                config.revision?.field ?? (config.checkpoints as { field: string }).field,
+              ],
               current: Option.none(),
             })
           : error,
@@ -723,11 +740,7 @@ export const makeEngine = (config: EngineConfig) => {
     slotAt: number,
     work: InstanceWork,
   ): Effect.Effect<
-    {
-      readonly run: ReadonlyArray<AnyEvent>
-      readonly alreadyApplied: ReadonlyArray<AnyEvent>
-      readonly superseded: ReadonlyArray<AnyEvent>
-    },
+    { readonly run: ReadonlyArray<AnyEvent>; readonly alreadyApplied: ReadonlyArray<AnyEvent> },
     any,
     any
   > =>
@@ -735,17 +748,13 @@ export const makeEngine = (config: EngineConfig) => {
       const alreadyApplied = work.events?.filter((e) => e.version <= slotAt) ?? []
       const pending = work.events?.filter((e) => e.version > slotAt)
       if (pending !== undefined ? pending.length === 0 : slotAt >= work.top) {
-        return { run: [], alreadyApplied, superseded: [] }
+        return { run: [], alreadyApplied }
       }
-      if (work.source.mode === "latest" && pending !== undefined) {
-        return {
-          run: [pending[pending.length - 1]!],
-          alreadyApplied,
-          superseded: pending.slice(0, -1),
-        }
-      }
+      // `latest` reads nothing: its candidates are the batch's events.
+      if (work.source.mode === "latest" && pending !== undefined)
+        return { run: pending, alreadyApplied }
       if (pending !== undefined && coveredFrom(pending, slotAt + 1, work.delivered)) {
-        return { run: pending, alreadyApplied, superseded: [] }
+        return { run: pending, alreadyApplied }
       }
       const upTo = pending === undefined ? work.top : pending[pending.length - 1]!.version
       const read = (yield* work.source.stream.readFrom(work.streamId, slotAt, {
@@ -763,10 +772,7 @@ export const makeEngine = (config: EngineConfig) => {
         const key = addressed(yield* call("key", () => work.source.key(work.streamId, e)))
         if (Option.isSome(key) && keyId(key.value) === rowId) mine.push(e)
       }
-      if (work.source.mode === "latest" && mine.length > 0) {
-        return { run: [mine[mine.length - 1]!], alreadyApplied, superseded: mine.slice(0, -1) }
-      }
-      return { run: mine, alreadyApplied, superseded: [] }
+      return { run: mine, alreadyApplied }
     })
 
   /**
@@ -793,94 +799,191 @@ export const makeEngine = (config: EngineConfig) => {
     })
     const attempt = Effect.gen(function* () {
       const row = yield* readRow(key)
-      const plans: Array<{
+      type Plan = {
         readonly work: InstanceWork
         readonly slot: Slot
+        /** The events to fold — in `latest` mode, the candidates, newest tried first. */
         readonly run: ReadonlyArray<AnyEvent>
         readonly alreadyApplied: ReadonlyArray<AnyEvent>
-        readonly superseded: ReadonlyArray<AnyEvent>
+      }
+      /**
+       * Instances that failed (not by `terminal`): left out of this write —
+       * their checkpoints don't move — and reported, so the row's other
+       * sources still apply.
+       */
+      const failed: Array<{
+        readonly source: string
+        readonly streamId: string
+        readonly error: unknown
       }> = []
+      const plans: Array<Plan> = []
       const claimed = new Map<string, string>()
       const slotRow = options?.fromScratch === true ? Option.none<Row>() : row
       for (const w of ordered) {
         const slot = slotOf(slotRow, w.source.name, w.streamIdStr, claimed)
-        if (slot instanceof ProjectionSourceConflict) return yield* Effect.fail(slot)
+        if (slot instanceof ProjectionSourceConflict) {
+          failed.push({ source: w.source.name, streamId: w.streamIdStr, error: slot })
+          continue
+        }
         const at = options?.fromScratch === true ? 0 : slot.at
-        const r = yield* runOf(rowId, at, w)
-        plans.push({ work: w, slot, ...r })
+        const r = yield* Effect.result(runOf(rowId, at, w))
+        if (Result.isFailure(r)) {
+          failed.push({ source: w.source.name, streamId: w.streamIdStr, error: r.failure })
+          continue
+        }
+        plans.push({ work: w, slot, ...r.success })
       }
-      // Fold.
-      let state: Option.Option<any> =
+      const initialState: Option.Option<any> =
         options?.fromScratch === true || Option.isNone(row) || row.value.tombstone
           ? Option.none()
           : Option.some(row.value.values)
-      let removed = Option.isSome(row) && row.value.tombstone && options?.fromScratch !== true
-      const enqueued: Array<Enqueued> = []
-      const results: Array<{
-        applied: Array<AnyEvent>
-        rejected: Array<{ event: AnyEvent; error: unknown }>
-      }> = []
-      for (const plan of plans) {
-        const applied: Array<AnyEvent> = []
-        const rejected: Array<{ event: AnyEvent; error: unknown }> = []
-        const context: EvolveContext = {
-          source: plan.work.source.name,
-          streamId: plan.work.streamIdStr,
-        }
-        for (const event of plan.run) {
-          const base = Option.isSome(state)
-            ? state.value
-            : yield* call("initial", () =>
-                config.initial(key, {
-                  source: context.source,
-                  streamId: plan.work.streamId,
-                  event,
+      const initiallyRemoved =
+        Option.isSome(row) && row.value.tombstone && options?.fromScratch !== true
+
+      type Folded = {
+        readonly state: Option.Option<any>
+        readonly removed: boolean
+        readonly enqueued: ReadonlyArray<Enqueued>
+        readonly results: ReadonlyArray<{
+          readonly applied: ReadonlyArray<AnyEvent>
+          readonly rejected: ReadonlyArray<{ readonly event: AnyEvent; readonly error: unknown }>
+          readonly superseded: ReadonlyArray<AnyEvent>
+        }>
+      }
+      /** Fold `active`; the index of the first instance that fails, if one does. */
+      const foldAll = (
+        active: ReadonlyArray<Plan>,
+      ): Effect.Effect<
+        { readonly folded: Folded } | { readonly failedAt: number; readonly error: unknown },
+        never,
+        any
+      > =>
+        Effect.gen(function* () {
+          let state = initialState
+          let removed = initiallyRemoved
+          const enqueued: Array<Enqueued> = []
+          const results: Array<Folded["results"][number]> = []
+          for (const [index, plan] of active.entries()) {
+            const applied: Array<AnyEvent> = []
+            const rejected: Array<{ event: AnyEvent; error: unknown }> = []
+            const superseded: Array<AnyEvent> = []
+            const context: EvolveContext = {
+              source: plan.work.source.name,
+              streamId: plan.work.streamIdStr,
+            }
+            /** Evolve one event onto the current state: its next state, or its failure. */
+            const evolveOne = (event: AnyEvent) =>
+              Effect.result(
+                Effect.gen(function* () {
+                  const base = Option.isSome(state)
+                    ? state.value
+                    : yield* call("initial", () =>
+                        config.initial(key, {
+                          source: context.source,
+                          streamId: plan.work.streamId,
+                          event,
+                        }),
+                      )
+                  const next = yield* plan.work.source.evolve(base, event, context)
+                  if (isRemoveRow(next) && config.removal === undefined) {
+                    return yield* new ValidationError({
+                      entityType,
+                      operation: config.label,
+                      cause:
+                        "`evolve` returned `removeRow`, but the projection declares no `removal`.",
+                    })
+                  }
+                  const effects =
+                    config.outbox === undefined
+                      ? []
+                      : yield* call("outbox", () =>
+                          config.outbox!.effects(
+                            event,
+                            isRemoveRow(next) ? undefined : next,
+                            context,
+                          ),
+                        )
+                  return { next, effects }
                 }),
               )
-          const result = yield* Effect.result(plan.work.source.evolve(base, event, context))
-          if (Result.isSuccess(result)) {
-            if (isRemoveRow(result.success)) {
-              if (config.removal === undefined) {
-                return yield* new ValidationError({
-                  entityType,
-                  operation: config.label,
-                  cause: "`evolve` returned `removeRow`, but the projection declares no `removal`.",
-                })
+            const accept = (
+              event: AnyEvent,
+              outcome: { next: unknown; effects: ReadonlyArray<unknown> },
+            ) => {
+              if (isRemoveRow(outcome.next)) {
+                state = Option.none()
+                removed = true
+              } else {
+                state = Option.some(outcome.next)
+                removed = false
               }
-              state = Option.none()
-              removed = true
+              applied.push(event)
+              for (const effect of outcome.effects)
+                enqueued.push({ effect, event, source: context.source })
+            }
+            if (plan.work.source.mode === "latest") {
+              // Newest first, until one is accepted: rejections fall back to an
+              // older event, and only those older than the accepted one are passed over.
+              for (let i = plan.run.length - 1; i >= 0; i--) {
+                const event = plan.run[i]!
+                const result = yield* evolveOne(event)
+                if (Result.isSuccess(result)) {
+                  accept(event, result.success)
+                  superseded.push(...plan.run.slice(0, i))
+                  break
+                }
+                if (plan.work.source.terminal?.(result.failure) === true) {
+                  rejected.unshift({ event, error: result.failure })
+                } else return { failedAt: index, error: result.failure }
+              }
             } else {
-              state = Option.some(result.success)
-              removed = false
+              for (const event of plan.run) {
+                const result = yield* evolveOne(event)
+                if (Result.isSuccess(result)) accept(event, result.success)
+                else if (plan.work.source.terminal?.(result.failure) === true) {
+                  rejected.push({ event, error: result.failure })
+                } else return { failedAt: index, error: result.failure }
+              }
             }
-            applied.push(event)
-            if (config.outbox !== undefined) {
-              const effects = yield* call("outbox", () =>
-                config.outbox!.effects(event, Option.getOrUndefined(state), context),
-              )
-              for (const effect of effects) enqueued.push({ effect, event, source: context.source })
-            }
-          } else if (plan.work.source.terminal?.(result.failure) === true) {
-            rejected.push({ event, error: result.failure })
-          } else {
-            return yield* Effect.fail(result.failure)
+            results.push({ applied, rejected, superseded })
           }
+          return { folded: { state, removed, enqueued, results } }
+        })
+
+      // Fold; an instance that fails is set aside and the rest folded again.
+      let active: ReadonlyArray<Plan> = plans
+      let folded: Folded
+      while (true) {
+        const attempt = yield* foldAll(active)
+        if ("folded" in attempt) {
+          folded = attempt.folded
+          break
         }
-        results.push({ applied, rejected })
+        const bad = active[attempt.failedAt]!
+        failed.push({
+          source: bad.work.source.name,
+          streamId: bad.work.streamIdStr,
+          error: attempt.error,
+        })
+        active = active.filter((p) => p !== bad)
       }
+      // Every instance failed: the row fails, with the first failure.
+      if (active.length === 0 && failed.length > 0) return yield* Effect.fail(failed[0]!.error)
+      const { state, removed, enqueued, results } = folded
+
       const instances = (version: (i: number) => number): Array<InstanceResult> =>
-        plans.map((plan, i) => ({
+        active.map((plan, i) => ({
           source: plan.work.source.name,
           streamId: plan.work.streamIdStr,
           applied: results[i]!.applied,
           alreadyApplied: plan.alreadyApplied,
           rejected: results[i]!.rejected,
-          superseded: plan.superseded,
+          superseded: results[i]!.superseded,
           version: version(i),
         }))
       const unchanged = (): RowResult => ({
         key,
-        instances: instances((i) => plans[i]!.slot.at),
+        instances: instances((i) => active[i]!.slot.at),
         state:
           Option.isSome(row) && !row.value.tombstone
             ? Option.some(row.value.values)
@@ -888,32 +991,30 @@ export const makeEngine = (config: EngineConfig) => {
         removed: Option.isSome(row) && row.value.tombstone,
         revision: revisionOf(row),
         enqueued: 0,
+        failed,
       })
-      const consumed = plans.some((p) => p.run.length > 0)
+      const consumed = active.some((p) => p.run.length > 0)
       if (!consumed && options?.fromScratch !== true) return unchanged()
       // No row came of it (only rejections, and none existed): write nothing.
       if (Option.isNone(state) && !removed) return unchanged()
-      // The new checkpoints.
-      const advanced = plans
+      // The new checkpoints: every event considered, applied or not.
+      const advanced = active
         .filter((p) => p.run.length > 0 || options?.fromScratch === true)
         .map((p) => ({
           source: p.work.source.name,
           streamIdStr: p.work.streamIdStr,
           slot: p.slot,
-          version:
-            p.run.length > 0
-              ? Math.max(p.run[p.run.length - 1]!.version, ...p.superseded.map((e) => e.version))
-              : p.slot.at,
+          version: p.run.length > 0 ? p.run[p.run.length - 1]!.version : p.slot.at,
         }))
       const target: Record<string, unknown> = Option.isSome(state)
         ? { ...(state.value as object) }
         : {}
       stamp(target, options?.fromScratch === true ? Option.none() : row, advanced)
       if (options?.fromScratch === true && config.revision !== undefined) {
-        target[config.revision] = (revisionOf(row) ?? 0) + 1
+        target[config.revision.field] = nextRevisionOf(row)
       }
       const nextRevision =
-        config.revision === undefined ? undefined : (target[config.revision] as number)
+        config.revision === undefined ? undefined : (target[config.revision.field] as number)
       let written: Option.Option<unknown>
       if (Option.isNone(state)) {
         // A tombstone keeps exactly the layout's fields.
@@ -937,13 +1038,14 @@ export const makeEngine = (config: EngineConfig) => {
         key,
         instances: instances(
           (i) =>
-            versions.get(`${plans[i]!.work.source.name}\u0000${plans[i]!.work.streamIdStr}`) ??
-            plans[i]!.slot.at,
+            versions.get(`${active[i]!.work.source.name}\u0000${active[i]!.work.streamIdStr}`) ??
+            active[i]!.slot.at,
         ),
         state: written,
         removed: Option.isNone(state),
         revision: nextRevision,
         enqueued: enqueued.length,
+        failed,
       }
     })
     return withRetry(attempt)
@@ -1040,13 +1142,15 @@ export const makeEngine = (config: EngineConfig) => {
             .pipe(Effect.ignore)
           return { delivered, undelivered: Option.some({ meta, error: outcome.failure }) }
         }
+        // Delivered: remove it, whoever holds the claim now. A drainer whose
+        // claim expired mid-delivery must still retire the effect, or two
+        // slow drainers re-claim it in turn forever.
         yield* client
           .deleteItem({
             TableName,
             Key: toAttributeMap({ [keys.pk]: raw[keys.pk], [keys.sk]: raw[keys.sk] }),
-            ConditionExpression: "#c = :c",
-            ExpressionAttributeNames: { "#c": CLAIM_TOKEN },
-            ExpressionAttributeValues: toAttributeMap({ ":c": token }),
+            ConditionExpression: "attribute_exists(#pk)",
+            ExpressionAttributeNames: { "#pk": keys.pk },
           })
           .pipe(
             Effect.catchIf(

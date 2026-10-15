@@ -213,8 +213,10 @@ export interface ProjectionConfig<
    * row has none). It may be an existing write counter readers already use.
    * With it, a write is guarded by the revision instead of the checkpoint, so
    * a `rebuild` can't be undone by a concurrent writer. Required by `outbox`.
+   * `{ field, initial }` sets the value a row without one is written with
+   * (default `1`) — `0`, say, to match a counter readers already see.
    */
-  readonly revision?: CheckpointField<ProjectionState<RM>> | undefined
+  readonly revision?: ProjectionRevision<ProjectionState<RM>> | undefined
   /**
    * Allow `evolve` to remove the row (`EventStore.removeRow`): the library
    * writes a tombstone at the row's key that keeps its checkpoint and
@@ -229,6 +231,21 @@ export interface ProjectionConfig<
     | ProjectionOutboxConfig<O, StreamEvent<TEvent, StreamMetadata<TMetadata>>, ProjectionState<RM>>
     | undefined
 }
+
+/** A projection's `revision` — the field, or the field and its starting value. */
+export type ProjectionRevision<S> =
+  | CheckpointField<S>
+  | { readonly field: CheckpointField<S>; readonly initial?: number | undefined }
+
+/** @internal `revision`, resolved. */
+export const resolveRevision = (
+  revision: ProjectionRevision<any> | undefined,
+): { readonly field: string; readonly initial: number } | undefined =>
+  revision === undefined
+    ? undefined
+    : typeof revision === "string"
+      ? { field: revision, initial: 1 }
+      : { field: revision.field as string, initial: revision.initial ?? 1 }
 
 /**
  * An ordered, at-least-once outbox (#155). `effects(event, next, context)`
@@ -848,6 +865,11 @@ export const refuseReadModel = (
   if (options.outbox && options.revision === undefined) {
     refuse("`outbox` orders a row's effects by its `revision`: declare one.")
   }
+  // Rows of this read model may be tombstones (#154): its `create` takes one
+  // for the absent row every read by key reports.
+  if (options.removal) {
+    ;(readModel as { _projectionTombstones?: boolean })._projectionTombstones = true
+  }
 }
 
 /** @internal An outbox config, resolved. */
@@ -927,11 +949,12 @@ export const projection = <
     typeof config.checkpoint === "string" ? config.checkpoint : config.checkpoint.field
   ) as string
   const offset = typeof config.checkpoint === "string" ? 0 : (config.checkpoint.offset ?? 0)
+  const revision = resolveRevision(config.revision)
   refuseReadModel(label, readModel, {
-    fields: [field, ...(config.revision === undefined ? [] : [config.revision as string])],
+    fields: [field, ...(revision === undefined ? [] : [revision.field])],
     removal: config.removal !== undefined,
     outbox: config.outbox !== undefined,
-    revision: config.revision as string | undefined,
+    revision: revision?.field,
   })
   if (!Number.isInteger(offset)) {
     throw new Error(`[EDD-9081] ${label}: the checkpoint offset ${offset} is not an integer.`)
@@ -951,7 +974,7 @@ export const projection = <
     sources: [source],
     initial: (_key, context) => config.initial(context.streamId, context.event),
     checkpoints: { kind: "scalar", field, offset },
-    revision: config.revision as string | undefined,
+    revision,
     toItem: config.toItem as EngineConfig["toItem"],
     toItemContext: (key, work) => ({ streamId: work[0]?.streamId, key }),
     retry: retrySchedule(config.retry),
@@ -1452,13 +1475,30 @@ export const runBatch = <Rec>(
       if (readers === undefined) streams.set(route.stream, [route])
       else readers.push(route)
     }
-    const unroutedStreams = decodeOnly.filter(([, stream]) => !streams.has(stream))
+    // `streams` may name a stream a projection reads too: it is decoded once,
+    // applied, and returned as `unrouted` as well.
+    // The same stream bound or unbound shares its event schema; a different
+    // stream with the same marker stays a conflict (`[EDD-9082]`).
+    const schemaOf = (stream: DecodableStream) =>
+      (stream as { readonly eventSchema?: unknown }).eventSchema
+    const routedSchemas = new Map(
+      [...streams.keys()].map((stream) => [stream.eventMarker, schemaOf(stream)]),
+    )
+    const decodeOnlyStreams = decodeOnly.filter(
+      ([, stream]) =>
+        !streams.has(stream) &&
+        !(
+          routedSchemas.has(stream.eventMarker) &&
+          routedSchemas.get(stream.eventMarker) === schemaOf(stream)
+        ),
+    )
     /** A marker's stream: the projections that read it, or its name when it has none. */
     const byMarker = markerIndex(operation, [
       ...[...streams.keys()].map((stream) => [stream.streamName, stream] as const),
-      ...unroutedStreams,
+      ...decodeOnlyStreams,
     ])
-    const unroutedNames = new Map(unroutedStreams.map(([name, stream]) => [stream, name]))
+    /** The names `streams` gives, by event marker. */
+    const unroutedNames = new Map(decodeOnly.map(([name, stream]) => [stream.eventMarker, name]))
     const unrouted: Array<{
       readonly position: number
       readonly stream: string
@@ -1490,14 +1530,12 @@ export const runBatch = <Rec>(
       if (Result.isFailure(decoded)) {
         decodeFailures.push({ record, error: decoded.failure })
         if (options.onDecodeFailure !== "skip") failed.add(i)
-      } else if (Option.isSome(decoded.success) && readers === undefined) {
-        unrouted.push({
-          position: i,
-          stream: unroutedNames.get(entry[1])!,
-          event: decoded.success.value,
-        })
       } else if (Option.isSome(decoded.success)) {
-        for (const route of readers!) {
+        const name = unroutedNames.get(entry[1].eventMarker)
+        if (name !== undefined) {
+          unrouted.push({ position: i, stream: name, event: decoded.success.value })
+        }
+        for (const route of readers ?? []) {
           const target = routed.get(route.name)!
           target.events.push(
             route.tag === undefined

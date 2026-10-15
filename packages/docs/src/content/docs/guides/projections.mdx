@@ -265,7 +265,7 @@ const makeFeedHandler = Effect.gen(function* () {
 })
 ```
 
-Each projection's outcomes come back under its name, with `positions` indexing the records. To act on streams that have no projection (side effects only) without decoding twice, name them in `streams: { Name: stream }`: their events come back in `unrouted`, each with its record's position. Two streams storing events under one marker make the call die with `[EDD-9082]`.
+Each projection's outcomes come back under its name, with `positions` indexing the records. To act on a stream's events without decoding twice (side effects only), name it in `streams: { Name: stream }`. Its events come back in `unrouted`, each with its record's position, whether or not a projection also reads the stream. Two streams storing events under one marker make the call die with `[EDD-9082]`.
 
 A process that polls the stream itself runs the same call per batch with [`runChangeFeed`](/effect-dynamodb/guides/change-feed/#projecting-the-feed), which acknowledges each batch per its response.
 

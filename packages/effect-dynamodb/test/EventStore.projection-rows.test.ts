@@ -95,6 +95,7 @@ const base = {
 }
 
 const Revisioned = EventStore.projection({ ...base, revision: "rev" })
+const FromZero = EventStore.projection({ ...base, revision: { field: "rev", initial: 0 } })
 const Removable = EventStore.projection({ ...base, revision: "rev", removal: {} })
 const Notifying = EventStore.projection({
   ...base,
@@ -156,6 +157,16 @@ describe("projection revision", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("a revision's `initial` is the first write's value", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+      yield* FromZero.apply(events[0]!)
+      expect(rowOf("o1")).toMatchObject({ rev: 0 })
+      yield* FromZero.apply(events[1]!)
+      expect(rowOf("o1")).toMatchObject({ rev: 1 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("a rebuild at the head still moves the revision, so a stale writer loses", () =>
     Effect.gen(function* () {
       const events = yield* seed("o1", [new Placed({ amount: 1 })])
@@ -201,6 +212,25 @@ describe("projection removal (tombstones)", () => {
       expect(again.applied).toEqual([])
       expect(again.removed).toBe(true)
       expect(rowOf("o1")!.__edd_e__).toBe("Summary#tombstone")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("the entity's create takes a tombstone's place, as get reports none", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Cancelled({})])
+      yield* Removable.applyBatch(events)
+      const created = yield* Summaries.create({
+        orderId: "o1",
+        total: 9,
+        version: 0,
+        rev: 0,
+      }).asEffect()
+      expect(created.total).toBe(9)
+      // A second create still finds the row.
+      const again = yield* Effect.flip(
+        Summaries.create({ orderId: "o1", total: 1, version: 0, rev: 0 }).asEffect(),
+      )
+      expect(again._tag).toBe("ConditionalCheckFailed")
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -330,6 +360,24 @@ describe("projection outbox", () => {
         expect(second.delivered).toBe(2)
         expect(delivered).toEqual([3, 7])
       }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a delivered effect is removed even if its claim was taken over meanwhile", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+      yield* Notifying.applyBatch(events)
+      const drained = yield* Notifying.drain({ orderId: "o1" }, () =>
+        Effect.sync(() => {
+          // The claim expired while delivering, and another drainer took it.
+          const [key, head] = [...store.entries()].find(
+            ([, item]) => item.__edd_e__?.S === "Summary#outbox",
+          )!
+          store.set(key, { ...head, __edd_claim__: { S: "other" } } as Item)
+        }),
+      )
+      expect(drained.delivered).toBe(1)
+      expect(items("read", "Summary#outbox")).toEqual([])
+    }).pipe(Effect.provide(TestLayer)),
   )
 
   it.effect("a head claimed by another drainer stops the drain", () =>

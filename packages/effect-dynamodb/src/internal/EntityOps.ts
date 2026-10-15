@@ -58,7 +58,7 @@ export type UpdateReturn<A, M extends ReturnValuesMode> = M extends "none"
  * alone (what these ops always sent).
  */
 export const withGuard = (
-  guard: ConditionInput | undefined,
+  guard: Expr | ConditionInput | undefined,
   condition: Expr | ConditionInput | undefined,
 ): Expr | ConditionInput | undefined => {
   if (guard === undefined) return condition

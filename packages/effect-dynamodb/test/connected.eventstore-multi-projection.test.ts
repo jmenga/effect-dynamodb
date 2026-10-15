@@ -164,6 +164,20 @@ const ShipmentProjection = EventStore.multiProjection({
   },
 })
 
+/** A claim shorter than a delivery: overlapping drainers re-claim each other's heads. */
+const SlowDrainProjection = EventStore.multiProjection({
+  readModel: Shipments,
+  initial,
+  sources,
+  checkpoints,
+  revision: "revision",
+  outbox: {
+    schema: Notice,
+    effects: (event) => [{ shipmentId: event.streamId, what: event.eventType, n: event.version }],
+    claimFor: "50 millis",
+  },
+})
+
 const ElsewhereProjection = EventStore.multiProjection({
   readModel: Shipments,
   initial,
@@ -480,6 +494,45 @@ describeConnected("EventStore multi-source projections (connected)", () => {
       expect(seen).toContain("scan:Scanned")
       expect(seen).toContain("order:LineAdded")
       void Option
+    }).pipe(provide),
+  )
+
+  it.live("a delivery outlasting its claim still retires the effect: no livelock", () =>
+    Effect.gen(function* () {
+      yield* Orders.append(
+        { orderId: "slow" },
+        Array.from({ length: 3 }, () => new LineAdded({ shipmentId: "slow", qty: 1 })),
+        0,
+      )
+      yield* SlowDrainProjection.applyBatch(
+        tagged("order" as const, yield* Orders.read({ orderId: "slow" })),
+      )
+      const deliveries: Array<number> = []
+      const deliver = (effect: Notice) =>
+        Effect.sleep("150 millis").pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              deliveries.push(effect.n)
+            }),
+          ),
+        )
+      yield* Effect.forEach(
+        [1, 2],
+        () => SlowDrainProjection.drain({ shipmentId: "slow" }, deliver),
+        {
+          concurrency: "unbounded",
+        },
+      )
+      yield* SlowDrainProjection.drain({ shipmentId: "slow" }, deliver)
+      // Every effect delivered, at least once, and the outbox emptied — bounded, not looping.
+      expect([...new Set(deliveries)].sort()).toEqual([1, 2, 3])
+      expect(deliveries.length).toBeLessThanOrEqual(6)
+      expect(
+        (yield* rawItems(readTableName)).filter(
+          (i) =>
+            i.__edd_e__ === "Shipment#outbox" && i.pk === "$multi-it#v1#shipment#shipmentid_slow",
+        ),
+      ).toEqual([])
     }).pipe(provide),
   )
 })

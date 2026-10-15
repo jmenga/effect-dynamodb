@@ -472,6 +472,129 @@ describe("multiProjection", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("latest + terminal falls back newest-first until one is accepted", () =>
+    Effect.gen(function* () {
+      const Guarded = EventStore.multiProjection({
+        ...config,
+        sources: (source: EventStore.SourceBuilder<{ readonly shipmentId: string }, Shipment>) => ({
+          scan: source(Scans, {
+            key: (id) => ({ shipmentId: id.shipmentId }),
+            evolve: (state, event) =>
+              event.data.location === "nowhere"
+                ? Effect.fail(new NegativeScore({ version: event.version }))
+                : Effect.succeed({ ...state, location: event.data.location }),
+            mode: "latest",
+            terminal: (error) => error._tag === "NegativeScore",
+          }),
+        }),
+        checkpoints: { field: "checkpoints" },
+      })
+      yield* Scans.append(
+        { shipmentId: "s9", carrier: "ups" },
+        [
+          new Scanned({ shipmentId: "s9", location: "depot" }),
+          new Scanned({ shipmentId: "s9", location: "truck" }),
+          new Scanned({ shipmentId: "s9", location: "nowhere" }),
+        ],
+        0,
+      )
+      const events = tagged(
+        "scan" as const,
+        yield* Scans.read({ shipmentId: "s9", carrier: "ups" }),
+      )
+      const result = yield* Guarded.applyBatch(events)
+      const outcome = result.outcomes[0]!
+      if (outcome._tag !== "Applied") throw new Error("not applied")
+      const instance = outcome.instances[0]!
+      expect(instance.applied.map((e) => e.version)).toEqual([2])
+      expect(instance.rejected.map((r) => r.event.version)).toEqual([3])
+      expect(instance.superseded.map((e) => e.version)).toEqual([1])
+      expect(instance.version).toBe(3)
+      expect(row("s9")).toMatchObject({ location: "truck", checkpoints: { "scan#s9#ups": 3 } })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("one instance's failure leaves the row's other sources to apply", () =>
+    Effect.gen(function* () {
+      const { orders } = yield* seed
+      yield* Inspections.append(
+        { inspectionId: "bad" },
+        [
+          new Inspected({ shipmentId: "s1", score: 1 }),
+          new Inspected({ shipmentId: "s1", score: 2 }),
+        ],
+        0,
+      )
+      const Fragile = EventStore.multiProjection({
+        ...config,
+        sources: (source: EventStore.SourceBuilder<{ readonly shipmentId: string }, Shipment>) => ({
+          order: source(Orders, {
+            key: (_id, event) => ({ shipmentId: event.data.shipmentId }),
+            evolve: (state, event) =>
+              Effect.succeed({ ...state, lines: state.lines + event.data.lines }),
+          }),
+          inspection: source(Inspections, {
+            key: (_id, event) => ({ shipmentId: event.data.shipmentId }),
+            evolve: (state, event) =>
+              event.version === 2
+                ? Effect.fail(new NegativeScore({ version: event.version }))
+                : Effect.succeed({ ...state, score: state.score + event.data.score }),
+          }),
+        }),
+        checkpoints: { field: "checkpoints" },
+      })
+      const bad = tagged("inspection" as const, yield* Inspections.read({ inspectionId: "bad" }))
+      const result = yield* Fragile.applyBatch([orders[0]!, bad[0]!, bad[1]!])
+      expect(result.outcomes.map((o) => [o._tag, o.positions])).toEqual([
+        ["Applied", [0]],
+        ["Failed", [1, 2]],
+      ])
+      expect(result.failedPositions).toEqual([1])
+      // The order applied; the inspection's checkpoint did not move.
+      expect(row("s1")).toMatchObject({ lines: 2, score: 0, checkpoints: { "order#o1": 1 } })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("revision starts at `initial` on a new row", () =>
+    Effect.gen(function* () {
+      const FromZero = EventStore.multiProjection({
+        ...config,
+        checkpoints: { field: "checkpoints" },
+        revision: { field: "revision", initial: 0 },
+      })
+      const { orders } = yield* seed
+      yield* FromZero.applyBatch(orders.slice(0, 1))
+      expect(row("s1")!.revision).toBe(0)
+      yield* FromZero.applyBatch(orders.slice(2, 3))
+      expect(row("s1")!.revision).toBe(1)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("`streams` may name a projected stream: its events are applied and returned", () =>
+    Effect.gen(function* () {
+      yield* seed
+      const records = [...store.entries()]
+        .filter(([k, item]) => k.startsWith("events|") && item.__edd_e__?.S === "order.event")
+        .map(([, item], i) => ({
+          eventID: `e${i}`,
+          eventName: "INSERT",
+          dynamodb: { SequenceNumber: String(i).padStart(4, "0"), NewImage: item as never },
+        }))
+      const bound = yield* EventStore.bindProjection(ShipmentProjection)
+      const result = yield* EventStore.processBatch(records, {
+        projections: { shipments: bound },
+        streams: { Order: Orders },
+        source: "lambda",
+      })
+      expect(result.unrouted.map((u) => [u.position, u.stream, u.event.version])).toEqual([
+        [0, "Order", 1],
+        [1, "Order", 2],
+        [2, "Order", 3],
+      ])
+      expect(result.outcomes.shipments).toHaveLength(2)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it("refuses checkpoints that cover no source, and unknown source mappings", () => {
     expect(() => EventStore.multiProjection({ ...config, checkpoints: {} } as never)).toThrow(
       /\[EDD-9081\]/,

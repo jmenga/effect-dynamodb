@@ -29,11 +29,13 @@ import {
   type ProjectionOutboxConfig,
   type ProjectionReadModel,
   type ProjectionReadModelError,
+  type ProjectionRevision,
   ProjectionRoutes,
   type ProjectionState,
   type Route,
   refuseReadModel,
   resolveOutbox,
+  resolveRevision,
   runBatch,
   type StreamRecord,
 } from "./EventProjection.js"
@@ -186,7 +188,7 @@ export interface MultiProjectionConfig<
   readonly sources: (source: SourceBuilder<ProjectionKey<RM>, ProjectionState<RM>>) => Sources
   readonly checkpoints: MultiCheckpoints<ProjectionState<RM>, keyof Sources & string>
   /** The revision field (required) — see `projection`'s `revision`. */
-  readonly revision: CheckpointField<ProjectionState<RM>>
+  readonly revision: ProjectionRevision<ProjectionState<RM>>
   /** The row as written, from the folded state — see `projection`'s `toItem`. */
   readonly toItem?:
     | ((
@@ -436,15 +438,16 @@ export const multiProjection = <
       }
     }
   }
+  const revision = resolveRevision(config.revision)!
   refuseReadModel(label, readModel, {
     fields: [
-      config.revision as string,
+      revision.field,
       ...(config.checkpoints.field === undefined ? [] : [config.checkpoints.field as string]),
       ...Object.values(mapped).flatMap((f) => [f.field, f.instanceField]),
     ],
     removal: config.removal !== undefined,
     outbox: config.outbox !== undefined,
-    revision: config.revision as string,
+    revision: revision.field,
   })
 
   const engineSources: Record<string, EngineSource> = {}
@@ -474,7 +477,7 @@ export const multiProjection = <
         ]),
       ),
     },
-    revision: config.revision as string,
+    revision,
     toItem: config.toItem as never,
     toItemContext: (key) => ({ key }),
     retry: retrySchedule(config.retry),
@@ -553,7 +556,13 @@ export const multiProjection = <
       // Rows across sources: each row's work, one entry per instance.
       const rows = new Map<
         string,
-        { key: K; positions: Array<number>; work: Array<InstanceWork> }
+        {
+          key: K
+          positions: Array<number>
+          work: Array<InstanceWork>
+          /** Each instance's positions in this row, by `<source>\u0000<streamId>`. */
+          byInstance: Map<string, Array<number>>
+        }
       >()
       for (const group of instances.values()) {
         const placed = yield* Effect.result(
@@ -598,8 +607,14 @@ export const multiProjection = <
           const ordered = [...row.events]
             .sort((a, b) => a.version - b.version)
             .filter((e, i, sorted) => i === 0 || sorted[i - 1]!.version !== e.version)
-          const entry = rows.get(id) ?? { key: row.key, positions: [], work: [] }
+          const entry = rows.get(id) ?? {
+            key: row.key,
+            positions: [] as Array<number>,
+            work: [] as Array<InstanceWork>,
+            byInstance: new Map<string, Array<number>>(),
+          }
           entry.positions.push(...row.positions)
+          entry.byInstance.set(`${group.source.name}\u0000${group.streamIdStr}`, row.positions)
           entry.work.push({
             source: group.source,
             streamIdStr: group.streamIdStr,
@@ -616,16 +631,31 @@ export const multiProjection = <
         return {
           first: positions[0]!,
           run: Effect.result(
-            (engine.applyRow(row.key, row.work) as Effect.Effect<RowResult, Err, Req>).pipe(
-              Effect.flatMap((result) => deliverAfter(appliedOf(result), options?.deliver)),
-            ),
+            Effect.gen(function* () {
+              const result = (yield* engine.applyRow(row.key, row.work)) as RowResult
+              return { result, applied: yield* deliverAfter(appliedOf(result), options?.deliver) }
+            }) as Effect.Effect<{ result: RowResult; applied: Applied }, Err, Req>,
           ).pipe(
-            Effect.map(
-              (result): Outcome =>
-                Result.isSuccess(result)
-                  ? { _tag: "Applied", positions, ...result.success }
-                  : { _tag: "Failed", key: row.key, positions, error: result.failure },
-            ),
+            Effect.map((outcome): ReadonlyArray<Outcome> => {
+              if (Result.isFailure(outcome)) {
+                return [{ _tag: "Failed", key: row.key, positions, error: outcome.failure }]
+              }
+              // The instances that failed are their own outcomes; the rest applied.
+              const failedAt = new Set<number>()
+              const instanceFailures: Array<Outcome> = outcome.success.result.failed.map((f) => {
+                const at = row.byInstance.get(`${f.source}\u0000${f.streamId}`) ?? []
+                for (const p of at) failedAt.add(p)
+                return { _tag: "Failed", key: row.key, positions: at, error: f.error as Err }
+              })
+              return [
+                {
+                  _tag: "Applied",
+                  positions: positions.filter((p) => !failedAt.has(p)),
+                  ...outcome.success.applied,
+                },
+                ...instanceFailures,
+              ]
+            }),
           ),
         }
       })
@@ -634,8 +664,10 @@ export const multiProjection = <
         ...failed,
         ...(yield* Effect.forEach(tasks, (task) => task.run, {
           concurrency: options?.concurrency ?? 10,
-        })),
-      ].sort((a, b) => a.positions[0]! - b.positions[0]!)
+        })).flat(),
+      ]
+        .filter((o) => o._tag === "Failed" || o.positions.length > 0 || o.instances.length > 0)
+        .sort((a, b) => (a.positions[0] ?? 0) - (b.positions[0] ?? 0))
       return {
         outcomes,
         failedPositions: outcomes
@@ -675,6 +707,7 @@ export const multiProjection = <
           removed: false,
           revision: undefined,
           enqueued: 0,
+          failed: [],
         })
       }
       const work: Array<InstanceWork> = []

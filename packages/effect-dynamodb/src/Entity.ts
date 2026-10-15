@@ -93,6 +93,7 @@ import {
   compileExpr,
   createConditionOps,
   type Expr,
+  ExprTag,
   emptyPartProblem,
   isExpr,
   nonEmptyCondition,
@@ -5441,14 +5442,7 @@ const makeImpl = <
           // a guard no `.condition()` can replace (#133). `upsert`'s create
           // attempt brings its own (`runGuardedPut` requires the item missing).
           const condition = withGuard(
-            opts.putKind === "create" && operation !== "upsert"
-              ? {
-                  attributeNotExists: [
-                    config.indexes.primary.pk.field,
-                    config.indexes.primary.sk.field,
-                  ],
-                }
-              : undefined,
+            opts.putKind === "create" && operation !== "upsert" ? createGuard(self) : undefined,
             opts.condition,
           )
           const userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
@@ -10600,6 +10594,35 @@ const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteT
  * carries no operations, so the bound op is the only descriptor its author can
  * ever hold.
  */
+/**
+ * @internal `create`'s guard: the item must not exist — or, on a read model a
+ * projection removes rows from (#154), be its tombstone, which every read by
+ * key reports as absent.
+ */
+export const createGuard = (entity: {
+  readonly entityType: string
+  readonly indexes: {
+    readonly primary?: {
+      readonly pk: { readonly field: string }
+      readonly sk: { readonly field: string }
+    }
+  }
+}): Expr | ConditionInput => {
+  const primary = entity.indexes.primary!
+  const missing: ConditionInput = { attributeNotExists: [primary.pk.field, primary.sk.field] }
+  if ((entity as { readonly _projectionTombstones?: boolean })._projectionTombstones !== true) {
+    return missing
+  }
+  return {
+    [ExprTag]: ExprTag,
+    _tag: "or",
+    exprs: [
+      parseShorthand(missing),
+      parseShorthand({ eq: { __edd_e__: `${entity.entityType}#tombstone` } }),
+    ],
+  } as Expr
+}
+
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined
 
@@ -10616,7 +10639,6 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     }
     // `create`'s own not-exists guard is ANDed with the caller's condition:
     // no `.condition()` replaces it (#133).
-    const primary = target._entity.indexes.primary!
     if (target._opType === "put") {
       const putKind = target._putKind ?? "put"
       return {
@@ -10624,9 +10646,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         entity: target._entity,
         input: target._input,
         condition: withGuard(
-          putKind === "create"
-            ? { attributeNotExists: [primary.pk.field, primary.sk.field] }
-            : undefined,
+          putKind === "create" ? createGuard(target._entity) : undefined,
           target._condition,
         ),
         putKind,

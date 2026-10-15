@@ -133,8 +133,9 @@ const ShipmentProjection = EventStore.multiProjection({
 - **`evolve(state, event, { source, streamId })`** folds into the **whole** row, so one source's part can depend on another's. Sources interleave in any order across writes, so a source's `evolve` must not assume another's has run first. Within one write, sources are folded in declaration order, then by stream id, then by version.
 - **`mode`:**
   - `"fold"` (the default) applies every event in version order and fills gaps from the store. Use it for events that change a few fields, where skipping one would lose data.
-  - `"latest"` applies only the newest event of each instance in a batch. The others are reported as `superseded`, and nothing is read. Use it for events that carry the source's whole part.
+  - `"latest"` applies only the newest event of each instance in a batch, and nothing is read. Use it for events that carry the source's whole part. Events are tried newest first: one that `terminal` rejects falls back to the next older event. The events older than the one accepted are reported as `superseded`.
 - **`terminal`** is per source.
+- **One instance's failure is its own.** A failure `terminal` doesn't accept leaves that instance's events out of the write, with its checkpoint unmoved, and reports them as a `Failed` outcome. The row's other instances still apply in the same write. The row fails only when every instance does.
 
 ### Checkpoints per source instance
 
@@ -157,7 +158,7 @@ checkpoints: {
 
 Every write sets `revision` one higher and is conditioned on the value it read: `attribute_not_exists` when the row has none, which covers legacy rows.
 - **Different sources serialise.** A writer that loses the race re-reads and retries with a jittered backoff, and no source's part is overwritten.
-- **An existing write counter** that readers already use can serve as the revision.
+- **An existing write counter** that readers already use can serve as the revision. `revision: { field, initial: 0 }` sets the value of a row's first write, so a counter readers see from 0 keeps its numbering (the default is 1).
 - **It is required** by multi-source projections and by the outbox, and is optional on `projection`. There it also makes `rebuild` safe to run alongside live delivery.
 
 ## Handling a batch
@@ -190,7 +191,7 @@ const removed = yield* ShipmentProjection.applyBatch([{ stream: "order", event: 
 ```
 
 - **A tombstone, not a deletion.** The row's key keeps a tombstone (`__edd_e__: "<entityType>#tombstone"`) with the checkpoints and revision and nothing else. A redelivery can't recreate the row.
-- **Every entity read by key reports it as absent:** `get`, `Batch.get` and `Transaction.transactGet`. Queries filter it out, and it carries no index keys.
+- **Every entity read by key reports it as absent:** `get`, `Batch.get` and `Transaction.transactGet`. Queries filter it out, and it carries no index keys. Likewise, the read model's `create` (also in a transaction) may write where a tombstone is.
 - **A later event** starts the row again from `initial`, from the tombstone's checkpoints.
 - **`removal: { ttl }`** lets DynamoDB expire tombstones. Choose more than the change feed's 24 hours plus any redelivery or replay window: once a tombstone expires, a very late event recreates the row.
 - **Refused** for read models with `unique` constraints, whose sentinels a tombstone write can't release.
@@ -203,6 +204,7 @@ Side effects driven from `applied` are at most once: a crash after the write los
 - **Delivery:** `drain(rowKey, deliver)`, or `deliver` on `applyBatch` / `processBatch`, hands them over strictly in order per row. It claims the head item, delivers it, deletes it, and repeats.
   - A `deliver` failure leaves the effect at the head for the next drain, and is reported as `undelivered`. It never fails the record, because the effects are committed.
   - A crash leaves a claim that expires (`claimFor`, 30 s by default), so the effect is delivered again: **at least once**. Each effect carries its event's stream id and version, so consumers can deduplicate.
+  - A successful delivery removes the effect, even if its claim expired meanwhile and another drainer took it over. So drainers never re-claim one another's heads in turn.
 - **Order** is one sequence per row, across all its sources.
 - **Where the items live:**
   - By default, in the row's own partition (`__edd_e__: "<entityType>#outbox"`). They show in the read model table's change stream and in full-table scans, but not in entity reads.
