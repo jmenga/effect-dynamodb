@@ -1083,8 +1083,8 @@ describe("EventStore.projection — rows keyed by event fields", () => {
         [{ deviceId: "d1", zone: "a" }, [1, 2, 5], 5],
         [{ deviceId: "d1", zone: "b" }, [3, 4], 4],
       ])
-      // Neither run is contiguous from its checkpoint (a: 1, 2, 5; b: 3, 4): a read each.
-      expect(calls.query).toBe(2)
+      // Each row's gaps (a: 3–4, b: 1–2) are the other row's events in the batch: no read.
+      expect(calls.query).toBe(0)
       expect(yield* zoneRow("d1", "a")).toMatchObject({ total: 6, readings: 2, seq: 5 })
       expect(yield* zoneRow("d1", "b")).toMatchObject({ total: 7, readings: 1, seq: 4 })
     }).pipe(Effect.provide(TestLayer)),
@@ -1420,11 +1420,64 @@ describe("EventStore.projection — events that address no row", () => {
       expect(batch.outcomes).toHaveLength(1)
       const outcome = batch.outcomes[0]!
       if (outcome._tag !== "Applied") throw new Error("not applied")
-      // The gap read skips it too.
       expect(versions(outcome.applied)).toEqual([1, 3])
       expect(Option.getOrThrow(outcome.state)).toMatchObject({ total: 2, seq: 3 })
+      // Delivered in the batch, the ignored event counts toward contiguity.
+      expect(calls.query).toBe(0)
       const applied = yield* SometimesZoned.apply(events[2]!)
       expect(Option.getOrThrow(applied).alreadyApplied.map((e) => e.version)).toEqual([3])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a gap read skips them", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "void", value: 9 }),
+        new Reading({ zone: "a", value: 2 }),
+      ])
+      const applied = Option.getOrThrow(yield* SometimesZoned.apply(events[2]!))
+      expect(versions(applied.applied)).toEqual([1, 3])
+      expect(calls.query).toBe(1)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("runs through EventStore.processBatch, typed", () =>
+    Effect.gen(function* () {
+      yield* seedDevice("d1", [new Placed({ zone: "a" }), new Reading({ zone: "void", value: 9 })])
+      const records = [...store.entries()]
+        .filter(([k]) => k.startsWith("events|") && store.get(k)!.__edd_e__?.S === "device.event")
+        .map(([, item], i) => recordOf(i + 1, item))
+      const result = yield* EventStore.processBatch(records, {
+        projections: { zones: SometimesZoned, orders: SummaryProjection },
+        source: "lambda",
+      })
+      // Outcomes keep their types; requirements are the unbound projections'.
+      const zones: ReadonlyArray<
+        EventStore.ProjectionOutcome<
+          typeof ZoneTotal.Type,
+          Placed | Reading,
+          Record<string, unknown> | undefined,
+          unknown,
+          unknown,
+          never
+        >
+      > = result.outcomes.zones
+      expect(zones.map((o) => [o._tag, o.positions])).toEqual([["Applied", [0]]])
+      type Needs = EventStore.ProjectionRequirementsOf<typeof SometimesZoned>
+      const needs: [Needs] extends [never] ? false : true = true
+      expect(needs).toBe(true)
+      const bound = yield* EventStore.bindProjection(SometimesZoned)
+      const viaBound = yield* EventStore.processBatch(records, {
+        projections: { zones: bound },
+        source: "lambda",
+      })
+      const run: Effect.Effect<unknown, unknown, never> = EventStore.processBatch(records, {
+        projections: { zones: bound },
+        source: "lambda",
+      })
+      void run
+      expect(viaBound.response).toEqual({ batchItemFailures: [] })
     }).pipe(Effect.provide(TestLayer)),
   )
 

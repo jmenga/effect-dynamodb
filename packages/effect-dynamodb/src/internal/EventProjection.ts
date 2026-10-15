@@ -890,6 +890,24 @@ export const projection = <
         .pipe(Effect.catchTag("ConditionalCheckFailed", () => Effect.fail(new LostRace(key))))
     }) as Effect.Effect<S, Err | LostRace, Req>
 
+  /**
+   * Every version from `from` to the last of `events` was delivered: `events`
+   * themselves, or `delivered` (the batch's other events of the stream, which
+   * are not this row's).
+   */
+  const coveredFrom = (
+    events: ReadonlyArray<AnyEvent>,
+    from: number,
+    delivered: ReadonlySet<number>,
+  ): boolean => {
+    const own = new Set(events.map((event) => event.version))
+    const last = events[events.length - 1]!.version
+    for (let version = from; version <= last; version++) {
+      if (!own.has(version) && !delivered.has(version)) return false
+    }
+    return true
+  }
+
   /** `events` is exactly `from, from + 1, …`. */
   const contiguousFrom = (events: ReadonlyArray<AnyEvent>, from: number): boolean =>
     events.every((event, i) => event.version === from + i)
@@ -979,7 +997,9 @@ export const projection = <
 
   /**
    * One row. `events` are the batch's events for it, sorted and deduplicated;
-   * `undefined` for a catch-up to `top`.
+   * `undefined` for a catch-up to `top`. `delivered` holds the versions of
+   * every event of the stream instance in the batch — this row's, other rows'
+   * and those addressing no row — so a run they cover needs no read.
    */
   const applyRow = (
     streamIdStr: string,
@@ -987,6 +1007,7 @@ export const projection = <
     key: K,
     events: ReadonlyArray<Ev> | undefined,
     top: number,
+    delivered: ReadonlySet<number> = new Set(),
   ): Effect.Effect<Applied, Err, Req> => {
     const id = keyId(key)
     const attempt = Effect.gen(function* () {
@@ -1005,7 +1026,7 @@ export const projection = <
       })
       if (pending !== undefined ? pending.length === 0 : at >= top) return done([])
       let run: ReadonlyArray<Ev>
-      if (pending !== undefined && contiguousFrom(pending, at + 1)) {
+      if (pending !== undefined && coveredFrom(pending, at + 1, delivered)) {
         run = pending
       } else {
         // Every version from the checkpoint to the highest one wanted — the
@@ -1112,6 +1133,7 @@ export const projection = <
           continue
         }
         const { streamId } = rows.success
+        const delivered = new Set(group.map(([, event]) => event.version))
         for (const row of rows.success.rows) {
           // Sorted by version, one event per version (a redelivery is a duplicate).
           const ordered = [...row.events]
@@ -1119,7 +1141,9 @@ export const projection = <
             .filter((e, i, sorted) => i === 0 || sorted[i - 1]!.version !== e.version)
           tasks.push({
             first: row.positions[0]!,
-            run: Effect.result(applyRow(streamIdStr, streamId, row.key, ordered, 0)).pipe(
+            run: Effect.result(
+              applyRow(streamIdStr, streamId, row.key, ordered, 0, delivered),
+            ).pipe(
               Effect.map(
                 (result): Outcome =>
                   Result.isSuccess(result)
@@ -1298,17 +1322,17 @@ export const projection = <
 // ---------------------------------------------------------------------------
 
 /** Any projection, bound or unbound. */
-export type AnyEventProjection = EventProjection<any, any, any, any, any, any, any, any>
+export type AnyEventProjection = EventProjection<any, any, any, any, any, any, any, any, any>
 
 /** A projection's outcomes. */
 export type ProjectionOutcomesOf<P> =
-  P extends EventProjection<infer S, infer A, any, infer M, infer Err, any, infer K, infer E>
+  P extends EventProjection<infer S, infer A, any, infer M, infer Err, any, infer K, infer E, any>
     ? ReadonlyArray<ProjectionOutcome<S, A, M, Err, K, E>>
     : never
 
 /** A projection's requirements. */
 export type ProjectionRequirementsOf<P> =
-  P extends EventProjection<any, any, any, any, any, infer R, any, any> ? R : never
+  P extends EventProjection<any, any, any, any, any, infer R, any, any, any> ? R : never
 
 /** Result of {@link processBatch}. */
 export interface ProcessBatchesResult<
