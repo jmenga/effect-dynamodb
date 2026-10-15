@@ -67,6 +67,20 @@ describe("CheckpointStore", () => {
   })
 
   describe("DynamoDB", () => {
+    it("refuses a finishedTtl shorter than 28 hours", () => {
+      expect(() =>
+        CheckpointStore.makeDynamoDB({ tableName: "t", finishedTtl: "27 hours" }),
+      ).toThrow(/\[EDD-9084\].*finishedTtl/)
+      expect(() =>
+        CheckpointStore.layerDynamoDB({ tableName: "t", finishedTtl: "1 hour" }),
+      ).toThrow(/EDD-9084/)
+      expect(() =>
+        CheckpointStore.makeDynamoDB({ tableName: "t", finishedTtl: "28 hours" }),
+      ).not.toThrow()
+      expect(() => CheckpointStore.makeDynamoDB({ tableName: "t" })).not.toThrow()
+      expect(Duration.toMillis(CheckpointStore.minFinishedTtl)).toBe(28 * 60 * 60 * 1000)
+    })
+
     it("tableDefinition is pk/sk strings, on demand", () => {
       expect(CheckpointStore.tableDefinition("checkpoints")).toEqual({
         TableName: "checkpoints",

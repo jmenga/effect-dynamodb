@@ -127,7 +127,8 @@ export interface DynamoDBCheckpointStoreOptions {
   /**
    * How long a `Finished` checkpoint is kept (its `ttl` attribute, honoured
    * when TTL is enabled on the table). A closed shard leaves the stream 24
-   * hours after it closes. Default: 2 days.
+   * hours after it closes. Default: 2 days; at least {@link MIN_FINISHED_TTL}
+   * (28 hours), `[EDD-9084]` otherwise.
    */
   readonly finishedTtl?: Duration.Input | undefined
 }
@@ -166,15 +167,32 @@ const isConditionFailed = (error: DynamoClientError): boolean =>
   isAwsConditionalCheckFailed(error.cause)
 
 /** A checkpoint store on a DynamoDB table, through `DynamoClient`. */
+/**
+ * The shortest `finishedTtl` accepted: 28 hours. A `Finished` checkpoint must
+ * outlive every shard that depends on it being there — the shard itself, listed
+ * up to 24 hours after it closes, and the children of a parent already gone at
+ * a fresh start, which can stay listed for a shard's lifetime (about 4 hours)
+ * plus those 24 hours. A checkpoint expired earlier makes a restart report
+ * `ChangeFeedTrimmed` for records that were never lost.
+ */
+export const MIN_FINISHED_TTL: Duration.Duration = Duration.hours(28)
+
 export const makeDynamoDB = (
   options: DynamoDBCheckpointStoreOptions,
-): Effect.Effect<CheckpointStoreService, never, DynamoClient> =>
-  Effect.gen(function* () {
+): Effect.Effect<CheckpointStoreService, never, DynamoClient> => {
+  const finishedTtl = Duration.fromInputUnsafe(options.finishedTtl ?? "2 days")
+  if (Duration.toMillis(finishedTtl) < Duration.toMillis(MIN_FINISHED_TTL)) {
+    throw new Error(
+      `[EDD-9084] CheckpointStore.layerDynamoDB("${options.tableName}"): finishedTtl ` +
+        `(${Duration.toMillis(finishedTtl)} ms) is shorter than 28 hours. A finished shard's ` +
+        "checkpoint must outlive the shards that depend on it (24 hours of retention plus a " +
+        "shard's lifetime), or a restart reports lost records that were not lost.",
+    )
+  }
+  return Effect.gen(function* () {
     const client = yield* DynamoClient
     const TableName = options.tableName
-    const finishedTtlSeconds = Math.ceil(
-      Duration.toMillis(Duration.fromInputUnsafe(options.finishedTtl ?? "2 days")) / 1000,
-    )
+    const finishedTtlSeconds = Math.ceil(Duration.toMillis(finishedTtl) / 1000)
     const pkOf = (feed: FeedId): AttributeValue => ({ S: `${feed.consumer}#${feed.streamArn}` })
     const leaseKey = (feed: FeedId) => ({ pk: pkOf(feed), sk: { S: LEASE_SK } })
 
@@ -312,6 +330,7 @@ export const makeDynamoDB = (
 
     return { load, commit, acquireLease, renewLease, releaseLease } satisfies CheckpointStoreService
   })
+}
 
 /**
  * Effect `Context.Service` for the change feed's checkpoint store.
@@ -334,6 +353,9 @@ export class CheckpointStore extends Context.Service<CheckpointStore, Checkpoint
     CheckpointStore,
     makeMemory,
   )
+
+  /** The shortest `finishedTtl` accepted — see {@link MIN_FINISHED_TTL}. */
+  static readonly minFinishedTtl = MIN_FINISHED_TTL
 
   /** A store on a DynamoDB table — see {@link tableDefinition}. */
   static readonly layerDynamoDB = (

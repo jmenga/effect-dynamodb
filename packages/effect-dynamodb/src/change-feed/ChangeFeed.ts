@@ -102,7 +102,12 @@ export type StartingPosition = "TRIM_HORIZON" | "LATEST"
 export interface ChangeFeedLeaseOptions {
   /** How long a lease lasts unless renewed. Default 30 s. */
   readonly duration?: Duration.Input | undefined
-  /** How often the holder renews it. Default a third of `duration`. */
+  /**
+   * How often the holder renews it. Default a third of `duration`. Must be
+   * less than half of `duration` (`[EDD-9083]` otherwise): a renewal the store
+   * fails to write is retried until `renewEvery` before the lease would lapse,
+   * which leaves `duration − 2 × renewEvery` to retry in.
+   */
   readonly renewEvery?: Duration.Input | undefined
   /**
    * A lease held by another process: `"fail"` with `ChangeFeedLeaseHeld`
@@ -139,6 +144,13 @@ export interface ChangeFeedOptions {
   readonly batchSize?: number | undefined
   /** How often the whole stream is described again for new shards. Default 30 s. */
   readonly describeInterval?: Duration.Input | undefined
+  /**
+   * How many shard reads (`GetShardIterator` / `GetRecords` calls) may be in
+   * flight at once, across all shards. Every shard keeps its own reader and
+   * takes turns, so a bound below the number of open shards slows reading
+   * rather than starving any shard. Default 16.
+   */
+  readonly maxConcurrentReads?: number | undefined
   /**
    * Backoff for throttling and transient errors (retried without limit) and
    * for re-reading a batch with failed records: jittered, exponential from
@@ -202,6 +214,7 @@ const isTransient = (error: { readonly _tag: string }): boolean =>
  * - **Shards are read concurrently**, each in order with one batch in flight:
  *   a shard reads again only once its batch is acknowledged, so a slow
  *   consumer slows polling.
+ *   `maxConcurrentReads` bounds the reads in flight across shards.
  * - **Checkpoints** move only when a batch is acknowledged — at least once.
  *   A shard resumes after its checkpoint (`AFTER_SEQUENCE_NUMBER`). An expired
  *   iterator is re-acquired from the shard's position; a position past the
@@ -212,6 +225,10 @@ const isTransient = (error: { readonly _tag: string }): boolean =>
  *
  * The stream ends when the stream is disabled and every shard is drained;
  * otherwise it runs until interrupted.
+ *
+ * Throws `[EDD-9083]` for options it can't honour: `lease.renewEvery` of half
+ * `lease.duration` or more, a `batchSize` outside 1–1000, a
+ * `maxConcurrentReads` that is not a positive integer.
  *
  * @example
  * ```ts
@@ -224,8 +241,9 @@ const isTransient = (error: { readonly _tag: string }): boolean =>
  */
 export const changeFeed = (
   options: ChangeFeedOptions,
-): Stream.Stream<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore> =>
-  Stream.callback<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore>(
+): Stream.Stream<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore> => {
+  validate(options)
+  return Stream.callback<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore>(
     (queue) =>
       run(options, queue).pipe(
         Effect.catchCause((cause) =>
@@ -233,6 +251,42 @@ export const changeFeed = (
         ),
       ),
   )
+}
+
+/** The lease's `duration` and `renewEvery`, defaults applied. */
+const leaseTiming = (lease: ChangeFeedLeaseOptions) => {
+  const duration = Duration.fromInputUnsafe(lease.duration ?? "30 seconds")
+  const renewEvery = Duration.fromInputUnsafe(
+    lease.renewEvery ?? Duration.millis(Math.max(1, Math.floor(Duration.toMillis(duration) / 3))),
+  )
+  return { duration, renewEvery }
+}
+
+/** Refuse options the feed can't honour — `[EDD-9083]`. */
+const validate = (options: ChangeFeedOptions): void => {
+  const refuse = (problem: string): never => {
+    throw new Error(`[EDD-9083] changeFeed("${options.streamArn}"): ${problem}`)
+  }
+  if (options.lease !== false && options.lease !== undefined) {
+    const { duration, renewEvery } = leaseTiming(options.lease)
+    if (!(Duration.toMillis(renewEvery) > 0)) refuse("lease.renewEvery must be positive.")
+    if (Duration.toMillis(renewEvery) * 2 >= Duration.toMillis(duration)) {
+      refuse(
+        `lease.renewEvery (${Duration.toMillis(renewEvery)} ms) must be less than half of ` +
+          `lease.duration (${Duration.toMillis(duration)} ms), to leave time to retry a ` +
+          "renewal the store fails to write before the lease lapses.",
+      )
+    }
+  }
+  const reads = options.maxConcurrentReads
+  if (reads !== undefined && !(Number.isInteger(reads) && reads >= 1)) {
+    refuse(`maxConcurrentReads must be a positive integer, got ${reads}.`)
+  }
+  const size = options.batchSize
+  if (size !== undefined && !(Number.isInteger(size) && size >= 1 && size <= 1000)) {
+    refuse(`batchSize must be an integer from 1 to 1000, got ${size}.`)
+  }
+}
 
 const run = (
   options: ChangeFeedOptions,
@@ -269,6 +323,11 @@ const run = (
         ),
       )
 
+    /** Bounds the shard reads in flight; held for one call, not across a backoff. */
+    const reads = yield* Semaphore.make(options.maxConcurrentReads ?? 16)
+    const read = <A, E extends { readonly _tag: string }>(effect: Effect.Effect<A, E>) =>
+      transient(Semaphore.withPermit(reads, effect))
+
     /** A jittered delay growing per consecutive failure, capped at `backoff.max`. */
     const retryDelay = (failures: number) =>
       Effect.map(Random.nextBetween(0.8, 1.2), (jitter) =>
@@ -287,11 +346,7 @@ const run = (
 
     if (options.lease !== false) {
       const lease = options.lease ?? {}
-      const duration = Duration.fromInputUnsafe(lease.duration ?? "30 seconds")
-      const renewEvery = Duration.fromInputUnsafe(
-        lease.renewEvery ??
-          Duration.millis(Math.max(1, Math.floor(Duration.toMillis(duration) / 3))),
-      )
+      const { duration, renewEvery } = leaseTiming(lease)
       const owner = lease.owner ?? globalThis.crypto.randomUUID()
       const acquire = store.acquireLease(feed, owner, duration)
       yield* lease.onHeld === "wait"
@@ -350,6 +405,14 @@ const run = (
     let status: StreamStatus | undefined
     let shardFilter = true
 
+    /** Shards missing from a describe that a probe found still there, all closed parents. */
+    const probedClosed = new Set<string>()
+    /**
+     * Asks the describer for a full describe soon: drained shards that find no
+     * children share one describe instead of each running their own.
+     */
+    const wake = yield* Queue.dropping<void>(1)
+
     const absorb = (shards: ReadonlyArray<Shard>) => {
       for (const shard of shards) if (shard.ShardId !== undefined) known.set(shard.ShardId, shard)
     }
@@ -392,8 +455,9 @@ const run = (
     })
 
     /**
-     * The children of a drained shard — with `ShardFilter`, or a full describe
-     * where the filter is unsupported or finds none yet.
+     * The children of a drained shard — with `ShardFilter`, or, where the
+     * filter is unsupported or finds none yet, the describer's next full
+     * describe, which it runs soon (shared by every shard drained meanwhile).
      */
     const discoverChildren = (parentId: string) =>
       Effect.gen(function* () {
@@ -416,10 +480,11 @@ const run = (
             if (children.length > 0) return
           }
         }
-        yield* Effect.asVoid(describeAll)
+        Queue.offerUnsafe(wake, undefined)
       })
 
     const isOpen = (shardId: string): boolean =>
+      !probedClosed.has(shardId) &&
       known.get(shardId)?.SequenceNumberRange?.EndingSequenceNumber === undefined
 
     const startPosition = (shardId: string): Position => {
@@ -500,7 +565,7 @@ const run = (
           new ChangeFeedTrimmed({ streamArn, shardId, sequenceNumber: acknowledged, cause })
         while (true) {
           if (iterator === undefined) {
-            const acquired = yield* transient(
+            const acquired = yield* read(
               client.getShardIterator({
                 StreamArn: streamArn,
                 ShardId: shardId,
@@ -527,7 +592,7 @@ const run = (
             }
             misses = 0
           }
-          const page = yield* transient(
+          const page = yield* read(
             client.getRecords({ ShardIterator: iterator, Limit: batchSize }),
           ).pipe(
             Effect.map(Option.some),
@@ -599,33 +664,36 @@ const run = (
         yield* maybeEnd
       })
 
-    const listed = yield* describeAll
-    if (fresh) {
-      // Parents already gone from the stream predate this consumer: nothing of
-      // theirs is owed. Recorded, so a restart can tell them from lost ones.
-      for (const shard of known.values()) {
-        const parent = shard.ParentShardId
-        if (parent !== undefined && !listed.has(parent) && !finished.has(parent)) {
-          yield* store.commit(feed, parent, { _tag: "Finished" })
-          finished.add(parent)
-        }
-      }
-    } else {
-      // A shard this consumer still owes records from that has left the stream
-      // (downtime past the 24-hour retention): its unread records are lost.
-      const gone = (shardId: string, sequenceNumber: string | undefined) =>
-        new ChangeFeedTrimmed({
-          streamArn,
-          shardId,
-          sequenceNumber,
-          cause: new Error(
-            `Shard ${shardId} is no longer in the stream, and was not read to its end`,
-          ),
-        })
+    /**
+     * Whether a shard missing from a describe is still in the stream — its
+     * trim horizon still yields an iterator. Gone: not found, or trimmed.
+     */
+    const exists = (shardId: string) =>
+      read(
+        client.getShardIterator({
+          StreamArn: streamArn,
+          ShardId: shardId,
+          ShardIteratorType: "TRIM_HORIZON",
+        }),
+      ).pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          ResourceNotFoundError: () => Effect.succeed(false),
+          StreamDataTrimmed: () => Effect.succeed(false),
+          ShardIteratorExpired: (e) => Effect.die(e),
+        }),
+      )
+
+    let listed = yield* describeAll
+    /**
+     * Shards this consumer may still owe records from that the describe did
+     * not list: shards with a `Sequence` checkpoint, and the unfinished parents
+     * of listed shards it has not started.
+     */
+    const unlisted = () => {
+      const ids = new Map<string, "parent" | "checkpoint">()
       for (const [shardId, checkpoint] of checkpoints) {
-        if (checkpoint._tag === "Sequence" && !listed.has(shardId)) {
-          return yield* gone(shardId, checkpoint.sequenceNumber)
-        }
+        if (checkpoint._tag === "Sequence" && !listed.has(shardId)) ids.set(shardId, "checkpoint")
       }
       for (const [shardId, shard] of known) {
         const parent = shard.ParentShardId
@@ -633,10 +701,43 @@ const run = (
           parent !== undefined &&
           !checkpoints.has(shardId) &&
           !listed.has(parent) &&
-          !finished.has(parent)
+          !finished.has(parent) &&
+          !ids.has(parent)
         ) {
-          return yield* gone(parent, undefined)
+          ids.set(parent, "parent")
         }
+      }
+      return ids
+    }
+    let missing = unlisted()
+    // A describe may omit a shard that is still there: describe once more,
+    // then probe what is still missing before treating it as gone.
+    if (missing.size > 0) {
+      listed = yield* describeAll
+      missing = unlisted()
+    }
+    for (const [shardId, kind] of missing) {
+      if (yield* exists(shardId)) {
+        // Still there: read it like any other shard, before its children.
+        known.set(shardId, { ShardId: shardId })
+        if (kind === "parent") probedClosed.add(shardId)
+      } else if (fresh) {
+        // Gone before this consumer started: nothing of it is owed. Recorded,
+        // so a restart can tell it from a lost one.
+        yield* store.commit(feed, shardId, { _tag: "Finished" })
+        finished.add(shardId)
+      } else {
+        // Gone while this consumer still owed records from it (downtime past
+        // the 24-hour retention): its unread records are lost.
+        const checkpoint = checkpoints.get(shardId)
+        return yield* new ChangeFeedTrimmed({
+          streamArn,
+          shardId,
+          sequenceNumber: checkpoint?._tag === "Sequence" ? checkpoint.sequenceNumber : undefined,
+          cause: new Error(
+            `Shard ${shardId} is no longer in the stream, and was not read to its end`,
+          ),
+        })
       }
     }
     if (fresh && options.startingPosition === "LATEST") {
@@ -651,14 +752,19 @@ const run = (
     }
     yield* schedule
     yield* maybeEnd
+    // The describer: every `describeInterval`, or soon after a drained shard
+    // found no children — at most one describe per `pollInterval` for those.
     yield* Effect.forkIn(
       failStream(
         Effect.forever(
-          Effect.sleep(describeInterval).pipe(
-            Effect.andThen(describeAll),
-            Effect.andThen(schedule),
-            Effect.andThen(maybeEnd),
-          ),
+          Effect.gen(function* () {
+            yield* Effect.raceFirst(Effect.sleep(describeInterval), Queue.take(wake))
+            yield* Queue.clear(wake)
+            yield* describeAll
+            yield* schedule
+            yield* maybeEnd
+            yield* Effect.sleep(pollInterval)
+          }),
         ),
       ),
       scope,

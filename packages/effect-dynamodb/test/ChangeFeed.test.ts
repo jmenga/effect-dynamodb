@@ -68,6 +68,13 @@ class FakeStreams {
   throttle = 0
   /** `GetShardIterator` calls, per shard, to answer without an iterator. */
   readonly noIterator = new Map<string, number>()
+  /** Full describes, per shard, that leave the shard out (an inconsistent describe). */
+  readonly omitDescribes = new Map<string, number>()
+  private omitting = new Set<string>()
+  /** Delay of each `GetShardIterator` / `GetRecords`, and the most seen in flight. */
+  readDelayMs = 0
+  private inFlight = 0
+  maxInFlight = 0
   /** Shards dropped from the stream when answered without an iterator. */
   readonly removeOnIterator = new Set<string>()
   private seq = 0
@@ -128,6 +135,15 @@ class FakeStreams {
   }
 
   async send(command: unknown): Promise<unknown> {
+    if (
+      this.readDelayMs > 0 &&
+      (command instanceof GetShardIteratorCommand || command instanceof GetRecordsCommand)
+    ) {
+      this.inFlight++
+      this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+      await new Promise((resolve) => setTimeout(resolve, this.readDelayMs))
+      this.inFlight--
+    }
     if (command instanceof DescribeStreamCommand) {
       const input = command.input
       this.describeRequests.push(input)
@@ -148,13 +164,23 @@ class FakeStreams {
         }
       }
       this.log.push("describe")
+      if (input.ExclusiveStartShardId === undefined) {
+        this.omitting = new Set()
+        for (const [id, count] of this.omitDescribes) {
+          if (count > 0) {
+            this.omitting.add(id)
+            this.omitDescribes.set(id, count - 1)
+          }
+        }
+      }
+      const visible = this.shards.filter((s) => !this.omitting.has(s.id))
       // Two shards a page, to exercise pagination.
       const from =
         input.ExclusiveStartShardId === undefined
           ? 0
-          : this.shards.findIndex((s) => s.id === input.ExclusiveStartShardId) + 1
-      const page = this.shards.slice(from, from + 2)
-      const more = from + 2 < this.shards.length
+          : visible.findIndex((s) => s.id === input.ExclusiveStartShardId) + 1
+      const page = visible.slice(from, from + 2)
+      const more = from + 2 < visible.length
       return {
         StreamDescription: {
           StreamArn: STREAM_ARN,
@@ -167,6 +193,10 @@ class FakeStreams {
     if (command instanceof GetShardIteratorCommand) {
       const input = command.input
       this.iteratorRequests.push(input)
+      if (!this.shards.some((s) => s.id === input.ShardId)) {
+        this.log.push(`iterator:${input.ShardId}:missing`)
+        throw awsError("ResourceNotFoundException", `Shard ${input.ShardId} not found`)
+      }
       const shard = this.shard(input.ShardId!)
       this.log.push(`iterator:${shard.id}:${input.ShardIteratorType}`)
       const misses = this.noIterator.get(shard.id) ?? 0
@@ -755,7 +785,8 @@ describe("changeFeed", () => {
           shardId: "p",
           sequenceNumber: seqOf(1),
         })
-        expect(fake.iteratorRequests).toEqual([])
+        // Only a probe of p, confirming it is gone; nothing was read.
+        expect(fake.log.filter((l) => l.startsWith("iterator:"))).toEqual(["iterator:p:missing"])
       }),
     )
 
@@ -814,6 +845,131 @@ describe("changeFeed", () => {
         expect(sequencesOf(batches)).toEqual([2])
       }),
     )
+  })
+
+  describe("shards a describe omits", () => {
+    const fullDescribes = (fake: FakeStreams) =>
+      fake.describeRequests.filter(
+        (r) => r.ShardFilter === undefined && r.ExclusiveStartShardId === undefined,
+      ).length
+
+    it.live("a fresh start describes again before treating a missing parent as gone", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("p").addShard("c", "p").put("p", 2).put("c", 1)
+        fake.close("p")
+        fake.omitDescribes.set("p", 1)
+        const store = CheckpointStore.makeMemory()
+        const { committed, spy } = recording(store)
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }, 2).pipe(
+          Effect.provide(layerOf(fake, spy)),
+        )
+        expect(batches.map((b) => b.shardId)).toEqual(["p", "c"])
+        expect(sequencesOf(batches)).toEqual([1, 2, 3])
+        // p was read, not written off.
+        expect(committed.slice(0, 2)).toEqual([seqOf(2), "finished"])
+      }),
+    )
+
+    it.live("a parent missing from two describes is probed, and read first when it exists", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("p").addShard("c", "p").put("p", 2).put("c", 1)
+        fake.close("p")
+        fake.omitDescribes.set("p", 5)
+        const store = CheckpointStore.makeMemory()
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }, 2).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(batches.map((b) => b.shardId)).toEqual(["p", "c"])
+        expect(sequencesOf(batches)).toEqual([1, 2, 3])
+        // The probe of p's trim horizon, then its read.
+        expect(
+          fake.iteratorRequests.slice(0, 2).map((r) => [r.ShardId, r.ShardIteratorType]),
+        ).toEqual([
+          ["p", "TRIM_HORIZON"],
+          ["p", "TRIM_HORIZON"],
+        ])
+      }),
+    )
+
+    it.live("a restart reads a checkpointed shard a describe omits, without a trimmed error", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams().addShard("s1").put("s1", 3)
+        fake.omitDescribes.set("s1", 2)
+        const store = CheckpointStore.makeMemory()
+        yield* store.commit(feedId, "s1", { _tag: "Sequence", sequenceNumber: seqOf(1) })
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }, 1).pipe(
+          Effect.provide(layerOf(fake, store)),
+        )
+        expect(sequencesOf(batches)).toEqual([2, 3])
+      }),
+    )
+
+    it.live("drained shards without children share describes", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams()
+        for (let i = 1; i <= 8; i++) fake.addShard(`s${i}`).put(`s${i}`, 1).close(`s${i}`)
+        fake.status = "DISABLED"
+        // Children are looked up with ShardFilter (finding none), then by describe.
+        const batches = yield* collect({ streamArn: STREAM_ARN, ...fast }).pipe(
+          Effect.provide(layerOf(fake)),
+        )
+        expect(batches).toHaveLength(8)
+        expect(fake.log.filter((l) => l.startsWith("describe:filter"))).toHaveLength(8)
+        // The initial describe plus shared ones — not one per drained shard.
+        expect(fullDescribes(fake)).toBeLessThanOrEqual(3)
+      }),
+    )
+  })
+
+  describe("read concurrency", () => {
+    it.live("bounds the shard reads in flight without starving any shard", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams()
+        for (let i = 1; i <= 8; i++) fake.addShard(`s${i}`).put(`s${i}`, 1)
+        fake.readDelayMs = 5
+        const batches = yield* collect(
+          { streamArn: STREAM_ARN, ...fast, maxConcurrentReads: 2 },
+          8,
+        ).pipe(Effect.provide(layerOf(fake)))
+        expect(new Set(batches.map((b) => b.shardId)).size).toBe(8)
+        expect(fake.maxInFlight).toBe(2)
+      }),
+    )
+
+    it.live("reads 16 shards at once by default", () =>
+      Effect.gen(function* () {
+        const fake = new FakeStreams()
+        for (let i = 1; i <= 24; i++) fake.addShard(`s${i}`).put(`s${i}`, 1)
+        fake.readDelayMs = 20
+        yield* collect({ streamArn: STREAM_ARN, ...fast }, 24).pipe(Effect.provide(layerOf(fake)))
+        expect(fake.maxInFlight).toBe(16)
+      }),
+    )
+  })
+
+  describe("option validation", () => {
+    const attempt = (options: Partial<ChangeFeedOptions>) => () =>
+      changeFeed({ streamArn: STREAM_ARN, ...options })
+
+    it("refuses a renewal interval of half the lease or more", () => {
+      expect(attempt({ lease: { duration: "30 seconds", renewEvery: "15 seconds" } })).toThrow(
+        /\[EDD-9083\].*renewEvery \(15000 ms\) must be less than half of lease\.duration \(30000 ms\)/,
+      )
+      expect(attempt({ lease: { duration: "30 seconds", renewEvery: "20 seconds" } })).toThrow(
+        /EDD-9083/,
+      )
+      expect(attempt({ lease: { duration: "10 seconds" } })).not.toThrow()
+      expect(attempt({ lease: { duration: "30 seconds", renewEvery: "14 seconds" } })).not.toThrow()
+      expect(attempt({ lease: false })).not.toThrow()
+    })
+
+    it("refuses a non-positive read bound and an out-of-range batch size", () => {
+      expect(attempt({ maxConcurrentReads: 0 })).toThrow(/EDD-9083.*maxConcurrentReads/)
+      expect(attempt({ maxConcurrentReads: 1.5 })).toThrow(/EDD-9083/)
+      expect(attempt({ batchSize: 1001 })).toThrow(/EDD-9083.*batchSize/)
+      expect(attempt({ batchSize: 0 })).toThrow(/EDD-9083/)
+      expect(attempt({ batchSize: 1000, maxConcurrentReads: 1 })).not.toThrow()
+    })
   })
 
   describe("missing iterators", () => {
@@ -927,10 +1083,11 @@ describe("changeFeed", () => {
         const run = yield* collect({
           streamArn: STREAM_ARN,
           ...fast,
-          lease: { owner: "me", duration: "10 millis", renewEvery: "40 millis" },
+          lease: { owner: "me", duration: "30 seconds", renewEvery: "20 millis" },
         }).pipe(Effect.provide(layerOf(fake, store)), Effect.exit, Effect.forkChild)
-        // The lease lapses before its renewal; another process takes it.
+        // Another process takes the lease over; the next renewal finds it lost.
         yield* Effect.sleep("20 millis")
+        yield* store.releaseLease(feedId, "me")
         yield* store.acquireLease(feedId, "other", Duration.seconds(30))
         const exit = yield* Fiber.join(run)
         const error = Exit.isFailure(exit)
@@ -1033,7 +1190,7 @@ describe("changeFeed", () => {
         const fiber = yield* changeFeed({
           streamArn: STREAM_ARN,
           ...fast,
-          lease: { owner: "me", duration: "10 millis", renewEvery: "40 millis" },
+          lease: { owner: "me", duration: "30 seconds", renewEvery: "20 millis" },
         }).pipe(
           Stream.mapEffect((batch) =>
             Effect.uninterruptible(
@@ -1048,8 +1205,9 @@ describe("changeFeed", () => {
           Effect.exit,
           Effect.forkChild,
         )
-        // The lease lapses; another process takes it; the next renewal finds it lost.
+        // Another process takes the lease over; the next renewal finds it lost.
         yield* Effect.sleep("20 millis")
+        yield* store.releaseLease(feedId, "me")
         yield* store.acquireLease(feedId, "other", Duration.seconds(30))
         yield* Effect.sleep("40 millis")
         yield* Deferred.succeed(go, undefined)
