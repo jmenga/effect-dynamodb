@@ -59,6 +59,7 @@ export {
   RefNotFound,
   ResourceNotFoundError,
   StaleAppend,
+  StreamRecordIdentifierMissing,
   ThrottlingError,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,

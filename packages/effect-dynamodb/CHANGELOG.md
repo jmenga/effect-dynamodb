@@ -1,5 +1,16 @@
 # effect-dynamodb
 
+## 1.28.0
+
+### Minor Changes
+
+- [`f21d781`](https://github.com/jmenga/effect-dynamodb/commit/f21d78148db75528b33acab586b886b7f88e3428) - EventStore change-feed projections ([#151](https://github.com/jmenga/effect-dynamodb/issues/151)). `EventStore.projection({ stream, readModel, key, initial, evolve, checkpoint })` folds a stream's events from DynamoDB Streams into read-model entity rows in version order, taking the order from the event store instead of from delivery. Rows are keyed by `key(streamId, event)` — one per stream instance, or several per instance from event fields — each with its own checkpoint; `Option.none()` from `key` acknowledges an event that addresses no row. `applyBatch` sorts and deduplicates each row's events, reads only the versions the batch lacks (one strongly consistent `readFrom`, bounded by the new `toVersion` option), and writes the row once, conditioned on its checkpoint, keeping `Hidden` fields and `createdAt`; a lost race re-reads under a jittered backoff. Each outcome reports `applied` (at most once per event), `alreadyApplied` (republish for at-least-once) and `rejected` (events a `terminal` predicate acknowledged). Also: `apply`, `catchUp`, `rebuild`, `toItem`, a checkpoint `offset`, `processBatch` per projection and `EventStore.processBatch` across several projections of one feed (record positions, `unrouted` events of streams without a projection, `image` / `identifier` accessors, `onDecodeFailure`), `bindProjection` (`R = never`), `EventStore.decoder`, `EventStore.eventFilterPattern`, and `EventStore.batchResponse` keyed by `dynamodb.SequenceNumber` (Lambda) or `eventID` (Pipes), failing with the new `StreamRecordIdentifierMissing`. Streams expose `streamIdFields`, `eventMarker` and `parseStreamId`. New codes `[EDD-9081]`–`[EDD-9082]`.
+
+### Patch Changes
+
+- Updated dependencies [[`f21d781`](https://github.com/jmenga/effect-dynamodb/commit/f21d78148db75528b33acab586b886b7f88e3428)]:
+  - @effect-dynamodb/schema@1.28.0
+
 ## 1.27.0
 
 ### Minor Changes

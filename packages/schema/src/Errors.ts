@@ -531,6 +531,23 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
 }> {}
 
 /**
+ * A change-feed record to report in a partial batch response has no
+ * identifier — `dynamodb.SequenceNumber` for a Lambda event source mapping,
+ * `eventID` for an EventBridge Pipe, or whatever a caller's `identifier`
+ * accessor reads (a Pipe input template that drops it, say). An empty
+ * identifier would fail the whole batch, so none is guessed: fail the
+ * invocation instead, and the source redelivers the batch.
+ */
+export class StreamRecordIdentifierMissing extends Data.TaggedError(
+  "StreamRecordIdentifierMissing",
+)<{
+  /** The record's position among the failed records. */
+  readonly index: number
+  /** What was read: `dynamodb.SequenceNumber`, `eventID`, or `identifier`. */
+  readonly member: string
+}> {}
+
+/**
  * EDD-9024 — DEPRECATED in v1.7.1.
  *
  * @deprecated Since v1.7.1, this error is no longer thrown at runtime. It is
