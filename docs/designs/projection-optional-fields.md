@@ -45,7 +45,9 @@ The engine already reads an absent field as described in the issue:
   arrive adopts it.
 - **Map:** absent means no entries.
 - **Revision:** absent means the row has none. The write is conditioned on
-  `attribute_not_exists(revision)`, and stores `initial`.
+  `attribute_not_exists(revision)`, and stores `initial`. That holds for an
+  existing row without a revision too: its first write stores `initial`, not
+  `initial + 1`.
 
 There are two gaps on the write side, and both are fixed:
 

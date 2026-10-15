@@ -200,7 +200,7 @@ An absent field reads as empty:
 - **A checkpoint** reads as none, so every event applies. On `projection` without a `revision`, the first write is conditioned on `attribute_not_exists` on the checkpoint field.
 - **An `instanceField`** reads as unowned, so the first instance to arrive adopts it.
 - **The map** reads as having no entries. It is written only once an instance lands in it, so a row whose instances all have their own fields keeps it absent.
-- **The revision** reads as none: the write is conditioned on `attribute_not_exists`, and stores `initial`.
+- **The revision** reads as none: the write is conditioned on `attribute_not_exists`. A row written before the projection gets `initial` on its first projection write, like a new row, not `initial + 1`.
 
 The write is the row `evolve` returns plus the fields the projection set, so an optional field the row didn't have, and the projection didn't set, stays absent.
 
@@ -208,7 +208,7 @@ The write is the row `evolve` returns plus the fields the projection set, so an 
 
 Every write sets `revision` one higher and is conditioned on the value it read: `attribute_not_exists` when the row has none, which covers legacy rows.
 - **Different sources serialise.** A writer that loses the race re-reads and retries with a jittered backoff, and no source's part is overwritten.
-- **An existing write counter** that readers already use can serve as the revision. `revision: { field, initial: 0 }` sets the value of a row's first write, so a counter readers see from 0 keeps its numbering (the default is 1).
+- **An existing write counter** that readers already use can serve as the revision. `revision: { field, initial: 0 }` sets the value of a row's first write, so a counter readers see from 0 keeps its numbering (the default is 1). An existing row without a revision also gets `initial` on its first write.
 - **It is required** by multi-source projections and by the outbox, and is optional on `projection`. There it also makes `rebuild` safe to run alongside live delivery.
 
 ## Handling a batch

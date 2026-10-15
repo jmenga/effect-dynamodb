@@ -3705,7 +3705,8 @@ instance).
 - **Optional fields** (#158). A checkpoint, `instanceField`, map or revision
   field may be optional in the model, for rows written before the projection.
   Absent reads as no checkpoint, unowned, no entries or no revision, and the
-  write's guard is `attribute_not_exists`. The map is written only when it has
+  write's guard is `attribute_not_exists`. An existing row without a revision
+  gets `initial` on its first write (not `initial + 1`). The map is written only when it has
   entries or the row already had it, so a row gains only the fields the
   projection set.
 - **Tombstones** (`removal`, `EventStore.removeRow`) are raw items at the row's
