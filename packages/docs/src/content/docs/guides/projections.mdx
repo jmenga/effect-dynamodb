@@ -45,7 +45,7 @@ const OrderEvents = EventStore.makeStream({
 })
 ```
 
-The read model is an ordinary entity, here on its own table and with a GSI. A numeric field holds the **checkpoint**: the last stream version applied to the row.
+The read model is an ordinary entity — here on its own table, with a GSI. A numeric field holds the **checkpoint**: the last stream version applied to the row.
 
 ```typescript region="read-model" example="guide-projections.ts"
 const OrderSummary = Schema.Struct({
@@ -72,13 +72,11 @@ const OrderSummaries = Entity.make({
     },
   },
 })
-
-const ReadTable = Table.make({ schema: AppSchema, entities: { OrderSummaries } })
 ```
 
 ## Defining a projection
 
-A projection binds one source stream to a read model with one row per stream instance:
+A projection binds one source stream to a read model:
 
 ```typescript region="projection" example="guide-projections.ts"
 const OrderSummaryProjection = EventStore.projection({
@@ -108,12 +106,12 @@ const OrderSummaryProjection = EventStore.projection({
 })
 ```
 
-- **`key` and `initial`** receive the structured stream id. A decoded event carries it as the composites joined with `#` (`StreamEvent.streamId`), and the projection splits it back with `stream.parseStreamId`. On a multi-field stream id, a value containing `#` makes that ambiguous, so it fails with `ValidationError`.
-- **`evolve`** returns an `Effect`. A failure fails only that stream instance. To ignore an event, return the state unchanged; the checkpoint still advances.
-- **`checkpoint`** names a numeric field. The library writes it after the fold. If your read model numbers versions differently, `{ field: "version", offset: -1 }` stores `version + offset` (here, a model that counted from 0). Reads and conditions go through the same mapping, so stored values and their readers stay as they were.
-- **The projection owns the row.** It writes the whole row with `put` (or `create` for a new one), so don't let other writers update it.
-- **Some read models are refused with `[EDD-9081]`:** `versioned` (the checkpoint is the version), `softDelete` (projections never delete rows), and `timeSeries`.
-- **A lost race is retried.** If another invocation wins the conditional write, the projection re-reads the row and continues. The `retry` option sets how many times (default `5`); once exhausted, the instance fails with `ConcurrentModification`.
+- **`key(streamId, event)`** is the row an event folds into. A key built from the stream id alone gives one row per stream instance; a key that also reads the event lets a stream feed several rows (see [Rows keyed by event fields](#rows-keyed-by-event-fields)). `streamId` is structured: a decoded event carries it as the composites joined with `#` (`StreamEvent.streamId`), and the projection splits it back with `stream.parseStreamId` — on a multi-field id, a value containing `#` is ambiguous and fails with `ValidationError`.
+- **`initial(streamId, event)`** is the state a row starts from, before `event` — the first event folded into a row that does not exist yet.
+- **`evolve`** returns an `Effect`. Return the state unchanged to ignore an event (the checkpoint still advances). A failure fails that row only — unless `terminal` accepts it (below). `evolve` runs again on every lost-race retry, so keep it free of side effects.
+- **`checkpoint`** names a numeric field, written by the library after the fold. `{ field: "version", offset: -1 }` stores `version + offset` — for a read model that numbered versions differently (here, from 0) — with reads and conditions going through the same mapping, so stored values and their readers stay as they were.
+- **The projection owns the row.** It reads it strongly consistent — `Hidden` fields included — and writes it whole with `put` (or `create` for a new row), keeping its `createdAt`. `toItem(state, { streamId, key })` maps the folded state to the row as written, to recompute attributes kept for other readers.
+- **Refused read models** throw `[EDD-9081]`: `versioned` (the checkpoint is the version), `softDelete` (projections never delete rows) and `timeSeries`.
 
 ## Handling a batch
 
@@ -137,30 +135,102 @@ const makeHandler = Effect.gen(function* () {
 })
 ```
 
-`EventStore.bindProjection` resolves what the projection needs: the client, both tables' `TableConfig`, `evolve`'s requirements, and a `Compression` registry for packed event data. Every operation then has `R = never`.
+`EventStore.bindProjection` resolves what the projection needs — the client, both tables' `TableConfig`, `evolve`'s requirements and a `Compression` registry for packed event data — so every operation has `R = never`.
 
-Under `processBatch` is `applyBatch(events)`, which you can also call directly with decoded events. For each stream instance in the batch (instances run concurrently, `concurrency` 10 by default), it:
+Underneath is `applyBatch(events)`, which you can call with decoded events. Per row (concurrently across rows, `concurrency` 10 by default):
 
-1. **Sorts and deduplicates** the instance's events by version. A batch that arrives out of order, or carries a redelivery, needs no read to put it right.
-2. **Reads the row** (strongly consistent) and its checkpoint `c`. Events at or below `c` are reported as `alreadyApplied`. If nothing is left, the instance is done.
-3. **Fills gaps from the store.** If the remaining events are exactly `c + 1 …` the highest delivered version, nothing is read. Otherwise one strongly consistent `readFrom(c)` supplies the missing versions.
-4. **Folds and writes once,** conditioned on the checkpoint still being `c`. An instance with k events in the batch costs one write.
+1. **Sort and deduplicate** the row's events by version — an out-of-order batch, or one carrying a redelivery, needs no read to put right.
+2. **Read the row** (strongly consistent) and its checkpoint `c`. Events at or below `c` are reported as `alreadyApplied`; with nothing left, the row is done.
+3. **Fill gaps from the store.** If the remaining events are exactly `c + 1 …` the highest delivered version, nothing is read. Otherwise one strongly consistent `readFrom(c, { toVersion })` — bounded at that highest version — supplies the missing ones.
+4. **Fold and write once,** conditioned on the checkpoint still being `c`: k events of a row in the batch cost one write.
 
-A redelivered event, or a late one, is skipped by the checkpoint. A missing earlier event is read from the store. Neither ever waits.
-
-`apply(event)` is `applyBatch([event])`, with the instance's failure in the error channel.
+A redelivered or late event is skipped by the checkpoint; a missing earlier one is read from the store. Nothing waits. Outcomes are `Applied` or `Failed` per row; `applyBatch` itself never fails, so one row's error can't hide the others' `applied`. `apply(event)` is `applyBatch([event])` with the row's failure in the error channel. The outcome `positions` of `processBatch` index the records you passed.
 
 ### Side effects
 
-Each outcome's `applied` lists the events that call applied, in version order. Events read from the store to fill a gap are included. Every event appears in exactly one call's `applied`: the call whose conditional write won.
+Each outcome's `applied` lists the events that call applied, in version order — those read from the store to fill a gap included. Every event appears in exactly one call's `applied`: the one whose conditional write won.
 
-- **`applied` is at most once.** If the function crashes after the write and before it publishes, the redelivery is skipped by the checkpoint and the side effect is lost.
-- **`alreadyApplied` opts into at least once.** It lists the batch's events the row already had. Republish them on a redelivery, and make consumers tolerate duplicates (by stream id and version, for example).
-- **Order holds within one call's `applied`,** not across concurrent calls.
+- **`applied` is at most once.** A crash after the write and before publishing loses the side effect: the redelivery is skipped by the checkpoint.
+- **`alreadyApplied` opts into at least once.** It lists the batch's events the row already had; republish them, with consumers tolerating duplicates (by stream id and version, say). With gap-filling, an event applied early (by a later event's fill) is delivered again in its own right and lands in `alreadyApplied`, so this republishes on every reordering, not only after a failure.
+- **Order holds within one call's `applied`**, not across concurrent calls.
+
+## Rows keyed by event fields
+
+A key that reads the event lets one stream feed several rows — here one row per sensor and zone. Each row is still fed by that one stream instance, and keeps its own checkpoint: every stream version up to it has been considered for the row. When an event addresses another row, the earlier row keeps what it had, and the new row folds only its own events; a gap read keeps only the row's events.
+
+```typescript region="event-keyed" example="guide-projections.ts"
+class SensorPlaced extends Schema.TaggedClass<SensorPlaced>()("SensorPlaced", {
+  zone: Schema.String,
+}) {}
+class SensorReading extends Schema.TaggedClass<SensorReading>()("SensorReading", {
+  zone: Schema.String,
+  celsius: Schema.Number,
+}) {}
+
+const SensorEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Sensor",
+  events: [SensorPlaced, SensorReading],
+  streamId: { composite: ["sensorId"] },
+})
+
+// One row per sensor and zone: the zone comes from each event
+const ZoneReadings = Entity.make({
+  model: Schema.Struct({
+    sensorId: Schema.String,
+    zone: Schema.String,
+    readings: Schema.Number,
+    maxCelsius: Schema.Number,
+    seq: Schema.Number,
+    alertKey: DynamoModel.Hidden(Schema.String), // kept for another reader
+  }),
+  entityType: "ZoneReading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: ["zone"] },
+  },
+})
+
+class ZoneNotPlaced extends Data.TaggedError("ZoneNotPlaced")<{ readonly version: number }> {}
+
+const ZoneReadingProjection = EventStore.projection({
+  stream: SensorEvents,
+  readModel: ZoneReadings,
+  key: (streamId, event) => ({ sensorId: streamId.sensorId, zone: event.data.zone }),
+  initial: (streamId, event) => ({
+    sensorId: streamId.sensorId,
+    zone: event.data.zone,
+    readings: -1, // not placed yet
+    maxCelsius: Number.NEGATIVE_INFINITY,
+    seq: 0,
+    alertKey: "",
+  }),
+  evolve: (state, event) =>
+    Effect.gen(function* () {
+      const data = event.data
+      if (data._tag === "SensorPlaced") return { ...state, readings: 0 }
+      if (state.readings < 0) return yield* new ZoneNotPlaced({ version: event.version })
+      return {
+        ...state,
+        readings: state.readings + 1,
+        maxCelsius: Math.max(state.maxCelsius, data.celsius),
+      }
+    }),
+  checkpoint: "seq",
+  // A reading of a zone never placed is acknowledged and skipped, every time
+  terminal: (error) => error._tag === "ZoneNotPlaced",
+  // Recompute the attribute other readers query by, on every write
+  toItem: (state) => ({ ...state, alertKey: state.maxCelsius > 30 ? "hot" : "normal" }),
+})
+```
+
+- **`terminal`** marks the `evolve` failures that reject their event rather than fail the row. A rejected event is skipped and reported in the outcome's `rejected`; the fold continues, and rejected events alone never create a row (its `state` is `Option.none()`). On an existing row, the checkpoint advances past it. The decision must be deterministic: a rejected event of a row that doesn't exist yet is read again to fill a later gap — and rejected again.
+- **Without `terminal`**, a failure fails the row on every delivery: the checkpoint stays behind the failing event, so each later event of the row gap-fills it and fails the same way.
+- **`toItem`** recomputes a `Hidden` attribute other readers use, on every write.
 
 ## Partial batch responses
 
-`processBatch` reports the earliest record of every failed instance, plus every record whose image failed to decode. Enable `ReportBatchItemFailures` on the event source mapping. Lambda checkpoints at the lowest reported record and retries everything after it, and the checkpoints skip what was already applied.
+`processBatch` reports the earliest record of every failed row, plus every record whose image failed to decode. Enable `ReportBatchItemFailures` on the event source mapping: Lambda checkpoints at the lowest reported record and retries everything after it, which the checkpoints then skip.
 
 The record identifier depends on who reads the response:
 
@@ -169,11 +239,33 @@ The record identifier depends on who reads the response:
 | `"lambda"` | `dynamodb.SequenceNumber` | Lambda event source mapping ([docs](https://docs.aws.amazon.com/lambda/latest/dg/services-ddb-batchfailurereporting.html)) |
 | `"pipe"` | `eventID` | EventBridge Pipe target ([docs](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-pipes-dynamodb.html)) |
 
-A Pipe honours partial batch responses from its target, not from an enrichment, and an input template must keep `eventID`. A record missing its identifier throws `[EDD-9083]`, because an empty identifier would fail the whole batch. To fail extra records yourself (a side effect that failed, say), add them to `result.failedRecords` and call `EventStore.batchResponse(records, { source })`.
+- A Pipe honours partial batch responses from its target, not from an enrichment.
+- **A record shape of your own** — a Pipe input template's, say — is read with `image: (record) => …` and `identifier: (record) => …` instead of `source`.
+- **A failed record without an identifier** fails the call with `StreamRecordIdentifierMissing` (an empty identifier would fail the whole batch silently): fail the invocation, and the source redelivers the batch.
+- **A record that fails to decode** fails the same way every time, so reporting it holds its shard until the source gives up. `onDecodeFailure: "skip"` acknowledges it instead — it is still in `decodeFailures`, to log and dead-letter yourself.
+- To fail more records (a side effect that failed, say), add them to `result.failedRecords` and call `EventStore.batchResponse(records, { source })`.
+
+## One feed, several projections
+
+A table's feed usually carries several streams. `EventStore.processBatch` decodes each record once, routes it to every projection of its stream — records of other streams and items are skipped — and answers with one response across them all:
+
+```typescript region="feed-handler" example="guide-projections.ts"
+const makeFeedHandler = Effect.gen(function* () {
+  const summaries = yield* EventStore.bindProjection(OrderSummaryProjection)
+  const zones = yield* EventStore.bindProjection(ZoneReadingProjection)
+  return (batch: StreamBatch) =>
+    EventStore.processBatch(batch.Records, {
+      projections: { summaries, zones },
+      source: "lambda",
+    }).pipe(Effect.map((result) => result.response))
+})
+```
+
+Each projection's outcomes come back under its name, with `positions` indexing the records.
 
 ## Decoding several streams and filtering the feed
 
-`EventStore.decoder` builds one decoder for several streams. It dispatches on the image's `__edd_e__` and returns `Option.none()` for snapshots, idempotency sentinels and any other item. `EventStore.eventFilterPattern` builds the filter that keeps only these streams' event `INSERT`s, so other records never invoke the function:
+`EventStore.decoder` builds one decoder for several streams: it dispatches on the image's `__edd_e__`, and returns `Option.none()` for snapshots, idempotency sentinels and other items. `EventStore.eventFilterPattern` builds the filter that keeps only these streams' event `INSERT`s, so nothing else invokes the function:
 
 ```typescript region="decoder" example="guide-projections.ts"
 const decode = EventStore.decoder({ Order: OrderEvents })
@@ -203,19 +295,20 @@ const caughtUp = yield* OrderSummaryProjection.catchUp({ orderId: "o-1" })
 const rebuilt = yield* OrderSummaryProjection.rebuild({ orderId: "o-1" })
 ```
 
-- **`catchUp(streamId)`** applies everything from the row's checkpoint to the stream's head. Use it when a stream's *last* event was dead-lettered. An earlier missing event is filled in anyway by the next delivery.
-- **`rebuild(streamId)`** folds the whole stream from `initial`, ignoring the row's current state, and overwrites the row. It covers backfills, a new read model over existing streams, and a changed `evolve`. It returns no events, so a rebuild never replays side effects.
+- **`catchUp(streamId)`** brings the row of the stream's latest event up to the head — for a stream whose *last* event was dead-lettered (an earlier missing event is filled in by the next delivery anyway). With one row per stream instance, that is the only row.
+- **`rebuild(streamId)`** re-derives every row of the stream instance from version 1, ignoring their state — for backfills, a new read model over existing streams, or a changed `evolve` — and returns no events, so it never replays side effects. **Pause live delivery for the instance while it runs:** its write is conditioned on the checkpoint, and for a row already at the head that checkpoint does not change, so an `applyBatch` that read the row before the rebuild can still overwrite it.
 
-Neither reads the stream's snapshot. A snapshot holds the decider's state, not the read model's.
+Neither reads the stream's snapshot: that is the decider's state, not the read model's.
 
 ## Tuning
 
-With gap-filling, `ParallelizationFactor` and `BatchSize` only affect throughput and latency, not correctness:
+With gap-filling, `ParallelizationFactor` and `BatchSize` decide throughput and latency, not correctness:
 
-- **A larger `BatchSize`** puts more of an instance's events in one batch. They are ordered in memory and written once.
-- **A higher `ParallelizationFactor`** runs more lanes. Calls that race on one instance resolve through the conditional write. The loser re-reads and finds its events already applied.
+- **A larger `BatchSize`** puts more of a row's events in one batch, ordered in memory and written once.
+- **A higher `ParallelizationFactor`** runs more lanes, and calls that touch one row race on the conditional write. Each round has one winner; a loser re-reads, and has nothing left to do only when the winner reached its events. The default `retry` waits a jittered, growing delay up to 12 times (about 1.3 s in all); raise it if many lanes write the same rows. Exhausted, the row fails with `ConcurrentModification` and its records go back to the source — safe, as the redelivery is skipped or gap-filled.
 
 ## Limits
 
-- **One source stream per read model, one row per stream instance.** A row fed by several streams needs a checkpoint per source; that's not covered yet.
+- **A row is fed by one stream instance.** A row several streams contribute to needs a checkpoint per source, not covered yet.
 - **Rows are never deleted.** Deleting a row would lose its checkpoint, and a redelivery would recreate it. Mark removal with a status field instead (and a sparse index to keep it out of queries).
+- **`projection` takes an unbound stream and entity;** bind it with `EventStore.bindProjection`.

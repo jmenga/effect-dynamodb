@@ -163,7 +163,8 @@ the error channel: `Effect<ProjectionApplied, ProjectionError<E>, R>`.
   - with `"lambda"`, `itemIdentifier` is `record.dynamodb.SequenceNumber`;
   - with `"pipe"`, it is `record.eventID`.
 
-  A record without its identifier is an `[EDD-9083]` defect (for example, a
+  A record without its identifier is an `[EDD-9083]` defect — superseded in §9
+  by the typed `StreamRecordIdentifierMissing` (for example, a
   Pipe input template that drops `eventID`). Silently returning an empty
   identifier would fail the whole batch. Records are structural
   (`StreamRecord`), so there is no `aws-lambda` dependency.
@@ -217,3 +218,66 @@ Connected tests (`connected.eventstore-projection.test.ts`, DynamoDB Local):
 - offset;
 - `catchUp` / `rebuild`;
 - `processBatch` with a poison record.
+
+## 9. Review round 1 — rows keyed by event fields, and the review's fixes
+
+The owner added event-keyed rows to this PR, and the review (mixja, Request changes)
+added fixes and adoption asks. What changed from §§3–7:
+
+**Rows keyed by event fields.**
+- `key(streamId, event)` and `initial(streamId, event)`. A key from the stream id alone
+  gives one row per instance, as before. A key that reads the event lets one instance
+  feed several rows.
+- Each row is still fed by one instance, and its checkpoint means "every version up to
+  `c` has been considered for this row".
+- `applyBatch` groups by row (stream id, then key). A gap read keeps only the row's
+  events, so a gap is the normal case for a row.
+- `catchUp(streamId)` works on the row of the stream's latest event: one reverse
+  `Limit 1` query finds it.
+- `rebuild` re-derives every row and returns `{ rows }`.
+
+**Terminal rejections (ask b) and no-row states (ask c).**
+- A failure is deterministic, and gap reads re-read events. So an acknowledged
+  failure would recur on every later event of its row, and the row would be dead.
+- `terminal(error)` therefore rejects an event in the definition:
+  - it is skipped, and reported in `rejected`;
+  - the fold continues;
+  - rejected events alone never create a row (`state: Option.none()`, nothing
+    written);
+  - on an existing row, the checkpoint advances past them.
+- `ProjectionApplied.state` is an `Option`.
+
+**Blockers.**
+1. `processBatch` positions index the records: decoded events are mapped back through
+   `recordOf`.
+2. `Hidden` fields: the row is read with `asItem`, model fields picked (with the
+   prototype re-attached for a class model). `toItem(state, { streamId, key })` (ask a)
+   maps the state to the row as written.
+
+**Should-fixes.**
+- **`createdAt`:** an internal `put` option (`EntityPutOpts.createdAt`) writes the
+  row's own `createdAt`. A model without that field otherwise has no way to supply it.
+- **Bounded gap read:** a public `ReadFromOptions.toVersion` bounds the key condition
+  at the batch's highest version.
+- **Retry:**
+  - The default is `max(jittered(exponential(5ms, 1.5)), recurs(12))`.
+  - A private `LostRace` signal is retried. A `ConcurrentModification` from `evolve` or
+    from the read model's own write is not.
+  - Exhaustion maps the signal to `ConcurrentModification`.
+- **`rebuild` ABA:** documented; live delivery must be paused for the instance. A
+  token that changes on every write would need an attribute outside the model.
+- **Decode failures:** `onDecodeFailure: "report" | "skip"`.
+- **Missing identifiers:** `batchResponse` returns an `Effect` that fails with
+  `StreamRecordIdentifierMissing`, so `[EDD-9083]` is unused.
+- **Throwing callbacks:** `key` / `initial` / `toItem` run under `Effect.try`. A throw
+  is the row's (or, for `key`, the stream instance's) `ValidationError`.
+
+**One feed, several projections (ask d).**
+- `EventStore.processBatch(records, { projections, source | identifier, image?, … })`.
+- Each record is decoded once per stream and routed to every projection of that
+  stream; other records are skipped.
+- `outcomes` are per projection, with record positions, and there is one response.
+- `projection.processBatch` is the same runner with one route.
+
+**Not changed:** `projection` still takes unbound streams and entities, bound with
+`bindProjection`. The issue's "or a bound stream plus a bound entity" is not offered.
