@@ -5852,6 +5852,7 @@ export {
   type ProjectionConfig,
   type ProjectionError,
   type ProjectionKey,
+  type ProjectionOutboxConfig,
   type ProjectionOutcome,
   type ProjectionOutcomesOf,
   type ProjectionReadModel,
@@ -5865,6 +5866,13 @@ export {
   projection,
   type StreamRecord,
 } from "./internal/EventProjection.js"
+export {
+  type DrainResult,
+  type EvolveContext,
+  type OutboxMeta,
+  type RemoveRow,
+  removeRow,
+} from "./internal/ProjectionEngine.js"
 
 /**
  * Bind a projection to the services its operations need — `DynamoClient`,

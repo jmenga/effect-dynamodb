@@ -28,6 +28,7 @@ import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKey,
   getRejectReason,
+  isProjectionTombstone,
   resolveTableNames,
 } from "./internal/TransactableOps.js"
 import {
@@ -225,7 +226,11 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
     for (let i = 0; i < infos.length; i++) {
       const response = responses[i]
       const entity = infos[i]!.entity
-      const raw = response?.Item ? fromAttributeMap(response.Item) : undefined
+      // A projection tombstone (#154) is no row.
+      const raw =
+        response?.Item && !isProjectionTombstone(response.Item, entity.entityType)
+          ? fromAttributeMap(response.Item)
+          : undefined
 
       if (raw === undefined) {
         decoded.push(undefined)

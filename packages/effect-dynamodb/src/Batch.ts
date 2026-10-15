@@ -26,6 +26,7 @@ import {
   batchRejectReason,
   composePrimaryKey,
   getRejectReason,
+  isProjectionTombstone,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -141,7 +142,8 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
     const results: Array<unknown> = new Array(items.length).fill(undefined)
     for (let i = 0; i < fetched.length; i++) {
       const item = fetched[i]
-      if (item === undefined) continue
+      // A projection tombstone (#154) is no row.
+      if (item === undefined || isProjectionTombstone(item, infos[i]!.entity.entityType)) continue
       results[i] = yield* infos[i]!.entity._decodeRecord(fromAttributeMap(item))
     }
 

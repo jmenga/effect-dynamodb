@@ -22,6 +22,15 @@ import { toAttributeMap } from "../Marshaller.js"
 export const INCARNATION_TOKEN = "__edd_i__"
 
 /**
+ * A projection tombstone (#154) of `entityType` — written at a removed row's
+ * own key to keep its checkpoints. Every read by key reports it as absent.
+ */
+export const isProjectionTombstone = (
+  item: { readonly __edd_e__?: { readonly S?: string | undefined } | undefined } | undefined,
+  entityType: string,
+): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
+
+/**
  * @internal Hidden string set naming the unique-constraint fields an item
  * holds a DEFAULT for (#133): a decoding-default field that is also an index
  * composite is stored when omitted, but a default never creates a unique

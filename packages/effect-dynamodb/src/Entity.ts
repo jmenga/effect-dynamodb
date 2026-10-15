@@ -120,6 +120,7 @@ import {
   freshIncarnationToken,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
+  isProjectionTombstone,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import {
@@ -5591,7 +5592,9 @@ const makeImpl = <
                 : undefined,
           })
 
-          if (!result.Item) {
+          // A projection tombstone (#154) keeps a removed row's checkpoints at
+          // its key: there is no row.
+          if (!result.Item || isProjectionTombstone(result.Item, entityType)) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
