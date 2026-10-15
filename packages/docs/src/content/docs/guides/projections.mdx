@@ -5,6 +5,8 @@ description: "Fold EventStore events from a change feed into read models in vers
 
 A projection folds a stream's events into a read model: an order summary, a balance, a search document. With `EventStore`, the events usually reach the projection through the table's change feed: DynamoDB Streams, read by a Lambda event source mapping or an EventBridge Pipe. The change feed does not deliver a stream's events in version order. `EventStore.projection` takes the order from the event store instead.
 
+Outside Lambda and Pipes — a long-running service, a container, an edge device — [`effect-dynamodb/change-feed`](/effect-dynamodb/guides/change-feed/) polls the stream itself and runs it into the same projections.
+
 ## Delivery order is not event order
 
 - **DynamoDB Streams orders records per item only.** The [DynamoDB Streams documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) says it "guarantees ordering at the level of an individual item … not across an entire partition". Every event of a stream is its own item (one sort key per version), so nothing orders a stream's events relative to each other.
@@ -264,6 +266,8 @@ const makeFeedHandler = Effect.gen(function* () {
 ```
 
 Each projection's outcomes come back under its name, with `positions` indexing the records. To act on streams that have no projection (side effects only) without decoding twice, name them in `streams: { Name: stream }`: their events come back in `unrouted`, each with its record's position. Two streams storing events under one marker make the call die with `[EDD-9082]`.
+
+A process that polls the stream itself runs the same call per batch with [`runChangeFeed`](/effect-dynamodb/guides/change-feed/#projecting-the-feed), which acknowledges each batch per its response.
 
 ## Decoding several streams and filtering the feed
 

@@ -1324,6 +1324,44 @@ See [Event Sourcing](/effect-dynamodb/tutorials/event-sourcing/) for a complete 
 
 ---
 
+## Change feed (`effect-dynamodb/change-feed`)
+
+A polled DynamoDB Streams consumer for processes outside Lambda — see [Change Feed outside Lambda](/effect-dynamodb/guides/change-feed/). A subpath: it needs `@aws-sdk/client-dynamodb-streams` (an optional peer dependency), which the main entry never imports.
+
+```typescript
+import {
+  CheckpointStore,
+  changeFeed,
+  DynamoStreamsClient,
+  runChangeFeed,
+} from "effect-dynamodb/change-feed"
+```
+
+| Export | Description |
+|--------|-------------|
+| `changeFeed({ streamArn, consumer?, startingPosition?, pollInterval?, batchSize?, describeInterval?, backoff?, lease? })` | `Stream<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient \| CheckpointStore>`. Shards found with `DescribeStream` (paginated) at start and every `describeInterval` (default 30 s); a drained shard's children with `ShardFilter` (`CHILD_SHARDS`), or a full describe where the filter is unsupported or finds none. A parent is read to its end, every batch acknowledged, before its children; closed shards are checkpointed finished and dropped. Shards are read concurrently, one batch in flight each: a shard reads again only once its batch is acknowledged. Resumes `AFTER_SEQUENCE_NUMBER` a shard's checkpoint; `startingPosition` (`"TRIM_HORIZON"` default, or `"LATEST"`) applies when the consumer has no checkpoints at all. Expired iterators are re-acquired; a position past retention fails with `ChangeFeedTrimmed`. Throttling and `InternalServerError` retry without limit on `backoff` (jittered, `initial` 100 ms to `max` 10 s); an idle shard polls every `pollInterval` (1 s). `batchSize` is `GetRecords.Limit` (100). `consumer` (`"default"`) scopes checkpoints and the lease. Ends when the table's stream is disabled and every shard is drained |
+| `ChangeFeedBatch` | `{ streamArn, shardId, records, firstSequenceNumber, lastSequenceNumber, commit(), complete(response) }` — `records` non-empty, in sequence order, shaped like Lambda's (`ChangeFeedRecord`, the SDK's `GetRecords` record). `commit()` checkpoints at `lastSequenceNumber`; `complete({ batchItemFailures })` (identifiers = `SequenceNumber`) checkpoints at the record before the earliest failure and re-reads the shard from it after a growing backoff — an identifier naming no record fails the whole batch. Both `Effect<void, CheckpointStoreError>`; only the first acknowledgement counts |
+| `runChangeFeed(feed, { projections, streams?, onBatch?, onDecodeFailure?, image?, concurrency? })` | `Effect<void, E \| CheckpointStoreError \| StreamRecordIdentifierMissing, R \| projections' R>` — each batch through `EventStore.processBatch(batch.records, { source: "lambda", ... })`, `onBatch(batch, result)` (before the acknowledgement; its failure ends the run unacknowledged), then `batch.complete(result.response)`. Batches of different shards run concurrently |
+| `lease` option | `{ duration? (30 s), renewEvery? (duration / 3), onHeld?: "fail" \| "wait", owner? (random UUID) }` or `false`. One lease per consumer and stream in the checkpoint store: taken at start, renewed, released when the stream ends. Held elsewhere: `ChangeFeedLeaseHeld` (or wait); taken over while running: `ChangeFeedLeaseLost`. Not a fencing token |
+| `DynamoStreamsClient` | `Context.Service` (`@effect-dynamodb/DynamoStreamsClient`): `describeStream`, `getShardIterator`, `getRecords`, `listStreams`, each `Effect<Output, DynamoStreamsClientError>`. `layer({ region, endpoint?, credentials? })`, `layerConfig({ region, endpoint?, credentials? })` (Effect `Config`s), `layerFromSdkClient(client)` |
+| `CheckpointStore` | `Context.Service` (`@effect-dynamodb/CheckpointStore`): `load(feed)`, `commit(feed, shardId, checkpoint)`, `acquireLease` / `renewLease` / `releaseLease(feed, owner, duration?)`; `feed` is `{ streamArn, consumer }`, a checkpoint `{ _tag: "Sequence", sequenceNumber }` or `{ _tag: "Finished" }`. `layerMemory` (process-local), `layerDynamoDB({ tableName, finishedTtl? })` (needs `DynamoClient`), `makeMemory()` / `makeDynamoDB(options)` as values |
+| `CheckpointStore.tableDefinition(tableName)` | The checkpoint table's `CreateTable` input: `pk` (S, HASH) + `sk` (S, RANGE), on demand. Items: `{ pk: "<consumer>#<streamArn>", sk: "shard#<shardId>", sequenceNumber \| finished, updatedAt, ttl? }` and `{ pk, sk: "lease", owner, expiresAt }`; `ttl` (epoch s) only on finished shards, `finishedTtl` out (default 2 days) |
+
+### Errors
+
+| Error | Fields | Raised by |
+|-------|--------|-----------|
+| `ShardIteratorExpired` | `operation`, `cause` | `DynamoStreamsClient` (`ExpiredIteratorException`); the feed re-acquires |
+| `StreamDataTrimmed` | `operation`, `cause` | `DynamoStreamsClient` (`TrimmedDataAccessException`) |
+| `ChangeFeedTrimmed` | `streamArn`, `shardId`, `sequenceNumber`, `cause` | The feed: a shard's position is past the stream's retention — records were lost |
+| `ChangeFeedLeaseHeld` | `streamArn`, `consumer`, `owner`, `expiresAt` | Another process holds the lease |
+| `ChangeFeedLeaseLost` | `streamArn`, `consumer`, `owner` | The lease was taken over while running |
+| `CheckpointStoreError` | `operation`, `cause` | A checkpoint store operation failed |
+
+`DynamoStreamsClient` maps `LimitExceededException` to `ThrottlingError`, and otherwise uses the shared `DynamoValidationError`, `InternalServerError`, `ResourceNotFoundError` and `DynamoError`. `ChangeFeedError` is those (less the two iterator errors), `ChangeFeedTrimmed`, the lease errors and `CheckpointStoreError`.
+
+---
+
 ## StorageEncoding
 
 Helpers for [packed storage](/effect-dynamodb/guides/packed-storage/). Compressors come from the `Compression` service in context; none of these adds a requirement. The Effect forms cost one Effect per call and look the registry up only for a compressed value; to decode many values with no Effect per value, resolve the registry once (`yield* Effect.serviceOption(Compression)`) and call a `*Sync` twin in a loop.

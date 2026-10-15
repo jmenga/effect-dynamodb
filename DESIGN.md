@@ -3608,7 +3608,59 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
 - **Refused read models** (`[EDD-9081]`): `versioned`, `softDelete`, `timeSeries`, a
   checkpoint that is not a model field, a non-integer offset.
 - **Not covered:** a row fed by several streams (per-source checkpoints), row
-  deletion, an ordered outbox, a polled change-feed `Stream`.
+  deletion, an ordered outbox. A polled change-feed `Stream` is the subpath below.
+
+### Polled Change Feed (#156)
+
+Outside Lambda and Pipes, a process polls DynamoDB Streams itself. The subpath
+`effect-dynamodb/change-feed` (optional peer `@aws-sdk/client-dynamodb-streams`, never
+imported by the main entry — guarded by a test) turns a table's stream into an Effect
+`Stream` whose batches feed `EventStore.processBatch` unchanged. Design:
+`docs/designs/change-feed.md`.
+
+```typescript
+const feed = changeFeed({ streamArn, consumer: "projections", startingPosition: "TRIM_HORIZON" })
+// Stream<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore>
+yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } })
+// or by hand: batch.commit() / batch.complete(result.response)
+```
+
+- **Services.** `DynamoStreamsClient` (`Context.Service`; `DescribeStream`,
+  `GetShardIterator`, `GetRecords`, `ListStreams`; `layer` / `layerConfig` /
+  `layerFromSdkClient`) and `CheckpointStore` (`Context.Service`; `load`, `commit`,
+  `acquireLease` / `renewLease` / `releaseLease`; `layerMemory`, `layerDynamoDB({ tableName })`
+  over `DynamoClient`, `tableDefinition(name)` for its `pk`/`sk` table).
+- **Shards.** Full paginated `DescribeStream` at start and every `describeInterval`;
+  a drained shard's children via `ShardFilter: CHILD_SHARDS`, falling back to a full
+  describe where the filter is rejected (`ValidationException`, remembered) or finds none
+  (DynamoDB Local). Children are filtered by `ParentShardId`. A shard starts once its
+  parent is finished or gone from the stream — per-item order across splits. A
+  `GetRecords` without `NextShardIterator` ends a shard: after its last batch is
+  acknowledged it is checkpointed `Finished` and dropped. The feed ends once the stream
+  is `DISABLED` and every shard is finished.
+- **Positions.** Checkpoint → `AFTER_SEQUENCE_NUMBER`; `Finished` → skipped; otherwise
+  `TRIM_HORIZON`, except at a fresh `LATEST` start (no checkpoints at all), where the open
+  shards start at `LATEST` and closed ones are checkpointed `Finished` unread.
+  `ExpiredIteratorException` re-acquires from the shard's position;
+  `TrimmedDataAccessException` is `ChangeFeedTrimmed`.
+- **Batches and acknowledgement.** One `GetRecords` (`batchSize`, default 100) per batch,
+  one batch in flight per shard: the shard waits for `commit()` / `complete(response)`
+  (pull-based backpressure; shards concurrent). `complete` follows Lambda's partial batch
+  response contract keyed by `SequenceNumber`: checkpoint at the record before the
+  earliest failure, re-read `AT_SEQUENCE_NUMBER` it after a growing backoff; an unknown
+  identifier fails the whole batch. Checkpoints follow acknowledgements — at least once.
+- **Throttling.** `LimitExceededException` maps to `ThrottlingError`; it and
+  `InternalServerError` retry without limit on a jittered exponential backoff (100 ms →
+  10 s). Idle open shards poll every `pollInterval` (1 s); one reader per shard.
+- **Lease.** One item per `(consumer, streamArn)` in the checkpoint store: conditional
+  acquire (absent, expired or ours), renewed every `duration / 3`, released on exit;
+  `ChangeFeedLeaseHeld` (or `onHeld: "wait"`), `ChangeFeedLeaseLost` when taken over.
+  Guards against an accidental second consumer; writes are not fenced.
+- **Errors** (`Data.TaggedError`, in the subpath): `ShardIteratorExpired`,
+  `StreamDataTrimmed` (client), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`,
+  `ChangeFeedLeaseLost`, `CheckpointStoreError`.
+- **Not covered:** per-shard leases and rebalancing across processes, Kinesis Data
+  Streams for DynamoDB, a retry limit / dead-letter for a batch that keeps failing.
 
 ### Multi-source Projections, Tombstones and the Outbox (#153–#155)
 

@@ -1,0 +1,191 @@
+---
+title: "Change Feed outside Lambda"
+description: "Poll a table's DynamoDB stream from a long-running process as an Effect Stream — shard lineage, checkpoints, a lease, and projections"
+---
+
+Lambda event source mappings and EventBridge Pipes read a table's DynamoDB stream for you. A long-running service, a container or an edge device running DynamoDB Local has to poll the stream itself: find the shards, follow them as they split, keep iterators fresh, and remember where it got to. `effect-dynamodb/change-feed` does that as an Effect `Stream`, and its batches feed [projections](/effect-dynamodb/guides/projections/) unchanged.
+
+## Installation
+
+The change feed is a subpath of `effect-dynamodb`. It needs the DynamoDB Streams client, an optional peer dependency that the main entry never imports:
+
+```bash
+pnpm add @aws-sdk/client-dynamodb-streams
+```
+
+```typescript
+import {
+  CheckpointStore,
+  changeFeed,
+  DynamoStreamsClient,
+  runChangeFeed,
+} from "effect-dynamodb/change-feed"
+```
+
+## Setup
+
+The feed needs two services: `DynamoStreamsClient`, which wraps the Streams API, and `CheckpointStore`, which keeps each shard's checkpoint and the feed's lease. The DynamoDB-table store uses the `DynamoClient`:
+
+```typescript region="layers" example="guide-change-feed.ts"
+const ClientLive = DynamoClient.layerConfig(local)
+
+const ChangeFeedLive = Layer.mergeAll(
+  // The Streams API client — its own endpoint, its own SDK client
+  DynamoStreamsClient.layerConfig(local),
+  // Checkpoints and the lease, in a DynamoDB table
+  CheckpointStore.layerDynamoDB({ tableName: checkpointTableName }),
+).pipe(Layer.provideMerge(ClientLive))
+```
+
+- **`DynamoStreamsClient.layer({ region, endpoint?, credentials? })`** builds the SDK client when the layer is built and destroys it when its scope closes. `layerConfig` reads the same settings from `Config`, and `layerFromSdkClient(client)` wraps a client you construct yourself.
+- **`CheckpointStore.layerMemory`** keeps everything in memory, for tests or a feed that may start over. Its lease is process-local.
+
+The feed reads the stream named by the table's `LatestStreamArn`. The table needs a stream (`NEW_IMAGE` or `NEW_AND_OLD_IMAGES` for projections):
+
+```typescript region="stream-arn" example="guide-change-feed.ts"
+const created = yield* client.createTable({
+  TableName: eventsTableName,
+  ...keys,
+  StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+})
+const streamArn = created.TableDescription!.LatestStreamArn!
+```
+
+`CheckpointStore.tableDefinition(name)` returns the checkpoint table's `CreateTable` input:
+
+```typescript region="checkpoint-table" example="guide-change-feed.ts"
+yield* client.createTable(CheckpointStore.tableDefinition(checkpointTableName))
+```
+
+| Item | `pk` | `sk` | Attributes |
+|---|---|---|---|
+| Shard checkpoint | `<consumer>#<streamArn>` | `shard#<shardId>` | `sequenceNumber` (S) or `finished` (BOOL), `updatedAt` (N), `ttl` (N, finished shards only) |
+| Lease | `<consumer>#<streamArn>` | `lease` | `owner` (S), `expiresAt` (N, epoch ms) |
+
+The key is `pk` (S, HASH) + `sk` (S, RANGE), with on-demand billing. A finished shard's checkpoint carries a `ttl` two days out (a closed shard leaves the stream 24 hours after it closes); enable TTL on `ttl` to expire them. Sequence checkpoints never expire.
+
+## Projecting the feed
+
+`runChangeFeed` runs a feed into projections. Each batch goes through `EventStore.processBatch(batch.records, { projections, source: "lambda" })`, and the batch is then acknowledged with its partial batch response:
+
+```typescript region="run" example="guide-change-feed.ts"
+const projectAll = runChangeFeed(
+  changeFeed({ streamArn, consumer: "projections", pollInterval: "100 millis" }),
+  {
+    projections: { summaries: OrderSummaryProjection },
+    // Before each batch is acknowledged: act on what it applied
+    onBatch: (batch, result) =>
+      Effect.forEach(
+        result.outcomes.summaries,
+        (outcome) =>
+          outcome._tag === "Applied"
+            ? Console.log(`${batch.shardId}: ${outcome.streamId} → v${outcome.version}`)
+            : Console.log(`${batch.shardId}: ${outcome.streamId} failed, re-read`),
+        { discard: true },
+      ),
+  },
+)
+```
+
+- **The response contract is Lambda's.** With no failures, the shard's checkpoint moves past the batch. Otherwise it moves to the record *before* the earliest failed record, and the shard reads again from that record after a backoff that grows with each consecutive failure. The projections' checkpoints skip what was already applied.
+- **`processBatch`'s options** pass through: `streams` (decode-only streams, returned as `unrouted`), `onDecodeFailure`, `image` and `concurrency`. Records are always identified by `SequenceNumber`, which is what the checkpoints use.
+- **`onBatch(batch, result)`** runs before the acknowledgement, to act on `applied` or `unrouted` events. If it fails, the run ends without acknowledging the batch, so the batch is read again on restart.
+- **Batches of different shards** are processed concurrently; a shard's own batches are processed in order.
+- **The run ends** when the table's stream is disabled and every shard is drained, or when the feed fails. Otherwise it runs until interrupted.
+
+`EventStore.processBatch` reads the change-feed records as they come: the SDK's `GetRecords` records have the shape a Lambda event source mapping delivers (`eventID`, `eventName`, `dynamodb.SequenceNumber`, `dynamodb.NewImage`), with binary attributes as bytes.
+
+## Consuming batches yourself
+
+`changeFeed` is a `Stream` of `ChangeFeedBatch`es. Each holds one shard's records, in sequence order, together with the shard id and the first and last sequence numbers:
+
+```typescript region="manual" example="guide-change-feed.ts"
+const decode = EventStore.decoder({ Order: OrderEvents })
+const audited: Array<string> = []
+
+const feed = changeFeed({
+  streamArn,
+  consumer: "audit", // checkpoints and the lease are kept per consumer
+  startingPosition: "TRIM_HORIZON",
+  pollInterval: "100 millis",
+})
+
+yield* feed.pipe(
+  Stream.mapEffect((batch) =>
+    Effect.gen(function* () {
+      for (const record of batch.records) {
+        const image = record.dynamodb?.NewImage
+        if (record.eventName !== "INSERT" || image === undefined) continue
+        const decoded = yield* decode(image)
+        if (Option.isSome(decoded)) {
+          const { event } = decoded.value
+          audited.push(`${event.streamId} v${event.version} ${event.data._tag}`)
+        }
+      }
+      yield* batch.commit() // checkpoint at batch.lastSequenceNumber
+    }),
+  ),
+  Stream.take(1),
+  Stream.runDrain,
+)
+```
+
+- **Acknowledge every batch.** `batch.commit()` commits the shard's checkpoint at `lastSequenceNumber`. `batch.complete(response)` takes a partial batch response whose identifiers are `SequenceNumber`s, and applies the contract above. An identifier that names no record of the batch fails the whole batch, as Lambda does. Only the first acknowledgement of a batch counts.
+- **A shard waits for its acknowledgement.** It is not read again until its batch is acknowledged, so each shard has at most one batch in flight, and a slow consumer slows polling. A batch that is never acknowledged stalls its shard.
+- **Delivery is at least once.** A checkpoint moves only when a batch is acknowledged. A consumer that fails ends the stream, and what it had not acknowledged is read again on restart.
+
+## Shards and lineage
+
+DynamoDB Streams splits a table's feed into shards. A shard lives about four hours, then closes, and a child shard continues the same partition's records.
+
+- **Discovery.** The feed describes the stream (`DescribeStream`, paginated) when it starts and every `describeInterval` (default 30 s). When a shard is drained, its children are looked up at once with `ShardFilter` (`CHILD_SHARDS`). Where the filter is unsupported or finds nothing yet, a full describe is used instead.
+- **A parent is read to its end before its children.** A shard starts only when its parent is finished (every batch acknowledged), or when its parent has left the stream. So one item's records stay in order across a split.
+- **Closed shards** are drained, checkpointed as finished, and dropped.
+- **Shards are read concurrently**, each by one reader, which keeps within the two-readers-per-shard guidance.
+
+## Positions, checkpoints and restarts
+
+- **A shard with a checkpoint** resumes after it (`AFTER_SEQUENCE_NUMBER`). A shard checkpointed as finished is skipped.
+- **`startingPosition`** applies when the consumer has no checkpoints for the stream at all. `"TRIM_HORIZON"` (the default) reads every record still retained. `"LATEST"` starts the shards that are open at that moment after their latest record, and checkpoints the closed ones as finished without reading them. Every other shard without a checkpoint (a child found later, or any shard after a restart) starts at its trim horizon, because its records follow its parent's.
+- **`consumer`** (default `"default"`) names the application. Checkpoints and the lease are kept per consumer, so several applications can read one stream with one checkpoint table.
+- **An expired iterator** (one older than 15 minutes, because the consumer was slow) is acquired again from the shard's position.
+- **A position past the stream's 24-hour retention** fails the feed with `ChangeFeedTrimmed { streamArn, shardId, sequenceNumber }`: records were lost. Rebuild what the feed maintains, then clear the consumer's checkpoints to start over.
+
+## The lease
+
+One lease per consumer and stream, held in the checkpoint store, keeps a second process from consuming the same feed by accident:
+
+- it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends;
+- a second process fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or, with `lease: { onHeld: "wait" }`, retries until the lease is released or expires;
+- if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`.
+
+Expiry compares the holder's clock with the taker's, so hosts need roughly synchronised clocks. The lease guards against an accidental second consumer; checkpoint writes are not fenced by it. `lease: false` disables it. One consumer reads every shard: per-shard leases across several processes are not covered yet.
+
+## Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `streamArn` | — | The stream to read. |
+| `consumer` | `"default"` | The application; checkpoints and the lease are kept per consumer. |
+| `startingPosition` | `"TRIM_HORIZON"` | Where shards start when the consumer has no checkpoints (see above). |
+| `pollInterval` | `1 second` | How long an idle open shard waits between empty reads. |
+| `batchSize` | `100` | Records per batch (`GetRecords.Limit`, at most 1000). |
+| `describeInterval` | `30 seconds` | How often the whole stream is described again for new shards. |
+| `backoff` | `{ initial: 100 ms, max: 10 s }` | Jittered exponential backoff for throttling and transient errors (retried without limit) and for re-reading a failed batch. |
+| `lease` | enabled | `{ duration?, renewEvery?, onHeld?: "fail" \| "wait", owner? }`, or `false`. |
+
+Throttling (`LimitExceededException`, `ThrottlingException`) and `InternalServerError` are retried. Any other failure ends the stream with a typed error: `ChangeFeedError` is the shared client errors (`DynamoError`, `ResourceNotFoundError`, …), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`, `ChangeFeedLeaseLost` or `CheckpointStoreError`.
+
+## DynamoDB Local
+
+DynamoDB Local serves the Streams API, and the feed runs against it unchanged, with the checkpoint table in the same local instance. DynamoDB Local differs from AWS in ways the feed accounts for:
+
+- `ShardFilter` may be unsupported or return nothing: child shards are then found with a full describe.
+- It does not rotate or split shards, so lineage only comes into play when a stream is disabled (which closes its shards) or on AWS.
+- Disabling a table's stream closes its shards: the feed drains them and ends.
+
+## Limits
+
+- **One consumer process per stream and consumer name.** Per-shard leases and rebalancing across processes are a follow-up.
+- **DynamoDB Streams only.** Kinesis Data Streams for DynamoDB is not a source; its records already reach `EventStore.processBatch` through Lambda or a Pipe.
+- **No retry limit.** A batch whose records keep failing is retried until it succeeds or the records leave the stream; nothing is dead-lettered.
