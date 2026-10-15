@@ -19,7 +19,7 @@ delivery:
 | `projection.catchUp(streamId)` / `rebuild(streamId)` | bring a row to the head / re-derive it from version 1 |
 | `projection.processBatch(records, { source })` | decode a raw batch → `applyBatch` → `batchItemFailures` |
 | `EventStore.bindProjection(projection)` | the same operations with `R = never` |
-| `EventStore.decoder(streams)` | one image decoder dispatching across several streams |
+| `EventStore.decoder({ [name]: stream })` | one image decoder dispatching across several streams |
 | `EventStore.eventFilterPattern(streams)` | the ESM / Pipe filter pattern for those streams' event `INSERT`s |
 | `EventStore.batchResponse(failedRecords, { source })` | the partial batch response, keyed by `SequenceNumber` (Lambda) or `eventID` (Pipes) |
 | `stream.parseStreamId(id)` / `stream.streamIdFields` | recover the structured stream id from `StreamEvent.streamId` |
@@ -136,13 +136,16 @@ the error channel: `Effect<ProjectionApplied, ProjectionError<E>, R>`.
   (strongly consistent), then folds from `initial` to the head. It writes
   conditioned as in §4 and retries on a lost race. It returns
   `{ state: Option<State>, version }` and never `applied`, so a rebuild can't
-  replay side effects. An empty stream writes nothing (`Option.none()`). A
-  stream snapshot is decider state, not read-model state, so neither path
+  replay side effects. An empty stream writes nothing and returns the row as
+  read (`Option.none()` when there is none). A stream snapshot is decider state, not read-model state, so neither path
   reads it.
 
 ## 6. Decoding, filtering and batch responses
 
-- **`EventStore.decoder(streams)`** builds a map from each stream's
+- **`EventStore.decoder({ [name]: stream })`** takes the streams in a record,
+  because `EventStream.streamName` is typed `string` and an array can't give the
+  result a literal discriminant. The record's keys name the streams. The
+  decoder builds a map from each stream's
   `__edd_e__` event marker (`<streamname>.event`, lower-cased) to the stream.
   `decode(image)` reads the marker off the raw image:
   - an unknown marker gives `Option.none()`;
