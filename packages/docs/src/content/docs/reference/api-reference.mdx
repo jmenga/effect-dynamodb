@@ -1186,6 +1186,9 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | `decodeStreamImage(image, options?)` | `Effect<Option<StreamEvent<TEvent, M>>, ValidationError>` — decode a DynamoDB Streams `NewImage` / `OldImage` (DynamoDB JSON with `B` as bytes or base64, or unmarshalled) into the `StreamEvent` the read paths return; `Option.none()` for an image that is not one of this stream's events |
 | `decodeStreamImage(image, { raw: true })` | `Effect<Option<RawStreamEvent<TEvent, M>>, ValidationError>` — the same, each event also carrying `rawData`: its `data` as stored, in wire form (parsed JSON of a packed value, or the unmarshalled map), unmodelled fields included |
 | `storedAs` | `{ data: PackedConfig \| undefined, state: PackedConfig \| undefined }` — the stream's resolved storage settings |
+| `streamIdFields` | The stream id's composite fields, in declaration order |
+| `eventMarker` | The `__edd_e__` value of the stream's event items (`<streamname>.event`, lower-cased) |
+| `parseStreamId(streamId)` | `Effect<StreamIdInput, ValidationError>` — the structured id of a `StreamEvent.streamId` (composites joined with `#`); a multi-field id whose part count differs from its field count (a value containing `#`) is ambiguous and fails |
 
 `BoundEventStream` additionally exposes `provide(effect)` as an escape hatch to push services into an arbitrary effect.
 
@@ -1215,6 +1218,23 @@ Per-call options (`CommandOptions`):
 | `expectedVersion` | If-Match: a loaded version other than this fails with `VersionConflict` (carrying `actualVersion`) before `decide` runs. Never retried |
 | `additionalItems` | A static array of transact ops, or a function of the `Decision` (`{ events, state, previous, version }`) returning the ops or an `Effect` of them, committed in the same transaction as the events |
 
+### Change-feed projections
+
+Read models folded from DynamoDB Streams in version order, gap-filled from the event store — see [Projections from DynamoDB Streams](/effect-dynamodb/guides/projections/).
+
+| Export | Description |
+|--------|-------------|
+| `EventStore.projection({ stream, readModel, key, initial, evolve, checkpoint, retry? })` | An `EventProjection`: one source stream folded into one row of the `readModel` entity per stream instance. `key(streamId)` / `initial(streamId)` take the structured stream id; `evolve(state, event)` returns `Effect<State, E, R>`; `checkpoint` names a numeric model field holding the last applied version (`{ field, offset }` stores `version + offset`), set by the library; `retry` (number or `Schedule`, default `5`) bounds lost-race retries. A `versioned`, `softDelete` or `timeSeries` read model, a checkpoint the model lacks and a non-integer offset throw `[EDD-9081]` |
+| `projection.applyBatch(events, { concurrency? })` | `Effect<ProjectionBatchResult, never, R>` — per stream instance: sort and deduplicate, read the row (strongly consistent), drop events at or below its checkpoint (`alreadyApplied`), fill gaps with one strongly consistent `readFrom` (none when the batch is contiguous from the checkpoint), fold, and write once conditioned on the checkpoint (`create` for a new row); a lost race re-reads. `outcomes` are `Applied` (`applied`, `alreadyApplied`, `state`, `version`, `positions`) or `Failed` (`error`, `positions`); `failedPositions` the earliest input position of each failed instance. `concurrency` defaults to `10` |
+| `projection.apply(event)` | `applyBatch([event])` with the instance's failure in the error channel: `Effect<ProjectionApplied, ProjectionError, R>` |
+| `projection.catchUp(streamId)` | `Effect<ProjectionCaughtUp, ProjectionError, R>` — apply from the row's checkpoint to the stream's head |
+| `projection.rebuild(streamId)` | `Effect<ProjectionRebuilt, ProjectionError, R>` — fold the whole stream from `initial`, ignoring the row's state, and write it; returns no events. A stream with no events writes nothing |
+| `projection.processBatch(records, { source, concurrency? })` | Decode the `INSERT`s' `NewImage`s (others, and images that are not this stream's events, skipped), `applyBatch`, and build the partial batch response: `{ outcomes, decodeFailures, failedRecords, response }` |
+| `EventStore.bindProjection(projection)` | Resolve the client, both tables, `evolve`'s requirements and the `Compression` registry; every operation then has `R = never`. Checks the stream's codecs as `bind` does (`[EDD-9078]`) |
+| `EventStore.decoder({ [name]: stream })` | `(image) => Effect<Option<{ stream: name, event }>, ValidationError>` — dispatch an image to its stream by `__edd_e__`; `Option.none()` for anything else. Accepts `EventStream` or `BoundEventStream`. Two streams with one event marker throw `[EDD-9082]` |
+| `EventStore.eventFilterPattern(streams)` | `{ eventName: ["INSERT"], dynamodb: { NewImage: { __edd_e__: { S: markers } } } }` — `JSON.stringify` into an event source mapping's or a Pipe's `FilterCriteria.Filters[].Pattern` |
+| `EventStore.batchResponse(failedRecords, { source })` | `{ batchItemFailures: [{ itemIdentifier }] }` — `dynamodb.SequenceNumber` for `source: "lambda"`, `eventID` for `"pipe"`; a record missing it throws `[EDD-9083]` |
+
 ### Fold helpers
 
 | Export | Description |
@@ -1241,6 +1261,10 @@ Per-call options (`CommandOptions`):
 | `StreamIndexSettings` | `{ type: "lsi" \| "gsi", index, pk, sk }` |
 | `EventStream<TEvent, TStreamIdFields, TMetadata>` | Repository interface returned by `makeStream` |
 | `BoundEventStream<TEvent, TStreamIdFields, TMetadata>` | Same shape as `EventStream` with `R = never` on every operation |
+| `EventProjection<S, A, TStreamIdFields, M, Err, R>` | Returned by `projection`; `bindProjection` gives `R = never` |
+| `ProjectionApplied<S, A, M>` | `{ streamId, applied, alreadyApplied, state, version }` — `applied` is at most once per event; republishing `alreadyApplied` gives at least once |
+| `ProjectionOutcome` | `({ _tag: "Applied", positions } & ProjectionApplied) \| { _tag: "Failed", streamId, positions, error }` |
+| `StreamRecord` | `{ eventID?, eventName?, dynamodb?: { SequenceNumber?, NewImage? } }` — structural; no `aws-lambda` dependency |
 
 ### Usage
 

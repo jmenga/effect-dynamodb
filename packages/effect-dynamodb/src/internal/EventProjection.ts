@@ -719,10 +719,10 @@ export const projection = <
     return Effect.forEach(
       [...groups],
       ([streamId, group]) => {
-        const seen = new Set<number>()
+        // Sorted by version, one event per version (a redelivery is a duplicate).
         const ordered = [...group.events]
           .sort((a, b) => a.version - b.version)
-          .filter((e) => (seen.has(e.version) ? false : (seen.add(e.version), true)))
+          .filter((e, i, sorted) => i === 0 || sorted[i - 1]!.version !== e.version)
         return Effect.result(applyInstance(streamId, undefined, ordered)).pipe(
           Effect.map(
             (result): ProjectionOutcome<S, TEvent, StreamMetadata<TMetadata>, Err> =>

@@ -1,0 +1,221 @@
+---
+title: "Projections from DynamoDB Streams"
+description: "Fold EventStore events from a change feed into read models in version order, filling gaps from the event store instead of waiting for delivery"
+---
+
+A projection folds a stream's events into a read model: an order summary, a balance, a search document. With `EventStore`, the events usually reach the projection through the table's change feed: DynamoDB Streams, read by a Lambda event source mapping or an EventBridge Pipe. The change feed does not deliver a stream's events in version order. `EventStore.projection` takes the order from the event store instead.
+
+## Delivery order is not event order
+
+- **DynamoDB Streams orders records per item only.** The [DynamoDB Streams documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) says it "guarantees ordering at the level of an individual item … not across an entire partition". Every event of a stream is its own item (one sort key per version), so nothing orders a stream's events relative to each other.
+- **A transaction's records carry no grouping or order.** In the AWS wording, "stream records from the same transaction might appear at different times and could be interleaved with records from other transactions". An `append` of several events can arrive split across batches, interleaved with other appends, or out of version order.
+- **`ParallelizationFactor` above 1** processes one shard's records on several concurrent lanes, keeping order only per item. A stream's events then routinely finish out of order.
+- **Delivery is at least once.** A failed batch is retried, and a record can arrive again after it was processed.
+
+### Why waiting for the predecessor stalls
+
+A fold has to apply version `n − 1` before `n`. The usual way to cope with `n` arriving first is to wait for `n − 1` to be delivered: poll the read model, then fail the record so it is retried.
+
+With `ParallelizationFactor` 1, or whenever `n` and `n − 1` share a lane, `n − 1` is queued *behind* `n`. So `n` waits for a record that can't arrive until `n` is done, and fails. It is then retried ahead of `n − 1` again, until its retries run out and it is dead-lettered. The lane stalls the whole time, and the read model never gets `n`.
+
+The event store already holds what is missing. An `append` is one transaction with a version-contiguity check, so when version `n` has a stream record, versions `1 … n` are all committed. A strongly consistent read returns them. A projection never has to wait for a delivery.
+
+## Setup
+
+The examples on this page use this stream:
+
+```typescript region="stream" example="guide-projections.ts"
+class OrderPlaced extends Schema.TaggedClass<OrderPlaced>()("OrderPlaced", {
+  customer: Schema.String,
+}) {}
+class ItemAdded extends Schema.TaggedClass<ItemAdded>()("ItemAdded", {
+  sku: Schema.String,
+  price: Schema.Number,
+}) {}
+class OrderShipped extends Schema.TaggedClass<OrderShipped>()("OrderShipped", {}) {}
+
+const AppSchema = DynamoSchema.make({ name: "shop", version: 1 })
+const EventsTable = Table.make({ schema: AppSchema, entities: {} })
+
+const OrderEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Order",
+  events: [OrderPlaced, ItemAdded, OrderShipped],
+  streamId: { composite: ["orderId"] },
+})
+```
+
+The read model is an ordinary entity, here on its own table and with a GSI. A numeric field holds the **checkpoint**: the last stream version applied to the row.
+
+```typescript region="read-model" example="guide-projections.ts"
+const OrderSummary = Schema.Struct({
+  orderId: Schema.String,
+  customer: Schema.String,
+  status: Schema.String,
+  items: Schema.Number,
+  total: Schema.Number,
+  version: Schema.Number, // the checkpoint: the last applied stream version
+})
+
+const OrderSummaries = Entity.make({
+  model: OrderSummary,
+  entityType: "OrderSummary",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byStatus: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["status"] },
+      sk: { field: "gsi1sk", composite: ["orderId"] },
+    },
+  },
+})
+
+const ReadTable = Table.make({ schema: AppSchema, entities: { OrderSummaries } })
+```
+
+## Defining a projection
+
+A projection binds one source stream to a read model with one row per stream instance:
+
+```typescript region="projection" example="guide-projections.ts"
+const OrderSummaryProjection = EventStore.projection({
+  stream: OrderEvents,
+  readModel: OrderSummaries,
+  key: (streamId) => ({ orderId: streamId.orderId }),
+  initial: (streamId) => ({
+    orderId: streamId.orderId,
+    customer: "",
+    status: "new",
+    items: 0,
+    total: 0,
+    version: 0,
+  }),
+  evolve: (state, event) => {
+    const data = event.data
+    switch (data._tag) {
+      case "OrderPlaced":
+        return Effect.succeed({ ...state, customer: data.customer, status: "placed" })
+      case "ItemAdded":
+        return Effect.succeed({ ...state, items: state.items + 1, total: state.total + data.price })
+      case "OrderShipped":
+        return Effect.succeed({ ...state, status: "shipped" })
+    }
+  },
+  checkpoint: "version",
+})
+```
+
+- **`key` and `initial`** receive the structured stream id. A decoded event carries it as the composites joined with `#` (`StreamEvent.streamId`), and the projection splits it back with `stream.parseStreamId`. On a multi-field stream id, a value containing `#` makes that ambiguous, so it fails with `ValidationError`.
+- **`evolve`** returns an `Effect`. A failure fails only that stream instance. To ignore an event, return the state unchanged; the checkpoint still advances.
+- **`checkpoint`** names a numeric field. The library writes it after the fold. If your read model numbers versions differently, `{ field: "version", offset: -1 }` stores `version + offset` (here, a model that counted from 0). Reads and conditions go through the same mapping, so stored values and their readers stay as they were.
+- **The projection owns the row.** It writes the whole row with `put` (or `create` for a new one), so don't let other writers update it.
+- **Some read models are refused with `[EDD-9081]`:** `versioned` (the checkpoint is the version), `softDelete` (projections never delete rows), and `timeSeries`.
+- **A lost race is retried.** If another invocation wins the conditional write, the projection re-reads the row and continues. The `retry` option sets how many times (default `5`); once exhausted, the instance fails with `ConcurrentModification`.
+
+## Handling a batch
+
+`processBatch` takes the batch's raw records, decodes the `INSERT`s of this stream's events, applies them, and builds the partial batch response:
+
+```typescript region="handler" example="guide-projections.ts"
+type StreamBatch = { readonly Records: ReadonlyArray<EventStore.StreamRecord> }
+
+const makeHandler = Effect.gen(function* () {
+  const summaries = yield* EventStore.bindProjection(OrderSummaryProjection)
+  return (batch: StreamBatch) =>
+    Effect.gen(function* () {
+      const result = yield* summaries.processBatch(batch.Records, { source: "lambda" })
+      for (const outcome of result.outcomes) {
+        if (outcome._tag === "Failed") continue
+        // Side effects for the events this call applied, in version order
+        for (const event of outcome.applied) yield* publish(outcome.streamId, event)
+      }
+      return result.response
+    })
+})
+```
+
+`EventStore.bindProjection` resolves what the projection needs: the client, both tables' `TableConfig`, `evolve`'s requirements, and a `Compression` registry for packed event data. Every operation then has `R = never`.
+
+Under `processBatch` is `applyBatch(events)`, which you can also call directly with decoded events. For each stream instance in the batch (instances run concurrently, `concurrency` 10 by default), it:
+
+1. **Sorts and deduplicates** the instance's events by version. A batch that arrives out of order, or carries a redelivery, needs no read to put it right.
+2. **Reads the row** (strongly consistent) and its checkpoint `c`. Events at or below `c` are reported as `alreadyApplied`. If nothing is left, the instance is done.
+3. **Fills gaps from the store.** If the remaining events are exactly `c + 1 …` the highest delivered version, nothing is read. Otherwise one strongly consistent `readFrom(c)` supplies the missing versions.
+4. **Folds and writes once,** conditioned on the checkpoint still being `c`. An instance with k events in the batch costs one write.
+
+A redelivered event, or a late one, is skipped by the checkpoint. A missing earlier event is read from the store. Neither ever waits.
+
+`apply(event)` is `applyBatch([event])`, with the instance's failure in the error channel.
+
+### Side effects
+
+Each outcome's `applied` lists the events that call applied, in version order. Events read from the store to fill a gap are included. Every event appears in exactly one call's `applied`: the call whose conditional write won.
+
+- **`applied` is at most once.** If the function crashes after the write and before it publishes, the redelivery is skipped by the checkpoint and the side effect is lost.
+- **`alreadyApplied` opts into at least once.** It lists the batch's events the row already had. Republish them on a redelivery, and make consumers tolerate duplicates (by stream id and version, for example).
+- **Order holds within one call's `applied`,** not across concurrent calls.
+
+## Partial batch responses
+
+`processBatch` reports the earliest record of every failed instance, plus every record whose image failed to decode. Enable `ReportBatchItemFailures` on the event source mapping. Lambda checkpoints at the lowest reported record and retries everything after it, and the checkpoints skip what was already applied.
+
+The record identifier depends on who reads the response:
+
+| `source` | Identifier | Consumer |
+|---|---|---|
+| `"lambda"` | `dynamodb.SequenceNumber` | Lambda event source mapping ([docs](https://docs.aws.amazon.com/lambda/latest/dg/services-ddb-batchfailurereporting.html)) |
+| `"pipe"` | `eventID` | EventBridge Pipe target ([docs](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-pipes-dynamodb.html)) |
+
+A Pipe honours partial batch responses from its target, not from an enrichment, and an input template must keep `eventID`. A record missing its identifier throws `[EDD-9083]`, because an empty identifier would fail the whole batch. To fail extra records yourself (a side effect that failed, say), add them to `result.failedRecords` and call `EventStore.batchResponse(records, { source })`.
+
+## Decoding several streams and filtering the feed
+
+`EventStore.decoder` builds one decoder for several streams. It dispatches on the image's `__edd_e__` and returns `Option.none()` for snapshots, idempotency sentinels and any other item. `EventStore.eventFilterPattern` builds the filter that keeps only these streams' event `INSERT`s, so other records never invoke the function:
+
+```typescript region="decoder" example="guide-projections.ts"
+const decode = EventStore.decoder({ Order: OrderEvents })
+
+const describeImage = (image: Record<string, AttributeValue>) =>
+  decode(image).pipe(
+    Effect.map(
+      Option.match({
+        onNone: () => "not an event",
+        onSome: ({ stream, event }) => `${stream} v${event.version}`,
+      }),
+    ),
+  )
+
+// FilterCriteria for the event source mapping (or the Pipe)
+const filterCriteria = {
+  Filters: [{ Pattern: JSON.stringify(EventStore.eventFilterPattern([OrderEvents])) }],
+}
+```
+
+The decoded value's `stream` is the name you gave the stream in the record, so a `switch` on it narrows `event`. Two streams that store events under the same marker throw `[EDD-9082]`.
+
+## Catch-up and rebuild
+
+```typescript region="catch-up" example="guide-projections.ts"
+const caughtUp = yield* OrderSummaryProjection.catchUp({ orderId: "o-1" })
+const rebuilt = yield* OrderSummaryProjection.rebuild({ orderId: "o-1" })
+```
+
+- **`catchUp(streamId)`** applies everything from the row's checkpoint to the stream's head. Use it when a stream's *last* event was dead-lettered. An earlier missing event is filled in anyway by the next delivery.
+- **`rebuild(streamId)`** folds the whole stream from `initial`, ignoring the row's current state, and overwrites the row. It covers backfills, a new read model over existing streams, and a changed `evolve`. It returns no events, so a rebuild never replays side effects.
+
+Neither reads the stream's snapshot. A snapshot holds the decider's state, not the read model's.
+
+## Tuning
+
+With gap-filling, `ParallelizationFactor` and `BatchSize` only affect throughput and latency, not correctness:
+
+- **A larger `BatchSize`** puts more of an instance's events in one batch. They are ordered in memory and written once.
+- **A higher `ParallelizationFactor`** runs more lanes. Calls that race on one instance resolve through the conditional write. The loser re-reads and finds its events already applied.
+
+## Limits
+
+- **One source stream per read model, one row per stream instance.** A row fed by several streams needs a checkpoint per source; that's not covered yet.
+- **Rows are never deleted.** Deleting a row would lose its checkpoint, and a redelivery would recreate it. Mark removal with a status field instead (and a sparse index to keep it out of queries).

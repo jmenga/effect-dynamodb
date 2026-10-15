@@ -3529,6 +3529,66 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   fails with the operation's existing `ValidationError`, whose `cause` is a
   `CompressorNotRegistered` — no error channel changes.
 
+### Change-feed Projections (#151)
+
+DynamoDB Streams orders records per item only, and a transaction's records carry no
+grouping or order, so a stream's events reach a change-feed consumer in any order.
+Waiting for a predecessor's delivery stalls whenever it is queued behind its successor
+(one lane, or a shared hash lane). Projections take their order from the event store
+instead. Design: `docs/designs/eventstore-projections.md`.
+
+```typescript
+const Summaries = EventStore.projection({
+  stream: OrderEvents,            // one source stream
+  readModel: OrderSummaries,      // a plain Entity: one row per stream instance
+  key: (id) => ({ orderId: id.orderId }),
+  initial: (id) => ({ orderId: id.orderId, status: "new", total: 0, version: 0 }),
+  evolve: (state, event) => Effect.succeed(next(state, event)),
+  checkpoint: "version",          // or { field, offset }: the field stores version + offset
+})
+const bound = yield* EventStore.bindProjection(Summaries)   // R = never
+const { response } = yield* bound.processBatch(records, { source: "lambda" })
+```
+
+- **`applyBatch(events)`.** Per stream instance (concurrently, default 10):
+  1. sort and deduplicate the instance's events;
+  2. read the row strongly consistent; events at or below its checkpoint `c` are
+     `alreadyApplied`;
+  3. if the rest are not exactly `c + 1 …` their highest version, one strongly
+     consistent `readFrom(c)` fills the gaps (sound because `append` is a
+     contiguity-checked transaction);
+  4. fold through `evolve` and set the checkpoint;
+  5. write once, with `put` conditioned on `checkpoint = c + offset`, or `create` for a
+     new row. A failed condition is a lost race: re-read under `retry` (default 5),
+     then `ConcurrentModification`.
+
+  Per-instance failures are outcome values, so the effect never fails.
+  `apply(event)` = `applyBatch([event])`, failure in the error channel.
+- **Side effects.** Each event is in exactly one call's `applied` (the one whose write
+  won), so side effects off `applied` are at most once. Republishing `alreadyApplied`
+  on redelivery gives at least once.
+- **`catchUp(streamId)`** folds from the checkpoint to the head. **`rebuild(streamId)`**
+  folds the whole stream from `initial` and returns no events. Neither reads the
+  stream's snapshot, because it is decider state.
+- **Stream id.** `StreamEvent.streamId` is the composites joined with `#`.
+  `stream.parseStreamId` splits it, and a part count other than the field count (a `#`
+  in a value) is a `ValidationError`. `stream.streamIdFields` and `stream.eventMarker`
+  are public.
+- **Feed helpers.**
+  - `EventStore.decoder({ name: stream })` dispatches on `__edd_e__`
+    (`[EDD-9082]` for a shared marker).
+  - `EventStore.eventFilterPattern(streams)` is the ESM/Pipe filter for the event
+    `INSERT`s.
+  - `EventStore.batchResponse(records, { source })` keys by
+    `dynamodb.SequenceNumber` (Lambda) or `eventID` (Pipes); a missing identifier is
+    `[EDD-9083]`.
+  - `processBatch` composes the three and reports the earliest record of each
+    failed instance plus each undecodable record.
+- **Refused read models** (`[EDD-9081]`): `versioned`, `softDelete`, `timeSeries`, a
+  checkpoint that is not a model field, a non-integer offset.
+- **Not covered:** several source streams per row (per-source checkpoints), row
+  deletion, an ordered outbox, a polled change-feed `Stream`.
+
 ### Command Handler Retry
 
 ```typescript
@@ -3963,6 +4023,8 @@ pre-#147 unions.
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
+| `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
+| `EventStream.parseStreamId` | `ValidationError` |
 | `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.

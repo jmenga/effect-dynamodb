@@ -24,6 +24,11 @@
  *   read by the stored form, so a stream may mix native, JSON and compressed
  *   items; `measureAppend` / `measureSnapshot` for caller-side size planning,
  *   and `decodeStreamImage` for DynamoDB Streams records
+ * - Change-feed projections (#151): `projection` folds a stream into a
+ *   read-model entity in version order, filling gaps from the store instead of
+ *   waiting for delivery (`applyBatch`, `apply`, `catchUp`, `rebuild`,
+ *   `processBatch`, `bindProjection`), plus `decoder`, `eventFilterPattern`
+ *   and `batchResponse` for the change feed itself
  *
  * Built on the existing library primitives (DynamoSchema, KeyComposer, Query,
  * DynamoClient, Marshaller).

@@ -841,18 +841,22 @@ describe("EventStore.projection — definition and binding", () => {
   })
 
   it("types the checkpoint as a numeric field and the requirements of each form", () => {
-    EventStore.projection({
-      ...base,
-      readModel: OrderSummaries,
-      // @ts-expect-error — `status` is a string field
-      checkpoint: "status",
-    })
-    EventStore.projection({
-      ...base,
-      readModel: OrderSummaries,
-      // @ts-expect-error — not a field of the read model
-      checkpoint: { field: "missing", offset: 1 },
-    })
+    // Type-checked only, never run.
+    const _typesOnly = () => {
+      EventStore.projection({
+        ...base,
+        readModel: OrderSummaries,
+        // @ts-expect-error — `status` is a string field
+        checkpoint: "status",
+      })
+      EventStore.projection({
+        ...base,
+        readModel: OrderSummaries,
+        // @ts-expect-error — not a field of the read model
+        checkpoint: { field: "missing", offset: 1 },
+      })
+    }
+    void _typesOnly
     // The unbound operations need the client and the tables.
     type Needs = Effect.Services<ReturnType<typeof SummaryProjection.apply>>
     const needs: [Needs] extends [DynamoClient | Table.TableConfig] ? true : false = true

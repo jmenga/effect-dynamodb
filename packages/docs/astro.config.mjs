@@ -49,6 +49,7 @@ export default defineConfig({
             { label: "Vector Search", slug: "guides/vector-search" },
             { label: "Geospatial", slug: "guides/geospatial" },
             { label: "DynamoDB Streams", slug: "guides/streams" },
+            { label: "Projections from Streams", slug: "guides/projections" },
             { label: "Testing", slug: "guides/testing" },
             { label: "Validations", slug: "guides/validations" },
             { label: "Advanced", slug: "guides/advanced" },
