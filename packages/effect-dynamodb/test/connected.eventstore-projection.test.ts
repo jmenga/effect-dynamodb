@@ -19,10 +19,12 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Config, Data, Effect, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
+import * as ZlibCompression from "../src/compression/zlib.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -132,7 +134,47 @@ const ZoneTotals = Entity.make({
   timestamps: true,
 })
 
-const ReadTable = Table.make({ schema: AppSchema, entities: { Balances, ZoneTotals } })
+/**
+ * Event data stored packed with gzip — the stream names a codec, so decoding
+ * its images needs the `Compression` registry (`[EDD-9078]` without it).
+ */
+const Ledgers = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Ledger",
+  events: [Deposited],
+  streamId: { composite: ["ledgerId"] },
+  storedAs: {
+    data: DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 1 } }),
+  },
+})
+
+const LedgerTotal = Schema.Struct({
+  ledgerId: Schema.String,
+  total: Schema.Number,
+  seq: Schema.Number,
+})
+const LedgerTotals = Entity.make({
+  model: LedgerTotal,
+  entityType: "LedgerTotal",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ledgerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const LedgerProjection = EventStore.projection({
+  stream: Ledgers,
+  readModel: LedgerTotals,
+  key: (id) => ({ ledgerId: id.ledgerId }),
+  initial: (id) => ({ ledgerId: id.ledgerId, total: 0, seq: 0 }),
+  evolve: (state, event) => Effect.succeed({ ...state, total: state.total + event.data.amount }),
+  checkpoint: "seq",
+})
+
+const ReadTable = Table.make({
+  schema: AppSchema,
+  entities: { Balances, ZoneTotals, LedgerTotals },
+})
 
 class NotPlaced extends Data.TaggedError("NotPlaced")<{ readonly version: number }> {}
 
@@ -604,5 +646,63 @@ describeConnected("EventStore projections (connected)", () => {
           batchItemFailures: [{ itemIdentifier: records[1]!.eventID! }],
         })
       }).pipe(provide),
+  )
+
+  it.effect("a bound projection decodes a compressed stream under its own context", () =>
+    Effect.gen(function* () {
+      const codecs = Compression.layer([ZlibCompression.gzip()])
+      // Appended and bound where the codec is registered…
+      const [bound, record] = yield* Effect.gen(function* () {
+        yield* Ledgers.append({ ledgerId: "l1" }, [new Deposited({ amount: 4 })], 0)
+        const client = yield* DynamoClient
+        const { Items = [] } = yield* client.query({
+          TableName: eventsTableName,
+          KeyConditionExpression: "#pk = :pk",
+          ExpressionAttributeNames: { "#pk": "pk" },
+          ExpressionAttributeValues: { ":pk": { S: "$proj-it#v1#ledger#l1" } },
+          ConsistentRead: true,
+        })
+        const event = Items.find((item) => item.__edd_e__?.S === Ledgers.eventMarker)!
+        return [
+          yield* EventStore.bindProjection(LedgerProjection),
+          recordOf(event as Item),
+        ] as const
+      }).pipe(Effect.provide(codecs))
+      // …and run where it isn't: nothing is required, so nothing may be missing.
+      const result = yield* EventStore.processBatch([record], {
+        projections: { ledgers: bound },
+        source: "lambda",
+      })
+      expect(result.response).toEqual({ batchItemFailures: [] })
+      expect(result.outcomes.ledgers.map((o) => o._tag)).toEqual(["Applied"])
+      const single = yield* bound.processBatch([record], { source: "lambda" })
+      expect(single.outcomes.map((o) => o._tag)).toEqual(["Applied"])
+    }).pipe(provide),
+  )
+
+  it.effect("returns the events of streams named without a projection", () =>
+    Effect.gen(function* () {
+      yield* Accounts.append({ accountId: "unrouted" }, [new Opened({ owner: "ji" })], 0)
+      yield* Devices.append({ deviceId: "unrouted" }, [new Placed({ zone: "q" })], 0)
+      const [account] = yield* eventItems("unrouted")
+      const client = yield* DynamoClient
+      const { Items = [] } = yield* client.query({
+        TableName: eventsTableName,
+        KeyConditionExpression: "#pk = :pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+        ExpressionAttributeValues: { ":pk": { S: "$proj-it#v1#device#unrouted" } },
+        ConsistentRead: true,
+      })
+      const records = [recordOf(Items[0] as Item), recordOf(account!)]
+      const result = yield* EventStore.processBatch(records, {
+        projections: { balances: BalanceProjection },
+        streams: { Device: Devices },
+        source: "lambda",
+      })
+      expect(result.unrouted.map((u) => [u.position, u.stream, u.event.version])).toEqual([
+        [0, "Device", 1],
+      ])
+      expect(result.outcomes.balances.map((o) => o.positions)).toEqual([[1]])
+    }).pipe(provide),
   )
 })

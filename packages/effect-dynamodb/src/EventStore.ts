@@ -78,7 +78,11 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import type { EventProjection, StreamRecord } from "./internal/EventProjection.js"
+import {
+  type EventProjection,
+  ProjectionDecode,
+  type StreamRecord,
+} from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
@@ -5888,9 +5892,10 @@ export const bindProjection = <
   R,
   K,
   E,
+  I extends boolean,
 >(
-  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E>,
-): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E>, never, R> =>
+  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I>,
+): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I>, never, R> =>
   Effect.gen(function* () {
     const ctx = yield* Effect.context<R>()
     // The codec check `bind` makes, against the registry captured here.
@@ -5906,6 +5911,8 @@ export const bindProjection = <
       applyBatch: (events, options) => provide(projection.applyBatch(events, options)),
       apply: (event) => provide(projection.apply(event)),
       catchUp: (streamId) => provide(projection.catchUp(streamId)),
+      // A multi-projection batch decodes through this, under the captured context.
+      [ProjectionDecode]: (image: StreamImage) => provide(projection[ProjectionDecode](image)),
       rebuild: (streamId) => provide(projection.rebuild(streamId)),
       // Both overloads share one implementation.
       processBatch: ((records: ReadonlyArray<StreamRecord>, options: never) =>
@@ -5917,7 +5924,8 @@ export const bindProjection = <
         Err,
         never,
         K,
-        E
+        E,
+        I
       >["processBatch"],
-    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E>
+    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I>
   })

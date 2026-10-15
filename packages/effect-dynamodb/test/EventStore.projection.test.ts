@@ -1377,3 +1377,89 @@ describe("EventStore.processBatch — several projections", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Events that address no row
+// ---------------------------------------------------------------------------
+
+/** Readings of the "void" zone address no row. */
+const SometimesZoned = EventStore.projection({
+  stream: Devices,
+  readModel: ZoneTotals,
+  key: (id, event) =>
+    event.data.zone === "void"
+      ? Option.none()
+      : Option.some({ deviceId: id.deviceId, zone: event.data.zone }),
+  initial: (id, event) => ({
+    deviceId: id.deviceId,
+    zone: event.data.zone,
+    total: 0,
+    readings: 0,
+    seq: 0,
+  }),
+  evolve: (state, event) =>
+    Effect.succeed(
+      event.data._tag === "Reading" ? { ...state, total: state.total + event.data.value } : state,
+    ),
+  checkpoint: "seq",
+})
+
+describe("EventStore.projection — events that address no row", () => {
+  it.effect("acknowledges them without touching a row", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "void", value: 9 }),
+        new Reading({ zone: "a", value: 2 }),
+      ])
+      const ignored = yield* SometimesZoned.apply(events[1]!)
+      expect(ignored).toEqual(Option.none())
+      expect(calls).toEqual({ query: 0, getItem: 0, putItem: 0 })
+      const batch = yield* SometimesZoned.applyBatch([events[2]!, events[1]!, events[0]!])
+      expect(batch.ignored).toEqual([1])
+      expect(batch.outcomes).toHaveLength(1)
+      const outcome = batch.outcomes[0]!
+      if (outcome._tag !== "Applied") throw new Error("not applied")
+      // The gap read skips it too.
+      expect(versions(outcome.applied)).toEqual([1, 3])
+      expect(Option.getOrThrow(outcome.state)).toMatchObject({ total: 2, seq: 3 })
+      const applied = yield* SometimesZoned.apply(events[2]!)
+      expect(Option.getOrThrow(applied).alreadyApplied.map((e) => e.version)).toEqual([3])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("catchUp walks back past them; rebuild leaves them out", () =>
+    Effect.gen(function* () {
+      yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "a", value: 2 }),
+        new Reading({ zone: "void", value: 9 }),
+      ])
+      const caught = yield* SometimesZoned.catchUp({ deviceId: "d1" })
+      expect(caught.key).toEqual(Option.some({ deviceId: "d1", zone: "a" }))
+      expect(versions(caught.applied)).toEqual([1, 2])
+      const { rows } = yield* SometimesZoned.rebuild({ deviceId: "d1" })
+      expect(rows.map((r) => [r.key, r.version])).toEqual([[{ deviceId: "d1", zone: "a" }, 2]])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a duplicate marker in a multi-projection batch is a defect inside the effect", () =>
+    Effect.gen(function* () {
+      const Twin = EventStore.makeStream({
+        table: EventsTable,
+        streamName: "ORDER",
+        events: [OrderPlaced],
+        streamId: { composite: ["orderId"] },
+      })
+      // Building the effect does not throw…
+      const run = EventStore.processBatch([], {
+        projections: { orders: SummaryProjection },
+        streams: { Twin },
+        source: "lambda",
+      })
+      // …running it dies.
+      const exit = yield* Effect.exit(run)
+      expect(String(exit)).toContain("EDD-9082")
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})

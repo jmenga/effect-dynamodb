@@ -22,7 +22,7 @@ import {
   StreamRecordIdentifierMissing,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { DateTime, Effect, Option, Pipeable, Result, Schedule, type Schema } from "effect"
+import { DateTime, Effect, Option, Pipeable, Result, Schedule, type Schema, Stream } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
 import * as Query from "../Query.js"
@@ -104,6 +104,7 @@ export interface ProjectionConfig<
   RM extends ProjectionReadModel,
   E,
   R,
+  KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
 > {
   /** The source stream. One projection reads one stream. */
   readonly stream: EventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any>
@@ -116,11 +117,16 @@ export interface ProjectionConfig<
    * fed by several streams needs a checkpoint per source, which projections
    * don't keep). When a later event addresses a different row, the earlier
    * row keeps what it had, and the new row folds only its own events.
+   *
+   * Return an `Option` to let an event address no row: `Option.none()`
+   * acknowledges it — no row is read or written, no checkpoint moves, and it
+   * is in no outcome (`ignored` lists its position). `apply` then returns an
+   * `Option` too.
    */
   readonly key: (
     streamId: StreamIdInput<TStreamIdFields>,
     event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
-  ) => ProjectionKey<RM>
+  ) => KR
   /**
    * The state a row starts from, before `event` — the first event folded into
    * a row that does not exist yet.
@@ -163,14 +169,20 @@ export interface ProjectionConfig<
    * decision must be deterministic: a rejected event can be read again (to
    * fill a later gap) and is rejected again. Any other failure fails the row,
    * and keeps failing it on every redelivery.
+   *
+   * A row that is never created (every one of its events rejected) has no
+   * checkpoint, so each later delivery of its events gap-reads from version 1
+   * and reports the earlier rejections again — dedupe `rejected` by version
+   * when counting or logging them; the read grows with the stream.
    */
   readonly terminal?: ((error: E) => boolean) | undefined
   /**
    * Retries after a lost race — another invocation advanced the row between
    * this one's read and its conditional write. Each retry re-reads the row, so
    * it usually finds the events applied and has nothing left to write. A
-   * number `n` is `Schedule.recurs(n)`. Default `5`. Exhausted, the row fails
-   * with `ConcurrentModification`.
+   * number `n` is `Schedule.recurs(n)`. Default: up to 12 retries after a
+   * jittered delay growing from 5 ms by 1.5× (about 1.3 s in all). Exhausted,
+   * the row fails with `ConcurrentModification`.
    */
   readonly retry?: number | Schedule.Schedule<unknown, ConcurrentModification> | undefined
 }
@@ -249,6 +261,8 @@ export interface ProjectionBatchResult<S, A, M, Err, K = unknown, E = unknown> {
    * to report in a partial batch response.
    */
   readonly failedPositions: ReadonlyArray<number>
+  /** Input positions of the events whose `key` returned `Option.none()`, ascending. */
+  readonly ignored: ReadonlyArray<number>
 }
 
 /** Result of {@link EventProjection.catchUp}. */
@@ -350,6 +364,11 @@ export interface ProcessBatchOptions<Rec> extends ApplyBatchOptions {
    * — and everything after it on its shard — until its retries or age run out.
    * `"skip"` acknowledges it, to log and dead-letter it yourself. Either way it
    * is in `decodeFailures`.
+   *
+   * Skipping acknowledges the record, not the stored event: the next event of
+   * the same row gap-fills through it, fails to decode it, and fails the row
+   * (that record is reported). It helps when the bad event is its stream's
+   * last, or once the stored item is repaired or removed.
    */
   readonly onDecodeFailure?: "report" | "skip" | undefined
 }
@@ -537,6 +556,9 @@ export const eventFilterPattern = (
 const EventProjectionTypeId: unique symbol = Symbol.for("effect-dynamodb/EventProjection")
 export type EventProjectionTypeId = typeof EventProjectionTypeId
 
+/** @internal See {@link EventProjection}'s decode member. */
+export const ProjectionDecode: unique symbol = Symbol.for("effect-dynamodb/EventProjection/Decode")
+
 /**
  * A change-feed projection: one source stream folded into read-model rows —
  * see {@link projection}. Its operations need `DynamoClient | TableConfig`
@@ -552,10 +574,19 @@ export interface EventProjection<
   R,
   K = unknown,
   E = unknown,
+  I extends boolean = false,
 > extends Pipeable.Pipeable {
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
   readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
+  /**
+   * @internal The stream's image decode — under the bound context for a
+   * bound projection, so a multi-projection batch decodes as its projections
+   * would.
+   */
+  readonly [ProjectionDecode]: (
+    image: StreamImage,
+  ) => Effect.Effect<Option.Option<StreamEvent<A, M>>, ValidationError, never>
   /** The read model's entity type. */
   readonly entityType: string
 
@@ -585,7 +616,15 @@ export interface EventProjection<
   ): Effect.Effect<ProjectionBatchResult<S, A, M, Err, K, E>, never, R>
 
   /** {@link EventProjection.applyBatch} of one event, its failure in the error channel. */
-  apply(event: StreamEvent<A, M>): Effect.Effect<ProjectionApplied<S, A, M, K, E>, Err, R>
+  apply(
+    event: StreamEvent<A, M>,
+  ): Effect.Effect<
+    I extends true
+      ? Option.Option<ProjectionApplied<S, A, M, K, E>>
+      : ProjectionApplied<S, A, M, K, E>,
+    Err,
+    R
+  >
 
   /**
    * Bring the row of the stream's latest event up to the head: read that
@@ -711,8 +750,9 @@ export const projection = <
   RM extends ProjectionReadModel,
   E = never,
   R = never,
+  KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
 >(
-  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R>,
+  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R, KR>,
 ): EventProjection<
   ProjectionState<RM>,
   TEvent,
@@ -721,7 +761,8 @@ export const projection = <
   ProjectionError<RM, E>,
   R | DynamoClient | TableConfig,
   ProjectionKey<RM>,
-  E
+  E,
+  [Extract<KR, Option.Option<unknown>>] extends [never] ? false : true
 > => {
   type S = ProjectionState<RM>
   type K = ProjectionKey<RM>
@@ -895,8 +936,12 @@ export const projection = <
       ),
     )
 
-  const keyOf = (streamId: Id, event: Ev): Effect.Effect<K, ValidationError> =>
-    call("key", () => config.key(streamId, event))
+  /** The row an event addresses — none when `key` says it addresses none. */
+  const keyOf = (streamId: Id, event: Ev): Effect.Effect<Option.Option<K>, ValidationError> =>
+    call("key", () => {
+      const key = config.key(streamId, event)
+      return Option.isOption(key) ? (key as Option.Option<K>) : Option.some(key as K)
+    })
 
   /**
    * Fold `events` onto `row` (or a new row), skipping the events `terminal`
@@ -976,7 +1021,8 @@ export const projection = <
         }
         run = []
         for (const event of read) {
-          if (keyId(yield* keyOf(streamId, event)) === id) (run as Array<Ev>).push(event)
+          const key = yield* keyOf(streamId, event)
+          if (Option.isSome(key) && keyId(key.value) === id) (run as Array<Ev>).push(event)
         }
       }
       if (run.length === 0) return done([])
@@ -1018,6 +1064,8 @@ export const projection = <
         if (group === undefined) streams.set(event.streamId, [[position, event]])
         else group.push([position, event])
       })
+      /** Positions of the events that address no row. */
+      const ignored: Array<number> = []
       // Then by row; each row's task is ordered by its first delivered event.
       const tasks: Array<{
         readonly first: number
@@ -1032,7 +1080,12 @@ export const projection = <
             const streamId = yield* stream.parseStreamId(streamIdStr)
             const byRow = new Map<string, { key: K; positions: Array<number>; events: Array<Ev> }>()
             for (const [position, event] of group) {
-              const key = yield* keyOf(streamId, event)
+              const addressed = yield* keyOf(streamId, event)
+              if (Option.isNone(addressed)) {
+                ignored.push(position)
+                continue
+              }
+              const key = addressed.value
               const id = keyId(key)
               const row = byRow.get(id)
               if (row === undefined) byRow.set(id, { key, positions: [position], events: [event] })
@@ -1093,18 +1146,26 @@ export const projection = <
           .filter((o) => o._tag === "Failed")
           .map((o) => o.positions[0]!)
           .sort((a, b) => a - b),
+        ignored: ignored.sort((a, b) => a - b),
       }
     })
 
-  const apply = (event: Ev): Effect.Effect<Applied, Err, Req> =>
-    applyBatch([event]).pipe(
-      Effect.flatMap(({ outcomes }) => {
-        const outcome = outcomes[0]!
-        if (outcome._tag === "Failed") return Effect.fail(outcome.error)
-        const { _tag, positions, ...applied } = outcome
-        return Effect.succeed(applied)
-      }),
-    )
+  /**
+   * `applyBatch([event])`, the row's failure in the error channel — wrapped in
+   * an `Option` when `key` returns one (none: the event addresses no row).
+   */
+  const apply = (event: Ev): Effect.Effect<Applied | Option.Option<Applied>, Err, Req> =>
+    Effect.gen(function* () {
+      const streamId = yield* stream.parseStreamId(event.streamId)
+      const key = yield* call("key", () => config.key(streamId, event))
+      const optional = Option.isOption(key)
+      if (optional && Option.isNone(key)) return Option.none<Applied>()
+      const { outcomes } = yield* applyBatch([event])
+      const outcome = outcomes[0]!
+      if (outcome._tag === "Failed") return yield* Effect.fail(outcome.error)
+      const { _tag, positions, ...applied } = outcome
+      return optional ? Option.some(applied) : applied
+    }) as Effect.Effect<Applied | Option.Option<Applied>, Err, Req>
 
   const joinStreamId = (streamId: Id): string =>
     stream.streamIdFields.map((f) => (streamId as Record<string, string>)[f]).join("#")
@@ -1113,15 +1174,27 @@ export const projection = <
     streamId: Id,
   ): Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
-      const [head] = (yield* Query.collect(
+      // The latest event that addresses a row — usually the head, one page.
+      const pages = yield* Query.paginate(
         stream.query
           .events(streamId)
-          .pipe(Query.reverse, Query.limit(1), (q) => Query.consistentRead(q)),
-      )) as Array<Ev>
-      if (head === undefined) {
+          .pipe(Query.reverse, Query.pageSize(25), (q) => Query.consistentRead(q)),
+      )
+      const latest = yield* pages.pipe(
+        Stream.flatMap((page) => Stream.fromIterable(page as Array<Ev>)),
+        Stream.mapEffect((event) =>
+          keyOf(streamId, event).pipe(
+            Effect.map((key) => Option.map(key, (k) => [event, k] as const)),
+          ),
+        ),
+        Stream.filter((found) => Option.isSome(found)),
+        Stream.map((found) => Option.getOrThrow(found)),
+        Stream.runHead,
+      )
+      if (Option.isNone(latest)) {
         return { key: Option.none(), applied: [], rejected: [], state: Option.none(), version: 0 }
       }
-      const key = yield* keyOf(streamId, head)
+      const [head, key] = latest.value
       const result = yield* applyRow(joinStreamId(streamId), streamId, key, undefined, head.version)
       return {
         key: Option.some(key),
@@ -1139,7 +1212,9 @@ export const projection = <
       const events = (yield* stream.read(streamId, { consistentRead: true })) as Array<Ev>
       const rows = new Map<string, { key: K; events: Array<Ev> }>()
       for (const event of events) {
-        const key = yield* keyOf(streamId, event)
+        const addressed = yield* keyOf(streamId, event)
+        if (Option.isNone(addressed)) continue
+        const key = addressed.value
         const id = keyId(key)
         const row = rows.get(id)
         if (row === undefined) rows.set(id, { key, events: [event] })
@@ -1176,10 +1251,15 @@ export const projection = <
     options: ProcessBatchOptions<Rec> & (IdentifyBySource | IdentifyWith<Rec>),
   ) =>
     runBatch(`${label}.processBatch`, records, options, [
-      { name: "projection", stream: stream as unknown as DecodableStream, applyBatch },
+      {
+        name: "projection",
+        stream: stream as unknown as DecodableStream,
+        decode: (image: StreamImage) => stream.decodeStreamImage(image),
+        applyBatch,
+      },
     ]).pipe(
       Effect.map(
-        ({ outcomes, ...rest }) =>
+        ({ outcomes, unrouted: _, ...rest }) =>
           ({
             ...rest,
             outcomes: outcomes.projection as ReadonlyArray<Outcome>,
@@ -1195,6 +1275,7 @@ export const projection = <
     },
     stream,
     entityType: readModel.entityType,
+    [ProjectionDecode]: (image: StreamImage) => stream.decodeStreamImage(image),
     applyBatch,
     apply,
     catchUp,
@@ -1233,7 +1314,14 @@ export type ProjectionRequirementsOf<P> =
 export interface ProcessBatchesResult<
   Projections extends { readonly [name: string]: AnyEventProjection },
   Rec,
+  Streams extends { readonly [name: string]: DecodableStream } = {},
 > {
+  /**
+   * The events of the `streams` named without a projection, in delivery order,
+   * each with its record's position — so a caller acting on them needs no
+   * second decode.
+   */
+  readonly unrouted: ReadonlyArray<{ readonly position: number } & DecodedStreamEvent<Streams>>
   /**
    * Each projection's outcomes — `positions` index the **records** passed in.
    * A projection whose stream had no events in the batch has none.
@@ -1254,7 +1342,12 @@ export interface ProcessBatchesResult<
 /** @internal One projection behind a feed: the stream it decodes and its `applyBatch`. */
 interface Route {
   readonly name: string
+  /** The (unbound) stream — its identity groups the projections that read it. */
   readonly stream: DecodableStream
+  /** How its images decode — under the bound context for a bound projection. */
+  readonly decode: (
+    image: StreamImage,
+  ) => Effect.Effect<Option.Option<unknown>, ValidationError, any>
   readonly applyBatch: (
     events: ReadonlyArray<any>,
     options?: ApplyBatchOptions | undefined,
@@ -1277,8 +1370,15 @@ const runBatch = <Rec>(
   records: ReadonlyArray<Rec>,
   options: ProcessBatchOptions<Rec> & (IdentifyBySource | IdentifyWith<Rec>),
   routes: ReadonlyArray<Route>,
+  /** Streams decoded without a projection: their events are returned as `unrouted`. */
+  decodeOnly: ReadonlyArray<readonly [string, DecodableStream]> = [],
 ): Effect.Effect<
   {
+    readonly unrouted: ReadonlyArray<{
+      readonly position: number
+      readonly stream: string
+      readonly event: unknown
+    }>
     readonly outcomes: Record<
       string,
       ReadonlyArray<ProjectionOutcome<any, any, any, any, any, any>>
@@ -1293,18 +1393,26 @@ const runBatch = <Rec>(
   StreamRecordIdentifierMissing,
   any
 > => {
-  // One decode per stream, however many projections read it.
-  const streams = new Map<DecodableStream, Array<Route>>()
-  for (const route of routes) {
-    const readers = streams.get(route.stream)
-    if (readers === undefined) streams.set(route.stream, [route])
-    else readers.push(route)
-  }
-  const byMarker = markerIndex(
-    operation,
-    [...streams.keys()].map((stream) => [stream.streamName, stream] as const),
-  )
   return Effect.gen(function* () {
+    // One decode per stream, however many projections read it.
+    const streams = new Map<DecodableStream, Array<Route>>()
+    for (const route of routes) {
+      const readers = streams.get(route.stream)
+      if (readers === undefined) streams.set(route.stream, [route])
+      else readers.push(route)
+    }
+    const unroutedStreams = decodeOnly.filter(([, stream]) => !streams.has(stream))
+    /** A marker's stream: the projections that read it, or its name when it has none. */
+    const byMarker = markerIndex(operation, [
+      ...[...streams.keys()].map((stream) => [stream.streamName, stream] as const),
+      ...unroutedStreams,
+    ])
+    const unroutedNames = new Map(unroutedStreams.map(([name, stream]) => [stream, name]))
+    const unrouted: Array<{
+      readonly position: number
+      readonly stream: string
+      readonly event: unknown
+    }> = []
     const image =
       options.image ?? (insertImage as unknown as (record: Rec) => StreamImage | undefined)
     /** Each projection's events, and the record each came from. */
@@ -1320,14 +1428,25 @@ const runBatch = <Rec>(
         typeof recordImage === "object" && recordImage !== null && !Array.isArray(recordImage)
           ? byMarker.get(imageEntityType(recordImage) ?? "")
           : undefined
-      // Not an event of any projection's stream: nothing to apply.
+      // Not an event of any stream named: nothing to apply.
       if (entry === undefined) continue
-      const decoded = yield* Effect.result(entry[1].decodeStreamImage(recordImage))
+      const readers = streams.get(entry[1])
+      const decoded = yield* Effect.result(
+        readers === undefined
+          ? entry[1].decodeStreamImage(recordImage)
+          : readers[0]!.decode(recordImage),
+      )
       if (Result.isFailure(decoded)) {
         decodeFailures.push({ record, error: decoded.failure })
         if (options.onDecodeFailure !== "skip") failed.add(i)
+      } else if (Option.isSome(decoded.success) && readers === undefined) {
+        unrouted.push({
+          position: i,
+          stream: unroutedNames.get(entry[1])!,
+          event: decoded.success.value,
+        })
       } else if (Option.isSome(decoded.success)) {
-        for (const route of streams.get(entry[1])!) {
+        for (const route of readers!) {
           const target = routed.get(route.name)!
           target.events.push(decoded.success.value)
           target.recordOf.push(i)
@@ -1362,7 +1481,7 @@ const runBatch = <Rec>(
         ? { identifier: options.identifier }
         : { source: (options as IdentifyBySource).source }) as IdentifyWith<Rec>,
     )
-    return { outcomes, decodeFailures, failedRecords, response }
+    return { unrouted, outcomes, decodeFailures, failedRecords, response }
   })
 }
 
@@ -1379,8 +1498,9 @@ const runBatch = <Rec>(
  * Records are read as `StreamRecord`s, identified per `source`, or through
  * `image` / `identifier` accessors for a shape of your own (a Pipe input
  * template's). A failed record without an identifier fails the call with
- * `StreamRecordIdentifierMissing`. Two projected streams storing events under
- * one marker throw `[EDD-9082]`.
+ * `StreamRecordIdentifierMissing`. `streams` names streams to decode without a
+ * projection: their events come back as `unrouted`. Two streams storing
+ * events under one marker die with `[EDD-9082]`.
  *
  * @example
  * ```ts
@@ -1395,22 +1515,33 @@ export const processBatch: {
   <
     const Projections extends { readonly [name: string]: AnyEventProjection },
     Rec extends StreamRecord,
+    const Streams extends { readonly [name: string]: DecodableStream } = {},
   >(
     records: ReadonlyArray<Rec>,
     options: ProcessBatchOptions<Rec> &
-      (IdentifyBySource | IdentifyWith<Rec>) & { readonly projections: Projections },
+      (IdentifyBySource | IdentifyWith<Rec>) & {
+        readonly projections: Projections
+        readonly streams?: Streams | undefined
+      },
   ): Effect.Effect<
-    ProcessBatchesResult<Projections, Rec>,
+    ProcessBatchesResult<Projections, Rec, Streams>,
     StreamRecordIdentifierMissing,
     ProjectionRequirementsOf<Projections[keyof Projections]>
   >
-  <const Projections extends { readonly [name: string]: AnyEventProjection }, Rec>(
+  <
+    const Projections extends { readonly [name: string]: AnyEventProjection },
+    Rec,
+    const Streams extends { readonly [name: string]: DecodableStream } = {},
+  >(
     records: ReadonlyArray<Rec>,
     options: ProcessBatchOptions<Rec> & {
       readonly image: (record: Rec) => StreamImage | undefined
-    } & IdentifyWith<Rec> & { readonly projections: Projections },
+    } & IdentifyWith<Rec> & {
+        readonly projections: Projections
+        readonly streams?: Streams | undefined
+      },
   ): Effect.Effect<
-    ProcessBatchesResult<Projections, Rec>,
+    ProcessBatchesResult<Projections, Rec, Streams>,
     StreamRecordIdentifierMissing,
     ProjectionRequirementsOf<Projections[keyof Projections]>
   >
@@ -1423,7 +1554,9 @@ export const processBatch: {
       ([name, projection]) => ({
         name,
         stream: projection.stream as unknown as DecodableStream,
+        decode: (image: StreamImage) => projection[ProjectionDecode](image),
         applyBatch: (events, applyOptions) => projection.applyBatch(events, applyOptions),
       }),
     ),
+    Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
   )
