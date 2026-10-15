@@ -307,3 +307,15 @@ added fixes and adoption asks. What changed from §§3–7:
     event of the row gap-fills through it and fails.
   - A row that is never created re-reads from version 1 and re-reports its rejections
     on each later delivery, so dedupe them by version.
+
+## 11. Review round 3
+
+- **Blocker (types):** `AnyEventProjection`, `ProjectionOutcomesOf` and
+  `ProjectionRequirementsOf` now take `EventProjection`'s ninth parameter (the
+  `Option`-key flag) as well. An `Option`-key projection passed to
+  `EventStore.processBatch` compiled to "No overload matches", its outcomes resolved
+  to `never`, and its requirements were lost. A type test covers it, and it fails
+  with the old types.
+- **Contiguity:** a row needs no read when the batch's events of its stream
+  instance cover every version from its checkpoint to its highest event. Those
+  events can be the row's own, other rows', or ones addressing no row.

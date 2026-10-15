@@ -142,7 +142,7 @@ Underneath is `applyBatch(events)`, which you can call with decoded events. Per 
 
 1. **Sort and deduplicate** the row's events by version — an out-of-order batch, or one carrying a redelivery, needs no read to put right.
 2. **Read the row** (strongly consistent) and its checkpoint `c`. Events at or below `c` are reported as `alreadyApplied`; with nothing left, the row is done.
-3. **Fill gaps from the store.** If the remaining events are exactly `c + 1 …` the highest delivered version, nothing is read. Otherwise one strongly consistent `readFrom(c, { toVersion })` — bounded at that highest version — supplies the missing ones.
+3. **Fill gaps from the store.** If the batch holds every version from `c + 1` to the highest delivered one — the row's own events, or the stream's events for other rows or for no row — nothing is read. Otherwise one strongly consistent `readFrom(c, { toVersion })` — bounded at that highest version — supplies the missing ones.
 4. **Fold and write once,** conditioned on the checkpoint still being `c`: k events of a row in the batch cost one write.
 
 A redelivered or late event is skipped by the checkpoint; a missing earlier one is read from the store. Nothing waits. Outcomes are `Applied` or `Failed` per row; `applyBatch` itself never fails, so one row's error can't hide the others' `applied`. `apply(event)` is `applyBatch([event])` with the row's failure in the error channel. The outcome `positions` of `processBatch` index the records you passed.
