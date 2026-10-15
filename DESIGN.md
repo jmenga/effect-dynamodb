@@ -3610,6 +3610,47 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
 - **Not covered:** a row fed by several streams (per-source checkpoints), row
   deletion, an ordered outbox, a polled change-feed `Stream`.
 
+### Multi-source Projections, Tombstones and the Outbox (#153–#155)
+
+Design: `docs/designs/eventstore-projections-2.md`. One row engine
+(`internal/ProjectionEngine.ts`) serves `projection` (one source, a scalar
+checkpoint) and `multiProjection` (several sources, a checkpoint per source
+instance).
+
+- **The engine.** It reads the row raw (strongly consistent; a tombstone reads as
+  one), works out each instance's checkpoint slot and run (gap-filled in `fold`
+  mode, newest-only in `latest`), and folds in declared source order, then
+  stream id, then version. It writes once — through the entity's `put` (keeping
+  `createdAt`), as a raw tombstone, or with outbox items in one
+  `TransactWriteItems` — conditioned on the revision (or the scalar
+  checkpoint). A lost race retries with a jittered backoff.
+- **`revision`** is a library-owned numeric field: `+1` on every write, which is
+  conditioned on the value read (`attribute_not_exists` when absent). One
+  comparison serialises every writer, whatever its source, and closes
+  `rebuild`'s ABA case. It is required by `multiProjection` and `outbox`.
+- **Checkpoints** are a `Record<string, number>` map keyed `<source>#<streamId>`,
+  and/or per-source `{ field, offset, instanceField }` for legacy rows.
+  `instanceField` records the owning instance; an empty one is adopted by the
+  first instance that arrives. Another instance goes to the map, or fails with
+  `ProjectionSourceConflict`. Within one attempt, a field goes to the first
+  instance in fold order, which is how `rebuild` repairs a wrong owner. There
+  is no cap: an oversized row fails in DynamoDB and is diagnosed there.
+- **Tombstones** (`removal`, `EventStore.removeRow`) are raw items at the row's
+  key (`<entityType>#tombstone`) keeping the checkpoint fields and revision;
+  TTL is opt-in. Entity `get`, `Batch.get` and `Transaction.transactGet`
+  report them as absent. A later event restarts from `initial`. Removal is
+  refused for read models with `unique` / `retain` / `softDelete` features.
+- **The outbox** writes effects as items (`<entityType>#outbox`, sort key
+  `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
+  in the row's transaction. `drain` claims the head item (a conditional update
+  with an expiring claim), delivers it, deletes it on its claim, and repeats:
+  in order per row, at least once. `deliver` on `applyBatch` / `processBatch`
+  drains after the write; `drainPending` sweeps through a sparse
+  `outbox.index`.
+- **`EventStore.processBatch`** routes through each projection's internal
+  routes (one per source stream; `bindProjection` wraps their decode and apply
+  in its context), so single- and multi-source projections share one feed.
+
 ### Command Handler Retry
 
 ```typescript
@@ -4046,6 +4087,7 @@ pre-#147 unions.
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 | `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
 | `EventStream.parseStreamId` | `ValidationError` |
+| `EventStore` multi-source projection `catchUp` / `rebuild` (`applyBatch` / `processBatch` per row) | the sources' `evolve` errors, the read model's errors, `ValidationError`, `ConcurrentModification`, `ProjectionSourceConflict` |
 | `EventStore.batchResponse`, `projection.processBatch`, `EventStore.processBatch` | `StreamRecordIdentifierMissing` (per-row errors are outcome values) |
 | `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 

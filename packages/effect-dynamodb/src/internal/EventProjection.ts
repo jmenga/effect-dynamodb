@@ -1520,10 +1520,10 @@ export const runBatch = <Rec>(
         outcomes[route.name] = []
         continue
       }
-      const batch = yield* route.applyBatch(
-        events,
-        options.concurrency === undefined ? undefined : { concurrency: options.concurrency },
-      )
+      const batch = yield* route.applyBatch(events, {
+        ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
+        ...(options.deliver === undefined ? {} : { deliver: options.deliver }),
+      })
       for (const position of batch.failedPositions) failed.add(recordOf[position]!)
       // Positions index the records, not the decoded events.
       outcomes[route.name] = batch.outcomes.map((outcome) => ({

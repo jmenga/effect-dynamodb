@@ -377,6 +377,30 @@ describe("projection outbox", () => {
       }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("`deliver` passes through processBatch, per projection", () =>
+    Effect.gen(function* () {
+      yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+      const records = [...store.entries()]
+        .filter(([k, item]) => k.startsWith("events|") && item.__edd_e__?.S === "order.event")
+        .map(([, item], i) => ({
+          eventID: `e${i}`,
+          eventName: "INSERT",
+          dynamodb: { SequenceNumber: String(i).padStart(4, "0"), NewImage: item as never },
+        }))
+      const seen: Array<number> = []
+      const single = yield* Notifying.processBatch(records, {
+        source: "lambda",
+        deliver: (effect) =>
+          Effect.sync(() => {
+            seen.push((effect as Notice).total)
+          }),
+      })
+      expect(single.response).toEqual({ batchItemFailures: [] })
+      expect(seen).toEqual([3])
+      expect(items("read", "Summary#outbox")).toEqual([])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("a separate outbox table, swept by drainPending through its index", () =>
     Effect.gen(function* () {
       yield* seed("o1", [new Placed({ amount: 1 })])

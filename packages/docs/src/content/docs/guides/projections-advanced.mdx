@@ -1,0 +1,233 @@
+---
+title: "Multi-source Projections, Tombstones and the Outbox"
+description: "Read models fed by several streams, rows that can be removed, and side effects committed with the row and delivered in order"
+---
+
+[Projections from DynamoDB Streams](/effect-dynamodb/guides/projections/) folds one stream into a read model. This page covers what builds on it:
+
+- **[Several sources per row](#several-sources-per-row):** one row that several streams contribute to, each instance with its own checkpoint.
+- **[`revision`](#revision-one-guard-for-every-writer):** one guard that serialises every writer of a row.
+- **[Removing rows](#removing-rows):** tombstones that keep the checkpoints.
+- **[An outbox](#an-ordered-outbox):** side effects committed with the row and delivered in order, at least once.
+
+## Setup
+
+Three streams feed one shipment summary. An order feeds several shipments. A scan stream carries each shipment's whole location, and a scale reports weights:
+
+```typescript region="streams" example="guide-projections-advanced.ts"
+class ParcelAdded extends Schema.TaggedClass<ParcelAdded>()("ParcelAdded", {
+  shipmentId: Schema.String,
+  parcels: Schema.Number,
+}) {}
+class OrderCancelled extends Schema.TaggedClass<OrderCancelled>()("OrderCancelled", {
+  shipmentId: Schema.String,
+}) {}
+class Scanned extends Schema.TaggedClass<Scanned>()("Scanned", {
+  location: Schema.String,
+}) {}
+class Weighed extends Schema.TaggedClass<Weighed>()("Weighed", {
+  shipmentId: Schema.String,
+  kg: Schema.Number,
+}) {}
+
+const AppSchema = DynamoSchema.make({ name: "freight", version: 1 })
+const EventsTable = Table.make({ schema: AppSchema, entities: {} })
+
+// One order feeds several shipments
+const OrderEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Order",
+  events: [ParcelAdded, OrderCancelled],
+  streamId: { composite: ["orderId"] },
+})
+// One scan stream per shipment: each event carries the whole location
+const ScanEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Scan",
+  events: [Scanned],
+  streamId: { composite: ["shipmentId"] },
+})
+// Weighings arrive from a scale, one stream per weighing session
+const WeighEvents = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Weigh",
+  events: [Weighed],
+  streamId: { composite: ["sessionId"] },
+})
+```
+
+The read model keeps a checkpoint per source instance in a map field, and a `revision` that every write increments:
+
+```typescript region="read-model" example="guide-projections-advanced.ts"
+const ShipmentSummary = Schema.Struct({
+  shipmentId: Schema.String,
+  parcels: Schema.Number,
+  location: Schema.String,
+  kg: Schema.Number,
+  checkpoints: Schema.Record(Schema.String, Schema.Number), // one per source instance
+  revision: Schema.Number, // incremented by every write, and its guard
+})
+
+const ShipmentSummaries = Entity.make({
+  model: ShipmentSummary,
+  entityType: "ShipmentSummary",
+  primaryKey: {
+    pk: { field: "pk", composite: ["shipmentId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const ReadTable = Table.make({ schema: AppSchema, entities: { ShipmentSummaries } })
+```
+
+## Several sources per row
+
+```typescript region="projection" example="guide-projections-advanced.ts"
+const ShipmentNotice = Schema.Struct({ shipmentId: Schema.String, kind: Schema.String })
+
+const ShipmentProjection = EventStore.multiProjection({
+  readModel: ShipmentSummaries,
+  initial: (key) => ({
+    shipmentId: key.shipmentId,
+    parcels: 0,
+    location: "",
+    kg: 0,
+    checkpoints: {},
+    revision: 0,
+  }),
+  sources: (source) => ({
+    order: source(OrderEvents, {
+      key: (_orderId, event) => ({ shipmentId: event.data.shipmentId }),
+      evolve: (state, event) =>
+        Effect.succeed(
+          event.data._tag === "OrderCancelled"
+            ? EventStore.removeRow
+            : { ...state, parcels: state.parcels + event.data.parcels },
+        ),
+    }),
+    scan: source(ScanEvents, {
+      key: (streamId) => ({ shipmentId: streamId.shipmentId }),
+      evolve: (state, event) => Effect.succeed({ ...state, location: event.data.location }),
+      mode: "latest", // each scan carries the whole location: only the newest matters
+    }),
+    weigh: source(WeighEvents, {
+      key: (_sessionId, event) => ({ shipmentId: event.data.shipmentId }),
+      evolve: (state, event) => Effect.succeed({ ...state, kg: state.kg + event.data.kg }),
+    }),
+  }),
+  checkpoints: { field: "checkpoints" },
+  revision: "revision",
+  removal: {},
+  outbox: {
+    schema: ShipmentNotice,
+    effects: (event, next) =>
+      event.eventType === "Scanned" && next !== undefined
+        ? [{ shipmentId: next.shipmentId, kind: `at ${next.location}` }]
+        : [],
+  },
+})
+```
+
+- **Sources** are declared through the `source` helper. Each call infers its own stream's event types, against the row's key and state.
+- **`key(streamId, event)`** names the row an event contributes to, as in a single-source projection. `Option.none()` means no row. One instance can feed many rows (one order, many shipments).
+- **`evolve(state, event, { source, streamId })`** folds into the **whole** row, so one source's part can depend on another's. Sources interleave in any order across writes, so a source's `evolve` must not assume another's has run first. Within one write, sources are folded in declaration order, then by stream id, then by version.
+- **`mode`:**
+  - `"fold"` (the default) applies every event in version order and fills gaps from the store. Use it for events that change a few fields, where skipping one would lose data.
+  - `"latest"` applies only the newest event of each instance in a batch. The others are reported as `superseded`, and nothing is read. Use it for events that carry the source's whole part.
+- **`terminal`** is per source.
+
+### Checkpoints per source instance
+
+A row keeps one checkpoint per **source instance** (`<source>#<streamId>` in the `checkpoints` map). Each one means "every version up to here has been considered for this row". A second instance of the same source, such as an entity re-identified mid-stream that starts again at version 1, gets its own entry, so its early events are never mistaken for stale ones.
+
+Rows that already keep one numeric field per source can map them instead:
+
+```typescript
+checkpoints: {
+  field: "checkpoints", // optional: where a second instance goes
+  sources: { weigh: { field: "weighVersion", offset: -1, instanceField: "weighSession" } },
+}
+```
+
+- **`instanceField`** records which stream instance owns the scalar. An empty one (a new row, or a legacy one) is adopted by the first instance that arrives.
+- **Another instance** goes to the map when one is declared. Without a map, it fails with `ProjectionSourceConflict` and nothing is written.
+- **Adoption is a guess.** A legacy row is adopted by whichever instance arrives first. If that's the wrong one, `rebuild` repairs it ([below](#repair)).
+
+## `revision`: one guard for every writer
+
+Every write sets `revision` one higher and is conditioned on the value it read: `attribute_not_exists` when the row has none, which covers legacy rows.
+- **Different sources serialise.** A writer that loses the race re-reads and retries with a jittered backoff, and no source's part is overwritten.
+- **An existing write counter** that readers already use can serve as the revision.
+- **It is required** by multi-source projections and by the outbox, and is optional on `projection`. There it also makes `rebuild` safe to run alongside live delivery.
+
+## Handling a batch
+
+`EventStore.processBatch` takes multi-source projections next to single-source ones. Each record is decoded once and routed to every projection that reads its stream:
+
+```typescript region="handler" example="guide-projections-advanced.ts"
+type StreamBatch = { readonly Records: ReadonlyArray<EventStore.StreamRecord> }
+
+const makeHandler = Effect.gen(function* () {
+  const shipments = yield* EventStore.bindProjection(ShipmentProjection)
+  return (batch: StreamBatch) =>
+    EventStore.processBatch(batch.Records, {
+      projections: { shipments },
+      source: "lambda",
+      // Deliver each written row's effects, in order, right after its write
+      deliver: (effect, meta) => deliver(effect as typeof ShipmentNotice.Type, meta),
+    }).pipe(Effect.map((result) => result.response))
+})
+```
+
+Each row's outcome lists its instances: `{ source, streamId, applied, alreadyApplied, rejected, superseded, version }`. It also has the row's `state`, `removed`, `revision` and `enqueued`.
+
+## Removing rows
+
+With `removal`, `evolve` may return `EventStore.removeRow`:
+
+```typescript region="removal" example="guide-projections-advanced.ts"
+const removed = yield* ShipmentProjection.applyBatch([{ stream: "order", event: cancelled! }])
+```
+
+- **A tombstone, not a deletion.** The row's key keeps a tombstone (`__edd_e__: "<entityType>#tombstone"`) with the checkpoints and revision and nothing else. A redelivery can't recreate the row.
+- **Every entity read by key reports it as absent:** `get`, `Batch.get` and `Transaction.transactGet`. Queries filter it out, and it carries no index keys.
+- **A later event** starts the row again from `initial`, from the tombstone's checkpoints.
+- **`removal: { ttl }`** lets DynamoDB expire tombstones. Choose more than the change feed's 24 hours plus any redelivery or replay window: once a tombstone expires, a very late event recreates the row.
+- **Refused** for read models with `unique` constraints, whose sentinels a tombstone write can't release.
+
+## An ordered outbox
+
+Side effects driven from `applied` are at most once: a crash after the write loses them. An outbox commits them **with** the row.
+
+- **Commit:** `outbox.effects(event, next, context)` returns the effects an applied event produces. They are encoded through `outbox.schema` and written as outbox items in the same `TransactWriteItems` as the row (or tombstone). A write without effects stays a single `PutItem`.
+- **Delivery:** `drain(rowKey, deliver)`, or `deliver` on `applyBatch` / `processBatch`, hands them over strictly in order per row. It claims the head item, delivers it, deletes it, and repeats.
+  - A `deliver` failure leaves the effect at the head for the next drain, and is reported as `undelivered`. It never fails the record, because the effects are committed.
+  - A crash leaves a claim that expires (`claimFor`, 30 s by default), so the effect is delivered again: **at least once**. Each effect carries its event's stream id and version, so consumers can deduplicate.
+- **Order** is one sequence per row, across all its sources.
+- **Where the items live:**
+  - By default, in the row's own partition (`__edd_e__: "<entityType>#outbox"`). They show in the read model table's change stream and in full-table scans, but not in entity reads.
+  - With `table` (keyed `keys`, default `pk` / `sk`) they go to another table, still in the same transaction. That keeps them out of the read model table's stream altogether.
+- **Sweeping:** `drainPending(deliver)` finds rows with pending effects through `outbox.index`, a sparse index whose key attributes only outbox items carry. It covers rows that receive no further events.
+- **Limit:** a transaction holds 100 items, so one row write can commit at most 99 effects.
+
+## Repair
+
+`rebuild(rowKey, { instances })` re-derives a row from the named instances. A `sourcesOf(rowKey)` in the config can find them instead, for example over a stream index.
+- It folds each instance's events keyed to the row from `initial`.
+- It writes every checkpoint from scratch, with the next revision.
+- A field-mapped scalar goes to the first instance in fold order, which repairs a row adopted by the wrong instance.
+
+```typescript region="rebuild" example="guide-projections-advanced.ts"
+const rebuilt = yield* ShipmentProjection.rebuild(
+  { shipmentId: "sh-1" },
+  {
+    instances: {
+      order: [{ orderId: "o-1" }],
+      scan: [{ shipmentId: "sh-1" }],
+      weigh: [{ sessionId: "w-1" }],
+    },
+  },
+)
+```
+
+`catchUp(rowKey)` brings every instance the row's checkpoints know up to its head.
