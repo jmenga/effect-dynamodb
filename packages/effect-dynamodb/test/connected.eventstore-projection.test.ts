@@ -19,8 +19,9 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, Effect, Layer, Option, Schema } from "effect"
+import { Config, Data, Effect, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -98,7 +99,79 @@ const Balances = Entity.make({
   timestamps: true,
 })
 
-const ReadTable = Table.make({ schema: AppSchema, entities: { Balances } })
+class Placed extends Schema.TaggedClass<Placed>()("Placed", { zone: Schema.String }) {}
+class Reading extends Schema.TaggedClass<Reading>()("Reading", {
+  zone: Schema.String,
+  value: Schema.Number,
+}) {}
+
+const Devices = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Device",
+  events: [Placed, Reading],
+  streamId: { composite: ["deviceId"] },
+})
+
+/** One row per device and zone — the zone comes from each event. */
+const ZoneTotal = Schema.Struct({
+  deviceId: Schema.String,
+  zone: Schema.String,
+  total: Schema.Number,
+  placed: Schema.Boolean,
+  seq: Schema.Number,
+  lookup: DynamoModel.Hidden(Schema.String),
+})
+
+const ZoneTotals = Entity.make({
+  model: ZoneTotal,
+  entityType: "ZoneTotal",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["zone"] },
+  },
+  timestamps: true,
+})
+
+const ReadTable = Table.make({ schema: AppSchema, entities: { Balances, ZoneTotals } })
+
+class NotPlaced extends Data.TaggedError("NotPlaced")<{ readonly version: number }> {}
+
+const zoneConfig = {
+  stream: Devices,
+  readModel: ZoneTotals,
+  key: (id: { readonly deviceId: string }, event: EventStore.StreamEvent<Placed | Reading>) => ({
+    deviceId: id.deviceId,
+    zone: event.data.zone,
+  }),
+  initial: (
+    id: { readonly deviceId: string },
+    event: EventStore.StreamEvent<Placed | Reading>,
+  ) => ({
+    deviceId: id.deviceId,
+    zone: event.data.zone,
+    total: 0,
+    placed: false,
+    seq: 0,
+    lookup: "",
+  }),
+  evolve: (state: typeof ZoneTotal.Type, event: EventStore.StreamEvent<Placed | Reading>) =>
+    Effect.gen(function* () {
+      const data = event.data
+      if (data._tag === "Placed") return { ...state, placed: true }
+      if (!state.placed) return yield* new NotPlaced({ version: event.version })
+      return { ...state, total: state.total + data.value }
+    }),
+  checkpoint: "seq" as const,
+  toItem: (state: typeof ZoneTotal.Type) => ({ ...state, lookup: `${state.zone}#${state.total}` }),
+}
+
+/** A reading of a zone never placed is rejected — acknowledged, writing nothing. */
+const ZoneProjection = EventStore.projection({
+  ...zoneConfig,
+  terminal: (error) => error._tag === "NotPlaced",
+})
+/** The same, failing the row instead. */
+const StrictZoneProjection = EventStore.projection(zoneConfig)
 
 const evolve = (state: Balance, event: EventStore.StreamEvent<AccountEvent>) => {
   const data = event.data
@@ -285,7 +358,7 @@ describeConnected("EventStore projections (connected)", () => {
     }).pipe(provide),
   )
 
-  it.effect("concurrent batches racing on one instance apply each event exactly once", () =>
+  it.live("concurrent batches racing on one instance apply each event exactly once", () =>
     Effect.gen(function* () {
       const n = 24
       yield* Accounts.append(
@@ -330,12 +403,12 @@ describeConnected("EventStore projections (connected)", () => {
       const events = yield* Accounts.read({ accountId: "zero" })
       const first = yield* projection.apply(events[1]!)
       expect(first.applied.map((e) => e.version)).toEqual([1, 2])
-      expect(first.state.version).toBe(1)
+      expect(Option.getOrThrow(first.state).version).toBe(1)
       const again = yield* projection.applyBatch(events)
       const outcome = again.outcomes[0]!
       if (outcome._tag !== "Applied") throw new Error("not applied")
       expect(outcome.applied.map((e) => e.version)).toEqual([3])
-      expect(outcome.state.version).toBe(2)
+      expect(Option.getOrThrow(outcome.state).version).toBe(2)
       expect(outcome.version).toBe(3)
     }).pipe(provide),
   )
@@ -350,15 +423,15 @@ describeConnected("EventStore projections (connected)", () => {
       expect(caught.applied.map((e) => e.version)).toEqual([3, 4])
       expect(Option.getOrThrow(caught.state).balance).toBe(6)
 
-      const rebuilt = yield* BalanceProjection.rebuild({ accountId: "dlq" })
-      expect(rebuilt.version).toBe(4)
-      expect(Option.getOrThrow(rebuilt.state)).toMatchObject({
+      const { rows } = yield* BalanceProjection.rebuild({ accountId: "dlq" })
+      expect(rows.map((r) => r.version)).toEqual([4])
+      expect(Option.getOrThrow(rows[0]!.state)).toMatchObject({
         balance: 6,
         deposits: 3,
         version: 4,
       })
       const empty = yield* BalanceProjection.rebuild({ accountId: "never" })
-      expect(empty).toEqual({ state: Option.none(), version: 0 })
+      expect(empty).toEqual({ rows: [] })
     }).pipe(provide),
   )
 
@@ -376,5 +449,160 @@ describeConnected("EventStore projections (connected)", () => {
       const pipe = yield* BalanceProjection.processBatch(records, { source: "pipe" })
       expect(pipe.response).toEqual({ batchItemFailures: [{ itemIdentifier: poison.eventID! }] })
     }).pipe(provide),
+  )
+
+  it.effect("moves a stream's events between rows mid-stream", () =>
+    Effect.gen(function* () {
+      yield* Devices.append(
+        { deviceId: "d1" },
+        [
+          new Placed({ zone: "north" }),
+          new Reading({ zone: "north", value: 5 }),
+          new Placed({ zone: "south" }),
+          new Reading({ zone: "south", value: 7 }),
+          new Reading({ zone: "north", value: 1 }),
+        ],
+        0,
+      )
+      const events = yield* Devices.read({ deviceId: "d1" })
+      const bound = yield* EventStore.bindProjection(ZoneProjection)
+      // Delivered out of order across two batches.
+      const first = yield* bound.applyBatch([events[4]!, events[3]!])
+      expect(
+        first.outcomes.map((o) =>
+          o._tag === "Applied" ? [o.key, o.applied.map((e) => e.version), o.version] : o._tag,
+        ),
+      ).toEqual([
+        [{ deviceId: "d1", zone: "north" }, [1, 2, 5], 5],
+        [{ deviceId: "d1", zone: "south" }, [3, 4], 4],
+      ])
+      const late = yield* bound.applyBatch(events.slice(0, 3))
+      expect(late.outcomes.every((o) => o._tag === "Applied" && o.applied.length === 0)).toBe(true)
+      const north = yield* Entity.asItem(
+        Entity.consistentRead(ZoneTotals.get({ deviceId: "d1", zone: "north" })),
+      )
+      const south = yield* Entity.asItem(
+        Entity.consistentRead(ZoneTotals.get({ deviceId: "d1", zone: "south" })),
+      )
+      expect(north).toMatchObject({ total: 6, seq: 5, lookup: "north#6" })
+      expect(south).toMatchObject({ total: 7, seq: 4, lookup: "south#7" })
+    }).pipe(provide),
+  )
+
+  it.effect("an update to a row never created fails typed and writes nothing", () =>
+    Effect.gen(function* () {
+      yield* Devices.append(
+        { deviceId: "d2" },
+        [new Reading({ zone: "east", value: 3 }), new Placed({ zone: "east" })],
+        0,
+      )
+      const [reading, placed] = yield* Devices.read({ deviceId: "d2" })
+      const missing = () =>
+        Effect.flip(ZoneTotals.get({ deviceId: "d2", zone: "east" }).asEffect()).pipe(
+          Effect.map((e) => e._tag),
+        )
+      // Without `terminal`: the row fails with the typed error.
+      const error = yield* Effect.flip(StrictZoneProjection.apply(reading!))
+      expect(error).toEqual(new NotPlaced({ version: 1 }))
+      expect(yield* missing()).toBe("ItemNotFound")
+      // With `terminal`: rejected, acknowledged, nothing written.
+      const rejected = yield* ZoneProjection.apply(reading!)
+      expect(rejected.rejected.map((r) => r.error)).toEqual([new NotPlaced({ version: 1 })])
+      expect(rejected.state).toEqual(Option.none())
+      expect(yield* missing()).toBe("ItemNotFound")
+      // The placing event then starts the row; the reading stays rejected.
+      const started = yield* ZoneProjection.apply(placed!)
+      expect(started.applied.map((e) => e.version)).toEqual([2])
+      expect(started.rejected.map((r) => r.event.version)).toEqual([1])
+      expect(Option.getOrThrow(started.state)).toMatchObject({ placed: true, total: 0, seq: 2 })
+    }).pipe(provide),
+  )
+
+  it.live("keeps createdAt and Hidden fields across projection writes", () =>
+    Effect.gen(function* () {
+      yield* Devices.append(
+        { deviceId: "d3" },
+        [new Placed({ zone: "west" }), new Reading({ zone: "west", value: 2 })],
+        0,
+      )
+      const [placed, reading] = yield* Devices.read({ deviceId: "d3" })
+      // Without `toItem`, an unchanged state must keep the Hidden field it read.
+      const plain = EventStore.projection({
+        ...zoneConfig,
+        evolve: (state: typeof ZoneTotal.Type) => Effect.succeed({ ...state, lookup: "kept" }),
+        toItem: undefined,
+      })
+      yield* plain.apply(placed!)
+      const row = () =>
+        Entity.asItem(Entity.consistentRead(ZoneTotals.get({ deviceId: "d3", zone: "west" })))
+      const before = yield* row()
+      yield* Effect.sleep("30 millis")
+      const unchanged = EventStore.projection({
+        ...zoneConfig,
+        evolve: (state: typeof ZoneTotal.Type) => Effect.succeed(state),
+        toItem: undefined,
+      })
+      yield* unchanged.apply(reading!)
+      const after = yield* row()
+      expect(after.seq).toBe(2)
+      expect(after.lookup).toBe("kept")
+      expect(String(after.createdAt)).toBe(String(before.createdAt))
+      expect(String(after.updatedAt)).not.toBe(String(before.updatedAt))
+    }).pipe(provide),
+  )
+
+  it.live("24 racing single-event deliveries all succeed under the default retry", () =>
+    Effect.gen(function* () {
+      const n = 24
+      yield* Accounts.append(
+        { accountId: "race24" },
+        [new Opened({ owner: "gu" }), ...deposits(n - 1)],
+        0,
+      )
+      const events = yield* Accounts.read({ accountId: "race24" })
+      const bound = yield* EventStore.bindProjection(BalanceProjection)
+      const results = yield* Effect.forEach(events, (event) => bound.applyBatch([event]), {
+        concurrency: "unbounded",
+      })
+      const outcomes = results.flatMap((r) => r.outcomes)
+      expect(outcomes.filter((o) => o._tag === "Failed")).toEqual([])
+      expect(appliedVersions(outcomes)).toEqual(Array.from({ length: n }, (_, i) => i + 1))
+    }).pipe(provide),
+  )
+
+  it.effect(
+    "maps processBatch positions to records and routes one feed to several projections",
+    () =>
+      Effect.gen(function* () {
+        yield* Accounts.append({ accountId: "feed" }, [new Opened({ owner: "ha" })], 0)
+        yield* Devices.append({ deviceId: "feed" }, [new Reading({ zone: "z", value: 1 })], 0)
+        const [account] = yield* eventItems("feed")
+        const device = yield* Effect.gen(function* () {
+          const client = yield* DynamoClient
+          const result = yield* client.query({
+            TableName: eventsTableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: "$proj-it#v1#device#feed" } },
+            ConsistentRead: true,
+          })
+          return (result.Items ?? [])[0] as Item
+        })
+        const modify = { ...recordOf(account!), eventName: "MODIFY" }
+        const records = [modify, recordOf(device), recordOf(account!)]
+        const single = yield* BalanceProjection.processBatch(records, { source: "lambda" })
+        expect(single.outcomes.map((o) => o.positions)).toEqual([[2]])
+        const result = yield* EventStore.processBatch(records, {
+          projections: { balances: BalanceProjection, zones: StrictZoneProjection },
+          source: "pipe",
+        })
+        expect(result.outcomes.balances.map((o) => [o._tag, o.positions])).toEqual([
+          ["Applied", [2]],
+        ])
+        expect(result.outcomes.zones.map((o) => [o._tag, o.positions])).toEqual([["Failed", [1]]])
+        expect(result.response).toEqual({
+          batchItemFailures: [{ itemIdentifier: records[1]!.eventID! }],
+        })
+      }).pipe(provide),
   )
 })

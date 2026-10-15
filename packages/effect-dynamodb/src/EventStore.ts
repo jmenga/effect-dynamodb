@@ -78,7 +78,7 @@ import {
   Schema,
 } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
-import type { EventProjection } from "./internal/EventProjection.js"
+import type { EventProjection, StreamRecord } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
@@ -575,6 +575,15 @@ export type AppendError =
  */
 export interface ReadOptions {
   readonly consistentRead?: boolean | undefined
+}
+
+/**
+ * Options accepted by {@link EventStream.readFrom}: {@link ReadOptions} plus
+ * `toVersion`, the last version to read (inclusive) — the key condition stops
+ * there, so nothing past it is read or paid for. Default: the stream's head.
+ */
+export interface ReadFromOptions extends ReadOptions {
+  readonly toVersion?: number | undefined
 }
 
 /**
@@ -1678,13 +1687,14 @@ export interface EventStream<
   >
 
   /**
-   * Read the events after `afterVersion` (exclusive), ascending. Pass
-   * `{ consistentRead: true }` for read-your-writes — see {@link ReadOptions}.
+   * Read the events after `afterVersion` (exclusive), ascending — up to
+   * `toVersion` (inclusive) when given. Pass `{ consistentRead: true }` for
+   * read-your-writes — see {@link ReadFromOptions}.
    */
   readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-    options?: ReadOptions | undefined,
+    options?: ReadFromOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
@@ -3423,7 +3433,7 @@ export const makeStream = <
   const readFrom = (
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-    options?: ReadOptions | undefined,
+    options?: ReadFromOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
     DynamoClientError | ValidationError,
@@ -3433,10 +3443,13 @@ export const makeStream = <
       // Versions are integers, so the inclusive lower bound `afterVersion + 1`
       // is exactly the old exclusive `#sk > eventSk(afterVersion)`. The upper
       // bound keeps the snapshot item (which sorts after every event) out of the
-      // scanned range.
+      // scanned range; `toVersion` narrows it to the versions wanted.
+      const upper =
+        options?.toVersion === undefined ? maxEventSk : composeEventSk(options.toVersion)
+      if (options?.toVersion !== undefined && options.toVersion <= afterVersion) return []
       const query = withReadOptions(
         buildEventsQuery(streamId).pipe(
-          Query.where({ between: [composeEventSk(afterVersion + 1), maxEventSk] }),
+          Query.where({ between: [composeEventSk(afterVersion + 1), upper] }),
         ),
         options,
       )
@@ -4157,7 +4170,7 @@ export interface BoundEventStream<
   readFrom(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-    options?: ReadOptions | undefined,
+    options?: ReadFromOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
     DynamoClientError | ValidationError,
@@ -5810,6 +5823,7 @@ export const foldFrom: {
 // ---------------------------------------------------------------------------
 
 export {
+  type AnyEventProjection,
   type ApplyBatchOptions,
   type BatchItemFailuresResponse,
   type BatchResponseSource,
@@ -5822,6 +5836,9 @@ export {
   type EventProjection,
   type EventProjectionTypeId,
   eventFilterPattern,
+  type IdentifyBySource,
+  type IdentifyWith,
+  type ProcessBatchesResult,
   type ProcessBatchOptions,
   type ProcessBatchResult,
   type ProjectionApplied,
@@ -5832,10 +5849,15 @@ export {
   type ProjectionError,
   type ProjectionKey,
   type ProjectionOutcome,
+  type ProjectionOutcomesOf,
   type ProjectionReadModel,
   type ProjectionReadModelError,
   type ProjectionRebuilt,
+  type ProjectionRebuiltRow,
+  type ProjectionRejected,
+  type ProjectionRequirementsOf,
   type ProjectionState,
+  processBatch,
   projection,
   type StreamRecord,
 } from "./internal/EventProjection.js"
@@ -5857,14 +5879,23 @@ export {
  *   )
  * ```
  */
-export const bindProjection = <S, A, TStreamIdFields extends ReadonlyArray<string>, M, Err, R>(
-  projection: EventProjection<S, A, TStreamIdFields, M, Err, R>,
-): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never>, never, R> =>
+export const bindProjection = <
+  S,
+  A,
+  TStreamIdFields extends ReadonlyArray<string>,
+  M,
+  Err,
+  R,
+  K,
+  E,
+>(
+  projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E>,
+): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E>, never, R> =>
   Effect.gen(function* () {
     const ctx = yield* Effect.context<R>()
     // The codec check `bind` makes, against the registry captured here.
     yield* Effect.provide(bind(projection.stream), ctx as Context.Context<any>)
-    const provide = <X, E>(effect: Effect.Effect<X, E, R>): Effect.Effect<X, E, never> =>
+    const provide = <X, Y>(effect: Effect.Effect<X, Y, R>): Effect.Effect<X, Y, never> =>
       Effect.provide(effect, ctx)
     return {
       ...projection,
@@ -5876,6 +5907,17 @@ export const bindProjection = <S, A, TStreamIdFields extends ReadonlyArray<strin
       apply: (event) => provide(projection.apply(event)),
       catchUp: (streamId) => provide(projection.catchUp(streamId)),
       rebuild: (streamId) => provide(projection.rebuild(streamId)),
-      processBatch: (records, options) => provide(projection.processBatch(records, options)),
-    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never>
+      // Both overloads share one implementation.
+      processBatch: ((records: ReadonlyArray<StreamRecord>, options: never) =>
+        provide(projection.processBatch(records, options))) as EventProjection<
+        S,
+        A,
+        TStreamIdFields,
+        M,
+        Err,
+        never,
+        K,
+        E
+      >["processBatch"],
+    } satisfies EventProjection<S, A, TStreamIdFields, M, Err, never, K, E>
   })

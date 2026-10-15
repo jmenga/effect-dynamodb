@@ -7,13 +7,16 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
   DynamoError,
+  StreamRecordIdentifierMissing,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Data, Effect, Layer, Option, Schema } from "effect"
+import { Data, Effect, Fiber, Layer, Option, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import { beforeEach } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -93,9 +96,57 @@ const TenantSummaries = Entity.make({
   },
 })
 
+const ZoneTotal = Schema.Struct({
+  deviceId: Schema.String,
+  zone: Schema.String,
+  total: Schema.Number,
+  readings: Schema.Number,
+  seq: Schema.Number,
+})
+
+const ZoneTotals = Entity.make({
+  model: ZoneTotal,
+  entityType: "ZoneTotal",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["zone"] },
+  },
+})
+
+const TaggedSummary = Schema.Struct({
+  orderId: Schema.String,
+  status: Schema.String,
+  total: Schema.Number,
+  version: Schema.Number,
+  searchKey: DynamoModel.Hidden(Schema.String),
+})
+
+const TaggedSummaries = Entity.make({
+  model: TaggedSummary,
+  entityType: "TaggedSummary",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const PaymentTotal = Schema.Struct({
+  paymentId: Schema.String,
+  total: Schema.Number,
+  n: Schema.Number,
+})
+const PaymentTotals = Entity.make({
+  model: PaymentTotal,
+  entityType: "PaymentTotal",
+  primaryKey: {
+    pk: { field: "pk", composite: ["paymentId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
 const ReadTable = Table.make({
   schema: AppSchema,
-  entities: { OrderSummaries, TenantSummaries },
+  entities: { OrderSummaries, TenantSummaries, ZoneTotals, TaggedSummaries, PaymentTotals },
 })
 
 class RejectedEvent extends Data.TaggedError("RejectedEvent")<{ readonly version: number }> {}
@@ -143,6 +194,10 @@ const calls = { query: 0, getItem: 0, putItem: 0 }
 let afterGet: Array<(table: string) => void> = []
 /** Fail every conditional put, as if another writer always won. */
 let rejectPuts = false
+/** Fail this many more conditional writes, then let them through. */
+let rejectNextPuts = 0
+/** Every query's key condition values, for asserting the range read. */
+const queried: Array<Record<string, AttributeValue>> = []
 
 const keyOf = (table: string, item: Item) => `${table}|${item.pk?.S}|${item.sk?.S}`
 
@@ -226,6 +281,7 @@ const InMemoryClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.sync(() => {
       calls.query++
+      queried.push(input.ExpressionAttributeValues ?? {})
       return runQuery(input) as never
     }),
   transactWriteItems: (input) =>
@@ -252,6 +308,7 @@ const InMemoryClient = mockDynamoClientLayer({
       const current = store.get(key)
       if (
         (rejectPuts && input.ConditionExpression !== undefined) ||
+        (rejectNextPuts > 0 && input.ConditionExpression !== undefined && rejectNextPuts-- > 0) ||
         !holds(
           input.ConditionExpression,
           current,
@@ -279,10 +336,13 @@ beforeEach(() => {
   calls.putItem = 0
   afterGet = []
   rejectPuts = false
+  rejectNextPuts = 0
+  queried.length = 0
   evolved.length = 0
 })
 
 const resetCalls = () => {
+  queried.length = 0
   calls.query = 0
   calls.getItem = 0
   calls.putItem = 0
@@ -338,7 +398,7 @@ describe("EventStore.projection — applyBatch", () => {
       expect(versions(outcome.applied)).toEqual([1, 2, 3])
       expect(outcome.alreadyApplied).toEqual([])
       expect(outcome.version).toBe(3)
-      expect(outcome.state).toEqual({
+      expect(Option.getOrThrow(outcome.state)).toEqual({
         orderId: "o1",
         status: "shipped",
         total: 15,
@@ -346,7 +406,7 @@ describe("EventStore.projection — applyBatch", () => {
         version: 3,
       })
       expect(calls).toEqual({ query: 0, getItem: 1, putItem: 1 })
-      expect(yield* rowOf("o1")).toEqual(outcome.state)
+      expect(yield* rowOf("o1")).toEqual(Option.getOrThrow(outcome.state))
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -365,7 +425,7 @@ describe("EventStore.projection — applyBatch", () => {
         expect(versions(outcome.applied)).toEqual([1, 2, 3])
         expect(outcome.positions).toEqual([0, 1, 2, 3])
         expect(evolved).toEqual([1, 2, 3])
-        expect(outcome.state.total).toBe(16)
+        expect(Option.getOrThrow(outcome.state).total).toBe(16)
         expect(calls.query).toBe(0)
       }).pipe(Effect.provide(TestLayer)),
   )
@@ -380,8 +440,11 @@ describe("EventStore.projection — applyBatch", () => {
       // Only version 3 is delivered — 1 and 2 are queued behind it.
       const outcome = yield* SummaryProjection.apply(e3!)
       expect(versions(outcome.applied)).toEqual([1, 2, 3])
-      expect(outcome.state.total).toBe(16)
+      expect(Option.getOrThrow(outcome.state).total).toBe(16)
       expect(calls).toEqual({ query: 1, getItem: 1, putItem: 1 })
+      // The read stops at the delivered version.
+      const bounds = Object.values(queried[0]!).map((v) => v.S ?? "")
+      expect(bounds.some((b) => /\.event_1#0*3$/.test(b))).toBe(true)
       // The late deliveries of 1 and 2 are no-ops.
       resetCalls()
       const late = yield* SummaryProjection.applyBatch(
@@ -411,7 +474,7 @@ describe("EventStore.projection — applyBatch", () => {
         if (outcome._tag !== "Applied") throw new Error("not applied")
         expect(versions(outcome.applied)).toEqual([1, 2, 3])
         expect(outcome.version).toBe(3)
-        expect(outcome.state.status).toBe("placed")
+        expect(Option.getOrThrow(outcome.state).status).toBe("placed")
         expect(calls.query).toBe(1)
       }).pipe(Effect.provide(TestLayer)),
   )
@@ -430,7 +493,7 @@ describe("EventStore.projection — applyBatch", () => {
       if (outcome._tag !== "Applied") throw new Error("not applied")
       expect(versions(outcome.applied)).toEqual([2, 3])
       expect(evolved).toEqual([2, 3])
-      expect(outcome.state.total).toBe(16)
+      expect(Option.getOrThrow(outcome.state).total).toBe(16)
       expect(calls).toEqual({ query: 0, getItem: 1, putItem: 1 })
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -454,7 +517,10 @@ describe("EventStore.projection — applyBatch", () => {
             ...toAttributeMap({ total: 15, lines: 1, version: 2 }),
           })
         })
-        const result = yield* SummaryProjection.applyBatch(events.slice(1))
+        // The retry sleeps (jittered) first: run it on the test clock.
+        const fiber = yield* Effect.forkChild(SummaryProjection.applyBatch(events.slice(1)))
+        yield* TestClock.adjust("1 second")
+        const result = yield* Fiber.join(fiber)
         const outcome = result.outcomes[0]!
         if (outcome._tag !== "Applied") throw new Error("not applied")
         expect(outcome.applied).toEqual([])
@@ -534,7 +600,7 @@ describe("EventStore.projection — applyBatch", () => {
       ])
       const first = yield* projection.apply(events[0]!)
       expect(first.version).toBe(1)
-      expect(first.state.version).toBe(0)
+      expect(Option.getOrThrow(first.state).version).toBe(0)
       const second = yield* projection.applyBatch(events)
       const outcome = second.outcomes[0]!
       if (outcome._tag !== "Applied") throw new Error("not applied")
@@ -570,7 +636,9 @@ describe("EventStore.projection — applyBatch", () => {
       const [ambiguous] = yield* TenantOrders.read({ tenant: "a#b", orderId: "o1" })
       expect(ok!.streamId).toBe("acme#o1")
       const applied = yield* projection.apply(ok!)
-      expect(applied.state).toEqual({ tenant: "acme", orderId: "o1", total: 3, seq: 1 })
+      expect(applied.state).toEqual(
+        Option.some({ tenant: "acme", orderId: "o1", total: 3, seq: 1 }),
+      )
       const error = yield* Effect.flip(projection.apply(ambiguous!))
       expect(error).toBeInstanceOf(ValidationError)
       expect(String((error as ValidationError).cause)).toContain("ambiguous")
@@ -599,7 +667,8 @@ describe("EventStore.projection — catchUp and rebuild", () => {
       expect(versions(caught.applied)).toEqual([2, 3])
       expect(caught.version).toBe(3)
       expect(Option.getOrThrow(caught.state).status).toBe("shipped")
-      expect(calls).toEqual({ query: 1, getItem: 1, putItem: 1 })
+      // The head (to find its row), then the row's range.
+      expect(calls).toEqual({ query: 2, getItem: 1, putItem: 1 })
       resetCalls()
       const again = yield* SummaryProjection.catchUp({ orderId: "o1" })
       expect(again.applied).toEqual([])
@@ -610,7 +679,13 @@ describe("EventStore.projection — catchUp and rebuild", () => {
   it.effect("catchUp of a stream with no events and no row returns none", () =>
     Effect.gen(function* () {
       const caught = yield* SummaryProjection.catchUp({ orderId: "nothing" })
-      expect(caught).toEqual({ applied: [], state: Option.none(), version: 0 })
+      expect(caught).toEqual({
+        key: Option.none(),
+        applied: [],
+        rejected: [],
+        state: Option.none(),
+        version: 0,
+      })
       expect(calls.putItem).toBe(0)
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -626,9 +701,11 @@ describe("EventStore.projection — catchUp and rebuild", () => {
       const key = summaryKey("o1")
       store.set(key, { ...store.get(key)!, ...toAttributeMap({ total: 999 }) })
       resetCalls()
-      const rebuilt = yield* SummaryProjection.rebuild({ orderId: "o1" })
-      expect(rebuilt.version).toBe(2)
-      expect(Option.getOrThrow(rebuilt.state).total).toBe(15)
+      const { rows } = yield* SummaryProjection.rebuild({ orderId: "o1" })
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.key).toEqual({ orderId: "o1" })
+      expect(rows[0]!.version).toBe(2)
+      expect(Option.getOrThrow(rows[0]!.state).total).toBe(15)
       expect(evolved).toEqual([1, 2])
       expect((yield* rowOf("o1")).total).toBe(15)
     }).pipe(Effect.provide(TestLayer)),
@@ -637,7 +714,7 @@ describe("EventStore.projection — catchUp and rebuild", () => {
   it.effect("rebuild of a stream with no events writes nothing", () =>
     Effect.gen(function* () {
       const rebuilt = yield* SummaryProjection.rebuild({ orderId: "nothing" })
-      expect(rebuilt).toEqual({ state: Option.none(), version: 0 })
+      expect(rebuilt).toEqual({ rows: [] })
       expect(calls.putItem).toBe(0)
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -684,6 +761,8 @@ describe("EventStore.projection — processBatch", () => {
       const applied = result.outcomes[0]!
       if (applied._tag !== "Applied") throw new Error("not applied")
       expect(versions(applied.applied)).toEqual([1, 2])
+      // Positions index the records: the MODIFY and the snapshot are skipped.
+      expect(result.outcomes.map((o) => o.positions)).toEqual([[0], [2, 4]])
       expect(result.failedRecords).toEqual([records[2]])
       expect(result.response).toEqual({ batchItemFailures: [{ itemIdentifier: "000003" }] })
       const pipe = yield* SummaryProjection.processBatch(records, { source: "pipe" })
@@ -703,25 +782,74 @@ describe("EventStore.projection — processBatch", () => {
       expect(result.decodeFailures).toHaveLength(1)
       expect(result.decodeFailures[0]!.error).toBeInstanceOf(ValidationError)
       expect(result.response).toEqual({ batchItemFailures: [{ itemIdentifier: "000007" }] })
+      // Skipped: still in decodeFailures, not reported.
+      const skipped = yield* SummaryProjection.processBatch([poison], {
+        source: "lambda",
+        onDecodeFailure: "skip",
+      })
+      expect(skipped.decodeFailures).toHaveLength(1)
+      expect(skipped.response).toEqual({ batchItemFailures: [] })
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it("batchResponse identifies records per source and refuses a missing identifier", () => {
-    const record = recordOf(42, {})
-    expect(EventStore.batchResponse([record], { source: "lambda" })).toEqual({
-      batchItemFailures: [{ itemIdentifier: "000042" }],
-    })
-    expect(EventStore.batchResponse([record], { source: "pipe" })).toEqual({
-      batchItemFailures: [{ itemIdentifier: "id-42" }],
-    })
-    expect(EventStore.batchResponse([], { source: "lambda" })).toEqual({ batchItemFailures: [] })
-    expect(() => EventStore.batchResponse([{ dynamodb: {} }], { source: "lambda" })).toThrow(
-      /\[EDD-9083\].*dynamodb\.SequenceNumber/,
-    )
-    expect(() => EventStore.batchResponse([{ dynamodb: {} }], { source: "pipe" })).toThrow(
-      /\[EDD-9083\].*eventID/,
-    )
-  })
+  it.effect("reads a record shape of its own through image and identifier accessors", () =>
+    Effect.gen(function* () {
+      yield* seed("o1", [new OrderPlaced({ amount: 10 }), new Rejected({})])
+      const [v1, v2] = itemsOf("$proj#v1#order#o1")
+      const records = [
+        { eventData: v2!, eventID: "e-2" },
+        { eventData: undefined, eventID: "e-x" },
+        { eventData: v1!, eventID: "e-1" },
+      ]
+      const result = yield* SummaryProjection.processBatch(records, {
+        image: (record) => record.eventData as never,
+        identifier: (record) => record.eventID,
+      })
+      expect(result.outcomes.map((o) => [o._tag, o.positions])).toEqual([["Failed", [0, 2]]])
+      expect(result.response).toEqual({ batchItemFailures: [{ itemIdentifier: "e-2" }] })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("fails with StreamRecordIdentifierMissing for a failed record without one", () =>
+    Effect.gen(function* () {
+      yield* seed("o1", [new Rejected({})])
+      const [v1] = itemsOf("$proj#v1#order#o1")
+      const error = yield* Effect.flip(
+        SummaryProjection.processBatch([{ dynamodb: { NewImage: v1! as never } }], {
+          source: "lambda",
+        }),
+      )
+      expect(error).toEqual(
+        new StreamRecordIdentifierMissing({ index: 0, member: "dynamodb.SequenceNumber" }),
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("batchResponse identifies records per source and fails on a missing identifier", () =>
+    Effect.gen(function* () {
+      const record = recordOf(42, {})
+      expect(yield* EventStore.batchResponse([record], { source: "lambda" })).toEqual({
+        batchItemFailures: [{ itemIdentifier: "000042" }],
+      })
+      expect(yield* EventStore.batchResponse([record], { source: "pipe" })).toEqual({
+        batchItemFailures: [{ itemIdentifier: "id-42" }],
+      })
+      expect(yield* EventStore.batchResponse([{ id: "x" }], { identifier: (r) => r.id })).toEqual({
+        batchItemFailures: [{ itemIdentifier: "x" }],
+      })
+      expect(yield* EventStore.batchResponse([], { source: "lambda" })).toEqual({
+        batchItemFailures: [],
+      })
+      expect(
+        yield* Effect.flip(
+          EventStore.batchResponse([record, { dynamodb: {} }], { source: "lambda" }),
+        ),
+      ).toEqual(new StreamRecordIdentifierMissing({ index: 1, member: "dynamodb.SequenceNumber" }))
+      expect(yield* Effect.flip(EventStore.batchResponse([{}], { source: "pipe" }))).toEqual(
+        new StreamRecordIdentifierMissing({ index: 0, member: "eventID" }),
+      )
+    }),
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -829,6 +957,13 @@ describe("EventStore.projection — definition and binding", () => {
       } as never),
     ).toThrow(/\[EDD-9081\].*softDelete/)
     expect(() =>
+      EventStore.projection({
+        ...base,
+        readModel: { ...OrderSummaries, timeSeries: { orderBy: "at" } },
+        checkpoint: "version",
+      } as never),
+    ).toThrow(/\[EDD-9081\].*timeSeries/)
+    expect(() =>
       EventStore.projection({ ...base, readModel: OrderSummaries, checkpoint: "missing" as never }),
     ).toThrow(/\[EDD-9081\].*"missing"/)
     expect(() =>
@@ -871,6 +1006,374 @@ describe("EventStore.projection — definition and binding", () => {
       const outcome = yield* bound.apply(events[0]!)
       void applied
       expect(versions(outcome.applied)).toEqual([1])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Rows keyed by event fields (one stream feeding several rows)
+// ---------------------------------------------------------------------------
+
+class Placed extends Schema.TaggedClass<Placed>()("Placed", { zone: Schema.String }) {}
+class Reading extends Schema.TaggedClass<Reading>()("Reading", {
+  zone: Schema.String,
+  value: Schema.Number,
+}) {}
+
+const Devices = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Device",
+  events: [Placed, Reading],
+  streamId: { composite: ["deviceId"] },
+})
+
+class NotPlaced extends Data.TaggedError("NotPlaced")<{ readonly version: number }> {}
+class Negative extends Data.TaggedError("Negative")<{ readonly version: number }> {}
+
+/** A zone row starts with `Placed`; a reading of a zone never placed is rejected. */
+const ZoneProjection = EventStore.projection({
+  stream: Devices,
+  readModel: ZoneTotals,
+  key: (id, event) => ({ deviceId: id.deviceId, zone: event.data.zone }),
+  initial: (id, event) => ({
+    deviceId: id.deviceId,
+    zone: event.data.zone,
+    total: 0,
+    readings: -1, // not placed yet
+    seq: 0,
+  }),
+  evolve: (state, event) =>
+    Effect.gen(function* () {
+      const data = event.data
+      if (data._tag === "Placed") return { ...state, readings: 0 }
+      if (state.readings < 0) return yield* new NotPlaced({ version: event.version })
+      if (data.value < 0) return yield* new Negative({ version: event.version })
+      return { ...state, total: state.total + data.value, readings: state.readings + 1 }
+    }),
+  checkpoint: "seq",
+  terminal: (error) => error._tag === "NotPlaced" || error._tag === "Negative",
+})
+
+const seedDevice = (deviceId: string, events: ReadonlyArray<Placed | Reading>) =>
+  Effect.gen(function* () {
+    yield* Devices.append({ deviceId }, events, 0)
+    const read = yield* Devices.read({ deviceId })
+    resetCalls()
+    return read
+  })
+
+const zoneRow = (deviceId: string, zone: string) => ZoneTotals.get({ deviceId, zone }).asEffect()
+
+describe("EventStore.projection — rows keyed by event fields", () => {
+  it.effect("folds each row from its own events, keeping each row's checkpoint", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "a", value: 5 }),
+        new Placed({ zone: "b" }),
+        new Reading({ zone: "b", value: 7 }),
+        new Reading({ zone: "a", value: 1 }),
+      ])
+      const result = yield* ZoneProjection.applyBatch(events)
+      expect(
+        result.outcomes.map((o) =>
+          o._tag === "Applied" ? [o.key, versions(o.applied), o.version] : o._tag,
+        ),
+      ).toEqual([
+        [{ deviceId: "d1", zone: "a" }, [1, 2, 5], 5],
+        [{ deviceId: "d1", zone: "b" }, [3, 4], 4],
+      ])
+      // Neither run is contiguous from its checkpoint (a: 1, 2, 5; b: 3, 4): a read each.
+      expect(calls.query).toBe(2)
+      expect(yield* zoneRow("d1", "a")).toMatchObject({ total: 6, readings: 2, seq: 5 })
+      expect(yield* zoneRow("d1", "b")).toMatchObject({ total: 7, readings: 1, seq: 4 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("fills a row's gap with only its own events, skipping the other rows'", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Placed({ zone: "b" }),
+        new Reading({ zone: "a", value: 5 }),
+        new Reading({ zone: "b", value: 7 }),
+      ])
+      // Only version 4 arrives: zone b reads 1–4 and folds 2 and 4.
+      const b = yield* ZoneProjection.apply(events[3]!)
+      expect(versions(b.applied)).toEqual([2, 4])
+      expect(b.version).toBe(4)
+      // Zone a, delivered later, starts from its own (absent) row.
+      const a = yield* ZoneProjection.apply(events[2]!)
+      expect(versions(a.applied)).toEqual([1, 3])
+      expect(Option.getOrThrow(a.state)).toMatchObject({ total: 5, seq: 3 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("rejects a reading of a zone never placed without creating the row", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Reading({ zone: "a", value: 5 }),
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "a", value: 2 }),
+      ])
+      const first = yield* ZoneProjection.apply(events[0]!)
+      expect(first.applied).toEqual([])
+      expect(first.rejected.map((r) => [r.event.version, r.error])).toEqual([
+        [1, new NotPlaced({ version: 1 })],
+      ])
+      expect(first.state).toEqual(Option.none())
+      expect(calls.putItem).toBe(0)
+      // The placing event starts the row; the earlier reading is rejected again.
+      const placed = yield* ZoneProjection.applyBatch(events.slice(1))
+      const outcome = placed.outcomes[0]!
+      if (outcome._tag !== "Applied") throw new Error("not applied")
+      expect(versions(outcome.applied)).toEqual([2, 3])
+      expect(outcome.rejected.map((r) => r.event.version)).toEqual([1])
+      expect(Option.getOrThrow(outcome.state)).toMatchObject({ total: 2, readings: 1, seq: 3 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("advances an existing row's checkpoint past a rejected event", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Reading({ zone: "a", value: -1 }),
+      ])
+      yield* ZoneProjection.apply(events[0]!)
+      resetCalls()
+      const rejected = yield* ZoneProjection.apply(events[1]!)
+      expect(rejected.applied).toEqual([])
+      expect(rejected.rejected.map((r) => r.error)).toEqual([new Negative({ version: 2 })])
+      expect(rejected.version).toBe(2)
+      expect(calls.putItem).toBe(1)
+      // Redelivered, it is already applied: not rejected again.
+      const again = yield* ZoneProjection.apply(events[1]!)
+      expect(again.rejected).toEqual([])
+      expect(versions(again.alreadyApplied)).toEqual([2])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a non-terminal failure fails the row and writes nothing", () =>
+    Effect.gen(function* () {
+      const strict = EventStore.projection({
+        stream: Devices,
+        readModel: ZoneTotals,
+        key: (id, event) => ({ deviceId: id.deviceId, zone: event.data.zone }),
+        initial: (id, event) => ({
+          deviceId: id.deviceId,
+          zone: event.data.zone,
+          total: 0,
+          readings: -1,
+          seq: 0,
+        }),
+        evolve: (state, event) =>
+          event.data._tag === "Reading" && state.readings < 0
+            ? Effect.fail(new NotPlaced({ version: event.version }))
+            : Effect.succeed({ ...state, readings: 0 }),
+        checkpoint: "seq",
+      })
+      const [reading] = yield* seedDevice("d1", [new Reading({ zone: "a", value: 5 })])
+      const error = yield* Effect.flip(strict.apply(reading!))
+      expect(error).toEqual(new NotPlaced({ version: 1 }))
+      expect(calls.putItem).toBe(0)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("catchUp brings the latest event's row to the head; rebuild re-derives every row", () =>
+    Effect.gen(function* () {
+      const events = yield* seedDevice("d1", [
+        new Placed({ zone: "a" }),
+        new Placed({ zone: "b" }),
+        new Reading({ zone: "a", value: 5 }),
+        new Reading({ zone: "b", value: 7 }),
+      ])
+      yield* ZoneProjection.apply(events[0]!)
+      const caught = yield* ZoneProjection.catchUp({ deviceId: "d1" })
+      expect(caught.key).toEqual(Option.some({ deviceId: "d1", zone: "b" }))
+      expect(versions(caught.applied)).toEqual([2, 4])
+      const { rows } = yield* ZoneProjection.rebuild({ deviceId: "d1" })
+      expect(rows.map((r) => [r.key, r.version, Option.getOrThrow(r.state).total])).toEqual([
+        [{ deviceId: "d1", zone: "a" }, 3, 5],
+        [{ deviceId: "d1", zone: "b" }, 4, 7],
+      ])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a throwing key fails its stream instance only", () =>
+    Effect.gen(function* () {
+      const throwing = EventStore.projection({
+        stream: Devices,
+        readModel: ZoneTotals,
+        key: (id, event) => {
+          if (id.deviceId === "bad") throw new Error("no zone")
+          return { deviceId: id.deviceId, zone: event.data.zone }
+        },
+        initial: (id, event) => ({
+          deviceId: id.deviceId,
+          zone: event.data.zone,
+          total: 0,
+          readings: 0,
+          seq: 0,
+        }),
+        evolve: (state) => Effect.succeed(state),
+        checkpoint: "seq",
+      })
+      const [bad] = yield* seedDevice("bad", [new Placed({ zone: "a" })])
+      const [good] = yield* seedDevice("good", [new Placed({ zone: "a" })])
+      const result = yield* throwing.applyBatch([bad!, good!])
+      expect(result.outcomes.map((o) => [o.streamId, o._tag])).toEqual([
+        ["bad", "Failed"],
+        ["good", "Applied"],
+      ])
+      const failed = result.outcomes[0]!
+      if (failed._tag !== "Failed") throw new Error("not failed")
+      expect(failed.key).toBeUndefined()
+      expect(failed.error).toBeInstanceOf(ValidationError)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Hidden fields, toItem, races
+// ---------------------------------------------------------------------------
+
+describe("EventStore.projection — Hidden fields, toItem and races", () => {
+  it.effect("an unchanged state keeps its Hidden fields through the whole-row put", () =>
+    Effect.gen(function* () {
+      const projection = EventStore.projection({
+        stream: Orders,
+        readModel: TaggedSummaries,
+        key: (id) => ({ orderId: id.orderId }),
+        initial: (id) => ({
+          orderId: id.orderId,
+          status: "new",
+          total: 0,
+          version: 0,
+          searchKey: `order#${id.orderId}`,
+        }),
+        evolve: (state) => Effect.succeed(state),
+        checkpoint: "version",
+      })
+      const events = yield* seed("o1", [new OrderPlaced({ amount: 10 }), new OrderShipped({})])
+      yield* projection.apply(events[0]!)
+      const second = yield* projection.apply(events[1]!)
+      expect(second.version).toBe(2)
+      expect(store.get(summaryKey("o1"))!.searchKey).toEqual({ S: "order#o1" })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("keeps Hidden fields across writes and recomputes them with toItem", () =>
+    Effect.gen(function* () {
+      const projection = EventStore.projection({
+        stream: Orders,
+        readModel: TaggedSummaries,
+        key: (id) => ({ orderId: id.orderId }),
+        initial: (id) => ({
+          orderId: id.orderId,
+          status: "new",
+          total: 0,
+          version: 0,
+          searchKey: "",
+        }),
+        // Ignores every event but OrderPlaced — the state comes back unchanged.
+        evolve: (state, event) =>
+          Effect.succeed(
+            event.data._tag === "OrderPlaced"
+              ? { ...state, status: "placed", total: event.data.amount }
+              : state,
+          ),
+        checkpoint: "version",
+        toItem: (state) => ({ ...state, searchKey: `${state.status}#${state.version}` }),
+      })
+      const events = yield* seed("o1", [new OrderPlaced({ amount: 10 }), new OrderShipped({})])
+      yield* projection.apply(events[0]!)
+      const second = yield* projection.apply(events[1]!)
+      expect(second.version).toBe(2)
+      const stored = store.get(summaryKey("o1"))!
+      expect(stored.searchKey).toEqual({ S: "placed#2" })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("retries lost races under the default policy", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o1", [
+        new OrderPlaced({ amount: 10 }),
+        new ItemAdded({ amount: 1 }),
+      ])
+      yield* SummaryProjection.apply(events[0]!)
+      resetCalls()
+      rejectNextPuts = 4
+      // The default policy sleeps (jittered) between attempts: run it on the test clock.
+      const fiber = yield* Effect.forkChild(SummaryProjection.apply(events[1]!))
+      yield* TestClock.adjust("10 seconds")
+      const outcome = yield* Fiber.join(fiber)
+      expect(versions(outcome.applied)).toEqual([2])
+      expect(calls.putItem).toBe(5)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("does not retry a ConcurrentModification that evolve raises", () =>
+    Effect.gen(function* () {
+      const projection = EventStore.projection({
+        stream: Orders,
+        readModel: OrderSummaries,
+        key: (id) => ({ orderId: id.orderId }),
+        initial: (id) => ({ orderId: id.orderId, status: "new", total: 0, lines: 0, version: 0 }),
+        evolve: () =>
+          Effect.fail(
+            new ConcurrentModification({
+              entityType: "Other",
+              key: {},
+              attributes: [],
+              current: Option.none(),
+            }),
+          ),
+        checkpoint: "version",
+      })
+      const [event] = yield* seed("o1", [new OrderPlaced({ amount: 1 })])
+      const error = yield* Effect.flip(projection.apply(event!))
+      expect(error).toBeInstanceOf(ConcurrentModification)
+      expect((error as ConcurrentModification).entityType).toBe("Other")
+      expect(calls.getItem).toBe(1)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// One feed, several projections
+// ---------------------------------------------------------------------------
+
+const PaymentProjection = EventStore.projection({
+  stream: Payments,
+  readModel: PaymentTotals,
+  key: (id) => ({ paymentId: id.paymentId }),
+  initial: (id) => ({ paymentId: id.paymentId, total: 0, n: 0 }),
+  evolve: (state, event) => Effect.succeed({ ...state, total: state.total + event.data.amount }),
+  checkpoint: "n",
+})
+
+describe("EventStore.processBatch — several projections", () => {
+  it.effect("routes each stream's records to its projections and answers once", () =>
+    Effect.gen(function* () {
+      yield* seed("o1", [new OrderPlaced({ amount: 10 }), new Rejected({})])
+      yield* Payments.append({ paymentId: "p1" }, [new ItemAdded({ amount: 2 })], 0)
+      yield* TenantOrders.append({ tenant: "t", orderId: "x" }, [new ItemAdded({ amount: 1 })], 0)
+      const [o1, o2] = itemsOf("$proj#v1#order#o1")
+      const payment = [...store.values()].find((i) => i.__edd_e__?.S === "payment.event")!
+      const unprojected = [...store.values()].find((i) => i.__edd_e__?.S === "tenantorder.event")!
+      const records = [
+        recordOf(1, unprojected),
+        recordOf(2, payment),
+        recordOf(3, o2!),
+        recordOf(4, o1!),
+      ]
+      const result = yield* EventStore.processBatch(records, {
+        projections: { orders: SummaryProjection, payments: PaymentProjection },
+        source: "lambda",
+      })
+      expect(result.outcomes.payments.map((o) => [o._tag, o.positions])).toEqual([["Applied", [1]]])
+      expect(result.outcomes.orders.map((o) => [o._tag, o.positions])).toEqual([["Failed", [2, 3]]])
+      expect(result.response).toEqual({ batchItemFailures: [{ itemIdentifier: "000003" }] })
     }).pipe(Effect.provide(TestLayer)),
   )
 })

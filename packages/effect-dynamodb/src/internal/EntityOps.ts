@@ -8,7 +8,7 @@ import type { ReturnValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Pipeable, Utils } from "effect"
+import { type DateTime, Effect, Pipeable, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
@@ -407,6 +407,11 @@ export interface EntityPutOpts {
   readonly putKind?: PutKind | undefined
   /** The operation errors name — `upsert` runs its create through `put`. */
   readonly operation?: string | undefined
+  /**
+   * @internal The creation time to write when the input has none, instead of
+   * now — an EventStore projection rewriting a row it read keeps the row's.
+   */
+  readonly createdAt?: DateTime.Utc | undefined
 }
 
 /**

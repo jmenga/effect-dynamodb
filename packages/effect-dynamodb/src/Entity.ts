@@ -5367,7 +5367,10 @@ const makeImpl = <
           // primitive directly.
           if (systemFields.createdAt) {
             if (item[systemFields.createdAt] === undefined) {
-              item[systemFields.createdAt] = generateTimestamp(systemFields.createdAtEncoding, now)
+              item[systemFields.createdAt] = generateTimestamp(
+                systemFields.createdAtEncoding,
+                opts.createdAt ?? now,
+              )
             }
           }
           if (systemFields.updatedAt) {
@@ -5410,7 +5413,9 @@ const makeImpl = <
           const guarded = hasUniqueConstraints || Boolean(systemFields.version)
           const createdAtSupplied =
             systemFields.createdAt !== null &&
-            (encoded as globalThis.Record<string, unknown>)[systemFields.createdAt] !== undefined
+            ((encoded as globalThis.Record<string, unknown>)[systemFields.createdAt] !==
+              undefined ||
+              opts.createdAt !== undefined)
 
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
