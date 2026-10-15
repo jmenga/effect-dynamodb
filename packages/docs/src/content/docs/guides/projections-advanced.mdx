@@ -154,6 +154,56 @@ checkpoints: {
 - **Another instance** goes to the map when one is declared. Without a map, it fails with `ProjectionSourceConflict` and nothing is written.
 - **Adoption is a guess.** A legacy row is adopted by whichever instance arrives first. If that's the wrong one, `rebuild` repairs it ([below](#repair)).
 
+### Rows written before the projection
+
+A read model that already has rows lacks the projection's fields on every one of them, so it declares them optional. Each position accepts an optional field: `checkpoints.field`, a source's `field` and `instanceField`, and `revision` (and `checkpoint` on `projection`).
+
+```typescript region="adoption" example="guide-projections-advanced.ts"
+const WeightLog = Schema.Struct({
+  shipmentId: Schema.String,
+  kg: Schema.Number,
+  // Absent on rows written before the projection
+  weighVersion: Schema.optional(Schema.Number),
+  weighSession: Schema.optional(Schema.String),
+  checkpoints: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  revision: Schema.optional(Schema.Number),
+})
+
+const WeightLogs = Entity.make({
+  model: WeightLog,
+  entityType: "WeightLog",
+  primaryKey: {
+    pk: { field: "pk", composite: ["shipmentId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const WeightProjection = EventStore.multiProjection({
+  readModel: WeightLogs,
+  initial: (key) => ({ shipmentId: key.shipmentId, kg: 0 }),
+  sources: (source) => ({
+    weigh: source(WeighEvents, {
+      key: (_sessionId, event) => ({ shipmentId: event.data.shipmentId }),
+      evolve: (state, event) => Effect.succeed({ ...state, kg: state.kg + event.data.kg }),
+    }),
+  }),
+  checkpoints: {
+    field: "checkpoints",
+    sources: { weigh: { field: "weighVersion", offset: -1, instanceField: "weighSession" } },
+  },
+  revision: "revision",
+})
+```
+
+An absent field reads as empty:
+
+- **A checkpoint** reads as none, so every event applies. On `projection` without a `revision`, the first write is conditioned on `attribute_not_exists` on the checkpoint field.
+- **An `instanceField`** reads as unowned, so the first instance to arrive adopts it.
+- **The map** reads as having no entries. It is written only once an instance lands in it, so a row whose instances all have their own fields keeps it absent.
+- **The revision** reads as none: the write is conditioned on `attribute_not_exists`, and stores `initial`.
+
+The write is the row `evolve` returns plus the fields the projection set, so an optional field the row didn't have, and the projection didn't set, stays absent.
+
 ## `revision`: one guard for every writer
 
 Every write sets `revision` one higher and is conditioned on the value it read: `attribute_not_exists` when the row has none, which covers legacy rows.

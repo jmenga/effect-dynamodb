@@ -3702,6 +3702,12 @@ instance).
   `ProjectionSourceConflict`. Within one attempt, a field goes to the first
   instance in fold order, which is how `rebuild` repairs a wrong owner. There
   is no cap: an oversized row fails in DynamoDB and is diagnosed there.
+- **Optional fields** (#158). A checkpoint, `instanceField`, map or revision
+  field may be optional in the model, for rows written before the projection.
+  Absent reads as no checkpoint, unowned, no entries or no revision, and the
+  write's guard is `attribute_not_exists`. The map is written only when it has
+  entries or the row already had it, so a row gains only the fields the
+  projection set.
 - **Tombstones** (`removal`, `EventStore.removeRow`) are raw items at the row's
   key (`<entityType>#tombstone`) keeping the checkpoint fields and revision;
   TTL is opt-in. Entity `get`, `Batch.get` and `Transaction.transactGet`

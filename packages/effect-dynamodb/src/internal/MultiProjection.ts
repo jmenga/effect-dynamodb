@@ -22,6 +22,7 @@ import {
   type ApplyBatchOptions,
   type CheckpointField,
   type DecodableStream,
+  type DefinedOf,
   type IdentifyBySource,
   type IdentifyWith,
   type ProcessBatchOptions,
@@ -163,17 +164,26 @@ export interface MultiCheckpoints<S, SourceName extends string> {
     | undefined
 }
 
-/** The model's `Record<string, number>` fields. */
+/** The model's `Record<string, number>` fields, optional ones included (absent: no entries). */
 export type RecordField<S> = {
-  [F in keyof S]-?: S[F] extends Readonly<Record<string, number>>
-    ? S[F] extends number
-      ? never
-      : F
-    : never
+  [F in keyof S]-?: [DefinedOf<S[F]>] extends [never]
+    ? never
+    : DefinedOf<S[F]> extends Readonly<Record<string, number>>
+      ? DefinedOf<S[F]> extends number
+        ? never
+        : F
+      : never
 }[keyof S] &
   string
-/** The model's string fields. */
-export type StringField<S> = { [F in keyof S]-?: S[F] extends string ? F : never }[keyof S] & string
+/** The model's string fields, optional ones included (absent: unowned). */
+export type StringField<S> = {
+  [F in keyof S]-?: [DefinedOf<S[F]>] extends [never]
+    ? never
+    : DefinedOf<S[F]> extends string
+      ? F
+      : never
+}[keyof S] &
+  string
 
 /** Configuration of {@link multiProjection}. */
 export interface MultiProjectionConfig<

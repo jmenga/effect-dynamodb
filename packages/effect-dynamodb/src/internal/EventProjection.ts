@@ -99,9 +99,20 @@ export type ProjectionReadModelError<RM> =
       ? Exclude<E, ItemNotFound>
       : never)
 
-/** The read model's numeric fields — those a checkpoint may name. */
+/** `T` without `undefined` — an optional field's declared type. */
+export type DefinedOf<T> = Exclude<T, undefined>
+
+/**
+ * The read model's numeric fields — those a checkpoint may name. An optional
+ * field (absent on rows written before the projection) is accepted: absent
+ * reads as no checkpoint.
+ */
 export type CheckpointField<S> = {
-  [K in keyof S]-?: S[K] extends number ? K : never
+  [K in keyof S]-?: [DefinedOf<S[K]>] extends [never]
+    ? never
+    : DefinedOf<S[K]> extends number
+      ? K
+      : never
 }[keyof S] &
   string
 

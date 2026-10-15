@@ -459,7 +459,12 @@ export const makeEngine = (config: EngineConfig) => {
           target[mapped.instanceField] = a.streamIdStr
         } else map[instanceKey(a.source, a.streamIdStr)] = a.version
       }
-      if (layout.map !== undefined) target[layout.map] = map
+      // An empty map stays absent on a row that had none.
+      if (
+        layout.map !== undefined &&
+        (Object.keys(map).length > 0 || previous?.[layout.map] !== undefined)
+      )
+        target[layout.map] = map
     }
     if (config.revision !== undefined) target[config.revision.field] = nextRevisionOf(row)
   }
@@ -497,6 +502,17 @@ export const makeEngine = (config: EngineConfig) => {
       }
     }
     const stored = row.value.values[layout.field]
+    // A row written before the projection: no checkpoint yet.
+    if (stored === undefined) {
+      return {
+        input: { attributeNotExists: layout.field },
+        raw: {
+          expression: "attribute_not_exists(#g)",
+          names: { "#g": dbName(layout.field) },
+          values: {},
+        },
+      }
+    }
     return {
       input: { eq: { [layout.field]: stored } },
       raw: {
