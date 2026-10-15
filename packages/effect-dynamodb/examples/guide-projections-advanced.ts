@@ -9,6 +9,8 @@
  *   - outbox: side effects committed with the row, drained in order
  *   - EventStore.processBatch() over a feed carrying every stream
  *   - rebuild() as the repair path
+ *   - adopting rows written before the projection: optional checkpoint,
+ *     instance, map and revision fields
  *
  * DynamoDB Local has no stream trigger, so the demo appends events, reads the
  * stored items back and feeds them to the handler as Lambda-shaped records.
@@ -153,7 +155,50 @@ const ShipmentProjection = EventStore.multiProjection({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 4. The handler
+// 4. Adopting rows written before the projection
+// ---------------------------------------------------------------------------
+
+// #region adoption
+const WeightLog = Schema.Struct({
+  shipmentId: Schema.String,
+  kg: Schema.Number,
+  // Absent on rows written before the projection
+  weighVersion: Schema.optional(Schema.Number),
+  weighSession: Schema.optional(Schema.String),
+  checkpoints: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  revision: Schema.optional(Schema.Number),
+})
+
+const WeightLogs = Entity.make({
+  model: WeightLog,
+  entityType: "WeightLog",
+  primaryKey: {
+    pk: { field: "pk", composite: ["shipmentId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const WeightProjection = EventStore.multiProjection({
+  readModel: WeightLogs,
+  initial: (key) => ({ shipmentId: key.shipmentId, kg: 0 }),
+  sources: (source) => ({
+    weigh: source(WeighEvents, {
+      key: (_sessionId, event) => ({ shipmentId: event.data.shipmentId }),
+      evolve: (state, event) => Effect.succeed({ ...state, kg: state.kg + event.data.kg }),
+    }),
+  }),
+  checkpoints: {
+    field: "checkpoints",
+    sources: { weigh: { field: "weighVersion", offset: -1, instanceField: "weighSession" } },
+  },
+  revision: "revision",
+})
+// #endregion
+
+const LegacyTable = Table.make({ schema: AppSchema, entities: { WeightLogs } })
+
+// ---------------------------------------------------------------------------
+// 5. The handler
 // ---------------------------------------------------------------------------
 
 /** Stands in for a message to a bus. */
@@ -297,6 +342,21 @@ const program = Effect.gen(function* () {
     "rebuild",
   )
 
+  // A weight log written before the projection: none of its fields
+  const logs = yield* DynamoClient.make({ entities: { WeightLogs } })
+  yield* logs.entities.WeightLogs.put({ shipmentId: "sh-1", kg: 1 })
+  const weighs = yield* WeighEvents.read({ sessionId: "w-1" })
+  yield* WeightProjection.applyBatch(weighs.map((event) => ({ stream: "weigh", event })))
+  const log = yield* logs.entities.WeightLogs.get({ shipmentId: "sh-1" })
+  yield* Console.log(`sh-1 log: ${log.kg} kg, weigh version ${log.weighVersion}`)
+  assertEq(
+    [log.kg, log.weighVersion, log.weighSession, log.revision],
+    [8, 1, "w-1", 1],
+    "adopted",
+  )
+  // No instance went to the map, so it was not written
+  assertEq(log.checkpoints, undefined, "map stays absent")
+
   for (const TableName of [eventsTableName, readTableName]) yield* client.deleteTable({ TableName })
 })
 
@@ -308,6 +368,7 @@ const AppLayer = Layer.mergeAll(
   }),
   EventsTable.layer({ name: eventsTableName }),
   ReadTable.layer({ name: readTableName }),
+  LegacyTable.layer({ name: readTableName }),
 )
 
 Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(() => console.log("\nDone."))
