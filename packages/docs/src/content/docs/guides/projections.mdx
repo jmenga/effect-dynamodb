@@ -5,6 +5,8 @@ description: "Fold EventStore events from a change feed into read models in vers
 
 A projection folds a stream's events into a read model: an order summary, a balance, a search document. With `EventStore`, the events usually reach the projection through the table's change feed: DynamoDB Streams, read by a Lambda event source mapping or an EventBridge Pipe. The change feed does not deliver a stream's events in version order. `EventStore.projection` takes the order from the event store instead.
 
+Outside Lambda and Pipes — a long-running service, a container, an edge device — [`effect-dynamodb/change-feed`](/effect-dynamodb/guides/change-feed/) polls the stream itself and runs it into the same projections.
+
 ## Delivery order is not event order
 
 - **DynamoDB Streams orders records per item only.** The [DynamoDB Streams documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) says it "guarantees ordering at the level of an individual item … not across an entire partition". Every event of a stream is its own item (one sort key per version), so nothing orders a stream's events relative to each other.
@@ -263,7 +265,9 @@ const makeFeedHandler = Effect.gen(function* () {
 })
 ```
 
-Each projection's outcomes come back under its name, with `positions` indexing the records. To act on streams that have no projection (side effects only) without decoding twice, name them in `streams: { Name: stream }`: their events come back in `unrouted`, each with its record's position. Two streams storing events under one marker make the call die with `[EDD-9082]`.
+Each projection's outcomes come back under its name, with `positions` indexing the records. To act on a stream's events without decoding twice (side effects only), name it in `streams: { Name: stream }`. Its events come back in `unrouted`, each with its record's position, whether or not a projection also reads the stream. Two streams storing events under one marker make the call die with `[EDD-9082]`.
+
+A process that polls the stream itself runs the same call per batch with [`runChangeFeed`](/effect-dynamodb/guides/change-feed/#projecting-the-feed), which acknowledges each batch per its response.
 
 ## Decoding several streams and filtering the feed
 
@@ -298,7 +302,7 @@ const rebuilt = yield* OrderSummaryProjection.rebuild({ orderId: "o-1" })
 ```
 
 - **`catchUp(streamId)`** brings the row of the stream's latest event up to the head — for a stream whose *last* event was dead-lettered (an earlier missing event is filled in by the next delivery anyway). With one row per stream instance, that is the only row.
-- **`rebuild(streamId)`** re-derives every row of the stream instance from version 1, ignoring their state — for backfills, a new read model over existing streams, or a changed `evolve` — and returns no events, so it never replays side effects. **Pause live delivery for the instance while it runs:** its write is conditioned on the checkpoint, and for a row already at the head that checkpoint does not change, so an `applyBatch` that read the row before the rebuild can still overwrite it.
+- **`rebuild(streamId)`** re-derives every row of the stream instance from version 1, ignoring their state — for backfills, a new read model over existing streams, or a changed `evolve` — and returns no events, so it never replays side effects. **Without a [`revision`](/effect-dynamodb/guides/projections-advanced/#revision-one-guard-for-every-writer), pause live delivery for the instance while it runs:** the write is then conditioned on the checkpoint. For a row already at the head, the checkpoint doesn't change, so an `applyBatch` that read the row before the rebuild can still overwrite it. A `revision` changes on every write, which closes that gap.
 
 Neither reads the stream's snapshot: that is the decider's state, not the read model's.
 
@@ -309,8 +313,16 @@ With gap-filling, `ParallelizationFactor` and `BatchSize` decide throughput and 
 - **A larger `BatchSize`** puts more of a row's events in one batch, ordered in memory and written once.
 - **A higher `ParallelizationFactor`** runs more lanes, and calls that touch one row race on the conditional write. Each round has one winner; a loser re-reads, and has nothing left to do only when the winner reached its events. The default `retry` waits a jittered, growing delay up to 12 times (about 1.3 s in all); raise it if many lanes write the same rows. Exhausted, the row fails with `ConcurrentModification` and its records go back to the source — safe, as the redelivery is skipped or gap-filled.
 
+## Beyond one source
+
+[Multi-source Projections, Tombstones and the Outbox](/effect-dynamodb/guides/projections-advanced/) covers:
+- rows fed by several streams;
+- `revision`;
+- removing rows;
+- an ordered, at-least-once outbox.
+
 ## Limits
 
-- **A row is fed by one stream instance.** A row several streams contribute to needs a checkpoint per source, not covered yet.
-- **Rows are never deleted.** Deleting a row would lose its checkpoint, and a redelivery would recreate it. Mark removal with a status field instead (and a sparse index to keep it out of queries).
+- **A row of `projection` is fed by one stream instance.** A row that several streams contribute to is a [multi-source projection](/effect-dynamodb/guides/projections-advanced/#several-sources-per-row).
+- **Rows are removed with tombstones** ([`removal`](/effect-dynamodb/guides/projections-advanced/#removing-rows)), never deleted. Deleting a row would lose its checkpoint, and a redelivery would recreate it.
 - **`projection` takes an unbound stream and entity;** bind it with `EventStore.bindProjection`.

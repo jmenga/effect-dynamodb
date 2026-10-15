@@ -19,7 +19,7 @@ import type {
   UniqueConstraintViolation,
 } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
   Entity,
@@ -34,6 +34,7 @@ import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundWriteOp } from "./BoundCrud.js"
+import { withGuard } from "./EntityOps.js"
 import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
 import {
   composePrimaryKey,
@@ -254,6 +255,8 @@ export const buildTransactWriteItems = (
       key?: Record<string, unknown> | undefined
       input?: Record<string, unknown> | undefined
       condition?: ExpressionResult | undefined
+      /** The caller's own condition — what a `create` over a tombstone keeps. */
+      callerCondition?: Expr | ConditionInput | undefined
     }> = []
 
     for (let opIndex = 0; opIndex < operations.length; opIndex++) {
@@ -299,6 +302,7 @@ export const buildTransactWriteItems = (
           opIndex,
           input: info.input!,
           condition: compileOpCondition(info.entity, info.condition),
+          callerCondition: info.callerCondition,
         })
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined)
@@ -374,12 +378,22 @@ export const buildTransactWriteItems = (
           }
           continue
         }
+        // `create` over a projection tombstone (#154): take its place,
+        // carrying its checkpoints over, guarded on that tombstone.
+        const over =
+          op.putKind === "create"
+            ? yield* op.entity._overTombstone(tableName, built.item)
+            : Option.none<ConditionInput>()
         push(
           {
             Put: {
               TableName: tableName,
-              Item: built.marshalled,
-              ...conditionFields(op.condition),
+              Item: Option.isSome(over) ? toAttributeMap(built.item) : built.marshalled,
+              ...conditionFields(
+                Option.isSome(over)
+                  ? compileOpCondition(op.entity, withGuard(over.value, op.callerCondition))
+                  : op.condition,
+              ),
             },
           },
           { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },

@@ -50,6 +50,11 @@ export default defineConfig({
             { label: "Geospatial", slug: "guides/geospatial" },
             { label: "DynamoDB Streams", slug: "guides/streams" },
             { label: "Projections from Streams", slug: "guides/projections" },
+            {
+              label: "Multi-source Projections & Outbox",
+              slug: "guides/projections-advanced",
+            },
+            { label: "Change Feed outside Lambda", slug: "guides/change-feed" },
             { label: "Testing", slug: "guides/testing" },
             { label: "Validations", slug: "guides/validations" },
             { label: "Advanced", slug: "guides/advanced" },

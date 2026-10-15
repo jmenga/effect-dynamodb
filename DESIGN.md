@@ -3608,7 +3608,115 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
 - **Refused read models** (`[EDD-9081]`): `versioned`, `softDelete`, `timeSeries`, a
   checkpoint that is not a model field, a non-integer offset.
 - **Not covered:** a row fed by several streams (per-source checkpoints), row
-  deletion, an ordered outbox, a polled change-feed `Stream`.
+  deletion, an ordered outbox. A polled change-feed `Stream` is the subpath below.
+
+### Polled Change Feed (#156)
+
+Outside Lambda and Pipes, a process polls DynamoDB Streams itself. The subpath
+`effect-dynamodb/change-feed` (optional peer `@aws-sdk/client-dynamodb-streams`, never
+imported by the main entry — guarded by a test) turns a table's stream into an Effect
+`Stream` whose batches feed `EventStore.processBatch` unchanged. Design:
+`docs/designs/change-feed.md`.
+
+```typescript
+const feed = changeFeed({ streamArn, consumer: "projections", startingPosition: "TRIM_HORIZON" })
+// Stream<ChangeFeedBatch, ChangeFeedError, DynamoStreamsClient | CheckpointStore>
+yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } })
+// or by hand: batch.commit() / batch.complete(result.response)
+```
+
+- **Services.** `DynamoStreamsClient` (`Context.Service`; `DescribeStream`,
+  `GetShardIterator`, `GetRecords`, `ListStreams`; `layer` / `layerConfig` /
+  `layerFromSdkClient`) and `CheckpointStore` (`Context.Service`; `load`, `commit`,
+  `acquireLease` / `renewLease` / `releaseLease`; `layerMemory`, `layerDynamoDB({ tableName })`
+  over `DynamoClient` (`finishedTtl` at least 28 h, `[EDD-9084]`), `tableDefinition(name)`
+  for its `pk`/`sk` table).
+- **Shards.** Full paginated `DescribeStream` at start and every `describeInterval`;
+  a drained shard's children via `ShardFilter: CHILD_SHARDS`, falling back to a full
+  describe where the filter is rejected (`ValidationException`, remembered) or finds none
+  (DynamoDB Local) — the describer's next describe, shared by shards drained meanwhile.
+  Children are filtered by `ParentShardId`. A shard starts once its
+  parent is finished or gone from the stream — per-item order across splits. At a
+  restart, a checkpointed shard or an unread shard's unfinished parent gone from the
+  stream fails with `ChangeFeedTrimmed` before anything is read; a fresh start
+  checkpoints already-gone parents `Finished`. A shard missing at startup counts as gone
+  only after a second describe and a `GetShardIterator(TRIM_HORIZON)` probe (not found or
+  trimmed); one that exists is read, a parent first. An open shard without an iterator is
+  retried after a refresh, never finished. A
+  `GetRecords` without `NextShardIterator` ends a shard: after its last batch is
+  acknowledged it is checkpointed `Finished` and dropped. The feed ends once the stream
+  is `DISABLED` and every shard is finished.
+- **Positions.** Checkpoint → `AFTER_SEQUENCE_NUMBER`; `Finished` → skipped; otherwise
+  `TRIM_HORIZON`, except at a fresh `LATEST` start (no checkpoints at all), where the open
+  shards start at `LATEST` and closed ones are checkpointed `Finished` unread.
+  `ExpiredIteratorException` re-acquires from the shard's position;
+  `TrimmedDataAccessException` is `ChangeFeedTrimmed`.
+- **Batches and acknowledgement.** One `GetRecords` (`batchSize`, default 100) per batch,
+  one batch in flight per shard: the shard waits for `commit()` / `complete(response)`
+  (pull-based backpressure; shards concurrent). `complete` follows Lambda's partial batch
+  response contract keyed by `SequenceNumber`: checkpoint at the record before the
+  earliest failure, re-read `AT_SEQUENCE_NUMBER` it after a growing backoff; an unknown
+  identifier fails the whole batch. Checkpoints follow acknowledgements — at least once.
+  Acknowledgements are serialised; the first whose write succeeds settles the batch, and a
+  failed write can be retried.
+- **Throttling.** `LimitExceededException` maps to `ThrottlingError`; it and
+  `InternalServerError` retry without limit on a jittered exponential backoff (100 ms →
+  10 s). Idle open shards poll every `pollInterval` (1 s). One reader per shard per feed;
+  `maxConcurrentReads` (16) bounds the reads in flight across shards, a permit per call.
+  AWS's two-readers-per-shard guidance counts every consumer name, Lambda mapping and Pipe.
+- **Lease.** One item per `(consumer, streamArn)` in the checkpoint store: conditional
+  acquire (absent, expired or ours), renewed every `duration / 3` (`renewEvery` must be
+  below `duration / 2`, `[EDD-9083]`; store failures retried until `renewEvery` before it
+  lapses), released on exit; `ChangeFeedLeaseHeld` (or
+  `onHeld: "wait"`), `ChangeFeedLeaseLost` when taken over. Once lost, acknowledgements
+  fail with `ChangeFeedLeaseLost` instead of committing.
+  Guards against an accidental second consumer; writes are not fenced.
+- **Errors** (`Data.TaggedError`, in the subpath): `ShardIteratorExpired`,
+  `StreamDataTrimmed` (client), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`,
+  `ChangeFeedLeaseLost`, `CheckpointStoreError`.
+- **Not covered:** per-shard leases and rebalancing across processes, Kinesis Data
+  Streams for DynamoDB, a retry limit / dead-letter for a batch that keeps failing.
+
+### Multi-source Projections, Tombstones and the Outbox (#153–#155)
+
+Design: `docs/designs/eventstore-projections-2.md`. One row engine
+(`internal/ProjectionEngine.ts`) serves `projection` (one source, a scalar
+checkpoint) and `multiProjection` (several sources, a checkpoint per source
+instance).
+
+- **The engine.** It reads the row raw (strongly consistent; a tombstone reads as
+  one), works out each instance's checkpoint slot and run (gap-filled in `fold`
+  mode, newest-only in `latest`), and folds in declared source order, then
+  stream id, then version. It writes once — through the entity's `put` (keeping
+  `createdAt`), as a raw tombstone, or with outbox items in one
+  `TransactWriteItems` — conditioned on the revision (or the scalar
+  checkpoint). A lost race retries with a jittered backoff.
+- **`revision`** is a library-owned numeric field: `+1` on every write, which is
+  conditioned on the value read (`attribute_not_exists` when absent). One
+  comparison serialises every writer, whatever its source, and closes
+  `rebuild`'s ABA case. It is required by `multiProjection` and `outbox`.
+- **Checkpoints** are a `Record<string, number>` map keyed `<source>#<streamId>`,
+  and/or per-source `{ field, offset, instanceField }` for legacy rows.
+  `instanceField` records the owning instance; an empty one is adopted by the
+  first instance that arrives. Another instance goes to the map, or fails with
+  `ProjectionSourceConflict`. Within one attempt, a field goes to the first
+  instance in fold order, which is how `rebuild` repairs a wrong owner. There
+  is no cap: an oversized row fails in DynamoDB and is diagnosed there.
+- **Tombstones** (`removal`, `EventStore.removeRow`) are raw items at the row's
+  key (`<entityType>#tombstone`) keeping the checkpoint fields and revision;
+  TTL is opt-in. Entity `get`, `Batch.get` and `Transaction.transactGet`
+  report them as absent. A later event restarts from `initial`. Removal is
+  refused for read models with `unique` / `retain` / `softDelete` features.
+- **The outbox** writes effects as items (`<entityType>#outbox`, sort key
+  `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
+  in the row's transaction. `drain` claims the head item (a conditional update
+  with an expiring claim), delivers it, deletes it on its claim, and repeats:
+  in order per row, at least once. `deliver` on `applyBatch` / `processBatch`
+  drains after the write; `drainPending` sweeps through a sparse
+  `outbox.index`.
+- **`EventStore.processBatch`** routes through each projection's internal
+  routes (one per source stream; `bindProjection` wraps their decode and apply
+  in its context), so single- and multi-source projections share one feed.
 
 ### Command Handler Retry
 
@@ -4046,6 +4154,7 @@ pre-#147 unions.
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 | `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
 | `EventStream.parseStreamId` | `ValidationError` |
+| `EventStore` multi-source projection `catchUp` / `rebuild` (`applyBatch` / `processBatch` per row) | the sources' `evolve` errors, the read model's errors, `ValidationError`, `ConcurrentModification`, `ProjectionSourceConflict` |
 | `EventStore.batchResponse`, `projection.processBatch`, `EventStore.processBatch` | `StreamRecordIdentifierMissing` (per-row errors are outcome values) |
 | `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 

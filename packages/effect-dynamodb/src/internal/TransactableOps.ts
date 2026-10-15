@@ -9,9 +9,11 @@ import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Schema } from "effect"
+import { DateTime, Effect, Option, Schema } from "effect"
+import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
-import { toAttributeMap } from "../Marshaller.js"
+import type { ConditionInput } from "../Expression.js"
+import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 
 /**
  * @internal Hidden per-incarnation token of a versioned entity (#133): set
@@ -20,6 +22,83 @@ import { toAttributeMap } from "../Marshaller.js"
  * `__edd_e__` so it cannot collide with a model field; never decoded.
  */
 export const INCARNATION_TOKEN = "__edd_i__"
+
+/**
+ * @internal What a projection with `removal` records on its read model (#154):
+ * the fields its tombstones keep (checkpoints, owners) and its revision field.
+ */
+export interface ProjectionTombstones {
+  readonly kept: ReadonlyArray<string>
+  readonly revision: string | undefined
+}
+
+/** @internal */
+export const projectionTombstonesOf = (entity: object): ProjectionTombstones | undefined =>
+  (entity as { readonly _projectionTombstones?: ProjectionTombstones })._projectionTombstones
+
+/**
+ * @internal `create` over a projection tombstone (#154): read the key, and
+ * when it holds the entity's tombstone, carry the projection's kept fields
+ * over into `item` (stored names, wire values) — its checkpoints, so a late
+ * redelivery is still recognised — with the revision one higher, and return
+ * the guard naming that very tombstone. `None` when there is no tombstone:
+ * `create`'s own guard applies.
+ */
+export const overTombstone = (
+  entity: {
+    readonly entityType: string
+    readonly indexes: {
+      readonly primary?: {
+        readonly pk: { readonly field: string }
+        readonly sk: { readonly field: string }
+      }
+    }
+    readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  },
+  client: Pick<DynamoClientService, "getItem">,
+  tableName: string,
+  item: Record<string, unknown>,
+): Effect.Effect<Option.Option<ConditionInput>, DynamoClientError> =>
+  Effect.gen(function* () {
+    const layout = projectionTombstonesOf(entity)
+    if (layout === undefined) return Option.none()
+    const primary = entity.indexes.primary!
+    const { Item } = yield* client.getItem({
+      TableName: tableName,
+      Key: toAttributeMap({
+        [primary.pk.field]: item[primary.pk.field],
+        [primary.sk.field]: item[primary.sk.field],
+      }),
+      ConsistentRead: true,
+    })
+    if (Item === undefined || !isProjectionTombstone(Item, entity.entityType)) return Option.none()
+    const tomb = fromAttributeMap(Item) as Record<string, unknown>
+    const dbName = (field: string) => {
+      const probe: Record<string, unknown> = { [field]: 1 }
+      entity._renameToDynamo(probe)
+      return Object.keys(probe)[0] ?? field
+    }
+    for (const field of layout.kept) {
+      const name = dbName(field)
+      if (tomb[name] !== undefined) item[name] = tomb[name]
+    }
+    if (layout.revision !== undefined) {
+      const name = dbName(layout.revision)
+      if (tomb[name] !== undefined) item[name] = Number(tomb[name]) + 1
+    }
+    return Option.some({
+      eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
+    } as ConditionInput)
+  })
+
+/**
+ * A projection tombstone (#154) of `entityType` — written at a removed row's
+ * own key to keep its checkpoints. Every read by key reports it as absent.
+ */
+export const isProjectionTombstone = (
+  item: { readonly __edd_e__?: { readonly S?: string | undefined } | undefined } | undefined,
+  entityType: string,
+): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
 
 /**
  * @internal Hidden string set naming the unique-constraint fields an item

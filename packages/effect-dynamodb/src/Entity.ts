@@ -120,6 +120,8 @@ import {
   freshIncarnationToken,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
+  isProjectionTombstone,
+  overTombstone,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import {
@@ -744,6 +746,14 @@ export interface Entity<
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
+  /**
+   * @internal `create` over a projection tombstone (#154), for the transaction
+   * path — see `overTombstone`.
+   */
+  readonly _overTombstone: (
+    tableName: string,
+    item: globalThis.Record<string, unknown>,
+  ) => Effect.Effect<Option.Option<ConditionInput>, DynamoClientError, DynamoClient>
 
   /**
    * @internal Configure the entity with table schema and tag.
@@ -5440,17 +5450,23 @@ const makeImpl = <
           // a guard no `.condition()` can replace (#133). `upsert`'s create
           // attempt brings its own (`runGuardedPut` requires the item missing).
           const condition = withGuard(
-            opts.putKind === "create" && operation !== "upsert"
-              ? {
-                  attributeNotExists: [
-                    config.indexes.primary.pk.field,
-                    config.indexes.primary.sk.field,
-                  ],
-                }
-              : undefined,
+            opts.putKind === "create" && operation !== "upsert" ? createGuard(self) : undefined,
             opts.condition,
           )
-          const userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
+          let userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
+
+          // `create` over a projection tombstone (#154): the row takes the
+          // tombstone's place, its checkpoints and revision carried over, on
+          // the condition that tombstone is still there.
+          if (opts.putKind === "create" && operation !== "upsert" && !guarded) {
+            const over = yield* overTombstone(self, client, tableName, item)
+            if (Option.isSome(over)) {
+              userCondition = compileCondition(
+                withGuard(over.value, opts.condition) as Expr | ConditionInput,
+                resolveDbName,
+              )
+            }
+          }
 
           if (guarded) {
             const plan = yield* runGuardedPut({
@@ -5489,7 +5505,7 @@ const makeImpl = <
             }
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
-                if (condition && isAwsConditionalCheckFailed(err.cause)) {
+                if (userCondition && isAwsConditionalCheckFailed(err.cause)) {
                   return new ConditionalCheckFailed({
                     entityType,
                     key: encoded as globalThis.Record<string, unknown>,
@@ -5591,7 +5607,9 @@ const makeImpl = <
                 : undefined,
           })
 
-          if (!result.Item) {
+          // A projection tombstone (#154) keeps a removed row's checkpoints at
+          // its key: there is no row.
+          if (!result.Item || isProjectionTombstone(result.Item, entityType)) {
             return yield* new ItemNotFound({ entityType, key: encodedKey })
           }
 
@@ -10035,6 +10053,11 @@ const makeImpl = <
     _multiItemWriteFeatures: multiItemWriteFeatures(),
     _liveRows: liveRows,
     _attachPrototype: attachPrototype,
+    _overTombstone: (tableName: string, item: globalThis.Record<string, unknown>) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        return yield* overTombstone(self, client, tableName, item)
+      }),
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
       injectedTableTag: import("effect").Context.Service<TableConfig, TableConfig>,
@@ -10556,6 +10579,8 @@ export interface TransactableInfo {
    * a `Put` MUST reject `"upsert"` rather than compile it (#100).
    */
   readonly putKind?: PutKind | undefined
+  /** For `opType: "put"`: the caller's own condition, without `create`'s guard. */
+  readonly callerCondition?: Expr | ConditionInput | undefined
 }
 
 /** @internal */
@@ -10597,6 +10622,22 @@ const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteT
  * carries no operations, so the bound op is the only descriptor its author can
  * ever hold.
  */
+/**
+ * @internal `create`'s guard: the item must not exist. (Over a projection
+ * tombstone, `create` reads it and guards on it instead — `overTombstone`.)
+ */
+export const createGuard = (entity: {
+  readonly indexes: {
+    readonly primary?: {
+      readonly pk: { readonly field: string }
+      readonly sk: { readonly field: string }
+    }
+  }
+}): ConditionInput => {
+  const primary = entity.indexes.primary!
+  return { attributeNotExists: [primary.pk.field, primary.sk.field] }
+}
+
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined
 
@@ -10613,7 +10654,6 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
     }
     // `create`'s own not-exists guard is ANDed with the caller's condition:
     // no `.condition()` replaces it (#133).
-    const primary = target._entity.indexes.primary!
     if (target._opType === "put") {
       const putKind = target._putKind ?? "put"
       return {
@@ -10621,12 +10661,11 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         entity: target._entity,
         input: target._input,
         condition: withGuard(
-          putKind === "create"
-            ? { attributeNotExists: [primary.pk.field, primary.sk.field] }
-            : undefined,
+          putKind === "create" ? createGuard(target._entity) : undefined,
           target._condition,
         ),
         putKind,
+        callerCondition: target._condition,
       }
     }
     if (target._opType === "update") {

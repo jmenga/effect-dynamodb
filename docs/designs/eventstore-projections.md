@@ -268,7 +268,7 @@ added fixes and adoption asks. What changed from §§3–7:
   token that changes on every write would need an attribute outside the model.
 - **Decode failures:** `onDecodeFailure: "report" | "skip"`.
 - **Missing identifiers:** `batchResponse` returns an `Effect` that fails with
-  `StreamRecordIdentifierMissing`, so `[EDD-9083]` is unused.
+  `StreamRecordIdentifierMissing`, so `[EDD-9083]` is not used here. The change feed (#156) later takes it for invalid feed settings.
 - **Throwing callbacks:** `key` / `initial` / `toItem` run under `Effect.try`. A throw
   is the row's (or, for `key`, the stream instance's) `ValidationError`.
 

@@ -36,6 +36,7 @@ export {
   makeCompositeKeyHoleError,
   makeCompositeNullableError,
   OptimisticLockError,
+  ProjectionSourceConflict,
   RefNotFound,
   ResourceNotFoundError,
   StaleAppend,

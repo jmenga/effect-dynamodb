@@ -531,6 +531,20 @@ export class DuplicateCommand extends Data.TaggedError("DuplicateCommand")<{
 }> {}
 
 /**
+ * A multi-source projection's row keeps `source`'s checkpoint in a scalar
+ * field owned by one stream instance (`recorded`), and another instance
+ * (`arriving`) addressed the row. The projection declares no checkpoint map
+ * to hold a second instance, so its events can't be guarded: nothing was
+ * written. Add a map field (`checkpoints.field`), or `rebuild` the row.
+ */
+export class ProjectionSourceConflict extends Data.TaggedError("ProjectionSourceConflict")<{
+  readonly entityType: string
+  readonly source: string
+  readonly recorded: string
+  readonly arriving: string
+}> {}
+
+/**
  * A change-feed record to report in a partial batch response has no
  * identifier — `dynamodb.SequenceNumber` for a Lambda event source mapping,
  * `eventID` for an EventBridge Pipe, or whatever a caller's `identifier`
