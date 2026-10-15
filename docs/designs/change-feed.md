@@ -42,8 +42,12 @@ one item are ordered within a shard and from a parent into its child.
 - **Children.** When a shard is drained, its children are looked up at once
   with `DescribeStream({ ShardFilter: { Type: "CHILD_SHARDS", ShardId } })`.
   A store that rejects `ShardFilter` (`ValidationException`) is remembered,
-  and every later lookup uses a full describe instead. Either way, the result
-  is filtered by `ParentShardId`, so a store that ignores the filter is safe.
+  and every later lookup uses a full describe instead; a filtered lookup that
+  finds no child yet (DynamoDB Local accepts the filter and returns nothing)
+  also falls back to a full describe. Either way, the result is filtered by
+  `ParentShardId`, so a store that ignores the filter is safe.
+- **Pruning.** A full describe forgets finished shards that have left the
+  stream, so a long-running feed does not accumulate them.
 - **Parent before child.** A shard starts only when its parent is finished,
   or its parent is not in the describe output (trimmed past retention).
   DynamoDB shards only split, never merge, so each has at most one parent.
@@ -135,8 +139,9 @@ processes from consuming the same feed by accident:
 - released when the stream ends;
 - a second consumer fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or
   with `lease: { onHeld: "wait" }` retries until the lease is free or expires;
-- a failed renewal (another owner took over) fails the feed with
-  `ChangeFeedLeaseLost`.
+- a renewal the store fails to write (`CheckpointStoreError`) is retried up to
+  three times on the backoff; a renewal refused because another owner took
+  over fails the feed with `ChangeFeedLeaseLost`.
 
 Expiry compares the holder's clock with the taker's, so hosts need roughly
 synchronised clocks. The lease guards against an accidental second consumer;
@@ -160,6 +165,10 @@ type ShardCheckpoint =
 
 `consumer` (default `"default"`) names the application consuming the feed, so
 two different consumers of one stream can share a checkpoint table.
+
+The store comes from the context (`R` of the feed) rather than a `checkpoints`
+option, so it is chosen by layer like every other service — a test swaps in
+`layerMemory`, a deployment `layerDynamoDB`.
 
 - **In memory** (`layerMemory`): a map per layer; the lease is process-local.
 - **DynamoDB** (`layerDynamoDB({ tableName })`, needs `DynamoClient`): one
