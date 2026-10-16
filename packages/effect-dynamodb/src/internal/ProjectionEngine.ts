@@ -75,6 +75,32 @@ export const removeRow: RemoveRow = { [RemoveRowTypeId]: RemoveRowTypeId }
 export const isRemoveRow = (u: unknown): u is RemoveRow =>
   typeof u === "object" && u !== null && RemoveRowTypeId in u
 
+// ---------------------------------------------------------------------------
+// Skipping (#162)
+// ---------------------------------------------------------------------------
+
+const SkipEventTypeId: unique symbol = Symbol.for("effect-dynamodb/EventStore/SkipEvent")
+
+/** What `evolve` returns to skip an event — see {@link skipEvent}. */
+export interface SkipEvent {
+  readonly [SkipEventTypeId]: typeof SkipEventTypeId
+}
+
+/**
+ * Returned from a projection's `evolve`, skips the event: the fold carries on
+ * with the state before it, no outbox effects are produced, and the event is
+ * reported in `skipped`, never `applied`. A row whose events are all skipped
+ * (or already applied) is not written, and its revision doesn't move. A
+ * skipped event doesn't move its instance's checkpoint: the checkpoint rises
+ * only to the instance's last applied or rejected event, so a skipped event
+ * above it is read and decided again later.
+ */
+export const skipEvent: SkipEvent = { [SkipEventTypeId]: SkipEventTypeId }
+
+/** @internal */
+export const isSkipEvent = (u: unknown): u is SkipEvent =>
+  typeof u === "object" && u !== null && SkipEventTypeId in u
+
 /** The `__edd_e__` of a read model's tombstones. */
 export const tombstoneMarker = (entityType: string): string => `${entityType}#tombstone`
 /** The `__edd_e__` of a read model's outbox items. */
@@ -218,6 +244,8 @@ export interface InstanceResult {
   readonly alreadyApplied: ReadonlyArray<AnyEvent>
   readonly rejected: ReadonlyArray<{ readonly event: AnyEvent; readonly error: unknown }>
   readonly superseded: ReadonlyArray<AnyEvent>
+  /** The events `evolve` skipped (`skipEvent`), in version order. */
+  readonly skipped: ReadonlyArray<AnyEvent>
   /** The instance's checkpoint after this call, in store numbering. */
   readonly version: number
 }
@@ -375,17 +403,22 @@ export const makeEngine = (config: EngineConfig) => {
   interface Slot {
     readonly kind: "scalar" | "field" | "map"
     readonly at: number
+    /** The instance claimed a field with no recorded owner, in this attempt. */
+    readonly adopted?: true
   }
 
   /**
    * `claimed` records, per field-mapped source, the instance that owns its
    * field in this attempt — so two instances of one source never both take it.
+   * `adopt: false` reads an unowned field without claiming it (#162): the
+   * instance won't write it, so the next instance of its source may.
    */
   const slotOf = (
     row: Option.Option<Row>,
     source: string,
     streamIdStr: string,
     claimed: Map<string, string>,
+    adopt: boolean,
   ): Slot | ProjectionSourceConflict => {
     const values = Option.isSome(row) ? row.value.values : undefined
     const layout = config.checkpoints
@@ -403,10 +436,12 @@ export const makeEngine = (config: EngineConfig) => {
     const stored = values?.[mapped.instanceField]
     const owner = claimed.get(source) ?? (stored === null || stored === "" ? undefined : stored)
     const scalar = values?.[mapped.field]
+    const at = scalar === undefined ? 0 : Number(scalar) - mapped.offset
     // No owner recorded: a new row, or a legacy one — adopted by this instance.
+    if (owner === undefined && !adopt) return { kind: "field", at }
     if (owner === undefined || owner === streamIdStr) {
       claimed.set(source, streamIdStr)
-      return { kind: "field", at: scalar === undefined ? 0 : Number(scalar) - mapped.offset }
+      return owner === undefined ? { kind: "field", at, adopted: true } : { kind: "field", at }
     }
     if (layout.map !== undefined) return fromMap()
     return new ProjectionSourceConflict({
@@ -828,6 +863,7 @@ export const makeEngine = (config: EngineConfig) => {
             ? 1
             : 0
     })
+    const fromScratch = options?.fromScratch === true
     const attempt = Effect.gen(function* () {
       const row = yield* readRow(key)
       type Plan = {
@@ -842,44 +878,56 @@ export const makeEngine = (config: EngineConfig) => {
        * their checkpoints don't move — and reported, so the row's other
        * sources still apply.
        */
-      const failed: Array<{
+      type Failure = {
         readonly source: string
         readonly streamId: string
         readonly error: unknown
-      }> = []
-      const plans: Array<Plan> = []
-      const claimed = new Map<string, string>()
-      const slotRow = options?.fromScratch === true ? Option.none<Row>() : row
-      for (const w of ordered) {
-        const slot = slotOf(slotRow, w.source.name, w.streamIdStr, claimed)
-        if (slot instanceof ProjectionSourceConflict) {
-          failed.push({ source: w.source.name, streamId: w.streamIdStr, error: slot })
-          continue
-        }
-        const at = options?.fromScratch === true ? 0 : slot.at
-        const r = yield* Effect.result(runOf(rowId, at, w))
-        if (Result.isFailure(r)) {
-          failed.push({ source: w.source.name, streamId: w.streamIdStr, error: r.failure })
-          continue
-        }
-        plans.push({ work: w, slot, ...r.success })
       }
+      const slotRow = fromScratch ? Option.none<Row>() : row
+      /**
+       * Each instance's slot and run, in fold order. `barred` instances read an
+       * unowned field without adopting it; `adopters` are those that adopted one.
+       */
+      const planAll = (barred: ReadonlySet<InstanceWork>) =>
+        Effect.gen(function* () {
+          const failed: Array<Failure> = []
+          const plans: Array<Plan> = []
+          const adopters: Array<InstanceWork> = []
+          const claimed = new Map<string, string>()
+          for (const w of ordered) {
+            const slot = slotOf(slotRow, w.source.name, w.streamIdStr, claimed, !barred.has(w))
+            if (slot instanceof ProjectionSourceConflict) {
+              failed.push({ source: w.source.name, streamId: w.streamIdStr, error: slot })
+              continue
+            }
+            if (slot.adopted === true) adopters.push(w)
+            const at = fromScratch ? 0 : slot.at
+            const r = yield* Effect.result(runOf(rowId, at, w))
+            if (Result.isFailure(r)) {
+              failed.push({ source: w.source.name, streamId: w.streamIdStr, error: r.failure })
+              continue
+            }
+            plans.push({ work: w, slot, ...r.success })
+          }
+          return { plans, failed, adopters }
+        })
       const initialState: Option.Option<any> =
-        options?.fromScratch === true || Option.isNone(row) || row.value.tombstone
+        fromScratch || Option.isNone(row) || row.value.tombstone
           ? Option.none()
           : Option.some(row.value.values)
-      const initiallyRemoved =
-        Option.isSome(row) && row.value.tombstone && options?.fromScratch !== true
+      const initiallyRemoved = Option.isSome(row) && row.value.tombstone && !fromScratch
 
+      type InstanceFold = {
+        readonly applied: ReadonlyArray<AnyEvent>
+        readonly rejected: ReadonlyArray<{ readonly event: AnyEvent; readonly error: unknown }>
+        readonly superseded: ReadonlyArray<AnyEvent>
+        readonly skipped: ReadonlyArray<AnyEvent>
+      }
       type Folded = {
         readonly state: Option.Option<any>
         readonly removed: boolean
         readonly enqueued: ReadonlyArray<Enqueued>
-        readonly results: ReadonlyArray<{
-          readonly applied: ReadonlyArray<AnyEvent>
-          readonly rejected: ReadonlyArray<{ readonly event: AnyEvent; readonly error: unknown }>
-          readonly superseded: ReadonlyArray<AnyEvent>
-        }>
+        readonly results: ReadonlyArray<InstanceFold>
       }
       /** Fold `active`; the index of the first instance that fails, if one does. */
       const foldAll = (
@@ -893,11 +941,12 @@ export const makeEngine = (config: EngineConfig) => {
           let state = initialState
           let removed = initiallyRemoved
           const enqueued: Array<Enqueued> = []
-          const results: Array<Folded["results"][number]> = []
+          const results: Array<InstanceFold> = []
           for (const [index, plan] of active.entries()) {
             const applied: Array<AnyEvent> = []
             const rejected: Array<{ event: AnyEvent; error: unknown }> = []
             const superseded: Array<AnyEvent> = []
+            const skipped: Array<AnyEvent> = []
             const context: EvolveContext = {
               source: plan.work.source.name,
               streamId: plan.work.streamIdStr,
@@ -916,6 +965,8 @@ export const makeEngine = (config: EngineConfig) => {
                         }),
                       )
                   const next = yield* plan.work.source.evolve(base, event, context)
+                  // A skip: the state stays, and the event produces no effects.
+                  if (isSkipEvent(next)) return { next, effects: [] }
                   if (isRemoveRow(next) && config.removal === undefined) {
                     return yield* new ValidationError({
                       entityType,
@@ -953,50 +1004,90 @@ export const makeEngine = (config: EngineConfig) => {
                 enqueued.push({ effect, event, source: context.source })
             }
             if (plan.work.source.mode === "latest") {
-              // Newest first, until one is accepted: rejections fall back to an
-              // older event, and only those older than the accepted one are passed over.
+              // Newest first, until one is accepted: rejections and skips fall back
+              // to an older event, and only those older than the accepted one are passed over.
               for (let i = plan.run.length - 1; i >= 0; i--) {
                 const event = plan.run[i]!
                 const result = yield* evolveOne(event)
-                if (Result.isSuccess(result)) {
+                if (Result.isSuccess(result) && isSkipEvent(result.success.next)) {
+                  skipped.unshift(event)
+                } else if (Result.isSuccess(result)) {
                   accept(event, result.success)
                   superseded.push(...plan.run.slice(0, i))
                   break
-                }
-                if (plan.work.source.terminal?.(result.failure) === true) {
+                } else if (plan.work.source.terminal?.(result.failure) === true) {
                   rejected.unshift({ event, error: result.failure })
                 } else return { failedAt: index, error: result.failure }
               }
             } else {
               for (const event of plan.run) {
                 const result = yield* evolveOne(event)
-                if (Result.isSuccess(result)) accept(event, result.success)
-                else if (plan.work.source.terminal?.(result.failure) === true) {
+                if (Result.isSuccess(result)) {
+                  if (isSkipEvent(result.success.next)) skipped.push(event)
+                  else accept(event, result.success)
+                } else if (plan.work.source.terminal?.(result.failure) === true) {
                   rejected.push({ event, error: result.failure })
                 } else return { failedAt: index, error: result.failure }
               }
             }
-            results.push({ applied, rejected, superseded })
+            results.push({ applied, rejected, superseded, skipped })
           }
           return { folded: { state, removed, enqueued, results } }
         })
 
-      // Fold; an instance that fails is set aside and the rest folded again.
-      let active: ReadonlyArray<Plan> = plans
+      /**
+       * The checkpoint an instance's fold moves it to: its last applied or
+       * rejected event (#162 — skipped ones don't count). None: it stays as read.
+       */
+      const checkpointOf = (plan: Plan, result: InstanceFold): number | undefined => {
+        let last: number | undefined
+        for (const e of result.applied) if (last === undefined || e.version > last) last = e.version
+        for (const r of result.rejected) {
+          if (last === undefined || r.event.version > last) last = r.event.version
+        }
+        // A rebuild records an instance with nothing to fold at its read checkpoint.
+        if (last === undefined && fromScratch && plan.run.length === 0) return plan.slot.at
+        return last
+      }
+
+      // Plan, and fold; an instance that fails is set aside and the rest folded
+      // again. An instance that adopted an unowned field but won't write it
+      // (all skipped, or failed) releases it, and — when another instance of
+      // its source could take it — the row is planned again without its claim.
+      const barred = new Set<InstanceWork>()
+      let failed: Array<Failure>
+      let active: ReadonlyArray<Plan>
       let folded: Folded
       while (true) {
-        const attempt = yield* foldAll(active)
-        if ("folded" in attempt) {
-          folded = attempt.folded
-          break
+        const planned = yield* planAll(barred)
+        failed = planned.failed
+        active = planned.plans
+        while (true) {
+          const attempt = yield* foldAll(active)
+          if ("folded" in attempt) {
+            folded = attempt.folded
+            break
+          }
+          const bad = active[attempt.failedAt]!
+          failed.push({
+            source: bad.work.source.name,
+            streamId: bad.work.streamIdStr,
+            error: attempt.error,
+          })
+          active = active.filter((p) => p !== bad)
         }
-        const bad = active[attempt.failedAt]!
-        failed.push({
-          source: bad.work.source.name,
-          streamId: bad.work.streamIdStr,
-          error: attempt.error,
-        })
-        active = active.filter((p) => p !== bad)
+        const writes = new Set(
+          active
+            .filter((p, i) => checkpointOf(p, folded.results[i]!) !== undefined)
+            .map((p) => p.work),
+        )
+        const released = planned.adopters.filter(
+          (w) =>
+            !writes.has(w) &&
+            ordered.some((o) => o !== w && o.source === w.source && !barred.has(o)),
+        )
+        if (released.length === 0) break
+        for (const w of released) barred.add(w)
       }
       // Every instance failed: the row fails, with the first failure.
       if (active.length === 0 && failed.length > 0) return yield* Effect.fail(failed[0]!.error)
@@ -1010,6 +1101,7 @@ export const makeEngine = (config: EngineConfig) => {
           alreadyApplied: plan.alreadyApplied,
           rejected: results[i]!.rejected,
           superseded: results[i]!.superseded,
+          skipped: results[i]!.skipped,
           version: version(i),
         }))
       const unchanged = (): RowResult => ({
@@ -1024,24 +1116,24 @@ export const makeEngine = (config: EngineConfig) => {
         enqueued: 0,
         failed,
       })
-      const consumed = active.some((p) => p.run.length > 0)
-      if (!consumed && options?.fromScratch !== true) return unchanged()
+      // Written only when an event was applied or rejected (or rebuilding):
+      // skipped and already-applied events alone leave the row as read.
+      const changed = results.some((r) => r.applied.length > 0 || r.rejected.length > 0)
+      if (!changed && !fromScratch) return unchanged()
       // No row came of it (only rejections, and none existed): write nothing.
       if (Option.isNone(state) && !removed) return unchanged()
-      // The new checkpoints: every event considered, applied or not.
-      const advanced = active
-        .filter((p) => p.run.length > 0 || options?.fromScratch === true)
-        .map((p) => ({
-          source: p.work.source.name,
-          streamIdStr: p.work.streamIdStr,
-          slot: p.slot,
-          version: p.run.length > 0 ? p.run[p.run.length - 1]!.version : p.slot.at,
-        }))
+      // The new checkpoints: every event up to the last applied or rejected one.
+      const advanced = active.flatMap((p, i) => {
+        const version = checkpointOf(p, results[i]!)
+        return version === undefined
+          ? []
+          : [{ source: p.work.source.name, streamIdStr: p.work.streamIdStr, slot: p.slot, version }]
+      })
       const target: Record<string, unknown> = Option.isSome(state)
         ? { ...(state.value as object) }
         : {}
-      stamp(target, options?.fromScratch === true ? Option.none() : row, advanced)
-      if (options?.fromScratch === true && config.revision !== undefined) {
+      stamp(target, fromScratch ? Option.none() : row, advanced)
+      if (fromScratch && config.revision !== undefined) {
         target[config.revision.field] = nextRevisionOf(row)
       }
       const nextRevision =

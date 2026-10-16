@@ -6,6 +6,7 @@
  *     a checkpoint per source instance, writes guarded by a revision
  *   - "fold" and "latest" sources
  *   - removal: EventStore.removeRow and tombstones that keep the checkpoints
+ *   - EventStore.skipEvent: an event that changes nothing writes nothing
  *   - outbox: side effects committed with the row, drained in order
  *   - EventStore.processBatch() over a feed carrying every stream
  *   - rebuild() as the repair path
@@ -138,7 +139,11 @@ const ShipmentProjection = EventStore.multiProjection({
     }),
     weigh: source(WeighEvents, {
       key: (_sessionId, event) => ({ shipmentId: event.data.shipmentId }),
-      evolve: (state, event) => Effect.succeed({ ...state, kg: state.kg + event.data.kg }),
+      // A tare reading changes nothing: skip it, so the row isn't written
+      evolve: (state, event) =>
+        Effect.succeed(
+          event.data.kg === 0 ? EventStore.skipEvent : { ...state, kg: state.kg + event.data.kg },
+        ),
     }),
   }),
   checkpoints: { field: "checkpoints" },
@@ -309,6 +314,24 @@ const program = Effect.gen(function* () {
     "checkpoints",
   )
 
+  // A tare reading is skipped: nothing is written, the revision stays
+  yield* WeighEvents.append({ sessionId: "w-1" }, [new Weighed({ shipmentId: "sh-1", kg: 0 })], 2)
+  const [tare] = yield* WeighEvents.readFrom({ sessionId: "w-1" }, 2)
+  // #region skip
+  const skip = yield* ShipmentProjection.applyBatch([{ stream: "weigh", event: tare! }])
+  // #endregion
+  const tared = skip.outcomes[0]!
+  assertEq(
+    tared._tag === "Applied" && [tared.instances[0]!.skipped.length, tared.revision],
+    [1, sh1.revision],
+    "skipped",
+  )
+  assertEq(
+    (yield* db.entities.ShipmentSummaries.get({ shipmentId: "sh-1" })).checkpoints["weigh#w-1"],
+    2,
+    "skipped event stays above the checkpoint",
+  )
+
   // Cancel the order: its shipments' rows become tombstones
   yield* OrderEvents.append(
     { orderId: "o-1" },
@@ -351,7 +374,7 @@ const program = Effect.gen(function* () {
   yield* Console.log(`sh-1 log: ${log.kg} kg, weigh version ${log.weighVersion}`)
   assertEq(
     [log.kg, log.weighVersion, log.weighSession, log.revision],
-    [8, 1, "w-1", 1],
+    [8, 2, "w-1", 1], // three weighings, the last a tare: version 3, stored from 0
     "adopted",
   )
   // No instance went to the map, so it was not written

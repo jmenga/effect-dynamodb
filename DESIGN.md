@@ -3569,8 +3569,11 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
      keeping the row's events (sound because `append` is a contiguity-checked
      transaction);
   4. fold through `evolve`, skipping events whose failure `terminal` accepts
-     (`rejected`; rejected events alone never create a row), map through `toItem`,
-     set the checkpoint;
+     (`rejected`; rejected events alone never create a row) and events for which
+     `evolve` returns `EventStore.skipEvent` (`skipped`, #162: no outbox effects;
+     a row whose events are all skipped or already applied is not written), map
+     through `toItem`, set the checkpoint to the last applied or rejected event
+     (a skipped event above it is read and decided again later);
   5. write once, with `put` conditioned on `checkpoint = c + offset` and carrying the
      row's `createdAt` (an internal `put` option), or `create` for a new row. A failed
      condition is a lost race — a private signal, retried under `retry` (default:

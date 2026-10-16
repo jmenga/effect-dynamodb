@@ -5889,6 +5889,8 @@ export {
   type OutboxMeta,
   type RemoveRow,
   removeRow,
+  type SkipEvent,
+  skipEvent,
 } from "./internal/ProjectionEngine.js"
 
 /**

@@ -20,6 +20,7 @@ import {
   Context,
   Data,
   DateTime,
+  Deferred,
   Duration,
   Effect,
   Equal,
@@ -7976,7 +7977,22 @@ describeConnected("EventStore snapshots + retry (closes #84)", () => {
 
   it.effect("without retry, a real concurrent conflict surfaces as VersionConflict", () =>
     Effect.gen(function* () {
-      const handle = EventStore.commandHandler(ledgerDecider, PlainLedger)
+      // Both handlers read the stream before either appends: each `decide`
+      // waits until the other has decided too, so the race is certain.
+      const arrived = { count: 0 }
+      const bothRead = yield* Deferred.make<void>()
+      const handle = EventStore.commandHandler(
+        {
+          ...ledgerDecider,
+          decide: (command: LedgerCommand, state: LedgerState) =>
+            Effect.gen(function* () {
+              if (++arrived.count === 2) yield* Deferred.succeed(bothRead, undefined)
+              yield* Deferred.await(bothRead)
+              return yield* ledgerDecider.decide(command, state)
+            }),
+        },
+        PlainLedger,
+      )
       const key = { accountId: "conflict-1" }
 
       const results = yield* Effect.all(

@@ -55,6 +55,7 @@ import {
   type RemoveRow,
   type RowResult,
   retrySchedule,
+  type SkipEvent,
 } from "./ProjectionEngine.js"
 
 // ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ export interface MultiSource<St extends AnyStream, K, S, E, R> {
     state: S,
     event: EventOfStream<St>,
     context: EvolveContext,
-  ): Effect.Effect<S | RemoveRow, E, R>
+  ): Effect.Effect<S | RemoveRow | SkipEvent, E, R>
   readonly mode: "fold" | "latest"
   terminal(error: E): boolean
 }
@@ -99,14 +100,15 @@ export interface MultiSourceConfig<St extends AnyStream, K, S, E, R> {
   /**
    * Fold one event into the row's state (the whole row: every source's part).
    * Sources interleave in any order across writes, so a source's `evolve` must
-   * not depend on another's having run first. Return `EventStore.removeRow` to
+   * not depend on another's having run first. Return `EventStore.skipEvent` to
+   * skip the event (see `projection`'s `evolve`), or `EventStore.removeRow` to
    * remove the row (with `removal`).
    */
   readonly evolve: (
     state: S,
     event: EventOfStream<St>,
     context: EvolveContext,
-  ) => Effect.Effect<S | RemoveRow, E, R>
+  ) => Effect.Effect<S | RemoveRow | SkipEvent, E, R>
   /**
    * `"fold"` (default): every event, in version order, gaps filled from the
    * store — for contributions that change a few fields (deltas). `"latest"`:
@@ -238,6 +240,12 @@ export type MultiInstanceResult<Sources extends Record<string, AnySource>> = {
     }>
     /** `"latest"` mode: the instance's older events in the batch, passed over. */
     readonly superseded: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
+    /**
+     * The events `evolve` skipped (`EventStore.skipEvent`), in version order —
+     * never in `applied`, and not below the instance's new checkpoint unless
+     * a later event of it was applied or rejected.
+     */
+    readonly skipped: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
     /** The instance's checkpoint after the call. */
     readonly version: number
   }
