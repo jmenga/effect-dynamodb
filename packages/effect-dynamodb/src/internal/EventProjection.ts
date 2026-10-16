@@ -52,6 +52,7 @@ import {
   type RemoveRow,
   type RowResult,
   retrySchedule,
+  type SkipEvent,
 } from "./ProjectionEngine.js"
 
 // ---------------------------------------------------------------------------
@@ -167,17 +168,19 @@ export interface ProjectionConfig<
     event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
   ) => ProjectionState<RM>
   /**
-   * Apply one event. Return the state unchanged to ignore an event (the
-   * checkpoint still advances), or `EventStore.removeRow` to remove the row
-   * (with `removal`). A failure fails this row only, unless `terminal`
-   * accepts it. The library sets the checkpoint (and revision) after the
+   * Apply one event. Return the state unchanged to fold an event that
+   * changes nothing (the row is still written, and the checkpoint advances);
+   * `EventStore.skipEvent` to skip it (no write when nothing else applies, the
+   * checkpoint stays below it, reported in `skipped`); or
+   * `EventStore.removeRow` to remove the row (with `removal`). A failure
+   * fails this row only, unless `terminal` accepts it. The library sets the checkpoint (and revision) after the
    * fold; `evolve` need not. It runs again on every lost-race retry, so keep
    * it free of side effects.
    */
   readonly evolve: (
     state: ProjectionState<RM>,
     event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
-  ) => Effect.Effect<ProjectionState<RM> | RemoveRow, E, R>
+  ) => Effect.Effect<ProjectionState<RM> | RemoveRow | SkipEvent, E, R>
   /** See {@link ProjectionCheckpoint}. */
   readonly checkpoint: ProjectionCheckpoint<ProjectionState<RM>>
   /**
@@ -327,6 +330,13 @@ export interface ProjectionApplied<S, A, M, K = unknown, E = unknown> {
    */
   readonly alreadyApplied: ReadonlyArray<StreamEvent<A, M>>
   /**
+   * The events `evolve` skipped (`EventStore.skipEvent`), in version order —
+   * never in `applied`. A row with only skipped (or already-applied) events
+   * isn't written. A skipped event above the checkpoint is read and decided
+   * again by a later call.
+   */
+  readonly skipped: ReadonlyArray<StreamEvent<A, M>>
+  /**
    * The row as written, or as read when nothing was left to apply.
    * `Option.none()` when there is no row: every event was rejected, or the
    * row is removed (`removed`).
@@ -386,6 +396,8 @@ export interface ProjectionCaughtUp<S, A, M, K = unknown, E = unknown> {
   readonly applied: ReadonlyArray<StreamEvent<A, M>>
   /** The events `evolve` rejected, in version order. */
   readonly rejected: ReadonlyArray<ProjectionRejected<A, M, E>>
+  /** The events `evolve` skipped, in version order. */
+  readonly skipped: ReadonlyArray<StreamEvent<A, M>>
   /** The row — `Option.none()` when there is none, or it is removed. */
   readonly state: Option.Option<S>
   readonly version: number
@@ -401,6 +413,8 @@ export interface ProjectionRebuiltRow<S, A, M, K = unknown, E = unknown> {
   /** The version of the row's last event. */
   readonly version: number
   readonly rejected: ReadonlyArray<ProjectionRejected<A, M, E>>
+  /** The events `evolve` skipped, in version order. */
+  readonly skipped: ReadonlyArray<StreamEvent<A, M>>
   /** The fold ended removed: a tombstone was written. */
   readonly removed: boolean
 }
@@ -1008,6 +1022,7 @@ export const projection = <
       applied: (instance?.applied ?? []) as Applied["applied"],
       rejected: (instance?.rejected ?? []) as Applied["rejected"],
       alreadyApplied: (instance?.alreadyApplied ?? []) as Applied["alreadyApplied"],
+      skipped: (instance?.skipped ?? []) as Applied["skipped"],
       state: result.state as Option.Option<S>,
       version: instance?.version ?? 0,
       removed: result.removed,
@@ -1199,6 +1214,7 @@ export const projection = <
           key: Option.none(),
           applied: [],
           rejected: [],
+          skipped: [],
           state: Option.none(),
           version: 0,
           removed: false,
@@ -1220,6 +1236,7 @@ export const projection = <
         key: Option.some(key),
         applied: applied.applied,
         rejected: applied.rejected,
+        skipped: applied.skipped,
         state: applied.state,
         version: applied.version,
         removed: applied.removed,
@@ -1267,6 +1284,7 @@ export const projection = <
                 state: applied.state,
                 version: applied.version,
                 rejected: applied.rejected,
+                skipped: applied.skipped,
                 removed: applied.removed,
               }
             }),
