@@ -112,7 +112,11 @@ const ShipmentProjection = EventStore.multiProjection({
     }),
     weigh: source(WeighEvents, {
       key: (_sessionId, event) => ({ shipmentId: event.data.shipmentId }),
-      evolve: (state, event) => Effect.succeed({ ...state, kg: state.kg + event.data.kg }),
+      // A tare reading changes nothing: skip it, so the row isn't written
+      evolve: (state, event) =>
+        Effect.succeed(
+          event.data.kg === 0 ? EventStore.skipEvent : { ...state, kg: state.kg + event.data.kg },
+        ),
     }),
   }),
   checkpoints: { field: "checkpoints" },
@@ -230,7 +234,26 @@ const makeHandler = Effect.gen(function* () {
 })
 ```
 
-Each row's outcome lists its instances: `{ source, streamId, applied, alreadyApplied, rejected, superseded, version }`. It also has the row's `state`, `removed`, `revision` and `enqueued`.
+Each row's outcome lists its instances: `{ source, streamId, applied, alreadyApplied, rejected, superseded, skipped, version }`. It also has the row's `state`, `removed`, `revision` and `enqueued`.
+
+## Skipping an event
+
+`evolve` may return `EventStore.skipEvent` for an event that should leave the row alone. No option enables it.
+
+```typescript region="skip" example="guide-projections-advanced.ts"
+const skip = yield* ShipmentProjection.applyBatch([{ stream: "weigh", event: tare! }])
+```
+
+- **Nothing is written** when a row's events are all skipped (or already applied). The outcome is `Applied`, with `applied: []`, the row as read, and the revision unchanged. Skipped events alone never create a row.
+- **Reported in `skipped`, never in `applied`.** A skipped event produces no outbox effects. The fold carries on with the state from before it.
+- **A mixed write is still one write.** When other events of the row apply (from the same instance or another), the row is written once, with the revision bumped once.
+- **The checkpoint stops at the last applied or rejected event.** Skipped events below it are covered. A skipped event above it is not: it is read and decided again by the instance's next gap-fill, a redelivery, or `catchUp`, against the row as it is then. Keep the decision deterministic, as with `terminal`. An instance whose events keep being skipped re-reads them on every delivery.
+- **Per instance.** When all of an instance's events were skipped, its map entry is not added and its field-mapped checkpoint and instance field are not written. An unowned field goes to the first instance of its source that writes it.
+- **In `"latest"` mode**, a skipped newest event falls back to the next older one, as a rejection does.
+- **Compared with the alternatives:**
+  - Returning the state unchanged counts as a fold step: the row is written, the revision moves and the event is in `applied`.
+  - A `terminal` rejection writes an existing row, and moves the checkpoint past the event.
+  - A skip does neither.
 
 ## Removing rows
 
