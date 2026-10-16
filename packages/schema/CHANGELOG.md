@@ -1,5 +1,11 @@
 # @effect-dynamodb/schema
 
+## 1.30.1
+
+### Patch Changes
+
+- [`32d0f11`](https://github.com/jmenga/effect-dynamodb/commit/32d0f119146e8a3f01290418e6d2e9d954ea0117) - Projection rows read through a `DynamoModel.configure`d read model now hold exactly the model's fields ([#160](https://github.com/jmenga/effect-dynamodb/issues/160)), `Hidden` ones included. The engine looked up the field list on the configured wrapper, found none, and kept the whole decoded item. As a result, `pk`, `sk`, `__edd_e__` and other storage attributes leaked into the state that `evolve` receives and that results carry (for example, the stored row of an already-applied redelivery, or `catchUp`). The make-time check that a named checkpoint, instance, map or revision field belongs to the model (`EDD-9081`) now applies to configured models too.
+
 ## 1.30.0
 
 ### Minor Changes

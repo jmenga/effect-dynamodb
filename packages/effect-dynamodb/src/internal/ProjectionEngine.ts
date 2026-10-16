@@ -16,6 +16,7 @@
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import { isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
 import {
   ConcurrentModification,
   type ConditionalCheckFailed,
@@ -24,6 +25,7 @@ import {
   ProjectionSourceConflict,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   DateTime,
   Duration as Dur,
@@ -259,10 +261,14 @@ export const addressed = <K>(key: unknown): Option.Option<K> =>
 /** A map checkpoint's key. */
 export const instanceKey = (source: string, streamId: string): string => `${source}#${streamId}`
 
-/** @internal */
-export const modelFields = (model: Schema.Top): ReadonlyArray<string> | undefined => {
-  const fields = (model as { readonly fields?: unknown }).fields
-  return typeof fields === "object" && fields !== null ? Object.keys(fields) : undefined
+/**
+ * @internal The read model's field names, `Hidden` ones included — through a
+ * `DynamoModel.configure`d model to its schema (#160).
+ */
+export const modelFields = (model: unknown): ReadonlyArray<string> | undefined => {
+  const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
+  const fields = getSchemaFields(schema)
+  return fields === undefined ? undefined : Object.keys(fields)
 }
 
 /** A row as read. */
