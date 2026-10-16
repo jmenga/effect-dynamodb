@@ -683,6 +683,7 @@ describe("EventStore.projection — catchUp and rebuild", () => {
         key: Option.none(),
         applied: [],
         rejected: [],
+        skipped: [],
         state: Option.none(),
         version: 0,
         removed: false,
