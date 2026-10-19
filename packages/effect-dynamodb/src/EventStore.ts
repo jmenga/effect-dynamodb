@@ -11,7 +11,11 @@
  * - `commandHandler` combinator for the load-decide-fold-append cycle
  *   (snapshot-aware single-request loads, consistent loads, an optional
  *   `VersionConflict` retry policy, caller-supplied `expectedVersion`,
- *   decision-derived `additionalItems`, inline snapshots)
+ *   decision-derived `additionalItems`, inline snapshots, a caller's own
+ *   state record as the load via `loadState`)
+ * - Head proofs (`append({ headProof })`, #164): an additional item or the
+ *   inline snapshot proves the stream head in place of the version-contiguity
+ *   `ConditionCheck`
  * - Stream indexes (`makeStream({ indexes })`): sub-streams ordered by a key
  *   derived from each event, on an LSI or GSI, each projecting all of the
  *   event, all but its metadata, or only its keys — `readIndex`,
@@ -104,6 +108,7 @@ import {
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  opConditionFailed,
   type TransactItemTarget,
   type TransactWriteItem,
   type TransactWriteOp,
@@ -359,7 +364,8 @@ export interface AppendMeasurement {
    * What the stream's own actions (the contiguity check, the event puts, the
    * sentinel and the inline snapshot) add to the `TransactWriteItems` request
    * — its 4 MB (4,194,304-byte) limit counts items, keys and expressions.
-   * Caller `additionalItems` are not included: add their size yourself.
+   * Caller `additionalItems` are not included: add their size yourself. With
+   * a `headProof` there is no contiguity check to count.
    */
   readonly transactionBytes: number
 }
@@ -474,6 +480,19 @@ export type AppendMetadataOptions<TMetadata> =
     }
 
 /**
+ * The item of an {@link EventStream.append} that proves the stream head is at
+ * `expectedVersion`, in place of the version-contiguity `ConditionCheck` (see
+ * {@link AppendOptionsBase.headProof}).
+ *
+ * - `{ additionalItem: n }` — `additionalItems[n]`, whose own condition holds
+ *   only when the stream is at `expectedVersion` (the caller's state record,
+ *   conditioned on the version it was loaded at, or on its absence at 0).
+ * - `"snapshot"` — the append's inline snapshot, conditioned on
+ *   `asOfVersion = expectedVersion`.
+ */
+export type HeadProof = { readonly additionalItem: number } | "snapshot"
+
+/**
  * The options of {@link EventStream.append} other than its metadata (see
  * {@link AppendMetadataOptions}).
  *
@@ -537,6 +556,43 @@ export interface AppendOptionsBase<TState = never> {
    *   repeat, run backwards or lie in the future, as imported history can.
    */
   readonly eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
+  /**
+   * The item that proves the stream head is at `expectedVersion`, in place of
+   * the version-contiguity `ConditionCheck`. Omitted: the check is written.
+   *
+   * The check reads the event at `expectedVersion`, and DynamoDB bills a
+   * `ConditionCheck` inside a transaction at 2 WCU per KB of the checked
+   * item, so with large events it is a sizeable part of every append. The
+   * event puts already reject a stale `expectedVersion`; the check rejects
+   * one that is ahead of the head, which would leave a gap. An item whose own
+   * condition holds only at `expectedVersion` proves that just as well.
+   *
+   * - `{ additionalItem: n }` — `additionalItems[n]` is the proof. It must
+   *   carry a condition of its own (`.condition()`, `create()`,
+   *   `Transaction.check`); one without, or an `n` that is not an index into
+   *   `additionalItems`, fails with `ValidationError` before anything is
+   *   written. When that condition fails, the append fails with
+   *   `VersionConflict` — never `AdditionalItemConditionFailed` — judged
+   *   after `DuplicateCommand` and the event puts, ahead of the other items.
+   *
+   *   **The caller owns the invariant**: every writer of the stream (a
+   *   handler, an import, a migration, a raw `append`) must write the item in
+   *   the same transaction as its events, conditioned the same way. An append
+   *   without it leaves the item behind the head, and every later append
+   *   fails with `VersionConflict` until it is repaired. Writing the item's
+   *   version without the events it counts moves it ahead of the head — the
+   *   one way to open a gap — so write that version only in their append.
+   * - `"snapshot"` — the inline snapshot is the proof: its `Put` is
+   *   conditioned on `asOfVersion = expectedVersion` (`attribute_not_exists`
+   *   at version 0), and a failure is a `VersionConflict`. Requires
+   *   `snapshot` (else `ValidationError`) and a stream whose snapshot config
+   *   is `mode: "inline"` without `every` (else a defect, `[EDD-9085]`). A
+   *   snapshot can lag the head (a raw `append`, data written before inline
+   *   mode), and then fails the condition: use it only when the snapshot is
+   *   known to be at the head, as {@link CommandHandlerOptions.headProof}
+   *   does.
+   */
+  readonly headProof?: HeadProof | undefined
 }
 
 /**
@@ -1514,6 +1570,45 @@ const unverifiedSnapshotRefusal = (
       `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`
 
 /**
+ * @internal `[EDD-9085]`: a snapshot head proof (`headProof: "snapshot"`) is
+ * accepted only by a stream whose snapshot is written in every append
+ * (`mode: "inline"` without `every`) — any other snapshot lags the head by
+ * design, and would fail the proof's condition. Returns the refusal message,
+ * or `undefined` when the stream accepts it.
+ */
+const snapshotProofRefusal = (
+  streamName: string,
+  settings: SnapshotSettings | undefined,
+  operation: string,
+): string | undefined =>
+  settings !== undefined && settings.mode === "inline" && settings.every === undefined
+    ? undefined
+    : `[EDD-9085] EventStream "${streamName}": ${operation} with headProof: "snapshot" requires ` +
+      `snapshot mode "inline" without "every" — the only mode that writes the snapshot in every ` +
+      `append, so it can prove the head. ` +
+      (settings === undefined
+        ? "This stream has no snapshot config."
+        : `This stream's snapshot is mode "${settings.mode}"` +
+          `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`)
+
+/**
+ * @internal Why a `headProof` is malformed — not `"snapshot"` nor
+ * `{ additionalItem: n }` with `n` a non-negative integer — or `undefined`
+ * when it is well-formed.
+ */
+const headProofShapeProblem = (headProof: unknown): string | undefined => {
+  if (headProof === "snapshot") return undefined
+  const n =
+    typeof headProof === "object" && headProof !== null
+      ? (headProof as { readonly additionalItem?: unknown }).additionalItem
+      : undefined
+  return typeof n === "number" && Number.isInteger(n) && n >= 0
+    ? undefined
+    : `headProof must be "snapshot" or { additionalItem: n } with n a non-negative integer; ` +
+        `received ${JSON.stringify(headProof) ?? String(headProof)}. Nothing was written.`
+}
+
+/**
  * @internal Why an `eventTimestamps` value cannot be written for `count`
  * events — not an array, the wrong length, or an entry that is neither a
  * valid `DateTime` (finite epoch) nor `undefined` — or `undefined` when it can. `label` opens the
@@ -1927,6 +2022,11 @@ interface AppendTransaction {
   readonly snapshotIndex: number
   /** The version the events are appended after. */
   readonly expectedVersion: number
+  /**
+   * The head proof (see {@link AppendOptionsBase.headProof}): the caller op
+   * whose own condition proves the head, or `"snapshot"`.
+   */
+  readonly headProof: HeadProof | undefined
 }
 
 /**
@@ -2643,6 +2743,29 @@ export const makeStream = <
             }
           }
 
+          // The head proof (#164) stands in for the contiguity check, so its
+          // own condition failing shares their verdict — ahead of the other
+          // additional items.
+          const proofFailed =
+            tx.headProof === "snapshot"
+              ? failedAt(tx.snapshotIndex)
+              : tx.headProof !== undefined &&
+                opConditionFailed(
+                  tx.additional,
+                  rawReasons,
+                  tx.headProof.additionalItem,
+                  tx.guardCount + tx.eventCount,
+                )
+          if (proofFailed) {
+            return Effect.fail(
+              new VersionConflict({
+                streamName: config.streamName,
+                streamId: streamIdStr,
+                expectedVersion: tx.expectedVersion,
+              }),
+            )
+          }
+
           // The additional items, attributed back to the caller OPS that
           // produced them (several items can belong to one op). Only an op's
           // own condition is `AdditionalItemConditionFailed`: a guarded put
@@ -2917,6 +3040,38 @@ export const makeStream = <
         return yield* snapshotUnavailable("append({ snapshot })")
       }
 
+      // The head proof (#164), checked ahead of the no-op fast path, as the
+      // per-event options are. An index into `additionalItems` is checked by
+      // `append`, which has them (`measureAppend` does not take them).
+      const headProof = options?.headProof
+      if (headProof !== undefined) {
+        const problem = headProofShapeProblem(headProof)
+        if (problem !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.headProof",
+            cause: problem,
+          })
+        }
+        if (headProof === "snapshot") {
+          const refusal = snapshotProofRefusal(
+            config.streamName,
+            snapshotSettings,
+            'append({ headProof: "snapshot" })',
+          )
+          if (refusal !== undefined) return yield* Effect.die(new Error(refusal))
+          if (snapshotState === undefined) {
+            return yield* new ValidationError({
+              entityType: snapshotEntityType,
+              operation: "EventStore.append.headProof",
+              cause:
+                'headProof: "snapshot" requires the inline snapshot it names: pass `snapshot` ' +
+                "with the state as of this append. Nothing was written.",
+            })
+          }
+        }
+      }
+
       // Nothing at all to write — preserve the historical no-op fast path.
       // With additional items or a dedup sentinel the transaction still runs:
       // a caller who asked for a side write means it, and silently dropping it
@@ -2950,7 +3105,9 @@ export const makeStream = <
       // (#144): an append is never split — splitting would break its
       // atomicity — so one over the limit is rejected whole by DynamoDB and
       // reported as `AppendTooLarge`, with the expanded item count.
-      const needsContiguityCheck = expectedVersion > 0 && events.length > 0
+      // A head proof (#164) proves the same thing, so it replaces the check.
+      const needsContiguityCheck =
+        expectedVersion > 0 && events.length > 0 && headProof === undefined
 
       const tableConfig = yield* config.table.Tag
       const tableName = tableConfig.name
@@ -3154,23 +3311,39 @@ export const makeStream = <
         }
       }
 
-      // The inline snapshot (#138): unconditional — see AppendOptions.snapshot.
-      // Packed per `snapshot.storedAs` (#147), so the transaction-size and
-      // item-size diagnosis count its stored bytes.
+      // The inline snapshot (#138): unconditional — see AppendOptions.snapshot
+      // — unless it is the head proof (#164), when it is conditioned on being
+      // at `expectedVersion`. Packed per `snapshot.storedAs` (#147), so the
+      // transaction-size and item-size diagnosis count its stored bytes.
       let snapshotPut: TransactWriteItem | undefined
       if (snapshotState !== undefined) {
+        const item = yield* buildSnapshotItem(
+          streamId as Record<string, unknown>,
+          snapshotState,
+          expectedVersion + events.length,
+          now,
+          "EventStore.append.snapshot",
+          eventPartitions,
+        )
         snapshotPut = {
-          Put: {
-            TableName: tableName,
-            Item: yield* buildSnapshotItem(
-              streamId as Record<string, unknown>,
-              snapshotState,
-              expectedVersion + events.length,
-              now,
-              "EventStore.append.snapshot",
-              eventPartitions,
-            ),
-          },
+          Put:
+            headProof !== "snapshot"
+              ? { TableName: tableName, Item: item }
+              : expectedVersion === 0
+                ? {
+                    TableName: tableName,
+                    Item: item,
+                    ConditionExpression: "attribute_not_exists(pk)",
+                  }
+                : {
+                    TableName: tableName,
+                    Item: item,
+                    ConditionExpression: "#asOfVersion = :expectedVersion",
+                    ExpressionAttributeNames: { "#asOfVersion": "asOfVersion" },
+                    ExpressionAttributeValues: toAttributeMap({
+                      ":expectedVersion": expectedVersion,
+                    }),
+                  },
         }
       }
 
@@ -3216,6 +3389,25 @@ export const makeStream = <
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
+      const headProof = options?.headProof
+
+      // The additional item a head proof names (#164) must exist — checked
+      // before anything is read, and ahead of the no-op fast path. Its shape
+      // is checked first, by `buildAppend`'s own rule.
+      const proofOp =
+        typeof headProof === "object" && headProofShapeProblem(headProof) === undefined
+          ? headProof.additionalItem
+          : undefined
+      if (proofOp !== undefined && proofOp >= additionalOps.length) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.append.headProof",
+          cause:
+            `headProof names additionalItems[${proofOp}], but the append has ` +
+            `${additionalOps.length} additional item${additionalOps.length === 1 ? "" : "s"}. ` +
+            "Nothing was written.",
+        })
+      }
 
       const parts = yield* buildAppend(streamId, events, expectedVersion, options)
       if (parts === undefined) return { version: expectedVersion, events: [] }
@@ -3275,6 +3467,7 @@ export const makeStream = <
           sentinelIndex,
           snapshotIndex,
           expectedVersion,
+          headProof,
         }
       }
 
@@ -3288,6 +3481,18 @@ export const makeStream = <
           additionalOps,
           "EventStore.append.additionalItems",
         )
+        // An item without a condition of its own proves nothing about the
+        // head: accepting it would drop the gap protection silently.
+        if (proofOp !== undefined && !additional.conditioned.has(proofOp)) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "EventStore.append.headProof",
+            cause:
+              `headProof names additionalItems[${proofOp}], which carries no condition of its ` +
+              "own: the proof must be conditioned on the stream being at expectedVersion " +
+              "(`.condition()`, `create()` or `Transaction.check`). Nothing was written.",
+          })
+        }
         const tx = layout(additional)
 
         // DynamoDB's rules — one operation per item (an additional item
@@ -4597,13 +4802,27 @@ export const indexDefinitions = (
 // ---------------------------------------------------------------------------
 
 /**
+ * The state and stream version a {@link CommandHandlerOptions.loadState}
+ * loads from the caller's own record: `version` is the stream version the
+ * state is as of, which the handler appends after.
+ */
+export interface LoadedState<State> {
+  readonly state: State
+  readonly version: number
+}
+
+/**
  * Handler-level configuration for {@link commandHandler}.
  *
  * `idempotency` carries the policy that is fixed for the handler; the
  * `commandId` that identifies one delivery can only be per-call and lives in the
  * handler's own options.
+ *
+ * `State` and `TStreamId` type {@link loadState}: the decider's state, and the
+ * stream id the handler is called with (`any` for a data-last handler, whose
+ * stream is not yet known).
  */
-export interface CommandHandlerOptions {
+export interface CommandHandlerOptions<State = any, TStreamId = any> {
   /**
    * Retry policy applied to `VersionConflict` **only**.
    *
@@ -4703,7 +4922,82 @@ export interface CommandHandlerOptions {
    * not extra item reads.
    */
   readonly verifySnapshot?: boolean | undefined
+
+  /**
+   * Load the state and head from the caller's own record instead of the
+   * stream (#164). `None` is a new stream: the decider's initial state at
+   * version 0.
+   *
+   * The rest of the cycle is unchanged: the If-Match check against the loaded
+   * `version`, `decide`, `evolve`, the derived items, then the append after
+   * `version` — where the caller writes the record, through `additionalItems`.
+   * A `VersionConflict` re-runs `loadState` under the {@link retry} policy, as
+   * a stream load is re-run. A no-op decision or a `decide` failure is
+   * answered from the record: the stream head is not read.
+   *
+   * - **Read strongly consistent.** An eventually consistent read can return
+   *   a record behind the head; the append then fails with `VersionConflict`
+   *   and burns a retry (nothing is corrupted).
+   * - Without {@link headProof} the append still writes the
+   *   version-contiguity check, so a record that is stale or ahead of the
+   *   head conflicts rather than opening a gap. With
+   *   `headProof: { additionalItem: n }`, the record is the proof, and its
+   *   contract (see {@link AppendOptionsBase.headProof}) covers **every**
+   *   writer of the stream.
+   * - A `version` that is not a non-negative integer, or a result that is not
+   *   an `Option`, fails with `ValidationError`
+   *   (`operation: "EventStore.commandHandler.loadState"`), never retried. A
+   *   failure of the `Effect` surfaces as is. Its error and requirements join
+   *   the handler's (a `BoundEventStream` handler's only requirements).
+   * - On a snapshot-configured stream the snapshot is not read, so its
+   *   version is unknown: a `mode: "inline"` stream without `every` still
+   *   writes it in every append; with `every` (inline or after-append), one
+   *   is written when an append crosses a multiple of `every`.
+   * - Refused with {@link verifySnapshot}`: false` (there is no stream load
+   *   to skip) and with `headProof: "snapshot"` (the handler never sees the
+   *   snapshot, so cannot know it is at the head): `[EDD-9085]` when the
+   *   handler is created.
+   */
+  readonly loadState?:
+    | ((streamId: TStreamId) => Effect.Effect<Option.Option<LoadedState<State>>, any, any>)
+    | undefined
+
+  /**
+   * The item that proves the stream head, in place of the version-contiguity
+   * `ConditionCheck`, on every append the handler makes (see
+   * {@link AppendOptionsBase.headProof}). Omitted: the check is written.
+   *
+   * - `{ additionalItem: n }` — the caller's record at `additionalItems[n]`,
+   *   conditioned on the loaded version (or its absence at version 0). Every
+   *   call whose decision appends must then return that item, carrying its
+   *   own condition; otherwise the call fails with `ValidationError` and
+   *   nothing is written. A failure of its condition is a `VersionConflict`,
+   *   and follows the {@link retry} policy. Usually paired with
+   *   {@link loadState}.
+   * - `"snapshot"` — the inline snapshot, on a `mode: "inline"` stream
+   *   without `every` (any other throws `[EDD-9085]` when the handler is
+   *   created). Applied on an attempt only when its load found the snapshot
+   *   at the head — a verified load with no event after the snapshot, or an
+   *   unverified one ({@link verifySnapshot}`: false`); otherwise that
+   *   append writes the check. A conflict goes through the same stale-snapshot
+   *   handling and retry policy as without it.
+   */
+  readonly headProof?: HeadProof | undefined
 }
+
+/** @internal The error of a handler config's {@link CommandHandlerOptions.loadState}. */
+type LoadStateError<TConfig> = TConfig extends {
+  readonly loadState: (...args: any) => Effect.Effect<any, infer EL, any>
+}
+  ? EL
+  : never
+
+/** @internal The requirements of a handler config's {@link CommandHandlerOptions.loadState}. */
+type LoadStateContext<TConfig> = TConfig extends {
+  readonly loadState: (...args: any) => Effect.Effect<any, any, infer RL>
+}
+  ? RL
+  : never
 
 /**
  * The outcome of one `decide` call, handed to a function-form
@@ -5030,8 +5324,8 @@ type CommandHandler<
   ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2 | E3 | E4,
-  DynamoClient | TableConfig | R2 | R3 | R4
+  CommandHandlerErrors<E> | E2 | E3 | E4 | LoadStateError<TConfig>,
+  DynamoClient | TableConfig | R2 | R3 | R4 | LoadStateContext<TConfig>
 >
 
 /**
@@ -5053,8 +5347,8 @@ type BoundCommandHandler<
   ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2 | E3 | E4,
-  R2 | R3 | R4
+  CommandHandlerErrors<E> | E2 | E3 | E4 | LoadStateError<TConfig>,
+  R2 | R3 | R4 | LoadStateContext<TConfig>
 >
 
 /**
@@ -5137,6 +5431,37 @@ const makeCommandHandlerImpl = <
   // Ignored on a stream without a snapshot config: there is no snapshot to trust.
   const unverifiedLoads = options?.verifySnapshot === false && snapshotSettings !== undefined
 
+  // The head proof and a caller's load (#164), refused up front (EDD-9085)
+  // when they cannot work together or on this stream.
+  const loadState = options?.loadState
+  const headProof = options?.headProof
+  const refuse = (problem: string): never => {
+    throw new Error(`[EDD-9085] EventStream "${stream.streamName}": commandHandler ${problem}`)
+  }
+  if (loadState !== undefined && typeof loadState !== "function") {
+    refuse("loadState must be a function of the stream id.")
+  }
+  if (headProof !== undefined) {
+    const problem = headProofShapeProblem(headProof)
+    if (problem !== undefined) refuse(problem.replace(" Nothing was written.", ""))
+    if (headProof === "snapshot") {
+      const refusal = snapshotProofRefusal(stream.streamName, snapshotSettings, "commandHandler")
+      if (refusal !== undefined) throw new Error(refusal)
+    }
+  }
+  if (loadState !== undefined && options?.verifySnapshot === false) {
+    refuse(
+      "with loadState and verifySnapshot: false — loadState replaces the stream load, so " +
+        "there is no snapshot load to leave unverified.",
+    )
+  }
+  if (loadState !== undefined && headProof === "snapshot") {
+    refuse(
+      'with loadState and headProof: "snapshot" — the handler never reads the snapshot, so ' +
+        "it cannot know the snapshot is at the head.",
+    )
+  }
+
   const retryPolicy = options?.retry
   const schedule =
     retryPolicy === undefined
@@ -5173,7 +5498,8 @@ const makeCommandHandlerImpl = <
       readonly state: State
       /** The version the events are appended after. */
       readonly version: number
-      readonly snapshotAsOfVersion: number
+      /** `undefined` when the state came from `loadState`: the snapshot was not read. */
+      readonly snapshotAsOfVersion: number | undefined
       /** `false` when the version is an unverified snapshot's `asOfVersion`. */
       readonly verified: boolean
       /** Events past the current snapshot (all events without one). */
@@ -5187,6 +5513,48 @@ const makeCommandHandlerImpl = <
     const load = (verify: boolean) =>
       Effect.gen(function* () {
         let state = decider.initialState
+        // The caller's own record (#164), trusted as the head: the append's
+        // check (or the head proof) catches one that is not.
+        if (loadState !== undefined) {
+          const result: unknown = yield* loadState(streamId)
+          const refused = (cause: string) =>
+            new ValidationError({
+              entityType: stream.streamName,
+              operation: "EventStore.commandHandler.loadState",
+              cause,
+            })
+          if (!Option.isOption(result)) {
+            return yield* refused(
+              "loadState must return an Option of { state, version }: None for a new stream. " +
+                "Nothing was written.",
+            )
+          }
+          if (Option.isNone(result)) {
+            const fresh: Loaded = {
+              state,
+              version: 0,
+              snapshotAsOfVersion: undefined,
+              verified: true,
+              eventsAfterSnapshot: 0,
+            }
+            return fresh
+          }
+          const record = result.value as LoadedState<State>
+          if (!Number.isInteger(record.version) || record.version < 0) {
+            return yield* refused(
+              `loadState returned version ${String(record.version)}: it must be a non-negative ` +
+                "integer, the stream version the state is as of. Nothing was written.",
+            )
+          }
+          const loaded: Loaded = {
+            state: record.state,
+            version: record.version,
+            snapshotAsOfVersion: undefined,
+            verified: true,
+            eventsAfterSnapshot: 0,
+          }
+          return loaded
+        }
         if (snapshotSettings !== undefined) {
           const latest = (yield* stream.readLatest(
             streamId,
@@ -5316,6 +5684,7 @@ const makeCommandHandlerImpl = <
           additionalItems?: ReadonlyArray<TransactWriteOp>
           idempotency?: AppendIdempotency
           snapshot?: State
+          headProof?: HeadProof
         } = {}
         if (callOptions?.metadata !== undefined) appendOptions.metadata = callOptions.metadata
         if (eventMetadata !== undefined) appendOptions.eventMetadata = eventMetadata
@@ -5330,15 +5699,35 @@ const makeCommandHandlerImpl = <
 
         // Inline snapshots (#138) ride in the append transaction: on every
         // append, or once `every` events have accumulated since the snapshot.
+        // A `loadState` load never saw the snapshot (#164), so its cadence is
+        // an append that crosses a multiple of `every`.
         const mode = snapshotSettings?.mode ?? "after-append"
         const every = snapshotSettings?.every
         const newVersion = baseVersion + newEvents.length
+        const snapshotDue = (version: number): boolean =>
+          every !== undefined &&
+          (loaded.snapshotAsOfVersion === undefined
+            ? Math.floor(version / every) > Math.floor(baseVersion / every)
+            : version - loaded.snapshotAsOfVersion >= every)
         if (
           snapshotSettings !== undefined &&
           mode === "inline" &&
-          (every === undefined || newVersion - loaded.snapshotAsOfVersion >= every)
+          (every === undefined || snapshotDue(newVersion))
         ) {
           appendOptions.snapshot = next
+        }
+
+        // The head proof (#164). The caller's record proves it on every
+        // append; the inline snapshot only when this load found it at the
+        // head — a lagging one would fail the condition, so the check stays.
+        if (typeof headProof === "object") {
+          appendOptions.headProof = headProof
+        } else if (
+          headProof === "snapshot" &&
+          appendOptions.snapshot !== undefined &&
+          loaded.snapshotAsOfVersion === baseVersion
+        ) {
+          appendOptions.headProof = "snapshot"
         }
 
         const appended = stream.append(
@@ -5362,11 +5751,7 @@ const makeCommandHandlerImpl = <
         //    Best-effort: the events are already durable, so a snapshot-write
         //    failure must not report the command as failed. The next threshold
         //    crossing retries it.
-        if (
-          mode === "after-append" &&
-          every !== undefined &&
-          result.version - loaded.snapshotAsOfVersion >= every
-        ) {
+        if (mode === "after-append" && snapshotDue(result.version)) {
           yield* stream
             .writeSnapshot(streamId, next, result.version)
             .pipe(
@@ -5694,11 +6079,17 @@ const makeCommandHandlerImpl = <
  * `EventStreamTypeId` brand of the second argument.
  */
 export const commandHandler: {
+  // `TConfig` has no default (#164): with one, a context-sensitive
+  // `loadState: (streamId) => …` fixed it at the default before the lambda
+  // was typed, so the lambda's parameter was untyped. Without options it
+  // infers as its constraint, which neither requires `commandId` nor adds a
+  // `loadState` channel.
+  //
   // Data-last. One generic signature, not a Bound/unbound overload pair:
   // `pipe` infers from an overloaded argument using its LAST signature only,
   // which typed `bound.pipe(commandHandler(decider))` as an unbound handler
   // still requiring `DynamoClient | TableConfig`.
-  <State, Command, TEvent, E, const TConfig extends CommandHandlerOptions | undefined = undefined>(
+  <State, Command, TEvent, E, const TConfig extends CommandHandlerOptions<State> | undefined>(
     decider: Decider<State, Command, TEvent, E>,
     options?: TConfig,
   ): <
@@ -5721,7 +6112,7 @@ export const commandHandler: {
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     TPartitionedIndexName extends string,
-    const TConfig extends CommandHandlerOptions | undefined = undefined,
+    const TConfig extends CommandHandlerOptions<State, StreamIdInput<TStreamIdFields>> | undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
     stream: BoundEventStream<
@@ -5748,7 +6139,7 @@ export const commandHandler: {
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     TPartitionedIndexName extends string,
-    const TConfig extends CommandHandlerOptions | undefined = undefined,
+    const TConfig extends CommandHandlerOptions<State, StreamIdInput<TStreamIdFields>> | undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
     stream: EventStream<
