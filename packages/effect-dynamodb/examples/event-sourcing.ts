@@ -6,8 +6,10 @@
  * snapshots, atomic side writes, idempotency, consistent reads, If-Match
  * expected versions, inline projections, inline snapshots + readLatest,
  * large commands as stepped commands, stream indexes, event metadata and
- * timestamps, stream index projection, and a GSI several streams share by a
- * derived partition.
+ * timestamps, stream index projection, a GSI several streams share by a
+ * derived partition, and a head proof in place of the contiguity check —
+ * the inline snapshot, or the application's own state record that the
+ * command handler loads its state from.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -239,6 +241,46 @@ const InlineMatchEvents = EventStore.makeStream({
   streamId: { composite: ["matchId"] },
   snapshot: { schema: MatchStateSchema, mode: "inline" },
 })
+// #endregion
+
+// #region state-record
+// The application's own record of a match: its state, and the stream version
+// that state is as of. Every append writes it, in the same transaction.
+class MatchRecord extends Schema.Class<MatchRecord>("MatchRecord")({
+  matchId: Schema.String,
+  state: MatchStateSchema,
+  streamVersion: Schema.Number,
+}) {}
+
+const MatchRecords = Entity.make({
+  model: MatchRecord,
+  entityType: "MatchRecord",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const RecordTable = Table.make({ schema: AppSchema, entities: { MatchRecords } })
+
+const RecordedMatches = EventStore.makeStream({
+  table: RecordTable,
+  streamName: "RecordedMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+})
+
+// The record an append after `decision.version` writes, conditioned on the
+// version the handler loaded: it holds only while the stream is still there.
+const recordOf =
+  (matchId: string) =>
+  ({ state, version, events }: EventStore.Decision<MatchState, MatchEvent>) => [
+    MatchRecords.put({ matchId, state, streamVersion: version + events.length }).pipe(
+      version === 0
+        ? MatchRecords.condition((t, { notExists }) => notExists(t.streamVersion))
+        : MatchRecords.condition({ streamVersion: version }),
+    ),
+  ]
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -884,6 +926,24 @@ const program = Effect.gen(function* () {
     `verifySnapshot: false: version ${ended.version}, status=${ended.state.status}; readLatest version ${lean.version}`,
   )
 
+  // #region head-proof-snapshot
+  // The inline snapshot proves the head, so no contiguity check is written.
+  const handleProved = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+    headProof: "snapshot",
+  })
+  yield* handleProved(
+    { matchId: "m-7" },
+    { _tag: "StartMatch", venue: "Eden Gardens", homeTeam: "IND", awayTeam: "AUS" },
+  )
+  // [event put, snapshot put conditioned on asOfVersion = 1]
+  const proved = yield* handleProved(
+    { matchId: "m-7" },
+    { _tag: "CompleteInnings", innings: 1, runs: 305, wickets: 10 },
+  )
+  // → version 2
+  // #endregion
+  yield* Console.log(`headProof "snapshot": version ${proved.version}`)
+
   // --- Large commands: stepped commands ---
   yield* Console.log("\n=== Stepped commands ===")
   // #region stepped-command
@@ -1325,6 +1385,50 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Series partition:\n  ${sortKeys.join("\n  ")}`)
   yield* Console.log(`Match t1 through bySeries: ${t1.map((e) => `v${e.version}`).join(", ")}`)
 
+  // --- State from the application's own record ---
+  yield* Console.log("\n=== loadState + headProof ===")
+  const recordConfig = yield* RecordTable.Tag
+  yield* client
+    .deleteTable({ TableName: recordConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client.createTable({
+    TableName: recordConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    ...Table.definition(RecordTable),
+  })
+  // #region load-state
+  const recordedMatches = yield* EventStore.bind(RecordedMatches)
+  const handleRecorded = EventStore.commandHandler(matchDecider, recordedMatches, {
+    // State and head from the record, read strongly consistent; none is a new match.
+    loadState: ({ matchId }) =>
+      Effect.gen(function* () {
+        const record = yield* Entity.consistentRead(MatchRecords.get({ matchId }))
+        return Option.some({ state: record.state, version: record.streamVersion })
+      }).pipe(Effect.catchTag("ItemNotFound", () => Effect.succeed(Option.none()))),
+    // The record at additionalItems[0] proves the head: no contiguity check.
+    headProof: { additionalItem: 0 },
+    retry: 3,
+  })
+
+  yield* handleRecorded(
+    { matchId: "m-8" },
+    { _tag: "StartMatch", venue: "Gabba", homeTeam: "AUS", awayTeam: "IND" },
+    { additionalItems: recordOf("m-8") },
+  )
+  // Loaded from the record: one GetItem, then [event put, record put].
+  const recorded = yield* handleRecorded(
+    { matchId: "m-8" },
+    { _tag: "CompleteInnings", innings: 1, runs: 260, wickets: 10 },
+    { additionalItems: recordOf("m-8") },
+  )
+  // → version 2; the record holds the same state at streamVersion 2
+  // #endregion
+  const stored = yield* Entity.consistentRead(MatchRecords.get({ matchId: "m-8" }))
+  yield* Console.log(
+    `loadState: version ${recorded.version}; record at streamVersion ${stored.streamVersion}`,
+  )
+  yield* client.deleteTable({ TableName: recordConfig.name })
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
@@ -1367,6 +1471,7 @@ const AppLayer = Layer.mergeAll(
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
   SeriesTable.layer({ name: "event-sourcing-series" }),
+  RecordTable.layer({ name: "event-sourcing-records" }),
   WebCrypto,
 )
 

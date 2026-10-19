@@ -259,12 +259,14 @@ The handler returns `{ state, version, events }`, where `state` is the fold from
 
 `append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
 
-- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append over the limit is rejected by DynamoDB and nothing is written; the library recognises the rejection, counts the items it sent, and fails with a typed `AppendTooLarge` error carrying that count, with DynamoDB's error as its `cause`. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
+- **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot unless a [head proof](#step-23-state-from-your-own-record) replaces it, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append over the limit is rejected by DynamoDB and nothing is written; the library recognises the rejection, counts the items it sent, and fails with a typed `AppendTooLarge` error carrying that count, with DynamoDB's error as its `cause`. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
 - **4 MB total payload per transaction, 400 KB per item.** An append whose items pass 4 MB, or with any one item over 400 KB, is rejected by DynamoDB and nothing is written. The append fails with a `ValidationError` that names the culprit: the item (`the event at version 2`, the inline snapshot, the idempotency sentinel or `operation 0 (User)` among `additionalItems`) and its key, or for 4 MB the largest items. DynamoDB's own error is kept as the `cause`. Keep event payloads small; large blobs belong in S3 with a reference in the event.
 
 An append is **never split** across transactions, because splitting breaks its atomicity. If a command legitimately decides more than one transaction holds, split it into [stepped commands](#step-18-large-commands--stepped-commands): one command, one decision, one atomic append.
 
 `append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
+
+The check reads the event at `expectedVersion`, and DynamoDB bills a `ConditionCheck` in a transaction at 2 WCU per KB of the item it checks, so with large events it is a real share of every append. When the transaction already holds an item that proves the head (the inline snapshot, or a state record of your own), `headProof` names that item and the check is left out: see [Proving the head with the snapshot](#proving-the-head-with-the-snapshot) and [Step 23](#step-23-state-from-your-own-record).
 
 ---
 
@@ -887,6 +889,35 @@ So in the last two cases, `decide` **can run twice for one call**, and so can a 
 The head check is a `Query` for any event *after* the snapshot's version (reverse, `Limit: 1`), not a read of the newest event. While the snapshot is current, that range is empty, so the `Query` reads no items and costs only DynamoDB's per-request minimum, however large the events are. It reads an event only when the snapshot lags, and then the event it reads is the head. So a decision that appends nothing costs one extra round trip, not extra item reads.
 
 The option is accepted only on a `mode: "inline"` stream without `every`, the only mode that keeps the snapshot at the head. On any other snapshot config, creating the handler throws `[EDD-9068]`, and `readLatest` dies with it. On a stream without a snapshot config the option is ignored.
+
+### Proving the head with the snapshot
+
+Every append after version 0 carries the [version-contiguity check](#append-limits-and-version-contiguity), which reads the event at `expectedVersion`. On an inline stream without `every`, the snapshot in the same transaction can prove the head instead. `headProof: "snapshot"` conditions the snapshot `Put` on `asOfVersion = expectedVersion` (on its absence at version 0) and leaves the check out:
+
+```typescript region="head-proof-snapshot" example="event-sourcing.ts"
+// The inline snapshot proves the head, so no contiguity check is written.
+const handleProved = EventStore.commandHandler(matchDecider, inlineMatchEvents, {
+  headProof: "snapshot",
+})
+yield* handleProved(
+  { matchId: "m-7" },
+  { _tag: "StartMatch", venue: "Eden Gardens", homeTeam: "IND", awayTeam: "AUS" },
+)
+// [event put, snapshot put conditioned on asOfVersion = 1]
+const proved = yield* handleProved(
+  { matchId: "m-7" },
+  { _tag: "CompleteInnings", innings: 1, runs: 305, wickets: 10 },
+)
+// → version 2
+```
+
+Why it is enough: the snapshot's condition proves the head is at least `expectedVersion`, and the event put at `expectedVersion + 1` (`attribute_not_exists`) proves it is at most that.
+
+- The handler uses the proof only when its load found the snapshot at the head: a verified load with no event after the snapshot, or an unverified one (`verifySnapshot: false`). A snapshot that lags (a raw `append`, data written before inline mode) would fail the condition, so that append writes the check, and its inline snapshot brings the snapshot back to the head.
+- A failed proof is a `VersionConflict`, handled as any other: the `retry` policy, or under `verifySnapshot: false` the stale-snapshot re-decision above.
+- On `append`, pass it with the snapshot: `append(id, events, v, { snapshot, headProof: "snapshot" })`. The caller then owns knowing that the snapshot is at `v`; a lagging one is a `VersionConflict`, never a gap.
+- Accepted only on a `mode: "inline"` stream without `every`, and only with `snapshot` on the append. Any other snapshot config throws `[EDD-9085]` when the handler is created, and `append` dies with it. Without a snapshot, `append` fails with `ValidationError`.
+- Without `headProof`, nothing changes: the check is written, and the inline snapshot `Put` is unconditional.
 
 ---
 
@@ -1703,6 +1734,112 @@ const t1 = yield* seriesMatches.readIndex("bySeries", firstTest, {
 
 ---
 
+## Step 23: State From Your Own Record
+
+Some applications already keep the aggregate's state in a record of their own: its current state plus the stream version it is as of, written with every append and conditioned on the version that was loaded. That record makes two things redundant:
+
+- **The stream load.** `loadState` gives the handler the state and the head from the record, instead of replaying the stream or reading its snapshot.
+- **The contiguity check.** The record's condition already proves the head, so `headProof: { additionalItem: n }` names it and the check is left out.
+
+The record lives on its own table here, next to the stream:
+
+```typescript region="state-record" example="event-sourcing.ts"
+// The application's own record of a match: its state, and the stream version
+// that state is as of. Every append writes it, in the same transaction.
+class MatchRecord extends Schema.Class<MatchRecord>("MatchRecord")({
+  matchId: Schema.String,
+  state: MatchStateSchema,
+  streamVersion: Schema.Number,
+}) {}
+
+const MatchRecords = Entity.make({
+  model: MatchRecord,
+  entityType: "MatchRecord",
+  primaryKey: {
+    pk: { field: "pk", composite: ["matchId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const RecordTable = Table.make({ schema: AppSchema, entities: { MatchRecords } })
+
+const RecordedMatches = EventStore.makeStream({
+  table: RecordTable,
+  streamName: "RecordedMatch",
+  events: [MatchStarted, InningsCompleted, MatchEnded],
+  streamId: { composite: ["matchId"] },
+})
+
+// The record an append after `decision.version` writes, conditioned on the
+// version the handler loaded: it holds only while the stream is still there.
+const recordOf =
+  (matchId: string) =>
+  ({ state, version, events }: EventStore.Decision<MatchState, MatchEvent>) => [
+    MatchRecords.put({ matchId, state, streamVersion: version + events.length }).pipe(
+      version === 0
+        ? MatchRecords.condition((t, { notExists }) => notExists(t.streamVersion))
+        : MatchRecords.condition({ streamVersion: version }),
+    ),
+  ]
+```
+
+The handler loads from the record, decides, and appends the events with the record as `additionalItems[0]`:
+
+```typescript region="load-state" example="event-sourcing.ts"
+const recordedMatches = yield* EventStore.bind(RecordedMatches)
+const handleRecorded = EventStore.commandHandler(matchDecider, recordedMatches, {
+  // State and head from the record, read strongly consistent; none is a new match.
+  loadState: ({ matchId }) =>
+    Effect.gen(function* () {
+      const record = yield* Entity.consistentRead(MatchRecords.get({ matchId }))
+      return Option.some({ state: record.state, version: record.streamVersion })
+    }).pipe(Effect.catchTag("ItemNotFound", () => Effect.succeed(Option.none()))),
+  // The record at additionalItems[0] proves the head: no contiguity check.
+  headProof: { additionalItem: 0 },
+  retry: 3,
+})
+
+yield* handleRecorded(
+  { matchId: "m-8" },
+  { _tag: "StartMatch", venue: "Gabba", homeTeam: "AUS", awayTeam: "IND" },
+  { additionalItems: recordOf("m-8") },
+)
+// Loaded from the record: one GetItem, then [event put, record put].
+const recorded = yield* handleRecorded(
+  { matchId: "m-8" },
+  { _tag: "CompleteInnings", innings: 1, runs: 260, wickets: 10 },
+  { additionalItems: recordOf("m-8") },
+)
+// → version 2; the record holds the same state at streamVersion 2
+```
+
+### `loadState`
+
+- It returns an `Option` of `{ state, version }`. `None` is a new stream: the decider's initial state at version 0.
+- The rest of the cycle is unchanged: the If-Match check against the loaded version, `decide`, the fold, the derived items, the append. A `VersionConflict` runs `loadState` again under the `retry` policy.
+- A domain error or a no-op is answered from the record. The handler trusts it and doesn't read the stream.
+- **Read strongly consistent.** An eventually consistent read can return a record behind the head. Nothing is corrupted (the append conflicts and retries), but every stale read costs a retry.
+- Its error and requirements join the handler's. On a bound stream they are the handler's only requirements.
+- A `version` that is not a non-negative integer, or a result that is not an `Option`, fails with `ValidationError` (`operation: "EventStore.commandHandler.loadState"`), never retried.
+- Without `headProof`, the append still writes the contiguity check, so a record that is stale or ahead conflicts instead of opening a gap.
+- The snapshot is not read. On a `mode: "inline"` stream without `every`, the snapshot is still written in every append. With `every`, one is written when an append crosses a multiple of `every`.
+- Creating the handler throws `[EDD-9085]` for `loadState` with `verifySnapshot: false` (there is no stream load to skip) or with `headProof: "snapshot"` (the handler never sees the snapshot).
+
+### `headProof: { additionalItem: n }`
+
+- On `append`, `additionalItems[n]` is the proof: `append(id, events, v, { additionalItems, headProof: { additionalItem: n } })`. On the handler, it applies to every append the handler makes, so every call that appends must return that item.
+- The item must carry a condition of its own: `.condition()`, `create()` or `Transaction.check`. One without, or an `n` that is not an index into `additionalItems`, fails with `ValidationError` before anything is written. A put with no condition would prove nothing.
+- When its condition fails, the append fails with `VersionConflict` (so the `retry` policy sees it), never `AdditionalItemConditionFailed`. It ranks after `DuplicateCommand` and the event puts, ahead of the other additional items.
+
+:::caution[The record is a contract with every writer]
+The library can't see who else writes the stream. The proof holds only while **every** writer (the handler, an import, a migration, a raw `stream.append`) writes the record in the same transaction as its events, conditioned the same way.
+
+- A writer that appends without the record leaves the record behind the head. Every later append then fails its event put, so the stream loops on `VersionConflict` until the record is repaired. That's a stuck stream, not a gap.
+- A record whose version is written without the events it counts moves ahead of the head, and that is the one way to open a gap. Write the record's version only in the append of those events.
+:::
+
+---
+
 ## Running the Example
 
 The complete runnable example is at [`examples/event-sourcing.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/event-sourcing.ts) in the repository.
@@ -1750,6 +1887,7 @@ const AppLayer = Layer.mergeAll(
   ScorecardTable.layer({ name: "event-sourcing-scorecards" }),
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
   SeriesTable.layer({ name: "event-sourcing-series" }),
+  RecordTable.layer({ name: "event-sourcing-records" }),
   WebCrypto,
 )
 
@@ -1788,6 +1926,8 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Index projection** | `projection: "withoutMetadata"` (`INCLUDE` without `metadata`, read in one query) or `"keys"` (`INCLUDE ["__edd_e__"]`, events fetched from the table) on a stream index; the deployed `Projection` must match `indexDefinitions` |
 | **Packed storage** | `makeStream({ storedAs: { data: DynamoModel.Packed(...) } })` and `snapshot.storedAs` store data and state as JSON, compressed above a threshold; readers decode by the stored form, so a stream can mix encodings |
 | **Shared indexes** | A GSI index's `partition` (from the stream id or the event) lets several streams write one partition, and its `snapshot` puts each stream's snapshot there too; `indexDefinitions` emits the shared GSI once; `readIndex` takes the `partition` |
+| **Head proof** | `headProof: "snapshot"` (inline without `every`) or `{ additionalItem: n }` names an item whose own condition proves the head, in place of the version-contiguity `ConditionCheck`; its failure is a `VersionConflict` |
+| **State from your own record** | `commandHandler(..., { loadState })` loads state and head from the application's record instead of the stream; with `headProof: { additionalItem }`, the record written with every append is also the version guard |
 
 ## What's Next?
 

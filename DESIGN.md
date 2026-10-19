@@ -3323,6 +3323,57 @@ items and costs only DynamoDB's per-request minimum, however large the events ar
 lagging snapshot makes it read an event (the head). The trade-off for such decisions is
 one extra round trip, not extra item reads.
 
+### Head Proof and `loadState` (#164)
+
+Every append after version 0 carries the version-contiguity `ConditionCheck` on the event
+at `expectedVersion`. Inside a transaction DynamoDB bills it at 2 WCU per KB of the
+checked item, so with large events it is a sizeable share of every append. The event
+puts' `attribute_not_exists(pk)` already rejects a stale `expectedVersion`; the check
+rejects one ahead of the head. An item whose own condition holds only at
+`expectedVersion` proves the head is at least that, the event put at
+`expectedVersion + 1` that it is at most that — so it can replace the check.
+
+- **`append({ headProof })`** — `HeadProof = { additionalItem: n } | "snapshot"`. Omitted:
+  the check is written, exactly as before.
+  - `{ additionalItem: n }`: `additionalItems[n]` must carry a condition of its own
+    (`.condition()`, `create()`, `Transaction.check`; a guarded put's read guard does not
+    count) — else, or for an `n` out of range, `ValidationError` before anything is
+    written. Its own condition failing is `VersionConflict` (judged through a guarded
+    put's verdict, so a lost race is still rewritten), ranked after `DuplicateCommand` and
+    the event puts, ahead of the other additional items.
+  - `"snapshot"`: the inline snapshot `Put` is conditioned on `asOfVersion = :expected`
+    (`attribute_not_exists(pk)` at 0); a failure at its position is `VersionConflict`.
+    Needs `snapshot` (`ValidationError`) and a `mode: "inline"` stream without `every`
+    (`[EDD-9085]`, a defect). A lagging snapshot fails the condition — a conflict, never a
+    gap.
+  - `measureAppend` accepts it and leaves the check out of `transactionBytes`.
+  - **The caller's contract** (`{ additionalItem }`): every writer of the stream writes
+    the item, conditioned the same way, in the same transaction as its events. An append
+    without it leaves the record behind the head (a `VersionConflict` loop, not a gap); a
+    record version written without its events moves it ahead of the head — the one way to
+    open a gap.
+- **`commandHandler({ loadState })`** — `(streamId) => Effect<Option<{ state, version }>,
+  EL, RL>` replaces the stream load; `None` is version 0 with the initial state. If-Match,
+  `decide`, the fold and the append are unchanged; a `VersionConflict` re-runs it under
+  `retry`; a no-op or domain error is answered from the record. `EL` / `RL` join the
+  handler's channels (`LoadStateError` / `LoadStateContext` of the inferred `TConfig`,
+  which therefore has no default type: a default fixed `TConfig` before an inline
+  `(streamId) => …` was contextually typed). A bad `version` or a non-`Option` result is a
+  `ValidationError` (`EventStore.commandHandler.loadState`), never retried. The snapshot is
+  not read: inline without `every` still writes it every append; with `every`, a snapshot
+  is written when an append crosses a multiple of `every`.
+- **`commandHandler({ headProof })`** — the handler-level proof for every append.
+  `{ additionalItem }` is passed as is (a call that appends must return the item).
+  `"snapshot"` is applied per attempt only when the load found the snapshot at the head
+  (`loaded.version === snapshotAsOfVersion`: a verified load with no event after it, an
+  unverified load, or an empty stream); otherwise that append writes the check, and a
+  conflict takes the existing stale-snapshot path.
+- **Refused at construction (`[EDD-9085]`)**: `loadState` with `verifySnapshot: false`
+  (no stream load to skip), `loadState` with `headProof: "snapshot"` (the snapshot is never
+  read), `headProof: "snapshot"` on any other snapshot config, a malformed `headProof`.
+
+Design: `docs/designs/eventstore-head-proof.md`.
+
 ### Large Commands — Stepped Commands
 
 An append is always one `TransactWriteItems`: it is never split. An append receives
@@ -4305,8 +4356,13 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 | `EDD-9080` | `EventStore.ts` | `query.index` without `partition` for an index that derives its partition, or with one for a stream-scoped index (a defect; the first is unreachable from typed code) |
+| `EDD-9081` | `internal/EventProjection.ts`, `internal/MultiProjection.ts` | A projection the library cannot run: a `versioned`, `softDelete` or `timeSeries` read model, a checkpoint field the model lacks, a non-integer checkpoint offset, `removal` / `outbox` on a read model with `unique` constraints, `outbox` without `revision`, `checkpoints` declaring neither `field` nor `sources`, or an `outbox` operation on a projection without one |
+| `EDD-9082` | `internal/EventProjection.ts` | Two streams given to `processBatch` / `decoder` store events under the same `__edd_e__` marker |
+| `EDD-9083` | `change-feed/ChangeFeed.ts` | `changeFeed` options it cannot honour: `lease.renewEvery` of half the lease `duration` or more, a `batchSize` outside 1–1000, or a `maxConcurrentReads` that is not a positive integer |
+| `EDD-9084` | `change-feed/CheckpointStore.ts` | `CheckpointStore.layerDynamoDB` / `makeDynamoDB` given a `finishedTtl` under 28 hours (`CheckpointStore.minFinishedTtl`) |
+| `EDD-9085` | `EventStore.ts` | A head proof that cannot work (#164): `headProof: "snapshot"` on a stream whose snapshot config is not `mode: "inline"` without `every` (a defect from `append`, thrown by `commandHandler` at handler construction); and, at handler construction, a malformed handler `headProof`, a `loadState` that is not a function, `loadState` with `verifySnapshot: false`, or `loadState` with `headProof: "snapshot"` |
 
-Next free code: **`EDD-9081`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9086`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 
