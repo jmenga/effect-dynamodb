@@ -9491,3 +9491,808 @@ describe("EventStore per-event metadata (#144)", () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// headProof + commandHandler loadState (#164)
+// ---------------------------------------------------------------------------
+
+describe("EventStore headProof and loadState (#164)", () => {
+  const ProofInline = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "ProofMatch",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, mode: "inline" },
+  })
+  const ProofEvery = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "ProofEvery",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, mode: "inline", every: 3 },
+  })
+  const ProofAfter = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "ProofAfter",
+    events: [MatchStarted, InningsCompleted, MatchEnded],
+    streamId: { composite: ["matchId"] },
+    snapshot: { schema: MatchStateSchema, every: 3 },
+  })
+
+  const startMatch = () => new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })
+  const innings = (runs: number) => new InningsCompleted({ innings: 1, runs, wickets: 1 })
+  const cancelled = (reasons: ReadonlyArray<{ Code: string; Message?: string }>) => ({
+    name: "TransactionCanceledException",
+    CancellationReasons: reasons,
+  })
+  /** The caller's state record: `lastSeq` stands for the stream version. */
+  const record = (version: number, loaded: number) =>
+    Watermarks.put({ writerId: "m-1", lastSeq: version }).pipe(
+      loaded === 0
+        ? Watermarks.condition((t, { notExists }) => notExists(t.lastSeq))
+        : Watermarks.condition({ lastSeq: loaded }),
+    )
+  const kinds = (items: ReadonlyArray<any>) =>
+    items.map((i) =>
+      i.ConditionCheck !== undefined ? "check" : fromAttributeMap(i.Put.Item).__edd_e__,
+    )
+  const sent = (call = 0) => mockTransactWriteItems.mock.calls[call]![0].TransactItems
+  const inProgress = { status: "in-progress" as const, innings: [] }
+  const dies = (exit: Exit.Exit<unknown, unknown>, code: string) => {
+    expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+    expect(String(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause))).toContain(code)
+  }
+
+  describe("append({ headProof: { additionalItem } })", () => {
+    it.effect("writes no contiguity check, and the record carries its condition", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        const result = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [record(4, 3)],
+          headProof: { additionalItem: 0 },
+        })
+
+        expect(result.version).toBe(4)
+        expect(kinds(sent())).toEqual(["match.event", "Watermark"])
+        const guard = sent()[1].Put
+        expect(guard.ConditionExpression).toBe("#e0 = :e1")
+        expect(guard.ExpressionAttributeNames).toEqual({ "#e0": "lastSeq" })
+        expect(fromAttributeMap(guard.ExpressionAttributeValues)).toEqual({ ":e1": 3 })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("without headProof the check is written exactly as before", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [record(4, 3)],
+        })
+
+        expect(kinds(sent())).toEqual(["check", "match.event", "Watermark"])
+        expect(sent()[0].ConditionCheck.ConditionExpression).toBe("attribute_exists(pk)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "the proof's condition failure is a VersionConflict, not AdditionalItemConditionFailed",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValue(
+            cancelled([{ Code: "None" }, { Code: "None" }, { Code: "ConditionalCheckFailed" }]),
+          )
+
+          const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+            additionalItems: [Watermarks.put({ writerId: "other", lastSeq: 1 }), record(4, 3)],
+            headProof: { additionalItem: 1 },
+          }).pipe(Effect.flip)
+
+          expect(error._tag).toBe("VersionConflict")
+          expect((error as VersionConflict).expectedVersion).toBe(3)
+          expect((error as VersionConflict).streamId).toBe("m-1")
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("ranks the proof ahead of the other additional items", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [
+            Watermarks.put({ writerId: "other", lastSeq: 1 }).pipe(
+              Watermarks.condition({ lastSeq: 0 }),
+            ),
+            record(4, 3),
+          ],
+          headProof: { additionalItem: 1 },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("another item's condition failure is still AdditionalItemConditionFailed", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }, { Code: "None" }]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [
+            Watermarks.put({ writerId: "other", lastSeq: 1 }).pipe(
+              Watermarks.condition({ lastSeq: 0 }),
+            ),
+            record(4, 3),
+          ],
+          headProof: { additionalItem: 1 },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("AdditionalItemConditionFailed")
+        expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("DuplicateCommand still wins over the proof", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [record(4, 3)],
+          headProof: { additionalItem: 0 },
+          idempotency: { commandId: "cmd-1" },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("DuplicateCommand")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a guarded put as the proof is judged through its verdict", () =>
+      Effect.gen(function* () {
+        // Registrations is versioned + unique: its put expands to the row, its
+        // sentinel and a retained snapshot. The row is missing, so a failure
+        // of the row's condition is the caller's condition.
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([
+            { Code: "None" },
+            { Code: "ConditionalCheckFailed" },
+            { Code: "None" },
+            { Code: "None" },
+          ]),
+        )
+
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [
+            Registrations.put({ regId: "m-1", code: "C1" }).pipe(
+              Registrations.condition({ code: "C0" }),
+            ),
+          ],
+          headProof: { additionalItem: 0 },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect(kinds(sent())[0]).toBe("match.event")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("accepts create() and Transaction.check as the proof", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [startMatch()], 0, {
+          additionalItems: [Watermarks.create({ writerId: "m-1", lastSeq: 1 })],
+          headProof: { additionalItem: 0 },
+        })
+        expect(sent(0)[1].Put.ConditionExpression).toContain("attribute_not_exists")
+
+        yield* MatchEvents.append({ matchId: "m-1" }, [innings(1)], 1, {
+          additionalItems: [
+            Transaction.check(
+              Watermarks.get({ writerId: "m-1" }),
+              Expression.condition({ eq: { lastSeq: 1 } }),
+            ),
+          ],
+          headProof: { additionalItem: 0 },
+        })
+        expect(kinds(sent(1).slice(0, 1))).toEqual(["match.event"])
+        expect(sent(1)[1].ConditionCheck).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses an item without a condition of its own", () =>
+      Effect.gen(function* () {
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [Watermarks.put({ writerId: "m-1", lastSeq: 4 })],
+          headProof: { additionalItem: 0 },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
+        expect(String((error as ValidationError).cause)).toContain("no condition of its own")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses a guarded put the caller set no condition on", () =>
+      Effect.gen(function* () {
+        const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+          additionalItems: [Registrations.put({ regId: "m-1", code: "C1" })],
+          headProof: { additionalItem: 0 },
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "refuses an index out of range, before anything is read — no-op append included",
+      () =>
+        Effect.gen(function* () {
+          const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+            additionalItems: [record(4, 3)],
+            headProof: { additionalItem: 1 },
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect(String((error as ValidationError).cause)).toContain("1 additional item.")
+
+          const empty = yield* MatchEvents.append({ matchId: "m-1" }, [], 3, {
+            headProof: { additionalItem: 0 },
+          }).pipe(Effect.flip)
+          expect(empty._tag).toBe("ValidationError")
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expect(mockGetItem).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses a malformed headProof", () =>
+      Effect.gen(function* () {
+        for (const headProof of [{ additionalItem: -1 }, { additionalItem: 0.5 }, "items", {}]) {
+          const error = yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+            additionalItems: [record(4, 3)],
+            headProof: headProof as EventStore.HeadProof,
+          }).pipe(Effect.flip)
+          expect(error._tag).toBe("ValidationError")
+          expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
+        }
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe('append({ headProof: "snapshot" })', () => {
+    it.effect("conditions the inline snapshot on asOfVersion and writes no check", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* ProofInline.append({ matchId: "m-1" }, [innings(10)], 3, {
+          snapshot: inProgress,
+          headProof: "snapshot",
+        })
+
+        expect(kinds(sent())).toEqual(["proofmatch.event", "proofmatch.snapshot"])
+        const put = sent()[1].Put
+        expect(put.ConditionExpression).toBe("#asOfVersion = :expectedVersion")
+        expect(put.ExpressionAttributeNames).toEqual({ "#asOfVersion": "asOfVersion" })
+        expect(fromAttributeMap(put.ExpressionAttributeValues)).toEqual({ ":expectedVersion": 3 })
+        expect(fromAttributeMap(put.Item).asOfVersion).toBe(4)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("at version 0 the snapshot must not exist", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* ProofInline.append({ matchId: "m-1" }, [startMatch()], 0, {
+          snapshot: inProgress,
+          headProof: "snapshot",
+        })
+
+        expect(sent()[1].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("without headProof the inline snapshot stays unconditional", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* ProofInline.append({ matchId: "m-1" }, [innings(10)], 3, { snapshot: inProgress })
+
+        expect(kinds(sent())).toEqual(["check", "proofmatch.event", "proofmatch.snapshot"])
+        expect(sent()[2].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a failure at the snapshot's position is a VersionConflict", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockRejectedValue(
+          cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]),
+        )
+
+        const error = yield* ProofInline.append({ matchId: "m-1" }, [innings(10)], 3, {
+          snapshot: inProgress,
+          headProof: "snapshot",
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("requires the snapshot option", () =>
+      Effect.gen(function* () {
+        const error = yield* ProofInline.append({ matchId: "m-1" }, [innings(10)], 3, {
+          headProof: "snapshot",
+        }).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("dies with EDD-9085 on a stream whose snapshot cannot prove the head", () =>
+      Effect.gen(function* () {
+        dies(
+          yield* ProofEvery.append({ matchId: "m-1" }, [innings(10)], 3, {
+            snapshot: inProgress,
+            headProof: "snapshot",
+          }).pipe(Effect.exit),
+          "EDD-9085",
+        )
+        dies(
+          yield* ProofAfter.append({ matchId: "m-1" }, [innings(10)], 3, {
+            snapshot: inProgress,
+            headProof: "snapshot",
+          }).pipe(Effect.exit),
+          "EDD-9085",
+        )
+        dies(
+          yield* MatchEvents.append({ matchId: "m-1" }, [innings(10)], 3, {
+            headProof: "snapshot",
+          }).pipe(Effect.exit),
+          "has no snapshot config",
+        )
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("measureAppend({ headProof })", () => {
+    it.effect("leaves the check out of transactionBytes", () =>
+      Effect.gen(function* () {
+        const plain = yield* MatchEvents.measureAppend({ matchId: "m-1" }, [innings(10)], 3)
+        const proved = yield* MatchEvents.measureAppend({ matchId: "m-1" }, [innings(10)], 3, {
+          headProof: { additionalItem: 0 },
+        })
+
+        expect(proved.events).toEqual(plain.events)
+        expect(proved.transactionBytes).toBeLessThan(plain.transactionBytes)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("counts the snapshot proof's condition", () =>
+      Effect.gen(function* () {
+        const plain = yield* ProofInline.measureAppend({ matchId: "m-1" }, [innings(10)], 3, {
+          snapshot: inProgress,
+        })
+        const proved = yield* ProofInline.measureAppend({ matchId: "m-1" }, [innings(10)], 3, {
+          snapshot: inProgress,
+          headProof: "snapshot",
+        })
+        const unchecked = yield* ProofInline.measureAppend({ matchId: "m-1" }, [innings(10)], 3, {
+          snapshot: inProgress,
+          headProof: { additionalItem: 0 },
+        })
+
+        expect(proved.snapshot).toBe(plain.snapshot)
+        // The check is gone; the snapshot's condition is counted.
+        expect(proved.transactionBytes).toBeLessThan(plain.transactionBytes)
+        expect(proved.transactionBytes).toBeGreaterThan(unchecked.transactionBytes)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("commandHandler({ loadState })", () => {
+    /** A handler whose state lives in the caller's record. */
+    const recordHandler = (
+      loads: ReadonlyArray<Option.Option<EventStore.LoadedState<MatchState>>>,
+      extra: Omit<EventStore.CommandHandlerOptions, "loadState"> = {},
+    ) => {
+      const loadState = vi.fn()
+      for (const load of loads) loadState.mockReturnValueOnce(Effect.succeed(load))
+      const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+        ...extra,
+        loadState: (streamId) => loadState(streamId) as Effect.Effect<(typeof loads)[number]>,
+      })
+      return { handle, loadState }
+    }
+    const withRecord = (decision: EventStore.Decision<MatchState, MatchEvent>) => [
+      record(decision.version + decision.events.length, decision.version),
+    ]
+
+    it.effect("None is a new stream: the initial state at version 0", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const { handle, loadState } = recordHandler([Option.none()], {
+          headProof: { additionalItem: 0 },
+        })
+
+        const result = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+          { additionalItems: withRecord },
+        )
+
+        expect(result.version).toBe(1)
+        expect(result.state.status).toBe("in-progress")
+        expect(loadState).toHaveBeenCalledWith({ matchId: "m-1" })
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(kinds(sent())).toEqual(["match.event", "Watermark"])
+        expect(sent()[1].Put.ConditionExpression).toContain("attribute_not_exists")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "decides on the loaded state and appends after its version, without reading the stream",
+      () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          const { handle } = recordHandler([Option.some({ state: inProgress, version: 5 })], {
+            headProof: { additionalItem: 0 },
+          })
+
+          const result = yield* handle(
+            { matchId: "m-1" },
+            { _tag: "CompleteInnings", innings: 1, runs: 200, wickets: 3 },
+            { additionalItems: withRecord },
+          )
+
+          expect(result.version).toBe(6)
+          expect(result.state.innings).toEqual([{ runs: 200, wickets: 3 }])
+          expect(mockQuery).not.toHaveBeenCalled()
+          expect(mockGetItem).not.toHaveBeenCalled()
+          expect(firstAppendedEvent({ TransactItems: sent() }).version).toBe(6)
+          expect(kinds(sent())).toEqual(["match.event", "Watermark"])
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("without headProof the append keeps the contiguity check", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const { handle } = recordHandler([Option.some({ state: inProgress, version: 5 })])
+
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "EndMatch", result: "AUS won" },
+          { additionalItems: withRecord },
+        )
+
+        expect(kinds(sent())).toEqual(["check", "match.event", "Watermark"])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a VersionConflict re-runs loadState under the retry policy", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems
+          .mockRejectedValueOnce(cancelled([{ Code: "None" }, { Code: "ConditionalCheckFailed" }]))
+          .mockResolvedValueOnce({})
+        const { handle, loadState } = recordHandler(
+          [
+            Option.some({ state: inProgress, version: 5 }),
+            Option.some({ state: inProgress, version: 6 }),
+          ],
+          { headProof: { additionalItem: 0 }, retry: 1 },
+        )
+
+        const result = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "EndMatch", result: "AUS won" },
+          { additionalItems: withRecord },
+        )
+
+        expect(result.version).toBe(7)
+        expect(loadState).toHaveBeenCalledTimes(2)
+        expect(firstAppendedEvent({ TransactItems: sent(1) }).version).toBe(7)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("checks an If-Match against the loaded version", () =>
+      Effect.gen(function* () {
+        const { handle } = recordHandler([Option.some({ state: inProgress, version: 5 })])
+
+        const error = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "EndMatch", result: "AUS won" },
+          { expectedVersion: 4 },
+        ).pipe(Effect.flip)
+
+        expect(error._tag).toBe("VersionConflict")
+        expect((error as VersionConflict).actualVersion).toBe(5)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("answers a no-op and a decide failure from the record", () =>
+      Effect.gen(function* () {
+        const { handle } = recordHandler([
+          Option.some({ state: inProgress, version: 5 }),
+          Option.some({ state: inProgress, version: 5 }),
+        ])
+
+        const error = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        ).pipe(Effect.flip)
+        expect(error._tag).toBe("AlreadyStarted")
+
+        const noop = EventStore.commandHandler(
+          { ...matchDecider, decide: () => Effect.succeed([]) },
+          MatchEvents,
+          { loadState: () => Effect.succeed(Option.some({ state: inProgress, version: 5 })) },
+        )
+        const result = yield* noop({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" })
+        expect(result).toEqual({ state: inProgress, version: 5, events: [] })
+        expect(mockQuery).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("refuses a malformed result, never retried", () =>
+      Effect.gen(function* () {
+        for (const loaded of [
+          Option.some({ state: inProgress, version: -1 }),
+          Option.some({ state: inProgress, version: 1.5 }),
+          { state: inProgress, version: 1 },
+        ]) {
+          let calls = 0
+          const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+            retry: 3,
+            loadState: () => {
+              calls++
+              return Effect.succeed(loaded as Option.Option<EventStore.LoadedState<MatchState>>)
+            },
+          })
+          const error = yield* handle({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" }).pipe(
+            Effect.flip,
+          )
+          expect(error._tag).toBe("ValidationError")
+          expect((error as ValidationError).operation).toBe("EventStore.commandHandler.loadState")
+          expect(calls).toBe(1)
+        }
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("surfaces loadState's own failure", () =>
+      Effect.gen(function* () {
+        class RecordUnavailable extends Data.TaggedError("RecordUnavailable") {}
+        const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
+          loadState: () => Effect.fail(new RecordUnavailable()),
+        })
+
+        const error = yield* handle({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" }).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("RecordUnavailable")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("headProof { additionalItem } needs every appending call to return the item", () =>
+      Effect.gen(function* () {
+        const { handle } = recordHandler([Option.some({ state: inProgress, version: 5 })], {
+          headProof: { additionalItem: 0 },
+        })
+
+        const error = yield* handle({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" }).pipe(
+          Effect.flip,
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("works on a bound stream", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const bound = yield* EventStore.bind(MatchEvents)
+        const handle = EventStore.commandHandler(matchDecider, bound, {
+          loadState: () => Effect.succeed(Option.some({ state: inProgress, version: 2 })),
+          headProof: { additionalItem: 0 },
+        })
+
+        const result = yield* handle(
+          { matchId: "m-1" },
+          { _tag: "EndMatch", result: "x" },
+          { additionalItems: withRecord },
+        )
+        expect(result.version).toBe(3)
+        expect(kinds(sent())).toEqual(["match.event", "Watermark"])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an inline stream without `every` still snapshots in every append", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        const handle = EventStore.commandHandler(matchDecider, ProofInline, {
+          loadState: () => Effect.succeed(Option.some({ state: inProgress, version: 2 })),
+        })
+
+        yield* handle({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" })
+
+        expect(kinds(sent())).toEqual(["check", "proofmatch.event", "proofmatch.snapshot"])
+        expect(sent()[2].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("with `every`, snapshots when an append crosses a multiple of it", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+        mockPutItem.mockResolvedValue({})
+        const at = (version: number) => () =>
+          Effect.succeed(Option.some({ state: inProgress, version }))
+        const end = { _tag: "EndMatch", result: "x" } as const
+
+        // Inline: 2 → 3 crosses 3; 3 → 4 does not.
+        yield* EventStore.commandHandler(matchDecider, ProofEvery, { loadState: at(2) })(
+          { matchId: "m-1" },
+          end,
+        )
+        expect(kinds(sent(0))).toEqual(["check", "proofevery.event", "proofevery.snapshot"])
+        yield* EventStore.commandHandler(matchDecider, ProofEvery, { loadState: at(3) })(
+          { matchId: "m-1" },
+          end,
+        )
+        expect(kinds(sent(1))).toEqual(["check", "proofevery.event"])
+
+        // After-append: 5 → 6 crosses 6 and writes the snapshot after; 6 → 7 does not.
+        yield* EventStore.commandHandler(matchDecider, ProofAfter, { loadState: at(5) })(
+          { matchId: "m-1" },
+          end,
+        )
+        expect(mockPutItem).toHaveBeenCalledOnce()
+        expect(fromAttributeMap(mockPutItem.mock.calls[0]![0].Item).asOfVersion).toBe(6)
+        yield* EventStore.commandHandler(matchDecider, ProofAfter, { loadState: at(6) })(
+          { matchId: "m-1" },
+          end,
+        )
+        expect(mockPutItem).toHaveBeenCalledOnce()
+        expect(mockQuery).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it("refuses combinations that cannot work, when the handler is created (EDD-9085)", () => {
+      const loadState = () => Effect.succeed(Option.none())
+      expect(() =>
+        EventStore.commandHandler(matchDecider, ProofInline, { loadState, verifySnapshot: false }),
+      ).toThrow(/EDD-9085.*verifySnapshot: false/)
+      expect(() =>
+        EventStore.commandHandler(matchDecider, ProofInline, { loadState, headProof: "snapshot" }),
+      ).toThrow(/EDD-9085.*headProof: "snapshot"/)
+      expect(() =>
+        ProofInline.pipe(
+          EventStore.commandHandler(matchDecider, { loadState, headProof: "snapshot" }),
+        ),
+      ).toThrow(/EDD-9085/)
+      expect(() =>
+        EventStore.commandHandler(matchDecider, MatchEvents, {
+          loadState: "record" as never,
+        }),
+      ).toThrow(/EDD-9085.*loadState must be a function/)
+      expect(() =>
+        EventStore.commandHandler(matchDecider, MatchEvents, {
+          headProof: { additionalItem: -1 },
+        }),
+      ).toThrow(/EDD-9085.*non-negative integer/)
+    })
+  })
+
+  describe('commandHandler({ headProof: "snapshot" })', () => {
+    const snapshotAt = (version: number) =>
+      makeSnapshotItem("proofmatch", "m-1", version, { status: "i", innings: [] })
+    const eventAt = (version: number) =>
+      makeStreamEventItem("proofmatch", "m-1", version, "InningsCompleted", {
+        innings: version,
+        runs: version,
+        wickets: 1,
+      })
+    const end = { _tag: "EndMatch", result: "x" } as const
+
+    it("dies with EDD-9085 at construction on a stream whose snapshot cannot prove the head", () => {
+      for (const stream of [ProofEvery, ProofAfter, MatchEvents] as const) {
+        expect(() =>
+          EventStore.commandHandler(matchDecider, stream as typeof ProofInline, {
+            headProof: "snapshot",
+          }),
+        ).toThrow(/EDD-9085/)
+      }
+    })
+
+    it.effect("a verified load with the snapshot at the head proves it", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(4)))
+        mockTransactWriteItems.mockResolvedValue({})
+        const handle = EventStore.commandHandler(matchDecider, ProofInline, {
+          headProof: "snapshot",
+        })
+
+        yield* handle({ matchId: "m-1" }, end)
+
+        expect(kinds(sent())).toEqual(["proofmatch.event", "proofmatch.snapshot"])
+        expect(fromAttributeMap(sent()[1].Put.ExpressionAttributeValues)).toEqual({
+          ":expectedVersion": 4,
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("events after the snapshot keep the check for that append", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(4), [eventAt(5)]))
+        mockTransactWriteItems.mockResolvedValue({})
+        const handle = EventStore.commandHandler(matchDecider, ProofInline, {
+          headProof: "snapshot",
+        })
+
+        const result = yield* handle({ matchId: "m-1" }, end)
+
+        expect(result.version).toBe(6)
+        expect(kinds(sent())).toEqual(["check", "proofmatch.event", "proofmatch.snapshot"])
+        expect(sent()[2].Put.ConditionExpression).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a stream without a snapshot yet proves version 0 by the snapshot's absence", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue(latestPage(undefined))
+        mockTransactWriteItems.mockResolvedValue({})
+        const handle = EventStore.commandHandler(matchDecider, ProofInline, {
+          headProof: "snapshot",
+        })
+
+        yield* handle(
+          { matchId: "m-1" },
+          { _tag: "StartMatch", venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" },
+        )
+
+        expect(kinds(sent())).toEqual(["proofmatch.event", "proofmatch.snapshot"])
+        expect(sent()[1].Put.ConditionExpression).toBe("attribute_not_exists(pk)")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an unverified load proves it; a lagging snapshot re-decides with the check", () =>
+      Effect.gen(function* () {
+        // Unverified: the snapshot item alone, at v4.
+        mockGetItem.mockResolvedValue({ Item: snapshotAt(4) })
+        // The proof fails: an event at v5 was appended without a snapshot.
+        mockTransactWriteItems
+          .mockRejectedValueOnce(cancelled([{ Code: "ConditionalCheckFailed" }, { Code: "None" }]))
+          .mockResolvedValueOnce({})
+        // The verified reload sees the lagging snapshot.
+        mockQuery.mockResolvedValue(latestPage(snapshotAt(4), [eventAt(5)]))
+        const handle = EventStore.commandHandler(matchDecider, ProofInline, {
+          headProof: "snapshot",
+          verifySnapshot: false,
+        })
+
+        const result = yield* handle({ matchId: "m-1" }, end)
+
+        expect(result.version).toBe(6)
+        expect(kinds(sent(0))).toEqual(["proofmatch.event", "proofmatch.snapshot"])
+        expect(sent(0)[1].Put.ConditionExpression).toBe("#asOfVersion = :expectedVersion")
+        expect(kinds(sent(1))).toEqual(["check", "proofmatch.event", "proofmatch.snapshot"])
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+})

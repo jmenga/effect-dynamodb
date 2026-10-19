@@ -46,6 +46,12 @@
  *   `CompressorNotRegistered`); `measureAppend` / `measureSnapshot` need only
  *   `TableConfig` (nothing on a bound stream) and `decodeStreamImage` nothing,
  *   returning the read paths' `StreamEvent`.
+ * - Head proof and `loadState` (#164): an inline `loadState` lambda is
+ *   contextually typed by the stream id and the decider's state (the handler's
+ *   `TConfig` has no default, so the lambda does not fix it first); its error
+ *   and requirements join the handler's — a bound handler's only ones — in
+ *   all four forms, and a handler without it keeps its channels. `HeadProof`
+ *   is `{ additionalItem }` or `"snapshot"`, on `append` and `measureAppend`.
  *
  * Uses vitest's `expectTypeOf`; the assertions are compile-time only and are
  * checked by `tsc -p tsconfig.test.json` (`pnpm check`).
@@ -1475,3 +1481,94 @@ describe("EventStore shared stream index types (#149)", () => {
     expect(true).toBe(true)
   })
 })
+
+describe("commandHandler loadState and headProof (#164)", () => {
+  /** The store holding the caller's state records — `loadState`'s requirement. */
+  class RecordStore extends Context.Service<
+    RecordStore,
+    {
+      readonly load: (
+        id: string,
+      ) => Effect.Effect<Option.Option<EventStore.LoadedState<CounterState>>, RecordUnavailable>
+    }
+  >()("test/RecordStore") {}
+  class RecordUnavailable extends Data.TaggedError("RecordUnavailable") {}
+
+  const loadState = (streamId: { readonly counterId: string }) =>
+    Effect.flatMap(RecordStore, (store) => store.load(streamId.counterId))
+
+  it("loadState's error and requirements join the handler's, in every form", () => {
+    typeOnly(() => {
+      const handle = EventStore.commandHandler(decider, Counter, {
+        loadState: (streamId) => {
+          // Contextually typed by the stream and the decider.
+          expectTypeOf(streamId).toEqualTypeOf<EventStore.StreamIdInput<readonly ["counterId"]>>()
+          return loadState(streamId)
+        },
+        headProof: { additionalItem: 0 },
+      })
+      const result = handle(key, command)
+      expectTypeOf<Effect.Services<typeof result>>().toEqualTypeOf<Base | RecordStore>()
+      expectTypeOf<RecordUnavailable>().toExtend<Effect.Error<typeof result>>()
+      expectTypeOf<Overflow>().toExtend<Effect.Error<typeof result>>()
+
+      // Data-last.
+      const piped = Counter.pipe(EventStore.commandHandler(decider, { loadState }))
+      const pipedResult = piped(key, command)
+      expectTypeOf<Effect.Services<typeof pipedResult>>().toEqualTypeOf<Base | RecordStore>()
+      expectTypeOf<RecordUnavailable>().toExtend<Effect.Error<typeof pipedResult>>()
+
+      // Bound: loadState's requirements are the handler's only ones.
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Counter)
+        const boundResult = EventStore.commandHandler(decider, bound, { loadState })(key, command)
+        expectTypeOf<Effect.Services<typeof boundResult>>().toEqualTypeOf<RecordStore>()
+        const boundPiped = bound.pipe(EventStore.commandHandler(decider, { loadState }))(
+          key,
+          command,
+        )
+        expectTypeOf<Effect.Services<typeof boundPiped>>().toEqualTypeOf<RecordStore>()
+        expectTypeOf<RecordUnavailable>().toExtend<Effect.Error<typeof boundPiped>>()
+      })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("without loadState the handler's channels are unchanged", () => {
+    typeOnly(() => {
+      const plain = EventStore.commandHandler(decider, Counter)(key, command)
+      const proved = EventStore.commandHandler(decider, Counter, {
+        headProof: { additionalItem: 0 },
+      })(key, command)
+      expectTypeOf<Effect.Services<typeof proved>>().toEqualTypeOf<Base>()
+      expectTypeOf<Effect.Error<typeof proved>>().toEqualTypeOf<Effect.Error<typeof plain>>()
+    })
+    expect(true).toBe(true)
+  })
+
+  it("loadState must return the decider's state", () => {
+    typeOnly(() => {
+      // @ts-expect-error — `total` must be a number
+      EventStore.commandHandler(decider, Counter, {
+        loadState: () => Effect.succeed(Option_some({ state: { total: "1" }, version: 1 })),
+      })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("append and measureAppend accept a headProof; nothing else is one", () => {
+    typeOnly(() => {
+      Counter.append(key, [], 0, { headProof: { additionalItem: 0 } })
+      Counter.append(key, [], 0, { headProof: "snapshot" })
+      Counter.measureAppend(key, [], 0, { headProof: { additionalItem: 0 } })
+      // @ts-expect-error — not a head proof
+      Counter.append(key, [], 0, { headProof: "record" })
+      expectTypeOf<EventStore.HeadProof>().toEqualTypeOf<
+        { readonly additionalItem: number } | "snapshot"
+      >()
+    })
+    expect(true).toBe(true)
+  })
+})
+
+declare const Option_some: <A>(value: A) => Option.Option<A>

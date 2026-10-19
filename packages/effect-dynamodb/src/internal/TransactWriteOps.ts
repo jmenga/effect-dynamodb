@@ -199,6 +199,12 @@ export interface BuiltTransactWriteItems {
   readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
   /**
+   * The caller ops (indices into `operations`) that carry a condition of
+   * their own — `.condition()`, `create()`'s, `Transaction.check`'s. A
+   * guarded put's read guard is not one: it is the op's, not the caller's.
+   */
+  readonly conditioned: ReadonlySet<number>
+  /**
    * The key attributes the ops' entities write (primary and index, partition
    * and sort), for diagnosing a rejected key size. A thunk: needed only on
    * failure.
@@ -242,6 +248,7 @@ export const buildTransactWriteItems = (
         provenance: [],
         targets: () => [],
         guarded: [],
+        conditioned: new Set(),
         keys: () => mergeKeyAttributes(),
       }
     }
@@ -330,6 +337,10 @@ export const buildTransactWriteItems = (
     // What names each item, kept so its target is built only on failure.
     const naming: Array<() => TransactItemTarget> = []
     const guarded: Array<GuardedPut> = []
+    const conditioned = new Set<number>()
+    for (const op of opInfos) {
+      if (op.condition !== undefined) conditioned.add(op.opIndex)
+    }
     let tableName = ""
     let keyFields: ReadonlyArray<string> = []
     const push = (item: TransactWriteItem, from: ItemProvenance, derived = false) => {
@@ -427,12 +438,37 @@ export const buildTransactWriteItems = (
     const keys = () =>
       mergeKeyAttributes(...opInfos.map((op) => keyAttributesOf(op.entity.indexes as never)))
     const targets = () => naming.map((name) => name())
-    return { items, provenance, targets, guarded, keys }
+    return { items, provenance, targets, guarded, conditioned, keys }
   })
 
 // ---------------------------------------------------------------------------
 // judgeCancellation
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether caller op `opIndex`'s OWN condition rejected the write, from the
+ * transaction's positional reasons (`offset`: where `built`'s items start). A
+ * guarded put is read through its plan's verdict, so a race it lost is not a
+ * condition failure.
+ */
+export const opConditionFailed = (
+  built: BuiltTransactWriteItems,
+  reasons: ReadonlyArray<WriteCancellationReason | undefined>,
+  opIndex: number,
+  offset = 0,
+): boolean => {
+  const guarded = built.guarded.find((g) => g.opIndex === opIndex)
+  if (guarded !== undefined) {
+    const { start, plan } = guarded
+    return (
+      plan.verdict(reasons.slice(offset + start, offset + start + plan.items.length))?._tag ===
+      "Condition"
+    )
+  }
+  return built.provenance.some(
+    (from, i) => from.opIndex === opIndex && reasons[offset + i]?.Code === "ConditionalCheckFailed",
+  )
+}
 
 /** Attempts a transaction with guarded puts makes before it reports a lost race. */
 export const GUARDED_TRANSACTION_ATTEMPTS = 3
