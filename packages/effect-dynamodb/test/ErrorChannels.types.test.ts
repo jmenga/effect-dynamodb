@@ -37,13 +37,13 @@ import type {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
-import { type Effect, Schema, type Stream } from "effect"
+import { Effect, Schema, type Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import type { DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import type * as EventStore from "../src/EventStore.js"
+import * as EventStore from "../src/EventStore.js"
 import type { AggregateCreateError, AggregateWriteError } from "../src/index.js"
 import type * as Query from "../src/Query.js"
 import type * as StorageEncoding from "../src/StorageEncoding.js"
@@ -72,10 +72,25 @@ const Packed = Entity.make({
   primaryKey,
 })
 
-Table.make({
+const ErrorsTable = Table.make({
   schema: DynamoSchema.make({ name: "errors", version: 1 }),
   entities: { Plain, Packed },
 })
+
+class Shipped extends Schema.TaggedClass<Shipped>()("Shipped", { carrier: Schema.String }) {}
+
+const Shipments = EventStore.makeStream({
+  table: ErrorsTable,
+  streamName: "Shipment",
+  events: [Shipped],
+  streamId: { composite: ["orderId"] },
+})
+
+const shipmentDecider: EventStore.Decider<{ readonly count: number }, string, Shipped> = {
+  initialState: { count: 0 },
+  decide: (carrier) => Effect.succeed([new Shipped({ carrier })]),
+  evolve: (state) => ({ count: state.count + 1 }),
+}
 
 /** Any `CompressorNotRegistered` left in an error union. */
 type Leaked<E> = Extract<E, { readonly _tag: "CompressorNotRegistered" }>
@@ -211,6 +226,22 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
       | OptimisticLockError
       | ConcurrentModification
     >()
+  })
+
+  it("EventStore: StreamSealed in the handler's channel; transactWrite refuses appendOp (#166)", () => {
+    typeOnly(() => {
+      const handled = EventStore.commandHandler(shipmentDecider, Shipments)({ orderId: "o" }, "ups")
+      expectTypeOf<StreamSealed>().toExtend<Effect.Error<typeof handled>>()
+      const op = Shipments.appendOp({ orderId: "o" }, [new Shipped({ carrier: "ups" })], 1, {
+        seal: true,
+      })
+      // @ts-expect-error — a stream append op rides only in an EventStore append
+      Transaction.transactWrite([op])
+      Shipments.append({ orderId: "p" }, [new Shipped({ carrier: "ups" })], 0, {
+        additionalItems: [op, Plain.put({ orderId: "o", lines: [] })],
+      })
+    })
+    expect(true).toBe(true)
   })
 
   it("StorageEncoding helpers fail with ValidationError only", () => {

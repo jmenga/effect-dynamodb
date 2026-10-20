@@ -1327,3 +1327,85 @@ describe("EventStore packed storage — bound streams (#147)", () => {
     }),
   )
 })
+
+// ---------------------------------------------------------------------------
+// Sealing (#166)
+// ---------------------------------------------------------------------------
+
+describe("EventStore packed storage — a sealed stream (#166)", () => {
+  const voided = () => new Voided({ day: "2026-10-12", reason: "closed" })
+
+  it.effect("the marker is a native attribute beside packed data and state", () =>
+    Effect.gen(function* () {
+      yield* JsonLedger.append(id, [recorded(1), voided()], 0, {
+        seal: true,
+        snapshot: { total: 1, notes: ["note 1"] },
+      })
+      const [first, last] = storedEvents()
+      expect(first!.__edd_sealed__).toBeUndefined()
+      expect(last!.__edd_sealed__).toEqual({ BOOL: true })
+      expect(last!.data!.S).toBe('{"_tag":"Voided","day":"2026-10-12","reason":"closed"}')
+      const snap = storedSnapshot()!
+      expect(snap.__edd_sealed__).toEqual({ BOOL: true })
+      expect(snap.state!.S).toBe('{"total":1,"notes":["note 1"]}')
+
+      // Compressed data and state: the marker is untouched.
+      store.clear()
+      yield* GzipLedger.append(id, [recorded(1, LONG_NOTE)], 0, {
+        seal: true,
+        snapshot: { total: 1, notes: [LONG_NOTE, LONG_NOTE] },
+      })
+      expect(storedEvents()[0]!.data!.B![0]).toBe(0x21)
+      expect(storedEvents()[0]!.__edd_sealed__).toEqual({ BOOL: true })
+      expect(storedSnapshot()!.state!.B![0]).toBe(0x21)
+      expect(storedSnapshot()!.__edd_sealed__).toEqual({ BOOL: true })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("every read decodes the seal of a packed stream", () =>
+    Effect.gen(function* () {
+      yield* NativeLedger.append(id, [recorded(1)], 0, { snapshot: { total: 1, notes: [] } })
+      yield* ZstdLedger.append(id, [recorded(2, LONG_NOTE), voided()], 1, {
+        seal: true,
+        snapshot: { total: 3, notes: [] },
+      })
+
+      const events = yield* JsonLedger.read(id)
+      expect(events.map((e) => e.sealed)).toEqual([undefined, undefined, true])
+      expect(events[2]!.data).toBeInstanceOf(Voided)
+
+      const latest = yield* JsonLedger.readLatest(id)
+      expect(latest.seal?.version).toBe(3)
+      expect(latest.seal?.data).toBeInstanceOf(Voided)
+      expect(latest.events).toEqual([])
+      expect(Option.getOrThrow(latest.snapshot).state).toEqual({ total: 3, notes: [] })
+
+      const unverified = yield* ZstdLedger.readLatest(id, { verifySnapshot: false })
+      expect(unverified.seal).toEqual(events[2])
+
+      for (const index of ["byKindKeys", "byDayKeys"] as const) {
+        const indexed = yield* ZstdLedger.readIndex(index, id)
+        expect(indexed.find((e) => e.version === 3)?.sealed).toBe(true)
+        expect(indexed.find((e) => e.version === 2)?.sealed).toBeUndefined()
+      }
+      // byKind indexes Recorded events only: the sealing Voided is not in it.
+      const byKind = yield* ZstdLedger.readIndex("byKind", id)
+      expect(byKind.every((e) => e.sealed === undefined)).toBe(true)
+
+      const image = yield* ZstdLedger.decodeStreamImage(lambdaImage(storedEvents()[2]!) as never)
+      expect(Option.getOrThrow(image).sealed).toBe(true)
+      expect(Option.getOrThrow(image)).toStrictEqual(events[2])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a sealing Recorded event is reported through an all LSI", () =>
+    Effect.gen(function* () {
+      yield* JsonLedger.append(id, [recorded(1), recorded(2)], 0, {
+        seal: true,
+        snapshot: { total: 3, notes: [] },
+      })
+      const byKind = yield* JsonLedger.readIndex("byKind", id)
+      expect(byKind.map((e) => e.sealed)).toEqual([undefined, true])
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
