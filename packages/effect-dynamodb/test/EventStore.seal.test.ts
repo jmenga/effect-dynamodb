@@ -31,12 +31,13 @@ import {
   type ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Effect, Exit, Layer, Logger, Option, Schema } from "effect"
+import { Cause, DateTime, Effect, Exit, Layer, Logger, Option, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { buildTransactWriteItems } from "../src/internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import {
@@ -85,7 +86,23 @@ const Accounts = Entity.make({
   },
 })
 
-const SealTable = Table.make({ schema: AppSchema, entities: { Chains, Accounts } })
+/** A unique-constrained entity: its put is guarded (it expands and can race). */
+class Handle extends Schema.Class<Handle>("Handle")({
+  handleId: Schema.String,
+  code: Schema.String,
+}) {}
+
+const Handles = Entity.make({
+  model: Handle,
+  entityType: "Handle",
+  primaryKey: {
+    pk: { field: "pk", composite: ["handleId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  unique: { code: ["code"] },
+})
+
+const SealTable = Table.make({ schema: AppSchema, entities: { Chains, Accounts, Handles } })
 /** A second physical table, for a bound op built in its own context. */
 const OtherTable = Table.make({ schema: AppSchema, entities: {} })
 
@@ -149,6 +166,21 @@ const GenInline = EventStore.makeStream({
   events,
   streamId: { composite: ["accountId", "generation"] },
   snapshot: { schema: LedgerState, mode: "inline" },
+})
+/** The changeover's shape, with a metadata schema. */
+const MetaGen = EventStore.makeStream({
+  table: SealTable,
+  streamName: "MetaGen",
+  events,
+  streamId: { composite: ["accountId", "generation"] },
+  metadata: Schema.Struct({ correlationId: Schema.String }),
+})
+/** Another stream with the same id shape as `Ledger`: equal ids, a different name. */
+const Mirror = EventStore.makeStream({
+  table: SealTable,
+  streamName: "Mirror",
+  events,
+  streamId: { composite: ["accountId"] },
 })
 /** A stream on another table. */
 const Remote = EventStore.makeStream({
@@ -799,7 +831,7 @@ describe("EventStore appendOp (#166)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("carries an inline snapshot, metadata and timestamps of the inner stream", () =>
+  it.effect("carries an inline snapshot of the inner stream, marked with the seal", () =>
     Effect.gen(function* () {
       mockTransactWriteItems.mockResolvedValue({})
 
@@ -823,6 +855,94 @@ describe("EventStore appendOp (#166)", () => {
       expect(putItem(sent()[4])).toMatchObject({ asOfVersion: 5, state: { balance: 9 } })
     }).pipe(Effect.provide(TestLayer)),
   )
+
+  describe("metadata and timestamps", () => {
+    const at = DateTime.makeUnsafe("2020-01-02T03:04:05.000Z")
+    const meta = (correlationId: string) => ({ correlationId })
+
+    it.effect("a nested op writes its eventMetadata and eventTimestamps on its events", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* Ledger.append(id, [deposit(1)], 0, {
+          additionalItems: [
+            MetaGen.appendOp(A, [deposit(2), close()], 3, {
+              seal: true,
+              eventMetadata: [meta("c-1"), meta("c-2")],
+              eventTimestamps: [at, undefined],
+            }),
+          ],
+        })
+
+        const items = sent()
+        expect(kinds(items)).toEqual(["ledger.event", "check", "metagen.event", "metagen.event"])
+        const [first, last] = [putItem(items[2]), putItem(items[3])]
+        expect(first).toMatchObject({ version: 4, metadata: meta("c-1") })
+        expect(first.timestamp).toBe("2020-01-02T03:04:05.000Z")
+        expect(first.__edd_sealed__).toBeUndefined()
+        // The marker and the metadata side by side on the sealing event.
+        expect(last).toMatchObject({ version: 5, metadata: meta("c-2"), __edd_sealed__: true })
+        expect(last.timestamp).not.toBe("2020-01-02T03:04:05.000Z")
+        expect(items[3].Put.Item.__edd_sealed__).toEqual({ BOOL: true })
+        // The outer stream has no metadata: none is written on its event.
+        expect(putItem(items[0]).metadata).toBeUndefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a nested op writes one shared metadata value on every event", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* Ledger.append(id, [deposit(1)], 0, {
+          additionalItems: [
+            MetaGen.appendOp(A, [deposit(2), close()], 3, { seal: true, metadata: meta("c-9") }),
+          ],
+        })
+
+        const items = sent()
+        expect(putItem(items[2])).toMatchObject({ metadata: meta("c-9") })
+        expect(putItem(items[3])).toMatchObject({ metadata: meta("c-9"), __edd_sealed__: true })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an outer sealing append keeps its metadata beside the marker", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValue({})
+
+        yield* MetaGen.append(A, [deposit(1), close()], 2, {
+          seal: true,
+          metadata: meta("c-3"),
+          eventTimestamps: [undefined, at],
+        })
+
+        const items = sent()
+        expect(kinds(items)).toEqual(["check", "metagen.event", "metagen.event"])
+        expect(putItem(items[1])).toMatchObject({ metadata: meta("c-3") })
+        expect(putItem(items[1]).__edd_sealed__).toBeUndefined()
+        expect(putItem(items[2])).toMatchObject({
+          metadata: meta("c-3"),
+          __edd_sealed__: true,
+          timestamp: "2020-01-02T03:04:05.000Z",
+        })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a sealed event read back carries its metadata and sealed", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [
+            toAttributeMap({
+              ...fromAttributeMap(eventItem("metagen", 1, { sealed: true, streamId: "a-1#1" })),
+              metadata: meta("c-4"),
+            }),
+          ],
+        })
+        const [event] = yield* MetaGen.read(A)
+        expect(event!.sealed).toBe(true)
+        expect(event!.metadata).toEqual(meta("c-4"))
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 
   describe("an atomic multi-stream append, without a seal (B3)", () => {
     it.effect("both streams' events in one transaction, no marker anywhere", () =>
@@ -865,6 +985,18 @@ describe("EventStore appendOp (#166)", () => {
           additionalItems: [Gen.appendOp(A, [deposit(3)], 4), Gen.appendOp(C, [deposit(4)], 1)],
         }).pipe(Effect.flip)
         expectConflict(error, "Gen", "a-1#1", 4)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("several op streams: only the second failing is reported, naming it", () =>
+      Effect.gen(function* () {
+        const C = { accountId: "a-1", generation: "3" }
+        // [B event, A check, A event, C check, C event]: C's check at index 3.
+        mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, ok, failed(), ok]))
+        const error = yield* Gen.append(B, [deposit(1)], 0, {
+          additionalItems: [Gen.appendOp(A, [deposit(3)], 4), Gen.appendOp(C, [deposit(4)], 1)],
+        }).pipe(Effect.flip)
+        expectConflict(error, "Gen", "a-1#3", 1)
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -931,6 +1063,174 @@ describe("EventStore appendOp (#166)", () => {
         expectConflict(error, "Gen", "a-1#1", 4)
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    describe("the op after an entity op (its items start past item 0)", () => {
+      /** [B event, Chain, A check, A event]: A's items start at additional item 1. */
+      const chainFirst = () =>
+        Gen.append(B, [open(4)], 0, {
+          additionalItems: [chainPut(6), Gen.appendOp(A, [close()], 4, { seal: true })],
+        })
+
+      it.effect("the layout puts the chain item ahead of A's items", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockResolvedValue({})
+          yield* chainFirst()
+          expect(kinds(sent())).toEqual(["gen.event", "Chain", "check", "gen.event"])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("A's first put returning a marked item is StreamSealed naming A", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(
+            cancelled([
+              ok,
+              ok,
+              ok,
+              failed(eventItem("gen", 5, { sealed: true, streamId: "a-1#1" })),
+            ]),
+          )
+          const error = yield* chainFirst().pipe(Effect.flip)
+          expectSealed(error, "Gen", "a-1#1", 5)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("A's check returning a marked item is StreamSealed naming A", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(
+            cancelled([
+              ok,
+              ok,
+              failed(eventItem("gen", 4, { sealed: true, streamId: "a-1#1" })),
+              ok,
+            ]),
+          )
+          const error = yield* chainFirst().pipe(Effect.flip)
+          expectSealed(error, "Gen", "a-1#1", 4)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("only the chain failing: AdditionalItemConditionFailed { indices: [0] }", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, failed(), ok, ok]))
+          const error = yield* chainFirst().pipe(Effect.flip)
+          expect(error._tag).toBe("AdditionalItemConditionFailed")
+          expect((error as AdditionalItemConditionFailed).indices).toEqual([0])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
+
+    describe("beside a guarded put, a sentinel and a head proof (§6.1)", () => {
+      /** [B event, Handle, Handle sentinel, A check, A event] */
+      const withHandle = (op = Gen.appendOp(A, [deposit(3)], 4)) =>
+        Gen.append(B, [deposit(1)], 0, {
+          additionalItems: [Handles.put({ handleId: "h-1", code: "C1" }), op],
+        })
+
+      it.effect("a taken unique value and a nested conflict together: the nested error", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, failed(), failed(), ok]))
+          const error = yield* withHandle().pipe(Effect.flip)
+          expectConflict(error, "Gen", "a-1#1", 4)
+          expect(kinds(sent())).toEqual([
+            "gen.event",
+            "Handle",
+            "Handle._unique.code",
+            "check",
+            "gen.event",
+          ])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a taken unique value alone is still UniqueConstraintViolation", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, failed(), ok, ok]))
+          const error = yield* withHandle().pipe(Effect.flip)
+          expect(error._tag).toBe("UniqueConstraintViolation")
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a guarded put's lost race is retried, rebuilding the nested op", () =>
+        Effect.gen(function* () {
+          // The handle's put was created since its read (no item returned): a race.
+          mockTransactWriteItems
+            .mockRejectedValueOnce(cancelled([ok, failed(), ok, ok, ok]))
+            .mockResolvedValueOnce({})
+          const op = Gen.appendOp(A, [deposit(3)], 4)
+          const build = vi.spyOn(op, "_build")
+
+          const result = yield* withHandle(op)
+
+          expect(result.version).toBe(1)
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+          expect(build).toHaveBeenCalledTimes(2)
+          expect(kinds(sent(1))).toEqual(kinds(sent(0)))
+          expect(fromAttributeMap(sent(1)[3].ConditionCheck.Key).sk).toBe(eventSk("gen", 4))
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("a lost race and a nested conflict together: the nested error, no retry", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValue(cancelled([ok, failed(), ok, failed(), ok]))
+          const error = yield* withHandle().pipe(Effect.flip)
+          expectConflict(error, "Gen", "a-1#1", 4)
+          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      /** [B event, A check, A event, sentinel] */
+      const withIdempotency = () =>
+        Gen.append(B, [deposit(1)], 0, {
+          additionalItems: [Gen.appendOp(A, [deposit(3)], 4)],
+          idempotency: { commandId: "cmd-1" },
+        })
+
+      it.effect("the outer sentinel sits after the nested items and ranks above them", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, failed(), ok, failed()]))
+          const error = yield* withIdempotency().pipe(Effect.flip)
+          expect(kinds(sent())).toEqual(["gen.event", "check", "gen.event", "gen.command"])
+          expect(error._tag).toBe("DuplicateCommand")
+          expect(error).toMatchObject({ streamId: "a-1#2", commandId: "cmd-1" })
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("with an outer sentinel, a nested failure alone is the nested error", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, failed(), ok, ok]))
+          const error = yield* withIdempotency().pipe(Effect.flip)
+          expectConflict(error, "Gen", "a-1#1", 4)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      /** [B event at 4, Account (the proof), A check, A event] */
+      const withRecordProof = () =>
+        Gen.append(B, [deposit(1)], 3, {
+          additionalItems: [
+            Accounts.put({ accountId: "a-1#2", balance: 1, streamVersion: 4 }).pipe(
+              Accounts.condition({ streamVersion: 3 }),
+            ),
+            Gen.appendOp(A, [deposit(3)], 4),
+          ],
+          headProof: { additionalItem: 0 },
+        })
+
+      it.effect("an outer record proof and a nested failure together: VersionConflict(B)", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, failed(), failed(), ok]))
+          const error = yield* withRecordProof().pipe(Effect.flip)
+          expect(kinds(sent())).toEqual(["gen.event", "Account", "check", "gen.event"])
+          expectConflict(error, "Gen", "a-1#2", 3)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("an outer record proof holding, the nested failure: VersionConflict(A)", () =>
+        Effect.gen(function* () {
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, failed(), ok]))
+          const error = yield* withRecordProof().pipe(Effect.flip)
+          expectConflict(error, "Gen", "a-1#1", 4)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
 
     it.effect("the chain index failing alone: AdditionalItemConditionFailed { indices: [1] }", () =>
       Effect.gen(function* () {
@@ -1117,6 +1417,34 @@ describe("EventStore seal (#166) — reads", () => {
       expect(read[1]!.sealed).toBe(true)
       expect(read[1]!.data).toBeInstanceOf(Closed)
       expect("sealed" in read[0]!).toBe(false)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("readFrom returns the sealing event past S - 1, and nothing past S", () =>
+    Effect.gen(function* () {
+      mockQuery.mockResolvedValueOnce({ Items: [eventItem("ledger", 2, { sealed: true })] })
+      const after1 = yield* Ledger.readFrom(id, 1)
+      expect(after1.map((e) => [e.version, e.sealed])).toEqual([[2, true]])
+      expect(after1[0]!.data).toBeInstanceOf(Closed)
+
+      mockQuery.mockResolvedValueOnce({ Items: [] })
+      expect(yield* Ledger.readFrom(id, 2)).toEqual([])
+      // Each read is bounded below by its version: the second starts past the seal.
+      const [first, second] = mockQuery.mock.calls.map(([input]) => input)
+      expect(fromAttributeMap(first.ExpressionAttributeValues)).not.toEqual(
+        fromAttributeMap(second.ExpressionAttributeValues),
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("query.events marks only the sealing event", () =>
+    Effect.gen(function* () {
+      mockQuery.mockResolvedValue({
+        Items: [eventItem("ledger", 1), eventItem("ledger", 2, { sealed: true })],
+      })
+      const collected = yield* Ledger.query.events(id).pipe(Query.collect)
+      expect(collected.map((e) => e.sealed)).toEqual([undefined, true])
+      expect("sealed" in collected[0]!).toBe(false)
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -1791,6 +2119,71 @@ describe("EventStore seal (#166) — commandHandler", () => {
         expect(mockQuery).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    describe("another stream with the same formatted id", () => {
+      const deposit2: LedgerCommand = { _tag: "Deposit", amount: 2 }
+      /** Mirror (a-1) at 2: the same id as the handler's stream, another name. */
+      const mirrorOp = () => [Mirror.appendOp(id, [deposit(9)], 2)]
+
+      it.effect("its conflict is foreign: retried under an If-Match", () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValue({ Items: [eventItem("ledger", 1)] })
+          // [Ledger check, Ledger event, Mirror check, Mirror event]
+          mockTransactWriteItems
+            .mockRejectedValueOnce(cancelled([ok, ok, failed(), ok]))
+            .mockResolvedValueOnce({})
+
+          const result = yield* EventStore.commandHandler(decider, Ledger, { retry: 2 })(
+            id,
+            deposit2,
+            { expectedVersion: 1, additionalItems: mirrorOp },
+          )
+
+          expect(result.version).toBe(2)
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+          expect(kinds(sent(0))).toEqual(["check", "ledger.event", "check", "mirror.event"])
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("without a schedule it is returned, naming the other stream", () =>
+        Effect.gen(function* () {
+          mockQuery.mockResolvedValue({ Items: [eventItem("ledger", 1)] })
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, failed(), ok]))
+          const error = yield* EventStore.commandHandler(decider, Ledger)(id, deposit2, {
+            expectedVersion: 1,
+            additionalItems: mirrorOp,
+          }).pipe(Effect.flip)
+          expectConflict(error, "Mirror", "a-1", 2)
+        }).pipe(Effect.provide(TestLayer)),
+      )
+
+      it.effect("with verifySnapshot: false it is never taken for a lagging snapshot", () =>
+        Effect.gen(function* () {
+          mockGetItem.mockResolvedValue({ Item: snapshotItem("inline", 2) })
+          // [Inline check, Inline event, Ledger check, Ledger event, Inline snapshot]
+          mockTransactWriteItems.mockRejectedValueOnce(cancelled([ok, ok, failed(), ok, ok]))
+          const { decide, decider: d } = spied()
+
+          const error = yield* EventStore.commandHandler(d, Inline, { verifySnapshot: false })(
+            id,
+            deposit2,
+            { additionalItems: () => [Ledger.appendOp(id, [deposit(9)], 2)] },
+          ).pipe(Effect.flip)
+
+          expectConflict(error, "Ledger", "a-1", 2)
+          expect(kinds(sent())).toEqual([
+            "check",
+            "inline.event",
+            "check",
+            "ledger.event",
+            "inline.snapshot",
+          ])
+          // No verified reload, no second decision.
+          expect(mockQuery).not.toHaveBeenCalled()
+          expect(decide).toHaveBeenCalledOnce()
+        }).pipe(Effect.provide(TestLayer)),
+      )
+    })
 
     it.effect("a nested StreamSealed on A is terminal", () =>
       Effect.gen(function* () {

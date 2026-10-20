@@ -526,6 +526,112 @@ describeConnected("EventStore sealing and nested appends (#166)", () => {
         }).pipe(provide),
     )
 
+    it.effect("4b. the chain index put ahead of the op: each member still judged by position", () =>
+      Effect.gen(function* () {
+        const { accountId, A, B } = yield* seed
+        /** The same changeover, the chain item first in `additionalItems`. */
+        const chainFirst = (aVersion: number, chain: Chain) =>
+          Ledger.append(B, [new Opened({ continuesFrom: aVersion })], 0, {
+            additionalItems: [
+              chainPut(accountId, chain, "2"),
+              Ledger.appendOp(A, [closed()], aVersion, { seal: true }),
+            ],
+          })
+
+        // The chain revision moved: index 0 is the chain item.
+        const stale = new Chain({ accountId, current: "1", revision: 4 })
+        const chainError = yield* chainFirst(3, stale).pipe(Effect.flip)
+        expect(chainError).toMatchObject({ _tag: "AdditionalItemConditionFailed", indices: [0] })
+        yield* unchanged(accountId, 3)
+
+        // A sealed by another closer: its first put lands on the seal.
+        const chain = yield* chainOf(accountId)
+        yield* Ledger.append(A, [closed("9")], 3, { seal: true })
+        const sealedError = yield* chainFirst(3, chain).pipe(Effect.flip)
+        expect(sealedError).toMatchObject({
+          _tag: "StreamSealed",
+          streamId: `${accountId}#1`,
+          sealedVersion: 4,
+        })
+        expect(yield* ledgerOf(B)).toEqual([])
+        expect(yield* chainOf(accountId)).toMatchObject({ current: "1", revision: 5 })
+
+        // On a fresh account the same shape commits.
+        const next = yield* seed
+        const mark = transactions.length
+        const committed = yield* Ledger.append(next.B, [new Opened({ continuesFrom: 3 })], 0, {
+          additionalItems: [
+            chainPut(next.accountId, yield* chainOf(next.accountId), "2"),
+            Ledger.appendOp(next.A, [closed()], 3, { seal: true }),
+          ],
+        })
+        expect(committed.version).toBe(1)
+        expect(transactions.slice(mark)).toEqual([
+          ["ledger.event", "Chain", "check", "ledger.event"],
+        ])
+        expect((yield* ledgerOf(next.A)).at(-1)).toEqual([4, true])
+        expect(yield* chainOf(next.accountId)).toMatchObject({ current: "2", revision: 6 })
+      }).pipe(provide),
+    )
+
+    it.effect("4c. sealing a snapshot stream through the writers' definition (appendOp)", () =>
+      Effect.gen(function* () {
+        const accountId = fresh()
+        yield* Snapped.append({ accountId }, [d(), d()], 0, { snapshot: { balance: 2 } })
+        const mark = transactions.length
+
+        yield* Ledger.append(gen(accountId, "2"), [new Opened({ continuesFrom: 2 })], 0, {
+          additionalItems: [
+            Snapped.appendOp({ accountId }, [closed()], 2, {
+              seal: true,
+              snapshot: { balance: 2 },
+            }),
+          ],
+        })
+        expect(transactions.slice(mark)).toEqual([
+          ["ledger.event", "check", "snapped.event", "snapped.snapshot"],
+        ])
+
+        // The nested snapshot landed marked, at the seal.
+        const client = yield* DynamoClient
+        const { Item: stored } = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: `$seal-it#v1#snapped#${accountId}` },
+            sk: { S: DynamoSchema.composeKey(AppSchema, "snapped.snapshot", []) },
+          },
+          ConsistentRead: true,
+        })
+        expect(stored?.__edd_sealed__).toEqual({ BOOL: true })
+        expect(stored?.asOfVersion).toEqual({ N: "3" })
+        expect(yield* snappedOf(accountId)).toEqual([
+          [1, false],
+          [2, false],
+          [3, true],
+        ])
+
+        // An unverified read reports the seal through its extra GetItem.
+        const unverified = yield* Snapped.readLatest(
+          { accountId },
+          { verifySnapshot: false, consistentRead: true },
+        )
+        expect(unverified.seal?.version).toBe(3)
+        expect(unverified.seal?.data).toEqual(closed())
+
+        // A snapshot-proof writer at the seal is refused.
+        const error = yield* Snapped.append({ accountId }, [d()], 3, {
+          snapshot: { balance: 3 },
+          headProof: "snapshot",
+        }).pipe(Effect.flip)
+        expect(error).toMatchObject({
+          _tag: "StreamSealed",
+          streamName: "Snapped",
+          sealedVersion: 3,
+        })
+        expect((yield* snappedOf(accountId)).length).toBe(3)
+      }).pipe(provide),
+    )
+
     it.effect("6. across two tables, with a bound op on the other table", () =>
       Effect.gen(function* () {
         const accountId = fresh()
@@ -864,6 +970,39 @@ describeConnected("EventStore sealing and nested appends (#166)", () => {
         }).pipe(Effect.flip)
         expect(error).toMatchObject({ _tag: "StreamSealed", sealedVersion: 2 })
         expect((yield* snappedOf(accountId)).length).toBe(2)
+      }).pipe(provide),
+    )
+
+    it.effect("a snapshot proof behind the seal (K < S - 1) is StreamSealed, not a conflict", () =>
+      Effect.gen(function* () {
+        const accountId = fresh()
+        yield* Snapped.append({ accountId }, [d()], 0, { snapshot: { balance: 1 } })
+        yield* Snapped.append({ accountId }, [d()], 1, { snapshot: { balance: 2 } })
+        // Sealed through the writers' definition: the snapshot at S = 3 is marked.
+        yield* Snapped.append({ accountId }, [closed()], 2, {
+          seal: true,
+          snapshot: { balance: 2 },
+        })
+
+        // A writer still at 1: its put at 2 collides with an unmarked event,
+        // and its proof returns the marked snapshot.
+        const error = yield* Snapped.append({ accountId }, [d()], 1, {
+          snapshot: { balance: 3 },
+          headProof: "snapshot",
+        }).pipe(Effect.flip)
+        expect(error).toMatchObject({
+          _tag: "StreamSealed",
+          streamName: "Snapped",
+          sealedVersion: 3,
+        })
+        expect(yield* snappedOf(accountId)).toEqual([
+          [1, false],
+          [2, false],
+          [3, true],
+        ])
+        const snapshot = Option.getOrThrow(yield* Snapped.readSnapshot({ accountId }))
+        expect(snapshot.asOfVersion).toBe(3)
+        expect(snapshot.state).toEqual({ balance: 2 })
       }).pipe(provide),
     )
 

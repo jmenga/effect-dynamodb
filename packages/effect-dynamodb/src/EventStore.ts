@@ -2131,8 +2131,9 @@ export interface EventStream<
    * (otherwise a defect, `[EDD-9068]`), ignored on a stream without a
    * `snapshot` config — see {@link ReadLatestOptions}.
    *
-   * On a sealed stream the result carries the sealing event as `seal` (see
-   * {@link LatestState.seal}), in every mode.
+   * On a sealed stream the result carries the sealing event as `seal` when
+   * the read fetches the sealing event, in any mode (see
+   * {@link LatestState.seal} for the cases it does not).
    */
   readLatest(
     streamId: StreamIdInput<TStreamIdFields>,
@@ -6192,7 +6193,8 @@ const makeCommandHandlerImpl = <
     //    loads its snapshot, the events after it and its head in one request
     //    (#138) — or, unverified, the snapshot item alone; any other stream
     //    replays from the beginning.
-    const load = (verify: boolean) => Effect.flatMap(loadUnchecked(verify), refuseSealed)
+    const load = (verify: boolean) =>
+      Effect.flatMap(loadUnchecked(verify), (loaded) => refuseSealed(loaded))
     const loadUnchecked = (verify: boolean) =>
       Effect.gen(function* () {
         let state = decider.initialState

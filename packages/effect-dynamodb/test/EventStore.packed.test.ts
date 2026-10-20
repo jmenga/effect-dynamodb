@@ -1398,6 +1398,65 @@ describe("EventStore packed storage — a sealed stream (#166)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  describe("appendOp of a compressed stream inside a native stream's append", () => {
+    const nestedId = { ledgerId: "L-2" }
+    const nestedEvents = () =>
+      storedEvents().filter((item) => item.streamId?.S === nestedId.ledgerId)
+    const sealing = (stream: { readonly appendOp: typeof GzipLedger.appendOp }) =>
+      stream.appendOp(nestedId, [recorded(1, LONG_NOTE), voided()], 0, {
+        seal: true,
+        snapshot: { total: 1, notes: [LONG_NOTE, LONG_NOTE] },
+      })
+
+    it.effect("a bound op resolves the Compression registry it captured", () =>
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(GzipLedger).pipe(Effect.provide(TestLayer))
+
+        // The outer append runs with no Compression service at all.
+        yield* NativeLedger.append(id, [recorded(9)], 0, {
+          snapshot: { total: 9, notes: [] },
+          additionalItems: [sealing(bound)],
+        }).pipe(Effect.provide(NoCodecs))
+
+        const [first, last] = nestedEvents()
+        expect(header(first!)).toBe(0x21)
+        expect(first!.__edd_sealed__).toBeUndefined()
+        expect(last!.__edd_sealed__).toEqual({ BOOL: true })
+        expect(last!.data!.S).toBe('{"_tag":"Voided","day":"2026-10-12","reason":"closed"}')
+        // The outer stream's event stays a native map.
+        const outer = storedEvents().find((item) => item.streamId?.S === id.ledgerId)
+        expect(outer!.data!.M).toBeDefined()
+        const read = yield* bound.read(nestedId)
+        expect(read.map((e) => e.sealed)).toEqual([undefined, true])
+        expect(read[0]!.data).toEqual(recorded(1, LONG_NOTE))
+      }),
+    )
+
+    it.effect("an unbound op needs the registry in the outer append's context", () =>
+      Effect.gen(function* () {
+        const message = unregisteredCodecDefect(
+          yield* Effect.exit(
+            NativeLedger.append(id, [recorded(9)], 0, {
+              snapshot: { total: 9, notes: [] },
+              additionalItems: [sealing(GzipLedger)],
+            }),
+          ),
+        )
+        expect(message).toContain('stream "Ledger" stores "data" packed with codec "gzip"')
+        expect(sentTransactions).toHaveLength(0)
+        expect(store.size).toBe(0)
+
+        // With the registry in scope, the same op writes packed data.
+        yield* NativeLedger.append(id, [recorded(9)], 0, {
+          snapshot: { total: 9, notes: [] },
+          additionalItems: [sealing(GzipLedger)],
+        }).pipe(Effect.provide(Codecs))
+        expect(header(nestedEvents()[0]!)).toBe(0x21)
+        expect(nestedEvents()[1]!.__edd_sealed__).toEqual({ BOOL: true })
+      }).pipe(Effect.provide(NoCodecs)),
+    )
+  })
+
   it.effect("a sealing Recorded event is reported through an all LSI", () =>
     Effect.gen(function* () {
       yield* JsonLedger.append(id, [recorded(1), recorded(2)], 0, {
