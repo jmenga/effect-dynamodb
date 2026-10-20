@@ -680,7 +680,12 @@ describe("EventStore", () => {
 
         const check = call.TransactItems[0].ConditionCheck
         expect(check.TableName).toBe("events-table")
-        expect(check.ConditionExpression).toBe("attribute_exists(pk)")
+        // The contiguity check also refuses a sealed event (#166).
+        expect(check.ConditionExpression).toBe(
+          "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+        )
+        expect(check.ExpressionAttributeNames).toEqual({ "#pk": "pk", "#sealed": "__edd_sealed__" })
+        expect(check.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
 
         const key = fromAttributeMap(check.Key)
         expect(key.pk).toBe("$cricket#v1#match#m-1")
@@ -9571,7 +9576,9 @@ describe("EventStore headProof and loadState (#164)", () => {
         })
 
         expect(kinds(sent())).toEqual(["check", "match.event", "Watermark"])
-        expect(sent()[0].ConditionCheck.ConditionExpression).toBe("attribute_exists(pk)")
+        expect(sent()[0].ConditionCheck.ConditionExpression).toBe(
+          "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+        )
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -9784,8 +9791,14 @@ describe("EventStore headProof and loadState (#164)", () => {
 
         expect(kinds(sent())).toEqual(["proofmatch.event", "proofmatch.snapshot"])
         const put = sent()[1].Put
-        expect(put.ConditionExpression).toBe("#asOfVersion = :expectedVersion")
-        expect(put.ExpressionAttributeNames).toEqual({ "#asOfVersion": "asOfVersion" })
+        expect(put.ConditionExpression).toBe(
+          "#asOfVersion = :expectedVersion AND attribute_not_exists(#sealed)",
+        )
+        expect(put.ExpressionAttributeNames).toEqual({
+          "#asOfVersion": "asOfVersion",
+          "#sealed": "__edd_sealed__",
+        })
+        expect(put.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
         expect(fromAttributeMap(put.ExpressionAttributeValues)).toEqual({ ":expectedVersion": 3 })
         expect(fromAttributeMap(put.Item).asOfVersion).toBe(4)
       }).pipe(Effect.provide(TestLayer)),
@@ -10290,7 +10303,9 @@ describe("EventStore headProof and loadState (#164)", () => {
 
         expect(result.version).toBe(6)
         expect(kinds(sent(0))).toEqual(["proofmatch.event", "proofmatch.snapshot"])
-        expect(sent(0)[1].Put.ConditionExpression).toBe("#asOfVersion = :expectedVersion")
+        expect(sent(0)[1].Put.ConditionExpression).toBe(
+          "#asOfVersion = :expectedVersion AND attribute_not_exists(#sealed)",
+        )
         expect(kinds(sent(1))).toEqual(["check", "proofmatch.event", "proofmatch.snapshot"])
       }).pipe(Effect.provide(TestLayer)),
     )

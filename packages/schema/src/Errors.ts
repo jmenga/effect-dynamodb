@@ -441,6 +441,39 @@ export class VersionConflict extends Data.TaggedError("VersionConflict")<{
 }> {}
 
 /**
+ * The stream is sealed: an append (`EventStore.append(..., { seal: true })`,
+ * or a stream's `appendOp` carried in another append) marked its last event as
+ * the stream's final event, and no event can be appended after it.
+ *
+ * Terminal: no append to this stream can ever succeed again, so
+ * `EventStore.commandHandler` never retries it. The usual next step is the
+ * stream that succeeds it (for example the next generation of an account's
+ * ledger).
+ *
+ * - `streamName` / `streamId` name the sealed stream. For a failure of a
+ *   stream's `appendOp` carried in another append's `additionalItems`, that is
+ *   the inner stream, not the appending one.
+ * - `sealedVersion` is the version of the sealing event: the stream's final
+ *   version.
+ *
+ * It is diagnosed from the transaction's cancellation reasons, never from a
+ * pre-read: the version-contiguity check, the first event put and a snapshot
+ * head proof return the item they failed on, and a sealed item carries the
+ * marker. A writer several versions behind the seal gets `VersionConflict`
+ * instead, and learns of the seal when it reloads.
+ *
+ * Precedence: {@link DuplicateCommand} is reported ahead of it (a redelivered
+ * sealing command is a duplicate), and it is reported ahead of
+ * {@link VersionConflict} and every additional-item error.
+ */
+export class StreamSealed extends Data.TaggedError("StreamSealed")<{
+  readonly streamName: string
+  readonly streamId: string
+  /** The version of the sealing event: the stream's final version. */
+  readonly sealedVersion: number
+}> {}
+
+/**
  * DynamoDB's hard cap on the number of items in a single
  * `TransactWriteItems` request.
  */

@@ -65,6 +65,7 @@ import type {
   ConcurrentModification,
   DuplicateCommand,
   OptimisticLockError,
+  StreamSealed,
   TransactionCancelled,
   UniqueConstraintViolation,
   ValidationError,
@@ -1240,6 +1241,7 @@ describe("EventStore packed storage types (#147)", () => {
       >().toEqualTypeOf<ReadErrors>()
       expectTypeOf<EventStore.AppendError>().toEqualTypeOf<
         | VersionConflict
+        | StreamSealed
         | DuplicateCommand
         | AdditionalItemConditionFailed
         | AppendTooLarge

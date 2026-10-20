@@ -41,6 +41,7 @@ export {
   ResourceNotFoundError,
   StaleAppend,
   StreamRecordIdentifierMissing,
+  StreamSealed,
   ThrottlingError,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,

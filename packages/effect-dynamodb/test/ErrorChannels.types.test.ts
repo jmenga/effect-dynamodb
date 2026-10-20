@@ -29,6 +29,7 @@ import type {
   ItemNotFound,
   OptimisticLockError,
   RefNotFound,
+  StreamSealed,
   TransactionCancelled,
   TransactionOverflow,
   UniqueConstraintViolation,
@@ -199,6 +200,7 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
     expectTypeOf<Leaked<EventStore.AppendError>>().toBeNever()
     expectTypeOf<EventStore.AppendError>().toEqualTypeOf<
       | VersionConflict
+      | StreamSealed
       | DuplicateCommand
       | AdditionalItemConditionFailed
       | AppendTooLarge
