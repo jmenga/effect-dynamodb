@@ -21,6 +21,8 @@ An event-sourced cricket match tracker using effect-dynamodb's `EventStore` modu
 - Event metadata: one value per append, or one entry per event
 - Stream index projection: keeping metadata, or everything but the keys, out of an index
 - Shared indexes: one GSI partition several streams write, snapshots included
+- State from your own record: `loadState` and a record head proof
+- Sealing a stream: a generation changeover in one transaction, and atomic multi-stream appends
 
 ---
 
@@ -538,6 +540,9 @@ successful no-op rather than a regression of the cache. Auto-snapshot writes are
 best-effort — a failure is logged and never fails the command, because the events it
 summarises are already durable.
 
+`writeSnapshot` does not know whether a stream is sealed, so it must not target a sealed
+head with an unmarked snapshot. [Step 24](#head-proofs-and-sealed-streams) explains why.
+
 ## Step 12: Atomic Side Writes
 
 Real event-sourced systems usually need one non-event record kept in step with the events: an ingestion watermark, a read model, a stream registry row, a uniqueness guard. `append` accepts `additionalItems` — the same operation builders `Transaction.transactWrite` takes (`Entity.put`, `Entity.delete`, and `Transaction.check`) — and commits them in the **same** `TransactWriteItems` call as the events:
@@ -617,6 +622,7 @@ const condError = yield* matchEvents
 | `UniqueConstraintViolation` | A put in `additionalItems` takes a unique value another item holds | Choose another value |
 | `OptimisticLockError` / `ConcurrentModification` | A put in `additionalItems` lost a race with another writer of its item on every attempt | Retry the command |
 | `DuplicateCommand` | The idempotency sentinel — this `commandId` already ran | Nothing; the command already took effect |
+| `StreamSealed` | The stream is sealed: no event can follow its final one ([Step 24](#step-24-sealing-a-stream)) | Nothing on this stream; move to its successor. Never retried |
 | `TransactionCancelled` | Throttling, a concurrent transaction, or a validation error | Retry with backoff |
 | `AppendTooLarge` | DynamoDB rejected the append: `events + additionalItems + sentinel + contiguity check` exceeded its 100-item cap | Split the append |
 
@@ -1840,6 +1846,321 @@ The library can't see who else writes the stream. The proof holds only while **e
 
 ---
 
+## Step 24: Sealing a Stream
+
+A table restore makes a stream's version numbers reusable. A writer that loaded version 10 before the restore can append onto a *different* version 10 written after it. One way to close that hole is to key streams by **generation** (`{ accountId, generation }`): after a restore, writers move to the next generation and nobody writes to the old one again.
+
+One gap is left. A stale writer can still *succeed* in appending to the old generation when the restored head happens to equal its `expectedVersion`. Nobody reads that generation any more, so the write is silently lost. **Sealing** closes the gap. A sealed stream accepts no further events, and an append that tries fails with `StreamSealed`.
+
+The library has no notion of generations. The generation is just a stream id field, and the chain of generations is an item the application owns:
+
+```typescript title="ledger.ts" region="seal-stream" example="event-sourcing.ts"
+// An account's ledger, keyed by generation. After a table restore, writers
+// move to the next generation; sealing the old one makes sure nobody can
+// append to it again.
+class LedgerOpened extends Schema.TaggedClass<LedgerOpened>()("LedgerOpened", {
+  balance: Schema.Number,
+  // The generation this one continues, and the version its balance was read at.
+  continuesFrom: Schema.optionalKey(
+    Schema.Struct({ generation: Schema.String, version: Schema.Number }),
+  ),
+}) {}
+
+class Deposited extends Schema.TaggedClass<Deposited>()("Deposited", {
+  amount: Schema.Number,
+}) {}
+
+class Withdrawn extends Schema.TaggedClass<Withdrawn>()("Withdrawn", {
+  amount: Schema.Number,
+}) {}
+
+class LedgerClosed extends Schema.TaggedClass<LedgerClosed>()("LedgerClosed", {
+  reason: Schema.String,
+  // The generation that carries the ledger on, when there is one.
+  continuedIn: Schema.optionalKey(Schema.String),
+}) {}
+
+type LedgerEvent = LedgerOpened | Deposited | Withdrawn | LedgerClosed
+
+// The application's chain index: which generation is current, and where each
+// closed one ends. Every writer of it increments `revision`.
+class LedgerChain extends Schema.Class<LedgerChain>("LedgerChain")({
+  accountId: Schema.String,
+  current: Schema.String,
+  revision: Schema.Number,
+  generations: Schema.Array(
+    Schema.Struct({
+      generation: Schema.String,
+      validThrough: Schema.optionalKey(Schema.Number),
+    }),
+  ),
+}) {}
+
+const LedgerChains = Entity.make({
+  model: LedgerChain,
+  entityType: "LedgerChain",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const LedgerTable = Table.make({ schema: AppSchema, entities: { LedgerChains } })
+
+const Ledgers = EventStore.makeStream({
+  table: LedgerTable,
+  streamName: "Ledger",
+  events: [LedgerOpened, Deposited, Withdrawn, LedgerClosed],
+  streamId: { composite: ["accountId", "generation"] },
+})
+
+type LedgerState = { readonly balance: number }
+type LedgerCommand = { readonly _tag: "Deposit"; readonly amount: number }
+
+const ledgerDecider: EventStore.Decider<LedgerState, LedgerCommand, LedgerEvent> = {
+  initialState: { balance: 0 },
+  decide: (command) => Effect.succeed([new Deposited({ amount: command.amount })]),
+  evolve: (state, event) => {
+    if (event._tag === "LedgerOpened") return { balance: event.balance }
+    if (event._tag === "Deposited") return { balance: state.balance + event.amount }
+    if (event._tag === "Withdrawn") return { balance: state.balance - event.amount }
+    return state
+  },
+}
+```
+
+### Sealing with an append
+
+`append(..., { seal: true })` marks the append's **last** event as the stream's final event. The sealing event is your own event, and the library adds a marker attribute (`__edd_sealed__`) to its item:
+
+```typescript region="seal-append" example="event-sourcing.ts"
+const ledgers = yield* EventStore.bind(Ledgers)
+const closing = { accountId: "acc-9", generation: "1" }
+yield* ledgers.append(
+  closing,
+  [new LedgerOpened({ balance: 0 }), new Deposited({ amount: 40 })],
+  0,
+)
+
+// The account closes for good: this append's last event is the stream's last.
+const sealedAt = yield* ledgers.append(
+  closing,
+  [new Withdrawn({ amount: 40 }), new LedgerClosed({ reason: "account closed" })],
+  2,
+  { seal: true },
+)
+// → version 4; event 4 carries the seal marker
+```
+
+- The seal version `S` is `expectedVersion + events.length`. `seal: false` or no `seal` does nothing.
+- `seal: true` with zero events, or a `seal` that is not a boolean, fails with `ValidationError` (`operation: "EventStore.append.seal"`) before anything is written.
+- On a stream with `snapshot: { mode: "inline" }` and no `every`, a sealing `append` must also pass `snapshot`. The snapshot it writes carries the marker too, so a snapshot read sees the seal (see [the head-proof rules](#head-proofs-and-sealed-streams) below). `commandHandler` always attaches the snapshot on those streams.
+- `seal` works with every other append option, including `idempotency`, `additionalItems`, `metadata`, `eventTimestamps` and both head proofs. `measureAppend` accepts it and counts the marker.
+- A seal is permanent. There is no unseal.
+
+The seal costs nothing extra. Every append after version 0 already writes a version-contiguity `ConditionCheck` on the event at `expectedVersion`. Its condition becomes `attribute_exists(pk) AND attribute_not_exists(__edd_sealed__)`, so a writer that loaded after the seal fails it. A writer that loaded before the seal fails as it always did, because its next version is taken by the sealing event. Which error the writer gets is diagnosed from the cancellation reasons. Nothing is pre-read.
+
+| Writer | Fails at | Error |
+|---|---|---|
+| Loaded after the seal (`expectedVersion = S`) | The contiguity check on `S` | `StreamSealed` |
+| Loaded just before the seal (`S - 1`) | Its first event put, at `S` | `StreamSealed` |
+| Further behind (`K < S - 1`) | Its first event put, at `K + 1` | `VersionConflict`; a handler's retry reloads and gets `StreamSealed` |
+| `expectedVersion = 0` | Its first event put, at 1 | `VersionConflict`, or `StreamSealed` when `S = 1` |
+| `headProof: "snapshot"` at `S` | The snapshot proof | `StreamSealed` (the snapshot is marked) |
+| Redelivered sealing command (same `commandId`) | The idempotency sentinel | `DuplicateCommand` |
+
+`StreamSealed` carries `streamName`, `streamId` and `sealedVersion`. It ranks after `DuplicateCommand` (a redelivery is the truer answer) and ahead of `VersionConflict`.
+
+### Reading the seal
+
+```typescript region="sealed-read" example="event-sourcing.ts"
+const closed = yield* ledgers.readLatest(closing, { consistentRead: true })
+// → closed.seal: the LedgerClosed event at version 4, closed.version 4
+
+const closedEvents = yield* ledgers.read(closing, { consistentRead: true })
+const final = closedEvents.at(-1)
+// → final.sealed === true; no other event carries `sealed`
+```
+
+- `StreamEvent.sealed` is `true` on the sealing event and absent on every other event. `read`, `readFrom`, `query.events`, stream-index reads and `decodeStreamImage` all report it. A catch-up reader already past `S` gets `[]` from `readFrom`, and learns of the seal from the sealing event it already consumed, or from `readLatest`.
+- `LatestState.seal` is the sealing event, in every `readLatest` mode, honouring `consistentRead`. With an inline snapshot taken at `S`, the sealing event is in `seal` but not in `events`, because `events` holds only what follows the snapshot, and that snapshot already folds it in. With `verifySnapshot: false`, a marked snapshot costs one more `GetItem`, of the sealing event, and only on a sealed stream.
+- `seal.version < version` means events were written past the seal (see [one write past the seal](#one-write-past-the-seal-reopens-the-stream)).
+- `currentVersion` returns a number and does not report the seal. Neither does a `projection: "withoutMetadata"` stream index, because its `INCLUDE` list is fixed and does not name the marker; `"all"` and `"keys"` indexes do report it. Read the stream (`readLatest`) when you need the seal.
+
+### Handling `StreamSealed`
+
+`StreamSealed` is terminal: no append to that stream can ever succeed again. `commandHandler` never retries it, and its load reports the seal **before** `decide` runs, so a sealed stream spends no transaction:
+
+```typescript region="sealed-handler" example="event-sourcing.ts"
+const handleLedger = EventStore.commandHandler(ledgerDecider, ledgers, { retry: 3 })
+
+const outcome = yield* handleLedger(closing, { _tag: "Deposit", amount: 10 }).pipe(
+  Effect.map((result) => `deposited at v${result.version}`),
+  Effect.catchTag("StreamSealed", (sealed) =>
+    Effect.succeed(`refused: ${sealed.streamId} is sealed at v${sealed.sealedVersion}`),
+  ),
+)
+// → "refused: acc-9#1 is sealed at v4": seen on load, before decide, never retried
+
+// A raw append at the head fails the same way.
+const late = yield* ledgers
+  .append(closing, [new Deposited({ amount: 10 })], 4)
+  .pipe(Effect.flip)
+// → StreamSealed { sealedVersion: 4 }
+```
+
+- The handler checks after every load. With a `commandId`, it reports `DuplicateCommand` first when that command already committed.
+- `StreamSealed` outranks an If-Match: a call with an `expectedVersion` on a sealed stream gets `StreamSealed`, not `VersionConflict`, because the caller's right move is to the successor stream, not a retry.
+- A no-op decision is refused too. A sealed stream accepts no commands.
+- When the load finds events after the seal, the handler still fails with `StreamSealed` (`sealedVersion` is the seal's) and logs a warning naming the versions past it. Those are writes the application must recover.
+- With `loadState`, the handler learns of the seal from your record: return `sealedVersion` from `loadState`. It may be `version + 1` (see the record-proof rules below). A `sealedVersion` that is not a non-negative integer, or is below `version`, fails with `ValidationError`.
+
+### A generation changeover
+
+Closing generation `N` and opening `N + 1` is one transaction: seal `N` at the version the carry-over read, open `N + 1` with an event that links back to it, and move the chain index. `stream.appendOp(...)` builds another stream's append as an item of an append's `additionalItems`, which commits if and only if that append does:
+
+```typescript region="changeover" example="event-sourcing.ts"
+// Close generation `from`, open `to`, and move the chain index: one transaction.
+const changeover = (accountId: string, from: string, to: string) =>
+  Effect.gen(function* () {
+    const closingGeneration = { accountId, generation: from }
+    // ONE read gives the carried-over state AND the version the seal goes at.
+    const latest = yield* ledgers.readLatest(closingGeneration, { consistentRead: true })
+    if (latest.seal !== undefined) return latest.seal.version // already closed
+    const carried = EventStore.fold(ledgerDecider, latest.events)
+
+    // The chain index, read-modify-write: the whole item, rebuilt from this
+    // read, replaced only if no writer has changed it since.
+    const chain = yield* Entity.consistentRead(LedgerChains.get({ accountId }))
+    const nextChain = LedgerChains.put({
+      accountId,
+      current: to,
+      revision: chain.revision + 1,
+      generations: [
+        ...chain.generations.map((entry) =>
+          entry.generation === from ? { ...entry, validThrough: latest.version + 1 } : entry,
+        ),
+        { generation: to },
+      ],
+    }).pipe(LedgerChains.condition({ revision: chain.revision }))
+
+    yield* ledgers.append(
+      { accountId, generation: to },
+      [
+        new LedgerOpened({
+          balance: carried.balance,
+          continuesFrom: { generation: from, version: latest.version },
+        }),
+      ],
+      0,
+      {
+        additionalItems: [
+          // Generation `from` sealed at the version its state was read at.
+          ledgers.appendOp(
+            closingGeneration,
+            [new LedgerClosed({ reason: "restored", continuedIn: to })],
+            latest.version,
+            { seal: true },
+          ),
+          nextChain,
+        ],
+      },
+    )
+    return latest.version + 1
+  }).pipe(
+    // A stale append on `from`, or another writer of the chain index, since
+    // the reads: read both again, carrying the stale append forward.
+    Effect.retry({
+      times: 3,
+      while: (error) =>
+        error._tag === "VersionConflict" || error._tag === "AdditionalItemConditionFailed",
+    }),
+  )
+
+const sealedVersion = yield* changeover("acc-1", "1", "2")
+// → 3: generation 1 ends at its LedgerClosed event; generation 2 opens at
+//   version 1 with balance 250, continuing from generation 1 at version 2
+```
+
+**The seal's `expectedVersion` is the version the carried-over state was read at.** It comes from the same `readLatest` result as the state, and it travels in the opening event's back link (`continuesFrom.version`). Never re-read the old generation's head to get it. Suppose the state is read at 2, a stale writer then lands event 3, and the seal is built from a fresh read of the head (3). The transaction opens generation 2 with state through version 2, and seals generation 1 at 4. Event 3 is in neither generation, and both writers were told they succeeded. With the carry-over version, the seal's own check fails instead (`VersionConflict` naming generation 1), nothing is written, and the retry re-reads and carries event 3 forward.
+
+The chain index is a **read-modify-write under a `revision`**. Updates are not accepted in `additionalItems`, so the closer reads the item, builds the whole new item from that read with `revision + 1`, and puts it conditioned on the `revision` it read (`create()` for the first generation). A condition on only the field you change is not enough: a put replaces the whole item, and would silently drop a concurrent edit to any other field. Every writer of the item must increment `revision`. An entity with `timestamps` must re-supply `createdAt` from the read, or the put resets it.
+
+How the transaction fails, with nothing written in each case:
+
+| What went wrong | Error |
+|---|---|
+| The new generation is already open | `VersionConflict` naming the new generation |
+| A stale append landed on the old generation since the read | `VersionConflict` naming the old generation: read again |
+| Another closer already sealed the old generation | `StreamSealed` naming the old generation |
+| The chain index changed since the read | `AdditionalItemConditionFailed` (`indices: [1]`): read again |
+
+The appending stream's own failures are judged first, then each nested append's, in order, then the other additional items.
+
+- A nested append is a full append of its stream: its own contiguity check, event puts, seal marker, and an inline snapshot when you pass `snapshot`. It takes `seal`, `snapshot`, `metadata` / `eventMetadata` and `eventTimestamps`, but not `additionalItems`, `idempotency` or `headProof` (refused at the type level, and with `ValidationError`, `operation: "EventStore.appendOp"`, at runtime). Zero events are refused the same way. A nested op cannot be a `headProof: { additionalItem }` target.
+- **A record the old generation's writers load goes in the outer append.** When its writers use `loadState`, or a record head proof, the changeover's outer `additionalItems` also writes that record, beside the `appendOp`, with `sealedVersion` set (and on record-proof streams, the version kept at `S - 1`, as below). Without it, a handler whose record is more than one version below the seal loops on `VersionConflict` until its retry schedule ends, instead of reporting the seal.
+- **A handler on the new generation** can carry the old generation's sealing `appendOp` in a function-form `additionalItems`. It must take the version from the **decision** (for example `decision.events[0].continuesFrom.version`), never from its own read of the old head. A `VersionConflict` naming the old generation is retried by the handler's `retry` schedule, even under an If-Match on the new one, and is never taken for a lagging snapshot. Read the old generation inside `decide` through a bound stream, so each retried attempt reads it again and the opening event and the seal's version move together.
+- **One client per append.** A nested op's items are sent in the outer append's single `TransactWriteItems`, through the outer append's `DynamoClient`. A bound stream's op resolves its own table name from its captured context, so a stream on another table needs no extra layer, but its captured client is never used. Every table must be reachable through the outer client.
+- `measureAppend` refuses `additionalItems`, so it cannot measure a whole changeover. Measure each append and add them up.
+- `Transaction.transactWrite` does not accept a stream op: its type rejects it, and at runtime it fails with `ValidationError`.
+
+### Atomic multi-stream append
+
+`appendOp` does not need a seal. Without one, several streams' events commit together or not at all:
+
+```typescript region="multi-stream-append" example="event-sourcing.ts"
+// A transfer: both ledgers' events commit together, or neither does.
+const transfer = yield* ledgers.append(
+  { accountId: "acc-1", generation: "2" },
+  [new Withdrawn({ amount: 75 })],
+  1,
+  { additionalItems: [ledgers.appendOp(savings, [new Deposited({ amount: 75 })], 1)] },
+)
+// → acc-1 generation 2 at version 2, acc-2 generation 1 at version 2
+```
+
+Each stream's version is checked independently, and a stale `expectedVersion` on either fails the whole append (`VersionConflict` naming that stream). Don't nest an append to the appending stream itself: the two appends either touch one item twice, which fails with `ValidationError` (DynamoDB allows one operation per item in a transaction), or conflict.
+
+:::note[`additionalItems` is wider now]
+`append`'s `additionalItems`, and `commandHandler`'s `AdditionalItemsInput`, take `AppendWriteOp` (`TransactWriteOp | StreamAppendOp`). Passing a `TransactWriteOp[]` in still compiles. Code that *reads* one of those types and forwards the value to `Transaction.transactWrite` stops compiling: annotate the value as `ReadonlyArray<TransactWriteOp>`.
+:::
+
+### Head proofs and sealed streams
+
+A head proof replaces the contiguity check, so the seal's clause in that check never runs on that path. Each proof has its own rule.
+
+**`headProof: "snapshot"`.** The sealing append's inline snapshot carries the marker, and the snapshot proof becomes `asOfVersion = expectedVersion AND attribute_not_exists(__edd_sealed__)`. That is why a sealing append on an inline-without-`every` stream must pass `snapshot`: the snapshot at `S` is then the marked one, and it is what an unverified (`verifySnapshot: false`) load reads. **Seal through a definition that shares the writers' snapshot config.** A closer often runs in another process, with its own definition of the stream. If that definition has no snapshot config (or uses `every`), its seal is accepted without a snapshot, the snapshot stays unmarked below `S`, and an unverified `readLatest` does not report the seal. Writers are still refused: their append fails, and the handler's verified reload reports `StreamSealed`.
+
+**`headProof: { additionalItem: n }`.** The library can't enforce a seal through your record without a pre-read. Make every record-proof writer's first event put land on the sealing event instead:
+
+- Seal with **exactly one event**, so `S = E + 1`, where `E` is the record's version.
+- Write the record in the sealing transaction **without advancing its version**: it stays at `E = S - 1`, with your sealed flag and `sealedVersion: S` for `loadState`. Condition the record on `version = E`.
+- Every record-proof writer then loads `E` and appends at `expectedVersion = E`. Its record condition holds, and its first event put at `S` hits the sealing event: `StreamSealed`. A handler whose `loadState` returns `sealedVersion` fails before `decide`.
+
+Advancing the record to `S` lets a writer that loads it append at `S`: no contiguity check is written, its record condition holds, and event `S + 1` lands past the seal. Advance it only if every writer's record condition also tests your sealed flag. A seal of more than one event leaves the record more than one below `S`, where writers get `VersionConflict` and a handler loops; keep record-proof seals to one event.
+
+:::caution[`writeSnapshot` must not target a sealed head with an unmarked snapshot]
+`writeSnapshot` is one plain conditional `PutItem`. It does not know whether the stream is sealed, and it never writes the marker. A job that snapshots streams should skip sealed ones (`readLatest(...).seal` is present), or seal through a definition that shares the writers' inline snapshot config: the sealing append then writes the marked snapshot at `S`, and the monotonic `writeSnapshot` never replaces it.
+
+The residual, when all three happen: a closer on a definition without the inline-without-`every` snapshot config seals at `S`, leaving the snapshot unmarked below `S`; a `writeSnapshot(id, state, S)` then puts an **unmarked** snapshot at `S`; and a writer with `headProof: "snapshot"` appends at `S`. Its proof holds on the unmarked snapshot, no contiguity check is written, and event `S + 1` lands and is reported as success. A verified `readLatest` still reports the seal (`seal.version < version`).
+:::
+
+### Side writes still land
+
+An append with no events (only `additionalItems` and/or an idempotency sentinel) writes no contiguity check, so it still lands on a sealed stream. It adds nothing to the stream. A seal stops events, not side writes.
+
+### One write past the seal reopens the stream
+
+:::danger[Upgrade every writer before sealing]
+A writer on a library version before 1.33.0 writes the old contiguity check, and **can append past a seal**. Older readers ignore the marker.
+:::
+
+The seal is enforced on the event at a writer's `expectedVersion` (or the one after it), not on the stream. If any write gets past it (a pre-1.33 writer, a record-proof writer whose record was advanced to `S`, or the `writeSnapshot` residual above) and lands event `S + 1`, that event carries no marker. Every writer that then loads the head at `S + 1` passes the check and appends, and those events are on a generation nobody reads.
+
+The write side can't stop it without a pre-read. The read side reports it wherever the sealing event is among the items a read already fetches: `readLatest` sets `seal` from **any** marked event it reads, not only the newest, and the handler refuses to decide past a seal and logs the versions after it. A verified `readLatest` with an inline snapshot reads the snapshot and only a few events, so once enough events follow the seal, only a full `read` finds it. So: upgrade every writer first, keep a record-proof stream's record at `S - 1`, and never `writeSnapshot` a sealed head with an unmarked snapshot.
+
+---
+
 ## Running the Example
 
 The complete runnable example is at [`examples/event-sourcing.ts`](https://github.com/effect-ts/effect-dynamodb/tree/main/packages/effect-dynamodb/examples/event-sourcing.ts) in the repository.
@@ -1888,6 +2209,7 @@ const AppLayer = Layer.mergeAll(
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
   SeriesTable.layer({ name: "event-sourcing-series" }),
   RecordTable.layer({ name: "event-sourcing-records" }),
+  LedgerTable.layer({ name: "event-sourcing-ledgers" }),
   WebCrypto,
 )
 
@@ -1928,6 +2250,9 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Shared indexes** | A GSI index's `partition` (from the stream id or the event) lets several streams write one partition, and its `snapshot` puts each stream's snapshot there too; `indexDefinitions` emits the shared GSI once; `readIndex` takes the `partition` |
 | **Head proof** | `headProof: "snapshot"` (inline without `every`) or `{ additionalItem: n }` names an item whose own condition proves the head, in place of the version-contiguity `ConditionCheck`; its failure is a `VersionConflict` |
 | **State from your own record** | `commandHandler(..., { loadState })` loads state and head from the application's record instead of the stream; with `headProof: { additionalItem }`, the record written with every append is also the version guard |
+| **Sealing** | `append(..., { seal: true })` makes the append's last event the stream's final one; a later append fails with `StreamSealed` (terminal, never retried); `readLatest` returns the sealing event as `seal`, and `StreamEvent.sealed` marks it |
+| **Generation changeover** | `stream.appendOp(...)` in another append's `additionalItems` seals the old generation at the version its carried-over state was read at, in the transaction that opens the next one; the chain index is a whole-item put conditioned on a `revision` |
+| **Atomic multi-stream append** | `appendOp` without `seal`: several streams' events commit together or not at all |
 
 ## What's Next?
 

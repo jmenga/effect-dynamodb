@@ -3223,6 +3223,15 @@ stream.readSnapshot(streamId)                       // Effect<Option<Snapshot<St
 State round-trips through the user-supplied `snapshot.schema` — `Schema.encodeEffect`
 on write, `Schema.decodeUnknownEffect` on read — so transforming schemas work.
 
+**`writeSnapshot` on a sealed stream (#166).** `writeSnapshot` stays one plain conditional
+`PutItem`: it does not know whether the stream is sealed and never writes the seal marker,
+so it **must not target a sealed head with an unmarked snapshot**. The residual when it
+does: a closer on a definition without the inline-without-`every` snapshot config seals at
+`S` (the snapshot stays unmarked below `S`), a `writeSnapshot(id, state, S)` then puts an
+unmarked snapshot at `S`, and a `headProof: "snapshot"` append at `S` passes its proof and
+lands `S + 1`, reopening the stream. Sealing through the writers' definition writes the
+marked snapshot at `S`, which the monotonic `writeSnapshot` never replaces.
+
 **Snapshot-aware commandHandler.** When the stream declares `snapshot`, each handler
 invocation loads state with `readLatest` (the snapshot plus its delta in one `Query`,
 below) instead of a full replay, then runs the command path above. In the default
@@ -3373,6 +3382,92 @@ rejects one ahead of the head. An item whose own condition holds only at
   read), `headProof: "snapshot"` on any other snapshot config, a malformed `headProof`.
 
 Design: `docs/designs/eventstore-head-proof.md`.
+
+### Sealing a Stream (#166)
+
+A table restore makes version numbers reusable, so an application keys streams by
+generation (`{ accountId, generation }`) and moves writers to the next generation after a
+restore. A stale writer whose `expectedVersion` happens to equal the restored head could
+still append to the old generation, where nobody reads. **Sealing** closes that: a sealed
+stream accepts no further events. The library owns no notion of generations; it provides
+the seal, a way to carry another stream's append, `StreamSealed`, and read results that
+report the seal.
+
+- **`append(..., { seal: true })`** marks the append's **last** event (`S = expectedVersion
+  + n`) with the native `BOOL` attribute `__edd_sealed__`, and the inline snapshot of the
+  same append when it writes one. Never on the idempotency sentinel, nor on a snapshot from
+  `writeSnapshot` or the after-append path; never removed (no unseal). The marker is in
+  `STREAM_OWNED_ATTRIBUTES`, so an index attribute of that name is `[EDD-9064]`. It sits
+  outside `data` / `state`, so packed storage never touches it. Zero events or a
+  non-boolean `seal` is a `ValidationError` (`EventStore.append.seal`); so is a sealing
+  append without `snapshot` on a `mode: "inline"` stream without `every` (that check binds
+  only the definition that seals). `measureAppend` counts the marker.
+- **Enforcement — no pre-read, no extra items.** The contiguity check becomes
+  `attribute_exists(#pk) AND attribute_not_exists(#sealed)` with
+  `ReturnValuesOnConditionCheckFailure: ALL_OLD`; the **first** event put gains `ALL_OLD`;
+  the snapshot proof becomes `#asOfVersion = :expectedVersion AND
+  attribute_not_exists(#sealed)` with `ALL_OLD` (`attribute_not_exists(pk)` at 0, also
+  `ALL_OLD`). A writer at `S` fails the check; one at `S - 1` fails its first put on the
+  sealing event; both are `StreamSealed`. Further behind is `VersionConflict` (a handler's
+  retry reloads and reports the seal). Zero-event appends write no check, so side writes
+  still land.
+- **Attribution precedence** (`sendAppendTransaction`): `RepeatedItem` diagnosis →
+  sentinel (`DuplicateCommand`) → own stream sealed (a marked item returned at the check,
+  the first event put or the snapshot proof: `StreamSealed`, `sealedVersion` from the
+  item's `version` / `asOfVersion`) → other event-range failures (`VersionConflict`) →
+  head proof (`VersionConflict`) → additional items via `judgeCancellation`: nested stream
+  verdicts in op order, then guarded-put `fail`, then `conditions`
+  (`AdditionalItemConditionFailed`), then `retry` → `TransactionCancelled`.
+- **`stream.appendOp(id, events, v, options?)`** (`EventStream` and `BoundEventStream`)
+  returns a `StreamAppendOp`, accepted only by `append`'s and the handler's
+  `additionalItems` (`AppendWriteOp = TransactWriteOp | StreamAppendOp`).
+  `buildTransactWriteItems(ops, operation, { streams: true })` runs its lazy `_build`
+  (the inner stream's own `buildAppend`), pushes the items with `provenance.kind:
+  "stream"`, records a `streams` range with a verdict, and leaves it out of `conditioned`
+  (so it can't be a `headProof` target). Without `streams: true` it is refused
+  (`ValidationError`), so `Transaction.transactWrite` is unchanged. Options are
+  `NestedAppendOptions` (no `additionalItems`, `idempotency`, `headProof`; refused at
+  runtime with `EventStore.appendOp`, as are zero events, when the outer append builds).
+  The verdict over the nested slice: a marked item → `StreamSealed`, another failure of its
+  check or event puts → `VersionConflict`, both naming the inner stream. A bound op builds
+  under its captured `TableConfig` / `Compression`, but every item goes through the outer
+  append's `DynamoClient` (one transaction, one client). Without `seal` it is an atomic
+  multi-stream append.
+- **Changeover rule.** The seal's `expectedVersion` is the version the carried-over state
+  was read at (the same `readLatest`, or the decided opening event's back link), never a
+  fresh read of the head: a fresh read seals over a stale append the opening event never
+  carried. A chain-index item rides as a whole-item Entity put under an application
+  `revision` condition (read-modify-write; Entity updates in `append`'s `additionalItems`
+  are a follow-up). A record the sealed stream's writers load goes in the **outer**
+  append's `additionalItems`, with `sealedVersion`.
+- **Reads.** `decodeStreamEvent` sets `StreamEvent.sealed: true` on a marked event (`read`,
+  `readFrom`, `query.events`, `decodeStreamImage`, index reads except
+  `"withoutMetadata"`, whose `INCLUDE` list is unchanged). `LatestState.seal` is the
+  sealing event, set from **any** marked event the read fetched (the oldest when several
+  are marked), kept out of `events` when the snapshot already folds it in. With
+  `verifySnapshot: false`, a marked snapshot costs one `GetItem` of `event(asOfVersion)`;
+  an unmarked one (a seal through a definition without the inline config) reports nothing.
+  `currentVersion` stays a number.
+- **`commandHandler`.** After every load (and the unverified flow's verified reload) a
+  seal — `LatestState.seal`, or `LoadedState.sealedVersion` from `loadState` — fails with
+  `StreamSealed` before `decide`, after probing the idempotency sentinel
+  (`DuplicateCommand` first) and ahead of the If-Match check. A load with events past the
+  seal still fails, logging the post-seal versions. `sealedVersion` must be a non-negative
+  integer not below `version` (`ValidationError`). The handler never seals.
+- **Head proofs.** `"snapshot"`: the marked snapshot at `S` refuses the proof; seal
+  through a definition sharing the writers' inline-without-`every` config.
+  `{ additionalItem }`: unenforced by the library; the recommended pattern is a one-event
+  seal that keeps the record at `S - 1` with a sealed flag and `sealedVersion: S`, so every
+  record-proof writer's first put lands on the sealing event. Advancing the record to `S`
+  is safe only if every writer's condition tests the flag.
+- **Residuals (documented).** A pre-1.33 writer can append past a seal; so can a
+  record-proof writer whose record was advanced to `S`, and a `headProof: "snapshot"`
+  writer after a `writeSnapshot` put an unmarked snapshot at `S` (below). One such write
+  reopens the stream for every writer, because the check is on the event at the writer's
+  `expectedVersion`. Reads report it (`seal.version < version`) while the sealing event is
+  among the items they fetch; the handler refuses to decide.
+
+Design: `docs/designs/stream-seal.md`.
 
 ### Large Commands — Stepped Commands
 
@@ -3792,9 +3887,15 @@ EventStore.commandHandler(matchDecider, matchEvents, {
 On `VersionConflict` the **full read–decide–append cycle re-runs** — never a blind
 re-append of stale events, and a function-form `additionalItems` is re-derived from
 the fresh decision. Only `VersionConflict` is retried; domain errors,
-`DuplicateCommand` and infrastructure errors fail immediately. A call that
-supplies `expectedVersion` is never retried — its `VersionConflict` is the answer
-to a conditional write. A number `n` is shorthand for
+`DuplicateCommand`, `StreamSealed` (#166) and infrastructure errors fail
+immediately. A call that supplies `expectedVersion` is never retried on its own
+stream's `VersionConflict` — that is the answer to a conditional write. A
+`VersionConflict` naming **another** stream (a nested `appendOp`'s, told apart by
+`streamName` and `streamId`) is retried by the schedule even under an
+`expectedVersion`, whose If-Match is checked again on the reload, and is never
+taken for this stream's lagging snapshot (`returnAppendConflict` catches only
+own-stream conflicts). Without a schedule it is returned as-is, naming that
+stream. A number `n` is shorthand for
 `Schedule.recurs(n)` (n retries after the initial attempt). Default: no retry.
 
 `commandHandler` dispatches data-first vs data-last on the `EventStreamTypeId` brand of
@@ -4179,6 +4280,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `VectorIndexBackfilling` | `SearchVectors` called while the vector index is still backfilling |
 | `VersionConflict` | An `EventStore` append's version guard failed — the stream moved past `expectedVersion` (or is behind it) — or a `commandHandler` call's caller-supplied `expectedVersion` (If-Match, #136) did not match the loaded version. `actualVersion?` is set by the pre-decide check (the loaded version — after an unverified snapshot load, `verifySnapshot: false`, the verified head re-read before the check) and by an unverified-snapshot If-Match whose decision is confirmed against the head (the head read), and unset on any other append-time conflict, where the actual version is unknown without another read |
 | `DuplicateCommand` | An `EventStore` `commandId` was already applied to the stream |
+| `StreamSealed` | An `EventStore` append's stream is sealed (`streamName`, `streamId`, `sealedVersion`): an append or nested `appendOp` found a marked item, or a command handler's load found the seal (#166). Terminal, never retried; ranks after `DuplicateCommand`, ahead of `VersionConflict` |
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
 | `CompressorNotRegistered` | Never in an error channel: the `cause` of the `ValidationError` a packed value fails with when it needs a compression codec with no registered `Compressor` — a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
 | `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
@@ -4211,7 +4313,7 @@ pre-#147 unions.
 | `purge` | `ValidationError` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 | `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
 | `EventStream.parseStreamId` | `ValidationError` |
@@ -4339,7 +4441,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
 | `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
 | `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, `partition` or `snapshot`, an empty `index` / `sk` / `pk`, a `key` / `partition` / `snapshot` that is not a function, a `snapshot` without `partition` or on a stream without a snapshot config, a `projection` other than `"all"` / `"withoutMetadata"` / `"keys"`, or a member an index entry does not declare |
-| `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`) |
+| `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`, `__edd_sealed__`) |
 | `EDD-9065` | `EventStore.ts` | Two indexes of one stream share a physical index name or an attribute, or a GSI's `pk` and `sk` are the same attribute |
 | `EDD-9066` | `EventStore.ts` | `readIndex` / `query.index` called with a name the stream does not declare (a defect; unreachable from typed code) |
 | `EDD-9067` | `EventStore.ts` | `indexDefinitions` given two streams that define the same physical index differently (type, key attributes or projection); a derived partition or snapshot entry is not part of the definition |
