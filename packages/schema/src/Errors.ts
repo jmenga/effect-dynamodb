@@ -432,12 +432,59 @@ export class VectorIndexBackfilling extends Data.TaggedError("VectorIndexBackfil
  *   are checked against the head. Any other conflict detected by the append
  *   transaction itself leaves it unset, because DynamoDB does not report the
  *   stream's head.
+ *
+ * `streamName` / `streamId` name the stream whose version check failed. That
+ * is usually the appending stream, but a failure of another stream's
+ * `appendOp` carried in the append's `additionalItems` names that op's
+ * stream: compare them with the stream you appended to before treating the
+ * conflict as your own.
  */
 export class VersionConflict extends Data.TaggedError("VersionConflict")<{
   readonly streamName: string
   readonly streamId: string
   readonly expectedVersion: number
   readonly actualVersion?: number | undefined
+}> {}
+
+/**
+ * The stream is sealed: an append (`EventStore.append(..., { seal: true })`,
+ * or a stream's `appendOp` carried in another append) marked its last event as
+ * the stream's final event, and no event can be appended after it.
+ *
+ * Terminal: no append to this stream can ever succeed again, so
+ * `EventStore.commandHandler` never retries it. The usual next step is the
+ * stream that succeeds it (for example the next generation of an account's
+ * ledger).
+ *
+ * - `streamName` / `streamId` name the sealed stream. For a failure of a
+ *   stream's `appendOp` carried in another append's `additionalItems`, that is
+ *   the inner stream, not the appending one.
+ * - `sealedVersion` is the version of the sealing event: the stream's final
+ *   version.
+ *
+ * An append diagnoses it from the transaction's cancellation reasons, never
+ * from a pre-read: the version-contiguity check, the first event put and a
+ * snapshot head proof return the item they failed on, and a sealed item
+ * carries the marker. A writer several versions behind the seal gets
+ * `VersionConflict` instead, and learns of the seal when it reloads.
+ * `EventStore.commandHandler` also raises it before `decide`, from a load that
+ * shows the seal (the sealing event, a marked snapshot, or the
+ * `sealedVersion` a `loadState` returns).
+ *
+ * Precedence is per stream. Within one stream's items,
+ * {@link DuplicateCommand} is reported ahead of it (a redelivered sealing
+ * command is a duplicate), and it is reported ahead of that stream's
+ * {@link VersionConflict}. Across streams, the appending stream's own verdict
+ * comes first (so a `VersionConflict` of the appending stream masks a seal of
+ * a nested `appendOp`'s stream), then each nested `appendOp`'s verdict in op
+ * order (the first failing op wins, even over a later op's seal), then the
+ * other additional-item errors.
+ */
+export class StreamSealed extends Data.TaggedError("StreamSealed")<{
+  readonly streamName: string
+  readonly streamId: string
+  /** The version of the sealing event: the stream's final version. */
+  readonly sealedVersion: number
 }> {}
 
 /**
@@ -495,9 +542,10 @@ export class AppendTooLarge extends Data.TaggedError("AppendTooLarge")<{
  * Retrying is only useful if the caller's condition can become true; unlike a
  * version conflict, a blind read-decide-retry loop will not resolve it.
  *
- * Precedence: {@link DuplicateCommand} and {@link VersionConflict} are reported in
- * preference to this error when a conditional failure occurs at those positions
- * in the same transaction.
+ * Precedence: {@link DuplicateCommand}, {@link StreamSealed} and
+ * {@link VersionConflict} (of the appending stream, or of a nested `appendOp`'s
+ * stream) are reported in preference to this error when a conditional failure
+ * occurs at those positions in the same transaction.
  */
 export class AdditionalItemConditionFailed extends Data.TaggedError(
   "AdditionalItemConditionFailed",

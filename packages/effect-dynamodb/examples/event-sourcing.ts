@@ -9,7 +9,9 @@
  * timestamps, stream index projection, a GSI several streams share by a
  * derived partition, and a head proof in place of the contiguity check —
  * the inline snapshot, or the application's own state record that the
- * command handler loads its state from.
+ * command handler loads its state from — and sealing a stream: a generation
+ * changeover that seals one stream as it opens the next, and an atomic
+ * multi-stream append.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -520,8 +522,93 @@ const Umpires = EventStore.makeStream({
 // #endregion
 
 // ---------------------------------------------------------------------------
-// 10. Main program
+// 10. Sealing a stream — generations of an account's ledger (#166)
 // ---------------------------------------------------------------------------
+
+// #region seal-stream
+// An account's ledger, keyed by generation. After a table restore, writers
+// move to the next generation; sealing the old one makes sure nobody can
+// append to it again.
+class LedgerOpened extends Schema.TaggedClass<LedgerOpened>()("LedgerOpened", {
+  balance: Schema.Number,
+  // The generation this one continues, and the version its balance was read at.
+  continuesFrom: Schema.optionalKey(
+    Schema.Struct({ generation: Schema.String, version: Schema.Number }),
+  ),
+}) {}
+
+class Deposited extends Schema.TaggedClass<Deposited>()("Deposited", {
+  amount: Schema.Number,
+}) {}
+
+class Withdrawn extends Schema.TaggedClass<Withdrawn>()("Withdrawn", {
+  amount: Schema.Number,
+}) {}
+
+class LedgerClosed extends Schema.TaggedClass<LedgerClosed>()("LedgerClosed", {
+  reason: Schema.String,
+  // The generation that carries the ledger on, when there is one.
+  continuedIn: Schema.optionalKey(Schema.String),
+}) {}
+
+type LedgerEvent = LedgerOpened | Deposited | Withdrawn | LedgerClosed
+
+// The application's chain index: which generation is current, and where each
+// closed one ends. Every writer of it increments `revision`.
+class LedgerChain extends Schema.Class<LedgerChain>("LedgerChain")({
+  accountId: Schema.String,
+  current: Schema.String,
+  revision: Schema.Number,
+  generations: Schema.Array(
+    Schema.Struct({
+      generation: Schema.String,
+      validThrough: Schema.optionalKey(Schema.Number),
+    }),
+  ),
+}) {}
+
+const LedgerChains = Entity.make({
+  model: LedgerChain,
+  entityType: "LedgerChain",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const LedgerTable = Table.make({ schema: AppSchema, entities: { LedgerChains } })
+
+const Ledgers = EventStore.makeStream({
+  table: LedgerTable,
+  streamName: "Ledger",
+  events: [LedgerOpened, Deposited, Withdrawn, LedgerClosed],
+  streamId: { composite: ["accountId", "generation"] },
+})
+
+type LedgerState = { readonly balance: number }
+type LedgerCommand = { readonly _tag: "Deposit"; readonly amount: number }
+
+const ledgerDecider: EventStore.Decider<LedgerState, LedgerCommand, LedgerEvent> = {
+  initialState: { balance: 0 },
+  decide: (command) => Effect.succeed([new Deposited({ amount: command.amount })]),
+  evolve: (state, event) => {
+    if (event._tag === "LedgerOpened") return { balance: event.balance }
+    if (event._tag === "Deposited") return { balance: state.balance + event.amount }
+    if (event._tag === "Withdrawn") return { balance: state.balance - event.amount }
+    return state
+  },
+}
+// #endregion
+
+// ---------------------------------------------------------------------------
+// 11. Main program
+// ---------------------------------------------------------------------------
+
+const assertEq = <T>(actual: T, expected: T, label: string): void => {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a !== e) throw new Error(`Assertion failed [${label}]: expected ${e}, got ${a}`)
+}
 
 const program = Effect.gen(function* () {
   const client = yield* DynamoClient
@@ -1429,6 +1516,184 @@ const program = Effect.gen(function* () {
   )
   yield* client.deleteTable({ TableName: recordConfig.name })
 
+  // --- Sealing a stream ---
+  yield* Console.log("\n=== Sealing a stream ===")
+  const ledgerConfig = yield* LedgerTable.Tag
+  yield* client
+    .deleteTable({ TableName: ledgerConfig.name })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client.createTable({
+    TableName: ledgerConfig.name,
+    BillingMode: "PAY_PER_REQUEST",
+    ...Table.definition(LedgerTable),
+  })
+
+  // #region seal-append
+  const ledgers = yield* EventStore.bind(Ledgers)
+  const closing = { accountId: "acc-9", generation: "1" }
+  yield* ledgers.append(
+    closing,
+    [new LedgerOpened({ balance: 0 }), new Deposited({ amount: 40 })],
+    0,
+  )
+
+  // The account closes for good: this append's last event is the stream's last.
+  const sealedAt = yield* ledgers.append(
+    closing,
+    [new Withdrawn({ amount: 40 }), new LedgerClosed({ reason: "account closed" })],
+    2,
+    { seal: true },
+  )
+  // → version 4; event 4 carries the seal marker
+  // #endregion
+  yield* Console.log(`Sealed acc-9 generation 1 at version ${sealedAt.version}`)
+
+  // #region sealed-read
+  const closed = yield* ledgers.readLatest(closing, { consistentRead: true })
+  // → closed.seal: the LedgerClosed event at version 4, closed.version 4
+
+  const closedEvents = yield* ledgers.read(closing, { consistentRead: true })
+  const final = closedEvents.at(-1)
+  // → final.sealed === true; no other event carries `sealed`
+  // #endregion
+  assertEq(closed.seal?.version, 4, "readLatest reports the seal")
+  assertEq(final?.sealed, true, "the sealing event is marked")
+  yield* Console.log(
+    `readLatest: seal at v${closed.seal?.version} (${closed.seal?.eventType}), head v${closed.version}`,
+  )
+
+  // #region sealed-handler
+  const handleLedger = EventStore.commandHandler(ledgerDecider, ledgers, { retry: 3 })
+
+  const outcome = yield* handleLedger(closing, { _tag: "Deposit", amount: 10 }).pipe(
+    Effect.map((result) => `deposited at v${result.version}`),
+    Effect.catchTag("StreamSealed", (sealed) =>
+      Effect.succeed(`refused: ${sealed.streamId} is sealed at v${sealed.sealedVersion}`),
+    ),
+  )
+  // → "refused: acc-9#1 is sealed at v4": seen on load, before decide, never retried
+
+  // A raw append at the head fails the same way.
+  const late = yield* ledgers
+    .append(closing, [new Deposited({ amount: 10 })], 4)
+    .pipe(Effect.flip)
+  // → StreamSealed { sealedVersion: 4 }
+  // #endregion
+  assertEq(late._tag, "StreamSealed", "an append past the seal is refused")
+  yield* Console.log(`Handler: ${outcome}`)
+  yield* Console.log(`Raw append: ${late._tag}`)
+
+  // --- Generation changeover ---
+  yield* Console.log("\n=== Generation changeover ===")
+  // Generation 1 is open, and the chain index names it.
+  yield* ledgers.append(
+    { accountId: "acc-1", generation: "1" },
+    [new LedgerOpened({ balance: 0 }), new Deposited({ amount: 250 })],
+    0,
+    {
+      additionalItems: [
+        LedgerChains.create({
+          accountId: "acc-1",
+          current: "1",
+          revision: 1,
+          generations: [{ generation: "1" }],
+        }),
+      ],
+    },
+  )
+
+  // #region changeover
+  // Close generation `from`, open `to`, and move the chain index: one transaction.
+  const changeover = (accountId: string, from: string, to: string) =>
+    Effect.gen(function* () {
+      const closingGeneration = { accountId, generation: from }
+      // ONE read gives the carried-over state AND the version the seal goes at.
+      const latest = yield* ledgers.readLatest(closingGeneration, { consistentRead: true })
+      if (latest.seal !== undefined) return latest.seal.version // already closed
+      const carried = EventStore.fold(ledgerDecider, latest.events)
+
+      // The chain index, read-modify-write: the whole item, rebuilt from this
+      // read, replaced only if no writer has changed it since.
+      const chain = yield* Entity.consistentRead(LedgerChains.get({ accountId }))
+      const nextChain = LedgerChains.put({
+        accountId,
+        current: to,
+        revision: chain.revision + 1,
+        generations: [
+          ...chain.generations.map((entry) =>
+            entry.generation === from ? { ...entry, validThrough: latest.version + 1 } : entry,
+          ),
+          { generation: to },
+        ],
+      }).pipe(LedgerChains.condition({ revision: chain.revision }))
+
+      yield* ledgers.append(
+        { accountId, generation: to },
+        [
+          new LedgerOpened({
+            balance: carried.balance,
+            continuesFrom: { generation: from, version: latest.version },
+          }),
+        ],
+        0,
+        {
+          additionalItems: [
+            // Generation `from` sealed at the version its state was read at.
+            ledgers.appendOp(
+              closingGeneration,
+              [new LedgerClosed({ reason: "restored", continuedIn: to })],
+              latest.version,
+              { seal: true },
+            ),
+            nextChain,
+          ],
+        },
+      )
+      return latest.version + 1
+    }).pipe(
+      // A stale append on `from`, or another writer of the chain index, since
+      // the reads: read both again, carrying the stale append forward.
+      Effect.retry({
+        times: 3,
+        while: (error) =>
+          error._tag === "VersionConflict" || error._tag === "AdditionalItemConditionFailed",
+      }),
+    )
+
+  const sealedVersion = yield* changeover("acc-1", "1", "2")
+  // → 3: generation 1 ends at its LedgerClosed event; generation 2 opens at
+  //   version 1 with balance 250, continuing from generation 1 at version 2
+  // #endregion
+  const opened = yield* ledgers.read({ accountId: "acc-1", generation: "2" }, { consistentRead: true })
+  const chain = yield* Entity.consistentRead(LedgerChains.get({ accountId: "acc-1" }))
+  assertEq(sealedVersion, 3, "generation 1 is sealed at version 3")
+  assertEq(chain.revision, 2, "the chain index moved once")
+  const openedEvent = opened[0]?.data
+  yield* Console.log(
+    `Generation 1 sealed at v${sealedVersion}; generation 2 opened with ${openedEvent?._tag === "LedgerOpened" ? `balance ${openedEvent.balance}` : "?"}`,
+  )
+  yield* Console.log(
+    `Chain: current ${chain.current}, revision ${chain.revision}, generations ${JSON.stringify(chain.generations)}`,
+  )
+
+  // --- Atomic multi-stream append ---
+  yield* Console.log("\n=== Atomic multi-stream append ===")
+  const savings = { accountId: "acc-2", generation: "1" }
+  yield* ledgers.append(savings, [new LedgerOpened({ balance: 0 })], 0)
+  // #region multi-stream-append
+  // A transfer: both ledgers' events commit together, or neither does.
+  const transfer = yield* ledgers.append(
+    { accountId: "acc-1", generation: "2" },
+    [new Withdrawn({ amount: 75 })],
+    1,
+    { additionalItems: [ledgers.appendOp(savings, [new Deposited({ amount: 75 })], 1)] },
+  )
+  // → acc-1 generation 2 at version 2, acc-2 generation 1 at version 2
+  // #endregion
+  const savingsHead = yield* ledgers.currentVersion(savings, { consistentRead: true })
+  yield* Console.log(`Transfer: acc-1 v${transfer.version}, acc-2 v${savingsHead}`)
+  yield* client.deleteTable({ TableName: ledgerConfig.name })
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===")
   yield* client.deleteTable({ TableName: tableConfig.name })
@@ -1439,7 +1704,7 @@ const program = Effect.gen(function* () {
 })
 
 // ---------------------------------------------------------------------------
-// 11. Provide dependencies and run
+// 12. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
 // #region crypto-layer
@@ -1472,6 +1737,7 @@ const AppLayer = Layer.mergeAll(
   AuditedScorecardTable.layer({ name: "event-sourcing-audited-scorecards" }),
   SeriesTable.layer({ name: "event-sourcing-series" }),
   RecordTable.layer({ name: "event-sourcing-records" }),
+  LedgerTable.layer({ name: "event-sourcing-ledgers" }),
   WebCrypto,
 )
 

@@ -16,7 +16,9 @@ import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import type {
   ConcurrentModification,
   OptimisticLockError,
+  StreamSealed,
   UniqueConstraintViolation,
+  VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Option } from "effect"
@@ -90,6 +92,71 @@ export type TransactWriteOp =
   | EntityDelete<any, any>
   | BoundWriteOp
   | ConditionCheckOp
+
+// ---------------------------------------------------------------------------
+// StreamAppendOp — another stream's append, carried in an EventStore append
+// ---------------------------------------------------------------------------
+
+/** @internal */
+export const StreamAppendTypeId: unique symbol = Symbol.for("effect-dynamodb/StreamAppendOp")
+export type StreamAppendTypeId = typeof StreamAppendTypeId
+
+/**
+ * @internal The items of a {@link StreamAppendOp}, built by the inner
+ * stream's own append builder: its version-contiguity check (0 or 1), its
+ * event puts and its inline snapshot, in that order.
+ */
+export interface BuiltStreamAppend {
+  readonly items: ReadonlyArray<TransactWriteItem>
+  /** The event marker of the inner stream, for provenance. */
+  readonly entityType: string
+  /** Parallel to `items`: what names each one in a diagnosed rejection. */
+  readonly targets: () => ReadonlyArray<TransactItemTarget>
+  /** The key attributes the inner stream's items write. */
+  readonly keys: () => KeyAttributes
+  /**
+   * What a cancellation means for the nested append, from the reasons of its
+   * own items only (a slice parallel to `items`): `StreamSealed` when a check
+   * returned a sealed item, `VersionConflict` for any other failure of its
+   * contiguity check or event puts, `undefined` otherwise.
+   */
+  readonly verdict: (
+    reasons: ReadonlyArray<WriteCancellationReason | undefined>,
+  ) => StreamSealed | VersionConflict | undefined
+}
+
+/**
+ * An append of one event stream, carried as a transact item of ANOTHER
+ * stream's append (`EventStream.append`'s `additionalItems`, or a
+ * `commandHandler`'s): it commits if and only if that append does. Built by
+ * `EventStream.appendOp` (or the bound stream's).
+ *
+ * Accepted only there — `Transaction.transactWrite` refuses it (its type does
+ * not admit it, and at runtime it fails with `ValidationError`).
+ */
+export interface StreamAppendOp {
+  readonly [StreamAppendTypeId]: StreamAppendTypeId
+  /** The inner stream's name. */
+  readonly streamName: string
+  /**
+   * @internal Build the nested append's items. `source` names the op in a
+   * diagnosed rejection (`"operation 0"`).
+   */
+  readonly _build: (
+    source: string,
+  ) => Effect.Effect<BuiltStreamAppend, ValidationError, TableConfig | DynamoClient>
+}
+
+/** @internal Whether `op` is a {@link StreamAppendOp}. */
+export const isStreamAppendOp = (op: unknown): op is StreamAppendOp =>
+  typeof op === "object" && op !== null && StreamAppendTypeId in op
+
+/**
+ * The ops an `EventStore` append's `additionalItems` accept: every
+ * {@link TransactWriteOp}, plus another stream's append ({@link StreamAppendOp}).
+ * Accepted by `EventStream.append` and `commandHandler`, nowhere else.
+ */
+export type AppendWriteOp = TransactWriteOp | StreamAppendOp
 
 /**
  * Compile an op-attached condition (`Entity.create()`'s `attribute_not_exists`,
@@ -166,9 +233,14 @@ export interface ItemProvenance {
   /**
    * `"main"`: the op's own item. `"guarded"`: one of the items of a guarded put
    * — see {@link GuardedPut}, which reads their cancellation reasons.
+   * `"stream"`: one of the items of a nested stream append — see
+   * {@link NestedStreamAppend}.
    */
-  readonly kind: "main" | "guarded"
-  /** The entity the op targeted, so consumers can name it in an error. */
+  readonly kind: "main" | "guarded" | "stream"
+  /**
+   * The entity the op targeted (a nested stream append: its event marker), so
+   * consumers can name it in an error.
+   */
   readonly entityType: string
 }
 
@@ -186,6 +258,19 @@ export interface GuardedPut {
   readonly plan: PutPlan
 }
 
+/**
+ * A nested stream append ({@link StreamAppendOp}) among the items: where its
+ * items are, and how to read their cancellation reasons.
+ */
+export interface NestedStreamAppend {
+  /** Index into the caller's `operations` array. */
+  readonly opIndex: number
+  /** Where its items start in `items`. */
+  readonly start: number
+  readonly count: number
+  readonly verdict: BuiltStreamAppend["verdict"]
+}
+
 /** Compiled items plus the caller-op attribution for each one. */
 export interface BuiltTransactWriteItems {
   readonly items: Array<TransactWriteItem>
@@ -198,10 +283,13 @@ export interface BuiltTransactWriteItems {
    */
   readonly targets: () => ReadonlyArray<TransactItemTarget>
   readonly guarded: ReadonlyArray<GuardedPut>
+  /** The nested stream appends, in op order (only with `{ streams: true }`). */
+  readonly streams: ReadonlyArray<NestedStreamAppend>
   /**
    * The caller ops (indices into `operations`) that carry a condition of
    * their own — `.condition()`, `create()`'s, `Transaction.check`'s. A
    * guarded put's read guard is not one: it is the op's, not the caller's.
+   * Nor is a nested stream append: its conditions are its stream's.
    */
   readonly conditioned: ReadonlySet<number>
   /**
@@ -232,10 +320,17 @@ export interface BuiltTransactWriteItems {
  * touching one item included, among them two puts that swap unique values
  * and so release and claim the same sentinels. A caller adding items of its
  * own appends their targets to these.
+ *
+ * A {@link StreamAppendOp} is accepted only with `{ streams: true }` — an
+ * `EventStore` append's `additionalItems` — and is refused with
+ * `ValidationError` otherwise. Its items are built by the inner stream
+ * (provenance `kind: "stream"`), recorded in `streams`, and left out of
+ * `conditioned`.
  */
 export const buildTransactWriteItems = (
-  operations: ReadonlyArray<TransactWriteOp>,
+  operations: ReadonlyArray<AppendWriteOp>,
   operation: string,
+  options?: { readonly streams?: boolean | undefined } | undefined,
 ): Effect.Effect<
   BuiltTransactWriteItems,
   ValidationError | DynamoClientError,
@@ -248,6 +343,7 @@ export const buildTransactWriteItems = (
         provenance: [],
         targets: () => [],
         guarded: [],
+        streams: [],
         conditioned: new Set(),
         keys: () => mergeKeyAttributes(),
       }
@@ -265,9 +361,26 @@ export const buildTransactWriteItems = (
       /** The caller's own condition — what a `create` over a tombstone keeps. */
       callerCondition?: Expr | ConditionInput | undefined
     }> = []
+    /** The nested stream appends, by caller op index. */
+    const streamOps = new Map<number, StreamAppendOp>()
 
     for (let opIndex = 0; opIndex < operations.length; opIndex++) {
       const op = operations[opIndex]!
+      // Another stream's append (#166): only an EventStore append carries it.
+      if (isStreamAppendOp(op)) {
+        if (options?.streams !== true) {
+          return yield* new ValidationError({
+            entityType: "unknown",
+            operation,
+            cause:
+              `${operation}: operation ${opIndex} is a stream append op (appendOp of stream ` +
+              `"${op.streamName}"): a stream append op rides only in an EventStore append's ` +
+              "additionalItems. Nothing was sent.",
+          })
+        }
+        streamOps.set(opIndex, op)
+        continue
+      }
       // Check for ConditionCheckOp first (has its own TypeId)
       if (op != null && typeof op === "object" && ConditionCheckTypeId in op) {
         const checkOp = op as ConditionCheckOp
@@ -337,6 +450,8 @@ export const buildTransactWriteItems = (
     // What names each item, kept so its target is built only on failure.
     const naming: Array<() => TransactItemTarget> = []
     const guarded: Array<GuardedPut> = []
+    const streams: Array<NestedStreamAppend> = []
+    const streamKeys: Array<() => KeyAttributes> = []
     const conditioned = new Set<number>()
     for (const op of opInfos) {
       if (op.condition !== undefined) conditioned.add(op.opIndex)
@@ -360,7 +475,42 @@ export const buildTransactWriteItems = (
       )
     }
 
+    // The nested stream appends, built by their own streams, are pushed in
+    // caller op order between the entity ops' items.
+    const pushStreamOp = (opIndex: number) =>
+      Effect.gen(function* () {
+        const op = streamOps.get(opIndex)!
+        const nested = yield* op._build(`operation ${opIndex}`)
+        streams.push({
+          opIndex,
+          start: items.length,
+          count: nested.items.length,
+          verdict: nested.verdict,
+        })
+        streamKeys.push(nested.keys)
+        // Built once, on failure, then indexed.
+        let built: ReadonlyArray<TransactItemTarget> | undefined
+        const nestedTarget = (i: number): TransactItemTarget => {
+          if (built === undefined) built = nested.targets()
+          return built[i]!
+        }
+        for (const [i, item] of nested.items.entries()) {
+          items.push(item)
+          provenance.push({ opIndex, kind: "stream", entityType: nested.entityType })
+          naming.push(() => nestedTarget(i))
+        }
+      })
+    let nextOpIndex = 0
+    const flushStreamOpsBefore = (opIndex: number) =>
+      Effect.gen(function* () {
+        for (; nextOpIndex < opIndex; nextOpIndex++) {
+          if (streamOps.has(nextOpIndex)) yield* pushStreamOp(nextOpIndex)
+        }
+        nextOpIndex = opIndex + 1
+      })
+
     for (const op of opInfos) {
+      yield* flushStreamOpsBefore(op.opIndex)
       tableName = tableNames.get(op.entity)!
       const primary = op.entity.indexes.primary!
       keyFields = [primary.pk.field, primary.sk.field]
@@ -435,10 +585,15 @@ export const buildTransactWriteItems = (
       }
     }
 
+    yield* flushStreamOpsBefore(operations.length)
+
     const keys = () =>
-      mergeKeyAttributes(...opInfos.map((op) => keyAttributesOf(op.entity.indexes as never)))
+      mergeKeyAttributes(
+        ...opInfos.map((op) => keyAttributesOf(op.entity.indexes as never)),
+        ...streamKeys.map((nested) => nested()),
+      )
     const targets = () => naming.map((name) => name())
-    return { items, provenance, targets, guarded, conditioned, keys }
+    return { items, provenance, targets, guarded, streams, conditioned, keys }
   })
 
 // ---------------------------------------------------------------------------
@@ -478,6 +633,8 @@ export const GUARDED_TRANSACTION_ATTEMPTS = 3
  * from its positional reasons (`offset`: where those items start in the
  * request). In order of precedence:
  *
+ * - `stream` — a nested stream append's verdict (`StreamSealed` or
+ *   `VersionConflict` naming the inner stream), the first in op order.
  * - `fail` — a guarded put's final verdict: a unique value is taken
  *   (`UniqueConstraintViolation`) or its history conflicts (`ValidationError`).
  *   Never a caller-condition error: the caller set none.
@@ -495,6 +652,11 @@ export const judgeCancellation = (
   offset = 0,
 ):
   | {
+      readonly _tag: "stream"
+      readonly opIndex: number
+      readonly error: StreamSealed | VersionConflict
+    }
+  | {
       readonly _tag: "fail"
       readonly opIndex: number
       readonly error: UniqueConstraintViolation | ValidationError
@@ -506,6 +668,14 @@ export const judgeCancellation = (
       readonly stored: Extract<PutVerdict, { readonly _tag: "Retry" }>["stored"]
     }
   | undefined => {
+  // A nested stream append's items are its stream's: they are judged by its
+  // own verdict, never as caller conditions.
+  const inStream = new Set<number>()
+  for (const { opIndex, start, count, verdict } of built.streams) {
+    for (let i = 0; i < count; i++) inStream.add(start + i)
+    const error = verdict(reasons.slice(offset + start, offset + start + count))
+    if (error !== undefined) return { _tag: "stream", opIndex, error }
+  }
   const conditions = new Set<number>()
   let retry: Extract<PutVerdict, { readonly _tag: "Retry" }> | undefined
   const inGuarded = new Set<number>()
@@ -518,7 +688,7 @@ export const judgeCancellation = (
     else retry ??= verdict
   }
   for (let i = 0; i < built.items.length; i++) {
-    if (inGuarded.has(i)) continue
+    if (inGuarded.has(i) || inStream.has(i)) continue
     if (reasons[offset + i]?.Code !== "ConditionalCheckFailed") continue
     const from = built.provenance[i]
     if (from !== undefined) conditions.add(from.opIndex)

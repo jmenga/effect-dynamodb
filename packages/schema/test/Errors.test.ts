@@ -6,6 +6,7 @@ import {
   ItemDeleted,
   ItemNotFound,
   OptimisticLockError,
+  StreamSealed,
   TransactionCancelled,
   UniqueConstraintViolation,
   ValidationError,
@@ -48,6 +49,18 @@ describe("Errors", () => {
       expect(err.committed).toEqual(["root"])
       expect(err.subgraph).toBe("team2")
     })
+  })
+
+  it("StreamSealed carries the stream and the sealing event's version (#166)", () => {
+    const err = new StreamSealed({ streamName: "Ledger", streamId: "a-1#3", sealedVersion: 42 })
+    expect(err._tag).toBe("StreamSealed")
+    expect(err).toBeInstanceOf(Error)
+    expect(err).toMatchObject({ streamName: "Ledger", streamId: "a-1#3", sealedVersion: 42 })
+  })
+
+  it("StreamSealed is exported from the package entry point (#166)", async () => {
+    const entry = await import("../src/index.js")
+    expect(entry.StreamSealed).toBe(StreamSealed)
   })
 
   it("DynamoError has correct tag", () => {

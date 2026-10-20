@@ -16,6 +16,10 @@
  * - Head proofs (`append({ headProof })`, #164): an additional item or the
  *   inline snapshot proves the stream head in place of the version-contiguity
  *   `ConditionCheck`
+ * - Sealing (#166): `append(..., { seal: true })` makes its last event the
+ *   stream's final one (`StreamSealed` for any later append), and
+ *   `stream.appendOp(...)` carries one stream's append — sealing or not — in
+ *   another append's transaction
  * - Stream indexes (`makeStream({ indexes })`): sub-streams ordered by a key
  *   derived from each event, on an LSI or GSI, each projecting all of the
  *   event, all but its metadata, or only its keys — `readIndex`,
@@ -57,6 +61,7 @@ import {
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   type OptimisticLockError,
+  StreamSealed,
   TransactionCancelled,
   type UniqueConstraintViolation,
   ValidationError,
@@ -104,14 +109,18 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import {
+  type AppendWriteOp,
+  type BuiltStreamAppend,
   type BuiltTransactWriteItems,
   buildTransactWriteItems,
   GUARDED_TRANSACTION_ATTEMPTS,
+  isStreamAppendOp,
   judgeCancellation,
   opConditionFailed,
+  type StreamAppendOp,
+  StreamAppendTypeId,
   type TransactItemTarget,
   type TransactWriteItem,
-  type TransactWriteOp,
   transactItemTarget,
 } from "./internal/TransactWriteOps.js"
 import {
@@ -175,6 +184,18 @@ export interface StreamEvent<A, M = Record<string, unknown> | undefined> {
    * ({@link AppendOptionsBase.eventTimestamps}).
    */
   readonly timestamp: string
+  /**
+   * Present, and `true`, only on a sealing event: the stream's final event
+   * (see {@link AppendOptionsBase.seal}). Absent on every other event.
+   *
+   * Read from the item's `__edd_sealed__` marker, so it is reported by every
+   * read of the item itself — `read`, `readFrom`, `query.events`,
+   * `readLatest`, `decodeStreamImage`, and a stream index of projection
+   * `"all"` or `"keys"` — but not through a `"withoutMetadata"` index (whose
+   * projection does not include the marker), nor on a raw row whose
+   * `Query.select` projection omits it.
+   */
+  readonly sealed?: true
 }
 
 /**
@@ -517,8 +538,21 @@ export interface AppendOptionsBase<TState = never> {
    * the entity's put would: `UniqueConstraintViolation`, a history
    * `ValidationError`, or — a race lost on every attempt —
    * `OptimisticLockError` / `ConcurrentModification`.
+   *
+   * **Another stream's append** (#166): `otherStream.appendOp(...)` (see
+   * {@link EventStream.appendOp}) rides here too, so several streams' events
+   * commit together or not at all — and a stream can be sealed in the same
+   * transaction that opens its successor. Its failures name the inner stream
+   * (`StreamSealed`, `VersionConflict`), judged after this stream's own and
+   * ahead of the other items' errors.
+   *
+   * The element type is {@link AppendWriteOp}, wider than the
+   * `TransactWriteOp` that `Transaction.transactWrite` takes. Passing a
+   * `TransactWriteOp[]` here is unaffected; code that reads this property's
+   * type and forwards the value to `transactWrite` must annotate it
+   * `ReadonlyArray<TransactWriteOp>`.
    */
-  readonly additionalItems?: ReadonlyArray<TransactWriteOp>
+  readonly additionalItems?: ReadonlyArray<AppendWriteOp>
   /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
   readonly idempotency?: AppendIdempotency
   /**
@@ -591,8 +625,72 @@ export interface AppendOptionsBase<TState = never> {
    *   mode), and then fails the condition: use it only when the snapshot is
    *   known to be at the head, as {@link CommandHandlerOptions.headProof}
    *   does.
+   *
+   * **On a sealed stream** ({@link AppendOptionsBase.seal}): a head proof
+   * replaces the contiguity check, which is where the seal is enforced.
+   *
+   * - `"snapshot"`: the sealing append's inline snapshot carries the seal
+   *   marker, and the proof's condition also requires the snapshot to be
+   *   unmarked (`StreamSealed` otherwise). A seal written through a
+   *   definition **without** this snapshot config leaves the snapshot
+   *   unmarked below the seal; a later `writeSnapshot` at the seal version
+   *   then writes an unmarked snapshot there, and a snapshot-proof append can
+   *   land past the seal (see {@link EventStream.writeSnapshot}). Seal through
+   *   a definition that shares the writers' snapshot config.
+   * - `{ additionalItem: n }`: the library does not enforce the seal (it
+   *   cannot know the stream is sealed without a read). Seal such a stream
+   *   with **exactly one event**, and keep the record at the seal's
+   *   `expectedVersion` (one below the seal, with a sealed flag and the
+   *   seal's version for {@link LoadedState.sealedVersion}): every
+   *   record-proof writer then appends at that version, and its first event
+   *   put lands on the sealing event and fails with `StreamSealed`.
+   *   Advancing the record to the seal's version lets a record-proof writer
+   *   append past the seal, unless every writer's record condition also tests
+   *   the sealed flag. A seal of several events leaves a record-proof writer
+   *   on `VersionConflict` instead.
    */
   readonly headProof?: HeadProof | undefined
+  /**
+   * Seal the stream with this append (#166): its **last** event becomes the
+   * stream's final event, and no append can land after it — one that tries
+   * fails with `StreamSealed`. `false` and `undefined` do nothing.
+   *
+   * The append writes events `expectedVersion + 1 … expectedVersion + n`, so
+   * the seal version is `expectedVersion + n`. The library writes a marker
+   * attribute (`__edd_sealed__`) on that event's item, and on the inline
+   * snapshot when the append writes one; reads report it
+   * ({@link StreamEvent.sealed}, {@link LatestState.seal}). A seal is
+   * permanent.
+   *
+   * - A value that is not a boolean, or `true` with no events, fails with
+   *   `ValidationError` (`operation: "EventStore.append.seal"`) before
+   *   anything is written.
+   * - On a stream whose snapshot config is `mode: "inline"` without `every`,
+   *   `true` also requires `snapshot`, so the snapshot at the seal version is
+   *   the marked one and an unverified load sees the seal.
+   * - Combines with every other option. Through another stream's
+   *   `additionalItems` use {@link EventStream.appendOp}.
+   *
+   * **Enforcement.** Every append after version 0 already checks the event
+   * at its `expectedVersion`; that check also requires the event to be
+   * unmarked. A writer that loaded after the seal fails it; one that loaded
+   * just before fails on its first event put, which lands on the sealing
+   * event; both get `StreamSealed`. A writer further behind gets
+   * `VersionConflict` and learns of the seal when it reloads.
+   *
+   * **Upgrade every writer first.** A writer on a library version that does
+   * not enforce the seal, a record-proof writer whose record was advanced to
+   * the seal, or a snapshot-proof writer on an unmarked snapshot at the seal
+   * version can land one event past the seal — and that event, unmarked,
+   * reopens the stream for every writer. Reads still report the seal while
+   * the sealing event is among the items they fetch
+   * (`seal.version < version` on {@link LatestState}).
+   *
+   * Zero-event appends (only `additionalItems` and/or `idempotency`) write no
+   * event, and still land on a sealed stream: a seal stops events, not side
+   * writes.
+   */
+  readonly seal?: boolean | undefined
 }
 
 /**
@@ -606,9 +704,30 @@ export interface AppendOptionsBase<TState = never> {
 export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState> &
   AppendMetadataOptions<TMetadata>
 
-/** Error channel of {@link EventStream.append}. */
+/**
+ * The options of {@link EventStream.appendOp}: those of
+ * {@link EventStream.append} except `additionalItems`, `idempotency` and
+ * `headProof`, which a nested append may not carry (they are refused with
+ * `ValidationError` at runtime too, `operation: "EventStore.appendOp"`).
+ * The appending stream carries them: a record the nested stream's writers
+ * load goes in the OUTER append's `additionalItems`.
+ */
+export type NestedAppendOptions<TMetadata, TState = never> = Omit<
+  AppendOptionsBase<TState>,
+  "additionalItems" | "idempotency" | "headProof"
+> &
+  AppendMetadataOptions<TMetadata>
+
+export type { AppendWriteOp, StreamAppendOp }
+
+/**
+ * Error channel of {@link EventStream.append}. A nested
+ * {@link EventStream.appendOp}'s failures are reported through it too, naming
+ * the inner stream.
+ */
 export type AppendError =
   | VersionConflict
+  | StreamSealed
   | DuplicateCommand
   | AdditionalItemConditionFailed
   | AppendTooLarge
@@ -689,11 +808,30 @@ export interface ReadLatestOptions extends ReadOptions {
  *   present, it is the snapshot's `asOfVersion` and `events` is empty —
  *   **unverified**: events appended without a snapshot (a raw `append`, data
  *   written before `mode: "inline"`) may follow it.
+ * - `seal` — the sealing event, when the read found one (see
+ *   {@link AppendOptionsBase.seal}).
  */
 export interface LatestState<TState, TEvent, M = Record<string, unknown> | undefined> {
   readonly snapshot: Option.Option<Snapshot<TState>>
   readonly events: ReadonlyArray<StreamEvent<TEvent, M>>
   readonly version: number
+  /**
+   * The sealing event when the read found one, absent otherwise. It is
+   * separate from `events` because `events` holds only what follows the
+   * snapshot, and a snapshot written by the sealing append already folds it
+   * in (it is in `events` too when it follows the snapshot).
+   *
+   * Found from **any** sealed event among the items the read fetches, not
+   * only the newest, with no extra request — except with
+   * `verifySnapshot: false`, where a sealed snapshot costs one `GetItem` of
+   * the sealing event. An unverified read of a snapshot left unmarked (a seal
+   * written through a definition without this snapshot config) does not
+   * report it.
+   *
+   * `seal.version < version` means events were written past the seal by a
+   * writer that does not enforce it: they are on a closed stream.
+   */
+  readonly seal?: StreamEvent<TEvent, M>
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1302,88 @@ const PROJECTED_ENVELOPE_ATTRIBUTES: ReadonlyArray<EventItemAttribute> = [
 ]
 
 /**
+ * @internal The seal marker (#166): a native `BOOL` `true` on the sealing
+ * event's item and on the sealing append's inline snapshot. In the library's
+ * `__edd_*__` namespace, beside `__edd_e__`, so no model field can collide
+ * with it (event `data` is a nested map or a packed value). Not one of
+ * {@link EVENT_ITEM_ATTRIBUTES}: adding it would change the `INCLUDE` list of
+ * every deployed `"withoutMetadata"` index.
+ */
+const SEALED_ATTRIBUTE = "__edd_sealed__"
+
+/**
+ * @internal The version a sealed item returned by a failed condition
+ * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`) seals the stream at: an
+ * event's `version`, a snapshot's `asOfVersion`. `undefined` for a missing or
+ * unmarked item.
+ */
+const sealedVersionOf = (
+  item: Readonly<Record<string, unknown>> | undefined,
+): number | undefined => {
+  if (item === undefined) return undefined
+  const marker = item[SEALED_ATTRIBUTE] as { readonly BOOL?: boolean } | undefined
+  if (marker?.BOOL !== true) return undefined
+  const raw = fromAttributeMap(item as Record<string, AttributeValue>)
+  const version = typeof raw.version === "number" ? raw.version : raw.asOfVersion
+  return typeof version === "number" ? version : undefined
+}
+
+/**
+ * @internal What a cancelled append means for one stream, from the reasons of
+ * its own items: `[0, guardCount)` the contiguity check,
+ * `[guardCount, guardCount + eventCount)` the event puts, and the snapshot at
+ * `snapshotIndex` (`-1`: none). `StreamSealed` when the contiguity check, the
+ * first event put or the snapshot failed and returned a sealed item (#166);
+ * `VersionConflict` for any other failure of the check or the event puts;
+ * `undefined` otherwise. Shared by an append's own verdict and a nested
+ * {@link StreamAppendOp}'s.
+ */
+const streamAppendVerdict = (
+  reasons: ReadonlyArray<
+    { readonly Code?: string | undefined; readonly Item?: unknown } | undefined
+  >,
+  layout: {
+    readonly guardCount: number
+    readonly eventCount: number
+    readonly snapshotIndex: number
+    readonly streamName: string
+    readonly streamId: string
+    readonly expectedVersion: number
+  },
+): StreamSealed | VersionConflict | undefined => {
+  const failedAt = (index: number): boolean =>
+    index >= 0 && reasons[index]?.Code === "ConditionalCheckFailed"
+  const checked = [
+    ...(layout.guardCount > 0 ? [0] : []),
+    ...(layout.eventCount > 0 ? [layout.guardCount] : []),
+    layout.snapshotIndex,
+  ]
+  for (const index of checked) {
+    if (!failedAt(index)) continue
+    const sealedVersion = sealedVersionOf(
+      reasons[index]?.Item as Readonly<Record<string, unknown>> | undefined,
+    )
+    if (sealedVersion !== undefined) {
+      return new StreamSealed({
+        streamName: layout.streamName,
+        streamId: layout.streamId,
+        sealedVersion,
+      })
+    }
+  }
+  for (let i = 0; i < layout.guardCount + layout.eventCount; i++) {
+    if (failedAt(i)) {
+      return new VersionConflict({
+        streamName: layout.streamName,
+        streamId: layout.streamId,
+        expectedVersion: layout.expectedVersion,
+      })
+    }
+  }
+  return undefined
+}
+
+/**
  * @internal Attributes a stream writes on its own items — events, snapshot,
  * idempotency sentinel — plus the default TTL attribute. An index attribute
  * may not reuse any of them.
@@ -1181,6 +1401,7 @@ const STREAM_OWNED_ATTRIBUTES: ReadonlyArray<string> = [
   "asOfVersion",
   "state",
   "commandId",
+  SEALED_ATTRIBUTE,
   DEFAULT_TTL_ATTRIBUTE_NAME,
 ]
 
@@ -1738,6 +1959,23 @@ export interface EventStream<
    * infers the `pipe` subject. Method syntax makes the parameter bivariant, so
    * `EventStream<E, F, M, never>` unifies with `EventStream<E, F, M, TState>`
    * again. Callers are unaffected: supplying a `state` still requires `TState`.
+   *
+   * **Sealed streams** ({@link AppendOptionsBase.seal}): `writeSnapshot` is
+   * one plain conditional `PutItem`. It does not know whether the stream is
+   * sealed and never writes the seal marker, so it **must not target a sealed
+   * head with an unmarked snapshot**. Skip sealed streams in a job that
+   * snapshots streams (`readLatest(...).seal` is present), or seal through a
+   * definition that shares the writers' snapshot config: the sealing append
+   * then writes a marked snapshot at the seal version, which this monotonic
+   * write never replaces.
+   *
+   * The residual when it does: a stream sealed at `S` through a definition
+   * without the writers' `mode: "inline"`-without-`every` snapshot config
+   * keeps an unmarked snapshot below `S`; a `writeSnapshot` at `S` then puts
+   * an unmarked snapshot at the seal version, and an append with
+   * `headProof: "snapshot"` at `S` passes its proof and lands event `S + 1`
+   * past the seal — which reopens the stream for every writer. A verified
+   * `readLatest` still reports the seal (`seal.version < version`).
    */
   writeSnapshot(
     streamId: StreamIdInput<TStreamIdFields>,
@@ -1772,6 +2010,61 @@ export interface EventStream<
     expectedVersion: number,
     options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
+
+  /**
+   * An append of this stream as a transact item of ANOTHER stream's append
+   * (its `additionalItems`, or a `commandHandler`'s): it commits if and only
+   * if that append does (#166). Nothing is built or written until the outer
+   * append runs.
+   *
+   * - **With or without `seal`.** Without it, several streams' events commit
+   *   together or not at all (an atomic multi-stream append). With it, a
+   *   stream is sealed in the same transaction that opens its successor:
+   *
+   *   ```ts
+   *   const latest = yield* Ledgers.readLatest(genA, { consistentRead: true })
+   *   yield* Ledgers.append(genB, [new LedgerOpened({ continuesFrom: latest.version })], 0, {
+   *     additionalItems: [
+   *       Ledgers.appendOp(genA, [new LedgerClosed({ continuedIn: "4" })], latest.version, {
+   *         seal: true,
+   *       }),
+   *     ],
+   *   })
+   *   ```
+   * - **The seal's `expectedVersion` is the version the carried-over state
+   *   was read at** — the same `readLatest` result, or the version carried in
+   *   the decided opening event — never a separate read of the stream's head.
+   *   Re-reading the head between the carry-over read and the commit seals
+   *   over an append the opening event never carried, and that append is
+   *   lost. With the carry-over version, a stale append in between fails the
+   *   seal's check instead (`VersionConflict` naming this stream): re-read and
+   *   build both again.
+   * - It is a full append of this stream — its contiguity check, event puts,
+   *   seal marker and optional inline snapshot (`seal`, `snapshot`,
+   *   `metadata` / `eventMetadata`, `eventTimestamps`) — enforced
+   *   independently of the outer append. It may not carry `additionalItems`,
+   *   `idempotency` or `headProof` (see {@link NestedAppendOptions}); a record
+   *   this stream's writers load (a `loadState` record, a record head proof)
+   *   is written by the outer append's `additionalItems`, beside this op —
+   *   on a sealing op with `sealedVersion` (see {@link LoadedState}). Zero
+   *   events fail with `ValidationError` (`operation: "EventStore.appendOp"`).
+   * - Its failures name this stream: `StreamSealed` (terminal) or
+   *   `VersionConflict`, judged after the outer stream's own and ahead of
+   *   the other additional items. It cannot be a `headProof` target.
+   * - **One client per append.** Its items are sent in the outer append's
+   *   single `TransactWriteItems`, through the outer append's `DynamoClient`.
+   *   This unbound op resolves this stream's `TableConfig` from the outer
+   *   append's context, which must provide it; a bound stream's op resolves
+   *   it from its own captured context — but never uses its captured client.
+   *   Every table must be reachable through the outer client.
+   * - `Transaction.transactWrite` does not accept it.
+   */
+  appendOp(
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: NestedAppendOptions<TMetadata, TState> | undefined,
+  ): StreamAppendOp
 
   /**
    * Read every event of the stream, ascending by version. Pass
@@ -1837,6 +2130,10 @@ export interface EventStream<
    * verified read. Accepted only on a `mode: "inline"` stream without `every`
    * (otherwise a defect, `[EDD-9068]`), ignored on a stream without a
    * `snapshot` config — see {@link ReadLatestOptions}.
+   *
+   * On a sealed stream the result carries the sealing event as `seal` when
+   * the read fetches the sealing event, in any mode (see
+   * {@link LatestState.seal} for the cases it does not).
    */
   readLatest(
     streamId: StreamIdInput<TStreamIdFields>,
@@ -2191,8 +2488,8 @@ interface AppendParts {
  *   declare (such as a misspelled `projection`, also a type error).
  * @throws `[EDD-9064]` when an index attribute is one the stream writes itself
  *   (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`,
- *   `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, or the
- *   default TTL attribute `_ttl`). A custom `TableConfig.ttlAttributeName`
+ *   `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, the seal
+ *   marker `__edd_sealed__`, or the default TTL attribute `_ttl`). A custom `TableConfig.ttlAttributeName`
  *   is only known at runtime: an index attribute equal to it fails each append
  *   with `ValidationError`.
  * @throws `[EDD-9065]` when two indexes share a physical index name or an
@@ -2551,14 +2848,18 @@ export const makeStream = <
           : raw.metadata
       }
 
-      return {
+      const event: StreamEvent<TEvent, unknown> = {
         streamId: envelope.streamId,
         version: envelope.version,
         eventType: envelope.eventType,
         data,
         metadata,
         timestamp: envelope.timestamp,
+        // The seal marker (#166), present only on a sealing event, so an
+        // ordinary event's shape is unchanged.
+        ...(raw[SEALED_ATTRIBUTE] === true ? { sealed: true as const } : {}),
       }
+      return event
     }) as Effect.Effect<StreamEvent<TEvent>, ValidationError>
 
   // ---------------------------------------------------------------------------
@@ -2729,19 +3030,20 @@ export const makeStream = <
             )
           }
 
-          // The contiguity ConditionCheck and the event puts both mean "the
-          // stream is not where you said it was", so they share one verdict.
-          for (let i = 0; i < tx.guardCount + tx.eventCount; i++) {
-            if (failedAt(i)) {
-              return Effect.fail(
-                new VersionConflict({
-                  streamName: config.streamName,
-                  streamId: streamIdStr,
-                  expectedVersion: tx.expectedVersion,
-                }),
-              )
-            }
-          }
+          // A sealed stream (#166): the contiguity check, the first event put
+          // or the snapshot proof returned a sealing item — terminal, so it
+          // ranks above a conflict. Otherwise the contiguity ConditionCheck
+          // and the event puts both mean "the stream is not where you said it
+          // was", so they share one verdict.
+          const own = streamAppendVerdict(rawReasons, {
+            guardCount: tx.guardCount,
+            eventCount: tx.eventCount,
+            snapshotIndex: tx.snapshotIndex,
+            streamName: config.streamName,
+            streamId: streamIdStr,
+            expectedVersion: tx.expectedVersion,
+          })
+          if (own !== undefined) return Effect.fail(own)
 
           // The head proof (#164) stands in for the contiguity check, so its
           // own condition failing shares their verdict — ahead of the other
@@ -2772,7 +3074,10 @@ export const makeStream = <
           // the caller set no condition on reports what the entity's own put
           // would — a taken unique value, a history conflict — or, having
           // lost a race to a concurrent write, is written again (#133).
+          // A nested stream append's verdict (#166) comes first, naming its
+          // own stream.
           const judged = judgeCancellation(tx.additional, rawReasons, tx.guardCount + tx.eventCount)
+          if (judged?._tag === "stream") return Effect.fail(judged.error)
           if (judged?._tag === "fail") return Effect.fail(judged.error)
           if (judged?._tag === "conditions") {
             return Effect.fail(
@@ -2915,6 +3220,8 @@ export const makeStream = <
    *
    * `eventPartitions` — the partition the append's events have in each
    * index, by index name — is what the inline snapshot's entry must match.
+   * `sealed` writes the seal marker (#166): only a sealing append's inline
+   * snapshot carries it.
    */
   const buildSnapshotItem = (
     streamId: Record<string, unknown>,
@@ -2923,6 +3230,7 @@ export const makeStream = <
     now: string,
     operation: string,
     eventPartitions?: ReadonlyMap<string, IndexPartitionOrigin> | undefined,
+    sealed = false,
   ): Effect.Effect<Record<string, AttributeValue>, ValidationError> =>
     Effect.gen(function* () {
       const encoded = yield* encodeSnapshotState(state, operation)
@@ -2970,6 +3278,8 @@ export const makeStream = <
         item[idx.pk] = entry.partition
         item[idx.sk] = entry.key
       }
+      // Top-level and native, beside `state`, so packing never touches it.
+      if (sealed) item[SEALED_ATTRIBUTE] = true
       return toAttributeMap(item)
     })
 
@@ -3070,6 +3380,47 @@ export const makeStream = <
             })
           }
         }
+      }
+
+      // The seal (#166), checked ahead of the no-op fast path: a seal with
+      // nothing to mark must not pass as a no-op.
+      const seal = options?.seal
+      if (seal !== undefined && typeof seal !== "boolean") {
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.append.seal",
+          cause:
+            `seal must be a boolean; received ${JSON.stringify(seal) ?? String(seal)}. ` +
+            "Nothing was written.",
+        })
+      }
+      const sealing = seal === true
+      if (sealing && events.length === 0) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.append.seal",
+          cause: "A seal needs at least one event to mark. Nothing was written.",
+        })
+      }
+      // On the only snapshot config that accepts the snapshot head proof, the
+      // snapshot at the seal version must be the marked one: a seal without
+      // it leaves the snapshot below the seal, and a later `writeSnapshot` at
+      // the seal version would put an unmarked one a snapshot-proof writer
+      // could append past.
+      if (
+        sealing &&
+        snapshotState === undefined &&
+        snapshotSettings?.mode === "inline" &&
+        snapshotSettings.every === undefined
+      ) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.append.seal",
+          cause:
+            `Stream "${config.streamName}" writes its snapshot in every append (mode "inline" ` +
+            "without every), so a seal must carry the inline snapshot: pass `snapshot` with the " +
+            "state as of the sealing event, which is then marked sealed too. Nothing was written.",
+        })
       }
 
       // Nothing at all to write — preserve the historical no-op fast path.
@@ -3268,11 +3619,20 @@ export const makeStream = <
               if (idx.type === "gsi") item[idx.pk] = partition
             }
 
+            // The seal marker (#166) on the sealing append's last event, after
+            // the typed envelope, as `metadata` is.
+            if (sealing && i === events.length - 1) item[SEALED_ATTRIBUTE] = true
+
             return {
               Put: {
                 TableName: tableName,
                 Item: toAttributeMap(item),
                 ConditionExpression: "attribute_not_exists(pk)",
+                // The first put of a writer one version behind a seal lands on
+                // the sealing event: its item tells `StreamSealed` from a
+                // conflict (#166). Only the first: every put's item would
+                // bloat a failure response for writers already far behind.
+                ...(i === 0 ? { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } : {}),
               },
             }
           }),
@@ -3324,7 +3684,10 @@ export const makeStream = <
           now,
           "EventStore.append.snapshot",
           eventPartitions,
+          sealing,
         )
+        // As a head proof, a sealed snapshot fails the proof (#166), and
+        // returns its item so the failure is reported as `StreamSealed`.
         snapshotPut = {
           Put:
             headProof !== "snapshot"
@@ -3334,15 +3697,21 @@ export const makeStream = <
                     TableName: tableName,
                     Item: item,
                     ConditionExpression: "attribute_not_exists(pk)",
+                    ReturnValuesOnConditionCheckFailure: "ALL_OLD",
                   }
                 : {
                     TableName: tableName,
                     Item: item,
-                    ConditionExpression: "#asOfVersion = :expectedVersion",
-                    ExpressionAttributeNames: { "#asOfVersion": "asOfVersion" },
+                    ConditionExpression:
+                      "#asOfVersion = :expectedVersion AND attribute_not_exists(#sealed)",
+                    ExpressionAttributeNames: {
+                      "#asOfVersion": "asOfVersion",
+                      "#sealed": SEALED_ATTRIBUTE,
+                    },
                     ExpressionAttributeValues: toAttributeMap({
                       ":expectedVersion": expectedVersion,
                     }),
+                    ReturnValuesOnConditionCheckFailure: "ALL_OLD",
                   },
         }
       }
@@ -3358,13 +3727,20 @@ export const makeStream = <
        * cancellation reason, mapping to VersionConflict just like a
        * stale-version Put failure. A zero-event append (a pure side write)
        * writes no version and so can open no gap.
+       *
+       * It also enforces the seal (#166): the event at `expectedVersion` must
+       * not be a sealing event. It already reads that item, so the clause
+       * costs nothing; `ALL_OLD` returns the item on failure (response bytes
+       * only), so a sealed one is reported as `StreamSealed`.
        */
       const contiguityCheck: TransactWriteItem | undefined = needsContiguityCheck
         ? {
             ConditionCheck: {
               TableName: tableName,
               Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
-              ConditionExpression: "attribute_exists(pk)",
+              ConditionExpression: "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+              ExpressionAttributeNames: { "#pk": "pk", "#sealed": SEALED_ATTRIBUTE },
+              ReturnValuesOnConditionCheckFailure: "ALL_OLD",
             },
           }
         : undefined
@@ -3477,20 +3853,28 @@ export const makeStream = <
       for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
         // Caller-owned items, compiled through the same builder
         // `Transaction.transactWrite` uses, so the two APIs cannot drift.
+        // Another stream's append (#166) is accepted here, and only here.
         const additional = yield* buildTransactWriteItems(
           additionalOps,
           "EventStore.append.additionalItems",
+          { streams: true },
         )
         // An item without a condition of its own proves nothing about the
-        // head: accepting it would drop the gap protection silently.
+        // head: accepting it would drop the gap protection silently. Nor
+        // does another stream's append: its conditions are its stream's.
         if (proofOp !== undefined && !additional.conditioned.has(proofOp)) {
+          const named = additionalOps[proofOp]
           return yield* new ValidationError({
             entityType,
             operation: "EventStore.append.headProof",
-            cause:
-              `headProof names additionalItems[${proofOp}], which carries no condition of its ` +
-              "own: the proof must be conditioned on the stream being at expectedVersion " +
-              "(`.condition()`, `create()` or `Transaction.check`). Nothing was written.",
+            cause: isStreamAppendOp(named)
+              ? `headProof names additionalItems[${proofOp}], which is an append of stream ` +
+                `"${named.streamName}" (appendOp): its conditions prove that stream's head, ` +
+                "not this one's. Name an item conditioned on this stream being at " +
+                "expectedVersion. Nothing was written."
+              : `headProof names additionalItems[${proofOp}], which carries no condition of its ` +
+                "own: the proof must be conditioned on the stream being at expectedVersion " +
+                "(`.condition()`, `create()` or `Transaction.check`). Nothing was written.",
           })
         }
         const tx = layout(additional)
@@ -3515,6 +3899,109 @@ export const makeStream = <
       }
       return yield* Effect.fail(lost!)
     })
+
+  // ---------------------------------------------------------------------------
+  // appendOp — this stream's append inside another append (#166)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The nested append's items, built by `buildAppend` exactly as `append`
+   * builds them — contiguity check, event puts, seal marker, inline snapshot
+   * — with the verdict `append` itself applies to them. The options a nested
+   * append may not carry are refused here, for untyped callers.
+   */
+  const buildNestedAppend = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options: NestedAppendOptions<unknown, unknown> | undefined,
+    source: string,
+  ): Effect.Effect<BuiltStreamAppend, ValidationError, TableConfig> =>
+    Effect.gen(function* () {
+      const refuse = (cause: string) =>
+        new ValidationError({ entityType, operation: "EventStore.appendOp", cause })
+      const untyped = options as
+        | {
+            readonly additionalItems?: unknown
+            readonly idempotency?: unknown
+            readonly headProof?: unknown
+          }
+        | undefined
+      for (const key of ["additionalItems", "idempotency", "headProof"] as const) {
+        if (untyped?.[key] !== undefined) {
+          return yield* refuse(
+            `A stream append op may not carry ${key}: one sentinel and one head proof per ` +
+              "transaction, carried by the appending stream. Put them on the outer append. " +
+              "Nothing was written.",
+          )
+        }
+      }
+      if (events.length === 0) {
+        return yield* refuse(
+          `An append op of stream "${config.streamName}" needs at least one event: with none ` +
+            "it writes nothing. Nothing was written.",
+        )
+      }
+      const parts = (yield* buildAppend(
+        streamId,
+        events,
+        expectedVersion,
+        options as AppendOptions<unknown, unknown> | undefined,
+      ))!
+      const items: Array<TransactWriteItem> = []
+      const sources: Array<[string, string]> = []
+      const label = `${source} (stream "${config.streamName}", ${parts.streamIdStr})`
+      if (parts.contiguityCheck !== undefined) {
+        items.push(parts.contiguityCheck)
+        sources.push([entityType, `${label}: the version-contiguity check`])
+      }
+      const guardCount = items.length
+      for (const [i, item] of parts.eventItems.entries()) {
+        items.push(item)
+        sources.push([entityType, `${label}: the event at version ${expectedVersion + i + 1}`])
+      }
+      const snapshotIndex = parts.snapshotPut === undefined ? -1 : items.length
+      if (parts.snapshotPut !== undefined) {
+        items.push(parts.snapshotPut)
+        sources.push([snapshotEntityType, `${label}: the inline snapshot`])
+      }
+      const layout = {
+        guardCount,
+        eventCount: parts.eventItems.length,
+        snapshotIndex,
+        streamName: config.streamName,
+        streamId: parts.streamIdStr,
+        expectedVersion,
+      }
+      const built: BuiltStreamAppend = {
+        items,
+        entityType,
+        targets: () =>
+          items.map((item, i) =>
+            transactItemTarget(item, parts.tableName, ["pk", "sk"], sources[i]![0], sources[i]![1]),
+          ),
+        keys: () => ({
+          partition: ["pk", ...streamIndexes.map((idx) => idx.pk)],
+          sort: ["sk", ...streamIndexes.map((idx) => idx.sk)],
+        }),
+        verdict: (reasons) => streamAppendVerdict(reasons, layout),
+      }
+      return built
+    })
+
+  const appendOp = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: NestedAppendOptions<unknown, unknown> | undefined,
+  ): StreamAppendOp => ({
+    [StreamAppendTypeId]: StreamAppendTypeId,
+    streamName: config.streamName,
+    // The codec check runs as for every other operation of the stream.
+    _build: checked((source: string) =>
+      buildNestedAppend(streamId, events, expectedVersion, options, source),
+    ),
+  })
 
   // ---------------------------------------------------------------------------
   // measureAppend / measureSnapshot — caller-side size planning (#147, R1)
@@ -3859,6 +4346,34 @@ export const makeStream = <
       DynamoClient | TableConfig
     >
 
+  /** The raw event item at `version`, by its exact key, in one `GetItem` (#166). */
+  const getEventItem = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    version: number,
+    consistentRead: boolean,
+  ): Effect.Effect<
+    Record<string, unknown> | undefined,
+    DynamoClientError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { name: tableName } = yield* config.table.Tag
+      const result = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap({
+          pk: composeStreamPk(streamId as Record<string, unknown>),
+          sk: composeEventSk(version),
+        }),
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      })
+      return result.Item === undefined ? undefined : fromAttributeMap(result.Item)
+    }) as Effect.Effect<
+      Record<string, unknown> | undefined,
+      DynamoClientError,
+      DynamoClient | TableConfig
+    >
+
   const readSnapshot = (
     streamId: StreamIdInput<TStreamIdFields>,
   ): Effect.Effect<
@@ -3894,11 +4409,16 @@ export const makeStream = <
       // (`verifySnapshot` is ignored).
       if (snapshot === undefined) {
         const events = yield* read(streamId, options)
-        return {
+        // Any sealing event read (#166), not only the newest: a write past
+        // the seal leaves it behind the head (`seal.version < version`).
+        const seal = events.find((event) => event.sealed === true)
+        const state: LatestState<unknown, TEvent> = {
           snapshot: Option.none<Snapshot<unknown>>(),
           events,
           version: events[events.length - 1]?.version ?? 0,
+          ...(seal !== undefined ? { seal } : {}),
         }
+        return state
       }
 
       // `verifySnapshot: false` — the snapshot item alone, by its exact key:
@@ -3912,10 +4432,32 @@ export const makeStream = <
         const raw = yield* getSnapshotItem(streamId, options.consistentRead === true)
         if (raw !== undefined) {
           const current = yield* decodeSnapshotItem(raw, "EventStore.readLatest")
-          return {
-            snapshot: Option.some(current),
-            events: [],
-            version: current.asOfVersion,
+          // A snapshot written by a sealing append carries the marker (#166):
+          // its version is the seal's, so one `GetItem` of that event returns
+          // the sealing event — paid only on a sealed stream.
+          if (raw[SEALED_ATTRIBUTE] !== true) {
+            const state: LatestState<unknown, TEvent> = {
+              snapshot: Option.some(current),
+              events: [],
+              version: current.asOfVersion,
+            }
+            return state
+          }
+          const sealRaw = yield* getEventItem(
+            streamId,
+            current.asOfVersion,
+            options.consistentRead === true,
+          )
+          // Missing only if the data was corrupted: fall through to the
+          // verified read, which reports what the stream holds.
+          if (sealRaw !== undefined) {
+            const state: LatestState<unknown, TEvent> = {
+              snapshot: Option.some(current),
+              events: [],
+              version: current.asOfVersion,
+              seal: yield* decodeStreamEvent(sealRaw),
+            }
+            return state
           }
         }
       }
@@ -3989,11 +4531,28 @@ export const makeStream = <
       const asOfVersion = Option.isSome(latest) ? latest.value.asOfVersion : 0
       const delta = eventRaws.filter((raw) => (raw.version as number) > asOfVersion).reverse()
       const events = yield* Effect.forEach(delta, (raw) => decodeStreamEvent(raw))
-      return {
+      // The sealing event (#166), from ANY event item the query fetched —
+      // including those at or below the snapshot, which `events` leaves out
+      // (a snapshot at the seal already folds it in) — with no extra request.
+      // The oldest marked item is the seal; anything after it was written
+      // past it.
+      let sealRaw: Record<string, unknown> | undefined
+      for (const raw of eventRaws) {
+        if (raw[SEALED_ATTRIBUTE] === true) sealRaw = raw
+      }
+      const seal =
+        sealRaw === undefined
+          ? undefined
+          : (sealRaw.version as number) > asOfVersion
+            ? events.find((event) => event.version === sealRaw.version)
+            : yield* decodeStreamEvent(sealRaw)
+      const state: LatestState<unknown, TEvent> = {
         snapshot: latest,
         events,
         version: events[events.length - 1]?.version ?? asOfVersion,
+        ...(seal !== undefined ? { seal } : {}),
       }
+      return state
     }) as Effect.Effect<
       LatestState<unknown, TEvent>,
       DynamoClientError | ValidationError,
@@ -4264,6 +4823,7 @@ export const makeStream = <
     writeSnapshot: checked(writeSnapshot),
     readSnapshot: checked(readSnapshot),
     append: checked(append),
+    appendOp,
     read: checked(read),
     readFrom: checked(readFrom),
     currentVersion: checked(currentVersion),
@@ -4365,6 +4925,21 @@ export interface BoundEventStream<
     expectedVersion: number,
     options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendResult<TEvent>, AppendError, never>
+
+  /**
+   * See {@link EventStream.appendOp}. The op builds in this bound stream's
+   * captured context, so it resolves this stream's `TableConfig` (and
+   * `Compression` registry) itself: a stream on another table needs no extra
+   * layer in the outer append. Its items are still sent through the OUTER
+   * append's `DynamoClient` — one transaction cannot span clients — so the
+   * table must be reachable through it.
+   */
+  appendOp(
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: NestedAppendOptions<TMetadata, TState> | undefined,
+  ): StreamAppendOp
 
   /** See {@link EventStream.read}. */
   read(
@@ -4558,6 +5133,17 @@ export const bind = <
       readSnapshot: (streamId) => provide(stream.readSnapshot(streamId)),
       append: (streamId, events, expectedVersion, options) =>
         provide(stream.append(streamId, events, expectedVersion, options)),
+      // Built in the captured context (#166): only its TableConfig and
+      // Compression are used — the outer append sends the items.
+      appendOp: (streamId, events, expectedVersion, options) => {
+        const op = stream.appendOp(streamId, events, expectedVersion, options)
+        const bound: StreamAppendOp = {
+          [StreamAppendTypeId]: StreamAppendTypeId,
+          streamName: op.streamName,
+          _build: (source) => provide(op._build(source)),
+        }
+        return bound
+      },
       read: (streamId, options) => provide(stream.read(streamId, options)),
       readFrom: (streamId, afterVersion, options) =>
         provide(stream.readFrom(streamId, afterVersion, options)),
@@ -4809,6 +5395,22 @@ export const indexDefinitions = (
 export interface LoadedState<State> {
   readonly state: State
   readonly version: number
+  /**
+   * The caller's record says the stream is sealed at this version (#166):
+   * the handler then fails with `StreamSealed` before `decide`, without
+   * spending a transaction (after `DuplicateCommand` for a committed
+   * redelivery). It may be `version + 1`: a record-proof stream keeps its
+   * record one below the seal (see {@link AppendOptionsBase.headProof}).
+   *
+   * Must be a non-negative integer, not below `version` — otherwise the call
+   * fails with `ValidationError`
+   * (`operation: "EventStore.commandHandler.loadState"`). The sealing
+   * transaction writes it: in a changeover, the outer append's
+   * `additionalItems` carries the record beside the sealing `appendOp`.
+   * Without it, a record more than one version below the seal leaves the
+   * handler on `VersionConflict` until its retry schedule ends.
+   */
+  readonly sealedVersion?: number | undefined
 }
 
 /**
@@ -4836,9 +5438,16 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    * A number `n` is shorthand for `Schedule.recurs(n)` (n retries *after* the
    * initial attempt). Omit for the default: no retry.
    *
-   * `DuplicateCommand` is deliberately NOT retried — it is terminal. Nor is
-   * any call that supplies {@link CommandOptionsBase.expectedVersion}: the caller asked
-   * for a conditional write, so its `VersionConflict` is always surfaced.
+   * `DuplicateCommand` is deliberately NOT retried — it is terminal, as is
+   * `StreamSealed` (#166). Nor is a `VersionConflict` of this stream on a
+   * call that supplies {@link CommandOptionsBase.expectedVersion}: the caller
+   * asked for a conditional write, so it is always surfaced.
+   *
+   * A `VersionConflict` naming **another** stream — a stream's `appendOp`
+   * carried in `additionalItems` (#166) — is retried, with or without an
+   * `expectedVersion`: this stream's If-Match was not wrong, and the retried
+   * attempt reloads this stream and checks the If-Match again before
+   * `decide`. Without a schedule it is returned as-is, naming that stream.
    */
   readonly retry?: number | Schedule.Schedule<unknown, VersionConflict> | undefined
 
@@ -5030,12 +5639,27 @@ export interface Decision<State, Event> {
  * directly (pure projection) or as an `Effect` (a projection that needs a read).
  * The effect's `E2` joins the handler's error channel and its `R2` the handler's
  * requirements.
+ *
+ * The ops are {@link AppendWriteOp}s: another stream's `appendOp` (#166) rides
+ * here too, so a handler on stream B can carry stream A's sealing append. Its
+ * `expectedVersion` must come from the **decision** — the version carried in
+ * the decided opening event (`decision.events[0].continuesFrom.version`, say),
+ * from A's state as `decide` read it — never from a separate read of A's head,
+ * which would seal over an append the opening event never carried.
+ *
+ * A `VersionConflict` naming A (not this handler's stream) is never taken
+ * for this stream's lagging snapshot, and is retried by the
+ * {@link CommandHandlerOptions.retry} schedule even under an If-Match. A
+ * `StreamSealed` naming A is terminal: another closer sealed it.
+ *
+ * Code that reads this type and forwards a static array to
+ * `Transaction.transactWrite` must annotate it `ReadonlyArray<TransactWriteOp>`.
  */
 export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
-  | ReadonlyArray<TransactWriteOp>
+  | ReadonlyArray<AppendWriteOp>
   | ((
       decision: Decision<State, Event>,
-    ) => ReadonlyArray<TransactWriteOp> | Effect.Effect<ReadonlyArray<TransactWriteOp>, E2, R2>)
+    ) => ReadonlyArray<AppendWriteOp> | Effect.Effect<ReadonlyArray<AppendWriteOp>, E2, R2>)
 
 /**
  * The form `eventMetadata` ({@link CommandMetadataOptions}) accepts: a
@@ -5294,6 +5918,7 @@ type CommandOptionsArgs<
 type CommandHandlerErrors<E> =
   | E
   | VersionConflict
+  | StreamSealed
   | DuplicateCommand
   | AdditionalItemConditionFailed
   | AppendTooLarge
@@ -5379,7 +6004,7 @@ const hasEventStreamBrand = (u: unknown): boolean =>
 const deriveAdditionalItems = <State, Event>(
   input: AdditionalItemsInput<State, Event, unknown, unknown> | undefined,
   decision: Decision<State, Event>,
-): Effect.Effect<ReadonlyArray<TransactWriteOp> | undefined, unknown, unknown> => {
+): Effect.Effect<ReadonlyArray<AppendWriteOp> | undefined, unknown, unknown> => {
   if (typeof input !== "function") return Effect.succeed(input)
   const derived = input(decision)
   return Effect.isEffect(derived) ? derived : Effect.succeed(derived)
@@ -5504,13 +6129,73 @@ const makeCommandHandlerImpl = <
       readonly verified: boolean
       /** Events past the current snapshot (all events without one). */
       readonly eventsAfterSnapshot: number
+      /**
+       * The version the stream is sealed at (#166), when the load found the
+       * seal: a sealing event read, or the record's `sealedVersion`.
+       */
+      readonly sealedVersion: number | undefined
     }
+
+    /** This handler's stream id, as `append` reports it on errors. */
+    const ownStreamId = formatStreamIdOf(stream, streamId as Record<string, unknown>)
+
+    /**
+     * Whether a `VersionConflict` names this handler's stream — not another
+     * stream whose `appendOp` rode in `additionalItems` (#166).
+     */
+    const isOwnConflict = (error: VersionConflict): boolean =>
+      error.streamName === stream.streamName && error.streamId === ownStreamId
+
+    // A redelivery of a command that already committed: `append` ranks
+    // `DuplicateCommand` above `VersionConflict` and `StreamSealed`, so the
+    // pre-decide answers consult the command's sentinel first (one strongly
+    // consistent `GetItem`, on those paths only).
+    const failIfCommitted = Effect.gen(function* () {
+      const probe = commandSentinelProbeOf(stream)
+      const commandId = callOptions?.commandId
+      if (options?.idempotency !== undefined && commandId !== undefined && probe !== undefined) {
+        if (yield* probe(streamId as Record<string, unknown>, commandId)) {
+          return yield* new DuplicateCommand({
+            streamName: stream.streamName,
+            streamId: ownStreamId,
+            commandId,
+          })
+        }
+      }
+    })
+
+    // A sealed stream accepts no command (#166) — not even a no-op decision —
+    // so a load that shows the seal fails before `decide`, ahead of the
+    // If-Match check: no retry can succeed, and the caller's move is to the
+    // successor stream.
+    const refuseSealed = (loaded: Loaded) =>
+      Effect.gen(function* () {
+        const sealedVersion = loaded.sealedVersion
+        if (sealedVersion === undefined) return loaded
+        yield* failIfCommitted
+        if (sealedVersion < loaded.version) {
+          // Written past the seal by a writer that does not enforce it: on a
+          // closed stream nobody reads, so the application must recover them.
+          yield* Effect.logWarning(
+            `EventStore: stream "${stream.streamName}" (${ownStreamId}) is sealed at version ` +
+              `${sealedVersion}, but has events past the seal: versions ${sealedVersion + 1}` +
+              `${loaded.version > sealedVersion + 1 ? `…${loaded.version}` : ""}.`,
+          )
+        }
+        return yield* new StreamSealed({
+          streamName: stream.streamName,
+          streamId: ownStreamId,
+          sealedVersion,
+        })
+      })
 
     // 1. Establish the base state + version. A snapshot-configured stream
     //    loads its snapshot, the events after it and its head in one request
     //    (#138) — or, unverified, the snapshot item alone; any other stream
     //    replays from the beginning.
     const load = (verify: boolean) =>
+      Effect.flatMap(loadUnchecked(verify), (loaded) => refuseSealed(loaded))
+    const loadUnchecked = (verify: boolean) =>
       Effect.gen(function* () {
         let state = decider.initialState
         // The caller's own record (#164), trusted as the head: the append's
@@ -5536,6 +6221,7 @@ const makeCommandHandlerImpl = <
               snapshotAsOfVersion: undefined,
               verified: true,
               eventsAfterSnapshot: 0,
+              sealedVersion: undefined,
             }
             return fresh
           }
@@ -5546,12 +6232,24 @@ const makeCommandHandlerImpl = <
                 "integer, the stream version the state is as of. Nothing was written.",
             )
           }
+          const sealedVersion = record.sealedVersion
+          if (
+            sealedVersion !== undefined &&
+            (!Number.isInteger(sealedVersion) || sealedVersion < record.version)
+          ) {
+            return yield* refused(
+              `loadState returned sealedVersion ${String(sealedVersion)}: it must be a ` +
+                `non-negative integer, not below the record's version ${record.version} — the ` +
+                "version of the stream's sealing event. Nothing was written.",
+            )
+          }
           const loaded: Loaded = {
             state: record.state,
             version: record.version,
             snapshotAsOfVersion: undefined,
             verified: true,
             eventsAfterSnapshot: 0,
+            sealedVersion,
           }
           return loaded
         }
@@ -5576,6 +6274,7 @@ const makeCommandHandlerImpl = <
             // already fallen back to the verified read.
             verified: verify || Option.isNone(latest.snapshot),
             eventsAfterSnapshot: latest.events.length,
+            sealedVersion: latest.seal?.version,
           }
           return loaded
         }
@@ -5589,6 +6288,8 @@ const makeCommandHandlerImpl = <
           snapshotAsOfVersion: 0,
           verified: true,
           eventsAfterSnapshot: events.length,
+          // Any sealing event (#166), not only the newest.
+          sealedVersion: events.find((event) => event.sealed === true)?.version,
         }
         return loaded
       })
@@ -5681,7 +6382,7 @@ const makeCommandHandlerImpl = <
           metadata?: TMetadata
           eventMetadata?: ReadonlyArray<TMetadata | undefined>
           eventTimestamps?: ReadonlyArray<DateTime.DateTime | undefined>
-          additionalItems?: ReadonlyArray<TransactWriteOp>
+          additionalItems?: ReadonlyArray<AppendWriteOp>
           idempotency?: AppendIdempotency
           snapshot?: State
           headProof?: HeadProof
@@ -5736,10 +6437,13 @@ const makeCommandHandlerImpl = <
           baseVersion,
           appendOptions as AppendOptions<TMetadata, any>,
         ) as Effect.Effect<AppendResult<TEvent>, AppendError, unknown>
+        // Only this stream's conflict can mean a lagging snapshot: one naming
+        // another stream (a nested `appendOp`, #166) propagates.
         const outcome = yield* returnAppendConflict
           ? appended.pipe(
               Effect.catchIf(
-                (error): error is VersionConflict => error instanceof VersionConflict,
+                (error): error is VersionConflict =>
+                  error instanceof VersionConflict && isOwnConflict(error),
                 (conflict) => Effect.succeed(conflict),
               ),
             )
@@ -5781,20 +6485,10 @@ const makeCommandHandlerImpl = <
     // paid on this conflict path only.
     const ifMatchMismatch = (expected: number, actualVersion: number) =>
       Effect.gen(function* () {
-        const probe = commandSentinelProbeOf(stream)
-        const commandId = callOptions?.commandId
-        if (options?.idempotency !== undefined && commandId !== undefined && probe !== undefined) {
-          if (yield* probe(streamId as Record<string, unknown>, commandId)) {
-            return yield* new DuplicateCommand({
-              streamName: stream.streamName,
-              streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
-              commandId,
-            })
-          }
-        }
+        yield* failIfCommitted
         return yield* new VersionConflict({
           streamName: stream.streamName,
-          streamId: formatStreamIdOf(stream, streamId as Record<string, unknown>),
+          streamId: ownStreamId,
           expectedVersion: expected,
           actualVersion,
         })
@@ -5962,9 +6656,11 @@ const makeCommandHandlerImpl = <
     })
 
     // A caller-supplied `expectedVersion` is a conditional write: its
-    // `VersionConflict` (pre-decide or from the append) is the answer, never a
-    // cue to re-read and re-decide.
-    return schedule === undefined || expectedVersion !== undefined
+    // `VersionConflict` of this stream (pre-decide or from the append) is the
+    // answer, never a cue to re-read and re-decide. A conflict naming another
+    // stream (a nested `appendOp`, #166) is retried either way: the If-Match
+    // was not wrong, and the retried attempt checks it again on its reload.
+    return schedule === undefined
       ? attempt
       : Effect.retry(attempt, {
           // `while` runs before the schedule, so the schedule only ever sees a
@@ -5972,10 +6668,13 @@ const makeCommandHandlerImpl = <
           // because `Retry.Options` demands a schedule whose input accepts the
           // effect's *full* error union, and `Schedule` is contravariant on input.
           schedule: schedule as Schedule.Schedule<unknown, unknown>,
-          // `VersionConflict` only. `DuplicateCommand` is terminal — the same
-          // commandId can never succeed — and `AdditionalItemConditionFailed`
-          // will not resolve itself by re-deciding either.
-          while: (error: unknown) => error instanceof VersionConflict,
+          // `VersionConflict` only. `DuplicateCommand` and `StreamSealed` are
+          // terminal — the same commandId, or a sealed stream, can never
+          // succeed — and `AdditionalItemConditionFailed` will not resolve
+          // itself by re-deciding either.
+          while: (error: unknown) =>
+            error instanceof VersionConflict &&
+            (expectedVersion === undefined || !isOwnConflict(error)),
         })
   }
 }
