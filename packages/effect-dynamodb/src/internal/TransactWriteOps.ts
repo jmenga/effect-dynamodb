@@ -501,6 +501,10 @@ export const buildTransactWriteItems = (
 
       const plan = options?.plans?.get(opIndex)
       if (plan !== undefined) {
+        // No `condition` here, so a planned op is never in `conditioned`, even
+        // with a `.condition()` of its own: its verdict reports that as
+        // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
+        // plans nothing — if it ever does, add planned ops to it.
         opInfos.push({ type: "planned", entity: info.entity, opIndex, plan })
         continue
       }

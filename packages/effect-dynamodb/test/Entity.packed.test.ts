@@ -138,7 +138,23 @@ const Readings = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Orders, Docs, Readings } })
+class Note extends Schema.Class<Note>("Note")({
+  noteId: Schema.String,
+  title: Schema.String,
+  origin: Schema.Struct({ source: Schema.String }),
+}) {}
+
+/** Unversioned, so a restated packed immutable takes the plain (unread-write) path. */
+const Notes = Entity.make({
+  model: DynamoModel.configure(Note, { origin: { storedAs: json, immutable: true } }),
+  entityType: "Note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Orders, Docs, Readings, Notes } })
 
 // ---------------------------------------------------------------------------
 // In-memory DynamoClient
@@ -462,7 +478,10 @@ const order = (overrides: Partial<Order> = {}) =>
     ...overrides,
   })
 
-const client = DynamoClient.make({ entities: { Orders, Docs, Readings }, tables: { MainTable } })
+const client = DynamoClient.make({
+  entities: { Orders, Docs, Readings, Notes },
+  tables: { MainTable },
+})
 
 const failure = <E>(exit: Exit.Exit<unknown, E>): E => {
   if (Exit.isSuccess(exit)) throw new Error("expected a failure")
@@ -1013,6 +1032,37 @@ describe("Entity packed fields — update", () => {
       expect(error).toBeInstanceOf(ValidationError)
       expect(String((error as ValidationError).cause)).toMatch(/"origin" is immutable/)
     }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(
+    "a restated packed immutable on a missing item takes the missing-item path, sending no update",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        const partial = () =>
+          db.entities.Notes.update({ noteId: "n-1" }).set({ title: "t", origin: { source: "a" } })
+        expect((yield* Effect.flip(partial().asEffect()))._tag).toBe("ItemNotFound")
+        // In a transaction it is the same outcome, found while planning: nothing is sent.
+        expect((yield* Effect.flip(Transaction.transactWrite([partial()])))._tag).toBe(
+          "ItemNotFound",
+        )
+        const patch = db.entities.Notes.patch({ noteId: "n-1" }).set({ origin: { source: "a" } })
+        expect((yield* Effect.flip(patch.asEffect()))._tag).toBe("ConditionalCheckFailed")
+        expect(sentUpdates).toHaveLength(0)
+        expect(sentTransactions).toHaveLength(0)
+
+        // A complete item is created, standalone and in a transaction alike. The
+        // key composite is part of the payload, so the unbound combinator.
+        const complete = (noteId: string) =>
+          Notes.update({ noteId }).pipe(Entity.set({ noteId, title: "t", origin: { source: "a" } }))
+        yield* complete("n-2")
+        yield* Transaction.transactWrite([complete("n-3")])
+        expect(sentUpdates).toHaveLength(0)
+        expect(sentTransactions).toHaveLength(1)
+        expect(sentTransactions[0]![0]!.Put).toBeDefined()
+        expect(stored("n-2").origin?.S).toBe('{"source":"a"}')
+        expect(stored("n-3").origin?.S).toBe('{"source":"a"}')
+      }).pipe(Effect.provide(TestLayer)),
   )
 })
 

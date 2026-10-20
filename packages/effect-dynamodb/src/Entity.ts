@@ -6712,22 +6712,29 @@ const makeImpl = <
       // stored bytes (they depend on the codec and threshold it was written
       // under): an unread write reads it and compares the unpacked JSON
       // (#147). The write still requires the item (`attribute_exists`), and
-      // no library write changes an immutable value in between.
+      // no library write changes an immutable value in between. A missing
+      // item takes the path the write's rejection would have taken — create
+      // it, or fail — without sending a write that needs the item: an op that
+      // read its row missing writes nothing that requires it, which is what
+      // `transactWrite`'s planner relies on.
       if (plainWrite && immutables.some((asserted) => asserted.packed)) {
         const stored = yield* client.getItem({
           TableName: tableName,
           Key: marshalledKey,
           ConsistentRead: true,
         })
-        if (stored.Item !== undefined) {
-          const packedChange = yield* packedImmutableMismatch(immutables, stored.Item)
-          if (packedChange !== undefined) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update",
-              cause: packedChange,
-            })
-          }
+        if (stored.Item === undefined) {
+          return yield* createsOnMissing
+            ? new MissingForCreate({ input: uState.updates })
+            : missingItem()
+        }
+        const packedChange = yield* packedImmutableMismatch(immutables, stored.Item)
+        if (packedChange !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update",
+            cause: packedChange,
+          })
         }
       }
       // Build UpdateExpression

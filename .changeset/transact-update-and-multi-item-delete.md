@@ -48,9 +48,24 @@ a delete (**EDD-9060**), and an update of an entity with `vectorIndexes`
 (**EDD-9061**). The new `TransactWriteUpdateOp` type is `transactWrite`-only:
 `EventStore.append({ additionalItems })` and `Batch.write` are unchanged.
 
-The standalone `update` gets one fix, which transactions inherit through it: a
-**`clearMap` on a versioned entity now conditions the write on the version its
-read found**. Before, a bucket added between the read and the write survived the
+`transactWrite`'s error type gains `ItemNotFound` and `RefNotFound`, for every
+caller. A match that handles each of its errors exhaustively needs the two new
+cases.
+
+The standalone `update` gets two fixes, which transactions inherit through it.
+
+First, a **`clearMap` on a versioned entity now conditions the write on the
+version its read found**. Before, a bucket added between the read and the write survived the
 clear, even though a comment and `DESIGN.md` described a version CAS. A
 concurrent write is now an `OptimisticLockError`, and a stale `expectedVersion`
 is refused against that read before anything is sent.
+
+Second, an update that restates an immutable field stored packed
+(`DynamoModel.Packed`) reads the item to compare the unpacked value. **When that
+read finds the item missing, the update now takes the missing-item path
+directly**: a complete `.set()` creates the item, otherwise it fails
+`ItemNotFound`, or `ConditionalCheckFailed` for `patch`. Before, it went on to
+send a write that was bound to be rejected. Standalone, the outcome is unchanged
+and one request is saved. In a transaction, the rejection read as a lost race, so
+the caller got `ConcurrentModification` after every retry instead of
+`ItemNotFound`.
