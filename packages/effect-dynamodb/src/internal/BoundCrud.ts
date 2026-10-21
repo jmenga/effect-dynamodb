@@ -107,6 +107,15 @@ export interface BoundWriteOp {
 }
 
 /**
+ * A bound `update` builder, accepted by `Transaction.transactWrite` only — see
+ * `TransactWriteUpdateOp`. Erased for the same reason as {@link BoundWriteOp}.
+ */
+export interface BoundUpdateOp {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "update"
+}
+
+/**
  * Condition input accepted by `.condition()` — callback or shorthand record.
  * `P` names the entity's packed fields: their paths are {@link PackedPath}s,
  * usable only with `exists` / `notExists` (see `PathModel`).

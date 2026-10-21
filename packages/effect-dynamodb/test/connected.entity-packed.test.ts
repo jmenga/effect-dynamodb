@@ -301,9 +301,25 @@ class Tour extends Schema.Class<Tour>("Tour")({
   leg2: Leg,
 }) {}
 
+class Note extends Schema.Class<Note>("Note")({
+  noteId: Schema.String,
+  title: Schema.String,
+  origin: Schema.Struct({ source: Schema.String }),
+}) {}
+
+/** Unversioned, so a restated packed immutable takes the plain (unread-write) path. */
+const Notes = Entity.make({
+  model: DynamoModel.configure(Note, { origin: { storedAs: json, immutable: true } }),
+  entityType: "Note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["noteId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops },
+  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops, Notes },
 })
 /** Alternate configurations of the same entity types, over the same physical table. */
 /** Venues with packing turned off: the same entity type, unpacked. */
@@ -386,7 +402,7 @@ const provide = Effect.provide(Layer.mergeAll(ClientLayer, Tables))
 const provideBare = Effect.provide(Layer.mergeAll(BareClientLayer, Tables))
 
 const client = DynamoClient.make({
-  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops },
+  entities: { Orders, Docs, Readings, ZstdBlobs, Venues, Tickets, Invoices, Stops, Notes },
   aggregates: { Matches, Tours },
   tables: { MainTable },
 })
@@ -677,6 +693,46 @@ describeConnected("Entity packed fields (#147)", () => {
       const [t1] = yield* Transaction.transactGet([db.entities.Orders.get({ orderId: "t-1" })])
       expect(t1?.details?.note).toBe(LONG)
     }).pipe(provide),
+  )
+
+  it.effect(
+    "a restated packed immutable on a missing item: same outcome standalone and in transactWrite",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        const origin = { source: "import" }
+        const partial = () =>
+          db.entities.Notes.update({ noteId: "nm-1" }).set({ title: "t", origin })
+        const companion = (orderId: string) => db.entities.Orders.put(order(orderId))
+        expect((yield* Effect.flip(partial().asEffect()))._tag).toBe("ItemNotFound")
+        // Planned from the same op, so the same error — not a lost race — and
+        // the companion write is not sent.
+        expect(
+          (yield* Effect.flip(Transaction.transactWrite([partial(), companion("nm-c1")])))._tag,
+        ).toBe("ItemNotFound")
+        expect(yield* rawItem("order", "nm-c1")).toBeUndefined()
+        const patch = db.entities.Notes.patch({ noteId: "nm-1" }).set({ origin })
+        expect((yield* Effect.flip(patch.asEffect()))._tag).toBe("ConditionalCheckFailed")
+        expect((yield* Effect.flip(Transaction.transactWrite([patch])))._tag).toBe(
+          "ConditionalCheckFailed",
+        )
+
+        // A complete item is created, standalone and atomically with the
+        // companion. The key composite is part of the payload, so the unbound
+        // combinator.
+        const complete = (noteId: string) =>
+          Notes.update({ noteId }).pipe(Entity.set({ noteId, title: "t", origin }))
+        yield* complete("nm-2")
+        yield* Transaction.transactWrite([complete("nm-3"), companion("nm-c3")])
+        expect((yield* db.entities.Notes.get({ noteId: "nm-2" })).origin).toEqual(origin)
+        expect((yield* db.entities.Notes.get({ noteId: "nm-3" })).origin).toEqual(origin)
+        expect(yield* rawItem("order", "nm-c3")).toBeDefined()
+        // Once it exists, the restated value is checked and the update applies.
+        yield* Transaction.transactWrite([
+          db.entities.Notes.update({ noteId: "nm-2" }).set({ title: "t2", origin }),
+        ])
+        expect((yield* db.entities.Notes.get({ noteId: "nm-2" })).title).toBe("t2")
+      }).pipe(provide),
   )
 
   it.effect("retain snapshots, soft delete and restore copy stored values as-is", () =>
