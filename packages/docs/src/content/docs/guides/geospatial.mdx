@@ -149,10 +149,13 @@ for (const { item, distance } of results) {
 | `center` | `{ latitude, longitude }` | required | Search center |
 | `radius` | `number` | required | Search radius |
 | `unit` | `"m"` \| `"km"` | `"m"` | Radius unit |
-| `timeWindow` | `{ start, end }` | past 15 minutes | Temporal scope (epoch ms) |
+| `timeWindow` | `{ start, end }` | past 15 minutes | Inclusive time range (epoch ms), compared against the `timePartition.source` field |
 | `sort` | `"ASC"` \| `"DESC"` | `"ASC"` | Sort by distance |
+| `pkFilter` | `Record<string, unknown>` | — | Values for any GSI partition-key composites besides `parentCell` and `timePartition` (a tenant, for example) |
 
 **Returns:** `Array<{ item: Entity.Record, distance: number }>` — sorted by distance, filtered to the exact radius using great-circle distance.
+
+`timeWindow` filters items, not just partitions. The search queries every hourly partition the window touches, then keeps only the items whose `timePartition.source` timestamp lies within `[start, end]`, so a 30-second window returns only items from those 30 seconds, never the rest of the hour. The filtered-out items are still read from those partitions and consume read capacity, so cost scales with the number of hours the window touches, not with how long the window is.
 
 ### Enriching for Transactions
 
@@ -179,7 +182,8 @@ Given a nearby search with `center` and `radius`:
 4. **Contiguous chunking** — Adjacent H3 cells (numerically sequential) are grouped into `BETWEEN` range queries on the sort key, reducing the number of DynamoDB queries
 5. **Time partitions** — The time window is divided into hourly buckets
 6. **Parallel execution** — All (partition × chunk) query combinations execute in parallel
-7. **Great-circle filter** — Results are post-filtered using haversine distance to the exact radius
+7. **Time-window filter** — Items whose source timestamp falls outside `[start, end]` are dropped, since the first and last partitions extend past the window
+8. **Great-circle filter** — Results are post-filtered using haversine distance to the exact radius
 
 ## H3 Resolution Guide
 
