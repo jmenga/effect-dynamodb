@@ -1,5 +1,11 @@
 # @effect-dynamodb/geo
 
+## 1.34.1
+
+### Patch Changes
+
+- [`5fb5d1d`](https://github.com/jmenga/effect-dynamodb/commit/5fb5d1d5f78c3591299999a59722788474561ac2) - `GeoIndex.nearby()` now filters results to the `timeWindow`, not just the time partitions it touches. Each item is kept only when its `timePartition.source` timestamp lies in `[start, end]` (inclusive). Before, an hourly bucket returned everything written in that hour, so a 30-second window could return items up to an hour older (or newer than `end`). The default 15-minute window is filtered the same way. Closes [#169](https://github.com/jmenga/effect-dynamodb/issues/169).
+
 ## 1.34.0
 
 ## 1.33.0
