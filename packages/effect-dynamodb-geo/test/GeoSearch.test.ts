@@ -447,6 +447,85 @@ describe("GeoSearch", () => {
     expect(firstCall.KeyConditionExpression).toContain("BETWEEN")
   })
 
+  // -------------------------------------------------------------------------
+  // timeWindow filters items, not just partitions (#169)
+  // -------------------------------------------------------------------------
+
+  describe("timeWindow", () => {
+    // NOW sits 13m20s into its hourly bucket, so every timestamp below shares
+    // NOW's partition — the bucket the window selects also holds them all.
+    const HOUR_START = Math.floor(NOW / H3.HOURLY_BUCKET_MS) * H3.HOURLY_BUCKET_MS
+
+    // Each vehicle gets its own spot (~10 m apart): the mock GSI keys items by
+    // `gsi1pk|gsi1sk`, so two in the same cell and partition would collide.
+    let seeded = 0
+    const seedAt = (vehicleId: string, timestamp: number) =>
+      seedVehicle({
+        vehicleId,
+        latitude: SF_CENTER.latitude + 0.0001 * seeded++,
+        longitude: SF_CENTER.longitude,
+        timestamp,
+      })
+
+    const nearbyIds = (timeWindow?: { readonly start: number; readonly end: number }) =>
+      Effect.runPromise(
+        VehicleGeo.nearby({
+          center: SF_CENTER,
+          radius: 500,
+          unit: "m",
+          ...(timeWindow ? { timeWindow } : {}),
+        }).pipe(Effect.provide(TestLayer)),
+      ).then((results) => results.map((r) => r.item.vehicleId).sort())
+
+    it("drops items in a selected partition that predate the window start", async () => {
+      expect(NOW - 10 * 60_000).toBeGreaterThanOrEqual(HOUR_START)
+      await Effect.runPromise(
+        Effect.all([seedAt("v-stale", NOW - 10 * 60_000), seedAt("v-fresh", NOW - 10_000)]),
+      )
+
+      expect(await nearbyIds({ start: NOW - 30_000, end: NOW })).toEqual(["v-fresh"])
+    })
+
+    it("drops items in a selected partition that postdate the window end", async () => {
+      await Effect.runPromise(
+        Effect.all([seedAt("v-fresh", NOW - 10_000), seedAt("v-late", NOW + 60_000)]),
+      )
+
+      expect(await nearbyIds({ start: NOW - 30_000, end: NOW })).toEqual(["v-fresh"])
+    })
+
+    it("keeps items timestamped exactly at start and end", async () => {
+      await Effect.runPromise(
+        Effect.all([
+          seedAt("v-start", NOW - 30_000),
+          seedAt("v-end", NOW),
+          seedAt("v-before", NOW - 30_001),
+          seedAt("v-after", NOW + 1),
+        ]),
+      )
+
+      expect(await nearbyIds({ start: NOW - 30_000, end: NOW })).toEqual(["v-end", "v-start"])
+    })
+
+    it("filters by the default 15-minute window when none is given", async () => {
+      // The default window reaches back into the previous hourly bucket, which
+      // is queried whole — the item from 16 minutes ago is in it.
+      const now = vi.spyOn(Date, "now").mockReturnValue(NOW)
+      try {
+        await Effect.runPromise(
+          Effect.all([seedAt("v-16m", NOW - 16 * 60_000), seedAt("v-5m", NOW - 5 * 60_000)]),
+        )
+
+        expect(H3.getTimePartitions(NOW - 15 * 60_000, NOW, H3.HOURLY_BUCKET_MS)).toContain(
+          H3.computeTimePartition(NOW - 16 * 60_000, H3.HOURLY_BUCKET_MS),
+        )
+        expect(await nearbyIds()).toEqual(["v-5m"])
+      } finally {
+        now.mockRestore()
+      }
+    })
+  })
+
   it("enrichment round-trip: enrich + put + query returns consistent data", async () => {
     const input: Entity.Input<typeof Vehicles> = {
       vehicleId: "v-roundtrip",

@@ -1,5 +1,12 @@
 # effect-dynamodb
 
+## 1.34.1
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @effect-dynamodb/schema@1.34.1
+
 ## 1.34.0
 
 ### Minor Changes

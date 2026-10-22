@@ -52,6 +52,14 @@ export interface NearbyOptions {
   readonly center: LatLng
   readonly radius: number
   readonly unit?: H3.GeoUnit
+  /**
+   * Inclusive time range, in epoch milliseconds, compared against each item's
+   * `timePartition.source` field. Selects the time partitions to query and
+   * then keeps only the items whose source timestamp lies in `[start, end]`;
+   * an item without a numeric source timestamp is never returned.
+   *
+   * Defaults to the past 15 minutes (`{ start: now - 15 min, end: now }`).
+   */
   readonly timeWindow?: { readonly start: number; readonly end: number }
   readonly sort?: SortOrder
   readonly pkFilter?: Record<string, unknown>

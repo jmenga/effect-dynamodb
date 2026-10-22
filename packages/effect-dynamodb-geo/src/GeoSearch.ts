@@ -41,13 +41,16 @@ const H3_RESOLUTION_PRECISE = 15
  * Search for items near a geographic point within a given radius.
  *
  * Orchestrates:
- * 1. Compute optimal H3 resolution and ring size for the radius
- * 2. Generate and prune H3 cells within radius
- * 3. Group contiguous cells into BETWEEN range query chunks
- * 4. Generate time partition keys for the time window
- * 5. Build N queries (one per timePartition x chunk combination)
- * 6. Execute all queries in parallel
- * 7. Post-process: compute great-circle distance, filter by radius, sort
+ * 1. Compute the optimal H3 resolution for the radius
+ * 2. Compute the ring size needed to cover it
+ * 3. Generate the grid disk (concentric rings)
+ * 4. Prune cells outside the radius
+ * 5. Group contiguous cells into BETWEEN range query chunks
+ * 6. Generate time partition keys for the time window
+ * 7. Build N queries (one per timePartition x chunk combination), each keeping
+ *    only items whose `timePartition.source` timestamp lies in the window
+ * 8. Execute all queries in parallel
+ * 9. Post-process: compute great-circle distance, filter by radius, sort
  */
 export const nearby = <A>(
   config: SearchConfig<A>,
@@ -82,6 +85,16 @@ export const nearby = <A>(
     const startTime = options.timeWindow?.start ?? now - 15 * 60 * 1000
     const endTime = options.timeWindow?.end ?? now
     const timePartitions = H3.getTimePartitions(startTime, endTime, config.bucketMs)
+
+    // A partition spans a whole bucket, so the first and last ones also hold
+    // items from before `start` and after `end`. The window is a contract on
+    // the items returned, not just on the buckets read: each one is kept only
+    // when its source timestamp lies in `[start, end]` (#169).
+    const sourceField = config.fields.timePartition.source
+    const inTimeWindow = (item: A): boolean => {
+      const timestamp = (item as Record<string, unknown>)[sourceField]
+      return typeof timestamp === "number" && timestamp >= startTime && timestamp <= endTime
+    }
 
     // Step 7: Build queries — one per (timePartition, chunk)
     const { entity, indexDef, fields } = config
@@ -183,7 +196,10 @@ export const nearby = <A>(
             entity.indexes.primary?.pk.field,
             entity.indexes.primary?.sk.field,
           ],
-        }).pipe(Query.where({ between: [qc.lower, qc.upper] as const }))
+        }).pipe(
+          Query.where({ between: [qc.lower, qc.upper] as const }),
+          Query.filterBy(inTimeWindow),
+        )
 
         return Query.collect(query)
       },

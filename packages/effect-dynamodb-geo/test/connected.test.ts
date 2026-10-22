@@ -226,4 +226,39 @@ describeConnected("GeoSearch (connected)", () => {
       expect(r.distance).toBeLessThanOrEqual(1000)
     }
   })
+
+  it("timeWindow drops items outside the window from the partitions it selects (#169)", async () => {
+    // An hourly bucket well before the other tests' timestamps, so nothing
+    // else lands in it. All three items share the one partition the window
+    // selects; only the one inside the window may come back.
+    const hourStart =
+      Math.floor(NOW / H3.HOURLY_BUCKET_MS) * H3.HOURLY_BUCKET_MS - 10 * H3.HOURLY_BUCKET_MS
+    const minute = 60_000
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const at = (vehicleId: string, timestamp: number) =>
+          VehicleGeo.put({
+            vehicleId,
+            latitude: SF_CENTER.latitude,
+            longitude: SF_CENTER.longitude,
+            timestamp,
+          }).asEffect()
+        yield* at("v-169-stale", hourStart + 5 * minute)
+        yield* at("v-169-fresh", hourStart + 30 * minute)
+        yield* at("v-169-late", hourStart + 50 * minute)
+      }).pipe(provide),
+    )
+
+    const results = await Effect.runPromise(
+      VehicleGeo.nearby({
+        center: SF_CENTER,
+        radius: 500,
+        unit: "m",
+        timeWindow: { start: hourStart + 29 * minute, end: hourStart + 31 * minute },
+      }).pipe(provide),
+    )
+
+    expect(results.map((r) => r.item.vehicleId)).toEqual(["v-169-fresh"])
+  })
 })
