@@ -12,6 +12,7 @@ import { type DateTime, Effect, Pipeable, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
+import * as Capacity from "./Capacity.js"
 
 // ---------------------------------------------------------------------------
 // TypeId symbols
@@ -257,8 +258,10 @@ export const emptyUpdateState: UpdateState = {
  */
 export interface EntityOp<A, Rec, E, R> extends Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId
-  /** @internal */
+  /** @internal The op's core, run without an operation scope (internal compositions). */
   readonly _run: (mode: DecodeMode) => Effect.Effect<any, E, R>
+  /** @internal The op's public terminal: `_run` as a named operation (consumed capacity). */
+  readonly _exec: (mode: DecodeMode) => Effect.Effect<any, E, R>
   /** Convert this descriptor to an executable Effect. */
   readonly asEffect: () => Effect.Effect<A, E, R>
   /** Yield support for `Effect.gen`. */
@@ -380,8 +383,17 @@ export class EntityGetImpl<A, Rec, E, R> implements Pipeable.Pipeable {
         projection: this._projection,
       })
   }
+  /** `getVersion`, `restore` and `deleted.get` are get-shaped; their builder carries the name. */
+  get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
+    return (mode) =>
+      Capacity.operation(
+        Capacity.builderName(this._builder) ?? "Entity.get",
+        Capacity.entityTarget(this._entity),
+        this._run(mode),
+      )
+  }
   asEffect(): Effect.Effect<A, E, R> {
-    return this._run("model") as Effect.Effect<A, E, R>
+    return this._exec("model") as Effect.Effect<A, E, R>
   }
   [Symbol.iterator]() {
     return new Utils.SingleShotGen(this.asEffect()) as any
@@ -460,8 +472,16 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
         }),
       )
   }
+  get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
+    return (mode) =>
+      Capacity.operation(
+        `Entity.${this._putKind}`,
+        Capacity.entityTarget(this._entity),
+        this._run(mode),
+      )
+  }
   asEffect(): Effect.Effect<A, E, R> {
-    return this._run("model") as Effect.Effect<A, E, R>
+    return this._exec("model") as Effect.Effect<A, E, R>
   }
   [Symbol.iterator]() {
     return new Utils.SingleShotGen(this.asEffect()) as any
@@ -498,8 +518,16 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
         () => this._builder(mode, this._updateState),
       )
   }
+  get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
+    return (mode) =>
+      Capacity.operation(
+        this._updateState.patch ? "Entity.patch" : "Entity.update",
+        Capacity.entityTarget(this._entity),
+        this._run(mode),
+      )
+  }
   asEffect(): Effect.Effect<A, E, R> {
-    return this._run("model") as Effect.Effect<A, E, R>
+    return this._exec("model") as Effect.Effect<A, E, R>
   }
   [Symbol.iterator]() {
     return new Utils.SingleShotGen(this.asEffect()) as any
@@ -537,7 +565,8 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
     this._returnValues = returnValues
     this._mustExist = mustExist
   }
-  asEffect(): Effect.Effect<A, E, R> {
+  /** @internal The op's core, run without an operation scope. */
+  _core(): Effect.Effect<A, E, R> {
     return refuseEmptyParts(
       this._entity,
       this._mustExist ? "deleteIfExists" : "delete",
@@ -548,6 +577,16 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
           returnValues: this._returnValues,
           mustExist: this._mustExist,
         }),
+    )
+  }
+  /** `purge` is delete-shaped; its builder carries the name. */
+  asEffect(): Effect.Effect<A, E, R> {
+    return Capacity.operation(
+      this._mustExist
+        ? "Entity.deleteIfExists"
+        : (Capacity.builderName(this._builder) ?? "Entity.delete"),
+      Capacity.entityTarget(this._entity),
+      this._core(),
     )
   }
   [Symbol.iterator]() {

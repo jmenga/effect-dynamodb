@@ -90,7 +90,8 @@ import {
   Schedule,
   Schema,
 } from "effect"
-import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
+import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
@@ -2791,6 +2792,18 @@ export const makeStream = <
     op: (...args: Args) => Effect.Effect<A, E, R>,
   ): ((...args: Args) => Effect.Effect<A, E, R>) =>
     codecCheck === undefined ? op : (...args) => Effect.andThen(codecCheck, op(...args))
+  /**
+   * A stream method as a named operation for consumed-capacity reports
+   * (#174). Internal compositions call the unwrapped closures, so only the
+   * public method opens a scope.
+   */
+  const named =
+    <Args extends ReadonlyArray<any>, A, E, R>(
+      name: string,
+      op: (...args: Args) => Effect.Effect<A, E, R>,
+    ): ((...args: Args) => Effect.Effect<A, E, R>) =>
+    (...args) =>
+      Capacity.operation(`EventStream.${name}`, { target: config.streamName }, op(...args))
   /** The `[EDD-9076]` guard for queries of a stream whose `data` is packed. */
   const dataGuards: ReadonlyArray<PackedAttributeGuard> =
     dataStoredAs === undefined
@@ -4033,7 +4046,7 @@ export const makeStream = <
       const { tableName, streamIdStr, contiguityCheck, eventItems, sentinelPut, snapshotPut } =
         parts
 
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
 
       /**
        * Lay out the append's one transaction — see {@link AppendTransaction}:
@@ -4471,7 +4484,7 @@ export const makeStream = <
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("writeSnapshot")
 
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* config.table.Tag
       const now = DateTime.formatIso(yield* DateTime.now)
 
@@ -4580,7 +4593,7 @@ export const makeStream = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* config.table.Tag
       const result = yield* client.getItem({
         TableName: tableName,
@@ -4608,7 +4621,7 @@ export const makeStream = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* config.table.Tag
       const result = yield* client.getItem({
         TableName: tableName,
@@ -4713,7 +4726,7 @@ export const makeStream = <
         }
       }
 
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* config.table.Tag
 
       // One reverse Query over `[first event SK, snapshot SK]`: the snapshot
@@ -4819,7 +4832,7 @@ export const makeStream = <
     commandId: string,
   ): Effect.Effect<boolean, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* config.table.Tag
       const result = yield* client.getItem({
         TableName: tableName,
@@ -5071,15 +5084,15 @@ export const makeStream = <
     snapshotConfig: snapshotSettings,
     storedAs: storage,
     indexes: indexSettings,
-    writeSnapshot: checked(writeSnapshot),
-    readSnapshot: checked(readSnapshot),
-    append: checked(append),
+    writeSnapshot: checked(named("writeSnapshot", writeSnapshot)),
+    readSnapshot: checked(named("readSnapshot", readSnapshot)),
+    append: checked(named("append", append)),
     appendOp,
-    read: checked(read),
-    readFrom: checked(readFrom),
-    currentVersion: checked(currentVersion),
-    readLatest: checked(readLatest),
-    readIndex: checked(readIndex),
+    read: checked(named("read", read)),
+    readFrom: checked(named("readFrom", readFrom)),
+    currentVersion: checked(named("currentVersion", currentVersion)),
+    readLatest: checked(named("readLatest", readLatest)),
+    readIndex: checked(named("readIndex", readIndex)),
     measureAppend: checked(measureAppend),
     measureSnapshot: checked(measureSnapshot),
     decodeStreamImage: checked(decodeStreamImage),
@@ -5350,7 +5363,8 @@ export const bind = <
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
+    // Detached: no current operation or parent span is pinned for later calls (#174).
+    const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
     // The stream meets values compressed with every codec its `storedAs`
     // names, so the registry captured here must have them (#147).
     const codecError = unregisteredCodecError(
@@ -5367,6 +5381,7 @@ export const bind = <
 
     return {
       [EventStreamTypeId]: EventStreamTypeId,
+      [Capacity.CapturedReporting]: Capacity.capturedSettings(ctx as Context.Context<never>),
       pipe() {
         // eslint-disable-next-line prefer-rest-params
         return Pipeable.pipeArguments(this, arguments)
@@ -6929,22 +6944,34 @@ const makeCommandHandlerImpl = <
     // answer, never a cue to re-read and re-decide. A conflict naming another
     // stream (a nested `appendOp`, #166) is retried either way: the If-Match
     // was not wrong, and the retried attempt checks it again on its reload.
-    return schedule === undefined
-      ? attempt
-      : Effect.retry(attempt, {
-          // `while` runs before the schedule, so the schedule only ever sees a
-          // `VersionConflict` input — the widening cast is sound. It is needed
-          // because `Retry.Options` demands a schedule whose input accepts the
-          // effect's *full* error union, and `Schedule` is contravariant on input.
-          schedule: schedule as Schedule.Schedule<unknown, unknown>,
-          // `VersionConflict` only. `DuplicateCommand` and `StreamSealed` are
-          // terminal — the same commandId, or a sealed stream, can never
-          // succeed — and `AdditionalItemConditionFailed` will not resolve
-          // itself by re-deciding either.
-          while: (error: unknown) =>
-            error instanceof VersionConflict &&
-            (expectedVersion === undefined || !isOwnConflict(error)),
-        })
+    const run =
+      schedule === undefined
+        ? attempt
+        : Effect.retry(attempt, {
+            // `while` runs before the schedule, so the schedule only ever sees a
+            // `VersionConflict` input — the widening cast is sound. It is needed
+            // because `Retry.Options` demands a schedule whose input accepts the
+            // effect's *full* error union, and `Schedule` is contravariant on input.
+            schedule: schedule as Schedule.Schedule<unknown, unknown>,
+            // `VersionConflict` only. `DuplicateCommand` and `StreamSealed` are
+            // terminal — the same commandId, or a sealed stream, can never
+            // succeed — and `AdditionalItemConditionFailed` will not resolve
+            // itself by re-deciding either.
+            while: (error: unknown) =>
+              error instanceof VersionConflict &&
+              (expectedVersion === undefined || !isOwnConflict(error)),
+          })
+    // One report per invocation: the load and the append (and retries) nest
+    // under it (#174). A bound stream's captured setting applies, as it does
+    // to the bound calls inside.
+    return Capacity.operation(
+      "EventStore.commandHandler",
+      { target: stream.streamName },
+      run,
+      (stream as { readonly [Capacity.CapturedReporting]?: Capacity.Settings })[
+        Capacity.CapturedReporting
+      ],
+    )
   }
 }
 
@@ -7278,7 +7305,8 @@ export const bindProjection: {
   ): Effect.Effect<MultiProjection<S, K, Sources, Err, never, O>, never, R>
 } = (projection: any): Effect.Effect<any, never, any> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<any>()
+    // Detached: no current operation or parent span is pinned for later calls (#174).
+    const ctx = Capacity.detachContext(yield* Effect.context<any>())
     // The codec check `bind` makes, for every stream, against the registry captured here.
     const streams: ReadonlyArray<EventStream<any, any, any, any, any, any, any>> =
       isMultiProjection(projection)

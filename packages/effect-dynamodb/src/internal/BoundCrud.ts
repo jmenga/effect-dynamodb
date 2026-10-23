@@ -205,7 +205,7 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
 
   asEffect(): Effect.Effect<A, E, never> {
     return this._config.provide(
-      (this._op as unknown as { _run: (m: string) => Effect.Effect<A, E, any> })._run("record"),
+      (this._op as unknown as { _exec: (m: string) => Effect.Effect<A, E, any> })._exec("record"),
     )
   }
 
@@ -546,7 +546,7 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
 
   asEffect(): Effect.Effect<A, E, never> {
     return this._config.provide(
-      (this._op as unknown as { _run: (m: string) => Effect.Effect<A, E, any> })._run("record"),
+      (this._op as unknown as { _exec: (m: string) => Effect.Effect<A, E, any> })._exec("record"),
     )
   }
 
@@ -645,7 +645,7 @@ export class BoundGetImpl<A, E> extends BoundGetBase<A, E> implements BoundGet<A
   asEffect(): Effect.Effect<A, E, never> {
     // `"record"` — the decode mode bound `get` has always run through.
     return this._config.provide(
-      (this._op as unknown as { _run: (m: string) => Effect.Effect<A, E, any> })._run("record"),
+      (this._op as unknown as { _exec: (m: string) => Effect.Effect<A, E, any> })._exec("record"),
     )
   }
 }

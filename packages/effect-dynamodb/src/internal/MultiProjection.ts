@@ -18,6 +18,7 @@ import { Duration, Effect, Option, Pipeable, Result, type Schedule } from "effec
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
 import type { TableConfig } from "../Table.js"
+import * as Capacity from "./Capacity.js"
 import {
   type ApplyBatchOptions,
   type CheckpointField,
@@ -811,6 +812,8 @@ export const multiProjection = <
       })),
     )
 
+  const named = Capacity.namedOperation("MultiProjection", readModel.entityType)
+
   return {
     [MultiProjectionTypeId]: MultiProjectionTypeId,
     pipe() {
@@ -820,20 +823,29 @@ export const multiProjection = <
     [ProjectionRoutes]: routes,
     entityType: readModel.entityType,
     sources,
-    applyBatch,
-    catchUp,
-    rebuild,
-    processBatch,
-    drain: (key: K, deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
-      config.outbox === undefined
-        ? Effect.die(new Error(`[EDD-9081] ${label}.drain: the projection declares no \`outbox\`.`))
-        : engine.drain(key, deliver),
-    drainPending: (deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
-      config.outbox === undefined
-        ? Effect.die(
-            new Error(`[EDD-9081] ${label}.drainPending: the projection declares no \`outbox\`.`),
-          )
-        : engine.drainPending(deliver),
+    // Each method a named operation for consumed-capacity reports (#174).
+    applyBatch: named("applyBatch", applyBatch),
+    catchUp: named("catchUp", catchUp),
+    rebuild: named("rebuild", rebuild),
+    processBatch: named("processBatch", processBatch),
+    drain: named(
+      "drain",
+      (key: K, deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+        config.outbox === undefined
+          ? Effect.die(
+              new Error(`[EDD-9081] ${label}.drain: the projection declares no \`outbox\`.`),
+            )
+          : engine.drain(key, deliver),
+    ),
+    drainPending: named(
+      "drainPending",
+      (deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+        config.outbox === undefined
+          ? Effect.die(
+              new Error(`[EDD-9081] ${label}.drainPending: the projection declares no \`outbox\`.`),
+            )
+          : engine.drainPending(deliver),
+    ),
   } as unknown as MultiProjection<S, K, Sources, Err, Req, O>
 }
 

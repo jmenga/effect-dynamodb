@@ -28,6 +28,7 @@ import {
   Semaphore,
   Stream,
 } from "effect"
+import * as Capacity from "../internal/Capacity.js"
 import {
   type AnyEventProjection,
   type BatchItemFailuresResponse,
@@ -383,8 +384,12 @@ const run = (
           yield* Effect.sleep(Duration.millis(Math.min(Duration.toMillis(delay), deadline - now)))
         }
       })
+      // Forked fibers run detached from any current operation, so each
+      // checkpoint-store call is reported on its own (consumed capacity, #174).
       yield* Effect.forkIn(
-        failStream(Effect.forever(Effect.sleep(renewEvery).pipe(Effect.andThen(renew)))),
+        Capacity.detached(
+          failStream(Effect.forever(Effect.sleep(renewEvery).pipe(Effect.andThen(renew)))),
+        ),
         scope,
       )
     }
@@ -649,7 +654,7 @@ const run = (
       }
       return Effect.forEach(
         ready,
-        (shardId) => Effect.forkIn(failStream(shardLifecycle(shardId)), scope),
+        (shardId) => Effect.forkIn(Capacity.detached(failStream(shardLifecycle(shardId))), scope),
         { discard: true },
       )
     })
@@ -755,16 +760,18 @@ const run = (
     // The describer: every `describeInterval`, or soon after a drained shard
     // found no children — at most one describe per `pollInterval` for those.
     yield* Effect.forkIn(
-      failStream(
-        Effect.forever(
-          Effect.gen(function* () {
-            yield* Effect.raceFirst(Effect.sleep(describeInterval), Queue.take(wake))
-            yield* Queue.clear(wake)
-            yield* describeAll
-            yield* schedule
-            yield* maybeEnd
-            yield* Effect.sleep(pollInterval)
-          }),
+      Capacity.detached(
+        failStream(
+          Effect.forever(
+            Effect.gen(function* () {
+              yield* Effect.raceFirst(Effect.sleep(describeInterval), Queue.take(wake))
+              yield* Queue.clear(wake)
+              yield* describeAll
+              yield* schedule
+              yield* maybeEnd
+              yield* Effect.sleep(pollInterval)
+            }),
+          ),
         ),
       ),
       scope,
