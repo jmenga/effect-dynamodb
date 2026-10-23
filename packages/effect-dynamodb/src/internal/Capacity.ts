@@ -208,16 +208,33 @@ export interface OperationScope {
   readonly name: string
   readonly target: string | undefined
   readonly index: string | undefined
-  readonly parent: OperationScope | undefined
+  /**
+   * The enclosing open scope. Invariant: while this scope is open, its parent
+   * is open or `undefined` — a scope that closes first hands its open children
+   * to its own parent (re-rooting them when it was the root).
+   */
+  parent: OperationScope | undefined
   readonly settings: Settings
   closed: boolean
   outcome: OperationReport["outcome"]
+  // What this scope reports — to its parent's `nested`, or to the observer as
+  // a root. Cleared when an enclosing scope closes first: what was recorded up
+  // to then is already in that scope's totals (see {@link handOver}).
   readonly totals: MutableTotals
   readonly byCommand: Partial<Record<Command, number>>
   readonly tables: Map<string, TableAccumulator>
   vectorSearchRequestBytes: number
   vectorWriteRequestBytes: number
   readonly children: Map<string, { calls: number; totals: MutableTotals }>
+  /** What was cleared from the fields above. The span carries both: it covers the scope's whole life. */
+  readonly carried: {
+    readonly totals: MutableTotals
+    readonly tables: Set<string>
+    vectorSearchRequestBytes: number
+    vectorWriteRequestBytes: number
+  }
+  /** Child scopes still open. */
+  readonly openChildren: Set<OperationScope>
   span: Tracer.Span | undefined
 }
 
@@ -242,33 +259,61 @@ const zeroTotals = (): MutableTotals => ({
   unreportedRequests: 0,
 })
 
-/** A closed scope is treated as absent: its late requests become roots of their own. */
+const addTotals = (into: MutableTotals, from: MutableTotals): void => {
+  into.capacityUnits += from.capacityUnits
+  into.readCapacityUnits += from.readCapacityUnits
+  into.writeCapacityUnits += from.writeCapacityUnits
+  into.requests += from.requests
+  into.unreportedRequests += from.unreportedRequests
+}
+
+/**
+ * The nearest open scope at or above `current`. A fiber that outlived its
+ * operation still finds the operation's enclosing scope when that one is
+ * open; `undefined` only when every enclosing scope has closed (the work
+ * then reports as a root of its own).
+ */
 const liveScope = (
   current: OperationScope | typeof SUPPRESSED | undefined,
-): OperationScope | undefined =>
-  current === undefined || current === SUPPRESSED || current.closed ? undefined : current
+): OperationScope | undefined => {
+  if (current === SUPPRESSED) return undefined
+  let s = current
+  while (s?.closed) s = s.parent
+  return s
+}
 
 const newScope = (
   name: string,
   options: OperationOptions | undefined,
   settings: Settings,
   parent: OperationScope | undefined,
-): OperationScope => ({
-  name,
-  target: options?.target,
-  index: options?.index,
-  parent,
-  settings,
-  closed: false,
-  outcome: "success",
-  totals: zeroTotals(),
-  byCommand: {},
-  tables: new Map(),
-  vectorSearchRequestBytes: 0,
-  vectorWriteRequestBytes: 0,
-  children: new Map(),
-  span: undefined,
-})
+): OperationScope => {
+  const scope: OperationScope = {
+    name,
+    target: options?.target,
+    index: options?.index,
+    parent,
+    settings,
+    closed: false,
+    outcome: "success",
+    totals: zeroTotals(),
+    byCommand: {},
+    tables: new Map(),
+    vectorSearchRequestBytes: 0,
+    vectorWriteRequestBytes: 0,
+    children: new Map(),
+    carried: {
+      totals: zeroTotals(),
+      tables: new Set(),
+      vectorSearchRequestBytes: 0,
+      vectorWriteRequestBytes: 0,
+    },
+    openChildren: new Set(),
+    span: undefined,
+  }
+  parent?.openChildren.add(scope)
+  return scope
+}
 
 const startAttributes = (scope: OperationScope): Record<string, unknown> => ({
   [Attributes.dbSystem]: "aws.dynamodb",
@@ -278,18 +323,26 @@ const startAttributes = (scope: OperationScope): Record<string, unknown> => ({
   [Attributes.nested]: scope.parent !== undefined,
 })
 
+/** The span covers the scope's whole life: what it reports plus what was cleared from it. */
 const annotateEnd = (span: Tracer.Span, scope: OperationScope): void => {
-  span.attribute(Attributes.tableNames, [...scope.tables.keys()].sort())
-  span.attribute(Attributes.total, scope.totals.capacityUnits)
-  span.attribute(Attributes.read, scope.totals.readCapacityUnits)
-  span.attribute(Attributes.write, scope.totals.writeCapacityUnits)
-  span.attribute(Attributes.requestCount, scope.totals.requests)
-  if (scope.totals.unreportedRequests > 0)
-    span.attribute(Attributes.unreportedRequests, scope.totals.unreportedRequests)
-  if (scope.vectorSearchRequestBytes > 0)
-    span.attribute(Attributes.vectorSearchRequestBytes, scope.vectorSearchRequestBytes)
-  if (scope.vectorWriteRequestBytes > 0)
-    span.attribute(Attributes.vectorWriteRequestBytes, scope.vectorWriteRequestBytes)
+  const { carried } = scope
+  const totals = zeroTotals()
+  addTotals(totals, scope.totals)
+  addTotals(totals, carried.totals)
+  const vectorSearch = scope.vectorSearchRequestBytes + carried.vectorSearchRequestBytes
+  const vectorWrite = scope.vectorWriteRequestBytes + carried.vectorWriteRequestBytes
+  span.attribute(
+    Attributes.tableNames,
+    [...new Set([...carried.tables, ...scope.tables.keys()])].sort(),
+  )
+  span.attribute(Attributes.total, totals.capacityUnits)
+  span.attribute(Attributes.read, totals.readCapacityUnits)
+  span.attribute(Attributes.write, totals.writeCapacityUnits)
+  span.attribute(Attributes.requestCount, totals.requests)
+  if (totals.unreportedRequests > 0)
+    span.attribute(Attributes.unreportedRequests, totals.unreportedRequests)
+  if (vectorSearch > 0) span.attribute(Attributes.vectorSearchRequestBytes, vectorSearch)
+  if (vectorWrite > 0) span.attribute(Attributes.vectorWriteRequestBytes, vectorWrite)
 }
 
 const freezeTotals = (t: MutableTotals): CapacityTotals => ({
@@ -343,18 +396,50 @@ export const buildReport = (scope: OperationScope): OperationReport => ({
 const outcomeOf = (exit: Exit.Exit<unknown, unknown>): OperationReport["outcome"] =>
   Exit.isSuccess(exit) ? "success" : Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failure"
 
-const addTotals = (into: MutableTotals, from: MutableTotals): void => {
-  into.capacityUnits += from.capacityUnits
-  into.readCapacityUnits += from.readCapacityUnits
-  into.writeCapacityUnits += from.writeCapacityUnits
-  into.requests += from.requests
-  into.unreportedRequests += from.unreportedRequests
+/**
+ * Clear what `scope` (and every open scope under it) reports, moving it to
+ * the span-only `carried` totals. Called when an enclosing scope closes while
+ * `scope` is still running: everything recorded so far is already in that
+ * scope's totals, so only later work may be reported again.
+ */
+const clearReported = (scope: OperationScope): void => {
+  const { carried } = scope
+  addTotals(carried.totals, scope.totals)
+  for (const name of scope.tables.keys()) carried.tables.add(name)
+  carried.vectorSearchRequestBytes += scope.vectorSearchRequestBytes
+  carried.vectorWriteRequestBytes += scope.vectorWriteRequestBytes
+  Object.assign(scope.totals, zeroTotals())
+  for (const command of Object.keys(scope.byCommand)) delete scope.byCommand[command as Command]
+  scope.tables.clear()
+  scope.vectorSearchRequestBytes = 0
+  scope.vectorWriteRequestBytes = 0
+  scope.children.clear()
+  for (const child of scope.openChildren) clearReported(child)
 }
 
 /**
- * Close a scope: annotate its span, add it to its parent's `nested`
- * breakdown, and — for a root — deliver the report. The observer runs with
- * everything it does suppressed; its failures are logged and dropped.
+ * A scope is closing while some of its children still run (forked into an
+ * outer scope, or detached): hand them to its parent — or, when it is the
+ * root, make each a root of its own. Their later requests are then charged to
+ * the nearest open scope, and late work under a closed root is reported in a
+ * later root report instead of being lost.
+ */
+const handOver = (scope: OperationScope): void => {
+  const parent = scope.parent
+  parent?.openChildren.delete(scope)
+  for (const child of scope.openChildren) {
+    child.parent = parent
+    parent?.openChildren.add(child)
+    clearReported(child)
+  }
+  scope.openChildren.clear()
+}
+
+/**
+ * Close a scope: annotate its span, hand over its still-running children,
+ * add it to its parent's `nested` breakdown, and — for a root — deliver the
+ * report. The observer runs with everything it does suppressed; its failures
+ * are logged and dropped.
  */
 const finish = (scope: OperationScope, exit: Exit.Exit<unknown, unknown>): Effect.Effect<void> =>
   Effect.suspend(() => {
@@ -362,6 +447,7 @@ const finish = (scope: OperationScope, exit: Exit.Exit<unknown, unknown>): Effec
     scope.closed = true
     scope.outcome = outcomeOf(exit)
     if (scope.span !== undefined) annotateEnd(scope.span, scope)
+    handOver(scope)
     const parent = scope.parent
     if (parent !== undefined) {
       const entry = parent.children.get(scope.name)
@@ -738,19 +824,33 @@ const applyRequest = (scope: OperationScope, record: RequestRecord): void => {
   }
 }
 
-/** Charge one request to its scope and every open ancestor. */
+/**
+ * Charge one request to the nearest open scope at or above the one it was
+ * sent in, and every ancestor of that (all open, by the parent invariant).
+ * When every one of them has closed while the request was in flight, the
+ * request is reported as an implicit root of its own, so it is never lost.
+ */
 const record = (
   scope: OperationScope,
   command: Command,
   input: Record<string, unknown>,
   exit: Exit.Exit<unknown, unknown>,
-): void => {
-  const described = describeRequest(command, input, exit)
-  if (described === undefined) return
-  for (let s: OperationScope | undefined = scope; s !== undefined; s = s.parent) {
-    if (!s.closed) applyRequest(s, described)
-  }
-}
+): Effect.Effect<void> =>
+  Effect.suspend(() => {
+    const described = describeRequest(command, input, exit)
+    if (described === undefined) return Effect.void
+    const open = liveScope(scope)
+    if (open === undefined) {
+      // No span: the request ran under the (now ended) span of its operation.
+      const late = newScope(`DynamoClient.${command}`, undefined, scope.settings, undefined)
+      applyRequest(late, described)
+      return finish(late, exit)
+    }
+    for (let s: OperationScope | undefined = open; s !== undefined; s = s.parent) {
+      if (!s.closed) applyRequest(s, described)
+    }
+    return Effect.void
+  })
 
 // ---------------------------------------------------------------------------
 // The choke point
@@ -791,9 +891,7 @@ const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) 
       const scope = liveScope(inner.getRef(CurrentOperation))
       return raw(flagged).pipe(
         Effect.onExit((exit) =>
-          Effect.sync(() => {
-            if (scope !== undefined) record(scope, command, input, exit)
-          }),
+          scope !== undefined ? record(scope, command, input, exit) : Effect.void,
         ),
       )
     })

@@ -149,6 +149,8 @@ const placed = last()
 
 It works with concurrent calls too: an `Effect.forEach` with `concurrency` inside a `withOperation` sums every request it sends. `ConsumedCapacity.withOperationStream` is the stream form.
 
+Work you fork out of an operation (`Effect.forkDetach`, or `Effect.forkIn` an outer scope) may still be running when the operation ends. Nothing it sends is lost or counted twice. What it did before the operation ended is in the operation's report; what it does after is charged to the nearest enclosing operation that is still running. If none is, it is reported on its own, as its library operation (`Entity.put`) or, for a bare request, `DynamoClient.<Command>`. Such a report can arrive after the report of the operation that started the work.
+
 ## Failures
 
 A failed request is still a request: it is counted in `requests`, and in `outcome: "failure"`. Whether its capacity is known depends on DynamoDB:
