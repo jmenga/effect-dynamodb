@@ -175,10 +175,18 @@ const program = Effect.gen(function* () {
   )
   yield* Console.log(`${report.operation}: ${report.capacityUnits} units`)
 
-  // The innermost setting wins: under the plain layer the get still runs in a
-  // span, but this observer is not called.
+  // A bound client keeps the setting it was bound under: `db` was made under
+  // the observer layer, so providing the plain layer around a call through it
+  // changes nothing, and the observer still receives the report.
+  const beforeBound = received.length
   yield* db.entities.Orders.get({ orderId: "o-1" }).asEffect().pipe(Effect.provide(Reporting))
-  assertEq(last(), report, "no report under the plain layer")
+  assertEq(received.length, beforeBound + 1, "a bound client keeps its bind-time setting")
+
+  // An unbound op reads the setting when it runs, so the innermost layer wins:
+  // under the plain layer the get still runs in a span, but no observer is called.
+  const beforeUnbound = received.length
+  yield* Orders.get({ orderId: "o-1" }).asEffect().pipe(Effect.provide(Reporting))
+  assertEq(received.length, beforeUnbound, "the innermost setting wins for an unbound op")
 
   // ---------- Pagination: one report per query, every page counted ----------
   for (const n of [2, 3, 4, 5]) {
