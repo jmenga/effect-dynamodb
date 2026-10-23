@@ -973,6 +973,8 @@ Each item of the issue, plus the decisions this design adds, marked **in**, **ou
 | S27 | Public `ConsumedCapacity.detachContext` | **In (added, review)** | Every bind site must strip the current scope and parent span from what it captures (§6.6); the geo package can only call public API. |
 | S28 | Unbound `GeoIndex.make(...).put` reporting as `GeoIndex.put` | **Out (review)** | It returns the entity's put builder so entity combinators still apply; wrapping it would change its return type (owner decision 1). It reports as `Entity.put`; the bound `put` reports as `GeoIndex.put`. |
 | S29 | Bind-time capture of `Tracer.ParentSpan` | **Changed (review)** | Pre-existing: every bind captured the parent span current at bind time and re-provided it on every call. `detachContext` now omits it, so bound operations (and any user code they run) parent to the caller's span. |
+| S30 | Work that outlives its operation (forked out, still running at close) | **In (added, implementation review)** | Never lost and never double counted: handed to the nearest open scope, or re-rooted (§6.1, R12). |
+| S31 | `target` of stream queries run by a `Query` terminal | **Changed (implementation review)** | The stream name, matching every `EventStream.*` operation, instead of the stream's discriminator (§9.1, R16). |
 
 ---
 
