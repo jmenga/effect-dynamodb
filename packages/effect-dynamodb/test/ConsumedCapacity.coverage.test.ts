@@ -582,3 +582,27 @@ describe("consumed-capacity coverage", () => {
     )
   }
 })
+
+describe("consumed-capacity targets", () => {
+  it.effect("a stream's queries report under the stream name, as its operations do", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      yield* seedLedger().pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      yield* Effect.gen(function* () {
+        yield* Ledgers.read({ ledgerId: "l-1" })
+        yield* Query.collect(Ledgers.query.events({ ledgerId: "l-1" }))
+        yield* Query.collect(Ledgers.query.index("byAmount", { ledgerId: "l-1" }))
+        yield* Stream.runCollect(yield* Query.paginate(Ledgers.query.events({ ledgerId: "l-1" })))
+        yield* Query.count(Ledgers.query.events({ ledgerId: "l-1" }))
+      }).pipe(Effect.provide(ConsumedCapacity.layer({ onOperation })), Effect.provide(layer))
+      expect(reports.map((report) => [report.operation, report.target])).toEqual([
+        ["EventStream.read", "Ledger"],
+        ["Query.collect", "Ledger"],
+        ["Query.collect", "Ledger"],
+        ["Query.paginate", "Ledger"],
+        ["Query.count", "Ledger"],
+      ])
+    }),
+  )
+})

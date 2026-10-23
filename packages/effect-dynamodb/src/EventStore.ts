@@ -4866,6 +4866,9 @@ export const makeStream = <
       packed: dataGuards,
       resolveTableName: config.table.Tag.useSync((tc: TableConfig) => tc.name),
       keyFields: ["pk", "sk"],
+      // Consumed capacity reports these queries under the stream name, as
+      // every `EventStream.*` operation does (#174).
+      operationTarget: config.streamName,
       // Bound to the event SK range so non-event items in the stream partition
       // (the snapshot) are excluded at the key-condition level. A caller-supplied
       // `Query.where` replaces this — the `__edd_e__` filter still applies.
@@ -4954,6 +4957,7 @@ export const makeStream = <
         label: `EventStream "${config.streamName}" index "${idx.name}"`,
       },
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
+      operationTarget: config.streamName,
       // A "keys" index holds no events: an LSI has DynamoDB fetch them
       // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with
       // `BatchGetItem` on the table key.
