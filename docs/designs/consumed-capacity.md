@@ -1,8 +1,8 @@
 # Design: reporting consumed capacity and request counts (#174)
 
 **Issue:** [#174](https://github.com/jmenga/effect-dynamodb/issues/174)
-**Status:** Designed. Owner decisions 1–7 recorded in §2. Implementation follows in the same PR
-(single-PR workflow: this doc is commit 1).
+**Status:** Designed, revised after an adversarial review (§15). Owner decisions 1–7 recorded in
+§2. Implementation follows in the same PR (single-PR workflow: this doc is commit 1).
 **Affected packages:** `packages/effect-dynamodb` (new `ConsumedCapacity` module, a new
 `internal/Capacity.ts`, operation entry points in Entity / Query / Collection / Batch /
 Transaction / Aggregate / EventStore / projections / change-feed checkpoint store),
@@ -77,8 +77,9 @@ export interface Options {
   /**
    * Called once per ROOT library operation (§6), after it completes, fails or is
    * interrupted. Runs in the operation's fiber, inside its span, with reporting
-   * switched off for anything it does itself (§6.5). A failure or defect is logged
-   * at warning level and never changes the operation's result.
+   * suppressed for anything it does itself, even through a client bound with
+   * reporting on (§6.5). A failure or defect is logged at warning level and never
+   * changes the operation's result.
    */
   readonly onOperation?: ((report: OperationReport) => Effect.Effect<void>) | undefined
 }
@@ -122,6 +123,14 @@ export const Attributes: {
   readonly total: "aws.dynamodb.consumed_capacity.total"
   // … every name in §5.2
 }
+
+/**
+ * Strip per-call state from a context captured for later use: the current operation
+ * scope (§6) and the tracer's parent span. The library applies it at every bind site
+ * (§6.6); it is public so packages built on effect-dynamodb (the geo package) and
+ * applications that write their own bound wrappers can do the same.
+ */
+export const detachContext: <R>(context: Context.Context<R>) => Context.Context<R>
 ```
 
 `withOperation` and `withOperationStream` are `Function.dual`, as the project's conventions
@@ -212,6 +221,11 @@ context wins (`Effect.provide` merges, `packages/effect`'s `provideContext`). So
 
 The guide says this. It is the same rule `Compression` and `Embedder` already follow.
 
+The rule holds for every terminal, streams included: a stream terminal (`.paginate()`) reads the
+setting once when the stream starts, **inside** the bound client's provided context, and provides
+that resolved setting to every page pull (§7.3). So `collect`, `fetch`, `count` and `paginate`
+through one client always agree.
+
 ---
 
 ## 4. Architecture
@@ -264,8 +278,12 @@ Why this choke point meets decision 3:
   gap. A guard test fails if any operation in the coverage matrix produces an implicit root
   (§11.2).
 - **A static guard test** (`test/capacity-guard.test.ts`) fails if a `src/` file of either
-  package resolves the raw service (`yield* DynamoClient`, `DynamoClient.asEffect()`,
-  `Effect.service(DynamoClient)`) outside an allowlist:
+  package uses `DynamoClient` **as a value** outside an allowlist. "As a value" is any
+  occurrence that is not a type position, an import, a comment, or a static member access
+  other than `asEffect` / `use` (`DynamoClient.make`, `DynamoClient.layer*` are fine). That
+  covers `yield* DynamoClient`, `DynamoClient.asEffect()`, `DynamoClient.use(…)`,
+  `Effect.service(DynamoClient)`, `Effect.map(DynamoClient, …)` / `flatMap` / `andThen`,
+  `Effect.serviceOption(DynamoClient)` and `Context.get(ctx, DynamoClient)`. The allowlist:
   - `internal/Capacity.ts`;
   - `DynamoClient.ts` (`makeFromConfig` captures context and table operations);
   - `internal/TransactPlan.ts` and `VectorSearchEmulation.ts`, the two places that *build* a
@@ -287,8 +305,15 @@ testing guide says so.
     nothing was sent. `record()` marks its failure as "not sent", and the instrumentation skips
     such failures (§8.3).
 
-  Planning runs the op's **unwrapped core** (`op()` today, not the public `asEffect`), so the
-  recorded write's local failure never produces an error span named after the entity op.
+  Planning runs the op's **unwrapped core**, so the recorded write's local failure never
+  produces an error span named after the entity op. To make that true for every internal
+  composition, the operation scope sits on the op's **public terminals only** (§9.1): a new
+  `_exec(mode)` on each op class wraps `_run(mode)` in the scope, and `asEffect`, the
+  `Entity.asModel` / `asRecord` / `asItem` / `asNative` combinators and the bound builders call
+  `_exec`. `_run` stays unwrapped, so the internal compositions that call it — `updateOrCreate`
+  falling back to `create(...)._run`, `runUpdate`'s no-op re-read `get(key)._run`, planning's
+  `op()` — open no nested scope. A planned missing-row update therefore produces no
+  `Entity.create` span and nothing in `nested`.
 - **`VectorSearchEmulation.wrap`** is a test-only decorator. The library instruments the
   emulated client from outside. `searchVectors` counts as one request with no
   `ConsumedCapacity` (AWS bills vector search in bytes, §8.4). The emulator's internal `scan`s
@@ -361,9 +386,9 @@ status comes from `withSpan` as usual.
 | **`aws.dynamodb.consumed_capacity.total`** | number | end, **always** | Σ capacity units (0 when nothing was reported) |
 | `aws.dynamodb.consumed_capacity.read` | number | end, always | Σ RCU |
 | `aws.dynamodb.consumed_capacity.write` | number | end, always | Σ WCU |
-| `aws.dynamodb.request_count` | int | end, always | requests (pages, for a read) |
-| `aws.dynamodb.consumed_capacity.unreported_requests` | int | end, if > 0 | requests with no capacity in their outcome |
-| `aws.dynamodb.vector.search_request_bytes` / `.write_request_bytes` | int | end, if > 0 | vector index usage |
+| `effect_dynamodb.request_count` | int | end, always | requests (pages, for a read) |
+| `effect_dynamodb.unreported_requests` | int | end, if > 0 | requests with no capacity in their outcome |
+| `effect_dynamodb.vector.search_request_bytes` / `.write_request_bytes` | int | end, if > 0 | vector index usage |
 
 Span totals are **inclusive**: a span's totals include its nested operations, just as span
 durations do (§6.2).
@@ -371,6 +396,15 @@ durations do (§6.2).
 The OTel semconv attribute `aws.dynamodb.consumed_capacity` (a string[] of per-request JSON) is
 **not** emitted. It grows with every page of a long read. The per-table breakdown is in the
 observer report instead.
+
+**Namespace note.** OTel naming rules say a name must not be both an attribute and a
+namespace. `aws.dynamodb.consumed_capacity.total` (owner decision 2) makes
+`aws.dynamodb.consumed_capacity` a namespace while semconv defines it as an attribute. That
+conflict is deliberate (owner decision; the semconv attribute is not emitted, so no backend
+sees both). `.read` / `.write` sit beside `.total` in the same, already-chosen namespace.
+Everything else the library invents (`request_count`, `unreported_requests`, vector bytes)
+lives under `effect_dynamodb.*`, so a future semconv release cannot redefine it under us
+(S26).
 
 ---
 
@@ -383,12 +417,17 @@ like this:
 
 1. If `Reporting` is off, return the effect unchanged. The only cost is one reference read at
    run time.
-2. Read `CurrentOperation`, an internal `Context.Reference<Scope | undefined>`, default
-   `undefined`.
+2. Read `CurrentOperation`, an internal `Context.Reference<Scope | "suppressed" | undefined>`,
+   default `undefined`. `"suppressed"` (set only while an observer runs, §6.5) means "run the
+   effect unchanged". A scope that has already **closed** is treated as absent: a request or
+   operation that finds a closed scope current (a client built inside an operation and kept, a
+   fiber that outlived its operation) becomes a root of its own instead of nesting under a
+   dead scope and being lost.
 3. Create `scope = { name, opts, parent: current, totals, children }` and run the effect with
    `CurrentOperation = scope`. Child fibers inherit it.
 4. On exit (success, failure, interruption), freeze the totals, annotate the span, and, **if
-   `parent === undefined`**, build the `OperationReport` and call `onOperation`.
+   `parent === undefined`**, build the `OperationReport` and call `onOperation` (§6.5 for
+   where it runs).
 
 A request records into its scope **and every ancestor** (walking `parent`). So each scope's
 totals are inclusive.
@@ -446,22 +485,42 @@ This is the only delegate rule. Every other entry point always opens a scope.
 
 ### 6.5 The observer runs outside reporting
 
-`onOperation` runs with `Reporting` set to off and `CurrentOperation` cleared. Library
-operations the observer itself performs (writing a metrics row to DynamoDB, say) are therefore
-neither charged to the operation just reported nor reported themselves. Without this, an
-observer that writes to DynamoDB would recurse forever. Observer failures and defects are
-caught, logged with `Effect.logWarning` (with the cause), and dropped.
+`onOperation` runs with `CurrentOperation = "suppressed"`. Both the instrumented client and
+`withOperation` check for it **before** reading `Reporting`, so library operations the
+observer itself performs (writing a metrics row to DynamoDB, say) are neither charged to the
+operation just reported nor reported themselves — and this holds even when the observer writes
+through a client bound under an enabled layer. Turning `Reporting` off for the observer would
+not be enough: a bound client's captured `Reporting` wins over the run-time one (§3.3), so an
+observer writing through such a client would open a new root, report again, and loop forever.
+The sentinel cannot be overridden that way because no bind ever captures `CurrentOperation`
+(§6.6). Observer failures and defects are caught, logged with `Effect.logWarning` (with the
+cause), and dropped.
+
+**Where it runs.** On success or failure the observer runs after the operation's effect has
+finished, in the operation's fiber, as ordinary **interruptible** code: a slow observer under
+`Effect.timeout` is interrupted with the call and its report is dropped. Only when the
+operation itself is interrupted does the report go out from an exit finalizer, which is
+uninterruptible as all finalizers are; the guide advises forking inside the observer when it
+does slow I/O.
 
 ### 6.6 No stale scopes
 
-- **Bind-time capture.** `makeFromConfig`, `EventStore.bind`, `Aggregate.bind`,
-  `GeoIndex.bind` and `bindProjection` capture the whole context. They **omit
-  `CurrentOperation`** from what they capture (`Context.omit`). A client bound inside a library
-  operation therefore never pins later calls to that operation's (closed) scope.
-- **No late requests.** The library forks no fibers that outlive an operation: `src/` has no
-  `fork*` call, only `concurrency:` fan-out that is joined. A request that still records against
-  a closed scope (only possible through an application fork that escapes `withOperation`) is
-  dropped from that scope and logged at debug level.
+- **Bind-time capture.** Every site that captures `Effect.context()` for later use —
+  `makeFromConfig`, `Entity.bind`, `EventStore.bind`, `Aggregate.bind`, `bindProjection`
+  (`EventStore.ts`), and geo's `GeoIndex.bind` — passes it through `detachContext` (§3.1),
+  which omits `CurrentOperation` **and `Tracer.ParentSpan`**. Without the first, a client
+  bound inside an operation would pin later calls to that operation's scope (and
+  `makeFromConfig → Entity.bind` re-captures the caller's context, so omitting it in
+  `makeFromConfig` alone is not enough). Without the second, every span of a bound operation
+  would hang off the span that was current at bind time (an application-lifetime span),
+  not the caller's request span. The geo package calls the public `detachContext`.
+- **Closed scopes are absent** (§6.1, step 2), as a backstop for any capture this misses.
+- **Forked fibers.** The change feed (`change-feed/ChangeFeed.ts`) forks long-lived fibers
+  with `Effect.forkIn`: the lease-renewal loop and the per-shard lifecycles. They are started
+  with `CurrentOperation` cleared, so each `CheckpointStore.*` call they make is a root
+  operation reported on its own, not a child of whatever scope (an application
+  `withOperationStream` around the consumer) was current when the feed started. Everything
+  else in `src/` fans out with `concurrency:` and joins.
 
 ---
 
@@ -476,7 +535,7 @@ the issue asks for, "the number of pages (requests) a read made", for each kind 
 
 | Read | Pages reported |
 |---|---|
-| `fetch()` / `Query.execute` | one request (one page plus cursor) |
+| `fetch()` / `Query.execute` | one or more requests: without `limit`, one; with `limit`, as many as it takes to fill it (a `filter` or client-side predicate can reject rows), bounded by `maxPages` and the key range. A hydrated read adds a `BatchGetItem` per page. |
 | `EventStream.read` over a 3-page stream | `requests: 3`, `requestsByCommand: { Query: 3 }` |
 | `readLatest` in steady state | 1 |
 
@@ -495,8 +554,13 @@ These are summed into one scope, with every table listed:
 
 - **The scope opens when the stream starts** (first pull), via `Stream.unwrap` of the scope's
   creation. Each run of the stream is a separate operation.
-- **Every page request in the run records into it.** `Stream.provideService(CurrentOperation, scope)`
-  makes the pulls see it.
+- **The settings are resolved once, at that start, inside the bound client's provided context**
+  (a bound stream terminal is `Stream.unwrap(provide(Capacity.operationStream(...)))`, so the
+  read of `Reporting` sees the captured value). The resolved `Reporting` and the scope are then
+  provided to the stream (`Stream.provideService`), because pages are pulled later, from the
+  consumer's fiber, outside `provide`. Reporting for a stream therefore follows exactly the
+  bind-time / run-time rule of §3.3, like every effect terminal.
+- **Every page request in the run records into it**, through the provided `CurrentOperation`.
 - **It closes with `Stream.onExit`.** On normal completion the outcome is `"success"`. When a
   consumer stops early (`Stream.take`, `runHead`), the stream completes from its own side, the
   outcome is `"success"`, and the report covers **the pages actually read**. On failure it is
@@ -505,8 +569,9 @@ These are summed into one scope, with every table listed:
   as long as the stream run. `Stream.withParentSpan` makes the per-page spans its children.
 
 `BoundQuery.paginate()` today does `Stream.unwrap(provide(Query.paginate(q)))`. The scope wraps
-the outer stream, so the entity accessor's name (`Entity.query`) is the root and the inner
-`Query.paginate` is a delegate (§6.4).
+that stream, inside `provide`, so the entity accessor's name (`Entity.query`) is the root and
+the inner `Query.paginate` is a delegate (§6.4). For effect terminals the scope likewise sits
+inside `provide` (`provide(withOperation(...))`), never outside it.
 
 ### 7.4 Batch and transaction arrays
 
@@ -602,10 +667,10 @@ the choke point (§4). "Unbound + bound" means the wrapper sits in the op itself
 
 | Operation (report `operation`) | Entry point | Requests it can make | Notes |
 |---|---|---|---|
-| `Entity.get` | `EntityGetImpl._run` (unbound + bound; `asRecord` / `asNative` too) | GetItem | target = entity type |
-| `Entity.put` / `Entity.create` / `Entity.upsert` | `EntityPutImpl._run`, name from `_putKind` | PutItem, or TransactWriteItems (unique sentinels, retain snapshots); BatchGetItem (ref hydration) | |
-| `Entity.update` / `Entity.patch` | `EntityUpdateImpl._run` | UpdateItem, GetItem (read-first paths), TransactWriteItems (unique / retain / transactional cascade), Query + UpdateItem fan-out (eventual cascade) | cascade fan-out included |
-| `Entity.delete` / `Entity.deleteIfExists` | `EntityDeleteImpl.asEffect` | DeleteItem, GetItem, TransactWriteItems (sentinels, soft delete, retain) | |
+| `Entity.get` | `EntityGetImpl._exec` (unbound + bound; `asEffect`, `asRecord` / `asNative` / … too) — **not** `_run` (§4.2) | GetItem | target = entity type |
+| `Entity.put` / `Entity.create` / `Entity.upsert` | `EntityPutImpl._exec`, name from `_putKind` | PutItem, or TransactWriteItems (unique sentinels, retain snapshots); BatchGetItem (ref hydration) | |
+| `Entity.update` / `Entity.patch` | `EntityUpdateImpl._exec` | UpdateItem, GetItem (read-first paths), TransactWriteItems (unique / retain / transactional cascade), Query + UpdateItem fan-out (eventual cascade) | cascade fan-out included |
+| `Entity.delete` / `Entity.deleteIfExists` | `EntityDeleteImpl.asEffect` (the core moves to an unwrapped `_core()`) | DeleteItem, GetItem, TransactWriteItems (sentinels, soft delete, retain) | |
 | `Entity.append` (time series) | bound `append` builder (`BoundAppend.asEffect`) | TransactWriteItems, follow-up GetItem | |
 | `Entity.getVersion`, `Entity.versions`, `Entity.restore`, `Entity.purge`, `Entity.deleted.get`, `Entity.deleted.list` | each lifecycle function | GetItem, Query, TransactWriteItems, BatchWriteItem (purge chunks + retries), DeleteItem | |
 | `Entity.query` | `BoundQuery` terminals `collect` / `fetch` / `paginate` / `count` | Query (pages); BatchGetItem for keys-only projections | index = accessor name |
@@ -638,7 +703,7 @@ Two operations are deliberately absent:
 
 | Operation | Entry point | Requests | Notes |
 |---|---|---|---|
-| `GeoIndex.put` | `GeoIndex.make(...).put` wraps `entity.put` with `ConsumedCapacity.withOperation("GeoIndex.put", { target })` | as `Entity.put` | the inner `Entity.put` is a nested child |
+| `GeoIndex.put` | **bound** `GeoIndex.bind(...).put` wraps the put with `ConsumedCapacity.withOperation("GeoIndex.put", { target })` | as `Entity.put` | the inner `Entity.put` is a nested child. The **unbound** `GeoIndex.make(...).put` returns the entity's put builder (`P`) so it stays pipeable with entity combinators; wrapping it would change its type, so it reports as `Entity.put` (S28). |
 | `GeoIndex.nearby` | `GeoSearch.nearby` wrapped with `withOperation("GeoIndex.nearby", { target, index })` | N concurrent cell Queries (pages) | inner `Query.collect`s are delegates (§6.4) |
 
 ### 9.3 Out
@@ -663,8 +728,10 @@ Two operations are deliberately absent:
 | `src/index.ts` | `export * as ConsumedCapacity` |
 | `Entity.ts`, `EventStore.ts`, `Aggregate.ts`, `Query.ts`, `Batch.ts`, `Transaction.ts`, `internal/ProjectionEngine.ts`, `internal/BoundVectorQuery.ts`, `change-feed/CheckpointStore.ts` | `yield* DynamoClient` becomes `yield* Capacity.client` (45 sites) |
 | `internal/EntityOps.ts`, `internal/BoundCrud.ts`, `internal/BoundQuery.ts`, `DynamoClient.ts` (CollectionQuery, bound helpers), `Batch.ts`, `Transaction.ts`, `Aggregate.ts`, `EventStore.ts` (stream methods, commandHandler), `internal/EventProjection.ts`, `internal/MultiProjection.ts`, `change-feed/CheckpointStore.ts`, `Query.ts` (delegate terminals) | entry-point `withOperation` / `withOperationStream` with names per §9 |
-| `internal/TransactPlan.ts` | `NotSent` marker on recorded-write failures; planning uses unwrapped cores |
-| `DynamoClient.ts` `makeFromConfig`, `EventStore.bind` / `bindProjection`, `Aggregate.bind`, geo `GeoIndex.bind` | omit `CurrentOperation` from the captured context (§6.6) |
+| `internal/TransactPlan.ts` | `NotSent` marker on recorded-write failures (and on the synthetic missing-row `ConditionalCheckFailed`); planning uses unwrapped cores |
+| `internal/EntityOps.ts`, `internal/EntityCombinators.ts`, `internal/BoundCrud.ts` | `_exec(mode)` on each op class (scope on public terminals only, §4.2) |
+| `DynamoClient.ts` `makeFromConfig`, `Entity.bind`, `EventStore.bind` / `bindProjection`, `Aggregate.bind`, geo `GeoIndex.bind` | `detachContext` on the captured context: omits `CurrentOperation` and `Tracer.ParentSpan` (§6.6) |
+| `change-feed/ChangeFeed.ts` | `forkIn` sites start their fibers with `CurrentOperation` cleared (§6.6) |
 | `packages/effect-dynamodb-geo/src/GeoIndex.ts` | `put` / `nearby` wrapped (§9.2) |
 | `DESIGN.md` | new §16 "Consumed capacity" (summary of §3–§8 + the nesting rule) |
 | `CLAUDE.md` | module structure + dependencies (`ConsumedCapacity`, `internal/Capacity`); a behavioural note under "Entity Operations" |
@@ -717,7 +784,8 @@ tests with mocked responses.
    - Vector bytes.
 4. **Pagination.**
    - A 3-page `Entity.query` `collect` reports `requests: 3` and `{ Query: 3 }`, with the sum.
-   - `fetch()` reports one request.
+   - `fetch()` without `limit` reports one request; `fetch()` with `limit` and a `filter` that
+     crosses pages reports each page.
    - `paginate()` consumed with `Stream.take` stops after page 1: the report is sent once, with
      1 request, `"success"`.
    - A stream failing on page 2: `"failure"`, 2 requests.
@@ -744,12 +812,18 @@ tests with mocked responses.
    - `VectorSearchEmulation.layer`: `searchVectors` is one request, and its internal scans are
      not counted.
 9. **Context capture.**
-   - Enabled at bind time applies to calls without run-time provision.
-   - Enabled at run time only also reports.
-   - A client bound inside an operation does not pin later calls to it (§6.6).
+   - Enabled at bind time applies to calls without run-time provision — on `collect`, `fetch`,
+     `count` **and `paginate`**; enabled at run time only also reports on all four; a client
+     bound under `disabled` does not report `paginate` under a run-time enabled layer.
+   - A client built with `DynamoClient.make` inside an operation does not pin later calls to
+     it: each later call is its own root (§6.6).
+   - Bind under span A, call under span B: the library span's parent is B.
+   - A planned missing-row update in `transactWrite` opens no `Entity.create` scope.
 10. **Observer isolation.**
-    - An observer that runs a library operation does not recurse and is not reported.
+    - An observer that runs a library operation does not recurse and is not reported —
+      including when it writes through a client **bound under the enabled layer**.
     - An observer defect is logged and the op result is unchanged.
+    - A slow observer is interrupted by `Effect.timeout` around the operation.
     - `spans: false` produces observer calls and no spans.
 11. **Types.** `expectTypeOf` that bound ops' `R` is still `never` and that return types are
     unchanged with and without the layer. `ConsumedCapacity.layer()` is `Layer<never>`.
@@ -857,6 +931,10 @@ Each item of the issue, plus the decisions this design adds, marked **in**, **ou
 | S23 | OTel semconv `aws.dynamodb.consumed_capacity` (per-request JSON string[]) | **Out** | Unbounded on long reads. The per-table data is in the observer report (§5.2). |
 | S24 | Spans when reporting is off | **Out** | Owner decision 1 ("no change at all when off"). The library emits no spans today. |
 | S25 | `VectorSearchEmulation` reporting synthetic capacity | **Out** | AWS reports bytes it cannot know. It counts as one unreported request (§4.2). |
+| S26 | Attribute namespace for library-invented attributes | **Changed (review)** | `request_count`, `unreported_requests` and vector bytes move from `aws.dynamodb.*` to `effect_dynamodb.*`. `aws.dynamodb.consumed_capacity.{total,read,write}` stay: `.total` is owner-mandated and deliberately conflicts with the semconv attribute of the same stem (§5.2). |
+| S27 | Public `ConsumedCapacity.detachContext` | **In (added, review)** | Every bind site must strip the current scope and parent span from what it captures (§6.6); the geo package can only call public API. |
+| S28 | Unbound `GeoIndex.make(...).put` reporting as `GeoIndex.put` | **Out (review)** | It returns the entity's put builder so entity combinators still apply; wrapping it would change its return type (owner decision 1). It reports as `Entity.put`; the bound `put` reports as `GeoIndex.put`. |
+| S29 | Bind-time capture of `Tracer.ParentSpan` | **Changed (review)** | Pre-existing: every bind captured the parent span current at bind time and re-provided it on every call. `detachContext` now omits it, so bound operations (and any user code they run) parent to the caller's span. |
 
 ---
 
@@ -875,3 +953,23 @@ Each item of the issue, plus the decisions this design adds, marked **in**, **ou
    is slow".
 4. **Module name.** `ConsumedCapacity` shadows the SDK's type of the same name if both are
    imported unqualified. `Capacity` is the alternative.
+
+---
+
+## 15. Adversarial review (resolutions)
+
+Every finding was checked against the code; all eleven were real. How each is resolved:
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| R1 | blocker | An observer writing through a client bound with reporting on recursed forever (captured `Reporting` beats a run-time "off"). | **Accepted.** The observer runs under `CurrentOperation = "suppressed"`, checked before `Reporting`; no bind captures `CurrentOperation` (§6.5, §6.6). Test §11.2-10 uses a client bound under the enabled layer. |
+| R2 | major | Bind sites capture `Tracer.ParentSpan`, so bound spans parent to the bind-time span. | **Accepted.** `detachContext` omits it at every bind site (§6.6, S29). Test: bind under span A, call under B, parent is B. |
+| R3 | major | `Entity.bind` (and `EventStore.ts` `bindProjection`) was missing from the omit list; `makeFromConfig → Entity.bind` re-captures; geo could not omit an internal reference. | **Accepted.** All six capture sites use `detachContext`, which is public for geo; closed scopes are treated as absent as a backstop (§6.1, §6.6). |
+| R4 | major | `paginate` read the run-time `Reporting` while effect terminals read the captured one. | **Accepted.** Stream settings resolve at start inside `provide` and are provided to the pulls (§7.3, §3.3). Tests on all four terminals for bind-only and run-only enablement. |
+| R5 | major | Scopes on `_run` made internal compositions (`updateOrCreate → create._run`, the no-op re-read) open nested scopes inside planning. | **Accepted.** Scopes sit on public terminals via `_exec`; `_run` stays unwrapped (§4.2, §9.1). |
+| R6 | minor | Wrapping the unbound `GeoIndex.put` would change its return type. | **Accepted.** Only the bound `put` reports as `GeoIndex.put` (§9.2, S28). |
+| R7 | minor | `src/` does fork (change feed `forkIn`), so checkpoint ops could nest under a stale scope. | **Accepted.** Claim corrected; the forked fibers start with `CurrentOperation` cleared (§6.6). |
+| R8 | minor | `fetch()` is not always one request. | **Accepted.** §7.1 corrected; unit case added (§11.2-4). |
+| R9 | minor | The static guard missed `Effect.map(DynamoClient, …)`, `DynamoClient.use`, `Context.get(ctx, DynamoClient)`. | **Accepted.** The guard matches any value use of `DynamoClient` outside the allowlist (§4.1). |
+| R10 | minor | The observer, run from an exit finalizer, could not be interrupted. | **Partly accepted.** Success and failure reports run after the effect, interruptibly; only an interrupted operation reports from a finalizer (uninterruptible by nature), and the guide says to fork slow observers (§6.5). |
+| R11 | minor | `aws.dynamodb.consumed_capacity.*` turns a semconv attribute into a namespace; other custom names squat in `aws.dynamodb.*`. | **Partly accepted.** The `.total` conflict is the owner's call and is documented; `.read` / `.write` stay beside it; the other invented names move to `effect_dynamodb.*` (§5.2, S26). |
