@@ -1,0 +1,184 @@
+---
+title: "Consumed capacity"
+description: "Opt-in reporting of the read and write capacity every library operation consumed, as span attributes and per-operation reports."
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+Every DynamoDB request costs capacity units. A single `get` is one request, but a `commandHandler` is a read and an append, a query is as many requests as it has pages, and a batch write is as many requests as it has chunks and retries. This guide covers **consumed-capacity reporting**: the library asks DynamoDB what each request cost and sums it per **library operation** — `Entity.get`, `EventStream.readFrom`, `Batch.write`, `Aggregate.update` — so you can see, per operation, what you are paying for.
+
+## Turning it on
+
+Reporting is **off by default**. With no `ConsumedCapacity` layer in context the library sends no `ReturnConsumedCapacity` parameter, creates no span, and every input reaches the client unchanged. Turning it on adds one field to each response and nothing else: no return type changes, and every bound operation keeps `R = never`.
+
+```typescript region="enable" example="guide-consumed-capacity.ts"
+// Every library operation run under this layer asks DynamoDB for its consumed
+// capacity, and runs in a span carrying the totals.
+const Reporting = ConsumedCapacity.layer()
+```
+
+Under this layer, every library operation:
+
+- sends `ReturnConsumedCapacity: "TOTAL"` (or `"INDEXES"` with `level: "indexes"`) on each data-plane request;
+- sums the returned units, the number of requests and the tables they named over the whole operation;
+- runs in a span named `effect-dynamodb.<operation>` carrying those totals (`spans: false` turns the spans off).
+
+To receive the totals in code, give the layer an observer. It is called once per operation, after the operation completes, fails or is interrupted. `layerEffect` builds the options in an effect, for an observer that needs services:
+
+```typescript region="observer" example="guide-consumed-capacity.ts"
+// The same, with an observer: one report per library operation, after it ends.
+const received: Array<ConsumedCapacity.OperationReport> = []
+
+const ReportingWithObserver = ConsumedCapacity.layerEffect(
+  Effect.sync(() => ({
+    level: "total" as const,
+    onOperation: (report: ConsumedCapacity.OperationReport) =>
+      Effect.gen(function* () {
+        received.push(report)
+        yield* Effect.logDebug(
+          `${report.operation}: ${report.capacityUnits} units in ${report.requests} requests`,
+        )
+      }),
+  })),
+)
+```
+
+<Aside type="caution">
+  The observer runs after the operation, on the operation's fiber, and the operation's result waits for it. Keep it quick (push to a buffer or a metrics client), and fork slow I/O (`Effect.forkDetach`). For an effect, a slow observer is interrupted with its operation (by an `Effect.timeout` around it, say); but the report of an interrupted operation, and of every `paginate()` stream run, is delivered from a finalizer, which cannot be interrupted. A failure or defect in the observer is logged at warning level and never changes the operation's result.
+</Aside>
+
+## The report
+
+```typescript region="report" example="guide-consumed-capacity.ts"
+yield* db.entities.Orders.put({ orderId: "o-1", customerId: "c-1", total: 40 })
+const order = yield* db.entities.Orders.get({ orderId: "o-1" })
+
+const report = last()
+// report.operation      → "Entity.get"
+// report.target         → "Order"
+// report.capacityUnits  → 0.5   (an eventually consistent read of a small item)
+// report.requests       → 1
+// report.tables         → ["consumed-capacity-demo"]
+```
+
+| Field | Meaning |
+|---|---|
+| `operation` | The library operation: `"Entity.get"`, `"EventStream.append"`, `"Batch.write"`, … or the name given to `withOperation` |
+| `target`, `index` | The entity type, stream, aggregate or collection name; the index or accessor name for queries |
+| `capacityUnits`, `readCapacityUnits`, `writeCapacityUnits` | Units summed over every request. DynamoDB often returns only the total; the library then attributes it to read or write by the command (`GetItem`, `Query`, `Scan`, `BatchGetItem`, `TransactGetItems` read; the others write) |
+| `requests`, `requestsByCommand` | Requests sent, in all and per command: `{ Query: 3 }` |
+| `unreportedRequests` | Requests whose outcome carried no capacity (see [Failures](#failures)) |
+| `tables`, `byTable` | Every table a request named; per-table sums, with the per-index breakdown under `level: "indexes"` |
+| `vectorSearchRequestBytes`, `vectorWriteRequestBytes` | Vector index usage, which is billed in bytes, not units |
+| `nested` | Library operations run inside this one, grouped by name (see [Nesting](#nesting)) |
+| `outcome` | `"success"`, `"failure"` or `"interrupted"` |
+
+## Span attributes
+
+| Attribute | When | Meaning |
+|---|---|---|
+| `db.system.name` | always | `"aws.dynamodb"` |
+| `effect_dynamodb.operation` | always | The operation name |
+| `effect_dynamodb.target`, `effect_dynamodb.index` | when known | As in the report |
+| `effect_dynamodb.nested` | always | `true` when the span is inside another library operation |
+| `aws.dynamodb.table_names` | always | Every table a request named |
+| `aws.dynamodb.consumed_capacity.total` | always | Capacity units (0 when nothing was reported) |
+| `aws.dynamodb.consumed_capacity.read`, `.write` | always | Read and write units |
+| `effect_dynamodb.request_count` | always | Requests sent |
+| `effect_dynamodb.unreported_requests` | when > 0 | Requests with no capacity in their outcome |
+| `effect_dynamodb.vector.search_request_bytes`, `.write_request_bytes` | when > 0 | Vector index usage |
+
+`ConsumedCapacity.Attributes` holds these names, so dashboards and tests need no string literals. Span totals are **inclusive**, like span durations: a span's totals include the spans nested in it. To total a trace, sum only spans with `effect_dynamodb.nested = false`.
+
+## Pagination and streams
+
+A query is one operation however many pages it reads. Its report counts every page as a request:
+
+```typescript region="pagination" example="guide-consumed-capacity.ts"
+const orders = yield* db.entities.Orders.byCustomer({ customerId: "c-1" }).pageSize(2).collect()
+
+const query = last()
+// query.operation          → "Entity.query"
+// query.index              → "byCustomer"
+// query.requests           → 3   (pages of 2, 2 and 1)
+// query.requestsByCommand  → { Query: 3 }
+```
+
+- `collect()` and `count()` read every page; `fetch()` reads one page, or more when a `limit` with a `filter` needs them.
+- `paginate()` returns a stream. **Each run** of the stream is one operation, from its start to its end. A consumer that stops early (`Stream.take`) ends it as a success, with the pages actually read. Running the same stream twice gives two reports.
+
+## Nesting
+
+A library operation that runs other library operations reports **once**. A `commandHandler` reads the stream and appends to it; its report includes both, and lists them in `nested`:
+
+```typescript region="nesting" example="guide-consumed-capacity.ts"
+const handle = EventStore.commandHandler(deposit, Ledgers)
+yield* handle({ accountId: "a-1" }, 25)
+
+const handled = last()
+// handled.operation  → "EventStore.commandHandler"
+// handled.nested     → [{ operation: "EventStream.read", calls: 1, ... },
+//                       { operation: "EventStream.append", calls: 1, ... }]
+// handled.capacityUnits includes both: never add the nested totals again.
+```
+
+Nested operations get their own spans (with `effect_dynamodb.nested = true`), but no observer call: their cost is already in the parent's report. So summing every report the observer receives never counts a request twice. The same holds for an `Aggregate.update` and the entity writes it composes, a transaction and the operations it plans, and a projection and its reads.
+
+## Grouping your own operations
+
+`ConsumedCapacity.withOperation` names a unit of application work. Every library call inside it is charged to it, and appears in its `nested` breakdown:
+
+```typescript region="custom-operation" example="guide-consumed-capacity.ts"
+const placeOrder = (input: { orderId: string; accountId: string; total: number }) =>
+  Effect.gen(function* () {
+    yield* db.entities.Orders.put({
+      orderId: input.orderId,
+      customerId: input.accountId,
+      total: input.total,
+    })
+    yield* db.entities.Accounts.update({ accountId: input.accountId }).add({ orders: 1 })
+  }).pipe(ConsumedCapacity.withOperation("placeOrder", { target: "Order" }))
+
+yield* placeOrder({ orderId: "o-6", accountId: "a-1", total: 60 })
+
+const placed = last()
+// placed.operation  → "placeOrder"
+// placed.requests   → 2
+// placed.nested     → Entity.put and Entity.update, one call each
+```
+
+It works with concurrent calls too: an `Effect.forEach` with `concurrency` inside a `withOperation` sums every request it sends. `ConsumedCapacity.withOperationStream` is the stream form.
+
+Work you fork out of an operation (`Effect.forkDetach`, or `Effect.forkIn` an outer scope) may still be running when the operation ends. Nothing it sends is lost or counted twice. What it did before the operation ended is in the operation's report; what it does after is charged to the nearest enclosing operation that is still running. If none is, it is reported on its own, as its library operation (`Entity.put`) or, for a bare request, `DynamoClient.<Command>`. Such a report can arrive after the report of the operation that started the work.
+
+## Failures
+
+A failed request is still a request: it is counted in `requests`, and in `outcome: "failure"`. Whether its capacity is known depends on DynamoDB:
+
+```typescript region="failure" example="guide-consumed-capacity.ts"
+const duplicate = yield* db.entities.Orders.create({
+  orderId: "o-1",
+  customerId: "c-1",
+  total: 40,
+})
+  .asEffect()
+  .pipe(Effect.flip)
+
+const failed = last()
+// duplicate._tag              → "ConditionalCheckFailed"
+// failed.outcome              → "failure"
+// failed.requests             → 1
+// failed.unreportedRequests   → 1   (DynamoDB returns no capacity with this error)
+```
+
+No DynamoDB error carries `ConsumedCapacity` in the AWS SDK: not a `ConditionalCheckFailedException`, a cancelled transaction, nor any other. Those requests count in `unreportedRequests` instead. A failed conditional write is still billed (at least one write unit, says the DynamoDB Developer Guide), so the table's `ConsumedWriteCapacityUnits` metric in CloudWatch is the source of truth for it. A throttled request is rejected and consumes nothing. If an error ever does carry `ConsumedCapacity` (from a custom client, say), it is counted.
+
+## Decorated and mocked clients
+
+The instrumentation wraps whatever `DynamoClient` is in context: the built-in layer, a client you decorated with `Layer.effect(DynamoClient, Effect.map(DynamoClient, decorate))`, `VectorSearchEmulation.layer`, or a test mock. A decorator must forward `ReturnConsumedCapacity` and return the response's `ConsumedCapacity`, as a plain delegating decorator does. One that drops them still works: its requests are counted, and they show up as `unreportedRequests`.
+
+## Bind time and run time
+
+The setting is read when an operation runs, from the fiber that runs it. A client bound with `DynamoClient.make` (or `EventStore.bind`, `Aggregate.bind`, …) while a `ConsumedCapacity` layer was in context keeps that setting for every call through it, including a stream from `paginate()`. A client bound under `ConsumedCapacity.disabled` never reports.
+
+Binding captures only the setting, never the operation or span that was current when you bound: a client made inside a `withOperation` reports its later calls as their own operations, and their spans' parent is the span current when they run.

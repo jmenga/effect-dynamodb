@@ -60,8 +60,9 @@ import {
   SchemaAST,
 } from "effect"
 import * as Batch from "./Batch.js"
-import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import * as Capacity from "./internal/Capacity.js"
 import {
   type CompileResult,
   type ConditionOps,
@@ -1411,7 +1412,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     rejected: (diagnosis: Diagnosis, original: unknown) => E,
   ) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const tableConfig: TableConfig = yield* config.table.Tag
       const composites = KeyComposer.extractComposites(config.pk.composite, keyRecord(key))
       const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
@@ -1441,7 +1442,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
 
-  return {
+  return withOperations<Aggregate<TSchema, Record<string, unknown>>>(aggregateName, {
     [TypeId]: TypeId,
     _tag: "Aggregate",
     _tableTag: config.table.Tag,
@@ -1490,7 +1491,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     create: (input) =>
       Effect.gen(function* () {
-        const client = yield* DynamoClient
+        const client = yield* Capacity.client
         const tableConfig: TableConfig = yield* config.table.Tag
 
         // 1. Hydrate refs from edges
@@ -1770,7 +1771,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     list: (filter, options) =>
       Effect.gen(function* () {
-        const client = yield* DynamoClient
+        const client = yield* Capacity.client
         const tableConfig: TableConfig = yield* config.table.Tag
 
         if (!config.list) {
@@ -1937,6 +1938,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
         return { data: aggregates, cursor }
       }),
+  })
+}
+
+/**
+ * Each aggregate operation as a named operation for consumed-capacity
+ * reports (#174); the entity ops and batches it composes nest under it.
+ */
+const withOperations = <A extends Aggregate<any, any, any>>(aggregateName: string, ops: A): A => {
+  const target = { target: aggregateName }
+  return {
+    ...ops,
+    get: (key: any) => Capacity.operation("Aggregate.get", target, ops.get(key)),
+    create: (input: any) => Capacity.operation("Aggregate.create", target, ops.create(input)),
+    update: (key: any, mutationFn: any) =>
+      Capacity.operation("Aggregate.update", target, ops.update(key, mutationFn)),
+    delete: (key: any) => Capacity.operation("Aggregate.delete", target, ops.delete(key)),
+    list: (filter: any, options: any) =>
+      Capacity.operation("Aggregate.list", target, ops.list(filter, options)),
   }
 }
 
@@ -1954,7 +1973,8 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
   aggregate: Aggregate<TSchema, TKey, TInput>,
 ): Effect.Effect<BoundAggregate<TSchema, TKey, TInput>, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<DynamoClient | TableConfig>()
+    // Detached: no current operation or parent span is pinned for later calls (#174).
+    const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

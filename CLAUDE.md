@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 2596 core tests, 540 schema tests, 57 geo tests, 90 language-service tests, 52 doctest tests, 39 examples, 652 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 2949 core tests, 542 schema tests, 65 geo tests, 90 language-service tests, 53 doctest tests, 39 examples, 725 connected tests against DynamoDB Local.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -81,6 +81,7 @@ packages/effect-dynamodb/src/
 ├── change-feed/        # `effect-dynamodb/change-feed` subpath: polled DynamoDB Streams feed (DynamoStreamsClient, CheckpointStore, lease) into EventStore.processBatch
 ├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
+├── ConsumedCapacity.ts # Opt-in consumed-capacity reporting (#174): layer / layerEffect / disabled, observer reports, withOperation(Stream), span Attributes, detachContext
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
 ├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
@@ -91,6 +92,7 @@ packages/effect-dynamodb/src/
 │   ├── BoundQuery.ts   # BoundQuery fluent builder — wraps Query<A> with pre-resolved services
 │   ├── BoundCrud.ts    # Bound CRUD builders (BoundPut/Update/Delete/Append) + BoundGet (an Effect), all carrying BoundOpTypeId for the one unwrap protocol
 │   ├── BoundVectorQuery.ts # BoundVectorQuery — SearchVectors builder (.collect() is the only terminal)
+│   ├── Capacity.ts     # Consumed-capacity choke point: `Capacity.client` (instrumented DynamoClient view), operation scopes, summing, reports
 │   ├── EntityOps.ts    # Entity operation intermediates + UpdateState (record + path-based)
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
@@ -127,6 +129,8 @@ StorageEncoding → Marshaller, internal/Packed, Compression + PackedCodec (sche
 compression/zlib → node:zlib, Compression (schema pkg, types only)
 Projection → (standalone)
 Errors → effect (Data)
+ConsumedCapacity → internal/Capacity → DynamoClient (service key + types)
+Entity, Query, Batch, Transaction, Aggregate, EventStore, ProjectionEngine, BoundVectorQuery, CheckpointStore → internal/Capacity (`Capacity.client` — never the raw DynamoClient)
 ```
 
 ### Data Flow
@@ -271,6 +275,7 @@ Do NOT:
 - Put DynamoDB concepts in domain models — keep models pure, Entity handles DynamoDB binding
 - Pre-check a limit DynamoDB enforces (item size, transaction count/size, key length) — send the write and diagnose the rejection through `internal/WriteDiagnosis.ts`
 - Extract `A`/`E`/`R` from entity ops via `Effect.Effect<infer A>` — match against `EntityOp<infer A, ...>` instead
+- Resolve the raw client (`yield* DynamoClient`, `Effect.service(DynamoClient)`, …) in library `src/` — use `yield* Capacity.client`, or capacity is never reported (`test/capacity-guard.test.ts`; allowlist: `internal/Capacity.ts`, `DynamoClient.ts`, `internal/TransactPlan.ts`, `VectorSearchEmulation.ts`)
 
 ### TypeScript Conventions
 
@@ -333,6 +338,7 @@ Do NOT:
 | `guides/timeseries.mdx` | `examples/guide-timeseries.ts` |
 | `guides/packed-storage.mdx` | `examples/guide-packed-storage.ts` |
 | `guides/vector-search.mdx` | `examples/guide-vector-search.ts` |
+| `guides/consumed-capacity.mdx` | `examples/guide-consumed-capacity.ts` |
 | ... (all other tutorials/guides follow the same pattern) | |
 
 ### Sync normalization
@@ -528,6 +534,14 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Self-describing stored form, no marker attribute.** Native = legacy, `S` = JSON, `B` = header byte (`vvv ff ccc`: v1, json, codec) + compressed JSON. Readers dispatch on the stored value, never the config, so switching needs no rewrite. Compress only at `>= threshold` (default 1024) AND when smaller.
 - **Compressors via `Compression` service read from context** (no new `R`): `DynamoClient.make({ compressors })` > ambient at bind > ambient at run. Recommend `Compression.layer([...])` merged into the app layer (`DynamoClient.layer({ compressors })`'s output is lost behind a wrapper consumed via `Layer.provide`). A codec a bound member / stream config names must be registered at bind (`DynamoClient.make`, `EventStore.bind`) or an unbound stream's first op → `[EDD-9078]` defect. Any other missing codec → `ValidationError` whose `cause` is `CompressorNotRegistered` (never a new error-union member: packing is opt-in, so error channels stay those of 1.25.0). Read hot paths run a sync codec core, one Effect per row (`bench/packed-decode.ts`).
 - **Packing runs after encode/rename/sparse, before marshalling**, so every size measurement (diagnosis, `measureAppend`, `valueBytes`) counts stored bytes. Guards: EDD-9071–9079.
+
+### Consumed Capacity (#174, `docs/designs/consumed-capacity.md`, `guides/consumed-capacity.mdx`, DESIGN §16)
+- **Off by default; opt in with `ConsumedCapacity.layer({ level?, spans?, onOperation? })`.** Off = no `ReturnConsumedCapacity`, same input object, no spans. On = no type changes, `R = never` kept. Setting read at run time from the fiber; a client bound while it is in context keeps it (`disabled` included).
+- **One choke point.** Library code gets the client via `Capacity.client` (instrumented view of whatever `DynamoClient` is in context — decorated and mocked clients included). New library operations need an entry point: wrap the public terminal with `Capacity.operation(name, { target, index }, effect)` (or `operationStream`); otherwise their requests show up as an implicit `DynamoClient.<Command>` root and `test/ConsumedCapacity.coverage.test.ts` fails. Add the case there.
+- **Entity ops: scope in `_exec`, never in `_run`** — `TransactPlan` and internal compositions call `_run`. Query terminals are delegates (scope only when none is live).
+- **Nesting.** One observer report per ROOT operation; nested library ops charge every open ancestor (inclusive totals), get a span with `effect_dynamodb.nested = true`, and appear in the root's `nested`. The observer runs under a "suppressed" sentinel — nothing it runs is flagged or reported. Work outliving its scope (forked out) is never lost: a closing scope hands its open children to its parent, or re-roots them (clearing what it already counted, so nothing double counts); a request whose every scope closed mid-flight reports as `DynamoClient.<Command>`.
+- **Bind sites use `Capacity.detachContext`** (omits the current operation and `Tracer.ParentSpan`); a new bind site must too. Fibers forked into a long-lived scope start `Capacity.detached`.
+- **Failures** count as requests; SDK errors carry no `ConsumedCapacity`, so they add `unreportedRequests`. `TransactPlan`'s recorded-not-sent writes are marked `markNotSent` and not counted. DynamoDB Local returns `CapacityUnits` only and does not double transactional writes.
 
 ### Aggregate Operations
 - **Edge entities are first-class.** Own models, keys, indexes, and configuration. Composed via `Aggregate.one()`, `Aggregate.many()`, `BoundSubAggregate`.

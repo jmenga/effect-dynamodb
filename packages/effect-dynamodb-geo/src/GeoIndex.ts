@@ -20,6 +20,7 @@ import type {
   UniqueConstraintViolation,
   ValidationError,
 } from "effect-dynamodb"
+import { ConsumedCapacity } from "effect-dynamodb"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"
@@ -169,11 +170,22 @@ export const make = <A, P>(config: {
     bucketMs,
   }
 
+  // Consumed-capacity reports (#174): a search is one `GeoIndex.nearby`
+  // operation over all its cell queries. The unbound `put` stays the entity's
+  // own put builder (so entity combinators still apply) and reports as
+  // `Entity.put`; the bound `put` reports as `GeoIndex.put`.
+  const target = { target: config.entity.entityType, index: config.index }
   return {
     put: (input: A) => config.entity.put(enrich(input)),
-    nearby: (options: NearbyOptions) => _GeoSearch.nearby(searchConfig, options),
+    nearby: (options: NearbyOptions) =>
+      ConsumedCapacity.withOperation(
+        _GeoSearch.nearby(searchConfig, options),
+        "GeoIndex.nearby",
+        target,
+      ),
     enrich,
-  }
+    _target: target,
+  } as GeoIndex<A, P>
 }
 
 // ---------------------------------------------------------------------------
@@ -228,13 +240,23 @@ export const bind = <A, P>(
   geoIndex: GeoIndex<A, P>,
 ): Effect.Effect<BoundGeoIndex<A>, never, DynamoClient | Table.TableConfig> =>
   Effect.gen(function* () {
-    const ctx = yield* Effect.context<DynamoClient | Table.TableConfig>()
+    // Detached: no current operation or parent span is pinned for later calls.
+    const ctx = ConsumedCapacity.detachContext(
+      yield* Effect.context<DynamoClient | Table.TableConfig>(),
+    )
     const provide = <B, E>(
       effect: Effect.Effect<B, E, DynamoClient | Table.TableConfig>,
     ): Effect.Effect<B, E, never> => Effect.provide(effect, ctx) as Effect.Effect<B, E, never>
 
     return {
-      put: (input: A) => provide((geoIndex.put(input) as any).asEffect()),
+      put: (input: A) =>
+        provide(
+          ConsumedCapacity.withOperation(
+            (geoIndex.put(input) as any).asEffect() as Effect.Effect<A, any, any>,
+            "GeoIndex.put",
+            (geoIndex as { readonly _target?: ConsumedCapacity.OperationOptions })._target,
+          ),
+        ),
       nearby: (options: NearbyOptions) => provide(geoIndex.nearby(options)),
       enrich: geoIndex.enrich,
       provide,

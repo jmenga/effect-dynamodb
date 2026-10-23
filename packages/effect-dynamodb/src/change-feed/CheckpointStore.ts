@@ -8,7 +8,8 @@
 import type { AttributeValue, CreateTableCommandInput } from "@aws-sdk/client-dynamodb"
 import { isAwsConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
 import { Clock, Context, Duration, Effect, Layer, Option } from "effect"
-import { DynamoClient, type DynamoClientError } from "../DynamoClient.js"
+import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
+import * as Capacity from "../internal/Capacity.js"
 import { ChangeFeedLeaseHeld, ChangeFeedLeaseLost, CheckpointStoreError } from "./Errors.js"
 
 /**
@@ -190,7 +191,7 @@ export const makeDynamoDB = (
     )
   }
   return Effect.gen(function* () {
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
     const TableName = options.tableName
     const finishedTtlSeconds = Math.ceil(Duration.toMillis(finishedTtl) / 1000)
     const pkOf = (feed: FeedId): AttributeValue => ({ S: `${feed.consumer}#${feed.streamArn}` })
@@ -328,7 +329,15 @@ export const makeDynamoDB = (
           Effect.mapError(storeError("CheckpointStore.releaseLease")),
         )
 
-    return { load, commit, acquireLease, renewLease, releaseLease } satisfies CheckpointStoreService
+    // Each method a named operation for consumed-capacity reports (#174).
+    const named = Capacity.namedOperation("CheckpointStore", options.tableName)
+    return {
+      load: named("load", load),
+      commit: named("commit", commit),
+      acquireLease: named("acquireLease", acquireLease),
+      renewLease: named("renewLease", renewLease),
+      releaseLease: named("releaseLease", releaseLease),
+    } satisfies CheckpointStoreService
   })
 }
 

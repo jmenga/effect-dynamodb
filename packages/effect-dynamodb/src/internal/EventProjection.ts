@@ -36,6 +36,7 @@ import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
 import * as Query from "../Query.js"
 import type { Table, TableConfig } from "../Table.js"
+import * as Capacity from "./Capacity.js"
 import type { EntityGet, EntityPut } from "./EntityOps.js"
 import { imageEntityType, type StreamImage } from "./Packed.js"
 import {
@@ -1315,6 +1316,8 @@ export const projection = <
       ),
     )
 
+  const named = Capacity.namedOperation("Projection", readModel.entityType)
+
   const outboxRequired = (operation: string) =>
     Effect.die(
       new Error(`[EDD-9081] ${label}.${operation}: the projection declares no \`outbox\`.`),
@@ -1336,15 +1339,23 @@ export const projection = <
         applyBatch: (events, applyOptions) => applyBatch(events as ReadonlyArray<Ev>, applyOptions),
       },
     ],
-    applyBatch,
-    apply,
-    catchUp,
-    rebuild,
-    processBatch,
-    drain: (key: K, deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
-      config.outbox === undefined ? outboxRequired("drain") : engine.drain(key, deliver),
-    drainPending: (deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
-      config.outbox === undefined ? outboxRequired("drainPending") : engine.drainPending(deliver),
+    // Each method a named operation for consumed-capacity reports (#174).
+    // Internal compositions (routes, `processBatch`) call the unwrapped ones.
+    applyBatch: named("applyBatch", applyBatch),
+    apply: named("apply", apply),
+    catchUp: named("catchUp", catchUp),
+    rebuild: named("rebuild", rebuild),
+    processBatch: named("processBatch", processBatch),
+    drain: named(
+      "drain",
+      (key: K, deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+        config.outbox === undefined ? outboxRequired("drain") : engine.drain(key, deliver),
+    ),
+    drainPending: named(
+      "drainPending",
+      (deliver: (effect: O, meta: OutboxMeta) => Effect.Effect<void, any, any>) =>
+        config.outbox === undefined ? outboxRequired("drainPending") : engine.drainPending(deliver),
+    ),
   } as unknown as EventProjection<
     S,
     TEvent,
@@ -1665,15 +1676,19 @@ export const processBatch: {
     ProjectionRequirementsOf<Projections[keyof Projections]>
   >
 } = (records: ReadonlyArray<unknown>, options: any): any =>
-  runBatch(
+  Capacity.operation(
     "EventStore.processBatch",
-    records,
-    options,
-    Object.entries(
-      options.projections as Record<
-        string,
-        { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
-      >,
-    ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
-    Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+    undefined,
+    runBatch(
+      "EventStore.processBatch",
+      records,
+      options,
+      Object.entries(
+        options.projections as Record<
+          string,
+          { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
+        >,
+      ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
+      Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+    ),
   )

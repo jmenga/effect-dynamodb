@@ -51,6 +51,7 @@ packages/effect-dynamodb/src/
 ├── Transaction.ts      # TransactGetItems + TransactWriteItems (atomic multi-item ops)
 ├── Projection.ts       # ProjectionExpression builder for selecting specific attributes
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make(table) typed gateway
+├── ConsumedCapacity.ts # Opt-in consumed-capacity reporting: layer, observer, withOperation, span attributes (§16)
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb
 ├── Errors.ts           # Tagged errors
 ├── internal/           # Decomposed internals
@@ -60,6 +61,7 @@ packages/effect-dynamodb/src/
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
 │   ├── EntityCombinators.ts # Terminal functions and update combinators (record + path-based)
+│   ├── Capacity.ts     # Consumed-capacity choke point (instrumented client), operation scopes, summing (§16)
 │   └── ...             # Other internal modules
 └── index.ts            # Public API barrel export
 
@@ -139,6 +141,9 @@ DynamoClient → effect (Context, Layer), @aws-sdk/client-dynamodb, Entity (for 
 KeyComposer → (standalone, no internal deps)
 Marshaller → @aws-sdk/util-dynamodb
 Errors → effect (Data)
+ConsumedCapacity → internal/Capacity → DynamoClient (type + service key only)
+Entity, Query, Batch, Transaction, Aggregate, EventStore, ProjectionEngine, BoundVectorQuery,
+  CheckpointStore → internal/Capacity (`Capacity.client`, never the raw DynamoClient — §16)
 ```
 
 ### Layering Principle
@@ -4471,6 +4476,100 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9085` | `EventStore.ts` | A head proof that cannot work (#164): `headProof: "snapshot"` on a stream whose snapshot config is not `mode: "inline"` without `every` (a defect from `append`, thrown by `commandHandler` at handler construction); and, at handler construction, a malformed handler `headProof`, a `loadState` that is not a function, `loadState` with `verifySnapshot: false`, or `loadState` with `headProof: "snapshot"` |
 
 Next free code: **`EDD-9086`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+
+## 16. Consumed Capacity
+
+Opt-in reporting of the capacity every library operation consumed (#174). The full design,
+with its alternatives and the review that shaped it, is `docs/designs/consumed-capacity.md`;
+this section is the contract.
+
+### 16.1 Off by default
+
+`ConsumedCapacity.Reporting` is a `Context.Reference` whose default is "off". Off, no request
+is touched: every input reaches the client as the same object, no `ReturnConsumedCapacity` is
+sent, no span is created. On (`ConsumedCapacity.layer(options)` / `layerEffect` / providing
+`Reporting` directly), nothing about types changes: no return type gains a field, and every
+bound operation keeps `R = never`. `ConsumedCapacity.disabled` turns a subtree off.
+
+```ts
+ConsumedCapacity.layer({
+  level: "total" | "indexes",   // ReturnConsumedCapacity sent; default "total"
+  spans: true,                  // a span per library operation; default true
+  onOperation: (report) => Effect.Effect<void>, // one call per ROOT operation
+})
+```
+
+### 16.2 The choke point
+
+Every library code path resolves the client through `Capacity.client`: an instrumented view of
+whatever `DynamoClient` is in context (the built-in layer, a decorated client, a mock,
+`VectorSearchEmulation`). Its 11 data-plane methods (`getItem`, `putItem`, `updateItem`,
+`deleteItem`, `query`, `scan`, `batchGetItem`, `batchWriteItem`, `transactGetItems`,
+`transactWriteItems`, `searchVectors`) read the setting from the calling fiber; when on they
+add `ReturnConsumedCapacity` (an explicit caller value wins) and record the request into the
+current operation on exit. Table-management calls pass through. Only four files may resolve the
+raw service — `internal/Capacity.ts`, `DynamoClient.ts`, `internal/TransactPlan.ts` and
+`VectorSearchEmulation.ts` — enforced by `test/capacity-guard.test.ts` over both packages. A
+request outside every operation lands in an implicit `DynamoClient.<Command>` root, and the
+coverage test (`test/ConsumedCapacity.coverage.test.ts`) fails if any library operation
+produces one.
+
+### 16.3 Operations and nesting
+
+Each library operation opens a scope at its public entry point (`Entity.get` … `Entity.query`,
+`Batch.write`, `Transaction.transactWrite`, `Aggregate.update`, `EventStream.readFrom`,
+`EventStore.commandHandler`, `Projection.*`, `MultiProjection.*`, `CheckpointStore.*`,
+`GeoIndex.nearby`, …). Entity ops open it in `_exec` (public terminals) and never in `_run`,
+which planning (`TransactPlan`) calls. Query terminals (`Query.collect` / `execute` / `count` /
+`paginate`) are **delegates**: they open a scope only when no operation is live.
+
+- A scope opened inside another is **nested**: its requests are charged to it and to every open
+  ancestor (inclusive totals), it gets a span with `effect_dynamodb.nested = true`, and it
+  appears in the root report's `nested` breakdown (direct children, grouped by name) — but it
+  gets no observer call. Summing observer reports never double counts.
+- Work that outlives its operation (forked out with `forkDetach` / `forkIn`) is never lost:
+  what it did before the operation closed is in that operation's report; afterwards it is
+  charged to the nearest still-open enclosing operation, or reported as a root of its own
+  (a bare request as `DynamoClient.<Command>`). Still no double counting.
+- `ConsumedCapacity.withOperation(name, { target, index })` / `withOperationStream` open an
+  application scope the same way.
+- Streams (`paginate()`) are one operation per run, closed by a finalizer: early termination
+  reports `"success"` with the pages read.
+- The observer runs after the operation on its fiber, with the current operation set to a
+  "suppressed" sentinel, so anything it runs (even through a client bound with reporting on)
+  is neither flagged nor reported. A failure or defect in it is logged at warning level and
+  never changes the result. An interrupted operation reports from a finalizer.
+
+### 16.4 Bind time and run time
+
+The setting is read at run time from the operation's fiber; a client bound (`DynamoClient.make`,
+`Entity.bind`, `EventStore.bind` / `bindProjection`, `Aggregate.bind`, `GeoIndex.bind`) while
+a setting is in context keeps it (its captured context wins). Every bind site captures its
+context through `ConsumedCapacity.detachContext`, which omits the current operation and the
+tracer's parent span, so later calls neither nest under the operation that was live at bind
+time nor parent their spans to the span current then.
+
+### 16.5 Reports and spans
+
+`OperationReport`: `operation`, `target`, `index`, `capacityUnits` / `readCapacityUnits` /
+`writeCapacityUnits` (DynamoDB's split when returned, otherwise attributed by command kind),
+`requests`, `unreportedRequests`, `requestsByCommand`, `tables`, `byTable` (with per-index
+sums under `"indexes"`), `vectorSearchRequestBytes`, `vectorWriteRequestBytes`, `nested`,
+`outcome` (`"success"` / `"failure"` / `"interrupted"`).
+
+Spans are named `effect-dynamodb.<operation>` (kind `client`) and carry `db.system.name`,
+`effect_dynamodb.operation` / `.target` / `.index` / `.nested`, `aws.dynamodb.table_names`,
+`aws.dynamodb.consumed_capacity.total` / `.read` / `.write` (always), `effect_dynamodb.request_count`
+(always), and `effect_dynamodb.unreported_requests` / `effect_dynamodb.vector.*` (when > 0).
+`ConsumedCapacity.Attributes` exports the names.
+
+### 16.6 Failures
+
+No DynamoDB error shape in the AWS SDK models `ConsumedCapacity`, so a failed request
+(`ConditionalCheckFailed`, a cancelled transaction) counts as a request and as
+`unreportedRequests`. An error that does carry it (on the error or its `cause`) is counted. A
+write `TransactPlan` records for a transaction but never sends is marked "not sent" and is not
+counted.
 
 ## Appendix A: Migration Guide (v1 → v2 → v3)
 

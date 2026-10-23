@@ -168,6 +168,7 @@ import {
   type BoundVectorQueryConfig,
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
+import * as Capacity from "./internal/Capacity.js"
 import { createConditionOps } from "./internal/Expr.js"
 import {
   codecRequirements,
@@ -1155,7 +1156,8 @@ const makeFromConfig = (config: {
     // override (e.g. `@effect/platform-node`) takes precedence over the default
     // `globalThis.crypto`-backed wrapper. The `provide` helper is widened to
     // admit `Crypto.Crypto`. See `DESIGN.md` for the `R = never` rationale.
-    const baseCtx = yield* Effect.context<DynamoClient | TableConfig>()
+    // Detached: no current operation or parent span is pinned for later calls (#174).
+    const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
     const cryptoService = config.crypto ?? makeDefaultCrypto()
     const withCrypto = Context.add(baseCtx, Crypto.Crypto, cryptoService)
     // Bundle the Embedder the same way, so entities with `vectorIndexes` keep
@@ -1588,6 +1590,7 @@ const makeFromConfig = (config: {
           composeSkCondition,
           skFields: indexDef.sk.composite,
           ...entityNaming(entityLike._resolveDbName),
+          operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(finalQuery, bqConfig)
       }
@@ -1693,6 +1696,7 @@ const makeFromConfig = (config: {
           conditionOps,
           provide,
           ...entityNaming(entityLike._resolveDbName),
+          operation: { name: "Entity.scan", target: entityLike.entityType },
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
       }
@@ -1844,6 +1848,7 @@ const makeFromConfig = (config: {
               fields: domainFieldsOf(m.entityLike),
             })),
           ),
+          operation: { name: "Collection.query", target: collName },
         }
         return new BoundQueryImpl(query, bqConfig)
       }

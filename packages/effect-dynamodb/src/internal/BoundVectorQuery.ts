@@ -33,9 +33,10 @@ import type {
 } from "@effect-dynamodb/schema/VectorIndex.js"
 import { DEFAULT_TOP_K, toSimilarity } from "@effect-dynamodb/schema/VectorIndex.js"
 import { Effect, Option } from "effect"
-import { DynamoClient, type DynamoClientError } from "../DynamoClient.js"
+import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import { fromAttributeMap, toAttributeValue } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
+import * as Capacity from "./Capacity.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
@@ -231,7 +232,14 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
   }
 
   collect(): Effect.Effect<Array<VectorHit<A>>, VectorSearchError, never> {
-    return this._config.provide(this._execute())
+    // A named operation inside `provide` (consumed capacity, #174).
+    return this._config.provide(
+      Capacity.operation(
+        "Entity.vectorSearch",
+        { target: this._config.entityType, index: this._config.logicalName },
+        this._execute(),
+      ),
+    )
   }
 
   /** @internal The unprovided search program. */
@@ -254,7 +262,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
     } = this._config
     const state = this._state
     return Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* tableTag
 
       // 0. Only attributes declared in `filters: [...]` are INLINE_FILTER
