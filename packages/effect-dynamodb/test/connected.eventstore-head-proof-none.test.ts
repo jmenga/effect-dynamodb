@@ -141,7 +141,7 @@ const storedEvents = (accountId: string) =>
       ExpressionAttributeNames: { "#e": "__edd_e__" },
       ExpressionAttributeValues: { ":id": { S: accountId }, ":ledger": { S: "ledger." } },
     })
-    return (scanned.Items ?? []).toSorted(
+    return [...(scanned.Items ?? [])].sort(
       (a, b) => Number(a.version?.N ?? 0) - Number(b.version?.N ?? 0),
     )
   })
