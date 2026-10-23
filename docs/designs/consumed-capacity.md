@@ -606,8 +606,10 @@ inside `provide` (`provide(withOperation(...))`), never outside it.
   requests, and each is counted and summed. DynamoDB charges only for processed items, and its
   per-request capacity reflects that.
 - `TransactGetItems` / `TransactWriteItems` return one element per table. Transactional reads
-  and writes cost 2×, and DynamoDB's numbers already include that (Local: a 1-item transact
-  put reports 2 units, §11.1).
+  and writes cost 2×, and real DynamoDB's numbers already include that. DynamoDB Local does
+  **not** apply the doubling (a `TransactWriteItems` of two small puts reports 2 units on
+  Local, §11.1), so the connected suite asserts Local's values and the doubling is covered
+  by unit tests with mocked responses.
 
 ---
 
