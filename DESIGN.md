@@ -3346,8 +3346,8 @@ rejects one ahead of the head. An item whose own condition holds only at
 `expectedVersion` proves the head is at least that, the event put at
 `expectedVersion + 1` that it is at most that — so it can replace the check.
 
-- **`append({ headProof })`** — `HeadProof = { additionalItem: n } | "snapshot"`. Omitted:
-  the check is written, exactly as before.
+- **`append({ headProof })`** — `HeadProof = { additionalItem: n } | "snapshot" | "none"`.
+  Omitted: the check is written, exactly as before.
   - `{ additionalItem: n }`: `additionalItems[n]` must carry a condition of its own
     (`.condition()`, `create()`, `Transaction.check`; a guarded put's read guard does not
     count) — else, or for an `n` out of range, `ValidationError` before anything is
@@ -3359,6 +3359,19 @@ rejects one ahead of the head. An item whose own condition holds only at
     Needs `snapshot` (`ValidationError`) and a `mode: "inline"` stream without `every`
     (`[EDD-9085]`, a defect). A lagging snapshot fails the condition — a conflict, never a
     gap.
+  - `"none"` (#173): no check and no proof. **The caller guarantees the head**, taking over
+    both duties of the check: (1) no gap — `expectedVersion` never ahead of the head, which
+    holds for the version of any event read from the stream (`read`, `readFrom`,
+    `currentVersion`, `readLatest` without a snapshot config: nothing deletes events, so the
+    head only grows; such a version can be stale, never ahead). A snapshot's `asOfVersion`
+    (`readLatest` with a snapshot) is only as sound as the `writeSnapshot` callers, which
+    are not checked against the events; (2) the seal — refuse to append when the last event
+    read is sealed, since nothing else stops an append at `S`. A writer that read the head
+    just before a one-event seal (`S - 1`) still gets `StreamSealed` (its first put lands on
+    the sealing event, `ALL_OLD`); one further behind, or just before a seal of several
+    events, gets `VersionConflict` and must apply duty 2 on reload. The event puts still
+    reject a stale version (`VersionConflict`). Combines with every other option; `append`
+    and `measureAppend` only.
   - `measureAppend` accepts it and leaves the check out of `transactionBytes`.
   - **The caller's contract** (`{ additionalItem }`): every writer of the stream writes
     the item, conditioned the same way, in the same transaction as its events. An append
@@ -3380,12 +3393,38 @@ rejects one ahead of the head. An item whose own condition holds only at
   `"snapshot"` is applied per attempt only when the load found the snapshot at the head
   (`loaded.version === snapshotAsOfVersion`: a verified load with no event after it, an
   unverified load, or an empty stream); otherwise that append writes the check, and a
-  conflict takes the existing stale-snapshot path.
+  conflict takes the existing stale-snapshot path. `"none"` is not accepted (#173):
+  `Exclude<HeadProof, "none">` in the type, and for an untyped caller every call fails with
+  `ValidationError` (`EventStore.commandHandler.headProof`) before anything is read or
+  written; construction does not throw for it.
 - **Refused at construction (`[EDD-9085]`)**: `loadState` with `verifySnapshot: false`
   (no stream load to skip), `loadState` with `headProof: "snapshot"` (the snapshot is never
   read), `headProof: "snapshot"` on any other snapshot config, a malformed `headProof`.
 
-Design: `docs/designs/eventstore-head-proof.md`.
+- **Single-item fast path (#173).** In `sendAppendTransaction`, a request of exactly one
+  item that is the append's one event `Put` (no check, sentinel, snapshot or additional
+  item: a one-event append at version 0, or a one-event `"none"` append) is sent by
+  `sendAppendPut` as a `PutItem` with the same `Item`, `ConditionExpression` and
+  `ReturnValuesOnConditionCheckFailure: ALL_OLD`: 1 WCU per KB instead of 2, the same
+  atomicity and result. **Retry idempotency:** the SDK fills a transaction's
+  `ClientRequestToken`, so its resend after a lost response succeeds; a `PutItem` has no
+  token, so the fast path writes its own — `__edd_wt__`, 128 random bits from Web Crypto
+  per `append` call (`WRITE_TOKEN_ATTRIBUTE`, stream-owned) — and a failed condition whose
+  `ALL_OLD` item carries this call's token is the call's own commit: success. Any other
+  failed condition goes through `streamAppendVerdict` with the one reason (`StreamSealed`
+  from a marked returned item, else `VersionConflict`); a rejection the diagnosis names is
+  rewritten by the same `rewrite` against the item sent (`SentWrite` `_tag: "Item"`); a
+  failure a transaction reports as its item's reason is `TransactionCancelled`
+  (`operation: "PutItem"`) with that reason (`putItemReason`):
+  `ProvisionedThroughputExceededException` → `ProvisionedThroughputExceeded`,
+  `ThrottlingException` → `ThrottlingError`, `ItemCollectionSizeLimitExceededException` →
+  `ItemCollectionSizeLimitExceeded`, `TransactionConflictException` →
+  `TransactionConflict`, a key-type mismatch (`/Type mismatch/`) → `ValidationError`;
+  anything else passes through, as from the transaction. `measureAppend` counts the token
+  (a placeholder of its length) when the append would take this path. `appendOp` is never
+  sent this way.
+
+Design: `docs/designs/eventstore-head-proof.md`, `docs/designs/eventstore-head-proof-none.md`.
 
 ### Sealing a Stream (#166)
 
@@ -3463,9 +3502,13 @@ report the seal.
   `{ additionalItem }`: unenforced by the library; the recommended pattern is a one-event
   seal that keeps the record at `S - 1` with a sealed flag and `sealedVersion: S`, so every
   record-proof writer's first put lands on the sealing event. Advancing the record to `S`
-  is safe only if every writer's condition tests the flag.
+  is safe only if every writer's condition tests the flag. `"none"` (#173): unenforced by
+  the library; refusing on a sealed last event read is the caller's duty, and a writer
+  that read the head just before a one-event seal still fails its first put with
+  `StreamSealed` (one further behind gets `VersionConflict`).
 - **Residuals (documented).** A pre-1.33 writer can append past a seal; so can a
-  record-proof writer whose record was advanced to `S`, and a `headProof: "snapshot"`
+  record-proof writer whose record was advanced to `S`, a `headProof: "none"` writer
+  that does not refuse on the seal it read, and a `headProof: "snapshot"`
   writer after a `writeSnapshot` put an unmarked snapshot at `S` (below). One such write
   reopens the stream for every writer, because the check is on the event at the writer's
   `expectedVersion`. Reads report it (`seal.version < version`) while the sealing event is

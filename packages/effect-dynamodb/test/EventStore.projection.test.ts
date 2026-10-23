@@ -303,9 +303,16 @@ const InMemoryClient = mockDynamoClientLayer({
     }),
   putItem: (input) =>
     Effect.suspend(() => {
-      calls.putItem++
       const key = keyOf(input.TableName!, input.Item!)
       const current = store.get(key)
+      // An append of one event is a `PutItem` of the event (#173): the stream's
+      // write, not the projection's, so it is neither counted nor rejected.
+      if (input.Item?.__edd_e__?.S?.endsWith(".event") === true) {
+        if (current !== undefined) return Effect.fail(conditionalCheckFailed("PutItem"))
+        store.set(key, input.Item)
+        return Effect.succeed({} as never)
+      }
+      calls.putItem++
       if (
         (rejectPuts && input.ConditionExpression !== undefined) ||
         (rejectNextPuts > 0 && input.ConditionExpression !== undefined && rejectNextPuts-- > 0) ||
