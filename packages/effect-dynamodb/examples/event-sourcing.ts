@@ -38,6 +38,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { StreamSealed } from "@effect-dynamodb/schema/Errors.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
@@ -1692,6 +1693,48 @@ const program = Effect.gen(function* () {
   // #endregion
   const savingsHead = yield* ledgers.currentVersion(savings, { consistentRead: true })
   yield* Console.log(`Transfer: acc-1 v${transfer.version}, acc-2 v${savingsHead}`)
+
+  // --- Appending without the check: headProof "none" ---
+  yield* Console.log('\n=== headProof: "none" ===')
+  // #region head-proof-none
+  // A deposit reads the ledger in the same request, so it already knows what
+  // the contiguity check would prove: a version read from the stream is never
+  // ahead of the head. It takes over the check's other duty, the seal.
+  const depositAtHead = (id: { accountId: string; generation: string }, amount: number) =>
+    Effect.gen(function* () {
+      const latest = yield* ledgers.readLatest(id, { consistentRead: true })
+      if (latest.seal !== undefined) {
+        return yield* new StreamSealed({
+          streamName: "Ledger",
+          streamId: latest.seal.streamId,
+          sealedVersion: latest.seal.version,
+        })
+      }
+      return yield* ledgers.append(id, [new Deposited({ amount })], latest.version, {
+        headProof: "none",
+      })
+    })
+
+  const deposited = yield* depositAtHead(savings, 25)
+  // → version 3: one event, no check, sent as a single PutItem
+
+  // A writer that read the head before another one appended still loses the
+  // race: its event put lands on the taken version.
+  const lostRace = yield* ledgers
+    .append(savings, [new Deposited({ amount: 5 })], 2, { headProof: "none" })
+    .pipe(Effect.flip)
+  // → VersionConflict { expectedVersion: 2 }
+
+  // On a sealed ledger the caller's own read refuses, before anything is sent.
+  const refused = yield* depositAtHead(closing, 10).pipe(Effect.flip)
+  // → StreamSealed { sealedVersion: 4 }
+  // #endregion
+  assertEq(deposited.version, 3, "the deposit appends at the head")
+  assertEq(lostRace._tag, "VersionConflict", "a stale version still conflicts")
+  assertEq(refused._tag, "StreamSealed", "the caller refuses on the seal")
+  yield* Console.log(
+    `Deposit at v${deposited.version}; stale writer: ${lostRace._tag}; sealed ledger: ${refused._tag}`,
+  )
   yield* client.deleteTable({ TableName: ledgerConfig.name })
 
   // --- Cleanup ---

@@ -259,7 +259,7 @@ The handler returns `{ state, version, events }`, where `state` is the fold from
 
 ### Append limits and version contiguity
 
-`append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. That atomicity is bounded by DynamoDB's transaction limits:
+`append` writes every event in a single `TransactWriteItems` request, so an append is all-or-nothing — either every event in the batch is persisted or none is. An append whose request holds one item, its one event (the first event of a stream, or one event with [`headProof: "none"`](#appending-without-the-check-headproof-none), and no sentinel, snapshot or additional item), is sent as a plain conditional `PutItem` instead: the same item and condition, committed just as atomically, at 1 WCU per KB instead of a transaction's 2. Its failures are the same errors. That atomicity is bounded by DynamoDB's transaction limits:
 
 - **100 items per transaction.** Each event is one transact item, and when `expectedVersion > 0` the version-contiguity `ConditionCheck` (below) occupies one more slot unless a [head proof](#step-23-state-from-your-own-record) replaces it, as do any `additionalItems`, an idempotency sentinel and an inline snapshot. An append over the limit is rejected by DynamoDB and nothing is written; the library recognises the rejection, counts the items it sent, and fails with a typed `AppendTooLarge` error carrying that count, with DynamoDB's error as its `cause`. In practice a single append holds at most 100 events when `expectedVersion` is `0`, and at most 99 otherwise. The limit is exported as the `TRANSACT_WRITE_ITEMS_LIMIT` constant.
 - **4 MB total payload per transaction, 400 KB per item.** An append whose items pass 4 MB, or with any one item over 400 KB, is rejected by DynamoDB and nothing is written. The append fails with a `ValidationError` that names the culprit: the item (`the event at version 2`, the inline snapshot, the idempotency sentinel or `operation 0 (User)` among `additionalItems`) and its key, or for 4 MB the largest items. DynamoDB's own error is kept as the `cause`. Keep event payloads small; large blobs belong in S3 with a reference in the event.
@@ -268,7 +268,7 @@ An append is **never split** across transactions, because splitting breaks its a
 
 `append` also enforces that the appended range is **contiguous** with the stream head. Every event Put is conditioned on `attribute_not_exists(pk)`, which rejects *stale* expected versions (the target version slot already exists). In addition, when `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist — so an *ahead* expected version (say `expectedVersion: 10` on a stream whose head is at version 3) fails with `VersionConflict` instead of silently writing version 11 and leaving a permanent hole in the sequence. Both failure modes surface as the same `VersionConflict` error.
 
-The check reads the event at `expectedVersion`, and DynamoDB bills a `ConditionCheck` in a transaction at 2 WCU per KB of the item it checks, so with large events it is a real share of every append. When the transaction already holds an item that proves the head (the inline snapshot, or a state record of your own), `headProof` names that item and the check is left out: see [Proving the head with the snapshot](#proving-the-head-with-the-snapshot) and [Step 23](#step-23-state-from-your-own-record).
+The check reads the event at `expectedVersion`, and DynamoDB bills a `ConditionCheck` in a transaction at 2 WCU per KB of the item it checks, so with large events it is a real share of every append. When the transaction already holds an item that proves the head (the inline snapshot, or a state record of your own), `headProof` names that item and the check is left out: see [Proving the head with the snapshot](#proving-the-head-with-the-snapshot) and [Step 23](#step-23-state-from-your-own-record). A caller that read its `expectedVersion` from the stream can leave the check out with no proof item at all, by taking over its duties: see [`headProof: "none"`](#appending-without-the-check-headproof-none).
 
 ---
 
@@ -1955,7 +1955,7 @@ const sealedAt = yield* ledgers.append(
 - The seal version `S` is `expectedVersion + events.length`. `seal: false` or no `seal` does nothing.
 - `seal: true` with zero events, or a `seal` that is not a boolean, fails with `ValidationError` (`operation: "EventStore.append.seal"`) before anything is written.
 - On a stream with `snapshot: { mode: "inline" }` and no `every`, a sealing `append` must also pass `snapshot`. The snapshot it writes carries the marker too, so a snapshot read sees the seal (see [the head-proof rules](#head-proofs-and-sealed-streams) below). `commandHandler` always attaches the snapshot on those streams.
-- `seal` works with every other append option, including `idempotency`, `additionalItems`, `metadata`, `eventTimestamps` and both head proofs. `measureAppend` accepts it and counts the marker.
+- `seal` works with every other append option, including `idempotency`, `additionalItems`, `metadata`, `eventTimestamps` and every head proof. `measureAppend` accepts it and counts the marker.
 - A seal is permanent. There is no unseal.
 
 The seal costs nothing extra. Every append after version 0 already writes a version-contiguity `ConditionCheck` on the event at `expectedVersion`. Its condition becomes `attribute_exists(pk) AND attribute_not_exists(__edd_sealed__)`, so a writer that loaded after the seal fails it. A writer that loaded before the seal fails as it always did, because its next version is taken by the sealing event. Which error the writer gets is diagnosed from the cancellation reasons. Nothing is pre-read.
@@ -1967,6 +1967,8 @@ The seal costs nothing extra. Every append after version 0 already writes a vers
 | Further behind (`K < S - 1`) | Its first event put, at `K + 1` | `VersionConflict`; a handler's retry reloads and gets `StreamSealed` |
 | `expectedVersion = 0` | Its first event put, at 1 | `VersionConflict`, or `StreamSealed` when `S = 1` |
 | `headProof: "snapshot"` at `S` | The snapshot proof | `StreamSealed` (the snapshot is marked) |
+| `headProof: "none"` at `S - 1` | Its first event put, at `S` | `StreamSealed` |
+| `headProof: "none"` at `S` | Nothing: the caller must refuse | Its event lands past the seal (see [below](#appending-without-the-check-headproof-none)) |
 | Redelivered sealing command (same `commandId`) | The idempotency sentinel | `DuplicateCommand` |
 
 `StreamSealed` carries `streamName`, `streamId` and `sealedVersion`. It ranks after `DuplicateCommand` (a redelivery is the truer answer) and ahead of `VersionConflict`.
@@ -2139,10 +2141,70 @@ A head proof replaces the contiguity check, so the seal's clause in that check n
 
 Advancing the record to `S` lets a writer that loads it append at `S`: no contiguity check is written, its record condition holds, and event `S + 1` lands past the seal. Advance it only if every writer's record condition also tests your sealed flag. A seal of more than one event leaves the record more than one below `S`, where writers get `VersionConflict` and a handler loops; keep record-proof seals to one event.
 
+**`headProof: "none"`.** There is no check and no proof, so the library does not enforce the seal on that writer's append: refusing to append when the last event it read is sealed is the caller's duty (see [Appending without the check](#appending-without-the-check-headproof-none)). A writer that read the stream before the seal is still refused, because its first event put lands on the sealing event.
+
 :::caution[`writeSnapshot` must not target a sealed head with an unmarked snapshot]
 `writeSnapshot` is one plain conditional `PutItem`. It does not know whether the stream is sealed, and it never writes the marker. A job that snapshots streams should skip sealed ones (`readLatest(...).seal` is present), or seal through a definition that shares the writers' inline snapshot config: the sealing append then writes the marked snapshot at `S`, and the monotonic `writeSnapshot` never replaces it.
 
 The residual, when all three happen: a closer on a definition without the inline-without-`every` snapshot config seals at `S`, leaving the snapshot unmarked below `S`; a `writeSnapshot(id, state, S)` then puts an **unmarked** snapshot at `S`; and a writer with `headProof: "snapshot"` appends at `S`. Its proof holds on the unmarked snapshot, no contiguity check is written, and event `S + 1` lands and is reported as success. A verified `readLatest` still reports the seal (`seal.version < version`).
+:::
+
+### Appending without the check: `headProof: "none"`
+
+Some writers already know what the contiguity check would prove. A deposit that reads the ledger in the same request appends at a version it just read, and that version is never ahead of the head: events are never deleted, so the head only grows, and a version read from the stream can be stale but never ahead. For such a writer the check is pure cost. `headProof: "none"` leaves it out and writes no proof item, and a one-event append is then a single `PutItem`:
+
+```typescript region="head-proof-none" example="event-sourcing.ts"
+// A deposit reads the ledger in the same request, so it already knows what
+// the contiguity check would prove: a version read from the stream is never
+// ahead of the head. It takes over the check's other duty, the seal.
+const depositAtHead = (id: { accountId: string; generation: string }, amount: number) =>
+  Effect.gen(function* () {
+    const latest = yield* ledgers.readLatest(id, { consistentRead: true })
+    if (latest.seal !== undefined) {
+      return yield* new StreamSealed({
+        streamName: "Ledger",
+        streamId: latest.seal.streamId,
+        sealedVersion: latest.seal.version,
+      })
+    }
+    return yield* ledgers.append(id, [new Deposited({ amount })], latest.version, {
+      headProof: "none",
+    })
+  })
+
+const deposited = yield* depositAtHead(savings, 25)
+// → version 3: one event, no check, sent as a single PutItem
+
+// A writer that read the head before another one appended still loses the
+// race: its event put lands on the taken version.
+const lostRace = yield* ledgers
+  .append(savings, [new Deposited({ amount: 5 })], 2, { headProof: "none" })
+  .pipe(Effect.flip)
+// → VersionConflict { expectedVersion: 2 }
+
+// On a sealed ledger the caller's own read refuses, before anything is sent.
+const refused = yield* depositAtHead(closing, 10).pipe(Effect.flip)
+// → StreamSealed { sealedVersion: 4 }
+```
+
+**The caller guarantees the head.** It takes over both duties of the check:
+
+1. **No gap.** `expectedVersion` must never be ahead of the head. An ahead version writes its events past a gap that nothing fills. A version read from the stream (`read`, `readFrom`, `readLatest`, `currentVersion`, consistent or not) always meets this. A version from anywhere else (a cache, a client's `If-Match`, arithmetic) does not: keep the check.
+2. **The seal.** Refuse to append when the last event read is sealed (`StreamEvent.sealed`, or `LatestState.seal`). Nothing else stops an append at the seal's version: its event lands past the seal and reopens the stream for every writer (see [One write past the seal reopens the stream](#one-write-past-the-seal-reopens-the-stream)). A writer that read the stream before the seal still fails with `StreamSealed`, because its first event put lands on the sealing event.
+
+What stays the same:
+
+- Every event put is still conditioned on `attribute_not_exists(pk)`, so a stale `expectedVersion` (a lost race) is a `VersionConflict` with nothing written.
+- `"none"` combines with every other append option: `additionalItems`, `idempotency`, `snapshot` (which stays unconditional), `seal`, metadata and timestamps. Any of them makes the request more than one item, so it is a `TransactWriteItems`, without the check.
+- `measureAppend` accepts it and counts no check, as for any head proof.
+
+Where it is not accepted:
+
+- **`commandHandler`.** Its `headProof` option excludes `"none"` from the type, and an untyped `"none"` fails every call with `ValidationError` (`operation: "EventStore.commandHandler.headProof"`) before anything is read or written. Without a head proof the handler keeps the check.
+- **`appendOp`.** A nested append refuses every head proof.
+
+:::note[The single-item `PutItem`]
+Whenever an append's request would be exactly one item, its one event, the library sends a `PutItem` with that item, its condition and `ReturnValuesOnConditionCheckFailure: ALL_OLD`. That covers the first event of every stream (`expectedVersion: 0`, through `append` or `commandHandler`) as well as one-event `"none"` appends. One item commits atomically either way, so only the cost changes. Failures map to the transaction's errors: `StreamSealed` or `VersionConflict` from the returned item, a `ValidationError` naming the event for an item or key DynamoDB rejects, and `TransactionCancelled` (`operation: "PutItem"`) with reason `ThrottlingError` or `TransactionConflict` where a transaction would be cancelled for its item. The AWS SDK retries a throttled `PutItem` before it fails, so fewer throttling errors reach you. A nested `appendOp` always rides in its outer append's transaction.
 :::
 
 ### Side writes still land
@@ -2155,9 +2217,9 @@ An append with no events (only `additionalItems` and/or an idempotency sentinel)
 A writer on a library version before 1.33.0 writes the old contiguity check, and **can append past a seal**. Older readers ignore the marker.
 :::
 
-The seal is enforced on the event at a writer's `expectedVersion` (or the one after it), not on the stream. If any write gets past it (a pre-1.33 writer, a record-proof writer whose record was advanced to `S`, or the `writeSnapshot` residual above) and lands event `S + 1`, that event carries no marker. Every writer that then loads the head at `S + 1` passes the check and appends, and those events are on a generation nobody reads.
+The seal is enforced on the event at a writer's `expectedVersion` (or the one after it), not on the stream. If any write gets past it (a pre-1.33 writer, a record-proof writer whose record was advanced to `S`, a `headProof: "none"` writer that does not refuse on the seal it read, or the `writeSnapshot` residual above) and lands event `S + 1`, that event carries no marker. Every writer that then loads the head at `S + 1` passes the check and appends, and those events are on a generation nobody reads.
 
-The write side can't stop it without a pre-read. The read side reports it wherever the sealing event is among the items a read already fetches: `readLatest` sets `seal` from **any** marked event it reads, not only the newest, and the handler refuses to decide past a seal and logs the versions after it. A verified `readLatest` with an inline snapshot reads the snapshot and only a few events, so once enough events follow the seal, only a full `read` finds it. So: upgrade every writer first, keep a record-proof stream's record at `S - 1`, and never `writeSnapshot` a sealed head with an unmarked snapshot.
+The write side can't stop it without a pre-read. The read side reports it wherever the sealing event is among the items a read already fetches: `readLatest` sets `seal` from **any** marked event it reads, not only the newest, and the handler refuses to decide past a seal and logs the versions after it. A verified `readLatest` with an inline snapshot reads the snapshot and only a few events, so once enough events follow the seal, only a full `read` finds it. So: upgrade every writer first, keep a record-proof stream's record at `S - 1`, make every `headProof: "none"` writer refuse on a sealed last event, and never `writeSnapshot` a sealed head with an unmarked snapshot.
 
 ---
 
@@ -2249,6 +2311,8 @@ Effect.runPromise(main).then(() => console.log("\nDone."))
 | **Packed storage** | `makeStream({ storedAs: { data: DynamoModel.Packed(...) } })` and `snapshot.storedAs` store data and state as JSON, compressed above a threshold; readers decode by the stored form, so a stream can mix encodings |
 | **Shared indexes** | A GSI index's `partition` (from the stream id or the event) lets several streams write one partition, and its `snapshot` puts each stream's snapshot there too; `indexDefinitions` emits the shared GSI once; `readIndex` takes the `partition` |
 | **Head proof** | `headProof: "snapshot"` (inline without `every`) or `{ additionalItem: n }` names an item whose own condition proves the head, in place of the version-contiguity `ConditionCheck`; its failure is a `VersionConflict` |
+| **No head proof** | `append(..., { headProof: "none" })` leaves the check out for a caller whose `expectedVersion` was read from the stream; the caller refuses on a seal it read, and stale versions still conflict |
+| **Single-item append** | An append of one event and nothing else is a conditional `PutItem` (1 WCU per KB) instead of a transaction (2), with the same errors |
 | **State from your own record** | `commandHandler(..., { loadState })` loads state and head from the application's record instead of the stream; with `headProof: { additionalItem }`, the record written with every append is also the version guard |
 | **Sealing** | `append(..., { seal: true })` makes the append's last event the stream's final one; a later append fails with `StreamSealed` (terminal, never retried); `readLatest` returns the sealing event as `seal`, and `StreamEvent.sealed` marks it |
 | **Generation changeover** | `stream.appendOp(...)` in another append's `additionalItems` seals the old generation at the version its carried-over state was read at, in the transaction that opens the next one; the chain index is a whole-item put conditioned on a `revision` |

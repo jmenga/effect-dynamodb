@@ -117,7 +117,8 @@ The verdicts are those of the transactional path for the same failure.
 | `ValidationException` diagnosed (item over 400 KB, key too long, empty key) | `ValidationError` naming the event (`EventStore.append`, or `EventStore.append.indexes` for a stream-index key) | Same, by the same diagnosis and rewrite |
 | Throttling (`ProvisionedThroughputExceededException`, `ThrottlingException`) | `TransactionCancelled` (reason `ThrottlingError`) | `TransactionCancelled`, `operation: "PutItem"`, reason `ThrottlingError` |
 | `TransactionConflictException` (item in another transaction) | `TransactionCancelled` (reason `TransactionConflict`) | `TransactionCancelled`, `operation: "PutItem"`, reason `TransactionConflict` |
-| Anything else (`InternalServerError`, `ResourceNotFoundError`, an undiagnosed validation error, `DynamoError`) | Passed through | Passed through |
+| `ValidationException` "Type mismatch" (a key, or an index key, of the wrong type) | `TransactionCancelled` (reason `ValidationError`): an item reason in a transaction | `TransactionCancelled`, `operation: "PutItem"`, reason `ValidationError` |
+| Anything else (`InternalServerError`, `ResourceNotFoundError`, another undiagnosed validation error, `DynamoError`) | Passed through (the other validation errors are request errors of a one-item transaction too, as observed on DynamoDB Local) | Passed through |
 
 Both verdicts come from the same `streamAppendVerdict` the transaction uses,
 fed with the one reason, so they can't drift. The success value is unchanged:
