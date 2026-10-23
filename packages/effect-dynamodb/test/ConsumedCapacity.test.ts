@@ -7,7 +7,18 @@
 import { describe, expect, expectTypeOf, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Effect, Exit, Fiber, Layer, Logger, Schema, Stream, type Tracer } from "effect"
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Logger,
+  Schema,
+  Stream,
+  type Tracer,
+} from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
@@ -1013,6 +1024,159 @@ describe("nesting", () => {
         yield* client.getItem({ TableName: "shop-table", Key: { pk: { S: "x" }, sk: { S: "y" } } })
       }).pipe(Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))))
       expect(reports.map((r) => r.operation)).toEqual(["DynamoClient.GetItem"])
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 7b. Work that outlives its operation
+// ---------------------------------------------------------------------------
+
+describe("work that outlives its operation", () => {
+  /**
+   * An in-memory client whose `method` signals `started` and then waits for
+   * `gate` before answering, so a test can close an operation while the
+   * request is in flight.
+   */
+  const gatedClient = (method: "putItem" | "getItem") =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      const inner = serviceOf(InMemoryClient)
+      const raw = inner[method] as (input: any) => Effect.Effect<any, any>
+      const gated = {
+        ...inner,
+        [method]: (input: any) =>
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Deferred.await(gate)),
+            Effect.andThen(raw(input)),
+          ),
+      } as DynamoClientService
+      const { service } = withConsumedCapacity(gated)
+      return { service, started, gate }
+    })
+
+  const summary = (reports: ReadonlyArray<ConsumedCapacity.OperationReport>) =>
+    reports.map((r) => ({
+      operation: r.operation,
+      requests: r.requests,
+      capacityUnits: r.capacityUnits,
+      nested: r.nested.map((n) => [n.operation, n.calls, n.requests]),
+    }))
+
+  it.effect("a library op forked out of a root and finishing after it reports as a root", () =>
+    Effect.gen(function* () {
+      const { service, started, gate } = yield* gatedClient("putItem")
+      const { reports, onOperation } = collectReports()
+      const fiber = yield* Effect.gen(function* () {
+        const forked = yield* Effect.forkDetach(Orders.put(order(1)).asEffect())
+        yield* Deferred.await(started)
+        return forked
+      }).pipe(
+        ConsumedCapacity.withOperation("root"),
+        Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))),
+      )
+      expect(summary(reports)).toEqual([
+        { operation: "root", requests: 0, capacityUnits: 0, nested: [] },
+      ])
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(fiber)
+      expect(summary(reports)).toEqual([
+        { operation: "root", requests: 0, capacityUnits: 0, nested: [] },
+        { operation: "Entity.put", requests: 1, capacityUnits: 1, nested: [] },
+      ])
+    }),
+  )
+
+  it.effect("a bare request in flight when its root closes reports as DynamoClient.<Command>", () =>
+    Effect.gen(function* () {
+      const { service, started, gate } = yield* gatedClient("getItem")
+      const { reports, onOperation } = collectReports()
+      const fiber = yield* Effect.gen(function* () {
+        const forked = yield* Effect.forkDetach(
+          Effect.flatMap(Capacity.client, (client) =>
+            client.getItem({ TableName: "shop-table", Key: { pk: { S: "x" }, sk: { S: "y" } } }),
+          ),
+        )
+        yield* Deferred.await(started)
+        return forked
+      }).pipe(
+        ConsumedCapacity.withOperation("root"),
+        Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))),
+      )
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(fiber)
+      expect(summary(reports)).toEqual([
+        { operation: "root", requests: 0, capacityUnits: 0, nested: [] },
+        { operation: "DynamoClient.GetItem", requests: 1, capacityUnits: 0.5, nested: [] },
+      ])
+      expect(reports[1]!.outcome).toBe("success")
+    }),
+  )
+
+  it.effect(
+    "work spanning its root's close is reported once: before in the root, after in its own",
+    () =>
+      Effect.gen(function* () {
+        const { service, started, gate } = yield* gatedClient("getItem")
+        const { reports, onOperation } = collectReports()
+        const tracer = recordingTracer()
+        const child = Effect.gen(function* () {
+          yield* Orders.put(order(1))
+          yield* Orders.get({ orderId: "o-1" })
+        }).pipe(ConsumedCapacity.withOperation("child"))
+        const fiber = yield* Effect.gen(function* () {
+          const forked = yield* Effect.forkDetach(child)
+          yield* Deferred.await(started)
+          return forked
+        }).pipe(
+          ConsumedCapacity.withOperation("root"),
+          Effect.provide(
+            Layer.mergeAll(clientLayer(service), enabled({ onOperation }), tracer.layer),
+          ),
+        )
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(fiber)
+        expect(summary(reports)).toEqual([
+          { operation: "root", requests: 1, capacityUnits: 1, nested: [] },
+          { operation: "child", requests: 1, capacityUnits: 0.5, nested: [["Entity.get", 1, 1]] },
+        ])
+        // Summing reports counts every request exactly once.
+        expect(reports.reduce((sum, r) => sum + r.requests, 0)).toBe(2)
+        // The child's span still covers its whole life.
+        const span = tracer.named().find((s) => s.name === "effect-dynamodb.child")!
+        expect(span.attributes.get(ConsumedCapacity.Attributes.requestCount)).toBe(2)
+        expect(span.attributes.get(ConsumedCapacity.Attributes.total)).toBe(1.5)
+      }),
+  )
+
+  it.effect("a child outliving an inner operation is charged to the still-open root", () =>
+    Effect.gen(function* () {
+      const { service, started, gate } = yield* gatedClient("putItem")
+      const { reports, onOperation } = collectReports()
+      yield* Effect.gen(function* () {
+        const fiber = yield* Effect.gen(function* () {
+          const forked = yield* Effect.forkDetach(Orders.put(order(1)).asEffect())
+          yield* Deferred.await(started)
+          return forked
+        }).pipe(ConsumedCapacity.withOperation("inner"))
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(fiber)
+      }).pipe(
+        ConsumedCapacity.withOperation("root"),
+        Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))),
+      )
+      expect(summary(reports)).toEqual([
+        {
+          operation: "root",
+          requests: 1,
+          capacityUnits: 1,
+          nested: [
+            ["inner", 1, 0],
+            ["Entity.put", 1, 1],
+          ],
+        },
+      ])
     }),
   )
 })

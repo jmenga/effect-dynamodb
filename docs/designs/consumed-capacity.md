@@ -419,18 +419,38 @@ like this:
    run time.
 2. Read `CurrentOperation`, an internal `Context.Reference<Scope | "suppressed" | undefined>`,
    default `undefined`. `"suppressed"` (set only while an observer runs, §6.5) means "run the
-   effect unchanged". A scope that has already **closed** is treated as absent: a request or
-   operation that finds a closed scope current (a client built inside an operation and kept, a
-   fiber that outlived its operation) becomes a root of its own instead of nesting under a
-   dead scope and being lost.
+   effect unchanged". A scope that has already **closed** stands for its nearest still-open
+   ancestor: a request or operation that finds a closed scope current (a fiber that outlived
+   its operation) nests under that ancestor, and becomes a root of its own only when every
+   enclosing scope has closed. (A client built inside an operation and kept never sees that
+   operation at all: bind sites strip it, §6.6.)
 3. Create `scope = { name, opts, parent: current, totals, children }` and run the effect with
-   `CurrentOperation = scope`. Child fibers inherit it.
-4. On exit (success, failure, interruption), freeze the totals, annotate the span, and, **if
-   `parent === undefined`**, build the `OperationReport` and call `onOperation` (§6.5 for
-   where it runs).
+   `CurrentOperation = scope`. Child fibers inherit it. The parent tracks its open children.
+4. On exit (success, failure, interruption), freeze the totals, annotate the span, hand over
+   any children still running (below), and, **if `parent === undefined`**, build the
+   `OperationReport` and call `onOperation` (§6.5 for where it runs).
 
 A request records into its scope **and every ancestor** (walking `parent`). So each scope's
 totals are inclusive.
+
+**Work that outlives its operation.** A library call forked out of an operation (`forkIn`
+an outer scope, `forkDetach`) can still be running when the operation closes. Such work is
+never lost, and never counted twice:
+
+- When a scope closes while children of it are still open, each child is handed to the
+  closing scope's parent, or, when the closing scope is the root, becomes a root of its own.
+  Invariant: an open scope's parent is open or absent.
+- What the child (and everything open under it) recorded up to that moment is already in
+  the closing scope's totals, so its reportable totals and `nested` are cleared: its own
+  report, or its entry in the new parent's `nested`, covers only the work done afterwards.
+  Its span keeps covering its whole life (the cleared part is carried for the span only).
+- A request records at its exit into the nearest open scope at or above the one it was sent
+  in. If every one of them closed while it was in flight, it is reported as an implicit
+  `DynamoClient.<Command>` root (§4.1) with no span of its own: it already ran under its
+  operation's span.
+
+So summing `onOperation` reports still counts every request exactly once. A root's report
+may arrive before the late work it started; that late work arrives in a later report.
 
 ### 6.2 The rule
 
@@ -515,7 +535,8 @@ does slow I/O.
   `makeFromConfig` alone is not enough). Without the second, every span of a bound operation
   would hang off the span that was current at bind time (an application-lifetime span),
   not the caller's request span. The geo package calls the public `detachContext`.
-- **Closed scopes are absent** (§6.1, step 2), as a backstop for any capture this misses.
+- **Closed scopes stand for their nearest open ancestor** (§6.1, step 2), as a backstop for
+  any capture this misses, and so that work outliving its operation is never lost (§6.1).
 - **Forked fibers.** The change feed (`change-feed/ChangeFeed.ts`) forks long-lived fibers
   with `Effect.forkIn`: the lease-renewal loop and the per-shard lifecycles. They are started
   with `CurrentOperation` cleared, so each `CheckpointStore.*` call they make is a root
@@ -813,6 +834,11 @@ tests with mocked responses.
    - `Aggregate.update` and `Transaction.transactWrite` give one observer call each.
    - Geo-style concurrent fan-out under one `withOperation` sums correctly.
    - A `Query.collect` run directly is a root; run under `Entity.query` it is no extra scope.
+   - Work that outlives its operation (§6.1): a library op forked out of a root and finishing
+     after it reports as a root of its own; a bare request in flight when its root closes
+     reports as `DynamoClient.<Command>`; work spanning its root's close is reported once
+     (before in the root, after in its own report) while its span covers its whole life; a
+     child outliving an inner operation is charged to the still-open root.
 8. **Decorated / mocked clients.**
    - A user decorator layer (`Layer.effect(DynamoClient, Effect.map(DynamoClient, decorate))`)
      is instrumented and counted once.
@@ -974,7 +1000,7 @@ Every finding was checked against the code; all eleven were real. How each is re
 |---|---|---|---|
 | R1 | blocker | An observer writing through a client bound with reporting on recursed forever (captured `Reporting` beats a run-time "off"). | **Accepted.** The observer runs under `CurrentOperation = "suppressed"`, checked before `Reporting`; no bind captures `CurrentOperation` (§6.5, §6.6). Test §11.2-10 uses a client bound under the enabled layer. |
 | R2 | major | Bind sites capture `Tracer.ParentSpan`, so bound spans parent to the bind-time span. | **Accepted.** `detachContext` omits it at every bind site (§6.6, S29). Test: bind under span A, call under B, parent is B. |
-| R3 | major | `Entity.bind` (and `EventStore.ts` `bindProjection`) was missing from the omit list; `makeFromConfig → Entity.bind` re-captures; geo could not omit an internal reference. | **Accepted.** All six capture sites use `detachContext`, which is public for geo; closed scopes are treated as absent as a backstop (§6.1, §6.6). |
+| R3 | major | `Entity.bind` (and `EventStore.ts` `bindProjection`) was missing from the omit list; `makeFromConfig → Entity.bind` re-captures; geo could not omit an internal reference. | **Accepted.** All six capture sites use `detachContext`, which is public for geo; a closed scope stands for its nearest open ancestor as a backstop (§6.1, §6.6). |
 | R4 | major | `paginate` read the run-time `Reporting` while effect terminals read the captured one. | **Accepted.** Stream settings resolve at start inside `provide` and are provided to the pulls (§7.3, §3.3). Tests on all four terminals for bind-only and run-only enablement. |
 | R5 | major | Scopes on `_run` made internal compositions (`updateOrCreate → create._run`, the no-op re-read) open nested scopes inside planning. | **Accepted.** Scopes sit on public terminals via `_exec`; `_run` stays unwrapped (§4.2, §9.1). |
 | R6 | minor | Wrapping the unbound `GeoIndex.put` would change its return type. | **Accepted.** Only the bound `put` reports as `GeoIndex.put` (§9.2, S28). |
