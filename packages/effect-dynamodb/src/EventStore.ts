@@ -15,7 +15,10 @@
  *   state record as the load via `loadState`)
  * - Head proofs (`append({ headProof })`, #164): an additional item or the
  *   inline snapshot proves the stream head in place of the version-contiguity
- *   `ConditionCheck`
+ *   `ConditionCheck`, or (`headProof: "none"`, #173) the caller owns the head
+ *   and no proof is written
+ * - A one-item append (its one event, nothing else) is a plain conditional
+ *   `PutItem` rather than a transaction (#173)
  * - Sealing (#166): `append(..., { seal: true })` makes its last event the
  *   stream's final one (`StreamSealed` for any later append), and
  *   `stream.appendOp(...)` carries one stream's append — sealing or not — in
@@ -59,7 +62,10 @@ import {
   type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
+  isAwsThrottling,
   isAwsTransactionCancelled,
+  isAwsTransactionConflict,
+  isAwsValidationError,
   type OptimisticLockError,
   StreamSealed,
   TransactionCancelled,
@@ -127,6 +133,7 @@ import {
   type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
+  type KeyAttributes,
   mergeKeyAttributes,
   withCause,
 } from "./internal/WriteDiagnosis.js"
@@ -386,7 +393,11 @@ export interface AppendMeasurement {
    * sentinel and the inline snapshot) add to the `TransactWriteItems` request
    * — its 4 MB (4,194,304-byte) limit counts items, keys and expressions.
    * Caller `additionalItems` are not included: add their size yourself. With
-   * a `headProof` there is no contiguity check to count.
+   * a `headProof` (`"none"` included) there is no contiguity check to count.
+   *
+   * An append whose only item is its one event is sent as a `PutItem`
+   * instead (see {@link EventStream.append}), to which the 4 MB limit does
+   * not apply; the number is then that one item's share.
    */
   readonly transactionBytes: number
 }
@@ -501,17 +512,22 @@ export type AppendMetadataOptions<TMetadata> =
     }
 
 /**
- * The item of an {@link EventStream.append} that proves the stream head is at
- * `expectedVersion`, in place of the version-contiguity `ConditionCheck` (see
- * {@link AppendOptionsBase.headProof}).
+ * What stands in for the version-contiguity `ConditionCheck` of an
+ * {@link EventStream.append} (see {@link AppendOptionsBase.headProof}).
  *
  * - `{ additionalItem: n }` — `additionalItems[n]`, whose own condition holds
  *   only when the stream is at `expectedVersion` (the caller's state record,
  *   conditioned on the version it was loaded at, or on its absence at 0).
  * - `"snapshot"` — the append's inline snapshot, conditioned on
  *   `asOfVersion = expectedVersion`.
+ * - `"none"` — nothing: **the caller guarantees the head**, and takes over
+ *   both duties of the check — `expectedVersion` is never ahead of the head,
+ *   and no append follows a sealing event the caller read (see
+ *   {@link AppendOptionsBase.headProof}). `append` and `measureAppend` only:
+ *   {@link CommandHandlerOptions.headProof} and a nested
+ *   {@link EventStream.appendOp} refuse it.
  */
-export type HeadProof = { readonly additionalItem: number } | "snapshot"
+export type HeadProof = { readonly additionalItem: number } | "snapshot" | "none"
 
 /**
  * The options of {@link EventStream.append} other than its metadata (see
@@ -626,6 +642,31 @@ export interface AppendOptionsBase<TState = never> {
    *   known to be at the head, as {@link CommandHandlerOptions.headProof}
    *   does.
    *
+   * - `"none"` (#173) — no check and no proof: **the caller guarantees the
+   *   head.** Use it when the caller already knows what the check would
+   *   prove, to save its cost. The caller takes over both of its duties:
+   *
+   *   1. **No gap.** `expectedVersion` must never be ahead of the head: an
+   *      ahead version writes its events past a gap that nothing fills. A
+   *      version read from the stream (`read`, `readFrom`, `readLatest`,
+   *      `currentVersion`, consistent or not) always meets this: events are
+   *      never deleted, so the head only grows, and a version read from it
+   *      can be stale but never ahead. A version from anywhere else (a cache,
+   *      a client's If-Match, arithmetic) does not: keep the check.
+   *   2. **The seal.** Refuse to append when the last event read is sealed
+   *      ({@link StreamEvent.sealed}, {@link LatestState.seal}). Nothing
+   *      else stops an append at the seal's version: its first event lands
+   *      past the seal and reopens the stream for every writer. A writer
+   *      that loaded before the seal still fails: its first event put lands
+   *      on the sealing event, and it gets `StreamSealed`.
+   *
+   *   The event puts still reject a stale `expectedVersion`
+   *   (`VersionConflict`), as they always do. Combines with every other
+   *   option; an inline `snapshot` stays unconditional. `append` and
+   *   `measureAppend` only: {@link CommandHandlerOptions.headProof} does not
+   *   accept it (a `ValidationError` for an untyped caller), and a nested
+   *   {@link EventStream.appendOp} refuses every head proof.
+   *
    * **On a sealed stream** ({@link AppendOptionsBase.seal}): a head proof
    * replaces the contiguity check, which is where the seal is enforced.
    *
@@ -648,6 +689,8 @@ export interface AppendOptionsBase<TState = never> {
    *   append past the seal, unless every writer's record condition also tests
    *   the sealed flag. A seal of several events leaves a record-proof writer
    *   on `VersionConflict` instead.
+   * - `"none"`: the library does not enforce the seal — that is the caller's
+   *   duty 2 above.
    */
   readonly headProof?: HeadProof | undefined
   /**
@@ -672,8 +715,9 @@ export interface AppendOptionsBase<TState = never> {
    *   `additionalItems` use {@link EventStream.appendOp}.
    *
    * **Enforcement.** Every append after version 0 already checks the event
-   * at its `expectedVersion`; that check also requires the event to be
-   * unmarked. A writer that loaded after the seal fails it; one that loaded
+   * at its `expectedVersion` (unless a {@link headProof} replaces the check);
+   * that check also requires the event to be unmarked. A writer that loaded
+   * after the seal fails it; one that loaded
    * just before fails on its first event put, which lands on the sealing
    * event; both get `StreamSealed`. A writer further behind gets
    * `VersionConflict` and learns of the seal when it reloads.
@@ -1329,6 +1373,18 @@ const sealedVersionOf = (
 }
 
 /**
+ * @internal A `PutItem` validation error that a transaction reports as its
+ * item's cancellation reason (`ValidationError`) rather than as a request
+ * error: a key whose type is not the table's or an index's ("Type mismatch
+ * for key", "Type mismatch for Index Key"). Observed on DynamoDB Local, where
+ * an oversized item, an empty or oversized index key are request errors of
+ * the transaction as of the `PutItem` — and named by the diagnosis on both —
+ * and an oversized table key is a cancellation reason the diagnosis names.
+ * The single-item fast path (#173) reports these as the transaction does.
+ */
+const ITEM_REASON_VALIDATION = /Type mismatch/i
+
+/**
  * @internal What a cancelled append means for one stream, from the reasons of
  * its own items: `[0, guardCount)` the contiguity check,
  * `[guardCount, guardCount + eventCount)` the event puts, and the snapshot at
@@ -1813,20 +1869,20 @@ const snapshotProofRefusal = (
           `${settings.every === undefined ? "" : ` with every: ${settings.every}`}.`)
 
 /**
- * @internal Why a `headProof` is malformed — not `"snapshot"` nor
+ * @internal Why a `headProof` is malformed — not `"snapshot"`, `"none"` nor
  * `{ additionalItem: n }` with `n` a non-negative integer — or `undefined`
  * when it is well-formed.
  */
 const headProofShapeProblem = (headProof: unknown): string | undefined => {
-  if (headProof === "snapshot") return undefined
+  if (headProof === "snapshot" || headProof === "none") return undefined
   const n =
     typeof headProof === "object" && headProof !== null
       ? (headProof as { readonly additionalItem?: unknown }).additionalItem
       : undefined
   return typeof n === "number" && Number.isInteger(n) && n >= 0
     ? undefined
-    : `headProof must be "snapshot" or { additionalItem: n } with n a non-negative integer; ` +
-        `received ${JSON.stringify(headProof) ?? String(headProof)}. Nothing was written.`
+    : `headProof must be "snapshot", "none" or { additionalItem: n } with n a non-negative ` +
+        `integer; received ${JSON.stringify(headProof) ?? String(headProof)}. Nothing was written.`
 }
 
 /**
@@ -2001,6 +2057,16 @@ export interface EventStream<
   /**
    * Append `events` after `expectedVersion`, atomically, in one transaction —
    * see {@link AppendOptions}.
+   *
+   * An append whose request holds one item, its one event (no contiguity
+   * check, sentinel, snapshot or additional item: a one-event append at
+   * version 0, or with `headProof: "none"`), is sent as a `PutItem` with the
+   * same item and condition instead (#173): one item commits atomically
+   * either way, at half the write cost. Its failures are reported as the
+   * transaction's would be — `StreamSealed`, `VersionConflict`, a diagnosed
+   * `ValidationError`, and `TransactionCancelled` (`operation: "PutItem"`)
+   * for throttling or a conflicting transaction.
+   *
    * A method, like `writeSnapshot`, so a snapshot-less stream (whose
    * `options.snapshot` is `never`) stays assignable to other streams.
    */
@@ -2971,9 +3037,12 @@ export const makeStream = <
     )
 
   /**
-   * Map a failed `TransactWriteItems` of an append to its verdict. Resolves to
+   * Send an append — see {@link AppendTransaction} for its layout. Resolves to
    * the race a guarded additional put lost (so the transaction is built and
    * written again), and fails with every other verdict.
+   *
+   * A request of one item, the append's one event, is a `PutItem` (#173): see
+   * {@link sendAppendPut}. Everything else is one `TransactWriteItems`.
    */
   const sendAppendTransaction = (
     client: DynamoClientService,
@@ -2981,7 +3050,6 @@ export const makeStream = <
     streamIdStr: string,
     commandId: string | undefined,
   ): Effect.Effect<OptimisticLockError | ConcurrentModification | undefined, AppendError> => {
-    const sent = () => ({ _tag: "Transaction" as const, items: tx.items, targets: tx.targets })
     const diagnosed = (
       diagnosis: Diagnosis,
       original: unknown,
@@ -2995,6 +3063,21 @@ export const makeStream = <
             cause: original,
           })
         : appendLimitError(diagnosis, original, tx)
+    // The stream's own key attributes and the additional items', for the
+    // key-size diagnosis.
+    const keys = () =>
+      mergeKeyAttributes(
+        {
+          partition: ["pk", ...streamIndexes.map((idx) => idx.pk)],
+          sort: ["sk", ...streamIndexes.map((idx) => idx.sk)],
+        },
+        tx.additional.keys(),
+      )
+    const lone = tx.items.length === 1 && tx.eventCount === 1 ? tx.items[0]!.Put : undefined
+    if (lone !== undefined) {
+      return sendAppendPut(client, tx, lone, streamIdStr, keys, diagnosed)
+    }
+    const sent = () => ({ _tag: "Transaction" as const, items: tx.items, targets: tx.targets })
     return client.transactWriteItems({ TransactItems: tx.items }).pipe(
       Effect.as(undefined),
       // One operation per item (#133, #144): diagnosed BEFORE the conditional
@@ -3047,11 +3130,11 @@ export const makeStream = <
 
           // The head proof (#164) stands in for the contiguity check, so its
           // own condition failing shares their verdict — ahead of the other
-          // additional items.
+          // additional items. `"none"` (#173) has no item to fail.
           const proofFailed =
             tx.headProof === "snapshot"
               ? failedAt(tx.snapshotIndex)
-              : tx.headProof !== undefined &&
+              : typeof tx.headProof === "object" &&
                 opConditionFailed(
                   tx.additional,
                   rawReasons,
@@ -3108,20 +3191,96 @@ export const makeStream = <
       // transaction sent, naming the event, sentinel, snapshot or additional
       // item at fault. Over 100 items is `AppendTooLarge`, with the EXPANDED
       // count.
-      diagnoseFailure({
-        sent,
-        keys: () =>
-          mergeKeyAttributes(
-            {
-              partition: ["pk", ...streamIndexes.map((idx) => idx.pk)],
-              sort: ["sk", ...streamIndexes.map((idx) => idx.sk)],
-            },
-            tx.additional.keys(),
-          ),
-        rewrite: diagnosed,
-      }),
+      diagnoseFailure({ sent, keys, rewrite: diagnosed }),
     )
   }
+
+  /**
+   * The single-item fast path (#173): an append whose request is its one
+   * event `Put` sends it as a `PutItem` — the same item, condition and
+   * `ALL_OLD` — at 1 WCU per KB instead of a transaction's 2. One item
+   * commits atomically either way, and every failure maps to the verdict the
+   * transaction gives for the same case:
+   *
+   * - a failed condition is judged by {@link streamAppendVerdict} from the
+   *   one reason it stands for: `StreamSealed` when the returned item is
+   *   marked, `VersionConflict` otherwise;
+   * - a rejection DynamoDB names (an item over 400 KB, a key too long or
+   *   empty) is diagnosed against the same item and rewritten by the same
+   *   `rewrite`, so it names the event as the transaction's does;
+   * - throttling, a conflicting transaction and a key of the wrong type are
+   *   `TransactionCancelled` with the reason a transaction reports for its
+   *   item (`ThrottlingError`, `TransactionConflict`, `ValidationError`):
+   *   DynamoDB fails a `PutItem` with a request error where it cancels a
+   *   transaction for its item (see {@link ITEM_REASON_VALIDATION});
+   * - anything else passes through, as it does from the transaction (the
+   *   other validation errors a one-item transaction gets are request
+   *   errors there too).
+   */
+  const sendAppendPut = (
+    client: DynamoClientService,
+    tx: AppendTransaction,
+    put: NonNullable<TransactWriteItem["Put"]>,
+    streamIdStr: string,
+    keys: () => KeyAttributes,
+    diagnosed: (diagnosis: Diagnosis, original: unknown) => AppendTooLarge | ValidationError,
+  ): Effect.Effect<undefined, AppendError> =>
+    client.putItem(put).pipe(
+      Effect.as(undefined),
+      // Diagnosed first: what it names is terminal, and what it cannot
+      // explain is mapped below.
+      diagnoseFailure({
+        sent: () => ({
+          _tag: "Item" as const,
+          item: tx.items[0]!,
+          target: () => tx.targets()[0]!,
+        }),
+        keys,
+        rewrite: diagnosed,
+      }),
+      Effect.catch(
+        (
+          error: DynamoClientError | AppendTooLarge | ValidationError,
+        ): Effect.Effect<never, AppendError> => {
+          if (error._tag === "AppendTooLarge" || error._tag === "ValidationError") {
+            return Effect.fail(error)
+          }
+          const cause = error.cause
+          if (isAwsConditionalCheckFailed(cause)) {
+            const verdict = streamAppendVerdict(
+              [{ Code: "ConditionalCheckFailed", Item: cause.Item }],
+              {
+                guardCount: 0,
+                eventCount: 1,
+                snapshotIndex: -1,
+                streamName: config.streamName,
+                streamId: streamIdStr,
+                expectedVersion: tx.expectedVersion,
+              },
+            )
+            return Effect.fail(verdict ?? error)
+          }
+          const code = isAwsThrottling(cause)
+            ? "ThrottlingError"
+            : isAwsTransactionConflict(cause)
+              ? "TransactionConflict"
+              : isAwsValidationError(cause) &&
+                  ITEM_REASON_VALIDATION.test(
+                    (cause as { readonly message?: string }).message ?? "",
+                  )
+                ? "ValidationError"
+                : undefined
+          if (code === undefined) return Effect.fail(error)
+          return Effect.fail(
+            new TransactionCancelled({
+              operation: "PutItem",
+              reasons: [{ code, message: (cause as { readonly message?: string }).message }],
+              cause,
+            }),
+          )
+        },
+      ),
+    )
 
   /**
    * A diagnosed rejection of an append (#144) other than its item count. An
@@ -5590,8 +5749,13 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    *   unverified one ({@link verifySnapshot}`: false`); otherwise that
    *   append writes the check. A conflict goes through the same stale-snapshot
    *   handling and retry policy as without it.
+   *
+   * `"none"` is not accepted here (#173): it is excluded from the type, and
+   * for an untyped caller every call fails with `ValidationError`
+   * (`operation: "EventStore.commandHandler.headProof"`) before anything is
+   * read or written.
    */
-  readonly headProof?: HeadProof | undefined
+  readonly headProof?: Exclude<HeadProof, "none"> | undefined
 }
 
 /** @internal The error of a handler config's {@link CommandHandlerOptions.loadState}. */
@@ -6504,6 +6668,19 @@ const makeCommandHandlerImpl = <
     }
 
     const attempt = Effect.gen(function* () {
+      // `headProof: "none"` (#173) is `append`'s alone for now: refused for an
+      // untyped caller before anything is read. Not retryable, as below.
+      if ((headProof as HeadProof | undefined) === "none") {
+        return yield* new ValidationError({
+          entityType: stream.streamName,
+          operation: "EventStore.commandHandler.headProof",
+          cause:
+            'commandHandler does not accept headProof: "none": it is accepted by append only. ' +
+            "Omit headProof to keep the contiguity check, or name a proof item. " +
+            "Nothing was written.",
+        })
+      }
+
       // Backstop for JS callers and `any`-shaped call sites: silently degrading
       // to at-least-once would look like success right up until the day a
       // duplicate mattered. Not retryable — `while` below only retries
