@@ -55,6 +55,7 @@ export default defineConfig({
               slug: "guides/projections-advanced",
             },
             { label: "Change Feed outside Lambda", slug: "guides/change-feed" },
+            { label: "Consumed Capacity", slug: "guides/consumed-capacity" },
             { label: "Testing", slug: "guides/testing" },
             { label: "Validations", slug: "guides/validations" },
             { label: "Advanced", slug: "guides/advanced" },
