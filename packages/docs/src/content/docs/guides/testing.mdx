@@ -161,6 +161,8 @@ const TestLayer = Layer.merge(MockDynamoClient, MainTable.layer({ name: "test-ta
   In vitest tests, you can use `vi.fn()` for the mock functions instead of tracking calls manually. The `Layer.succeed` pattern is the same either way.
 </Aside>
 
+**Testing a consumed-capacity observer.** With a [`ConsumedCapacity`](/effect-dynamodb/guides/consumed-capacity/) layer in context, the library wraps whatever `DynamoClient` is provided — a mock included — and adds `ReturnConsumedCapacity` to each request it sends. To test an observer, have the mock answer such a request with a `ConsumedCapacity` field (`{ TableName: "test-table", CapacityUnits: 1 }`, or an array for batch and transaction commands) and assert on the reports the observer receives. A mock that returns no `ConsumedCapacity` still works: its requests are counted, as `unreportedRequests`.
+
 ---
 
 ## Verify a Put Operation

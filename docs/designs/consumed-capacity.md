@@ -562,7 +562,10 @@ These are summed into one scope, with every table listed:
   consumer's fiber, outside `provide`. Reporting for a stream therefore follows exactly the
   bind-time / run-time rule of §3.3, like every effect terminal.
 - **Every page request in the run records into it**, through the provided `CurrentOperation`.
-- **It closes with `Stream.onExit`.** On normal completion the outcome is `"success"`. When a
+- **It closes with a finalizer of the run's scope** (`Effect.addFinalizer` inside the scoped
+  `unwrap`; as implemented). So a stream's report, unlike an effect's, always goes out from a
+  finalizer, uninterruptibly: the advice to fork slow observer I/O (§6.5) applies to every
+  stream run. On normal completion the outcome is `"success"`. When a
   consumer stops early (`Stream.take`, `runHead`), the stream completes from its own side, the
   outcome is `"success"`, and the report covers **the pages actually read**. On failure it is
   `"failure"`, and on interruption `"interrupted"`.
