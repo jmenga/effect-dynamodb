@@ -4527,6 +4527,10 @@ which planning (`TransactPlan`) calls. Query terminals (`Query.collect` / `execu
   ancestor (inclusive totals), it gets a span with `effect_dynamodb.nested = true`, and it
   appears in the root report's `nested` breakdown (direct children, grouped by name) — but it
   gets no observer call. Summing observer reports never double counts.
+- Work that outlives its operation (forked out with `forkDetach` / `forkIn`) is never lost:
+  what it did before the operation closed is in that operation's report; afterwards it is
+  charged to the nearest still-open enclosing operation, or reported as a root of its own
+  (a bare request as `DynamoClient.<Command>`). Still no double counting.
 - `ConsumedCapacity.withOperation(name, { target, index })` / `withOperationStream` open an
   application scope the same way.
 - Streams (`paginate()`) are one operation per run, closed by a finalizer: early termination
