@@ -52,14 +52,19 @@ puts are unchanged. Every other option combines with it as it does today
 ### The contract: the caller takes over both duties of the check
 
 1. **No gap.** `expectedVersion` must never be ahead of the head. An ahead
-   version writes past a gap that no later append can fill. Any version read
-   from the stream meets this, whether the read was consistent or not.
+   version writes past a gap that no later append can fill. The version of any
+   event read from the stream meets this, whether the read was consistent or
+   not (see below for which reads qualify).
 2. **The seal.** The caller must refuse to append when the last event it read is
    sealed (`StreamEvent.sealed`, `LatestState.seal`). A writer that read the
    sealing event appends at `S`, and with no check its put at `S + 1` lands past
-   the seal, which reopens the stream for every writer. A writer that loaded
-   before the seal still fails: its first event put lands on the sealing event
-   (`ALL_OLD` returns the marked item), and it gets `StreamSealed`.
+   the seal, which reopens the stream for every writer. A writer that read the
+   head just before a one-event seal (`expectedVersion = S - 1`) still fails:
+   its first event put lands on the sealing event (`ALL_OLD` returns the marked
+   item), and it gets `StreamSealed`. A writer further behind, or just before a
+   seal of several events (whose earlier events are unmarked), lands on an
+   unmarked event and gets `VersionConflict`; it must apply this duty to what it
+   reads when it reloads.
 
 The event puts' `attribute_not_exists(pk)` still rejects a stale
 `expectedVersion` (`VersionConflict`), so a lost race is caught as before.
@@ -67,10 +72,20 @@ The event puts' `attribute_not_exists(pk)` still rejects a stale
 ### Why it is safe for a version read from the stream
 
 The library has no API that deletes an event: there is no stream delete or
-purge, and events have no TTL. The head therefore only grows. A version read
-from the stream, consistent or not, was the head at some point. It can be stale
-(the event puts reject that) but never ahead (only a gap needs the check). The
-check adds nothing for such a caller beyond the seal clause, and that is duty 2.
+purge, and events have no TTL. The head therefore only grows. The version of an
+event read from the stream, consistent or not, was the head at some point. It
+can be stale (the event puts reject that) but never ahead (only a gap needs the
+check). The check adds nothing for such a caller beyond the seal clause, and
+that is duty 2.
+
+Which reads give an event's version: `read`, `readFrom`, `currentVersion`, and
+`readLatest` on a stream without a snapshot config. `readLatest` with a snapshot
+can return the snapshot's `asOfVersion` (the verified read when no event follows
+it, and `verifySnapshot: false`). `writeSnapshot` accepts any `asOfVersion`
+above the stored one without checking that its event exists, so that version is
+only as sound as the `writeSnapshot` callers: a snapshot written ahead of the
+head makes a `"none"` append at its version write past a gap. The tutorial's
+example therefore reads the head with `read`.
 
 A version from anywhere else (a cache, a client's If-Match, arithmetic) isn't
 covered. Those callers keep the check.
@@ -94,8 +109,9 @@ When an append's request would hold exactly **one item, and that item is its
 one event `Put`** (no contiguity check, no sentinel, no snapshot, no additional
 items), the append sends a `PutItem` with the same `Item`, `ConditionExpression`
 (`attribute_not_exists(pk)`) and `ReturnValuesOnConditionCheckFailure: ALL_OLD`
-instead of a `TransactWriteItems`. One item commits atomically either way, so
-the semantics are unchanged at half the cost (1 WCU per KB instead of 2).
+instead of a `TransactWriteItems`. One item commits atomically either way, at
+half the cost (1 WCU per KB instead of 2). The item also carries a write token
+(below), so that the two requests behave the same under the SDK's retries.
 
 It applies to:
 
@@ -106,6 +122,37 @@ It applies to:
 It does not apply to `appendOp`. A nested append always rides in its outer
 append's transaction.
 
+### Retry idempotency: the write token
+
+The AWS SDK fills `TransactWriteItems.ClientRequestToken` itself (the member is
+an idempotency token in the service model, and the JSON codec generates it when
+the request is serialized, once, so the SDK's retries reuse it). DynamoDB
+answers a resend of a committed transaction with the same token with success.
+A `PutItem` has no such token. Without one, a conditional `PutItem` that commits
+but loses its response (a timeout, a reset connection, a 5xx after the commit)
+is resent by the SDK's standard retry, fails its own `attribute_not_exists(pk)`,
+and `ALL_OLD` returns the writer's own event. That would be reported as
+`VersionConflict` (or `StreamSealed` for a sealing event), and a
+`commandHandler({ retry })` would reload, decide again and append a duplicate
+event.
+
+So the fast path writes a token of its own: `__edd_wt__`, 128 random bits (32
+hex digits) from `globalThis.crypto.getRandomValues`, fresh for each `append`
+call. A failed condition whose `ALL_OLD` item carries this call's token is this
+call's own commit, and the append succeeds with its normal result. Any other
+returned item, including one byte for byte the same apart from its token (two
+writers' identical deposits at the same millisecond), is judged as before.
+Comparing content instead of a token would treat that case as success and lose
+the second deposit.
+
+Costs and visibility: 42 bytes on the item (`__edd_wt__` plus 32 characters),
+on fast-path events only (a transaction's events don't need it). It is a
+stream-owned attribute (an index attribute may not use the name), readers
+ignore it, and the `withoutMetadata` stream-index projection doesn't include it.
+`measureAppend` counts it (a placeholder of the same length) when the append
+would take the fast path. A caller-level retry (a new `append` call) gets a new
+token, so it reports `VersionConflict` as a new transaction would.
+
 ### Error mapping
 
 The verdicts are those of the transactional path for the same failure.
@@ -115,7 +162,10 @@ The verdicts are those of the transactional path for the same failure.
 | `ConditionalCheckFailedException`, returned item marked sealed | `StreamSealed` (first event put returned a sealed item) | `StreamSealed`, same fields (`sealedVersion` from the item) |
 | `ConditionalCheckFailedException`, otherwise | `VersionConflict` | `VersionConflict`, same fields |
 | `ValidationException` diagnosed (item over 400 KB, key too long, empty key) | `ValidationError` naming the event (`EventStore.append`, or `EventStore.append.indexes` for a stream-index key) | Same, by the same diagnosis and rewrite |
-| Throttling (`ProvisionedThroughputExceededException`, `ThrottlingException`) | `TransactionCancelled` (reason `ThrottlingError`) | `TransactionCancelled`, `operation: "PutItem"`, reason `ThrottlingError` |
+| `ConditionalCheckFailedException`, returned item carries this call's write token | Success (the SDK's resend reuses the transaction's `ClientRequestToken`) | Success, `{ version: expectedVersion + 1, events }` |
+| `ProvisionedThroughputExceededException` (a provisioned table) | `TransactionCancelled` (reason `ProvisionedThroughputExceeded`) | `TransactionCancelled`, `operation: "PutItem"`, reason `ProvisionedThroughputExceeded` |
+| `ThrottlingException` | `TransactionCancelled` (reason `ThrottlingError`) | `TransactionCancelled`, `operation: "PutItem"`, reason `ThrottlingError` |
+| `ItemCollectionSizeLimitExceededException` (an LSI's 10 GB item collection; stream indexes are LSIs by default) | `TransactionCancelled` (reason `ItemCollectionSizeLimitExceeded`) | `TransactionCancelled`, `operation: "PutItem"`, reason `ItemCollectionSizeLimitExceeded` |
 | `TransactionConflictException` (item in another transaction) | `TransactionCancelled` (reason `TransactionConflict`) | `TransactionCancelled`, `operation: "PutItem"`, reason `TransactionConflict` |
 | `ValidationException` "Type mismatch" (a key, or an index key, of the wrong type) | `TransactionCancelled` (reason `ValidationError`): an item reason in a transaction | `TransactionCancelled`, `operation: "PutItem"`, reason `ValidationError` |
 | Anything else (`InternalServerError`, `ResourceNotFoundError`, another undiagnosed validation error, `DynamoError`) | Passed through (the other validation errors are request errors of a one-item transaction too, as observed on DynamoDB Local) | Passed through |
@@ -125,24 +175,25 @@ fed with the one reason, so they can't drift. The success value is unchanged:
 `{ version: expectedVersion + 1, events }`.
 
 The AWS SDK retries a throttled `PutItem` before it fails, as it doesn't for a
-cancelled transaction. That is the only observable difference: fewer
-throttling failures reach the caller.
+cancelled transaction. Fewer throttling failures reach the caller, and the
+fast-path event carries its write token; those are the observable differences.
 
 ## Scoping decisions
 
 | Item | Decision |
 |---|---|
 | An append option that omits the check (issue proposal) | **In**, as `headProof: "none"` (the name proposed) |
-| Caller duty "no gap" | **In**, documented on `HeadProof` and `AppendOptionsBase.headProof` |
+| Caller duty "no gap" | **In**, documented on `HeadProof` and `AppendOptionsBase.headProof`. **Changed** from the issue's "a consistent read": any read of an event's version qualifies; a snapshot's `asOfVersion` does not by itself (review) |
 | Caller duty "the seal" | **In**, documented. The library doesn't enforce it on a `"none"` append |
-| Pre-seal writer fails on its first put | **Changed** from the issue's wording: it is `StreamSealed`, not `VersionConflict`. Since #166 the first put returns the marked item |
+| Pre-seal writer fails on its first put | **Changed** from the issue's wording: a writer just before a one-event seal gets `StreamSealed`, not `VersionConflict` (since #166 the first put returns the marked item). One further behind, or before a seal of several events, gets `VersionConflict` (review) |
 | Stale `expectedVersion` still rejected | **In**, unchanged (event puts) |
 | `"none"` on `measureAppend` | **In**. No check is counted |
 | `"none"` on `commandHandler` | **Out (deferred)**. Excluded from the type, `ValidationError` at runtime |
 | `"none"` on `appendOp` | **Out**. Nested appends keep refusing every `headProof` |
 | Single-item `PutItem` fast path | **Added** (owner decision). Covers one-event appends at version 0 and one-event `"none"` appends |
 | Fast path for `appendOp` | **Out**. A nested append is always part of a transaction |
-| Fast path telemetry or opt-out | **Out**. Same semantics and same errors, so there is nothing to opt out of |
+| Fast path telemetry or opt-out | **Out**. Same semantics, same errors and the same retry behaviour, so there is nothing to opt out of |
+| Fast-path retry idempotency | **Added** (review). A per-call write token on the `PutItem` event; a resend that finds its own token succeeds, as the transaction's idempotent retry does |
 | `AppendMeasurement` reporting which request is sent | **Out**. `transactionBytes` keeps its meaning (the stream's share of a `TransactWriteItems`) |
 | New error codes | **None** needed |
 | Changing the default | **Out**. Without `headProof` the check is written as before |

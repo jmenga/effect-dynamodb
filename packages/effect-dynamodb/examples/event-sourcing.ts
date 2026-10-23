@@ -1698,19 +1698,20 @@ const program = Effect.gen(function* () {
   yield* Console.log('\n=== headProof: "none" ===')
   // #region head-proof-none
   // A deposit reads the ledger in the same request, so it already knows what
-  // the contiguity check would prove: a version read from the stream is never
-  // ahead of the head. It takes over the check's other duty, the seal.
+  // the contiguity check would prove: the version of an event read from the
+  // stream is never ahead of the head. It takes over the check's other duty,
+  // the seal: it refuses when the last event it read is the sealing one.
   const depositAtHead = (id: { accountId: string; generation: string }, amount: number) =>
     Effect.gen(function* () {
-      const latest = yield* ledgers.readLatest(id, { consistentRead: true })
-      if (latest.seal !== undefined) {
+      const last = (yield* ledgers.read(id, { consistentRead: true })).at(-1)
+      if (last?.sealed === true) {
         return yield* new StreamSealed({
           streamName: "Ledger",
-          streamId: latest.seal.streamId,
-          sealedVersion: latest.seal.version,
+          streamId: last.streamId,
+          sealedVersion: last.version,
         })
       }
-      return yield* ledgers.append(id, [new Deposited({ amount })], latest.version, {
+      return yield* ledgers.append(id, [new Deposited({ amount })], last?.version ?? 0, {
         headProof: "none",
       })
     })
