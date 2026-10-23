@@ -128,6 +128,12 @@ interface QueryState {
   readonly hydration: QueryHydration | undefined
   /** See {@link KeyConditionDiagnosis}. */
   readonly keyConditionDiagnosis: KeyConditionDiagnosis | undefined
+  /**
+   * The consumed-capacity `target` of the query's operations, when it is not
+   * its entity types: an event stream's queries report under the stream name,
+   * as every `EventStream.*` operation does, not the stream's discriminator.
+   */
+  readonly operationTarget: string | undefined
 }
 
 /**
@@ -300,6 +306,8 @@ export const make = <A>(config: {
   readonly rawRow?: QueryRawRow | undefined
   /** See {@link QueryState.packed}. */
   readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** See {@link QueryState.operationTarget}. */
+  readonly operationTarget?: string | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     rawRow: config.rawRow,
@@ -309,6 +317,7 @@ export const make = <A>(config: {
     keepRow: undefined,
     hydration: config.hydration,
     keyConditionDiagnosis: config.keyConditionDiagnosis,
+    operationTarget: config.operationTarget,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -365,6 +374,7 @@ export const makeScan = <A>(config: {
     keepRow: undefined,
     hydration: undefined,
     keyConditionDiagnosis: undefined,
+    operationTarget: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -1322,11 +1332,14 @@ const examinePage = <A>(
   })
 
 /**
- * @internal The subject of a query for consumed-capacity reports: its entity
- * types and physical index, read from the descriptor.
+ * @internal The subject of a query for consumed-capacity reports: its
+ * explicit operation target (an event stream's name) or else its entity
+ * types, and its physical index, read from the descriptor.
  */
 export const operationOptions = (self: Query<unknown>): Capacity.OperationOptions => ({
-  target: self._state.entityTypes.length > 0 ? self._state.entityTypes.join(",") : undefined,
+  target:
+    self._state.operationTarget ??
+    (self._state.entityTypes.length > 0 ? self._state.entityTypes.join(",") : undefined),
   index: self._state.indexName,
 })
 

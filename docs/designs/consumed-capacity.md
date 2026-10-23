@@ -714,7 +714,7 @@ the choke point (§4). "Unbound + bound" means the wrapper sits in the op itself
 | `EventStream.append` | `append` | TransactWriteItems or PutItem; GetItem (idempotency replay, head probes); inline / after-append snapshot write | |
 | `EventStream.read` / `.readFrom` / `.currentVersion` / `.readLatest` / `.readIndex` | each method (`Query` inside is a delegate) | Query pages; BatchGetItem (`"keys"` index) | target = stream name |
 | `EventStream.readSnapshot` / `.writeSnapshot` | each method | GetItem / PutItem | |
-| `EventStream.query.events` / `.query.index` | the returned `Query` descriptor, run by a `Query` terminal | Query | root `Query.*`, target = stream |
+| `EventStream.query.events` / `.query.index` | the returned `Query` descriptor, run by a `Query` terminal | Query | root `Query.*`, target = stream name (the descriptor carries it as `operationTarget`, not the stream's discriminator) |
 | `EventStore.commandHandler` | the handler invocation | load (readLatest / read / loadState) + append (+ additional items) | nested children (§6.2) |
 | `Projection.apply` / `.applyBatch` / `.catchUp` / `.rebuild` / `.processBatch` / `.drain` / `.drainPending` | `EventProjection` / `MultiProjection` methods (`bindProjection` delegates) | GetItem, PutItem, UpdateItem, DeleteItem, Query, TransactWriteItems (ProjectionEngine) | target = projection entity type; multi-projection uses `MultiProjection.*` |
 | `CheckpointStore.load` / `.commit` / `.acquireLease` / `.renewLease` / `.releaseLease` | `CheckpointStore.makeDynamoDB` methods | GetItem, PutItem, UpdateItem, DeleteItem, Query | the change feed's DynamoDB Streams calls report no capacity (§9.3) |
@@ -1011,3 +1011,15 @@ Every finding was checked against the code; all eleven were real. How each is re
 | R9 | minor | The static guard missed `Effect.map(DynamoClient, …)`, `DynamoClient.use`, `Context.get(ctx, DynamoClient)`. | **Accepted.** The guard matches any value use of `DynamoClient` outside the allowlist (§4.1). |
 | R10 | minor | The observer, run from an exit finalizer, could not be interrupted. | **Partly accepted.** Success and failure reports run after the effect, interruptibly; only an interrupted operation reports from a finalizer (uninterruptible by nature), and the guide says to fork slow observers (§6.5). |
 | R11 | minor | `aws.dynamodb.consumed_capacity.*` turns a semconv attribute into a namespace; other custom names squat in `aws.dynamodb.*`. | **Partly accepted.** The `.total` conflict is the owner's call and is documented; `.read` / `.write` stay beside it; the other invented names move to `effect_dynamodb.*` (§5.2, S26). |
+
+### 15.1 Implementation review (resolutions)
+
+A second, independent review of the implementation raised five findings; all five were real.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| R12 | major | Work still running when its root closed was lost: late requests skipped closed scopes, and a non-root child only added itself to a closed parent's `nested`. | **Accepted.** A closing scope hands its open children to its parent, or re-roots them when it is the root; their reportable totals are cleared at that moment (already in the closing scope's), while their spans keep the whole. A request whose every enclosing scope closed while it was in flight reports as `DynamoClient.<Command>` (§6.1). Four unit tests (§11.2-7). |
+| R13 | minor | The example claimed a plain layer around a call through a bound client stops the observer; a vacuous JSON comparison hid that it does not. | **Accepted.** The example now asserts on `received.length`: a bound client keeps its bind-time setting, and an unbound op under the plain layer is not observed. |
+| R14 | minor | No changeset or version bump. | **Accepted.** Minor changeset for the four lockstep packages, consumed by `pnpm changeset version` in the same PR. |
+| R15 | minor | §7.4 said Local doubles transactional units, contradicting §11.1. | **Accepted.** §7.4 corrected: Local does not double them; unit tests cover the doubling. |
+| R16 | minor | A stream query run by a `Query` terminal reported `target` as the stream's discriminator (`ledger.event`), not the stream name every `EventStream.*` operation uses. | **Accepted.** Stream query descriptors carry `operationTarget: streamName` (§9.1). Test: `read`, `query.events`, `query.index` under `collect`, `paginate` and `count` all report `"Ledger"`. |
