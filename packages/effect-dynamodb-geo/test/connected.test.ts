@@ -1,5 +1,5 @@
 import { Config, Effect, Layer, Schema } from "effect"
-import { DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
+import { ConsumedCapacity, DynamoClient, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
 import * as H3 from "../src/H3.js"
@@ -260,5 +260,55 @@ describeConnected("GeoSearch (connected)", () => {
     )
 
     expect(results.map((r) => r.item.vehicleId)).toEqual(["v-169-fresh"])
+  })
+
+  it("nearby reports its consumed capacity: one report, a Query per cell (#174)", async () => {
+    const reports: Array<ConsumedCapacity.OperationReport> = []
+    const sent: Array<string> = []
+    const Counting = Layer.effect(
+      DynamoClient,
+      Effect.map(Effect.service(DynamoClient), (client) => ({
+        ...client,
+        query: (input: Parameters<typeof client.query>[0]) => {
+          sent.push(input.TableName ?? "")
+          return client.query(input)
+        },
+      })),
+    ).pipe(Layer.provide(ClientLayer))
+    const timestamp = NOW + 3000
+    await Effect.runPromise(
+      VehicleGeo.nearby({
+        center: SF_CENTER,
+        radius: 2000,
+        unit: "m",
+        timeWindow: { start: timestamp - H3.HOURLY_BUCKET_MS, end: timestamp },
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Counting,
+            MainTable.layer({ name: tableName }),
+            ConsumedCapacity.layer({
+              onOperation: (report) =>
+                Effect.sync(() => {
+                  reports.push(report)
+                }),
+            }),
+          ),
+        ),
+      ),
+    )
+    expect(sent.length).toBeGreaterThan(1)
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      operation: "GeoIndex.nearby",
+      target: "Vehicle",
+      requests: sent.length,
+      requestsByCommand: { Query: sent.length },
+      unreportedRequests: 0,
+      tables: [tableName],
+    })
+    // Every Query answered with its capacity (`unreportedRequests: 0` above);
+    // Local charges a page by the data it reads, so empty cells cost nothing.
+    expect(reports[0]!.capacityUnits).toBeGreaterThan(0)
   })
 })

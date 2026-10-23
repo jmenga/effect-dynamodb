@@ -73,7 +73,7 @@ import {
   Schema,
   Stream,
 } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import {
@@ -90,6 +90,7 @@ import {
   entityNaming,
   type RawSortKeyCondition,
 } from "./internal/BoundQuery.js"
+import * as Capacity from "./internal/Capacity.js"
 import {
   compileExpr,
   createConditionOps,
@@ -1730,6 +1731,12 @@ const compileCondition = (
 }
 
 /** Attempts a guarded put makes before it reports a lost race (#133). */
+/** Name a get- or delete-shaped op for consumed-capacity reports (its builder carries it). */
+const namedOp = <Op extends { readonly _builder: object }>(op: Op, name: string): Op => {
+  Capacity.nameBuilder(op._builder, name)
+  return op
+}
+
 const GUARDED_PUT_ATTEMPTS = 3
 
 /**
@@ -3590,7 +3597,7 @@ const makeImpl = <
           definition.sourceFields.some((field) => !(field in merged)),
       )
       if (needsFullSource) {
-        const client = yield* DynamoClient
+        const client = yield* Capacity.client
         const current = yield* client.getItem({ TableName: tableName, Key: marshalledKey })
         if (current.Item) {
           const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
@@ -3990,7 +3997,7 @@ const makeImpl = <
     encodedKey: globalThis.Record<string, unknown>,
   ) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const ours = (item: globalThis.Record<string, AttributeValue> | undefined) =>
         item !== undefined &&
         (incarnationAttr === undefined ||
@@ -4223,7 +4230,7 @@ const makeImpl = <
     readonly first?: boolean
   }) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const primary = config.indexes.primary
       const prefix =
         args.kind === "version"
@@ -4275,7 +4282,7 @@ const makeImpl = <
    */
   const latestTombstone = (tableName: string, pk: unknown, liveSk: string) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const primary = config.indexes.primary
       const own = (yield* client.query({
         TableName: tableName,
@@ -4439,7 +4446,7 @@ const makeImpl = <
   ): Effect.Effect<ReadonlyArray<K>, DynamoClientError, DynamoClient> =>
     Effect.gen(function* () {
       if (candidates.length === 0) return []
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
       const ownerPk = toAttributeValue(owner.pk)
@@ -4522,7 +4529,7 @@ const makeImpl = <
    */
   const highestRetainedVersion = (tableName: string, pk: unknown, liveSk: unknown) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const primary = config.indexes.primary
       const { Items } = yield* client.query({
         TableName: tableName,
@@ -4597,7 +4604,7 @@ const makeImpl = <
     readonly key: globalThis.Record<string, unknown>
   }): Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient> =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
       const item: globalThis.Record<string, unknown> = { ...args.item }
@@ -4878,7 +4885,7 @@ const makeImpl = <
    */
   const runGuardedPut = (args: Parameters<typeof planPut>[0]) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       let lost: Extract<PutVerdict, { readonly _tag: "Retry" }> | undefined
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
         const plan = yield* planPut(args)
@@ -5056,7 +5063,7 @@ const makeImpl = <
     Effect.gen(function* () {
       const { targets, filter, mode } = cascadeConfig
       const sourceEntityType = entityType
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
 
       if (!sourceIdentifierField) return undefined as undefined
 
@@ -5303,7 +5310,7 @@ const makeImpl = <
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
@@ -5555,7 +5562,7 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, opts: EntityGetOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const { name: tableName } = yield* tableTag
 
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
@@ -5699,7 +5706,7 @@ const makeImpl = <
         uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
         uState.condition,
       )
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const tc = yield* tableTag
       const tableName = tc.name
       const ttlAttrName = resolveTtlAttributeName(tc)
@@ -7581,7 +7588,7 @@ const makeImpl = <
       // so the row is read here, and a missing row is answered to the op as
       // its write would have been answered: it takes the same path.
       if (!recorded.readOwnRow && items.length > 0) {
-        const client = yield* DynamoClient
+        const client = yield* Capacity.client
         const { name: tableName } = yield* tableTag
         const read = yield* client.getItem({
           TableName: tableName,
@@ -7790,7 +7797,7 @@ const makeImpl = <
         readonly mustExist: boolean
       }) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
@@ -8382,7 +8389,7 @@ const makeImpl = <
    */
   const guardedUpsert = (input: unknown, mode: DecodeMode, opts: EntityPutOpts) =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const { name: tableName } = yield* tableTag
       yield* checkWithVectorNames(opts.withVectors, "upsert")
       // Required fields are required whether or not the item exists.
@@ -8503,7 +8510,7 @@ const makeImpl = <
           ) {
             return yield* guardedUpsert(input, mode, opts)
           }
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const { name: tableName } = yield* tableTag
           // Clock-backed time source for createdAt/updatedAt SET clauses.
           const now = yield* DateTime.now
@@ -8851,7 +8858,7 @@ const makeImpl = <
 
   const timeSeriesConfig = config.timeSeries as TimeSeriesConfig<any> | undefined
 
-  const append = (
+  const appendCore = (
     input: unknown,
     givenCondition?: Expr | ConditionInput,
     skipFollowUp = false,
@@ -8887,7 +8894,7 @@ const makeImpl = <
           cause: `append: ${emptyPart} Nothing was sent.`,
         })
       }
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const tc = yield* tableTag
       const tableName = tc.name
       const ttlAttrName = resolveTtlAttributeName(tc)
@@ -9313,6 +9320,19 @@ const makeImpl = <
   // history operation — BoundQuery for event items only
   // ---------------------------------------------------------------------------
 
+  // The public `append`: the core as the named operation (consumed capacity, #174).
+  const append = (
+    input: unknown,
+    givenCondition?: Expr | ConditionInput,
+    skipFollowUp = false,
+    removeAttrs?: ReadonlyArray<string>,
+  ) =>
+    Capacity.operation(
+      "Entity.append",
+      { target: entityType },
+      appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+    )
+
   const history = (key: unknown) => {
     if (!timeSeriesConfig) {
       throw new Error(
@@ -9448,7 +9468,7 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, opts: EntityGetOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const { name: tableName } = yield* tableTag
 
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
@@ -9524,7 +9544,7 @@ const makeImpl = <
           Effect.gen(function* () {
             const legacy = yield* legacyHistory({ tableName, pk: pkValue, liveSk, kind: "version" })
             if (legacy.length === 0) return {}
-            const client = yield* DynamoClient
+            const client = yield* Capacity.client
             const own = new Set<number>()
             let start: globalThis.Record<string, AttributeValue> | undefined
             do {
@@ -9691,7 +9711,7 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const tc = yield* tableTag
           const tableName = tc.name
           const ttlAttrName = resolveTtlAttributeName(tc)
@@ -9972,7 +9992,7 @@ const makeImpl = <
                 "delete(key).condition(...) instead.",
             })
           }
-          const client = yield* DynamoClient
+          const client = yield* Capacity.client
           const { name: tableName } = yield* tableTag
 
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
@@ -10340,7 +10360,7 @@ const makeImpl = <
     _attachPrototype: attachPrototype,
     _overTombstone: (tableName: string, item: globalThis.Record<string, unknown>) =>
       Effect.gen(function* () {
-        const client = yield* DynamoClient
+        const client = yield* Capacity.client
         return yield* overTombstone(self, client, tableName, item)
       }),
     _configure: (
@@ -10376,11 +10396,17 @@ const makeImpl = <
     deleteIfExists,
     upsert,
     scan,
-    getVersion,
+    // Lifecycle ops reuse the get / delete carriers; their builders carry the
+    // operation name consumed-capacity reports use (#174).
+    getVersion: (key: unknown, versionNumber: number) =>
+      namedOp(getVersion(key, versionNumber), "Entity.getVersion"),
     versions,
-    restore,
-    purge,
-    deleted: { get: deletedGet, list: deletedList },
+    restore: (key: unknown) => namedOp(restore(key), "Entity.restore"),
+    purge: (key: unknown) => namedOp(purge(key), "Entity.purge"),
+    deleted: {
+      get: (key: unknown) => namedOp(deletedGet(key), "Entity.deleted.get"),
+      list: deletedList,
+    },
     append,
     history,
 
@@ -10486,7 +10512,8 @@ export const bind = <
     // Crypto-requiring entity ops typecheck. A platform override supplied via
     // `DynamoClient.make({ crypto })` is already in `baseCtx` and is respected
     // (we only fill the default when absent). See `DESIGN.md`.
-    const baseCtx = yield* Effect.context<DynamoClient | TableConfig>()
+    // Detached: no current operation or parent span is pinned for later calls (#174).
+    const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
     const ctx = Option.isSome(Context.getOption(baseCtx, Crypto.Crypto))
       ? (baseCtx as Context.Context<DynamoClient | TableConfig | Crypto.Crypto>)
       : Context.add(baseCtx, Crypto.Crypto, makeDefaultCrypto())
@@ -10526,12 +10553,13 @@ export const bind = <
     // pre-resolved provide. Used by `versions` and `deleted.list` accessors so consumers
     // get the same fluent .collect() / .fetch() / .paginate() / .reverse() / .limit() /
     // .filter() ergonomics they get from index accessors and `.scan()`.
-    const wrapAsBoundQuery = <A>(q: Query.Query<A>) => {
+    const wrapAsBoundQuery = <A>(q: Query.Query<A>, operation: string) => {
       const bqConfig: BoundQueryConfig<unknown> = {
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
         ...entityNaming(entity._resolveDbName),
+        operation: { name: operation, target: entity.entityType },
       }
       return new BoundQueryImpl(
         q,
@@ -10564,148 +10592,152 @@ export const bind = <
       const boundEntityVersion = entity._entityVersion
       const concurrency = options?.concurrency ?? 4
       return provide(
-        Effect.gen(function* () {
-          if (vectorDefs.length === 0) return 0
-          const client = yield* DynamoClient
-          const { name: tableName } = yield* entity._tableTag as Context.Service<
-            TableConfig,
-            TableConfig
-          >
+        Capacity.operation(
+          "Entity.reembed",
+          { target: entity.entityType },
+          Effect.gen(function* () {
+            if (vectorDefs.length === 0) return 0
+            const client = yield* Capacity.client
+            const { name: tableName } = yield* entity._tableTag as Context.Service<
+              TableConfig,
+              TableConfig
+            >
 
-          const reembedItem = (marshalled: globalThis.Record<string, AttributeValue>) =>
-            Effect.gen(function* () {
-              const raw = fromAttributeMap(marshalled) as globalThis.Record<string, unknown>
-              const storedSk = raw[primary.sk.field]
-              const decoded = (yield* entity._decodeRecord(raw)) as globalThis.Record<
-                string,
-                unknown
-              >
-              // Snapshots / tombstones live in the same partition under a
-              // rewritten SK — their SK cannot be recomposed from the record.
-              const decodedKeyForm = keyFormFor(entity, decoded)
-              const liveSk = KeyComposer.composeSk(
-                boundSchema,
-                entity.entityType,
-                boundEntityVersion,
-                primary,
-                decodedKeyForm,
-              )
-              if (storedSk !== liveSk) return false
-
-              const attributes: globalThis.Record<string, unknown> = {}
-              for (const [logicalName, definition] of vectorDefs) {
-                const partition = KeyComposer.tryComposeVectorPartition(
+            const reembedItem = (marshalled: globalThis.Record<string, AttributeValue>) =>
+              Effect.gen(function* () {
+                const raw = fromAttributeMap(marshalled) as globalThis.Record<string, unknown>
+                const storedSk = raw[primary.sk.field]
+                const decoded = (yield* entity._decodeRecord(raw)) as globalThis.Record<
+                  string,
+                  unknown
+                >
+                // Snapshots / tombstones live in the same partition under a
+                // rewritten SK — their SK cannot be recomposed from the record.
+                const decodedKeyForm = keyFormFor(entity, decoded)
+                const liveSk = KeyComposer.composeSk(
                   boundSchema,
                   entity.entityType,
-                  definition,
+                  boundEntityVersion,
+                  primary,
                   decodedKeyForm,
                 )
-                if (partition === undefined) continue
-                const text = deriveSourceText(definition, decoded)
-                if (text === undefined) continue
-                const maybeEmbedder = yield* Effect.serviceOption(Embedder)
-                if (Option.isNone(maybeEmbedder)) {
-                  return yield* new EmbeddingError({
-                    entityType: entity.entityType,
-                    index: logicalName,
-                    reason:
-                      "No Embedder service is available. Provide one via " +
-                      "DynamoClient.make({ embedder }) before calling reembed().",
-                  })
-                }
-                const vector = yield* maybeEmbedder.value.embed(text)
-                if (vector.length !== definition.dimensions) {
-                  return yield* new EmbeddingError({
-                    entityType: entity.entityType,
-                    index: logicalName,
-                    reason:
-                      `Embedder produced ${vector.length} dimensions but vector index ` +
-                      `"${definition.index}" declares ${definition.dimensions}.`,
-                  })
-                }
-                attributes[definition.partitionField] = partition
-                attributes[definition.vectorField] = vector
-              }
-              if (Object.keys(attributes).length === 0) return false
+                if (storedSk !== liveSk) return false
 
-              const names: globalThis.Record<string, string> = { "#pk": primary.pk.field }
-              const values: globalThis.Record<string, AttributeValue> = {}
-              const sets: Array<string> = []
-              let i = 0
-              for (const [field, value] of Object.entries(attributes)) {
-                names[`#v${i}`] = field
-                values[`:v${i}`] = toAttributeValue(value)
-                sets.push(`#v${i} = :v${i}`)
-                i++
-              }
-              // Scan → embed → update is not atomic: an item can be hard-deleted
-              // between the scan page and this write, and an unconditional
-              // UpdateItem would resurrect it as a key-plus-vector fragment that
-              // decodes to nothing but still answers searches. Guard on the item
-              // still existing and treat the rejection as "skipped".
-              const update = {
-                TableName: tableName,
-                Key: {
-                  [primary.pk.field]: marshalled[primary.pk.field]!,
-                  [primary.sk.field]: marshalled[primary.sk.field]!,
-                },
-                UpdateExpression: `SET ${sets.join(", ")}`,
-                ConditionExpression: "attribute_exists(#pk)",
-                ExpressionAttributeNames: names,
-                ExpressionAttributeValues: values,
-              }
-              return yield* client.updateItem(update).pipe(
-                Effect.as(true),
-                Effect.catchIf(
-                  (err: DynamoClientError) => isAwsConditionalCheckFailed(err.cause),
-                  () => Effect.succeed(false),
-                ),
-                // An embedding that grows the item past 400 KB, named (#144).
-                diagnoseFailure({
-                  sent: () => ({
-                    _tag: "Item",
-                    item: { Update: update },
-                    target: () =>
-                      targetsFor(
-                        [{ Update: update }],
-                        [primary.pk.field, primary.sk.field],
-                        entity.entityType,
-                        () => "the re-embedded item",
-                      )[0]!,
-                  }),
-                  keys: () => keyAttributesOf(entity.indexes as never),
-                  rewrite: (diagnosis, original) =>
-                    diagnosedValidationError(diagnosis, original, {
-                      operation: "reembed",
+                const attributes: globalThis.Record<string, unknown> = {}
+                for (const [logicalName, definition] of vectorDefs) {
+                  const partition = KeyComposer.tryComposeVectorPartition(
+                    boundSchema,
+                    entity.entityType,
+                    definition,
+                    decodedKeyForm,
+                  )
+                  if (partition === undefined) continue
+                  const text = deriveSourceText(definition, decoded)
+                  if (text === undefined) continue
+                  const maybeEmbedder = yield* Effect.serviceOption(Embedder)
+                  if (Option.isNone(maybeEmbedder)) {
+                    return yield* new EmbeddingError({
                       entityType: entity.entityType,
-                    }),
-                }),
-              )
-            })
+                      index: logicalName,
+                      reason:
+                        "No Embedder service is available. Provide one via " +
+                        "DynamoClient.make({ embedder }) before calling reembed().",
+                    })
+                  }
+                  const vector = yield* maybeEmbedder.value.embed(text)
+                  if (vector.length !== definition.dimensions) {
+                    return yield* new EmbeddingError({
+                      entityType: entity.entityType,
+                      index: logicalName,
+                      reason:
+                        `Embedder produced ${vector.length} dimensions but vector index ` +
+                        `"${definition.index}" declares ${definition.dimensions}.`,
+                    })
+                  }
+                  attributes[definition.partitionField] = partition
+                  attributes[definition.vectorField] = vector
+                }
+                if (Object.keys(attributes).length === 0) return false
 
-          let updated = 0
-          let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
-          do {
-            const page = yield* client.scan({
-              TableName: tableName,
-              FilterExpression: "#et = :et",
-              ExpressionAttributeNames: { "#et": "__edd_e__" },
-              ExpressionAttributeValues: { ":et": { S: entity.entityType } },
-              ExclusiveStartKey: exclusiveStartKey,
-            })
-            const results = yield* Effect.all(
-              (page.Items ?? []).map((item) =>
-                reembedItem(item as globalThis.Record<string, AttributeValue>),
-              ),
-              { concurrency },
-            )
-            updated += results.filter((applied) => applied).length
-            exclusiveStartKey = page.LastEvaluatedKey as
-              | globalThis.Record<string, AttributeValue>
-              | undefined
-          } while (exclusiveStartKey !== undefined)
-          return updated
-        }),
+                const names: globalThis.Record<string, string> = { "#pk": primary.pk.field }
+                const values: globalThis.Record<string, AttributeValue> = {}
+                const sets: Array<string> = []
+                let i = 0
+                for (const [field, value] of Object.entries(attributes)) {
+                  names[`#v${i}`] = field
+                  values[`:v${i}`] = toAttributeValue(value)
+                  sets.push(`#v${i} = :v${i}`)
+                  i++
+                }
+                // Scan → embed → update is not atomic: an item can be hard-deleted
+                // between the scan page and this write, and an unconditional
+                // UpdateItem would resurrect it as a key-plus-vector fragment that
+                // decodes to nothing but still answers searches. Guard on the item
+                // still existing and treat the rejection as "skipped".
+                const update = {
+                  TableName: tableName,
+                  Key: {
+                    [primary.pk.field]: marshalled[primary.pk.field]!,
+                    [primary.sk.field]: marshalled[primary.sk.field]!,
+                  },
+                  UpdateExpression: `SET ${sets.join(", ")}`,
+                  ConditionExpression: "attribute_exists(#pk)",
+                  ExpressionAttributeNames: names,
+                  ExpressionAttributeValues: values,
+                }
+                return yield* client.updateItem(update).pipe(
+                  Effect.as(true),
+                  Effect.catchIf(
+                    (err: DynamoClientError) => isAwsConditionalCheckFailed(err.cause),
+                    () => Effect.succeed(false),
+                  ),
+                  // An embedding that grows the item past 400 KB, named (#144).
+                  diagnoseFailure({
+                    sent: () => ({
+                      _tag: "Item",
+                      item: { Update: update },
+                      target: () =>
+                        targetsFor(
+                          [{ Update: update }],
+                          [primary.pk.field, primary.sk.field],
+                          entity.entityType,
+                          () => "the re-embedded item",
+                        )[0]!,
+                    }),
+                    keys: () => keyAttributesOf(entity.indexes as never),
+                    rewrite: (diagnosis, original) =>
+                      diagnosedValidationError(diagnosis, original, {
+                        operation: "reembed",
+                        entityType: entity.entityType,
+                      }),
+                  }),
+                )
+              })
+
+            let updated = 0
+            let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
+            do {
+              const page = yield* client.scan({
+                TableName: tableName,
+                FilterExpression: "#et = :et",
+                ExpressionAttributeNames: { "#et": "__edd_e__" },
+                ExpressionAttributeValues: { ":et": { S: entity.entityType } },
+                ExclusiveStartKey: exclusiveStartKey,
+              })
+              const results = yield* Effect.all(
+                (page.Items ?? []).map((item) =>
+                  reembedItem(item as globalThis.Record<string, AttributeValue>),
+                ),
+                { concurrency },
+              )
+              updated += results.filter((applied) => applied).length
+              exclusiveStartKey = page.LastEvaluatedKey as
+                | globalThis.Record<string, AttributeValue>
+                | undefined
+            } while (exclusiveStartKey !== undefined)
+            return updated
+          }),
+        ),
       )
     }
 
@@ -10722,13 +10754,13 @@ export const bind = <
       deleteIfExists: (key: Key) => makeBoundDelete(entity.deleteIfExists(key), boundCrudConfig),
       // Lifecycle
       getVersion: (key: Key, version: number) =>
-        provide((entity.getVersion(key, version) as any)._run("record")),
-      versions: (key: Key) => wrapAsBoundQuery(entity.versions(key)),
-      restore: (key: Key) => provide((entity.restore(key) as any)._run("record")),
+        provide((entity.getVersion(key, version) as any)._exec("record")),
+      versions: (key: Key) => wrapAsBoundQuery(entity.versions(key), "Entity.versions"),
+      restore: (key: Key) => provide((entity.restore(key) as any)._exec("record")),
       purge: (key: Key) => provide(entity.purge(key).asEffect()),
       deleted: {
-        get: (key: Key) => provide((entity.deleted.get(key) as any)._run("record")),
-        list: (key: Key) => wrapAsBoundQuery(entity.deleted.list(key)),
+        get: (key: Key) => provide((entity.deleted.get(key) as any)._exec("record")),
+        list: (key: Key) => wrapAsBoundQuery(entity.deleted.list(key), "Entity.deleted.list"),
       },
       // Time-series (no-ops when entity is not configured; runtime check in
       // the entity-level `append` returns a ValidationError).
@@ -10810,22 +10842,50 @@ export const bind = <
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
           ...entityNaming(entity._resolveDbName),
+          operation: { name: "Entity.history", target: entity.entityType },
         }
         return new BoundQueryImpl(q, bqConfig)
       },
       // Query execution
+      // Each helper is a named operation, inside `provide` (consumed capacity, #174).
       paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
         const final = applyQuery(q, combinators)
-        return Stream.unwrap(provide(Query.paginate(final))).pipe(
-          Stream.flatMap((page) => Stream.fromIterable(page)),
-        )
+        const options = {
+          ...Query.operationOptions(final as Query.Query<unknown>),
+          target: entity.entityType,
+        }
+        return Stream.unwrap(
+          provide(
+            Effect.flatMap(Query.paginate(final), (pages) =>
+              Capacity.operationStream("Entity.paginate", options, pages),
+            ),
+          ),
+        ).pipe(Stream.flatMap((page) => Stream.fromIterable(page)))
       },
-      collect: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) =>
-        provide(Query.collect(applyQuery(q, combinators))),
-      fetch: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) =>
-        provide(Query.execute(applyQuery(q, combinators))),
+      collect: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+        const final = applyQuery(q, combinators)
+        const options = {
+          ...Query.operationOptions(final as Query.Query<unknown>),
+          target: entity.entityType,
+        }
+        return provide(Capacity.operation("Entity.collect", options, Query.collect(final)))
+      },
+      fetch: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+        const final = applyQuery(q, combinators)
+        const options = {
+          ...Query.operationOptions(final as Query.Query<unknown>),
+          target: entity.entityType,
+        }
+        return provide(Capacity.operation("Entity.fetch", options, Query.execute(final)))
+      },
       scanFetch: (...combinators: ReadonlyArray<(q: any) => any>) =>
-        provide(Query.execute(applyQuery(entity.scan(), combinators))),
+        provide(
+          Capacity.operation(
+            "Entity.scan",
+            { target: entity.entityType },
+            Query.execute(applyQuery(entity.scan(), combinators)),
+          ),
+        ),
     } as unknown as BoundEntity<
       TModel,
       TIndexes,

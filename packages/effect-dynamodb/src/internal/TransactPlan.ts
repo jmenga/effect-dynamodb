@@ -27,6 +27,7 @@ import { Data, Effect, Exit } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
 import type { PutVerdict, WriteCancellationReason } from "../Entity.js"
 import { attributeValueEquals } from "./AttributeValueEquals.js"
+import { markNotSent } from "./Capacity.js"
 
 /**
  * A planned write: its items, and how to read a cancellation of them — the
@@ -161,11 +162,14 @@ export const planWrite = <A, E, R>(
       const guarded = items.length === 1 && conditionOfItem(items[0]!) !== undefined
       if (options?.rowMissing === true && !missingAnswered && guarded) {
         missingAnswered = true
+        // Answered locally, never sent: not a request (consumed capacity, #174).
         return Effect.fail(
-          new DynamoError({
-            operation: name,
-            cause: { name: "ConditionalCheckFailedException" },
-          }),
+          markNotSent(
+            new DynamoError({
+              operation: name,
+              cause: { name: "ConditionalCheckFailedException" },
+            }),
+          ),
         )
       }
       if (recorded !== undefined) {
@@ -174,7 +178,9 @@ export const planWrite = <A, E, R>(
       }
       recorded = items
       return Effect.fail(
-        new DynamoError({ operation: name, cause: "recorded for a transaction, not sent" }),
+        markNotSent(
+          new DynamoError({ operation: name, cause: "recorded for a transaction, not sent" }),
+        ),
       )
     }
     const recording: DynamoClientService = {

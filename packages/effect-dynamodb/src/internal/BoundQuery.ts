@@ -15,6 +15,7 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
+import * as Capacity from "./Capacity.js"
 import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
 import { ExprTag, parseSimpleShorthand } from "./Expr.js"
 import type { PackedPath, Path, PathBuilder } from "./PathBuilder.js"
@@ -319,6 +320,18 @@ export interface BoundQueryConfig<Model> {
   readonly skFields?: ReadonlyArray<string> | undefined
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
   /**
+   * Optional: the operation its terminals report as (consumed capacity, #174)
+   * — `Entity.query` with the accessor name, `Collection.query`, … Without
+   * it, `Entity.scan` / `Entity.query` from the descriptor.
+   */
+  readonly operation?:
+    | {
+        readonly name: string
+        readonly target?: string | undefined
+        readonly index?: string | undefined
+      }
+    | undefined
+  /**
    * Optional: transform the raw SK condition produced by `.where()` into one
    * whose operands are composed the same way stored sort keys are.
    *
@@ -609,8 +622,24 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   // --- terminals ---
+  /**
+   * The terminal's operation, run INSIDE `provide` so the reporting setting a
+   * bound client captured is the one read.
+   */
+  private _operation(): readonly [string, Capacity.OperationOptions] {
+    const op = this._config.operation
+    if (op !== undefined) return [op.name, { target: op.target, index: op.index }]
+    const options = Query.operationOptions(this._query as Query.Query<unknown>)
+    return [this._query._state.isScan ? "Entity.scan" : "Entity.query", options]
+  }
+
+  private _run<X, E>(effect: Effect.Effect<X, E, any>): Effect.Effect<X, E, never> {
+    const [name, options] = this._operation()
+    return this._config.provide(Capacity.operation(name, options, effect))
+  }
+
   fetch(): Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never> {
-    const page = this._config.provide(Query.execute(this._query))
+    const page = this._run(Query.execute(this._query))
     const group = this._config.groupCollected
     return group === undefined
       ? page
@@ -620,7 +649,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   collect(): Effect.Effect<Array<A>, DynamoClientError | ValidationError, never> {
-    const collected = this._config.provide(Query.collect(this._query))
+    const collected = this._run(Query.collect(this._query))
     const group = this._config.groupCollected
     return group === undefined
       ? collected
@@ -633,9 +662,14 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   paginate(): Stream.Stream<A, DynamoClientError | ValidationError, never> {
     const tag = this._config.tagStreamed
-    const items = Stream.unwrap(this._config.provide(Query.paginate(this._query))).pipe(
-      Stream.flatMap((page: Array<A>) => Stream.fromIterable(page)),
-    )
+    const [name, options] = this._operation()
+    const items = Stream.unwrap(
+      this._config.provide(
+        Effect.flatMap(Query.paginate(this._query), (pages) =>
+          Capacity.operationStream(name, options, pages),
+        ),
+      ),
+    ).pipe(Stream.flatMap((page: Array<A>) => Stream.fromIterable(page)))
     return tag === undefined
       ? items
       : (items.pipe(
@@ -645,7 +679,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
   }
 
   count(): Effect.Effect<number, DynamoClientError | ValidationError, never> {
-    return this._config.provide(Query.count(this._query))
+    return this._run(Query.count(this._query))
   }
 }
 

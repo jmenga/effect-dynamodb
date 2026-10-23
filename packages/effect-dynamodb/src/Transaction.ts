@@ -23,11 +23,12 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Function as Fn } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
+import * as Capacity from "./internal/Capacity.js"
 import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKey,
@@ -142,11 +143,19 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   TransactGetResult<T>,
   DynamoClientError | ValidationError | TransactionCancelled,
   DynamoClient | TableConfig
+> => Capacity.operation("Transaction.transactGet", undefined, transactGetCore(items))
+
+const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
+  items: T,
+): Effect.Effect<
+  TransactGetResult<T>,
+  DynamoClientError | ValidationError | TransactionCancelled,
+  DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     // Cast rationale: same as Batch.get — empty array satisfies any mapped tuple type
     if (items.length === 0) return [] as unknown as TransactGetResult<T>
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
 
     // Unwrap each position to its get descriptor. A rejection belongs on the
     // error channel, not as a defect — the caller can neither catch nor
@@ -322,11 +331,28 @@ export const transactWrite = (
   | TransactionOverflow
   | RefNotFound,
   DynamoClient | TableConfig
+> => Capacity.operation("Transaction.transactWrite", undefined, transactWriteCore(operations))
+
+const transactWriteCore = (
+  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
+): Effect.Effect<
+  void,
+  | DynamoClientError
+  | ValidationError
+  | TransactionCancelled
+  | UniqueConstraintViolation
+  | OptimisticLockError
+  | ConcurrentModification
+  | ConditionalCheckFailed
+  | ItemNotFound
+  | TransactionOverflow
+  | RefNotFound,
+  DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     if (operations.length === 0) return
 
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
     let lost: OptimisticLockError | ConcurrentModification | undefined
     for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
       // Planned every attempt: a lost race is planned again from fresh reads.

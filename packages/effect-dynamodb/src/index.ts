@@ -90,6 +90,7 @@ export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
+export * as ConsumedCapacity from "./ConsumedCapacity.js"
 export type {
   CollectionAccessors,
   CollectionQuery,

@@ -17,6 +17,7 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
+import * as Capacity from "./internal/Capacity.js"
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
 import {
@@ -1320,6 +1321,15 @@ const examinePage = <A>(
     return { items, stoppedAt: -1 }
   })
 
+/**
+ * @internal The subject of a query for consumed-capacity reports: its entity
+ * types and physical index, read from the descriptor.
+ */
+export const operationOptions = (self: Query<unknown>): Capacity.OperationOptions => ({
+  target: self._state.entityTypes.length > 0 ? self._state.entityTypes.join(",") : undefined,
+  index: self._state.indexName,
+})
+
 // ---------------------------------------------------------------------------
 // Page result type
 // ---------------------------------------------------------------------------
@@ -1345,11 +1355,15 @@ export interface Page<A> {
 export const collect = <A>(
   self: Query<A>,
 ): Effect.Effect<Array<A>, DynamoClientError | ValidationError, DynamoClient> =>
-  Effect.gen(function* () {
-    const stream = yield* paginateInternal(self)
-    const pages = yield* Stream.runCollect(stream)
-    return pages.flat()
-  })
+  Capacity.delegate(
+    "Query.collect",
+    operationOptions(self),
+    Effect.gen(function* () {
+      const stream = yield* paginateInternal(self)
+      const pages = yield* Stream.runCollect(stream)
+      return pages.flat()
+    }),
+  )
 
 /**
  * Execute one page and return a {@link Page} with an opaque cursor.
@@ -1372,8 +1386,13 @@ export const collect = <A>(
 export const execute = <A>(
   self: Query<A>,
 ): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
+  Capacity.delegate("Query.execute", operationOptions(self), executeCore(self))
+
+const executeCore = <A>(
+  self: Query<A>,
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
     const tableName = self._state.resolveTableName
       ? yield* self._state.resolveTableName
       : self._state.tableName
@@ -1459,7 +1478,10 @@ export const paginate = <A>(
   Stream.Stream<Array<A>, DynamoClientError | ValidationError>,
   never,
   DynamoClient
-> => paginateInternal(self)
+> =>
+  Effect.flatMap(paginateInternal(self), (stream) =>
+    Capacity.operationStream("Query.paginate", operationOptions(self), stream, "delegate"),
+  )
 
 const paginateInternal = <A>(
   self: Query<A>,
@@ -1469,7 +1491,7 @@ const paginateInternal = <A>(
   DynamoClient
 > =>
   Effect.gen(function* () {
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
     const tableName = self._state.resolveTableName
       ? yield* self._state.resolveTableName
       : self._state.tableName
@@ -1564,8 +1586,13 @@ const pageStream = <A>(
 export const count = <A>(
   self: Query<A>,
 ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
+  Capacity.delegate("Query.count", operationOptions(self), countCore(self))
+
+const countCore = <A>(
+  self: Query<A>,
+): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
   Effect.gen(function* () {
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
     const tableName = self._state.resolveTableName
       ? yield* self._state.resolveTableName
       : self._state.tableName

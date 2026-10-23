@@ -70,12 +70,12 @@ export const asModel = <Self extends EntityOp<any, any, any, any>>(
   Self extends EntityOp<infer A, any, any, any> ? A : never,
   ExtractE<Self>,
   ExtractR<Self>
-> => self._run("model") as any
+> => self._exec("model") as any
 
 /** Decode through record schema (model + system fields). */
 export const asRecord = <Self extends EntityOp<any, any, any, any>>(
   self: Self,
-): Effect.Effect<ExtractRec<Self>, ExtractE<Self>, ExtractR<Self>> => self._run("record") as any
+): Effect.Effect<ExtractRec<Self>, ExtractE<Self>, ExtractR<Self>> => self._exec("record") as any
 
 /** Decode through item schema (model + system + keys + `__edd_e__`). Returns `Record<string, unknown>`. */
 export const asItem = <Self extends EntityOp<any, any, any, any>>(
@@ -84,7 +84,7 @@ export const asItem = <Self extends EntityOp<any, any, any, any>>(
   NoneOr<Self, globalThis.Record<string, unknown>>,
   ExtractE<Self>,
   ExtractR<Self>
-> => self._run("item") as any
+> => self._exec("item") as any
 
 /** Return raw marshalled DynamoDB format (`Record<string, AttributeValue>`). No decode. */
 export const asNative = <Self extends EntityOp<any, any, any, any>>(
@@ -93,7 +93,7 @@ export const asNative = <Self extends EntityOp<any, any, any, any>>(
   NoneOr<Self, globalThis.Record<string, AttributeValue>>,
   ExtractE<Self>,
   ExtractR<Self>
-> => self._run("native") as any
+> => self._exec("native") as any
 
 // ---------------------------------------------------------------------------
 // Update combinators — dual functions for pipe composition

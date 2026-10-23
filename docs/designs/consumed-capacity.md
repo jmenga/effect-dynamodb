@@ -441,10 +441,11 @@ totals are inclusive.
 
 Examples:
 
-- `commandHandler(...)` runs `readLatest` (or `loadState`), then `append`. The observer gets
-  **one** report, `EventStore.commandHandler`, whose totals are the load plus the append. Its
-  `nested` lists `EventStream.readLatest` and `EventStream.append` with their own (inclusive)
-  totals. The trace shows three spans.
+- `commandHandler(...)` runs its load (`readLatest` on a snapshot-configured stream, `read`
+  otherwise, or the application's `loadState`), then `append`. The observer gets **one**
+  report, `EventStore.commandHandler`, whose totals are the load plus the append. Its `nested`
+  lists the load (`EventStream.read` / `EventStream.readLatest`) and `EventStream.append` with
+  their own (inclusive) totals. The trace shows three spans.
 - `Aggregate.update` reads the aggregate and writes the diffed edges. One report,
   `Aggregate.update`. Any entity ops it composes appear as nested children.
 - `Transaction.transactWrite([Users.update(...), ...])` plans each op (its real reads count) and
@@ -683,7 +684,7 @@ the choke point (§4). "Unbound + bound" means the wrapper sits in the op itself
 | `Collection.query` | `CollectionQuery` terminals (`collect` / `fetch` / `paginate` / `count`) | Query per member table (parallel) | target = collection name |
 | `Batch.get` / `Batch.write` | `Batch.ts` | BatchGetItem / BatchWriteItem chunks + retries; TransactWriteItems (unique sentinels) | |
 | `Transaction.transactGet` / `Transaction.transactWrite` | `Transaction.ts` | TransactGetItems / TransactWriteItems; planning reads (§4.2) | |
-| `Aggregate.get` / `.create` / `.update` / `.delete` / `.list` | `Aggregate.ts` operation functions (`bind` delegates) | Query (collection read), TransactWriteItems, BatchWriteItem (orphan edge cleanup), GetItem (ref hydration) | target = aggregate name |
+| `Aggregate.get` / `.create` / `.update` / `.delete` / `.list` | `Aggregate.ts` operation functions (`bind` delegates) | Query (collection read), TransactWriteItems, BatchWriteItem (orphan edge cleanup), GetItem (ref hydration) | target = aggregate name (its root `entityType`) |
 | `EventStream.append` | `append` | TransactWriteItems or PutItem; GetItem (idempotency replay, head probes); inline / after-append snapshot write | |
 | `EventStream.read` / `.readFrom` / `.currentVersion` / `.readLatest` / `.readIndex` | each method (`Query` inside is a delegate) | Query pages; BatchGetItem (`"keys"` index) | target = stream name |
 | `EventStream.readSnapshot` / `.writeSnapshot` | each method | GetItem / PutItem | |
@@ -761,6 +762,9 @@ with a table carrying one GSI. Every data-plane command returns `ConsumedCapacit
 | DeleteItem | 1 | `Table: 1` |
 | Failed conditional PutItem, cancelled TransactWriteItems | no `ConsumedCapacity` on the error (§8.1) | — |
 
+Measured while writing the connected suite: a `TransactWriteItems` of two small puts reports
+`CapacityUnits: 2` on Local, so Local does not apply the transactional doubling to writes.
+
 So the **connected suite asserts real values**. Because Local never splits read from write, it
 exercises the command-kind attribution in §4.3. The explicit-split path is covered by unit
 tests with mocked responses.
@@ -800,7 +804,8 @@ tests with mocked responses.
    - `TransactPlan` recorded writes are not counted.
 7. **Nesting.**
    - `commandHandler` gives one observer call (`EventStore.commandHandler`), whose `nested`
-     holds `EventStream.readLatest` (1 call) and `EventStream.append` (1 call). The root totals
+     holds the load (`EventStream.read`, or `.readLatest` with snapshots; 1 call) and
+     `EventStream.append` (1 call). The root totals
      equal the sum of all requests. Three spans, the two children with `nested: true`.
    - `Aggregate.update` and `Transaction.transactWrite` give one observer call each.
    - Geo-style concurrent fan-out under one `withOperation` sums correctly.
@@ -852,7 +857,9 @@ as the existing suites use. Values are asserted exactly, from §11.1's measured 
 - `Entity.query` over a partition forced to 3 pages with `pageSize`: `requests: 3`, and units
   summed.
 - `Batch.write` of 30 items: 2 requests, units = item count.
-- `Transaction.transactWrite`: 2× units.
+- `Transaction.transactWrite`: one request, one unit per small item. DynamoDB Local does **not**
+  double transactional writes (two puts report 2; real DynamoDB charges 4), so the connected
+  suite asserts Local's values and the unit suite covers summing whatever the service returns.
 - Entity create with a unique constraint (sentinel transaction).
 - `EventStream.append` + `read` + `commandHandler` nesting (one observer call, inclusive totals).
 - `Aggregate.create`.
