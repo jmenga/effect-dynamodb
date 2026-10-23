@@ -309,11 +309,17 @@ const InMemoryClient = mockDynamoClientLayer({
       }
       return Effect.succeed({} as never)
     }),
+  // `writeSnapshot`, and an append of one event (#173).
   putItem: (input) =>
-    Effect.sync(() => {
+    Effect.suspend(() => {
       sentPuts.push(input.Item!)
+      if (rejectNextWrite !== undefined) {
+        const cause = rejectNextWrite
+        rejectNextWrite = undefined
+        return Effect.fail(new DynamoError({ operation: "PutItem", cause }))
+      }
       store.set(keyOf(input.Item!), input.Item!)
-      return {} as never
+      return Effect.succeed({} as never)
     }),
   getItem: (input) =>
     Effect.sync(() => {
@@ -998,8 +1004,8 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
       expect(String((error as ValidationError).cause)).toContain(
         `${measured.events[0]} bytes by DynamoDB's item-size rules`,
       )
-      // The stored item is the JSON string, not a map.
-      expect(sentTransactions[0]![0]!.Put!.Item!.data!.S).toBeDefined()
+      // The stored item is the JSON string, not a map (one event: a PutItem, #173).
+      expect(sentPuts[0]!.data!.S).toBeDefined()
     }).pipe(Effect.provide(TestLayer)),
   )
 

@@ -263,9 +263,10 @@ const TestDynamoClient = mockDynamoClientLayer({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
+  // Unanswered, a put succeeds — a one-event append is a `PutItem` (#173).
   putItem: (input) =>
     Effect.tryPromise({
-      try: () => mockPutItem(input),
+      try: async () => (await mockPutItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "PutItem", cause: e }),
     }),
   getItem: (input) =>
@@ -352,6 +353,16 @@ const cancelled = (reasons: ReadonlyArray<Reason>) =>
 
 const sent = (call = 0): ReadonlyArray<any> =>
   mockTransactWriteItems.mock.calls[call]![0].TransactItems
+/** The event `PutItem` requests: an append whose one item is its one event (#173). */
+const eventPuts = (): ReadonlyArray<any> =>
+  mockPutItem.mock.calls
+    .map(([input]) => input)
+    .filter((input) => String(fromAttributeMap(input.Item).__edd_e__).endsWith(".event"))
+/** No append was sent: no transaction, and no event `PutItem` (#173). */
+const expectNoAppendSent = (): void => {
+  expect(mockTransactWriteItems).not.toHaveBeenCalled()
+  expect(eventPuts()).toHaveLength(0)
+}
 /** What each item of a transaction is: "check", or the `__edd_e__` of its put. */
 const kinds = (items: ReadonlyArray<any>) =>
   items.map((i) =>
@@ -423,15 +434,15 @@ describe("EventStore seal (#166) — write shape", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("at version 0 there is no check; the first put still carries ALL_OLD", () =>
+  it.effect("at version 0 there is no check; the one put is a PutItem with ALL_OLD (#173)", () =>
     Effect.gen(function* () {
-      mockTransactWriteItems.mockResolvedValue({})
-
       yield* Ledger.append(id, [close()], 0, { seal: true })
 
-      expect(kinds(sent())).toEqual(["ledger.event"])
-      expect(sent()[0].Put.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
-      expect(sealedFlags(sent())).toEqual([true])
+      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      const [put] = eventPuts()
+      expect(put.ConditionExpression).toBe("attribute_not_exists(pk)")
+      expect(put.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
+      expect(fromAttributeMap(put.Item).__edd_sealed__).toBe(true)
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -481,7 +492,7 @@ describe("EventStore seal (#166) — write shape", () => {
 
       yield* Inline.writeSnapshot(id, { balance: 5 }, 5)
 
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      expectNoAppendSent()
       expect(mockPutItem).toHaveBeenCalledOnce()
       const put = mockPutItem.mock.calls[0]![0]
       expect(put.ConditionExpression).toBe(
@@ -541,7 +552,7 @@ describe("EventStore seal (#166) — write shape", () => {
       expect(sealed.events[1]).toBeGreaterThan(plain.events[1]!)
       expect(sealed.snapshot).toBeGreaterThan(plain.snapshot!)
       expect(sealed.transactionBytes).toBeGreaterThan(plain.transactionBytes)
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      expectNoAppendSent()
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -567,7 +578,7 @@ describe("EventStore seal (#166) — validation", () => {
     expect((error as ValidationError)._tag).toBe("ValidationError")
     expect((error as ValidationError).operation).toBe("EventStore.append.seal")
     expect(String((error as ValidationError).cause)).toContain(text)
-    expect(mockTransactWriteItems).not.toHaveBeenCalled()
+    expectNoAppendSent()
   }
 
   it.effect("seal with zero events", () =>
@@ -614,7 +625,7 @@ describe("EventStore seal (#166) — validation", () => {
     Effect.gen(function* () {
       const result = yield* Ledger.append(id, [], 3, { seal: false })
       expect(result.version).toBe(3)
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      expectNoAppendSent()
     }).pipe(Effect.provide(TestLayer)),
   )
 })
@@ -673,8 +684,12 @@ describe("EventStore seal (#166) — attribution", () => {
 
   it.effect("at version 0, event 1 being the seal is StreamSealed", () =>
     Effect.gen(function* () {
-      mockTransactWriteItems.mockRejectedValueOnce(
-        cancelled([failed(eventItem("ledger", 1, { sealed: true }))]),
+      // One event at version 0: a PutItem (#173), returning the stored item.
+      mockPutItem.mockRejectedValueOnce(
+        Object.assign(new Error("The conditional request failed"), {
+          name: "ConditionalCheckFailedException",
+          Item: eventItem("ledger", 1, { sealed: true }),
+        }),
       )
       const error = yield* Ledger.append(id, [deposit(1)], 0).pipe(Effect.flip)
       expectSealed(error, "Ledger", "a-1", 1)
@@ -1248,7 +1263,7 @@ describe("EventStore appendOp (#166)", () => {
       expect((error as ValidationError)._tag).toBe("ValidationError")
       expect((error as ValidationError).operation).toBe("EventStore.appendOp")
       expect(String((error as ValidationError).cause)).toContain(text)
-      expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      expectNoAppendSent()
     }
 
     for (const [key, value] of [
@@ -1281,7 +1296,7 @@ describe("EventStore appendOp (#166)", () => {
           additionalItems: [GenInline.appendOp(A, [close()], 4, { seal: true })],
         }).pipe(Effect.flip)
         expect((error as ValidationError).operation).toBe("EventStore.append.seal")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1295,7 +1310,7 @@ describe("EventStore appendOp (#166)", () => {
         expect(String((error as ValidationError).cause)).toContain(
           'which is an append of stream "Gen" (appendOp)',
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1309,7 +1324,7 @@ describe("EventStore appendOp (#166)", () => {
         expect(String((error as ValidationError).cause)).toContain(
           'operation 1 is a stream append op (appendOp of stream "Gen")',
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -1391,7 +1406,7 @@ describe("EventStore appendOp (#166)", () => {
           }),
         )
         expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
 
         mockTransactWriteItems.mockResolvedValue({})
         yield* Ledger.append(id, [deposit(1)], 0, {
@@ -1732,7 +1747,7 @@ describe("EventStore seal (#166) — commandHandler", () => {
         )
         expectSealed(error, "Ledger", "a-1", 2)
         expect(decide).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1765,7 +1780,7 @@ describe("EventStore seal (#166) — commandHandler", () => {
         expectSealed(error, "Inline", "a-1", 5)
         expect(decide).not.toHaveBeenCalled()
         expect(mockQuery).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1781,7 +1796,7 @@ describe("EventStore seal (#166) — commandHandler", () => {
         expect(decide).not.toHaveBeenCalled()
         expect(mockQuery).not.toHaveBeenCalled()
         expect(mockGetItem).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1976,7 +1991,7 @@ describe("EventStore seal (#166) — commandHandler", () => {
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.commandHandler.loadState")
         expect(String((error as ValidationError).cause)).toContain("sealedVersion")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   }
