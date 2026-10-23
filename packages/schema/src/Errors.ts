@@ -207,13 +207,6 @@ export const isAwsThrottling = (cause: unknown): boolean =>
   ((cause as { name: string }).name === "ThrottlingException" ||
     (cause as { name: string }).name === "ProvisionedThroughputExceededException")
 
-/** @internal A single-item write that touched an item another transaction holds. */
-export const isAwsTransactionConflict = (cause: unknown): boolean =>
-  cause != null &&
-  typeof cause === "object" &&
-  "name" in cause &&
-  (cause as { name: unknown }).name === "TransactionConflictException"
-
 /** @internal */
 export const isAwsValidationError = (cause: unknown): boolean =>
   cause != null &&

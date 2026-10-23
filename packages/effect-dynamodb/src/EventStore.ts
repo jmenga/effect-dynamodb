@@ -62,9 +62,7 @@ import {
   type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
-  isAwsThrottling,
   isAwsTransactionCancelled,
-  isAwsTransactionConflict,
   isAwsValidationError,
   type OptimisticLockError,
   StreamSealed,
@@ -397,7 +395,8 @@ export interface AppendMeasurement {
    *
    * An append whose only item is its one event is sent as a `PutItem`
    * instead (see {@link EventStream.append}), to which the 4 MB limit does
-   * not apply; the number is then that one item's share.
+   * not apply; the number is then that one item's share, its write token
+   * included (as it is in `events`).
    */
   readonly transactionBytes: number
 }
@@ -647,18 +646,26 @@ export interface AppendOptionsBase<TState = never> {
    *   prove, to save its cost. The caller takes over both of its duties:
    *
    *   1. **No gap.** `expectedVersion` must never be ahead of the head: an
-   *      ahead version writes its events past a gap that nothing fills. A
-   *      version read from the stream (`read`, `readFrom`, `readLatest`,
-   *      `currentVersion`, consistent or not) always meets this: events are
-   *      never deleted, so the head only grows, and a version read from it
-   *      can be stale but never ahead. A version from anywhere else (a cache,
-   *      a client's If-Match, arithmetic) does not: keep the check.
+   *      ahead version writes its events past a gap that nothing fills. The
+   *      version of an event read from the stream (`read`, `readFrom`,
+   *      `currentVersion`, or `readLatest` on a stream without a snapshot
+   *      config, consistent or not) always meets this: events are never
+   *      deleted, so the head only grows, and such a version can be stale but
+   *      never ahead. `readLatest` with a snapshot can return the snapshot's
+   *      `asOfVersion`, which is only as trustworthy as the `writeSnapshot`
+   *      callers: `writeSnapshot` does not check that its version's event
+   *      exists. A version from anywhere else (a cache, a client's If-Match,
+   *      arithmetic) does not meet it: keep the check.
    *   2. **The seal.** Refuse to append when the last event read is sealed
    *      ({@link StreamEvent.sealed}, {@link LatestState.seal}). Nothing
    *      else stops an append at the seal's version: its first event lands
    *      past the seal and reopens the stream for every writer. A writer
-   *      that loaded before the seal still fails: its first event put lands
-   *      on the sealing event, and it gets `StreamSealed`.
+   *      that read the head just before a one-event seal (`expectedVersion`
+   *      one below the sealing event) still fails: its first event put lands
+   *      on the sealing event, and it gets `StreamSealed`. A writer further
+   *      behind, or just before a seal of several events (its first put lands
+   *      on one of the seal's unmarked events), gets `VersionConflict`, and
+   *      must apply this duty to what it reads when it reloads.
    *
    *   The event puts still reject a stale `expectedVersion`
    *   (`VersionConflict`), as they always do. Combines with every other
@@ -1356,6 +1363,47 @@ const PROJECTED_ENVELOPE_ATTRIBUTES: ReadonlyArray<EventItemAttribute> = [
 const SEALED_ATTRIBUTE = "__edd_sealed__"
 
 /**
+ * @internal The write token of an event sent as a single-item `PutItem`
+ * (#173): random per `append` call, so the put can recognise its own item.
+ * A `TransactWriteItems` is idempotent under the AWS SDK's retries (the SDK
+ * fills its `ClientRequestToken`, and DynamoDB answers a resend of a
+ * committed transaction with success), but a `PutItem` has no token: a
+ * resend after a commit whose response was lost fails its own
+ * `attribute_not_exists(pk)`, and `ALL_OLD` returns the writer's own event.
+ * The token tells that case (success) from another writer's event at the
+ * same version (a conflict), however alike their content.
+ */
+const WRITE_TOKEN_ATTRIBUTE = "__edd_wt__"
+
+/** @internal The write token's length in hex digits: 128 random bits. */
+const WRITE_TOKEN_LENGTH = 32
+
+/** @internal A fresh write token, from the platform's Web Crypto (CSPRNG). */
+const makeWriteToken: Effect.Effect<string> = Effect.sync(() =>
+  Array.from(globalThis.crypto.getRandomValues(new Uint8Array(WRITE_TOKEN_LENGTH / 2)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join(""),
+)
+
+/**
+ * @internal The event `Put` of a single-item append with `token` as its write
+ * token (see {@link WRITE_TOKEN_ATTRIBUTE}).
+ */
+const withWriteToken = (item: TransactWriteItem, token: string): TransactWriteItem => ({
+  Put: {
+    ...item.Put!,
+    Item: { ...item.Put!.Item, [WRITE_TOKEN_ATTRIBUTE]: { S: token } },
+  },
+})
+
+/**
+ * @internal Whether an append's request is exactly one item, its one event
+ * `Put` — sent as a `PutItem` (#173) rather than a `TransactWriteItems`.
+ */
+const isSingleEventPut = (items: ReadonlyArray<TransactWriteItem>, eventCount: number): boolean =>
+  items.length === 1 && eventCount === 1 && items[0]!.Put !== undefined
+
+/**
  * @internal The version a sealed item returned by a failed condition
  * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`) seals the stream at: an
  * event's `version`, a snapshot's `asOfVersion`. `undefined` for a missing or
@@ -1383,6 +1431,41 @@ const sealedVersionOf = (
  * The single-item fast path (#173) reports these as the transaction does.
  */
 const ITEM_REASON_VALIDATION = /Type mismatch/i
+
+/**
+ * @internal The cancellation reason code a one-item `TransactWriteItems`
+ * reports for its item where a `PutItem` fails with `cause` instead, or
+ * `undefined` when the transaction reports it as a request error too (or not
+ * at all). The single-item fast path (#173) turns these into the
+ * `TransactionCancelled` the transaction gives:
+ *
+ * - `ProvisionedThroughputExceededException` — `ProvisionedThroughputExceeded`
+ *   (a provisioned table's capacity);
+ * - `ThrottlingException` — `ThrottlingError`;
+ * - `ItemCollectionSizeLimitExceededException` —
+ *   `ItemCollectionSizeLimitExceeded` (an LSI's 10 GB item collection, which
+ *   a stream index is by default);
+ * - `TransactionConflictException` — `TransactionConflict`;
+ * - a key of the wrong type ({@link ITEM_REASON_VALIDATION}) —
+ *   `ValidationError`.
+ */
+const putItemReason = (cause: unknown): string | undefined => {
+  const name = (cause as { readonly name?: unknown } | null | undefined)?.name
+  switch (name) {
+    case "ProvisionedThroughputExceededException":
+      return "ProvisionedThroughputExceeded"
+    case "ThrottlingException":
+      return "ThrottlingError"
+    case "ItemCollectionSizeLimitExceededException":
+      return "ItemCollectionSizeLimitExceeded"
+    case "TransactionConflictException":
+      return "TransactionConflict"
+  }
+  return isAwsValidationError(cause) &&
+    ITEM_REASON_VALIDATION.test((cause as { readonly message?: string }).message ?? "")
+    ? "ValidationError"
+    : undefined
+}
 
 /**
  * @internal What a cancelled append means for one stream, from the reasons of
@@ -1458,6 +1541,7 @@ const STREAM_OWNED_ATTRIBUTES: ReadonlyArray<string> = [
   "state",
   "commandId",
   SEALED_ATTRIBUTE,
+  WRITE_TOKEN_ATTRIBUTE,
   DEFAULT_TTL_ATTRIBUTE_NAME,
 ]
 
@@ -2062,10 +2146,14 @@ export interface EventStream<
    * check, sentinel, snapshot or additional item: a one-event append at
    * version 0, or with `headProof: "none"`), is sent as a `PutItem` with the
    * same item and condition instead (#173): one item commits atomically
-   * either way, at half the write cost. Its failures are reported as the
+   * either way, at half the write cost. The event also carries a random write
+   * token (`__edd_wt__`), so that an AWS SDK retry of a put that committed
+   * but lost its response recognises its own event and succeeds, as the
+   * transaction's idempotent retry does. Its failures are reported as the
    * transaction's would be — `StreamSealed`, `VersionConflict`, a diagnosed
    * `ValidationError`, and `TransactionCancelled` (`operation: "PutItem"`)
-   * for throttling or a conflicting transaction.
+   * with the reason a transaction gives its item (throttling, an item
+   * collection over its size limit, a conflicting transaction).
    *
    * A method, like `writeSnapshot`, so a snapshot-less stream (whose
    * `options.snapshot` is `never`) stays assignable to other streams.
@@ -3073,9 +3161,10 @@ export const makeStream = <
         },
         tx.additional.keys(),
       )
-    const lone = tx.items.length === 1 && tx.eventCount === 1 ? tx.items[0]!.Put : undefined
-    if (lone !== undefined) {
-      return sendAppendPut(client, tx, lone, streamIdStr, keys, diagnosed)
+    if (isSingleEventPut(tx.items, tx.eventCount)) {
+      return Effect.flatMap(makeWriteToken, (token) =>
+        sendAppendPut(client, tx, token, streamIdStr, keys, diagnosed),
+      )
     }
     const sent = () => ({ _tag: "Transaction" as const, items: tx.items, targets: tx.targets })
     return client.transactWriteItems({ TransactItems: tx.items }).pipe(
@@ -3198,21 +3287,25 @@ export const makeStream = <
   /**
    * The single-item fast path (#173): an append whose request is its one
    * event `Put` sends it as a `PutItem` — the same item, condition and
-   * `ALL_OLD` — at 1 WCU per KB instead of a transaction's 2. One item
-   * commits atomically either way, and every failure maps to the verdict the
-   * transaction gives for the same case:
+   * `ALL_OLD`, plus a write token (see {@link WRITE_TOKEN_ATTRIBUTE}) — at
+   * 1 WCU per KB instead of a transaction's 2. One item commits atomically
+   * either way, and every outcome maps to the one the transaction gives for
+   * the same case:
    *
-   * - a failed condition is judged by {@link streamAppendVerdict} from the
-   *   one reason it stands for: `StreamSealed` when the returned item is
-   *   marked, `VersionConflict` otherwise;
+   * - a failed condition whose returned item carries this call's write token
+   *   is this call's own commit, met again by an SDK retry of a `PutItem`
+   *   whose response was lost: success, as the transaction's idempotent
+   *   retry is;
+   * - any other failed condition is judged by {@link streamAppendVerdict}
+   *   from the one reason it stands for: `StreamSealed` when the returned
+   *   item is marked, `VersionConflict` otherwise;
    * - a rejection DynamoDB names (an item over 400 KB, a key too long or
-   *   empty) is diagnosed against the same item and rewritten by the same
+   *   empty) is diagnosed against the item sent and rewritten by the same
    *   `rewrite`, so it names the event as the transaction's does;
-   * - throttling, a conflicting transaction and a key of the wrong type are
-   *   `TransactionCancelled` with the reason a transaction reports for its
-   *   item (`ThrottlingError`, `TransactionConflict`, `ValidationError`):
+   * - a failure a transaction reports as its item's cancellation reason is
+   *   `TransactionCancelled` with that reason (see {@link putItemReason}):
    *   DynamoDB fails a `PutItem` with a request error where it cancels a
-   *   transaction for its item (see {@link ITEM_REASON_VALIDATION});
+   *   transaction for its item;
    * - anything else passes through, as it does from the transaction (the
    *   other validation errors a one-item transaction gets are request
    *   errors there too).
@@ -3220,35 +3313,34 @@ export const makeStream = <
   const sendAppendPut = (
     client: DynamoClientService,
     tx: AppendTransaction,
-    put: NonNullable<TransactWriteItem["Put"]>,
+    token: string,
     streamIdStr: string,
     keys: () => KeyAttributes,
     diagnosed: (diagnosis: Diagnosis, original: unknown) => AppendTooLarge | ValidationError,
-  ): Effect.Effect<undefined, AppendError> =>
-    client.putItem(put).pipe(
+  ): Effect.Effect<undefined, AppendError> => {
+    const item = withWriteToken(tx.items[0]!, token)
+    return client.putItem(item.Put!).pipe(
       Effect.as(undefined),
       // Diagnosed first: what it names is terminal, and what it cannot
       // explain is mapped below.
       diagnoseFailure({
-        sent: () => ({
-          _tag: "Item" as const,
-          item: tx.items[0]!,
-          target: () => tx.targets()[0]!,
-        }),
+        sent: () => ({ _tag: "Item" as const, item, target: () => tx.targets()[0]! }),
         keys,
         rewrite: diagnosed,
       }),
       Effect.catch(
         (
           error: DynamoClientError | AppendTooLarge | ValidationError,
-        ): Effect.Effect<never, AppendError> => {
+        ): Effect.Effect<undefined, AppendError> => {
           if (error._tag === "AppendTooLarge" || error._tag === "ValidationError") {
             return Effect.fail(error)
           }
           const cause = error.cause
           if (isAwsConditionalCheckFailed(cause)) {
+            const returned = cause.Item as Readonly<Record<string, AttributeValue>> | undefined
+            if (returned?.[WRITE_TOKEN_ATTRIBUTE]?.S === token) return Effect.succeed(undefined)
             const verdict = streamAppendVerdict(
-              [{ Code: "ConditionalCheckFailed", Item: cause.Item }],
+              [{ Code: "ConditionalCheckFailed", Item: returned }],
               {
                 guardCount: 0,
                 eventCount: 1,
@@ -3260,16 +3352,7 @@ export const makeStream = <
             )
             return Effect.fail(verdict ?? error)
           }
-          const code = isAwsThrottling(cause)
-            ? "ThrottlingError"
-            : isAwsTransactionConflict(cause)
-              ? "TransactionConflict"
-              : isAwsValidationError(cause) &&
-                  ITEM_REASON_VALIDATION.test(
-                    (cause as { readonly message?: string }).message ?? "",
-                  )
-                ? "ValidationError"
-                : undefined
+          const code = putItemReason(cause)
           if (code === undefined) return Effect.fail(error)
           return Effect.fail(
             new TransactionCancelled({
@@ -3281,6 +3364,7 @@ export const makeStream = <
         },
       ),
     )
+  }
 
   /**
    * A diagnosed rejection of an append (#144) other than its item count. An
@@ -4193,14 +4277,22 @@ export const makeStream = <
         return { events: [], sentinel: undefined, snapshot: undefined, transactionBytes: 0 }
       }
       const putBytes = (item: TransactWriteItem): number => itemBytes(item.Put?.Item ?? {})
-      const owned = [
+      const laidOut = [
         ...(parts.contiguityCheck === undefined ? [] : [parts.contiguityCheck]),
         ...parts.eventItems,
         ...(parts.sentinelPut === undefined ? [] : [parts.sentinelPut]),
         ...(parts.snapshotPut === undefined ? [] : [parts.snapshotPut]),
       ]
+      // A single-item append is sent as a `PutItem` carrying a write token
+      // (#173), whose bytes are measured here as a placeholder of its length.
+      // A `{ additionalItem }` proof means the append carries that item, so
+      // it is a transaction.
+      const single =
+        typeof options?.headProof !== "object" && isSingleEventPut(laidOut, parts.eventItems.length)
+      const owned = single ? [withWriteToken(laidOut[0]!, "0".repeat(WRITE_TOKEN_LENGTH))] : laidOut
+      const eventItems = single ? owned : parts.eventItems
       const measurement: AppendMeasurement = {
-        events: parts.eventItems.map(putBytes),
+        events: eventItems.map(putBytes),
         sentinel: parts.sentinelPut === undefined ? undefined : putBytes(parts.sentinelPut),
         snapshot: parts.snapshotPut === undefined ? undefined : putBytes(parts.snapshotPut),
         transactionBytes: owned.reduce((sum, item) => sum + transactItemBytes(item), 0),

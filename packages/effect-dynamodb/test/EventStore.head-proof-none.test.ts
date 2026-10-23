@@ -461,7 +461,7 @@ describe("the single-item fast path (#173)", () => {
   }
 
   it.effect(
-    "sends the transaction's item, condition and ALL_OLD, and returns the same result",
+    "sends the transaction's item, condition and ALL_OLD plus a write token, and returns the same result",
     () =>
       Effect.gen(function* () {
         const viaPut = yield* Noted.append(id, [deposit(1)], 0, {
@@ -475,7 +475,10 @@ describe("the single-item fast path (#173)", () => {
 
         const put = mockPutItem.mock.calls[0]![0]
         const txPut = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put
-        expect(put).toEqual(txPut)
+        const { __edd_wt__: token, ...item } = put.Item
+        expect(token.S).toMatch(/^[0-9a-f]{32}$/)
+        expect({ ...put, Item: item }).toEqual(txPut)
+        expect(txPut.Item.__edd_wt__).toBeUndefined()
         expect(Object.keys(put).sort()).toEqual([
           "ConditionExpression",
           "Item",
@@ -486,6 +489,73 @@ describe("the single-item fast path (#173)", () => {
         expect(viaPut).toEqual({ version: 1, events: [deposit(1)] })
       }).pipe(Effect.provide(TestLayer)),
   )
+
+  it.effect("every append call sends its own write token", () =>
+    Effect.gen(function* () {
+      yield* Ledger.append(id, [deposit(1)], 0)
+      yield* Ledger.append(id, [deposit(1)], 0)
+      const [first, second] = mockPutItem.mock.calls.map((call) => call[0].Item.__edd_wt__.S)
+      expect(first).not.toBe(second)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  describe("an SDK retry of a put that committed but lost its response (#173)", () => {
+    /**
+     * The first send commits, and its response is lost: the retry fails its
+     * own `attribute_not_exists(pk)`, and `ALL_OLD` returns the item the
+     * first send wrote — as a real `PutItem` retried by the SDK does.
+     */
+    const commitThenConflict = () =>
+      mockPutItem.mockImplementationOnce(async (input: { Item: unknown }) => {
+        throw putConditionFailed(input.Item)
+      })
+
+    it.effect("is the writer's own event: success, as a transaction's idempotent retry", () =>
+      Effect.gen(function* () {
+        commitThenConflict()
+        const result = yield* Ledger.append(id, [deposit(1)], 0)
+        expect(result).toEqual({ version: 1, events: [deposit(1)] })
+
+        // A one-event "none" append, sealing: its own sealed event is not a seal against it.
+        commitThenConflict()
+        const sealed = yield* Ledger.append(id, [close()], 3, { headProof: "none", seal: true })
+        expect(sealed).toEqual({ version: 4, events: [close()] })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a commandHandler appends once: no second decide, no duplicate event", () =>
+      Effect.gen(function* () {
+        commitThenConflict()
+        const decide = vi.fn(decider.decide)
+        const result = yield* EventStore.commandHandler({ ...decider, decide }, Ledger, {
+          retry: 3,
+        })(id, { amount: 5 })
+        expect(result.version).toBe(1)
+        expect(decide).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("another writer's identical event at the version is still a conflict", () =>
+      Effect.gen(function* () {
+        // Byte for byte what this writer sends, but for its own write token.
+        mockPutItem.mockImplementationOnce(async (input: { Item: Record<string, unknown> }) => {
+          throw putConditionFailed({ ...input.Item, __edd_wt__: { S: "f".repeat(32) } })
+        })
+        const error = yield* Ledger.append(id, [deposit(1)], 0).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(VersionConflict)
+
+        // An event without a token (written by a transaction) likewise.
+        mockPutItem.mockImplementationOnce(async (input: { Item: Record<string, unknown> }) => {
+          const { __edd_wt__: _token, ...item } = input.Item
+          throw putConditionFailed(item)
+        })
+        const untokened = yield* Ledger.append(id, [deposit(1)], 0).pipe(Effect.flip)
+        expect(untokened).toBeInstanceOf(VersionConflict)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
 
   it.effect("a commandHandler's first event takes it", () =>
     Effect.gen(function* () {
@@ -575,45 +645,38 @@ describe("the single-item fast path (#173)", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    for (const name of ["ProvisionedThroughputExceededException", "ThrottlingException"]) {
-      it.effect(`throttling (${name}): TransactionCancelled with a ThrottlingError reason`, () =>
+    // Each `PutItem` error, and the cancellation reason a transaction gives
+    // its item for the same failure.
+    const itemReasons = [
+      ["ProvisionedThroughputExceededException", "ProvisionedThroughputExceeded", "Rate exceeded"],
+      ["ThrottlingException", "ThrottlingError", "Rate exceeded"],
+      [
+        "ItemCollectionSizeLimitExceededException",
+        "ItemCollectionSizeLimitExceeded",
+        "Collection size exceeded",
+      ],
+      [
+        "TransactionConflictException",
+        "TransactionConflict",
+        "Transaction is ongoing for the item",
+      ],
+    ] as const
+    for (const [name, code, message] of itemReasons) {
+      it.effect(`${name}: TransactionCancelled with a ${code} reason`, () =>
         Effect.gen(function* () {
           const { fast, tx } = yield* both(
-            awsError(name, "Rate exceeded"),
-            awsTransactionCanceled([{ Code: "ThrottlingError", Message: "Rate exceeded" }]),
+            awsError(name, message),
+            awsTransactionCanceled([{ Code: code, Message: message }]),
           )
           expect(fast).toBeInstanceOf(TransactionCancelled)
           expect(tx).toBeInstanceOf(TransactionCancelled)
-          expect(fast).toMatchObject({
-            operation: "PutItem",
-            reasons: [{ code: "ThrottlingError", message: "Rate exceeded" }],
-          })
+          expect(fast).toMatchObject({ operation: "PutItem", reasons: [{ code, message }] })
           expect((tx as TransactionCancelled).reasons[0]).toEqual(
             (fast as TransactionCancelled).reasons[0],
           )
         }).pipe(Effect.provide(TestLayer)),
       )
     }
-
-    it.effect(
-      "a conflicting transaction: TransactionCancelled with a TransactionConflict reason",
-      () =>
-        Effect.gen(function* () {
-          const message = "Transaction is ongoing for the item"
-          const { fast, tx } = yield* both(
-            awsError("TransactionConflictException", message),
-            awsTransactionCanceled([{ Code: "TransactionConflict", Message: message }]),
-          )
-          expect(fast).toBeInstanceOf(TransactionCancelled)
-          expect(fast).toMatchObject({
-            operation: "PutItem",
-            reasons: [{ code: "TransactionConflict", message }],
-          })
-          expect((tx as TransactionCancelled).reasons[0]).toEqual(
-            (fast as TransactionCancelled).reasons[0],
-          )
-        }).pipe(Effect.provide(TestLayer)),
-    )
 
     it.effect("anything else passes through unchanged", () =>
       Effect.gen(function* () {

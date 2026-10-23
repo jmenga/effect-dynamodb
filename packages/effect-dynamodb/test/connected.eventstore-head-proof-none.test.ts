@@ -13,7 +13,9 @@
  * (another stream's append carrying `appendOp` with `seal: true`), a writer
  * that read the stream before the seal gets `StreamSealed` from DynamoDB's own
  * `ALL_OLD` item, and a writer that read the seal finds it on the last event
- * it read — refusing then is its duty.
+ * it read — refusing then is its duty. A `PutItem` event carries its write
+ * token, and an SDK-style resend of a committed `PutItem` succeeds on the
+ * writer's own event while another writer's is still a conflict.
  */
 
 import { it } from "@effect/vitest"
@@ -108,6 +110,41 @@ const LoggingClient = Layer.effect(
 
 const TestLayer = Layer.mergeAll(LoggingClient, NoneTable.layer({ name: tableName }))
 const provide = Effect.provide(TestLayer)
+
+/**
+ * A client whose every `PutItem` is sent twice and answered by the second
+ * send: what the AWS SDK's retry does when the first send commits and its
+ * response is lost (a timeout, a reset connection, a 5xx after the commit).
+ */
+const ResendingClient = Layer.effect(
+  DynamoClient,
+  Effect.map(
+    DynamoClient,
+    (client): DynamoClientService => ({
+      ...client,
+      putItem: (input) => Effect.andThen(client.putItem(input), client.putItem(input)),
+    }),
+  ),
+).pipe(Layer.provide(LoggingClient))
+const provideResending = Effect.provide(
+  Layer.mergeAll(ResendingClient, NoneTable.layer({ name: tableName })),
+)
+
+/** The stream's event items as stored, raw, in version order. */
+const storedEvents = (accountId: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const scanned = yield* client.scan({
+      TableName: tableName,
+      ConsistentRead: true,
+      FilterExpression: "streamId = :id AND begins_with(#e, :ledger)",
+      ExpressionAttributeNames: { "#e": "__edd_e__" },
+      ExpressionAttributeValues: { ":id": { S: accountId }, ":ledger": { S: "ledger." } },
+    })
+    return (scanned.Items ?? []).toSorted(
+      (a, b) => Number(a.version?.N ?? 0) - Number(b.version?.N ?? 0),
+    )
+  })
 
 const deposit = (amount: number) => new Deposited({ amount })
 
@@ -238,6 +275,73 @@ describeConnected('EventStore headProof: "none" and the single-item fast path (#
         expect(yield* versions(accountId)).toEqual([1, 2])
       }).pipe(provide),
   )
+
+  it.effect("a PutItem event carries its write token; a transaction's event does not", () =>
+    Effect.gen(function* () {
+      const accountId = "token"
+      yield* Ledger.append({ accountId }, [deposit(1)], 0)
+      yield* Ledger.append({ accountId }, [deposit(2), deposit(3)], 1, { headProof: "none" })
+
+      const tokens = (yield* storedEvents(accountId)).map((item) => item.__edd_wt__?.S)
+      expect(tokens).toHaveLength(3)
+      expect(tokens[0]).toMatch(/^[0-9a-f]{32}$/)
+      expect(tokens.slice(1)).toEqual([undefined, undefined])
+      // Readers ignore it.
+      expect(yield* Ledger.read({ accountId }, { consistentRead: true })).toHaveLength(3)
+    }).pipe(provide),
+  )
+
+  describe("an SDK retry of a PutItem that committed but lost its response", () => {
+    it.effect("succeeds on the writer's own event, as a transaction's retry does", () =>
+      Effect.gen(function* () {
+        const accountId = "resend"
+        // Version 0, then a "none" append, each sent twice: the second send
+        // fails its condition, and ALL_OLD returns the writer's own event.
+        const first = yield* Ledger.append({ accountId }, [deposit(1)], 0).pipe(provideResending)
+        const second = yield* Ledger.append({ accountId }, [deposit(2)], 1, {
+          headProof: "none",
+        }).pipe(provideResending)
+
+        expect(first).toEqual({ version: 1, events: [deposit(1)] })
+        expect(second).toEqual({ version: 2, events: [deposit(2)] })
+        expect(yield* versions(accountId)).toEqual([1, 2])
+      }).pipe(provide),
+    )
+
+    it.effect("a commandHandler appends once, with no duplicate event", () =>
+      Effect.gen(function* () {
+        const accountId = "resend-handler"
+        const handler = EventStore.commandHandler(
+          {
+            initialState: 0,
+            decide: (amount: number) => Effect.succeed([deposit(amount)]),
+            evolve: (balance: number, event: Deposited | Closed) =>
+              event._tag === "Deposited" ? balance + event.amount : balance,
+          },
+          Ledger,
+          { retry: 3 },
+        )
+        const result = yield* handler({ accountId }, 10).pipe(provideResending)
+
+        expect(result).toMatchObject({ version: 1, state: 10 })
+        expect(yield* versions(accountId)).toEqual([1])
+      }).pipe(provide),
+    )
+
+    it.effect("another writer's event at the version is still a VersionConflict", () =>
+      Effect.gen(function* () {
+        const accountId = "resend-race"
+        yield* Ledger.append({ accountId }, [deposit(1)], 0)
+        // The same content, written by another append call: its token differs.
+        const error = yield* Ledger.append({ accountId }, [deposit(1)], 0).pipe(
+          provideResending,
+          Effect.flip,
+        )
+        expect(error).toBeInstanceOf(VersionConflict)
+        expect(yield* versions(accountId)).toEqual([1])
+      }).pipe(provide),
+    )
+  })
 
   it.effect("the caller's consistent read keeps every append contiguous", () =>
     Effect.gen(function* () {

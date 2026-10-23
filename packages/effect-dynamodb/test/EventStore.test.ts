@@ -6791,7 +6791,10 @@ describe("EventStore stream index projection", () => {
           yield* ProjMatch.append({ matchId: "m-1" }, [new MatchEnded({ result: "won" })], 0, {
             metadata: { eventId: "evt-1" },
           })
-          const item = fromAttributeMap(putItemsOf("event")[0]!.Item)
+          // A one-event append at version 0 is a `PutItem` (#173), whose write
+          // token readers never need: it is not projected.
+          const { __edd_wt__: token, ...item } = fromAttributeMap(putItemsOf("event")[0]!.Item)
+          expect(token).toMatch(/^[0-9a-f]{32}$/)
           const indexAttributes = [
             "lsi1sk",
             "lsi2sk",
