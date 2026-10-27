@@ -118,7 +118,7 @@ db.Matches.get({ matchId: "m-1" })
 | DynamoClient.make(table) as typed gateway | `Table.make({ entities, aggregates })` declares members; `DynamoClient.make(table)` binds them all and returns typed access. Matches `HttpApiClient.make(api)` pattern from Effect v4 |
 | Entities are pure definitions | `Entity.make()` has no `table` parameter — entities carry only model, indexes, and config. Table association happens at `Table.make()` time |
 | Table declares its members | `Table.make({ schema, entities: { Users, Tasks }, aggregates: { Matches } })` — the named record provides property names on the typed client |
-| Aggregates compose entity operations | Aggregates never touch DynamoClient. They orchestrate Entity, Collection, and Transaction primitives |
+| Aggregates own their read and write path | Read: one partition query + assembly. Write: decompose the domain object, compose the rows, and issue one `transactWriteItems` per sub-aggregate group (`delete` uses `batchWriteItem`). They reuse Entity definitions for keys and schemas but do not route writes through Entity ops |
 | ElectroDB-style composite indexes | `{ pk: { field, composite }, sk: { field, composite } }` — attribute lists not templates |
 | DynamoSchema for key namespacing | `$schema#v1#entity#attrs` format with `$` sentinel prefix for ORM/non-ORM coexistence |
 | `__edd_e__` entity type attribute | Ugly name convention (like ElectroDB's `__edb_e__`) avoids collisions with user model fields |
@@ -128,7 +128,7 @@ db.Matches.get({ matchId: "m-1" })
 ### Module Dependencies
 
 ```
-Aggregate → Entity, Collection, Transaction, Errors (never DynamoClient directly)
+Aggregate → Entity, Batch (ref hydration), Table, KeyComposer, Marshaller, Errors, DynamoClient via Capacity.client (partition query, transactWriteItems per group, batchWriteItem for delete)
 Entity → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Expression, Errors
 Collection → DynamoClient, Entity, Table, Marshaller, Errors
 Transaction → DynamoClient, Entity, KeyComposer, Marshaller, Expression, Errors
@@ -2539,7 +2539,7 @@ A production cricket match management system built on ElectroDB demonstrates the
 
 **Context** — Fields on the aggregate's domain schema that must be propagated to every edge entity item in DynamoDB for query support. Defined once at the aggregate level.
 
-**Aggregate** — A domain object composed of multiple entity types that share a partition key. The aggregate orchestrates Entity, Collection, and Transaction primitives — it never touches DynamoClient directly. The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
+**Aggregate** — A domain object composed of multiple entity types that share a partition key. The aggregate reuses its edge entities' definitions for keys and schemas, and reads its partition and writes its rows through the DynamoClient itself (one partition query to read, one `transactWriteItems` per sub-aggregate group to write). The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
 
 **Optics** — Effect v4's `effect/Optic` library solves aggregate mutation: instead of manual destructuring, an optic navigates to the target and produces an updated aggregate immutably.
 

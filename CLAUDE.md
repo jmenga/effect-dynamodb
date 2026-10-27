@@ -108,7 +108,7 @@ packages/effect-dynamodb/src/
 ### Module Dependencies
 
 ```
-Aggregate → Entity, Collection, Transaction, Errors (never DynamoClient directly)
+Aggregate → Entity, Batch (ref hydration), Table, KeyComposer, Marshaller, Errors, DynamoClient via Capacity.client (partition query, transactWriteItems per group, batchWriteItem for delete)
 Entity → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Expr, Errors
 Collections → Entity (type-level for member validation), KeyComposer
 Collection → DynamoClient, Entity, Table, Marshaller, Errors
