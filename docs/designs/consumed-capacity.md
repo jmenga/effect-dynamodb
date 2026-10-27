@@ -364,7 +364,9 @@ to one accumulator safely. No `Ref` is needed.
 ### 5.1 When and how
 
 When reporting is on and `spans !== false`, every operation scope (§6), root or nested, runs in
-`Effect.withSpan(name, { kind: "client", attributes: <static> })`. Its totals are added with
+`Effect.withSpan(name, { kind, attributes: <static> })`. `kind` is `"client"` for a root and
+`"internal"` for a nested scope: backends that count client spans as database calls then count
+each root once, and OTel advises against nesting client spans. Its totals are added with
 `Effect.annotateCurrentSpan` in the scope's exit handler, which runs inside the span. Failure
 status comes from `withSpan` as usual.
 
@@ -978,21 +980,22 @@ Each item of the issue, plus the decisions this design adds, marked **in**, **ou
 
 ---
 
-## 14. Open questions
+## 14. Open questions (resolved)
 
-1. **Span name format.** This design uses `effect-dynamodb.<operation>`, for example
-   `effect-dynamodb.Entity.get`. An alternative is the bare `<operation>` with the library
-   identified by `effect_dynamodb.operation` and `db.system.name`.
-2. **Span kind.** This design uses `"client"`, following the OTel DB-client convention for
-   logical operations that issue requests. `"internal"` is the alternative, if the application's
-   backend treats client spans as remote calls.
+1. **Span name format.** Decided: `effect-dynamodb.<operation>`, for example
+   `effect-dynamodb.Entity.get`. It is stable, low-cardinality and searchable; the bare
+   `<operation>` with the library identified by attributes was the alternative.
+2. **Span kind.** Decided: `"client"` for a root operation, `"internal"` for a nested one (§5.1).
+   All-`"client"` would make one aggregate write look like several database calls to backends that
+   count client spans.
 3. **Observer timing.** The observer runs synchronously in the operation's fiber, before the
    operation returns. That is the simplest and deterministic for tests, but it adds the
    observer's latency to the call. The alternative is to fork it as a daemon, at the cost of
    determinism. The design keeps it synchronous and documents "fork inside the observer if it
-   is slow".
-4. **Module name.** `ConsumedCapacity` shadows the SDK's type of the same name if both are
-   imported unqualified. `Capacity` is the alternative.
+   is slow". Kept as designed.
+4. **Module name.** Decided: `ConsumedCapacity`, the DynamoDB term. It shadows the SDK's type of
+   the same name only if both are imported unqualified in one file; `Capacity` would be ambiguous
+   with provisioned capacity.
 
 ---
 
@@ -1012,7 +1015,7 @@ Every finding was checked against the code; all eleven were real. How each is re
 | R8 | minor | `fetch()` is not always one request. | **Accepted.** §7.1 corrected; unit case added (§11.2-4). |
 | R9 | minor | The static guard missed `Effect.map(DynamoClient, …)`, `DynamoClient.use`, `Context.get(ctx, DynamoClient)`. | **Accepted.** The guard matches any value use of `DynamoClient` outside the allowlist (§4.1). |
 | R10 | minor | The observer, run from an exit finalizer, could not be interrupted. | **Partly accepted.** Success and failure reports run after the effect, interruptibly; only an interrupted operation reports from a finalizer (uninterruptible by nature), and the guide says to fork slow observers (§6.5). |
-| R11 | minor | `aws.dynamodb.consumed_capacity.*` turns a semconv attribute into a namespace; other custom names squat in `aws.dynamodb.*`. | **Partly accepted.** The `.total` conflict is the owner's call and is documented; `.read` / `.write` stay beside it; the other invented names move to `effect_dynamodb.*` (§5.2, S26). |
+| R11 | minor | `aws.dynamodb.consumed_capacity.*` turns a semconv attribute into a namespace; other custom names squat in `aws.dynamodb.*`. | **Partly accepted.** The `.total` name is kept (owner decision): the library never emits the semconv `aws.dynamodb.consumed_capacity` itself, so the two never share a span; the conflict is documented; `.read` / `.write` stay beside it; the other invented names move to `effect_dynamodb.*` (§5.2, S26). |
 
 ### 15.1 Implementation review (resolutions)
 

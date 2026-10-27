@@ -179,6 +179,14 @@ export const Attributes = {
 /** Span name of an operation: `effect-dynamodb.<operation>`. */
 export const spanName = (operation: string): string => `effect-dynamodb.${operation}`
 
+/**
+ * Span kind of an operation: `client` for a root, `internal` for a nested one,
+ * so tracing backends that count client spans as database calls count each
+ * root once (OTel advises against nesting client spans).
+ */
+const spanKind = (scope: OperationScope): "client" | "internal" =>
+  scope.parent === undefined ? "client" : "internal"
+
 // ---------------------------------------------------------------------------
 // Operation scopes
 // ---------------------------------------------------------------------------
@@ -496,7 +504,7 @@ const runScope = <A, E, R>(
   if (!settings.spans) return finished
   return Effect.useSpan(
     spanName(name),
-    { kind: "client", attributes: startAttributes(scope) },
+    { kind: spanKind(scope), attributes: startAttributes(scope) },
     (span) => {
       scope.span = span
       return Effect.withParentSpan(finished, span)
@@ -577,7 +585,7 @@ export const operationStream = <A, E, R>(
             let scoped = Stream.provideService(withSettings, CurrentOperation, scope)
             if (settings.spans) {
               const span = yield* Effect.makeSpanScoped(spanName(name), {
-                kind: "client",
+                kind: spanKind(scope),
                 attributes: startAttributes(scope),
               })
               scope.span = span

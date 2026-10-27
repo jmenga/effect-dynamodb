@@ -4600,7 +4600,7 @@ time nor parent their spans to the span current then.
 sums under `"indexes"`), `vectorSearchRequestBytes`, `vectorWriteRequestBytes`, `nested`,
 `outcome` (`"success"` / `"failure"` / `"interrupted"`).
 
-Spans are named `effect-dynamodb.<operation>` (kind `client`) and carry `db.system.name`,
+Spans are named `effect-dynamodb.<operation>` (kind `client` for a root operation, `internal` for a nested one, so backends that count client spans as database calls count each root once) and carry `db.system.name`,
 `effect_dynamodb.operation` / `.target` / `.index` / `.nested`, `aws.dynamodb.table_names`,
 `aws.dynamodb.consumed_capacity.total` / `.read` / `.write` (always), `effect_dynamodb.request_count`
 (always), and `effect_dynamodb.unreported_requests` / `effect_dynamodb.vector.*` (when > 0).

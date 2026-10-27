@@ -877,6 +877,9 @@ describe("nesting", () => {
       expect(report.operation).toBe("EventStore.commandHandler")
       expect(report.target).toBe("Ledger")
       expect(report.requests).toBe(sent.length)
+      // The first event is a one-item append, sent as a PutItem (#173).
+      expect(report.requestsByCommand.PutItem).toBe(1)
+      expect(report.requestsByCommand.TransactWriteItems).toBeUndefined()
       expect(report.nested.map((n) => [n.operation, n.calls]).sort()).toEqual([
         ["EventStream.append", 1],
         ["EventStream.read", 1],
@@ -892,8 +895,34 @@ describe("nesting", () => {
       for (const span of spans) {
         const isRoot = span.name === "effect-dynamodb.EventStore.commandHandler"
         expect(span.attributes.get(ConsumedCapacity.Attributes.nested)).toBe(!isRoot)
+        // Only the root is a client span, so backends count one database call.
+        expect(span.kind).toBe(isRoot ? "client" : "internal")
         if (!isRoot) expect(parentName(span)).toBe("effect-dynamodb.EventStore.commandHandler")
       }
+    }),
+  )
+
+  it.effect("a one-item append reports its PutItem, a larger one its transaction", () =>
+    Effect.gen(function* () {
+      const { service } = inMemory()
+      const { reports, onOperation } = collectReports()
+      yield* Effect.gen(function* () {
+        yield* Ledgers.append({ ledgerId: "l-1" }, [new Deposited({ amount: 1 })], 0)
+        yield* Ledgers.append(
+          { ledgerId: "l-1" },
+          [new Deposited({ amount: 2 }), new Deposited({ amount: 3 })],
+          1,
+        )
+        yield* Ledgers.append({ ledgerId: "l-1" }, [new Deposited({ amount: 4 })], 3, {
+          headProof: "none",
+        })
+      }).pipe(Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))))
+      expect(reports.map((r) => [r.operation, r.requestsByCommand])).toEqual([
+        ["EventStream.append", { PutItem: 1 }],
+        ["EventStream.append", { TransactWriteItems: 1 }],
+        ["EventStream.append", { PutItem: 1 }],
+      ])
+      expect(reports.every((r) => r.capacityUnits > 0)).toBe(true)
     }),
   )
 

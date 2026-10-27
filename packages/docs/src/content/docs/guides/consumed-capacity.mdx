@@ -122,7 +122,7 @@ const handled = last()
 // handled.capacityUnits includes both: never add the nested totals again.
 ```
 
-Nested operations get their own spans (with `effect_dynamodb.nested = true`), but no observer call: their cost is already in the parent's report. So summing every report the observer receives never counts a request twice. The same holds for an `Aggregate.update` and the entity writes it composes, a transaction and the operations it plans, and a projection and its reads.
+Nested operations get their own spans (with `effect_dynamodb.nested = true` and span kind `internal`; only the outermost operation's span is a `client` span, so a backend that counts client spans as database calls counts each operation once), but no observer call: their cost is already in the parent's report. So summing every report the observer receives never counts a request twice. The same holds for an `Aggregate.update` and the entity writes it composes, a transaction and the operations it plans, and a projection and its reads.
 
 ## Grouping your own operations
 
@@ -182,3 +182,5 @@ The instrumentation wraps whatever `DynamoClient` is in context: the built-in la
 The setting is read when an operation runs, from the fiber that runs it. A client bound with `DynamoClient.make` (or `EventStore.bind`, `Aggregate.bind`, …) while a `ConsumedCapacity` layer was in context keeps that setting for every call through it, including a stream from `paginate()`. A client bound under `ConsumedCapacity.disabled` never reports.
 
 Binding captures only the setting, never the operation or span that was current when you bound: a client made inside a `withOperation` reports its later calls as their own operations, and their spans' parent is the span current when they run.
+
+The top-level `EventStore.processBatch(records, { projections })` is itself unbound, so its own operation follows the setting where it runs; each projection's work inside it follows the setting that projection was bound with.
