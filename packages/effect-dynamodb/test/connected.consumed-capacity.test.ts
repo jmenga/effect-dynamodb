@@ -404,13 +404,20 @@ describeConnected("consumed capacity (connected)", () => {
           yield* Ledgers.append({ ledgerId }, [new Deposited({ amount: 5 })], 0)
           yield* Ledgers.read({ ledgerId })
           yield* EventStore.commandHandler(ledgerDecider, Ledgers)({ ledgerId }, 3)
+          // The same shape as the handler's append: one event above version 0.
+          yield* Ledgers.append({ ledgerId }, [new Deposited({ amount: 4 })], 2)
         }),
       )
       expect(reports.map((r) => r.operation)).toEqual([
         "EventStream.append",
         "EventStream.read",
         "EventStore.commandHandler",
+        "EventStream.append",
       ])
+      // The first event is a one-item append, sent as a PutItem (#173); the
+      // later appends carry the head check, so they are transactions.
+      expect(reports[0]!.requestsByCommand).toEqual({ PutItem: 1 })
+      expect(reports[3]!.requestsByCommand).toEqual({ TransactWriteItems: 1 })
       for (const report of reports) {
         expect(report.unreportedRequests).toBe(0)
         expect(report.capacityUnits).toBeGreaterThan(0)
@@ -425,8 +432,8 @@ describeConnected("consumed capacity (connected)", () => {
         handler.nested.reduce((sum, child) => sum + child.capacityUnits, 0),
       )
       expect(handler.requests).toBe(handler.nested.reduce((sum, child) => sum + child.requests, 0))
-      // The handler's append costs what the standalone append cost.
-      expect(handler.nested[1]!.capacityUnits).toBe(reports[0]!.capacityUnits)
+      // The handler's append costs what a standalone append of its shape cost.
+      expect(handler.nested[1]!.capacityUnits).toBe(reports[3]!.capacityUnits)
     }),
   )
 
