@@ -339,9 +339,10 @@ const TestDynamoClient = mockDynamoClientLayer({
       try: () => mockTransactWriteItems(input),
       catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
     }),
+  // Unanswered, a put succeeds — a one-event append is a `PutItem` (#173).
   putItem: (input) =>
     Effect.tryPromise({
-      try: () => mockPutItem(input),
+      try: async () => (await mockPutItem(input)) ?? {},
       catch: (e) => new DynamoError({ operation: "PutItem", cause: e }),
     }),
   // Unanswered, a read finds no item (a guarded additional put reads its item).
@@ -359,6 +360,24 @@ const TestDynamoClient = mockDynamoClientLayer({
 
 const TestTableConfig = EventsTable.layer({ name: "events-table" })
 const TestLayer = Layer.merge(TestDynamoClient, TestTableConfig)
+
+/**
+ * The `PutItem` requests of one item kind — `"event"` (an append whose one
+ * item is its one event, #173) or `"snapshot"` (`writeSnapshot`).
+ */
+const putItemsOf = (kind: "event" | "snapshot"): ReadonlyArray<any> =>
+  mockPutItem.mock.calls
+    .map(([input]) => input)
+    .filter((input) => String(fromAttributeMap(input.Item).__edd_e__).endsWith(`.${kind}`))
+
+/**
+ * No append was sent: no transaction, and no event `PutItem` — the request of
+ * an append whose one item is its one event (#173).
+ */
+const expectNoAppendSent = (): void => {
+  expect(mockTransactWriteItems).not.toHaveBeenCalled()
+  expect(putItemsOf("event")).toHaveLength(0)
+}
 
 beforeEach(() => {
   vi.resetAllMocks()
@@ -507,10 +526,8 @@ describe("EventStore", () => {
   // -------------------------------------------------------------------------
 
   describe("append", () => {
-    it.effect("appends events via transactWriteItems", () =>
+    it.effect("appends one event at version 0 as a conditional PutItem (#173)", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         const result = yield* MatchEvents.append(
           { matchId: "m-1" },
           [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
@@ -519,14 +536,13 @@ describe("EventStore", () => {
 
         expect(result.version).toBe(1)
         expect(result.events).toHaveLength(1)
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        expect(call.TransactItems).toHaveLength(1)
-
-        const putItem = call.TransactItems[0].Put
+        const putItem = mockPutItem.mock.calls[0]![0]
         expect(putItem.TableName).toBe("events-table")
         expect(putItem.ConditionExpression).toBe("attribute_not_exists(pk)")
+        expect(putItem.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
 
         // Verify item structure
         const item = fromAttributeMap(putItem.Item)
@@ -577,7 +593,7 @@ describe("EventStore", () => {
 
         expect(result.version).toBe(5)
         expect(result.events).toEqual([])
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -585,13 +601,20 @@ describe("EventStore", () => {
       Effect.gen(function* () {
         const txError = {
           name: "TransactionCanceledException",
-          CancellationReasons: [{ Code: "ConditionalCheckFailed", Message: "Item already exists" }],
+          CancellationReasons: [
+            { Code: "ConditionalCheckFailed", Message: "Item already exists" },
+            { Code: "None" },
+          ],
         }
         mockTransactWriteItems.mockRejectedValue(txError)
 
+        // Two events: a transaction (one event alone is a PutItem, #173).
         const result = yield* MatchEvents.append(
           { matchId: "m-1" },
-          [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+          [
+            new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" }),
+            new InningsCompleted({ innings: 1, runs: 200, wickets: 10 }),
+          ],
           0,
         ).pipe(Effect.flip)
 
@@ -607,13 +630,19 @@ describe("EventStore", () => {
       Effect.gen(function* () {
         const txError = {
           name: "TransactionCanceledException",
-          CancellationReasons: [{ Code: "ValidationError", Message: "Bad input" }],
+          CancellationReasons: [
+            { Code: "ValidationError", Message: "Bad input" },
+            { Code: "None" },
+          ],
         }
         mockTransactWriteItems.mockRejectedValue(txError)
 
         const result = yield* MatchEvents.append(
           { matchId: "m-1" },
-          [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+          [
+            new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" }),
+            new InningsCompleted({ innings: 1, runs: 200, wickets: 10 }),
+          ],
           0,
         ).pipe(Effect.flip)
 
@@ -632,8 +661,6 @@ describe("EventStore", () => {
           metadata: Schema.Struct({ correlationId: Schema.String, userId: Schema.String }),
         })
 
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* MetaStream.append(
           { matchId: "m-1" },
           [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
@@ -641,8 +668,7 @@ describe("EventStore", () => {
           { metadata: { correlationId: "corr-1", userId: "admin" } },
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const item = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
         expect(item.metadata).toEqual({ correlationId: "corr-1", userId: "admin" })
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -704,14 +730,16 @@ describe("EventStore", () => {
 
         yield* MatchEvents.append(
           { matchId: "m-1" },
-          [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
+          [
+            new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" }),
+            new InningsCompleted({ innings: 1, runs: 200, wickets: 10 }),
+          ],
           0,
         )
 
         const call = mockTransactWriteItems.mock.calls[0]![0]
-        expect(call.TransactItems).toHaveLength(1)
-        expect(call.TransactItems[0].ConditionCheck).toBeUndefined()
-        expect(call.TransactItems[0].Put).toBeDefined()
+        expect(call.TransactItems).toHaveLength(2)
+        expect(call.TransactItems.every((item: any) => item.Put !== undefined)).toBe(true)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1612,7 +1640,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect(String((error as { cause: unknown }).cause)).toContain("omitted generated id")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1781,7 +1809,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("EDD-9048")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1801,7 +1829,7 @@ describe("EventStore", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("upsert")
         // Nothing may be written — the whole append is refused up front.
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2013,7 +2041,8 @@ describe("EventStore", () => {
         Effect.gen(function* () {
           mockQuery.mockResolvedValueOnce({ Items: [] })
           const rejection = awsValidationException(DDB_ITEM_SIZE)
-          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          // One event at version 0: a PutItem (#173).
+          mockPutItem.mockRejectedValueOnce(rejection)
 
           const error = yield* handleMatch(
             { matchId: "m-1" },
@@ -2027,7 +2056,7 @@ describe("EventStore", () => {
             "the item of the event at version 1, at pk=$cricket#v1#match#m-1",
           )
           expect(((failure.cause as Error).cause as { cause: unknown }).cause).toBe(rejection)
-          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+          expect(mockPutItem).toHaveBeenCalledOnce()
         }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2060,7 +2089,7 @@ describe("EventStore", () => {
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: [] })
         const rejection = awsValidationException("Some other validation problem")
-        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        mockPutItem.mockRejectedValueOnce(rejection)
 
         const error = yield* handleMatch(
           { matchId: "m-1" },
@@ -2069,7 +2098,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("DynamoError")
         expect((error as { cause: unknown }).cause).toBe(rejection)
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2144,7 +2173,7 @@ describe("EventStore", () => {
 
         expect(result.events).toEqual([])
         expect(result.version).toBe(0)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2241,7 +2270,7 @@ describe("EventStore", () => {
         expect(result.version).toBe(1)
         expect(result.events).toEqual([])
         expect(mockGetItem).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2309,8 +2338,6 @@ describe("EventStore", () => {
       Effect.gen(function* () {
         const bound = yield* EventStore.bind(MatchEvents)
 
-        mockTransactWriteItems.mockResolvedValue({})
-
         // This call has R = never — no need to provide DynamoClient | TableConfig
         const result = yield* bound.append(
           { matchId: "m-1" },
@@ -2320,7 +2347,7 @@ describe("EventStore", () => {
 
         expect(result.version).toBe(1)
         expect(result.events).toHaveLength(1)
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2438,16 +2465,14 @@ describe("EventStore", () => {
   describe("item structure", () => {
     it.effect("produces correct DynamoDB key format", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* MatchEvents.append(
           { matchId: "m-123" },
           [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
           0,
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const put = mockPutItem.mock.calls[0]![0]
+        const item = fromAttributeMap(put.Item)
 
         // PK: $cricket#v1#match#m-123
         expect(item.pk).toBe("$cricket#v1#match#m-123")
@@ -2473,16 +2498,14 @@ describe("EventStore", () => {
 
     it.effect("composes PK from multiple composite fields", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* CompoundStream.append(
           { leagueId: "L-1", teamId: "T-5" },
           [new MatchStarted({ venue: "MCG", homeTeam: "AUS", awayTeam: "ENG" })],
           0,
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const put = mockPutItem.mock.calls[0]![0]
+        const item = fromAttributeMap(put.Item)
 
         // PK should include both composites
         expect(item.pk).toBe("$cricket#v1#team#l-1#t-5")
@@ -2544,16 +2567,14 @@ describe("EventStore", () => {
 
     it.effect("append encodes transform event fields to wire form", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* GoalStream.append(
           { matchId: "g-1" },
           [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
           0,
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const put = mockPutItem.mock.calls[0]![0]
+        const item = fromAttributeMap(put.Item)
         // Wire form is the encoded ISO string, not a marshalled DateTime instance.
         expect(item.data).toEqual({
           _tag: "GoalScored",
@@ -2565,8 +2586,6 @@ describe("EventStore", () => {
 
     it.effect("append encodes transform metadata fields to wire form", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* GoalStream.append(
           { matchId: "g-1" },
           [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
@@ -2574,16 +2593,14 @@ describe("EventStore", () => {
           { metadata: { correlationId: "corr-1", recordedAt: DateTime.makeUnsafe(epochMs) } },
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const put = mockPutItem.mock.calls[0]![0]
+        const item = fromAttributeMap(put.Item)
         expect(item.metadata).toEqual({ correlationId: "corr-1", recordedAt: isoString })
       }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("transforming event schema round-trips append → read", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* GoalStream.append(
           { matchId: "g-1" },
           [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
@@ -2592,8 +2609,8 @@ describe("EventStore", () => {
         )
 
         // Feed the exact stored item back through the read path.
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+        const put = mockPutItem.mock.calls[0]![0]
+        mockQuery.mockResolvedValue({ Items: [put.Item] })
 
         const events = yield* GoalStream.read({ matchId: "g-1" })
 
@@ -2610,8 +2627,6 @@ describe("EventStore", () => {
 
     it.effect("metadata round-trips append → read (decoded, not raw)", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* GoalStream.append(
           { matchId: "g-1" },
           [new GoalScored({ scorer: "Kane", occurredAt: DateTime.makeUnsafe(epochMs) })],
@@ -2619,8 +2634,8 @@ describe("EventStore", () => {
           { metadata: { correlationId: "corr-1", recordedAt: DateTime.makeUnsafe(epochMs) } },
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+        const put = mockPutItem.mock.calls[0]![0]
+        mockQuery.mockResolvedValue({ Items: [put.Item] })
 
         const events = yield* GoalStream.read({ matchId: "g-1" })
 
@@ -2634,16 +2649,14 @@ describe("EventStore", () => {
 
     it.effect("Schema.TaggedClass events keep their _tag through append → read", () =>
       Effect.gen(function* () {
-        mockTransactWriteItems.mockResolvedValue({})
-
         yield* GoalStream.append(
           { matchId: "g-1" },
           [new MatchAbandoned({ reason: "rain", abandonedAt: DateTime.makeUnsafe(epochMs) })],
           0,
         )
 
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        const item = fromAttributeMap(call.TransactItems[0].Put.Item)
+        const put = mockPutItem.mock.calls[0]![0]
+        const item = fromAttributeMap(put.Item)
         expect(item.eventType).toBe("MatchAbandoned")
         expect(item.data).toEqual({
           _tag: "MatchAbandoned",
@@ -2651,7 +2664,7 @@ describe("EventStore", () => {
           abandonedAt: isoString,
         })
 
-        mockQuery.mockResolvedValue({ Items: [call.TransactItems[0].Put.Item] })
+        mockQuery.mockResolvedValue({ Items: [put.Item] })
         const events = yield* GoalStream.read({ matchId: "g-1" })
         expect(events[0]!.data).toBeInstanceOf(MatchAbandoned)
         const abandoned = events[0]!.data as MatchAbandoned
@@ -2671,7 +2684,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as { operation: string }).operation).toBe("EventStore.append")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -2691,7 +2704,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as { operation: string }).operation).toBe("EventStore.append.metadata")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3105,7 +3118,6 @@ describe("EventStore", () => {
     it.effect("never reads a snapshot for a stream without snapshot config", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockResolvedValue({})
 
         const handle = EventStore.commandHandler(matchDecider, MatchEvents)
         yield* handle(
@@ -3114,7 +3126,8 @@ describe("EventStore", () => {
         )
 
         expect(mockGetItem).not.toHaveBeenCalled()
-        expect(mockPutItem).not.toHaveBeenCalled()
+        expect(putItemsOf("snapshot")).toHaveLength(0)
+        expect(putItemsOf("event")).toHaveLength(1)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3249,7 +3262,6 @@ describe("EventStore", () => {
     it.effect("never auto-snapshots when `every` is not configured", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockResolvedValue({})
 
         const handle = EventStore.commandHandler(matchDecider, ManualSnapshotMatchEvents)
         yield* handle(
@@ -3258,10 +3270,11 @@ describe("EventStore", () => {
         )
 
         expect(mockQuery).toHaveBeenCalledOnce()
-        expect(mockPutItem).not.toHaveBeenCalled()
-        // No inline snapshot either: the mode is "after-append".
-        const call = mockTransactWriteItems.mock.calls[0]![0]
-        expect(call.TransactItems).toHaveLength(1)
+        expect(putItemsOf("snapshot")).toHaveLength(0)
+        // No inline snapshot either: the mode is "after-append", so the append
+        // is its one event, a PutItem (#173).
+        expect(putItemsOf("event")).toHaveLength(1)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3269,8 +3282,8 @@ describe("EventStore", () => {
       Effect.gen(function* () {
         mockGetItem.mockResolvedValue({})
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockResolvedValue({})
-        mockPutItem.mockRejectedValue({ name: "InternalServerError" })
+        // The event's PutItem (#173) succeeds; the snapshot write fails.
+        mockPutItem.mockResolvedValueOnce({}).mockRejectedValue({ name: "InternalServerError" })
 
         const stream = EventStore.makeStream({
           table: EventsTable,
@@ -3287,7 +3300,8 @@ describe("EventStore", () => {
         )
 
         expect(result.version).toBe(1)
-        expect(mockPutItem).toHaveBeenCalledOnce()
+        expect(putItemsOf("event")).toHaveLength(1)
+        expect(putItemsOf("snapshot")).toHaveLength(1)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3306,7 +3320,7 @@ describe("EventStore", () => {
 
         expect(result.events).toEqual([])
         expect(result.version).toBe(9)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
         expect(mockPutItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
@@ -3336,11 +3350,9 @@ describe("EventStore", () => {
     it.effect("data-last with options", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems
-          .mockRejectedValueOnce({
-            name: "TransactionCanceledException",
-            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
-          })
+        // One event at version 0 is a PutItem (#173): its failed condition is the conflict.
+        mockPutItem
+          .mockRejectedValueOnce({ name: "ConditionalCheckFailedException" })
           .mockResolvedValue({})
 
         const handle = MatchEvents.pipe(EventStore.commandHandler(matchDecider, { retry: 2 }))
@@ -3350,7 +3362,7 @@ describe("EventStore", () => {
         )
 
         expect(result.version).toBe(1)
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        expect(mockPutItem).toHaveBeenCalledTimes(2)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3425,11 +3437,9 @@ describe("EventStore", () => {
     it.effect("data-last passes a retry option through (BoundEventStream)", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems
-          .mockRejectedValueOnce({
-            name: "TransactionCanceledException",
-            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
-          })
+        // One event at version 0 is a PutItem (#173): its failed condition is the conflict.
+        mockPutItem
+          .mockRejectedValueOnce({ name: "ConditionalCheckFailedException" })
           .mockResolvedValue({})
 
         const bound = yield* EventStore.bind(MatchEvents)
@@ -3442,7 +3452,7 @@ describe("EventStore", () => {
         expect(result.version).toBe(1)
         // Without the option surviving the pipe this would be 1 and the effect
         // would have failed with VersionConflict.
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+        expect(mockPutItem).toHaveBeenCalledTimes(2)
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -3456,11 +3466,13 @@ describe("EventStore", () => {
       name: "TransactionCanceledException",
       CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
     }
+    // A first event (version 0, one event) is a PutItem (#173).
+    const putConflict = { name: "ConditionalCheckFailedException" }
 
     it.effect("no retry by default — VersionConflict propagates", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockRejectedValue(conflict)
+        mockPutItem.mockRejectedValue(putConflict)
 
         const handle = EventStore.commandHandler(matchDecider, MatchEvents)
         const error = yield* handle(
@@ -3469,7 +3481,7 @@ describe("EventStore", () => {
         ).pipe(Effect.flip)
 
         expect(error._tag).toBe("VersionConflict")
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3517,9 +3529,9 @@ describe("EventStore", () => {
     it.effect("retry accepts an Effect Schedule", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems
-          .mockRejectedValueOnce(conflict)
-          .mockRejectedValueOnce(conflict)
+        mockPutItem
+          .mockRejectedValueOnce(putConflict)
+          .mockRejectedValueOnce(putConflict)
           .mockResolvedValue({})
 
         const handle = EventStore.commandHandler(matchDecider, MatchEvents, {
@@ -3531,14 +3543,14 @@ describe("EventStore", () => {
         )
 
         expect(result.version).toBe(1)
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(3)
+        expect(mockPutItem).toHaveBeenCalledTimes(3)
       }).pipe(Effect.provide(TestLayer)),
     )
 
     it.effect("gives up after the policy is exhausted", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockRejectedValue(conflict)
+        mockPutItem.mockRejectedValue(putConflict)
 
         const handle = EventStore.commandHandler(matchDecider, MatchEvents, { retry: 2 })
         const error = yield* handle(
@@ -3548,7 +3560,7 @@ describe("EventStore", () => {
 
         expect(error._tag).toBe("VersionConflict")
         // Initial attempt + 2 retries.
-        expect(mockTransactWriteItems).toHaveBeenCalledTimes(3)
+        expect(mockPutItem).toHaveBeenCalledTimes(3)
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3578,7 +3590,7 @@ describe("EventStore", () => {
     it.effect("does not retry infrastructure errors", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValue({ Items: [] })
-        mockTransactWriteItems.mockRejectedValue({ name: "InternalServerError" })
+        mockPutItem.mockRejectedValue({ name: "InternalServerError" })
 
         const handle = EventStore.commandHandler(matchDecider, MatchEvents, { retry: 5 })
         const error = yield* handle(
@@ -3587,7 +3599,7 @@ describe("EventStore", () => {
         ).pipe(Effect.flip)
 
         expect(error._tag).toBe("DynamoError")
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3786,7 +3798,7 @@ describe("EventStore", () => {
         expect(vc.expectedVersion).toBe(1)
         expect(vc.actualVersion).toBe(2)
         expect(decide).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3896,7 +3908,7 @@ describe("EventStore", () => {
         expect(result.version).toBe(2)
         expect(result.events).toEqual([])
         expect(result.state.innings).toHaveLength(1)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3992,7 +4004,7 @@ describe("EventStore", () => {
             sk: "$cricket#v1#match.command#cmd-1",
           })
           expect(decide).not.toHaveBeenCalled()
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
           expect(mockQuery).toHaveBeenCalledOnce()
         }).pipe(Effect.provide(TestLayer)),
     )
@@ -4082,7 +4094,7 @@ describe("EventStore", () => {
             additionalItems: (decision) => {
               seen.push(decision)
               // Fold BEFORE append: nothing has been written yet.
-              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+              expectNoAppendSent()
               return [Watermarks.put({ writerId: "proj", lastSeq: decision.state.innings.length })]
             },
           },
@@ -4192,7 +4204,7 @@ describe("EventStore", () => {
 
         expect(result.events).toEqual([])
         expect(derive).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4331,7 +4343,7 @@ describe("EventStore", () => {
         )
 
         expect(projected).toBe(result.state)
-        const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+        const snapshot = fromAttributeMap(putItemsOf("snapshot")[0]!.Item)
         expect(snapshot.state).toEqual({ status: "i", innings: [] })
         expect(snapshot.asOfVersion).toBe(1)
       }).pipe(Effect.provide(TestLayer)),
@@ -4922,7 +4934,7 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         }).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.snapshot")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4933,7 +4945,7 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         }).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.snapshot")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -4948,7 +4960,7 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         expect(String(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause))).toContain(
           "EDD-9026",
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -5102,8 +5114,10 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         )
 
         expect(result.version).toBe(1)
-        expect(mockPutItem).toHaveBeenCalledOnce()
-        const snapshot = fromAttributeMap(mockPutItem.mock.calls[0]![0].Item)
+        // The event's PutItem (#173), then the snapshot's.
+        expect(mockPutItem).toHaveBeenCalledTimes(2)
+        expect(putItemsOf("snapshot")).toHaveLength(1)
+        const snapshot = fromAttributeMap(putItemsOf("snapshot")[0]!.Item)
         expect(snapshot.__edd_e__).toBe("aftertally.snapshot")
         expect(snapshot.state).toEqual({ innings: 1, runs: 80 })
       }).pipe(Effect.provide(TestLayer)),
@@ -5120,7 +5134,7 @@ describe("EventStore inline snapshots and readLatest (#138)", () => {
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).entityType).toBe("inlinetally.snapshot")
         expect((error as ValidationError).operation).toBe("EventStore.append.snapshot")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -5569,7 +5583,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           expect(decide).toHaveBeenCalledOnce()
           expect(mockQuery).toHaveBeenCalledOnce()
           expectHeadAbove(mockQuery.mock.calls[0]![0], 4)
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -5620,7 +5634,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           expect(decide).toHaveBeenCalledOnce()
           expect(mockQuery).toHaveBeenCalledOnce()
           expectHeadAbove(mockQuery.mock.calls[0]![0], 1)
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -5746,7 +5760,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
             expectedVersion: 1,
             actualVersion: 2,
           })
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
           expect(mockQuery).toHaveBeenCalledTimes(2)
         }).pipe(Effect.provide(TestLayer)),
       )
@@ -5831,7 +5845,7 @@ describe("EventStore verifySnapshot: false — unverified snapshot loads", () =>
           expect(error._tag).toBe("VersionConflict")
           expect((error as VersionConflict).actualVersion).toBe(6)
           expect(decide).not.toHaveBeenCalled()
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -6132,11 +6146,10 @@ describe("EventStore stream indexes (#140)", () => {
           expect(String((error as ValidationError).cause)).toMatch(pattern)
         }
         // Nothing is sent for any of these: the caller's own invariant.
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
-        // Length is DynamoDB's to judge (#144): a long key is sent.
-        mockTransactWriteItems.mockResolvedValue({})
+        expect(mockPutItem).not.toHaveBeenCalled()
+        // Length is DynamoDB's to judge (#144): a long key is sent (one event: a PutItem, #173).
         yield* withKey(() => "x".repeat(1025)).append({ matchId: "m-1" }, [started()], 0)
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -6152,7 +6165,8 @@ describe("EventStore stream indexes (#140)", () => {
             indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: () => "" } },
           })
           const rejection = awsValidationException(ddbEmptyIndexKey("lsi1", "lsi1sk"))
-          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          // One event at version 0: a PutItem (#173), diagnosed as the transaction is.
+          mockPutItem.mockRejectedValueOnce(rejection)
           const error = yield* Empty.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
           expect(error._tag).toBe("ValidationError")
           const failure = error as ValidationError
@@ -6162,12 +6176,12 @@ describe("EventStore stream indexes (#140)", () => {
           )
           expect(((failure.cause as Error).cause as DynamoError).cause).toBe(rejection)
           // The empty key was sent as derived.
-          const sent = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Put.Item
+          const sent = mockPutItem.mock.calls[0]![0].Item
           expect(sent.lsi1sk).toEqual({ S: "" })
-          expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+          expect(mockPutItem).toHaveBeenCalledOnce()
 
           // The message without an empty key in the request: unconfirmed, passed through.
-          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          mockPutItem.mockRejectedValueOnce(rejection)
           const unconfirmed = yield* MatchEvents.append({ matchId: "m-1" }, [started()], 0).pipe(
             Effect.flip,
           )
@@ -6188,7 +6202,7 @@ describe("EventStore stream indexes (#140)", () => {
           })
           for (const message of [DDB_SORT_KEY_LOCAL, DDB_SORT_KEY_AWS]) {
             const rejection = awsValidationException(message)
-            mockTransactWriteItems.mockRejectedValueOnce(rejection)
+            mockPutItem.mockRejectedValueOnce(rejection)
             const error = yield* Keyed.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
             expect(error._tag).toBe("ValidationError")
             const failure = error as ValidationError
@@ -6241,7 +6255,7 @@ describe("EventStore stream indexes (#140)", () => {
           indexes: { byKey: { index: "lsi1", sk: "lsi1sk", key: () => "é".repeat(512) } },
         })
         const rejection = awsValidationException(DDB_SORT_KEY_LOCAL)
-        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        mockPutItem.mockRejectedValueOnce(rejection)
         const error = yield* Keyed.append({ matchId: "m-1" }, [started()], 0).pipe(Effect.flip)
         expect(error._tag).toBe("DynamoError")
         expect((error as { cause: unknown }).cause).toBe(rejection)
@@ -6268,7 +6282,7 @@ describe("EventStore stream indexes (#140)", () => {
         )
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("TTL attribute")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }),
     )
 
@@ -6774,15 +6788,13 @@ describe("EventStore stream index projection", () => {
       "an appended event carries exactly pk, sk, the withoutMetadata list, metadata and its index attributes",
       () =>
         Effect.gen(function* () {
-          mockTransactWriteItems.mockResolvedValue({})
           yield* ProjMatch.append({ matchId: "m-1" }, [new MatchEnded({ result: "won" })], 0, {
             metadata: { eventId: "evt-1" },
           })
-          const item = fromAttributeMap(
-            mockTransactWriteItems.mock.calls[0]![0].TransactItems.find(
-              (i: any) => i.Put !== undefined,
-            ).Put.Item,
-          )
+          // A one-event append at version 0 is a `PutItem` (#173), whose write
+          // token readers never need: it is not projected.
+          const { __edd_wt__: token, ...item } = fromAttributeMap(putItemsOf("event")[0]!.Item)
+          expect(token).toMatch(/^[0-9a-f]{32}$/)
           const indexAttributes = [
             "lsi1sk",
             "lsi2sk",
@@ -7435,7 +7447,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
           'The partition of index "byOrder" for the event at version 3 is "ORDER#o-2", but the ' +
             'event at version 1 has "ORDER#o-1"',
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -7468,7 +7480,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
           'The inline snapshot\'s partition in index "byOrder" is "SKU#S-1", but the event at ' +
             'version 1 has "ORDER#o-1"',
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -7536,7 +7548,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
           expect(error._tag).toBe("ValidationError")
           expect(String((error as ValidationError).cause)).toMatch(pattern)
         }
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -7545,7 +7557,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
       () =>
         Effect.gen(function* () {
           const rejection = awsValidationException(ddbEmptyIndexKey("gsi1", "gsi1pk"))
-          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          mockPutItem.mockRejectedValueOnce(rejection)
           const error = yield* OrderComment.append(
             { commentId: "c-1" },
             [new CommentPosted({ orderId: "", body: "a" })],
@@ -7571,7 +7583,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
               },
             },
           })
-          mockTransactWriteItems.mockRejectedValueOnce(rejection)
+          mockPutItem.mockRejectedValueOnce(rejection)
           const named = yield* Bare.append(
             { commentId: "c-1" },
             [new CommentPosted({ orderId: "", body: "a" })],
@@ -7608,7 +7620,7 @@ describe("EventStore shared stream indexes with a derived partition (#149)", () 
         const rejection = awsValidationException(
           "Size of hashkey has exceeded the maximum size limit of 2048 bytes",
         )
-        mockTransactWriteItems.mockRejectedValueOnce(rejection)
+        mockPutItem.mockRejectedValueOnce(rejection)
         const error = yield* Long.append(
           { commentId: "c-1" },
           [new CommentPosted({ orderId: "o", body: "a" })],
@@ -8080,7 +8092,7 @@ describe("EventStore per-event metadata (#144)", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata[1]")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8096,7 +8108,7 @@ describe("EventStore per-event metadata (#144)", () => {
             `${entries.length} entries for 2 events`,
           )
         }
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8110,15 +8122,14 @@ describe("EventStore per-event metadata (#144)", () => {
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata")
         expect(String((error as ValidationError).cause)).toContain("mutually exclusive")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expect(mockPutItem).not.toHaveBeenCalled()
 
-        // `undefined` is absent, so this is not "both".
-        mockTransactWriteItems.mockResolvedValue({})
+        // `undefined` is absent, so this is not "both" (one event: a PutItem, #173).
         yield* Audited.append({ matchId: "m-1" }, [started()], 0, {
           metadata: undefined,
           eventMetadata: [meta("e-1")],
         })
-        expect(mockTransactWriteItems).toHaveBeenCalledOnce()
+        expect(mockPutItem).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8129,7 +8140,7 @@ describe("EventStore per-event metadata (#144)", () => {
         }).pipe(Effect.flip)
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.eventMetadata")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8137,7 +8148,7 @@ describe("EventStore per-event metadata (#144)", () => {
       Effect.gen(function* () {
         const result = yield* Audited.append({ matchId: "m-1" }, [], 3, { eventMetadata: [] })
         expect(result).toEqual({ version: 3, events: [] })
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8306,7 +8317,7 @@ describe("EventStore per-event metadata (#144)", () => {
             eventMetadata: (decision) => {
               seen.push(decision)
               // Evaluated before the append.
-              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+              expectNoAppendSent()
               return decision.events.map((_, i) => meta(`v${decision.version + i + 1}`))
             },
           },
@@ -8429,7 +8440,7 @@ describe("EventStore per-event metadata (#144)", () => {
 
         expect(result.events).toEqual([])
         expect(derive).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8516,7 +8527,7 @@ describe("EventStore per-event metadata (#144)", () => {
         )
         // Not retried, and nothing sent.
         expect(derive).toHaveBeenCalledOnce()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8538,7 +8549,7 @@ describe("EventStore per-event metadata (#144)", () => {
           "returned no entries for the decision's 2 events",
         )
         expect(derive).toHaveBeenCalledOnce()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8561,7 +8572,7 @@ describe("EventStore per-event metadata (#144)", () => {
         expect(error).toBeInstanceOf(MintFailed)
         expect(calls).toBe(1)
         expect(mockQuery).toHaveBeenCalledOnce()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8584,7 +8595,7 @@ describe("EventStore per-event metadata (#144)", () => {
         expect(String((array as ValidationError).cause)).toContain("must be a function")
 
         expect(mockQuery).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -8691,7 +8702,7 @@ describe("EventStore per-event metadata (#144)", () => {
               `has ${entries.length} entries for 2 events`,
             )
           }
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -8720,7 +8731,7 @@ describe("EventStore per-event metadata (#144)", () => {
           expect((notArray as ValidationError).operation).toBe("EventStore.append.eventTimestamps")
           expect(String((notArray as ValidationError).cause)).toContain("has no entries")
 
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -8744,7 +8755,7 @@ describe("EventStore per-event metadata (#144)", () => {
             )
           }
 
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -8764,7 +8775,7 @@ describe("EventStore per-event metadata (#144)", () => {
           // `[]` is consistent and keeps the fast path.
           const result = yield* Audited.append({ matchId: "m-1" }, [], 3, { eventTimestamps: [] })
           expect(result).toEqual({ version: 3, events: [] })
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -8852,14 +8863,13 @@ describe("EventStore per-event metadata (#144)", () => {
 
       it.effect("a bound stream accepts eventTimestamps", () =>
         Effect.gen(function* () {
-          mockTransactWriteItems.mockResolvedValue({})
           const bound = yield* EventStore.bind(Audited)
 
           yield* bound.append({ matchId: "m-1" }, [started()], 0, {
             eventTimestamps: [at("2019-05-01T00:00:00Z")],
           })
 
-          const [event] = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0])
+          const [event] = putItemsOf("event").map((put) => fromAttributeMap(put.Item))
           expect(event!.timestamp).toBe("2019-05-01T00:00:00.000Z")
         }).pipe(Effect.provide(TestLayer)),
       )
@@ -8908,7 +8918,7 @@ describe("EventStore per-event metadata (#144)", () => {
               eventTimestamps: (decision) => {
                 seen.push(decision)
                 // Evaluated before the append.
-                expect(mockTransactWriteItems).not.toHaveBeenCalled()
+                expectNoAppendSent()
                 return [forVersion(decision.version + 1), undefined]
               },
             },
@@ -9006,7 +9016,7 @@ describe("EventStore per-event metadata (#144)", () => {
 
           expect(result.events).toEqual([])
           expect(derive).not.toHaveBeenCalled()
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -9112,7 +9122,7 @@ describe("EventStore per-event metadata (#144)", () => {
             // Not retried.
             expect(derive).toHaveBeenCalledOnce()
           }
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -9129,7 +9139,7 @@ describe("EventStore per-event metadata (#144)", () => {
           )
           expect(String((error as ValidationError).cause)).toContain("must be a function")
           expect(mockQuery).not.toHaveBeenCalled()
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
         }).pipe(Effect.provide(TestLayer)),
       )
 
@@ -9158,7 +9168,7 @@ describe("EventStore per-event metadata (#144)", () => {
                   Effect.gen(function* () {
                     seen.push(decision)
                     // Evaluated before the append.
-                    expect(mockTransactWriteItems).not.toHaveBeenCalled()
+                    expectNoAppendSent()
                     const log = yield* SourceLog
                     return [yield* log.originalTime(decision.version + 1), undefined]
                   }),
@@ -9284,7 +9294,7 @@ describe("EventStore per-event metadata (#144)", () => {
               expect(calls).toBe(1)
               expect(additionalItems).not.toHaveBeenCalled()
               expect(mockQuery).toHaveBeenCalledOnce()
-              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+              expectNoAppendSent()
             }).pipe(Effect.provide(TestLayer)),
         )
 
@@ -9308,7 +9318,7 @@ describe("EventStore per-event metadata (#144)", () => {
 
             expect(error).toBeInstanceOf(LookupFailed)
             expect(ran).toBe(false)
-            expect(mockTransactWriteItems).not.toHaveBeenCalled()
+            expectNoAppendSent()
           }).pipe(Effect.provide(TestLayer)),
         )
 
@@ -9346,7 +9356,7 @@ describe("EventStore per-event metadata (#144)", () => {
                 // Not retried.
                 expect(runs).toBe(1)
               }
-              expect(mockTransactWriteItems).not.toHaveBeenCalled()
+              expectNoAppendSent()
             }).pipe(Effect.provide(TestLayer)),
         )
 
@@ -9374,7 +9384,7 @@ describe("EventStore per-event metadata (#144)", () => {
             expect(result.events).toEqual([])
             expect(derive).not.toHaveBeenCalled()
             expect(ran).toBe(false)
-            expect(mockTransactWriteItems).not.toHaveBeenCalled()
+            expectNoAppendSent()
           }).pipe(Effect.provide(TestLayer)),
         )
 
@@ -9728,7 +9738,7 @@ describe("EventStore headProof and loadState (#164)", () => {
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
         expect(String((error as ValidationError).cause)).toContain("no condition of its own")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -9740,7 +9750,7 @@ describe("EventStore headProof and loadState (#164)", () => {
         }).pipe(Effect.flip)
 
         expect(error._tag).toBe("ValidationError")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -9759,7 +9769,7 @@ describe("EventStore headProof and loadState (#164)", () => {
             headProof: { additionalItem: 0 },
           }).pipe(Effect.flip)
           expect(empty._tag).toBe("ValidationError")
-          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+          expectNoAppendSent()
           expect(mockGetItem).not.toHaveBeenCalled()
         }).pipe(Effect.provide(TestLayer)),
     )
@@ -9774,7 +9784,7 @@ describe("EventStore headProof and loadState (#164)", () => {
           expect(error._tag).toBe("ValidationError")
           expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
         }
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -9851,7 +9861,7 @@ describe("EventStore headProof and loadState (#164)", () => {
 
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -9877,7 +9887,7 @@ describe("EventStore headProof and loadState (#164)", () => {
           }).pipe(Effect.exit),
           "has no snapshot config",
         )
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
   })
@@ -10033,7 +10043,7 @@ describe("EventStore headProof and loadState (#164)", () => {
 
         expect(error._tag).toBe("VersionConflict")
         expect((error as VersionConflict).actualVersion).toBe(5)
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -10058,7 +10068,7 @@ describe("EventStore headProof and loadState (#164)", () => {
         const result = yield* noop({ matchId: "m-1" }, { _tag: "EndMatch", result: "x" })
         expect(result).toEqual({ state: inProgress, version: 5, events: [] })
         expect(mockQuery).not.toHaveBeenCalled()
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -10084,7 +10094,7 @@ describe("EventStore headProof and loadState (#164)", () => {
           expect((error as ValidationError).operation).toBe("EventStore.commandHandler.loadState")
           expect(calls).toBe(1)
         }
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -10113,7 +10123,7 @@ describe("EventStore headProof and loadState (#164)", () => {
         )
         expect(error._tag).toBe("ValidationError")
         expect((error as ValidationError).operation).toBe("EventStore.append.headProof")
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        expectNoAppendSent()
       }).pipe(Effect.provide(TestLayer)),
     )
 

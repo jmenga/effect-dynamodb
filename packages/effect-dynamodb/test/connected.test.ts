@@ -7808,7 +7808,10 @@ describeConnected("EventStore connected tests (closes #81)", () => {
       const occurredAt = DateTime.makeUnsafe("2026-05-04T12:00:00.000Z")
       const error = yield* EsBadKeyStream.append(
         { matchId: "bad-1" },
-        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        [
+          new EsGoalScored({ scorer: "Kane", occurredAt }),
+          new EsGoalScored({ scorer: "Son", occurredAt }),
+        ],
         0,
       ).pipe(Effect.flip)
 
@@ -7819,6 +7822,18 @@ describeConnected("EventStore connected tests (closes #81)", () => {
       // check failure — so it must NOT be flattened into a VersionConflict.
       expect(cancelled.reasons.map((r) => r.code)).toContain("ValidationError")
       expect(cancelled.reasons.map((r) => r.code)).not.toContain("ConditionalCheckFailed")
+
+      // One event is a PutItem (#173), which DynamoDB fails with a request
+      // error where it cancels a transaction's item: reported the same way.
+      const lone = yield* EsBadKeyStream.append(
+        { matchId: "bad-1" },
+        [new EsGoalScored({ scorer: "Kane", occurredAt })],
+        0,
+      ).pipe(Effect.flip)
+      expect(lone._tag).toBe("TransactionCancelled")
+      const loneCancelled = lone as { operation: string; reasons: ReadonlyArray<{ code?: string }> }
+      expect(loneCancelled.operation).toBe("PutItem")
+      expect(loneCancelled.reasons.map((r) => r.code)).toEqual(["ValidationError"])
     }).pipe(provideEsBadKey),
   )
 })
@@ -9496,6 +9511,8 @@ const esLatLog: Array<{
   readonly op: "query" | "transactWriteItems" | "putItem" | "getItem"
   readonly pk: string | undefined
   readonly items?: ReadonlyArray<Record<string, unknown>>
+  /** A `putItem`'s item type (`__edd_e__`): a snapshot, or a lone event (#173). */
+  readonly entity?: string | undefined
   /** Items a `query` read (its `ScannedCount`), recorded when it returns. */
   scanned?: number | undefined
 }> = []
@@ -9531,7 +9548,7 @@ const EsLatClientLayer = Layer.effect(
         return client.getItem(input)
       },
       putItem: (input) => {
-        esLatLog.push({ op: "putItem", pk: input.Item?.pk?.S })
+        esLatLog.push({ op: "putItem", pk: input.Item?.pk?.S, entity: input.Item?.__edd_e__?.S })
         return client.putItem(input)
       },
       transactWriteItems: (input) => {
@@ -9796,7 +9813,9 @@ describeConnected("EventStore inline snapshots and stepped commands (#138)", () 
       for (let i = 0; i < 4; i++) yield* legacy(key, { _tag: "Deposit", amount: 10 })
       // after-append, every 3: the snapshot was written by a separate put at v3.
       expect(Option.getOrThrow(yield* EsLegacy.readSnapshot(key)).asOfVersion).toBe(3)
-      expect(esLatRequests("legacy", accountId).filter((r) => r.op === "putItem")).toHaveLength(1)
+      // (The first command's one event was a PutItem too, #173.)
+      const puts = esLatRequests("legacy", accountId).filter((r) => r.op === "putItem")
+      expect(puts.map((r) => r.entity)).toEqual(["legacy.event", "legacy.snapshot"])
 
       // Same stream, now inline: the first command catches the lag up...
       const inline = EventStore.commandHandler(esCmdDecider(accountId), EsLegacyInline)

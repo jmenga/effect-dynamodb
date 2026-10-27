@@ -493,7 +493,7 @@ const asZstdSync = StorageEncoding.valueBytesSync({
 
 | Helper | Returns |
 |---|---|
-| `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the stream's own actions add to the `TransactWriteItems` request. The items are built by the same code `append` uses. Nothing is read or written. |
+| `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the stream's own actions add to the `TransactWriteItems` request. The items are built by the same code `append` uses. Nothing is read or written. An append of one event and nothing else is sent as a `PutItem`, where only the 400 KB item limit applies; its measured sizes include the 42-byte write token that `PutItem` carries. |
 | `stream.measureSnapshot(streamId, state, asOfVersion)` | the item size of the snapshot `writeSnapshot` would write |
 | `StorageEncoding.valueBytes({ schema, value, storedAs? })` | the size of one attribute **value** as stored, packed under `storedAs`, or as a native map if `storedAs` is omitted. An item's size is the sum, over its attributes, of the name's UTF-8 bytes plus the value's bytes. |
 | `StorageEncoding.valueBytesSync({ schema, value, storedAs?, compressors? })` | the same number, synchronously, for pure planning code. Compressors are passed in (a registry or a list; none by default, which is enough for an uncompressed config or a value under its threshold), and a failure throws the `ValidationError` `valueBytes` fails with. |

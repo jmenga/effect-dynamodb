@@ -1566,6 +1566,37 @@ describe("commandHandler loadState and headProof (#164)", () => {
       // @ts-expect-error — not a head proof
       Counter.append(key, [], 0, { headProof: "record" })
       expectTypeOf<EventStore.HeadProof>().toEqualTypeOf<
+        { readonly additionalItem: number } | "snapshot" | "none"
+      >()
+    })
+    expect(true).toBe(true)
+  })
+})
+
+describe('headProof: "none" (#173)', () => {
+  it("append and measureAppend accept it, unbound and bound", () => {
+    typeOnly(() => {
+      Counter.append(key, [], 0, { headProof: "none" })
+      Counter.measureAppend(key, [], 0, { headProof: "none" })
+      Effect.gen(function* () {
+        const bound = yield* EventStore.bind(Counter)
+        yield* bound.append(key, [], 0, { headProof: "none" })
+        yield* bound.measureAppend(key, [], 0, { headProof: "none" })
+      })
+    })
+    expect(true).toBe(true)
+  })
+
+  it("commandHandler does not accept it, in either call form", () => {
+    typeOnly(() => {
+      // @ts-expect-error — "none" is append's alone
+      EventStore.commandHandler(decider, Counter, { headProof: "none" })
+      // @ts-expect-error — "none" is append's alone
+      Counter.pipe(EventStore.commandHandler(decider, { headProof: "none" }))
+      // The proofs it does accept are unchanged.
+      EventStore.commandHandler(decider, Counter, { headProof: "snapshot" })
+      EventStore.commandHandler(decider, Counter, { headProof: { additionalItem: 0 } })
+      expectTypeOf<NonNullable<EventStore.CommandHandlerOptions["headProof"]>>().toEqualTypeOf<
         { readonly additionalItem: number } | "snapshot"
       >()
     })
