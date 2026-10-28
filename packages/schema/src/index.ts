@@ -53,6 +53,7 @@ export {
   ItemDeleted,
   ItemNotDeleted,
   ItemNotFound,
+  ItemNotMoved,
   makeCompositeKeyHoleError,
   makeCompositeNullableError,
   OptimisticLockError,

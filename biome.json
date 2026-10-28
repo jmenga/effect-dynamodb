@@ -51,6 +51,12 @@
   },
   "overrides": [
     {
+      "includes": ["packages/**/test/fixtures/**"],
+      "formatter": {
+        "enabled": false
+      }
+    },
+    {
       "includes": ["packages/effect-dynamodb/src/internal/sparse_check.ts"],
       "linter": {
         "enabled": false

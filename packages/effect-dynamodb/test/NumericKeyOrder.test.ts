@@ -13,10 +13,12 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { Effect, Layer, Schema } from "effect"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import {
@@ -359,6 +361,7 @@ describe("numeric primary-key composites round-trip (#171 E8)", () => {
     it.effect(`put, get, update and delete address offset ${offset}, level ${level}n`, () =>
       Effect.gen(function* () {
         const captured: Captured = { writes: [], keys: [] }
+        const reading136 = { sensorId: "s-1", offset, level }
         const result = yield* Effect.gen(function* () {
           const db = yield* DynamoClient.make({
             entities: { Readings },
@@ -378,10 +381,22 @@ describe("numeric primary-key composites round-trip (#171 E8)", () => {
         expect(result.offset).toBe(offset)
         expect(result.level).toBe(level)
         // Every read and write of the item (the unique constraint adds reads
-        // of the current item and transactions) addresses the key put wrote.
+        // of the current item and transactions) addresses the key put wrote,
+        // but for the put's one read of the key 1.36 composed — whose text
+        // differs — in case 1.36 wrote the item there.
         const addressed = captured.keys.filter((k) => k.key.pk?.S?.includes("#sensorid_"))
         expect(new Set(addressed.map((k) => k.op))).toEqual(new Set(["get", "update", "delete"]))
-        for (const { op, key } of addressed) {
+        const old = KeyText136.composeIndexKeys(
+          AppSchema,
+          "Reading",
+          1,
+          Readings.indexes.primary,
+          reading136,
+        )
+        expect(old).not.toEqual({ pk, sk })
+        const [first, fallback, ...rest] = addressed
+        expect(fallback).toEqual({ op: "get", key: { pk: { S: old.pk }, sk: { S: old.sk } } })
+        for (const { op, key } of [first!, ...rest]) {
           expect(key.pk!.S, op).toBe(pk)
           expect(key.sk!.S, op).toBe(sk)
         }
@@ -568,5 +583,68 @@ describe("[EDD-9096] a NaN composite is a ValidationError, never a write (#171 E
         client.entities.Gauges.primary({ gaugeId: "g" }).where((t, { gte }) => gte(t.slot, NaN)),
       ).toThrow("[EDD-9096]")
     }).pipe(Effect.provide(NanLayer)),
+  )
+})
+
+describe("a stored Schema.BigInt composite rebuilds its live sort key (#171)", () => {
+  // A small bigint is stored as an `N` that unmarshalls as a number. The
+  // live-row check (`_liveRows`) rebuilds a row's sort key from its stored
+  // composites, so it must compose that number back at bigint width — the
+  // width put wrote — not fall back to judging the row by its layout.
+  class Entry extends Schema.Class<Entry>("Entry")({
+    ledgerId: Schema.String,
+    seq: Schema.BigInt,
+    memo: Schema.String,
+  }) {}
+  const Entries = Entity.make({
+    model: Entry,
+    entityType: "Entry",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ledgerId"] },
+      sk: { field: "sk", composite: ["seq"] },
+    },
+    versioned: { retain: true },
+  })
+  const LedgerTable = Table.make({ schema: AppSchema, entities: { Entries } })
+
+  it.effect("the stored row's own composites compose its sort key", () =>
+    Effect.gen(function* () {
+      const written: Array<Record<string, AttributeValue>> = []
+      yield* Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Entries }, tables: { LedgerTable } })
+        yield* db.entities.Entries.put({ ledgerId: "l-1", seq: 5n, memo: "m" })
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            Layer.succeed(
+              DynamoClient,
+              mockDynamoClient({
+                getItem: () => Effect.succeed({} as never),
+                query: () => Effect.succeed({ Items: [] } as never),
+                transactWriteItems: (input) =>
+                  Effect.sync(() => {
+                    for (const item of input.TransactItems ?? []) {
+                      if (item.Put) written.push(item.Put.Item!)
+                    }
+                    return {} as never
+                  }),
+              }),
+            ),
+            LedgerTable.layer({ name: "ledger" }),
+          ),
+        ),
+      )
+      const live = written.find(
+        (item) => item.version !== undefined && !item.sk!.S!.includes("#v#"),
+      )!
+      const snapshot = written.find((item) => item.sk!.S!.includes("#v#"))!
+      expect(live.seq).toEqual({ N: "5" })
+      const fromRow = fromAttributeMap({ seq: live.seq! })
+      expect(fromRow.seq).toBe(5)
+      expect(Entries._keyForm(fromRow).seq).toBe(5n)
+      const rows = Entries._liveRows()!
+      expect(rows.isLive(live)).toBe(true)
+      expect(rows.isLive(snapshot)).toBe(false)
+    }),
   )
 })

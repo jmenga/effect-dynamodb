@@ -81,6 +81,8 @@ export interface Position {
   readonly boundary: Boundary
   /** Probes sent by this terminal call (§7.4). Never in a cursor: a resumed query starts afresh. */
   readonly skips: number
+  /** The key pass of a {@link keyPassesPlanner} plan: `1` the 1.36 key, `0` the current one. */
+  readonly pass?: 0 | 1 | undefined
 }
 
 /** How a read's `Limit` is sized: the pass-rate estimator (§8), or a jump run (§8.5, Z-order). */
@@ -93,6 +95,8 @@ export interface ReadStep {
   /** What a cursor taken before this read's next request records. */
   readonly at: Position
   readonly range: KeyRange
+  /** The partition this read is sent to, when not the query's own (a 1.36 key pass, #171). */
+  readonly pkValue?: string | undefined
   readonly startKey: Record<string, AttributeValue> | undefined
   /** The range's index in a precomputed plan (Z-order precise plans); `undefined` otherwise. */
   readonly planIndex: number | undefined
@@ -437,6 +441,7 @@ const positionCursor = (fingerprint: string, step: Step): Cursor.CursorV2 | null
         : boundary._tag === "TupleDone"
           ? { d: 1 as const }
           : {}),
+    ...(at.pass === undefined ? {} : { p: at.pass }),
   }
 }
 
@@ -840,6 +845,262 @@ export const compositePlanner =
       afterProbe,
       following: () => [],
       cursor,
+      explain,
+    }
+  }
+
+// ---------------------------------------------------------------------------
+// Key passes: rows still under their 1.36 keys (#171, DESIGN.md §7)
+// ---------------------------------------------------------------------------
+
+/** One key a query reads: a partition, and the sort key condition under it. */
+export interface KeyPass {
+  readonly pkValue: string
+  /** `eq` or `beginsWith` — the pins — or none: the whole partition. */
+  readonly condition: KeyCondition | undefined
+  /**
+   * The 1.36 key's only: where each row's values key it now, which sorts
+   * the rows of both passes by form. The current pass keeps a row stored at
+   * its key now — another value's 1.36 row can sit under the current key
+   * (`a%20b`'s 1.36 text is `a b`'s escaped text). The 1.36 pass keeps a row
+   * stored elsewhere whose key now the current pass selects — so not a row
+   * 1.36 keyed there for another value (`a` then `b` under pins on `a#b`).
+   * Without it, the current pass keeps every row and the 1.36 pass every
+   * row the current condition does not select.
+   */
+  readonly rows?: KeyPassRows | undefined
+}
+
+/** {@link KeyPass.rows}: where a stored row's values key it now. */
+export interface KeyPassRows {
+  /** The stored attributes it reads. */
+  readonly reads: ReadonlyArray<string>
+  /** The row's partition and sort key text now; `undefined` when its values compose none. */
+  readonly composed: (
+    row: Record<string, AttributeValue>,
+  ) => { readonly pk: string; readonly sk: string | undefined } | undefined
+  /**
+   * Read both passes when the two keys are one: rows of both forms share it
+   * (a time-series item's events, whose orderBy text changed) and the passes
+   * split them by form.
+   */
+  readonly split?: boolean | undefined
+}
+
+/** A plan reading a query's own key and its 1.36 key, as `Query.alsoRead136` installs it. */
+export interface KeyPassesSpec {
+  readonly entityType: string
+  /** The physical index, or `"primary"`. */
+  readonly index: string
+  readonly pkField: string
+  readonly skField: string | undefined
+  /** The query's own key, as its terminal sends it. */
+  readonly current: KeyPass
+  /** The key 1.36 composed for the same pins; its text differs from `current`'s. */
+  readonly legacy: KeyPass
+}
+
+/** The key range of a pass's condition: its inclusive forms. */
+const passRange = (condition: KeyCondition | undefined): KeyRange => {
+  if (condition === undefined) return { lower: undefined, upper: undefined, exact: true }
+  if ("beginsWith" in condition) {
+    return { lower: undefined, upper: undefined, beginsWith: condition.beginsWith, exact: true }
+  }
+  if ("eq" in condition) return { lower: condition.eq, upper: condition.eq, exact: true }
+  if ("between" in condition) {
+    return { lower: condition.between[0], upper: condition.between[1], exact: true }
+  }
+  if ("gte" in condition) return { lower: condition.gte, upper: undefined, exact: true }
+  if ("lte" in condition) return { lower: undefined, upper: condition.lte, exact: true }
+  throw new Error("[internal] A key pass reads its pins: a strict bound has no 1.36 pass.")
+}
+
+/**
+ * A planner reading a query's own key and the key 1.36 composed for the same
+ * pins, one after the other (#171): rows 1.36 wrote whose key text changed
+ * stay under the 1.36 key until they are written again or `rekey` moves
+ * them. Those are the older rows, so a forward read takes the 1.36 key first
+ * and `.reverse()` takes it last; each key is read in the query's direction.
+ * The plan is `key`. When both keys are in one partition, a read of the 1.36
+ * key drops the rows the current key selects too (a value whose 1.36 text
+ * prefixes its escaped text: `50%` of `50%25`), so no row is read twice.
+ *
+ * A position is the start of a pass or a key inside one; its cursor names the
+ * pass in `p`. A cursor without a fingerprint (a plain query's `{ k }`, from
+ * before the fallback had anything to read, or from 1.36) is placed by its
+ * key: in the 1.36 pass when the key lies under the 1.36 key and not the
+ * current one.
+ */
+export const keyPassesPlanner =
+  (spec: KeyPassesSpec): PlannerFactory =>
+  ({ reverse }): RangePlanner => {
+    const keyOf = (pass: KeyPass) => ({ pkValue: pass.pkValue, condition: pass.condition })
+    const fingerprint = fnv1a32(
+      canonicalJson({
+        passes: { current: keyOf(spec.current), legacy: keyOf(spec.legacy) },
+        reverse,
+      }),
+    )
+    const order: ReadonlyArray<0 | 1> = reverse ? [0, 1] : [1, 0]
+    const passOf = (pass: 0 | 1): KeyPass => (pass === 1 ? spec.legacy : spec.current)
+    const refuse = (why: string): ValidationError => cursorRefusal(spec.entityType, why)
+
+    const skField = spec.skField
+    const currentCondition = spec.current.condition
+    const samePartition = spec.legacy.pkValue === spec.current.pkValue
+    /** Does a sort key lie under the current pass's condition? */
+    const inCurrent = (key: KeyValue): boolean =>
+      currentCondition === undefined || keyConditionHolds(currentCondition, key)
+    /** In one partition: the 1.36 read leaves the current key's rows to the current read. */
+    const dedupe: RowCheck | undefined =
+      samePartition && skField !== undefined
+        ? {
+            fields: [],
+            reads: [skField],
+            accepts: (row) => {
+              const value = row[skField]
+              const key = value?.S ?? value?.B
+              if (key === undefined) return true
+              return currentCondition !== undefined && !keyConditionHolds(currentCondition, key)
+            },
+          }
+        : undefined
+    const rows = spec.legacy.rows
+    const reads =
+      rows === undefined
+        ? []
+        : [...new Set([spec.pkField, ...(skField === undefined ? [] : [skField]), ...rows.reads])]
+    /** Is the row stored at the key its values compose now? */
+    const atComposed = (
+      row: Record<string, AttributeValue>,
+      composed: { readonly pk: string; readonly sk: string | undefined },
+    ): boolean =>
+      row[spec.pkField]?.S === composed.pk &&
+      (skField === undefined || row[skField]?.S === composed.sk)
+    /** The current read's row check: a row stored at its key now. */
+    const currentCheck: RowCheck | undefined =
+      rows === undefined
+        ? undefined
+        : {
+            fields: [],
+            reads,
+            accepts: (row) => {
+              const composed = rows.composed(row)
+              return composed === undefined || atComposed(row, composed)
+            },
+          }
+    /** The 1.36 read's row check: a row stored elsewhere whose key now the current read selects. */
+    const legacyCheck: RowCheck | undefined =
+      rows === undefined
+        ? dedupe
+        : {
+            fields: [],
+            reads,
+            accepts: (row) => {
+              const composed = rows.composed(row)
+              if (composed === undefined) return dedupe === undefined || dedupe.accepts(row)
+              if (atComposed(row, composed)) return false
+              if (composed.pk !== spec.current.pkValue) return false
+              return composed.sk === undefined || inCurrent(composed.sk)
+            },
+          }
+    const checkOf = (pass: 0 | 1): RowCheck | undefined => (pass === 1 ? legacyCheck : currentCheck)
+
+    const read = (
+      pass: 0 | 1,
+      boundary: Boundary,
+      startKey?: Record<string, AttributeValue>,
+    ): ReadStep => ({
+      _tag: "Read",
+      at: {
+        mode: "key",
+        tuple: undefined,
+        boundary: startKey === undefined ? boundary : { _tag: "At", startKey },
+        skips: 0,
+        pass,
+      },
+      range: passRange(passOf(pass).condition),
+      pkValue: pass === 1 ? spec.legacy.pkValue : undefined,
+      startKey,
+      planIndex: undefined,
+      sizing: estimator,
+      rowCheck: checkOf(pass),
+    })
+
+    /** Does `key` lie in `pass` — its partition, and the range its condition selects? */
+    const inPass = (key: Record<string, Cursor.WireValue>, pass: 0 | 1): boolean => {
+      const pk = key[spec.pkField]
+      if (pk === undefined || !("S" in pk) || pk.S !== passOf(pass).pkValue) return false
+      if (skField === undefined) return true
+      const sk = key[skField]
+      const value = sk === undefined ? undefined : Cursor.wireToKeyValue(sk)
+      if (value === undefined) return false
+      const condition = passOf(pass).condition
+      return condition === undefined || keyConditionHolds(condition, value)
+    }
+
+    const start = (cursor: Cursor.CursorV2 | undefined): Step | ValidationError => {
+      if (cursor === undefined) return read(order[0]!, { _tag: "Start" })
+      if (cursor.f === undefined) {
+        // A plain query's `{ k }`, or 1.36's: placed by its key.
+        if (cursor.k === undefined || cursor.s !== undefined || cursor.t !== undefined) {
+          return refuse("it carries no position in this plan")
+        }
+        // Under both keys (one partition): the current pass's.
+        const pass =
+          inPass(cursor.k, 1) && !(samePartition && inPass(cursor.k, 0))
+            ? 1
+            : inPass(cursor.k, 0)
+              ? 0
+              : undefined
+        if (pass === undefined) return refuse("its key is outside the recomputed plan")
+        const startKey = Cursor.keyFromWire(cursor.k)
+        return read(pass, { _tag: "At", startKey }, startKey)
+      }
+      if (cursor.f !== fingerprint) return refuse("its plan fingerprint differs")
+      if (cursor.s !== "key" || cursor.t !== undefined || cursor.a !== undefined) {
+        return refuse("its position is not one of this plan's")
+      }
+      if (cursor.d !== undefined) return refuse("its position is not one of this plan's")
+      const pass = cursor.p ?? order[0]!
+      if (cursor.k === undefined) return read(pass, { _tag: "Start" })
+      if (!inPass(cursor.k, pass)) return refuse("its key is outside the recomputed plan")
+      const startKey = Cursor.keyFromWire(cursor.k)
+      return read(pass, { _tag: "At", startKey }, startKey)
+    }
+
+    const afterRead = (
+      step: ReadStep,
+      lastEvaluatedKey: Record<string, AttributeValue> | undefined,
+    ): Step => {
+      if (lastEvaluatedKey !== undefined) return readFrom(step, lastEvaluatedKey)
+      const next = order[order.indexOf(step.at.pass ?? 0) + 1]
+      return next === undefined ? done : read(next, { _tag: "Start" })
+    }
+
+    const explain = (sizing: QueryExplain["sizing"]): QueryExplain => ({
+      index: spec.index,
+      plan: "key",
+      reason: "one key condition, and the 1.36 key of rows not yet moved",
+      keyConditions: order.map((pass) => ({
+        ...shownRange(passRange(passOf(pass).condition)),
+        exact: checkOf(pass) === undefined,
+      })),
+      filter: undefined,
+      rowChecks: [],
+      sizing,
+    })
+
+    return {
+      fingerprint,
+      mode: "key",
+      filter: undefined,
+      rowCheck: checkOf(order[0]!),
+      start,
+      afterRead,
+      afterProbe: () => done,
+      following: () => [],
+      cursor: (step) => positionCursor(fingerprint, step),
       explain,
     }
   }

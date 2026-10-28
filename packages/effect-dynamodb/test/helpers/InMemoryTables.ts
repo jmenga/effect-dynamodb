@@ -162,6 +162,15 @@ export const holds = (
       const exists = path(p) !== undefined
       return t.text === "attribute_exists" ? exists : !exists
     }
+    if (t.text === "contains" || t.text === "begins_with") {
+      next() // (
+      const left = operand(next().text)
+      next() // ,
+      const right = operand(next().text)
+      next() // )
+      if (left?.S === undefined || right?.S === undefined) return false
+      return t.text === "contains" ? left.S.includes(right.S) : left.S.startsWith(right.S)
+    }
     if (peek()?.text.toUpperCase() === "IN") {
       next() // IN
       next() // (

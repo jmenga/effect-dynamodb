@@ -58,7 +58,8 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  *    numeric Type value: keep a `number` / `bigint` as-is, otherwise `decode`
  *    to reach it.
  * 3. **Anything else** — target is the Encoded value. A field with no encoding
- *    transformation is identity by construction (`SchemaAST` documents
+ *    transformation is identity by construction (a numeric one still coerced
+ *    to its declared kind, as in case 2) (`SchemaAST` documents
  *    `encoding === undefined` as "type and encoded forms are identical"), and
  *    is passed through WITHOUT attempting an encode — an open sort key bound
  *    like `gte(t.status, "d")` on a `Schema.Literals` composite is deliberately
@@ -117,10 +118,22 @@ export const makeCompositeKeyForm = (
       return fn
     }
 
-    // Case 3a — identity by construction.
+    // Case 3a — identity by construction. A numeric field still takes its
+    // declared kind, for the reason case 2 does: a stored `Schema.BigInt`
+    // value unmarshalls as a number (and a `Schema.Number` past 2^53 as a
+    // bigint), so a key re-derived from a stored row would compose at the
+    // other kind's width.
     if (!hasEncodingTransformation(field)) {
-      cache.set(attr, null)
-      return null
+      const kind = keyFormValueKind(field)
+      const fn =
+        kind === "bigint"
+          ? (value: unknown): unknown =>
+              typeof value === "number" && Number.isInteger(value) ? BigInt(value) : value
+          : kind === "number"
+            ? (value: unknown): unknown => (typeof value === "bigint" ? Number(value) : value)
+            : null
+      cache.set(attr, fn)
+      return fn
     }
 
     // Case 3b — target is the Encoded side.

@@ -15,6 +15,7 @@ import {
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
@@ -311,6 +312,23 @@ export const make = <
       collectionKeyForm(firstEntity, pkComposites),
     )
   }
+  /**
+   * The partition key 1.36 composed for the same composites (#171): rows 1.36
+   * wrote under a number composite whose text changed are read there too. A
+   * collection's sort key prefix holds names only, so it is unchanged.
+   */
+  const collectionPk136 = (
+    entity: (typeof entityEntries)[number][1],
+    pkComposites: Record<string, unknown>,
+  ): string | undefined =>
+    KeyText136.enabled(sharedSchema!)
+      ? KeyText136.composePk(
+          sharedSchema!,
+          entity.entityType,
+          entity.indexes[sharedIndexName!]!,
+          collectionKeyForm(entity, pkComposites),
+        )
+      : undefined
 
   // Main query: returns grouped results
   const queryAll = (pkComposites: Record<string, unknown>) => {
@@ -344,7 +362,7 @@ export const make = <
       q = q.pipe(Query.where({ beginsWith: collectionSkPrefix }))
     }
 
-    return q
+    return Query.alsoReadPartition136(q, collectionPk136(entityEntries[0]![1], pkComposites))
   }
 
   // Entity selector functions
@@ -397,7 +415,7 @@ export const make = <
         q = q.pipe(Query.where({ beginsWith: entitySkPrefix }))
       }
 
-      return q
+      return Query.alsoReadPartition136(q, collectionPk136(entity, pkComposites))
     }
   }
 

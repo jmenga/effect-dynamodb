@@ -102,6 +102,31 @@ describe("CompositeCodec", () => {
     })
   })
 
+  describe("a stored row's numbers take their field's kind (#171)", () => {
+    // A stored `N` unmarshalls as a number below 2^53 and a bigint above, so a
+    // key re-derived from a stored row (the live-row check, a move from a 1.36
+    // key) must reach the declared kind, or it composes at the other width.
+    const Stored = Schema.Struct({ small: Schema.BigInt, big: Schema.Number, label: Schema.String })
+    const fromRow = makeCompositeKeyForm(Stored, refuse)
+
+    it("a Schema.BigInt read back as a number is a bigint again", () => {
+      expect(fromRow("small", 5)).toBe(5n)
+      expect(serializeValue(fromRow("small", 5))).toBe(serializeValue(5n))
+      expect(fromRow("small", 5n)).toBe(5n)
+      // Not an integer: left for the composer to refuse, never truncated.
+      expect(fromRow("small", 2.5)).toBe(2.5)
+    })
+
+    it("a Schema.Number read back as a bigint is a number again", () => {
+      expect(fromRow("big", 12n)).toBe(12)
+      expect(fromRow("big", 12)).toBe(12)
+    })
+
+    it("a non-numeric field is untouched", () => {
+      expect(fromRow("label", 5)).toBe(5)
+    })
+  })
+
   describe("null and undefined", () => {
     it("passes through so sparse-composite handling stays with KeyComposer", () => {
       expect(encode("txn", undefined)).toBeUndefined()

@@ -520,6 +520,16 @@ export interface BoundQueryConfig<Model> {
     field: string | undefined,
   ) => Query.SortKeyCondition | undefined
   /**
+   * Optional: the 1.36 key `.where()`'s condition also reads (#171) — for an
+   * `eq` / `beginsWith` that extends an accessor's pins, the key 1.36
+   * composed for them. Called after {@link composeSkCondition} accepted the
+   * condition; `undefined` reads only the current key.
+   */
+  readonly where136?: (
+    condition: RawSortKeyCondition,
+    field: string | undefined,
+  ) => Query.KeyPass | undefined
+  /**
    * Optional: plan `.within(bounds)` on the query (#171) — an accessor's own
    * composites and encoders turn the bounds into key ranges and row checks.
    * Throws `[EDD-9093]` / `[EDD-9050]` for bounds it can't use. Without it,
@@ -787,8 +797,9 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
         "where",
       )
     }
+    const key136 = this._config.where136?.(condition, targetField())
     return new BoundQueryImpl<Model, never, A>(
-      Query.where(this._query, finalCondition),
+      Query.alsoRead136(Query.where(this._query, finalCondition), key136),
       this._config,
       "where",
     )

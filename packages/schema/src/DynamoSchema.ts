@@ -22,19 +22,40 @@ export interface DynamoSchema {
   readonly name: string
   readonly version: number
   readonly casing: Casing
+  /**
+   * `false` turns off the 1.36 key fallback (#171): operations no longer read
+   * or move rows still stored under the key text 1.36 composed. Absent means
+   * on. See {@link make}.
+   */
+  readonly legacyKeys?: false | undefined
 }
 
 /**
  * Create a DynamoSchema instance.
+ *
+ * `legacyKeys: false` turns off the 1.36 key fallback. 1.37 composes some key
+ * text differently from 1.36 — numbers that are negative, fractional, or 1e16
+ * and over (bigints: negative or 1e38 and over), sort key values holding a
+ * character U+0000–U+0025 (a space, `!`, `"`, `#`, `$`, `%`, a control
+ * character), and the event keys of a `NumberFromString` / `BigIntFromString`
+ * time-series `orderBy` — so a row 1.36 wrote with such a value sits under a
+ * key 1.37 does not compose. While the fallback is on (the default throughout
+ * 1.37.x) single-item reads also read that 1.36 key, queries that pin a key
+ * prefix read it too, and writes move the row to its current key. Once every
+ * row has moved (`db.tables.<Table>.rekey()`), turn it off: requests are then
+ * exactly those of a build without the fallback. The setting and the fallback
+ * go in the next major release.
  */
 export const make = (config: {
   readonly name: string
   readonly version: number
   readonly casing?: Casing | undefined
+  readonly legacyKeys?: boolean | undefined
 }): DynamoSchema => ({
   name: config.name,
   version: config.version,
   casing: config.casing ?? "lowercase",
+  ...(config.legacyKeys === false && { legacyKeys: false as const }),
 })
 
 /**

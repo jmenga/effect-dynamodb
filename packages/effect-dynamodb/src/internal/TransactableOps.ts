@@ -106,6 +106,22 @@ export const isProjectionTombstone = (
 ): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
 
 /**
+ * Marks a projection's row tombstone or outbox item written under the key
+ * text 1.37 composes (#171). They hold no values to tell whose key they are
+ * at, and `foo bar`'s current key is `foo%20bar`'s 1.36 key: one without the
+ * mark is 1.36's, the row its key reads back as.
+ */
+export const KEY_TEXT = "__edd_kt__"
+
+/** The read-model row an outbox item was written for: its key attributes' text. */
+export const OUTBOX_ROW_PK = "__edd_row_pk__"
+export const OUTBOX_ROW_SK = "__edd_row_sk__"
+
+/** A drainer's claim on an outbox item: its token, and the epoch millis it holds until. */
+export const OUTBOX_CLAIM = "__edd_claim__"
+export const OUTBOX_CLAIMED_UNTIL = "__edd_claimed_until__"
+
+/**
  * @internal Hidden string set naming the unique-constraint fields an item
  * holds a DEFAULT for (#133): a decoding-default field that is also an index
  * composite is stored when omitted, but a default never creates a unique

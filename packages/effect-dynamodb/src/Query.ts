@@ -34,7 +34,9 @@ import {
   displayKeyCondition,
   JUMP_INITIAL,
   JUMP_MAX_LIMIT,
+  type KeyPass,
   type KeyRange,
+  keyPassesPlanner,
   type PlannerFactory,
   type ProbeStep,
   type RangePlanner,
@@ -50,6 +52,8 @@ import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 // ---------------------------------------------------------------------------
 // Sort key condition types
 // ---------------------------------------------------------------------------
+
+export type { KeyPass, KeyPassRows } from "./internal/RangePlanner.js"
 
 /**
  * Sort key condition for narrowing query results within a partition.
@@ -214,6 +218,12 @@ interface QueryState {
   readonly planner: PlannerFactory | undefined
   /** @internal The skip-scan probe budget `.within()` was given (default 32). */
   readonly maxSkips: number | undefined
+  /**
+   * @internal The key 1.36 composed for the query's pins, when its text
+   * differs from the query's own (#171, see {@link alsoRead136}): a terminal
+   * reads it as a second key pass.
+   */
+  readonly key136: KeyPass | undefined
   /** @internal `.zorder()` options, merged over each other (#171). */
   readonly zorderOptions: ZOrderOptions | undefined
   /** @internal Set by {@link prepared}: the resolved planner and the step the terminal starts at. */
@@ -260,9 +270,10 @@ interface QueryState {
   /**
    * Run once at the start of each terminal, against the resolved table: may
    * swap the sort key `begins_with` operand and add a row filter (`keep`)
-   * applied, like {@link liveRows}, to rows before they are decoded.
-   * An entity's `versions` uses it to read history written by an earlier
-   * release alongside its own (#133).
+   * applied, like {@link liveRows}, to rows before they are decoded, or swap
+   * the partition key. An entity's `versions` uses it to read history written
+   * by an earlier release alongside its own (#133); an event stream, to read
+   * a stream still under its 1.36 key there (#171).
    */
   readonly prepare: QueryPrepare | undefined
   /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */
@@ -370,6 +381,11 @@ export type QueryPrepare = (tableName: string) => Effect.Effect<
     /** Replace a `begins_with` sort key condition on `from` with one on `to`. */
     readonly replaceBeginsWith?: { readonly from: string; readonly to: string } | undefined
     readonly keep?: ((row: Record<string, AttributeValue>) => boolean) | undefined
+    /**
+     * Read this partition instead: an event stream still under its 1.36 key
+     * is read there (#171).
+     */
+    readonly pkValue?: string | undefined
   },
   DynamoClientError,
   DynamoClient
@@ -491,6 +507,7 @@ export const make = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
+    key136: undefined,
     zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
@@ -555,6 +572,7 @@ export const makeScan = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
+    key136: undefined,
     zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
@@ -591,8 +609,46 @@ export const where: {
   return new QueryImpl<A>({
     ...state,
     skConditions: [{ field: state.skField, condition }],
+    // A new condition is not the pins the 1.36 key was composed for (#171):
+    // the caller that composed it installs the 1.36 key again.
+    key136: undefined,
   })
 })
+
+/** @internal Do two sort key conditions select the same keys, operand for operand? */
+const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined): boolean =>
+  JSON.stringify(a) === JSON.stringify(b)
+
+/**
+ * @internal Also read the key 1.36 composed for this query's pins (#171,
+ * DESIGN.md §7 "Rows written by 1.36"): its partition key and its `eq` /
+ * `beginsWith` sort key condition (or none). A row 1.36 wrote whose key text
+ * changed in 1.37 sits there until it is written again or `rekey` moves it.
+ * A terminal reads both keys as two passes of one plan
+ * (`RangePlanner.keyPassesPlanner`): the 1.36 key first, or last under
+ * {@link reverse}. A key equal to the query's own adds nothing — unless its
+ * rows are split by form (`KeyPass.rows.split`) — so a query whose key text
+ * did not change sends exactly what it always sent. Installed after the
+ * pins' {@link where}, which clears it.
+ */
+export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<A> => {
+  const state = self._state
+  if (key === undefined || state.isScan) return self
+  const own = state.skConditions[0]?.condition
+  const same = key.pkValue === state.pkValue && sameCondition(key.condition, own)
+  if (same && key.rows?.split !== true) return self
+  return new QueryImpl<A>({ ...state, key136: key })
+}
+
+/**
+ * @internal {@link alsoRead136} for a query whose 1.36 key differs in its
+ * partition key alone (a collection, a partition's tombstones): the 1.36
+ * partition under the query's own sort key condition.
+ */
+export const alsoReadPartition136 = <A>(self: Query<A>, pkValue: string | undefined): Query<A> =>
+  pkValue === undefined
+    ? self
+    : alsoRead136(self, { pkValue, condition: self._state.skConditions[0]?.condition })
 
 /**
  * Return **at most `n` items** — a contract on results, not on round trips.
@@ -1670,27 +1726,59 @@ const prepared = (
   // anything is sent (#133).
   const filterRefusal = refuseEmptyFilterParts(state)
   if (filterRefusal !== undefined) return Effect.fail(filterRefusal)
+  // A query that also reads its 1.36 key (#171) plans both passes from the
+  // prepared state: the prepare step may swap its own condition.
+  if (state.key136 !== undefined && state.planner === undefined) {
+    return Effect.flatMap(applyPrepare(state, tableName), (ready) => {
+      const resumed = resume(ready)
+      return resumed instanceof ValidationError ? Effect.fail(resumed) : Effect.succeed(resumed)
+    })
+  }
   const resumed = resume(state)
   if (resumed instanceof ValidationError) return Effect.fail(resumed)
-  return resumed.prepare === undefined
-    ? Effect.succeed(resumed)
-    : Effect.map(resumed.prepare(tableName), (prep) => {
+  return applyPrepare(resumed, tableName)
+}
+
+/** @internal {@link QueryState.prepare}, run against the resolved table and applied. */
+const applyPrepare = (
+  state: QueryState,
+  tableName: string,
+): Effect.Effect<QueryState, DynamoClientError, DynamoClient> =>
+  state.prepare === undefined
+    ? Effect.succeed(state)
+    : Effect.map(state.prepare(tableName), (prep) => {
         const swap = prep.replaceBeginsWith
         return {
-          ...resumed,
+          ...state,
           prepare: undefined,
+          pkValue: prep.pkValue ?? state.pkValue,
           keepRow: prep.keep,
           skConditions:
             swap === undefined
-              ? resumed.skConditions
-              : resumed.skConditions.map((c) =>
+              ? state.skConditions
+              : state.skConditions.map((c) =>
                   "beginsWith" in c.condition && c.condition.beginsWith === swap.from
                     ? { ...c, condition: { beginsWith: swap.to } }
                     : c,
                 ),
         }
       })
-}
+
+/**
+ * @internal The plan of a query that also reads its 1.36 key (#171): its own
+ * key and the 1.36 key, as two passes. `undefined` without one.
+ */
+const keyPasses = (state: QueryState): PlannerFactory | undefined =>
+  state.key136 === undefined || state.isScan
+    ? undefined
+    : keyPassesPlanner({
+        entityType: state.entityTypes.join(", ") || "unknown",
+        index: state.indexName ?? "primary",
+        pkField: state.pkField,
+        skField: state.skField,
+        current: { pkValue: state.pkValue, condition: state.skConditions[0]?.condition },
+        legacy: state.key136,
+      })
 
 /** @internal The planner a `.within()` installed, resolved against the final state. */
 const resolvePlanner = (state: QueryState, factory: PlannerFactory): RangePlanner =>
@@ -1713,8 +1801,22 @@ const resume = (state: QueryState): QueryState | ValidationError => {
   if (state.cursorText !== undefined && cursor === undefined) {
     return cursorRefusal(entityType, "it is not a cursor a query returned")
   }
-  if (state.planner === undefined) {
+  const factory = state.planner ?? keyPasses(state)
+  if (factory === undefined) {
     if (cursor === undefined) return state
+    if (cursor.p !== undefined) {
+      // From the same query while it also read its 1.36 key (#171) — the
+      // fallback since turned off: a position under the current key resumes.
+      if (cursor.p === 1) {
+        return cursorRefusal(
+          entityType,
+          "it reads rows under their 1.36 key, and this query no longer does",
+        )
+      }
+      return cursor.k === undefined
+        ? state
+        : { ...state, exclusiveStartKey: Cursor.keyFromWire(cursor.k) }
+    }
     if (
       cursor.k === undefined ||
       cursor.f !== undefined ||
@@ -1728,7 +1830,7 @@ const resume = (state: QueryState): QueryState | ValidationError => {
     }
     return { ...state, exclusiveStartKey: Cursor.keyFromWire(cursor.k) }
   }
-  const planner = resolvePlanner(state, state.planner)
+  const planner = resolvePlanner(state, factory)
   const start = planner.start(cursor)
   return start instanceof ValidationError ? start : { ...state, plan: { planner, start } }
 }
@@ -1744,6 +1846,7 @@ const plannedConditions = (state: QueryState, range: KeyRange): QueryState["skCo
 /** @internal The state one planned read is sent with: its range and its row check. */
 const readState = (state: QueryState, step: ReadStep): QueryState => ({
   ...state,
+  pkValue: step.pkValue ?? state.pkValue,
   skConditions: plannedConditions(state, step.range),
   rowCheck: step.rowCheck,
 })
@@ -3101,7 +3204,8 @@ const countPlanned = (
 export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, never> =>
   Effect.sync(() => {
     const state = self._state
-    if (state.planner === undefined) {
+    const factory = state.planner ?? keyPasses(state)
+    if (factory === undefined) {
       const [lower, upper] = displayKeyCondition(state.skConditions[0]?.condition)
       return {
         index: state.indexName ?? "primary",
@@ -3113,7 +3217,7 @@ export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, n
         sizing: explainedSizing(state),
       } satisfies QueryExplain
     }
-    const planner = resolvePlanner(state, state.planner)
+    const planner = resolvePlanner(state, factory)
     const start = planner.start(undefined)
     const planned: QueryState = {
       ...state,
@@ -3156,7 +3260,8 @@ export const asParams = <A>(
       }
     }
     // A `BatchGet`-hydrated query shows its index query; the `BatchGetItem`
-    // that follows each page is not part of these parameters.
+    // that follows each page is not part of these parameters. Nor is the
+    // read of a 1.36 key (#171): these are the query's own key's.
     return buildDynamoCommand(indexQueryState(state), tableName)
   })
 

@@ -144,7 +144,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, and optional casing |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `legacyKeys: false` to turn off the 1.36 key fallback ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -161,7 +161,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Type | Description |
 |------|-------------|
-| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing }` |
+| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, legacyKeys?: false }` |
 | `Casing` | `"lowercase" \| "uppercase" \| "preserve"` |
 
 ### Usage
@@ -1327,7 +1327,7 @@ Read models folded from DynamoDB Streams in version order, gap-filled from the e
 | `EventStore.processBatch(records, { projections, streams?, ...options })` | One feed, several projections: each record decoded once (bound projections under their own context) and routed to every projection of its stream (others skipped); `outcomes` per projection name, `positions` indexing `records`; one response across all. `streams` names streams whose events come back in `unrouted` (`{ position, stream, event }`), whether or not a projection also reads them. A marker shared by two streams dies with `[EDD-9082]` |
 | `EventStore.bindProjection(projection)` | Resolve the client, both tables, `evolve`'s requirements and the `Compression` registry; every operation then has `R = never`. Checks the stream's codecs as `bind` does (`[EDD-9078]`) |
 | `projection` options `revision`, `removal`, `outbox` | `revision`: a numeric model field the library owns, set one higher by every write and conditioned on (`attribute_not_exists` when absent); may be an existing write counter; required by `outbox`. `removal: { ttl? }`: `evolve` may return `EventStore.removeRow`, and the row becomes a tombstone at its own key (`__edd_e__` `<entityType>#tombstone`) keeping the checkpoint and revision, absent to every entity read by key (the read model's `create` may replace it, carrying its checkpoints over). `outbox: { schema, effects(event, next, context), table?, keys?, index?, claimFor? }`: effects written as outbox items (`<entityType>#outbox`) in the same `TransactWriteItems` as the row. `removal` / `outbox` on a read model with `unique` constraints, and `outbox` without `revision`, throw `[EDD-9081]` — see [Multi-source Projections, Tombstones and the Outbox](/effect-dynamodb/guides/projections-advanced/) |
-| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
+| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. Through 1.37.x both deliver a row's effects under its current key and under its 1.36 key in one order ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)). `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
 | `EventStore.multiProjection({ readModel, initial, sources: (source) => ({ name: source(stream, { key, evolve, mode?, terminal? }) }), checkpoints: { field?, sources? }, revision, toItem?, retry?, removal?, outbox?, sourcesOf? })` | A read model fed by several streams: a checkpoint per source instance (`checkpoints.field`, a `Record<string, number>` keyed `<source>#<streamId>`; or per-source `{ field, offset?, instanceField }` for legacy rows — another instance goes to the map, or fails with `ProjectionSourceConflict`), each write guarded by `revision`. Every checkpoint, instance, map and revision field may be optional in the model: absent reads as none, and an empty map is not written. `mode: "fold"` (gap-filled) or `"latest"` (newest event per instance, falling back newest-first past `terminal` rejections; older ones `superseded`). An instance whose `evolve` fails (not `terminal`) is left out of the write and reported as its own `Failed` outcome; the row's other instances apply. `revision: { field, initial }` sets a new row's first value. `applyBatch` takes decoder-style `{ stream: <source>, event }` events; `catchUp(rowKey)`; `rebuild(rowKey, { instances })` (or `sourcesOf`); `processBatch`; `drain` / `drainPending`. `bindProjection` and `EventStore.processBatch` accept it next to single-source projections |
 | `EventStore.removeRow` | Returned by `evolve` to remove the row (with `removal`) |
 | `EventStore.skipEvent` | Returned by `evolve` to skip the event: reported in `skipped` (never `applied`), no outbox effects, and no write when the row's events are all skipped or already applied. The instance's checkpoint stops at its last applied or rejected event, so a skipped event above it is decided again later. In `"latest"` mode a skip falls back to the next older event |
@@ -1514,7 +1514,7 @@ import {
   ItemNotFound, ConditionalCheckFailed,
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
-  ItemDeleted, ItemNotDeleted,
+  ItemDeleted, ItemNotDeleted, ItemNotMoved, StaleAppend,
   ConcurrentModification, UpdateAppliedButUnreadable, DeleteAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
@@ -1545,8 +1545,10 @@ import {
 | `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
 | `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
 | `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
+| `StaleAppend` | `"StaleAppend"` | A time-series `append` lost to a newer one: the current item's `orderByField` is already at or past `attemptedOrderBy`. Expected under newer-wins concurrency; `current` holds the winning item (`Option.none()` after `.skipFollowUp()`, where a failed `.condition()` also raises it) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
-| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
+| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted, or still lives under its 1.36 key) |
+| `ItemNotMoved` | `"ItemNotMoved"` | EDD-9097 — a `Transaction.transactWrite` (or `EventStore` `additionalItems`) op whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row, which a transaction can't move (`entityType`, `key`, `operation`: the item to write first). Nothing was written: write that item once through the entity, or run [`rekey`](/effect-dynamodb/guides/upgrading/), then run the transaction again |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
@@ -1579,11 +1581,12 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
 | `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
-| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `purge` | `ValidationError` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound`, `ItemNotMoved` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ItemNotMoved` |
 
 ### Usage
 

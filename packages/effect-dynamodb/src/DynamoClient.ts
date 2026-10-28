@@ -141,6 +141,7 @@ import type {
   IndexZOrderDimensions,
   IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -2302,6 +2303,8 @@ interface EntityLike {
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
+  /** Where a stored row's values key it in an index now (#171). */
+  readonly _indexRows136?: ((index: IndexDefinition) => Query.KeyPassRows) | undefined
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
@@ -2595,7 +2598,7 @@ const makeFromConfig = (config: {
         const hasSkComposites =
           !zorder &&
           indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
-        const finalQuery = hasSkComposites
+        const pinnedQuery = hasSkComposites
           ? Query.where(
               query,
               KeyComposer.composeSortKeyCondition(
@@ -2607,6 +2610,36 @@ const makeFromConfig = (config: {
               ),
             )
           : query
+
+        // Rows 1.36 wrote whose key text changed sit under the key 1.36
+        // composed for these pins until they move (#171): the query reads it
+        // too — the partition key, and the pins' `eq` / `begins_with`. A
+        // Z-order index is new in 1.37, so it has no 1.36 rows.
+        const pk136 =
+          !zorder && KeyText136.enabled(entityLike._schema)
+            ? KeyText136.composePk(
+                entityLike._schema,
+                entityLike.entityType,
+                indexDef,
+                compositesKeyForm,
+              )
+            : undefined
+        const finalQuery =
+          pk136 === undefined
+            ? pinnedQuery
+            : Query.alsoRead136(pinnedQuery, {
+                pkValue: pk136,
+                rows: entityLike._indexRows136?.(indexDef),
+                condition: hasSkComposites
+                  ? KeyText136.composeSortKeyCondition(
+                      entityLike._schema,
+                      entityLike.entityType,
+                      1,
+                      indexDef,
+                      compositesKeyForm,
+                    )
+                  : undefined,
+              })
 
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
@@ -2741,11 +2774,53 @@ const makeFromConfig = (config: {
           )
         }
 
+        /**
+         * The 1.36 key a `.where()` also reads (#171): an `eq` or
+         * `beginsWith` extends the pins, so the rows it selects under 1.36's
+         * key text are read too. A range bound reads only the current key.
+         */
+        const where136 = (
+          condition: RawSortKeyCondition,
+          field: string | undefined,
+        ): Query.KeyPass | undefined => {
+          if (pk136 === undefined || !("eq" in condition || "beginsWith" in condition)) {
+            return undefined
+          }
+          const pinnedCount = skComposites.findIndex(
+            (attr: string) => compositesKeyForm[attr] === undefined,
+          )
+          const targetAttr =
+            field !== undefined && skComposites.includes(field)
+              ? field
+              : skComposites[pinnedCount === -1 ? skComposites.length - 1 : pinnedCount]!
+          const pinned: Record<string, unknown> = {}
+          for (const attr of skComposites.slice(0, skComposites.indexOf(targetAttr))) {
+            pinned[attr] = compositesKeyForm[attr]
+          }
+          const operand = (value: unknown) => compositeKeyForm(targetAttr, value)
+          return {
+            pkValue: pk136,
+            rows: entityLike._indexRows136?.(indexDef),
+            condition: KeyText136.composeBoundCondition(
+              entityLike._schema,
+              entityLike.entityType,
+              1,
+              indexDef,
+              pinned,
+              targetAttr,
+              "eq" in condition
+                ? { eq: operand(condition.eq) }
+                : { beginsWith: operand(condition.beginsWith) },
+            ),
+          }
+        }
+
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
           conditionOps,
           provide,
           composeSkCondition,
+          where136,
           // A Z-order accessor bounds its dimensions and prefix composites
           // (#171), and takes `.zorder()`.
           ...(zorder
@@ -3001,6 +3076,20 @@ const makeFromConfig = (config: {
           const skPrefix = `${pre}#${casedNames.join("#")}`
           query = Query.where(query, { beginsWith: skPrefix })
         }
+
+        // A collection's sort key prefix holds names only, so its 1.36 key
+        // differs in the partition key alone — a number composite (#171).
+        query = Query.alsoReadPartition136(
+          query,
+          KeyText136.enabled(firstMember.entityLike._schema)
+            ? KeyText136.composePk(
+                firstMember.entityLike._schema,
+                firstMember.entityLike.entityType,
+                indexDef,
+                entityKeyForm(firstMember.entityLike, composites),
+              )
+            : undefined,
+        )
 
         // Wrap in BoundQuery that groups results by entity key
         const pathBuilder = createPathBuilder()

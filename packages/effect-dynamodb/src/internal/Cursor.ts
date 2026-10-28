@@ -45,6 +45,12 @@ export interface CursorV2 {
   readonly a?: WireValue
   /** TupleDone: tuple `t` is finished. */
   readonly d?: 1
+  /**
+   * The key pass of a query that also reads rows still under their 1.36 key
+   * (#171): `1` the 1.36 key, `0` its current key. Absent: the plan's first
+   * pass.
+   */
+  readonly p?: 0 | 1
 }
 
 const V2 = "v2."
@@ -197,7 +203,7 @@ export const decode = (text: string): CursorV2 | undefined => {
     return legacy ? { v: 2, k: parsed as Record<string, WireValue> } : undefined
   }
   if (!isRecord(parsed) || parsed.v !== 2) return undefined
-  const allowed = new Set(["v", "f", "s", "t", "k", "a", "d"])
+  const allowed = new Set(["v", "f", "s", "t", "k", "a", "d", "p"])
   if (Object.keys(parsed).some((key) => !allowed.has(key))) return undefined
   if (parsed.f !== undefined && typeof parsed.f !== "string") return undefined
   if (parsed.s !== undefined && !(typeof parsed.s === "string" && PLAN_MODES.has(parsed.s))) {
@@ -207,6 +213,7 @@ export const decode = (text: string): CursorV2 | undefined => {
   if (parsed.k !== undefined && !isWireKey(parsed.k)) return undefined
   if (parsed.a !== undefined && !isWireValue(parsed.a)) return undefined
   if (parsed.d !== undefined && parsed.d !== 1) return undefined
+  if (parsed.p !== undefined && parsed.p !== 0 && parsed.p !== 1) return undefined
   const positions = [parsed.k, parsed.a, parsed.d].filter((field) => field !== undefined)
   if (positions.length > 1) return undefined
   return parsed as unknown as CursorV2

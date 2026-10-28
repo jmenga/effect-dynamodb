@@ -61,6 +61,7 @@ import {
   AppendTooLarge,
   type ConcurrentModification,
   DuplicateCommand,
+  type ItemNotMoved,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   isAwsValidationError,
@@ -71,6 +72,7 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   isDispatchEligible,
   packedShape,
@@ -93,7 +95,7 @@ import {
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
-import { type Expr, eq } from "./internal/Expr.js"
+import { type Expr, eq, or } from "./internal/Expr.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
   isMultiProjection,
@@ -789,6 +791,7 @@ export type AppendError =
   | UniqueConstraintViolation
   | OptimisticLockError
   | ConcurrentModification
+  | ItemNotMoved
 
 // ---------------------------------------------------------------------------
 // Read options
@@ -1563,8 +1566,12 @@ const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
  * stream index several streams (or stream ids) share (#149). The table's `pk`
  * is projected into every index, whatever its projection.
  */
-const streamPkFilter = (streamPk: string): Expr =>
-  eq(createPathBuilder<{ readonly pk: string }>().pk, streamPk)
+const streamPkFilter = (streamPk: string, streamPk136?: string): Expr => {
+  const pk = createPathBuilder<{ readonly pk: string }>().pk
+  // A stream still under its 1.36 key (#171) has its items there: either
+  // key, since a stream is never split across the two.
+  return streamPk136 === undefined ? eq(pk, streamPk) : or(eq(pk, streamPk), eq(pk, streamPk136))
+}
 
 /**
  * @internal Validate `makeStream({ indexes })` at definition time.
@@ -2862,6 +2869,74 @@ export const makeStream = <
     return DynamoSchema.composeKey(schema, keyLabel, composites, keyOptions)
   }
 
+  /**
+   * The partition key 1.36 composed for `streamId`, when the 1.36 key
+   * fallback is on and its text differs from {@link composeStreamPk}'s — a
+   * number stream id composite whose text changed (#171).
+   */
+  const composeStreamPk136 = (streamId: Record<string, unknown>): string | undefined => {
+    if (!KeyText136.enabled(schema)) return undefined
+    const composites = KeyText136.extractComposites(compositeFields, streamId)
+    const pk136 = DynamoSchema.composeKey(schema, keyLabel, composites, keyOptions)
+    return pk136 === composeStreamPk(streamId) ? undefined : pk136
+  }
+
+  /**
+   * The partition key a stream lives under (#171, DESIGN.md §7 "Rows written
+   * by 1.36"): its current key, unless that key's text changed since 1.36 and
+   * the stream's first event is under its 1.36 key. A stream 1.36 started is
+   * read and appended there — its events, snapshot, seal and command
+   * sentinels — until `rekey` moves it whole; a stream is never split across
+   * the two keys, and a new one starts under its current key. A stream whose
+   * key text did not change costs no request; one whose did, one consistent
+   * `GetItem` of the first event's key.
+   */
+  const locateStream = (
+    streamId: Record<string, unknown>,
+  ): Effect.Effect<string, DynamoClientError, DynamoClient | TableConfig> =>
+    composeStreamPk136(streamId) === undefined
+      ? Effect.succeed(composeStreamPk(streamId))
+      : Effect.gen(function* () {
+          const { name: tableName } = yield* config.table.Tag
+          return yield* locateStreamIn(tableName, streamId)
+        })
+
+  /** {@link locateStream} in the table named `tableName`. */
+  const locateStreamIn = (
+    tableName: string,
+    streamId: Record<string, unknown>,
+  ): Effect.Effect<string, DynamoClientError, DynamoClient> => {
+    const current = composeStreamPk(streamId)
+    const pk136 = composeStreamPk136(streamId)
+    if (pk136 === undefined) return Effect.succeed(current)
+    return Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const first = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap({ pk: pk136, sk: composeEventSk(1) }),
+        ConsistentRead: true,
+        ProjectionExpression: "#pk",
+        ExpressionAttributeNames: { "#pk": "pk" },
+      })
+      return first.Item === undefined ? current : pk136
+    })
+  }
+
+  /**
+   * The `prepare` step of a query of the stream's partition: read it where
+   * the stream lives ({@link locateStream}). Only a stream whose key text
+   * changed has one.
+   */
+  const locatedPrepare = (
+    streamId: Record<string, unknown>,
+  ): { readonly prepare?: Query.QueryPrepare } =>
+    composeStreamPk136(streamId) === undefined
+      ? {}
+      : {
+          prepare: (tableName) =>
+            Effect.map(locateStreamIn(tableName, streamId), (pkValue) => ({ pkValue })),
+        }
+
   const composeEventSk = (version: number): string =>
     DynamoSchema.composeEventVersionKey(schema, eventKeyLabel, version, keyOptions)
 
@@ -3481,6 +3556,8 @@ export const makeStream = <
    */
   const buildSnapshotItem = (
     streamId: Record<string, unknown>,
+    /** The partition the stream lives under ({@link locateStream}). */
+    pk: string,
     state: unknown,
     asOfVersion: number,
     now: string,
@@ -3499,7 +3576,7 @@ export const makeStream = <
               operation: `${operation}.packed`,
             })
       const item: Record<string, unknown> = {
-        pk: composeStreamPk(streamId),
+        pk,
         sk: snapshotSk,
         __edd_e__: snapshotEntityType,
         streamId: composeStreamIdString(streamId),
@@ -3551,6 +3628,8 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options: AppendOptions<unknown, unknown> | undefined,
+    /** Where the stream lives ({@link locateStream}); its current key when not given. */
+    streamPk?: string | undefined,
   ): Effect.Effect<AppendParts | undefined, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
@@ -3734,7 +3813,7 @@ export const makeStream = <
         })
       }
 
-      const pk = composeStreamPk(streamId as Record<string, unknown>)
+      const pk = streamPk ?? composeStreamPk(streamId as Record<string, unknown>)
       // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
       const nowDateTime = yield* DateTime.now
       const now = DateTime.formatIso(nowDateTime)
@@ -3935,6 +4014,7 @@ export const makeStream = <
       if (snapshotState !== undefined) {
         const item = yield* buildSnapshotItem(
           streamId as Record<string, unknown>,
+          pk,
           snapshotState,
           expectedVersion + events.length,
           now,
@@ -4041,7 +4121,9 @@ export const makeStream = <
         })
       }
 
-      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
+      // A stream 1.36 started is appended where it lives (#171).
+      const pk = yield* locateStream(streamId as Record<string, unknown>)
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options, pk)
       if (parts === undefined) return { version: expectedVersion, events: [] }
       const { tableName, streamIdStr, contiguityCheck, eventItems, sentinelPut, snapshotPut } =
         parts
@@ -4172,7 +4254,11 @@ export const makeStream = <
     expectedVersion: number,
     options: NestedAppendOptions<unknown, unknown> | undefined,
     source: string,
-  ): Effect.Effect<BuiltStreamAppend, ValidationError, TableConfig> =>
+  ): Effect.Effect<
+    BuiltStreamAppend,
+    ValidationError | DynamoClientError,
+    TableConfig | DynamoClient
+  > =>
     Effect.gen(function* () {
       const refuse = (cause: string) =>
         new ValidationError({ entityType, operation: "EventStore.appendOp", cause })
@@ -4203,6 +4289,7 @@ export const makeStream = <
         events,
         expectedVersion,
         options as AppendOptions<unknown, unknown> | undefined,
+        yield* locateStream(streamId as Record<string, unknown>),
       ))!
       const items: Array<TransactWriteItem> = []
       const sources: Array<[string, string]> = []
@@ -4323,6 +4410,7 @@ export const makeStream = <
       const now = DateTime.formatIso(yield* DateTime.now)
       const item = yield* buildSnapshotItem(
         streamId as Record<string, unknown>,
+        composeStreamPk(streamId as Record<string, unknown>),
         state,
         asOfVersion,
         now,
@@ -4492,6 +4580,7 @@ export const makeStream = <
       // the stored bytes.
       const item = yield* buildSnapshotItem(
         streamId as Record<string, unknown>,
+        yield* locateStream(streamId as Record<string, unknown>),
         state,
         asOfVersion,
         now,
@@ -4598,7 +4687,7 @@ export const makeStream = <
       const result = yield* client.getItem({
         TableName: tableName,
         Key: toAttributeMap({
-          pk: composeStreamPk(streamId as Record<string, unknown>),
+          pk: yield* locateStream(streamId as Record<string, unknown>),
           sk: snapshotSk,
         }),
         ...(consistentRead ? { ConsistentRead: true } : {}),
@@ -4626,7 +4715,7 @@ export const makeStream = <
       const result = yield* client.getItem({
         TableName: tableName,
         Key: toAttributeMap({
-          pk: composeStreamPk(streamId as Record<string, unknown>),
+          pk: yield* locateStream(streamId as Record<string, unknown>),
           sk: composeEventSk(version),
         }),
         ...(consistentRead ? { ConsistentRead: true } : {}),
@@ -4740,7 +4829,7 @@ export const makeStream = <
         FilterExpression: "#e IN (:eventType, :snapshotType)",
         ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk", "#e": "__edd_e__" },
         ExpressionAttributeValues: toAttributeMap({
-          ":pk": composeStreamPk(streamId as Record<string, unknown>),
+          ":pk": yield* locateStream(streamId as Record<string, unknown>),
           ":first": eventSkPrefix,
           ":snapshot": snapshotSk,
           ":eventType": entityType,
@@ -4836,7 +4925,7 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
       const result = yield* client.getItem({
         TableName: tableName,
-        Key: toAttributeMap({ pk: composeStreamPk(streamId), sk: composeCommandSk(commandId) }),
+        Key: toAttributeMap({ pk: yield* locateStream(streamId), sk: composeCommandSk(commandId) }),
         ConsistentRead: true,
         ProjectionExpression: "#pk",
         ExpressionAttributeNames: { "#pk": "pk" },
@@ -4869,6 +4958,8 @@ export const makeStream = <
       // Consumed capacity reports these queries under the stream name, as
       // every `EventStream.*` operation does (#174).
       operationTarget: config.streamName,
+      // A stream 1.36 started is read where it lives (#171).
+      ...locatedPrepare(streamId as Record<string, unknown>),
       // Bound to the event SK range so non-event items in the stream partition
       // (the snapshot) are excluded at the key-condition level. A caller-supplied
       // `Query.where` replaces this — the `__edd_e__` filter still applies.
@@ -4936,6 +5027,7 @@ export const makeStream = <
       throw new Error(`[EDD-9080] EventStream "${config.streamName}": ${partitionProblem}`)
     }
     const streamPk = composeStreamPk(streamId as Record<string, unknown>)
+    const derived = idx.partition === "derived"
     const query = Query.make<StreamEvent<TEvent>>({
       tableName: "",
       indexName: idx.index,
@@ -4958,6 +5050,9 @@ export const makeStream = <
       },
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
       operationTarget: config.streamName,
+      // A stream-scoped index of a stream 1.36 started is read in the 1.36
+      // partition, as its events are (#171).
+      ...(derived ? {} : locatedPrepare(streamId as Record<string, unknown>)),
       // A "keys" index holds no events: an LSI has DynamoDB fetch them
       // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with
       // `BatchGetItem` on the table key.
@@ -4970,7 +5065,12 @@ export const makeStream = <
           }
         : {}),
     })
-    return idx.partition === "derived" ? Query.filterExpr(query, streamPkFilter(streamPk)) : query
+    return derived
+      ? Query.filterExpr(
+          query,
+          streamPkFilter(streamPk, composeStreamPk136(streamId as Record<string, unknown>)),
+        )
+      : query
   }
 
   /**
@@ -6190,19 +6290,8 @@ type CommandOptionsArgs<
   ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4>]
   : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4> | undefined]
 
-type CommandHandlerErrors<E> =
-  | E
-  | VersionConflict
-  | StreamSealed
-  | DuplicateCommand
-  | AdditionalItemConditionFailed
-  | AppendTooLarge
-  | DynamoClientError
-  | ValidationError
-  | TransactionCancelled
-  | UniqueConstraintViolation
-  | OptimisticLockError
-  | ConcurrentModification
+/** A command's own error `E` and everything {@link EventStream.append} can raise. */
+type CommandHandlerErrors<E> = E | AppendError
 
 /**
  * A handler over an {@link EventStream}. Generic per call over the error (`E2`)

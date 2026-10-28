@@ -27,6 +27,7 @@ import type {
   DeleteAppliedButUnreadable,
   DuplicateCommand,
   ItemNotFound,
+  ItemNotMoved,
   OptimisticLockError,
   RefNotFound,
   StreamSealed,
@@ -190,6 +191,7 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
         | ItemNotFound
         | TransactionOverflow
         | RefNotFound
+        | ItemNotMoved
       >()
     })
     expect(true).toBe(true)
@@ -231,6 +233,7 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
       | UniqueConstraintViolation
       | OptimisticLockError
       | ConcurrentModification
+      | ItemNotMoved
     >()
   })
 

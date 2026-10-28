@@ -46,6 +46,7 @@ import {
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
   extractArrayElement,
@@ -1410,6 +1411,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
       Effect.as(unpackAggregateItems(read.allItems, dispatchByType, aggregateName), read),
     )
 
+  /**
+   * The collection partition key 1.36 composed for `record` (#171, DESIGN.md
+   * §7 "Rows written by 1.36"), when its text is not `pkValue`'s: a numeric
+   * partition composite. `undefined` when the text is the same, or the
+   * schema's `legacyKeys` is off.
+   */
+  const collectionPk136 = (
+    record: Record<string, unknown>,
+    pkValue: string,
+  ): string | undefined => {
+    if (!KeyText136.enabled(config.schema)) return undefined
+    const pk136 = composeCollectionKey(
+      config.schema,
+      config.collection.name,
+      KeyText136.extractComposites(config.pk.composite, keyRecord(record)),
+    )
+    return pk136 === pkValue ? undefined : pk136
+  }
+
   /** {@link readPartition} without unpacking — `delete` needs only the keys. */
   const readPartitionRaw = <E>(
     key: Record<string, unknown>,
@@ -1420,16 +1440,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const tableConfig: TableConfig = yield* config.table.Tag
       const composites = KeyComposer.extractComposites(config.pk.composite, keyRecord(key))
       const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
-      const allItems = yield* queryAllItems(
-        client,
-        tableConfig.name,
-        config.collection.index,
-        config.pk.field,
-        pkValue,
-        consistentRead,
-        rejected,
-      )
-      return { client, tableConfig, pkValue, composites, allItems }
+      const read = (partition: string) =>
+        queryAllItems(
+          client,
+          tableConfig.name,
+          config.collection.index,
+          config.pk.field,
+          partition,
+          consistentRead,
+          rejected,
+        )
+      // An aggregate 1.36 wrote under its 1.36 partition text is read there
+      // too, until `update` or `rekey` moves its rows (#171). Its rows come
+      // first: they are the older ones.
+      const pk136 = collectionPk136(key, pkValue)
+      const allItems =
+        pk136 === undefined
+          ? yield* read(pkValue)
+          : [...(yield* read(pk136)), ...(yield* read(pkValue))]
+      return { client, tableConfig, pkValue, pk136, composites, allItems }
     })
 
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
@@ -1569,10 +1598,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
             puts: [...g.items].sort((a, b) => Number(isRoot(b)) - Number(isRoot(a))),
             deletes: [],
           }))
+        // An aggregate 1.36 created under its 1.36 partition text exists too:
+        // its root is checked absent in the same transaction (#171).
+        const pk136 = collectionPk136(assembled, pkValue)
         yield* writeTransactionGroups(client, tableConfig.name, ordered, aggregateName, groupKeys, {
           pkField: config.pk.field,
           entityType: config.root.entityType,
           key: { [config.pk.field]: pkValue, sk: rootSk },
+          ...(pk136 === undefined ? {} : { key136: { [config.pk.field]: pk136, sk: rootSk } }),
         })
 
         return decoded as Schema.Schema.Type<TSchema>
@@ -1580,7 +1613,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
     update: (key, mutationFn) =>
       Effect.gen(function* () {
-        const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update")
+        const { client, tableConfig, pkValue, pk136, allItems } = yield* fetchPartition(
+          key,
+          "update",
+        )
 
         if (allItems.length === 0) {
           return yield* new AggregateAssemblyError({
@@ -1676,22 +1712,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         //    PUTs and would otherwise clobber it. The old set is only mined for
         //    (pk, sk) delete keys, so it is never stamped.
         const now = yield* DateTime.now
-        // Packed AFTER the group diff above compared the decomposed values, so
-        // an unchanged packed value is never rewritten (#147).
-        const newDynamo = buildDynamoItems(
-          yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
-          config,
-          pkValue,
-          sortKeyComposites(
-            config.schema,
-            KeyComposer.extractComposites(
-              config.collection.sk?.composite ?? [],
-              keyRecord(assembledNew),
-            ),
-          ),
-          keyRecord,
-          stampFor(now, readExistingCreated(allItems)),
-        )
         const oldDynamo = buildDynamoItems(
           oldGroups,
           config,
@@ -1708,6 +1728,76 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
         const skOf = (item: Record<string, AttributeValue>): string =>
           (item.sk as { S?: string } | undefined)?.S ?? ""
+
+        // Rows still under their 1.36 key (#171, DESIGN.md §7 "Rows written by
+        // 1.36"): the 1.36 partition text, or a sort key whose discriminator or
+        // `many`-edge composite text changed. Each moves in its own group's
+        // transaction — the group is rewritten at the current keys and the
+        // row's stored key deleted beside the Put — keeping its `created`.
+        // A row at its current key whose list or collection index key holds
+        // 1.36 text (a list sort key composite whose text changed) has its
+        // group rewritten too, which recomposes the index keys.
+        const existingCreated = new Map(readExistingCreated(allItems))
+        const moved = new Map<string, Array<Record<string, AttributeValue>>>()
+        const movedSks = new Set<string>()
+        const relisted = new Set<string>()
+        if (KeyText136.enabled(config.schema)) {
+          const storedAt = new Map<string, Record<string, unknown>>()
+          for (const item of allItems) {
+            storedAt.set(`${String(item[config.pk.field])}\u0000${String(item.sk)}`, item)
+          }
+          const indexFields = [
+            ...(config.collection.index !== undefined && config.collection.sk !== undefined
+              ? [config.collection.sk.field]
+              : []),
+            ...(config.list === undefined ? [] : [config.list.pk.field, config.list.sk.field]),
+          ]
+          const createdField = stampFields?.createdAt ?? null
+          oldGroups.forEach((group, g) => {
+            group.items.forEach((item, i) => {
+              const composed = oldDynamo[g]!.items[i]!
+              const sk = skOf(composed)
+              const stored = storedAt.get(`${pkValue}\u0000${sk}`)
+              if (stored !== undefined) {
+                const stale = indexFields.some((field) => {
+                  const text = (composed[field] as { S?: string } | undefined)?.S
+                  return text !== undefined && text !== stored[field]
+                })
+                if (stale) relisted.add(group.name)
+                return
+              }
+              const pk = pk136 ?? pkValue
+              const sk136 = composeKey(config.schema, item.entityType, [...item.skComposites136])
+              const row = storedAt.get(`${pk}\u0000${sk136}`)
+              if (row === undefined) return
+              const keys = moved.get(group.name) ?? []
+              keys.push(toAttributeMap({ [config.pk.field]: pk, sk: sk136 }))
+              moved.set(group.name, keys)
+              movedSks.add(sk)
+              if (createdField !== null && row[createdField] !== undefined) {
+                existingCreated.set(sk, row[createdField])
+              }
+            })
+          })
+        }
+
+        // Packed AFTER the group diff above compared the decomposed values, so
+        // an unchanged packed value is never rewritten (#147).
+        const newDynamo = buildDynamoItems(
+          yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
+          config,
+          pkValue,
+          sortKeyComposites(
+            config.schema,
+            KeyComposer.extractComposites(
+              config.collection.sk?.composite ?? [],
+              keyRecord(assembledNew),
+            ),
+          ),
+          keyRecord,
+          stampFor(now, existingCreated),
+        )
+
         const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
         const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
         // Every sk that survives anywhere in the new decomposition — an old item is
@@ -1731,16 +1821,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
             contextChanged ||
             oldGroup === undefined ||
             newGroup === undefined ||
-            !deepEqualGroups(oldGroup, newGroup)
+            !deepEqualGroups(oldGroup, newGroup) ||
+            moved.has(name) ||
+            relisted.has(name) ||
+            (newItemsByGroup.get(name) ?? []).some((item) => movedSks.has(skOf(item)))
           if (!changed) continue
 
           const puts = newItemsByGroup.get(name) ?? []
-          const deletes = (oldItemsByGroup.get(name) ?? [])
-            .filter((item) => !survivingSks.has(skOf(item)))
-            .map((item) => ({
-              [config.pk.field]: item[config.pk.field]!,
-              sk: item.sk!,
-            }))
+          // A row under its 1.36 key is deleted there — removed from the
+          // aggregate or moved — never at a current key it does not have.
+          const deletes = [
+            ...(oldItemsByGroup.get(name) ?? [])
+              .filter((item) => !survivingSks.has(skOf(item)) && !movedSks.has(skOf(item)))
+              .map((item) => ({
+                [config.pk.field]: item[config.pk.field]!,
+                sk: item.sk!,
+              })),
+            ...(moved.get(name) ?? []),
+          ]
           if (puts.length === 0 && deletes.length === 0) continue
           groupWrites.push({ group: name, puts, deletes })
         }
@@ -1843,6 +1941,69 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         const skComplete = skValues.length === listConfig.sk.composite.length
 
+        // The list keys 1.36 composed for the filter (#171, DESIGN.md §7 "Rows
+        // written by 1.36"): when their text differs, the root items 1.36
+        // wrote are listed too, until `update` or `rekey` moves them — under
+        // the same equality / prefix rule, ahead of the current key's (behind
+        // it under `reverse`).
+        const legacy = ((): ListPass | undefined => {
+          if (!KeyText136.enabled(config.schema)) return undefined
+          const pkComposites = KeyText136.extractComposites(
+            listConfig.pk.composite,
+            keyRecord(filter ?? {}),
+          )
+          const skValues136: string[] = []
+          for (const attr of listConfig.sk.composite) {
+            if (listSkFilter[attr] !== undefined)
+              skValues136.push(KeyText136.serializeValue(listSkFilter[attr]))
+            else break
+          }
+          // Compared as the keys spell them: cased.
+          const text = (values: ReadonlyArray<string>) =>
+            composeCollectionKey(config.schema, listConfig.name, values)
+          const samePk = text(pkComposites) === text(listPkComposites)
+          const sameSk = text(skValues136) === text(skValues)
+          return samePk && sameSk ? undefined : { pkComposites, skValues: skValues136, samePk }
+        })()
+        const current: ListPass = { pkComposites: listPkComposites, skValues, samePk: true }
+        // Under a shared partition, a row the current key condition matches is
+        // read by the current pass only.
+        const skMatcher = (pass: ListPass) => {
+          const text = composeCollectionKey(config.schema, listConfig.name, pass.skValues)
+          return (sk: unknown): boolean =>
+            pass.skValues.length === 0 ||
+            (typeof sk === "string" &&
+              (skComplete ? sk === text : sk.startsWith(`${text}${KEY_DELIMITER}`)))
+        }
+        const inCurrent = skMatcher(current)
+        // A root item the current composer keys under the 1.36 condition too
+        // (a value holding `#`, or `%` and two hex digits, spelled as another
+        // value's escaped text) is not a 1.36 row: its list sort key is the
+        // one its values compose now.
+        const unmoved = (item: Record<string, unknown>): boolean => {
+          try {
+            const sk = composeCollectionKey(
+              config.schema,
+              listConfig.name,
+              sortKeyComposites(
+                config.schema,
+                KeyComposer.extractComposites(listConfig.sk.composite, keyRecord(item)),
+              ),
+            )
+            return item[listConfig.sk.field] !== sk
+          } catch {
+            return true
+          }
+        }
+        const acceptFor = (pass: ListPass) => {
+          const filterBy = options?.filterBy
+          if (pass === current || pass.samePk === false) return filterBy
+          return (item: Record<string, unknown>) =>
+            !inCurrent(item[listConfig.sk.field]) &&
+            unmoved(item) &&
+            (filterBy === undefined || filterBy(item))
+        }
+
         let rootItems: Array<Record<string, unknown>>
         let nextKey: Record<string, AttributeValue> | undefined
 
@@ -1869,31 +2030,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
 
           // Fan out across shards and merge. `limit` bounds each shard too — no
-          // single shard can contribute more than the whole page.
-          const shardQueries = Array.from({ length: listConfig.cardinality }, (_, shard) => {
-            const shardPkValue = composeCollectionKey(config.schema, listConfig.name, [
-              ...listPkComposites,
-              String(shard),
-            ])
-            return queryListPartition(
-              client,
-              tableConfig,
-              listConfig,
-              config.schema,
-              {
-                pkValue: shardPkValue,
-                skValues,
-                skComplete,
-                limit,
-                pageSize,
-                filter: rootFilter,
-                accept: options?.filterBy,
-                reverse: options?.reverse === true,
-                keyFields: listKeyFields,
-              },
-              aggregateName,
-            )
-          })
+          // single shard can contribute more than the whole page. The 1.36
+          // keys' shards are read too, first (#171).
+          const passes = legacy === undefined ? [current] : [legacy, current]
+          const cardinality = listConfig.cardinality
+          const shardQueries = passes.flatMap((pass) =>
+            Array.from({ length: cardinality }, (_, shard) => {
+              const shardPkValue = composeCollectionKey(config.schema, listConfig.name, [
+                ...pass.pkComposites,
+                String(shard),
+              ])
+              return queryListPartition(
+                client,
+                tableConfig,
+                listConfig,
+                config.schema,
+                {
+                  pkValue: shardPkValue,
+                  skValues: pass.skValues,
+                  skComplete,
+                  limit,
+                  pageSize,
+                  filter: rootFilter,
+                  accept: acceptFor(pass),
+                  reverse: options?.reverse === true,
+                  keyFields: listKeyFields,
+                },
+                aggregateName,
+              )
+            }),
+          )
           const shardResults = yield* Effect.all(shardQueries)
           const merged = shardResults.flatMap((r) => r.items)
           // Truncate the merged fan-out to `limit`. Previously the option was
@@ -1901,31 +2067,65 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootItems = limit === undefined ? merged : merged.slice(0, limit)
           nextKey = undefined
         } else {
-          const startKey = options?.cursor
+          let startKey = options?.cursor
             ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
             : undefined
-          const listPkValue = composeCollectionKey(config.schema, listConfig.name, listPkComposites)
-          const result = yield* queryListPartition(
-            client,
-            tableConfig,
-            listConfig,
-            config.schema,
-            {
-              pkValue: listPkValue,
-              skValues,
-              skComplete,
-              limit,
-              pageSize,
-              startKey,
-              filter: rootFilter,
-              accept: options?.filterBy,
-              reverse: options?.reverse === true,
-              keyFields: listKeyFields,
-            },
-            aggregateName,
-          )
-          rootItems = result.items
-          nextKey = result.lastKey
+          const passes =
+            legacy === undefined
+              ? [current]
+              : options?.reverse === true
+                ? [current, legacy]
+                : [legacy, current]
+          const pkOf = (pass: ListPass) =>
+            composeCollectionKey(config.schema, listConfig.name, pass.pkComposites)
+          // A cursor resumes the pass its key is in (a cursor names a row).
+          let at = 0
+          if (startKey !== undefined && legacy !== undefined) {
+            const inLegacy =
+              legacy.samePk === false
+                ? startKey[listConfig.pk.field]?.S === pkOf(legacy)
+                : !inCurrent(startKey[listConfig.sk.field]?.S)
+            at = passes.indexOf(inLegacy ? legacy : current)
+          }
+          rootItems = []
+          nextKey = undefined
+          for (; at < passes.length; at++) {
+            const pass = passes[at]!
+            const result = yield* queryListPartition(
+              client,
+              tableConfig,
+              listConfig,
+              config.schema,
+              {
+                pkValue: pkOf(pass),
+                skValues: pass.skValues,
+                skComplete,
+                limit: limit === undefined ? undefined : limit - rootItems.length,
+                pageSize,
+                startKey,
+                filter: rootFilter,
+                accept: acceptFor(pass),
+                reverse: options?.reverse === true,
+                keyFields: listKeyFields,
+              },
+              aggregateName,
+            )
+            rootItems.push(...result.items)
+            startKey = undefined
+            if (result.lastKey !== undefined) {
+              nextKey = result.lastKey
+              break
+            }
+            if (limit !== undefined && rootItems.length >= limit) {
+              // The page ends where this pass does: resume after its last
+              // row, which reads the rest of the pass (nothing) and goes on.
+              const last = rootItems[rootItems.length - 1]
+              if (at < passes.length - 1 && last !== undefined) {
+                nextKey = listKeyFromItem(toAttributeMap(last), listKeyFields)
+              }
+              break
+            }
+          }
         }
 
         // Extract PK composite values from each root item and assemble
@@ -2992,6 +3192,11 @@ interface DecomposedItem {
   readonly keyAttributes?: Record<string, unknown>
   readonly transactionGroup: string
   readonly skComposites: ReadonlyArray<string>
+  /**
+   * The sort key composites 1.36 composed (#171): values in 1.36's text,
+   * unescaped. `update` finds a row 1.36 wrote by them, to move it.
+   */
+  readonly skComposites136: ReadonlyArray<string>
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
 }
@@ -3062,6 +3267,7 @@ const decomposeAggregate = (
       keyAttributes: rootKeyAttrs,
       transactionGroup: "root",
       skComposites: [],
+      skComposites136: [],
       member: rootNode.entityType,
     })
 
@@ -3074,7 +3280,7 @@ const decomposeAggregate = (
         fieldValue,
         contextValues,
         "root",
-        [],
+        { current: [], legacy: [] },
         aggregateName,
         schema.casing,
       )
@@ -3132,6 +3338,27 @@ const mergeContextValues = (
   }
 }
 
+/** Discriminator `name#value` pairs for a sort key: today's text, and 1.36's (#171). */
+interface DiscriminatorValues {
+  readonly current: ReadonlyArray<string>
+  readonly legacy: ReadonlyArray<string>
+}
+
+/** A node's own static discriminator values as {@link DiscriminatorValues}. */
+const ownDiscriminatorValues = (
+  node: ResolvedNode,
+  casing: DynamoSchemaModule.Casing,
+): DiscriminatorValues => {
+  const entries =
+    node.ownDiscriminator === undefined
+      ? []
+      : Object.entries(node.ownDiscriminator).filter(([, v]) => typeof v !== "function")
+  return {
+    current: entries.flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)]),
+    legacy: entries.flatMap(([k, v]) => [k, KeyText136.serializeValue(v)]),
+  }
+}
+
 /**
  * Recursively decompose a node's value into DynamoDB items. Sort key values
  * are escaped with the schema's `casing` (`KeyComposer.sortKeyText`); the
@@ -3143,7 +3370,8 @@ const decomposeNode = (
   value: unknown,
   contextValues: ContextValues,
   parentGroup: string,
-  parentDiscriminatorValues: ReadonlyArray<string>,
+  /** The parent's discriminator values, in today's text and in 1.36's (#171). */
+  parentDiscriminators: DiscriminatorValues,
   aggregateName: string,
   casing: DynamoSchemaModule.Casing,
 ): Effect.Effect<void, AggregateDecompositionError> =>
@@ -3162,14 +3390,11 @@ const decomposeNode = (
       // Discriminator values for SK composition: the parent sub-aggregate's
       // (name#value pairs, empty at the top level) then this node's own, so a
       // nested sub-aggregate's rows are keyed apart per binding of its parent.
-      const discValues = [
-        ...parentDiscriminatorValues,
-        ...(node.ownDiscriminator
-          ? Object.entries(node.ownDiscriminator)
-              .filter(([, v]) => typeof v !== "function")
-              .flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)])
-          : []),
-      ]
+      const own = ownDiscriminatorValues(node, casing)
+      const discValues: DiscriminatorValues = {
+        current: [...parentDiscriminators.current, ...own.current],
+        legacy: [...parentDiscriminators.legacy, ...own.legacy],
+      }
 
       // Sub-aggregate root item: fields not claimed by child edges
       const childEdgeNames = new Set(node.children.map((c) => c.fieldName).filter(Boolean))
@@ -3194,7 +3419,8 @@ const decomposeNode = (
         entityType: node.entityType,
         attributes: subRootAttrs,
         transactionGroup: txGroup,
-        skComposites: discValues,
+        skComposites: discValues.current,
+        skComposites136: discValues.legacy,
         member: node.fieldName ?? node.entityType,
       })
 
@@ -3225,17 +3451,14 @@ const decomposeNode = (
       }
 
       // Own discriminator values as name#value pairs for SK composition
-      const ownDiscValues = node.ownDiscriminator
-        ? Object.entries(node.ownDiscriminator)
-            .filter(([, v]) => typeof v !== "function")
-            .flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)])
-        : []
+      const own = ownDiscriminatorValues(node, casing)
 
       items.push({
         entityType: node.entityType,
         attributes: attrs,
         transactionGroup: parentGroup,
-        skComposites: [...parentDiscriminatorValues, ...ownDiscValues],
+        skComposites: [...parentDiscriminators.current, ...own.current],
+        skComposites136: [...parentDiscriminators.legacy, ...own.legacy],
         member: node.fieldName ?? node.entityType,
       })
     } else {
@@ -3271,15 +3494,20 @@ const decomposeNode = (
         applyNodeAttrEncoders(keyAttrs, node.keyAttrEncoders)
         withContext(keyAttrs, contextValues.key)
 
-        const itemComposites = (yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)).map(
-          (text) => KeyComposer.sortKeyText(text, casing),
-        )
+        const values = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
 
         items.push({
           entityType: node.entityType,
           attributes: attrs,
           transactionGroup: parentGroup,
-          skComposites: [...parentDiscriminatorValues, ...itemComposites],
+          skComposites: [
+            ...parentDiscriminators.current,
+            ...values.map((value) => KeyComposer.serializeSortKeyValue(value, casing)),
+          ],
+          skComposites136: [
+            ...parentDiscriminators.legacy,
+            ...values.map((value) => KeyText136.serializeValue(value)),
+          ],
           member: node.fieldName ?? node.entityType,
         })
       }
@@ -3355,7 +3583,7 @@ const manyEdgeSkComposites = (
   node: ResolvedNode,
   attrs: Record<string, unknown>,
   aggregateName: string,
-): Effect.Effect<ReadonlyArray<string>, AggregateDecompositionError> =>
+): Effect.Effect<ReadonlyArray<unknown>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const declared = node.skComposite
     if (declared === undefined) return extractRefIdentifiers(attrs, node.refIdentifierField)
@@ -3386,7 +3614,7 @@ const manyEdgeSkComposites = (
       })
     }
 
-    return values.map((value) => KeyComposer.serializeValue(value))
+    return values
   })
 
 /**
@@ -3585,6 +3813,11 @@ interface RootGuard {
   readonly pkField: string
   readonly entityType: string
   readonly key: Record<string, unknown>
+  /**
+   * The root's 1.36 key, when its partition text differs (#171): checked
+   * absent in the first transaction, its cancellation `ConditionalCheckFailed`.
+   */
+  readonly key136?: Record<string, unknown> | undefined
 }
 
 type WriteGroupsError =
@@ -3656,7 +3889,21 @@ function writeTransactionGroups(
           },
         })),
         ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
+        ...(rootGuard?.key136 !== undefined && rootIndex >= 0
+          ? [
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: toAttributeMap(rootGuard.key136),
+                  ConditionExpression: "attribute_not_exists(#pk)",
+                  ExpressionAttributeNames: { "#pk": rootGuard.pkField },
+                },
+              },
+            ]
+          : []),
       ]
+      // The 1.36 root's check, last in the transaction.
+      const root136Index = rootGuard?.key136 !== undefined && rootIndex >= 0 ? itemCount : -1
 
       // Named once, for both diagnoses below.
       const sent = () => ({
@@ -3670,8 +3917,10 @@ function writeTransactionGroups(
               tableName,
               [keys.pkField, "sk"],
               entityType,
-              `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
-                `sub-aggregate "${group.group}"`,
+              item.ConditionCheck !== undefined
+                ? `the 1.36 key of the root item of sub-aggregate "${group.group}"`
+                : `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
+                    `sub-aggregate "${group.group}"`,
             )
           }),
       })
@@ -3720,10 +3969,12 @@ function writeTransactionGroups(
             const cancelled = error.cause as {
               CancellationReasons?: ReadonlyArray<{ Code?: string; Message?: string }>
             }
+            const reasons = cancelled.CancellationReasons
             if (
               rootGuard !== undefined &&
               rootIndex >= 0 &&
-              cancelled.CancellationReasons?.[rootIndex]?.Code === "ConditionalCheckFailed"
+              (reasons?.[rootIndex]?.Code === "ConditionalCheckFailed" ||
+                (root136Index >= 0 && reasons?.[root136Index]?.Code === "ConditionalCheckFailed"))
             ) {
               return new ConditionalCheckFailed({
                 entityType: rootGuard.entityType,
@@ -3860,6 +4111,16 @@ interface ListPartitionResult {
    * actually returned, so the caller resumes after what it saw.
    */
   readonly lastKey: Record<string, AttributeValue> | undefined
+}
+
+/** One key of an `Aggregate.list` read: today's, or 1.36's (#171). */
+interface ListPass {
+  /** The list partition key's composites, serialized. */
+  readonly pkComposites: ReadonlyArray<string>
+  /** The filter's leading sort key composites, serialized. */
+  readonly skValues: ReadonlyArray<string>
+  /** Whether the list partition key is the current one's. */
+  readonly samePk: boolean
 }
 
 interface ListPartitionOptions {
