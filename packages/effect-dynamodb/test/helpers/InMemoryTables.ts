@@ -1,14 +1,18 @@
 /**
- * An in-memory DynamoDB for projection unit tests — the operations the
- * projection engine issues (GetItem, PutItem, UpdateItem, DeleteItem, Query,
- * TransactWriteItems), with condition expressions evaluated: `AND` / `OR` /
+ * An in-memory DynamoDB for projection and time-series unit tests — GetItem,
+ * PutItem, UpdateItem, DeleteItem, Query and TransactWriteItems (`Put` and
+ * `Update` items), with condition expressions evaluated: `AND` / `OR` /
  * `NOT`, parentheses, `attribute_exists` / `attribute_not_exists`, and
  * `=` / `<>` / `<` / `<=` / `>` / `>=` on scalar attributes (`#a.#b` paths
  * included). A query's sort key condition — `BETWEEN`, `begins_with` or a
  * comparison — orders `S` keys as text and `B` keys by their bytes (#171).
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type {
+  AttributeValue,
+  GetItemCommandInput,
+  TransactWriteItemsCommandInput,
+} from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { mockDynamoClientLayer } from "./MockDynamoClient.js"
@@ -27,10 +31,21 @@ export const calls = {
 }
 /** Every query's expression values, for asserting the range read. */
 export const queried: Array<Record<string, AttributeValue>> = []
+/** Every `GetItem` and `TransactWriteItems` input, for asserting request shapes. */
+export const sent = {
+  getItem: [] as Array<GetItemCommandInput>,
+  transactWriteItems: [] as Array<TransactWriteItemsCommandInput>,
+}
 /** Hooks run once after the next `getItem` — a concurrent writer between read and write. */
 export const hooks = { afterGet: [] as Array<(table: string) => void> }
 /** Fail every conditional write, as if another writer always won. */
 export const rejection = { all: false, next: 0 }
+/**
+ * Cancel the next `next` transactions for a `TransactionConflict` — another
+ * transaction in flight on the item, as real DynamoDB reports it and DynamoDB
+ * Local never does — writing nothing.
+ */
+export const contention = { next: 0 }
 
 export const resetStore = () => {
   store.clear()
@@ -38,10 +53,13 @@ export const resetStore = () => {
   hooks.afterGet = []
   rejection.all = false
   rejection.next = 0
+  contention.next = 0
 }
 
 export const resetCalls = () => {
   queried.length = 0
+  sent.getItem.length = 0
+  sent.transactWriteItems.length = 0
   for (const k of Object.keys(calls) as Array<keyof typeof calls>) calls[k] = 0
 }
 
@@ -327,6 +345,7 @@ export const InMemoryClient = mockDynamoClientLayer({
   getItem: (input) =>
     Effect.sync(() => {
       calls.getItem++
+      sent.getItem.push(input)
       const item = store.get(keyOf(input.TableName!, input.Key!))
       const run = hooks.afterGet
       hooks.afterGet = []
@@ -402,19 +421,34 @@ export const InMemoryClient = mockDynamoClientLayer({
   transactWriteItems: (input) =>
     Effect.suspend(() => {
       calls.transactWriteItems++
+      sent.transactWriteItems.push(input)
       const ops = input.TransactItems ?? []
+      if (contention.next > 0) {
+        contention.next--
+        return Effect.fail(
+          new DynamoError({
+            operation: "TransactWriteItems",
+            cause: Object.assign(new Error("Transaction cancelled"), {
+              name: "TransactionCanceledException",
+              CancellationReasons: ops.map((_, i) => ({
+                Code: i === 0 ? "TransactionConflict" : "None",
+              })),
+            }),
+          }),
+        )
+      }
       // All conditions first; then every write.
       const reasons = ops.map((op) => {
-        const put = op.Put
-        if (put === undefined) return { Code: "None" }
-        const key = keyOf(put.TableName!, put.Item!)
+        const write = op.Put ?? op.Update
+        if (write === undefined) return { Code: "None" }
+        const key = keyOf(write.TableName!, op.Put?.Item ?? op.Update!.Key!)
         return conditionFails(
-          put.TableName!,
-          put.Item,
+          write.TableName!,
+          op.Put?.Item,
           key,
-          put.ConditionExpression,
-          put.ExpressionAttributeNames,
-          put.ExpressionAttributeValues,
+          write.ConditionExpression,
+          write.ExpressionAttributeNames,
+          write.ExpressionAttributeValues,
         )
           ? { Code: "ConditionalCheckFailed" }
           : { Code: "None" }
@@ -433,6 +467,19 @@ export const InMemoryClient = mockDynamoClientLayer({
       for (const op of ops) {
         if (op.Put?.Item !== undefined)
           store.set(keyOf(op.Put.TableName!, op.Put.Item), op.Put.Item)
+        const update = op.Update
+        if (update?.Key !== undefined) {
+          const key = keyOf(update.TableName!, update.Key)
+          store.set(
+            key,
+            applyUpdate(
+              store.get(key) ?? { ...update.Key },
+              update.UpdateExpression!,
+              update.ExpressionAttributeNames ?? {},
+              update.ExpressionAttributeValues ?? {},
+            ),
+          )
+        }
       }
       return Effect.succeed({} as never)
     }),

@@ -47,6 +47,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  compositeKeyFormKind,
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -392,6 +393,39 @@ const composeUniqueSentinel = (
  *
  * @internal
  */
+/**
+ * One `append` attempt's staleness guard: its condition, and the names and
+ * values only it uses.
+ */
+type AppendCas = {
+  readonly expression: string
+  readonly names: globalThis.Record<string, string>
+  readonly values: globalThis.Record<string, AttributeValue>
+}
+
+/**
+ * How many attempts an `append` on a string-encoded numeric `orderBy` makes in
+ * all, reading and writing again after a concurrent write moved the item under
+ * it (#171 E9) — and how many times any `append` sends its transaction while
+ * DynamoDB cancels it for a `TransactionConflict` ({@link isTransactionConflict}).
+ */
+const APPEND_GUARD_ATTEMPTS = 8
+
+/**
+ * A transaction DynamoDB cancelled for contention alone: another transaction
+ * was in flight on one of its items (`TransactionConflict`), and no condition
+ * evaluated false. Nothing was written, and sent again it can apply, so it is
+ * never a condition's verdict (#171). DynamoDB Local never raises it.
+ */
+const isTransactionConflict = (cause: unknown): boolean => {
+  if (!isAwsTransactionCancelled(cause)) return false
+  const reasons = cause.CancellationReasons ?? []
+  return (
+    reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+    !reasons.some((reason) => reason?.Code === "ConditionalCheckFailed")
+  )
+}
+
 /**
  * @internal Build a key-form normaliser for an arbitrary entity-like value.
  *
@@ -8913,7 +8947,10 @@ const makeImpl = <
   //   GetItem to disambiguate. If the stored `orderBy >= attempted`, the CAS
   //   fired → fail with `StaleAppend(current: Option.some)`. Otherwise the
   //   user-supplied `.condition()` rejected the write → fail with
-  //   `ConditionalCheckFailed(current: Option.some)`.
+  //   `ConditionalCheckFailed(current: Option.some)` — `Option.none` when
+  //   there is no item: the condition rejected the append creating it.
+  // - A cancellation for a `TransactionConflict` alone (another transaction
+  //   in flight on the item) is no verdict: the transaction is sent again.
   // - skipFollowUp success path: return `void`.
   // - skipFollowUp stale path: cannot disambiguate (no GetItem), so fail
   //   with `StaleAppend(current: Option.none)` for both cancellation modes.
@@ -9055,12 +9092,16 @@ const makeImpl = <
       }
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites),
-      // and the event key's orderBy text, before anything is marshalled: a
-      // value with no key text (`NaN`, `[EDD-9096]`) fails the append with a
-      // `ValidationError`, where the marshaller would refuse it as a defect.
+      // and the event key, before anything is marshalled: a value with no key
+      // text (`NaN`, `[EDD-9096]`) fails the append with a `ValidationError`,
+      // where the marshaller would refuse it as a defect. The event key's
+      // orderBy segment is the orderBy's KEY form, as `.history().where()`, row
+      // checks and `liveRows` compose it: a `NumberFromString` orderBy is the
+      // number, so events sort numerically (#171 F2; up to 1.36 the encoded
+      // text, which sorted "10" before "9").
       const primary = config.indexes.primary
       const appendKeyForm = keyForm(encoded)
-      const { pkValue, currentSk } = yield* composeKeysOrFail(entityType, "append", () => {
+      const { pkValue, currentSk, eventSk } = yield* composeKeysOrFail(entityType, "append", () => {
         const currentSk = KeyComposer.composeSk(
           schema,
           entityType,
@@ -9068,10 +9109,14 @@ const makeImpl = <
           primary,
           appendKeyForm,
         )
-        KeyComposer.composeEventSk(currentSk, encoded[orderByField], schema.casing)
         return {
           pkValue: KeyComposer.composePk(schema, entityType, primary, appendKeyForm),
           currentSk,
+          eventSk: KeyComposer.composeEventSk(
+            currentSk,
+            appendKeyForm[orderByField],
+            schema.casing,
+          ),
         }
       })
       const marshalledKey = toAttributeMap({
@@ -9194,33 +9239,24 @@ const makeImpl = <
         counter++
       }
 
-      // CAS condition: attribute_not_exists(#pk) OR #ob < :newOb
-      names["#_tspk"] = primary.pk.field
-      names["#_tsob"] = resolveDbName(orderByField)
-      // The comparison uses the stored domain-value representation — for
-      // DateTime.Utc this is ISO (lexicographic == chronological), for numbers
-      // it's numeric, for strings it's lexicographic. Matches how the current
-      // item stores `orderByField`.
+      // CAS: the append applies when the item is new or its stored orderBy is
+      // below the attempted one. `#_tspk` / `#_tsob` name the key and the
+      // orderBy attribute; each attempt's condition adds only the names and
+      // values it uses (DynamoDB refuses unused ones).
+      const pkName = primary.pk.field
+      const orderByName = resolveDbName(orderByField)
+      // The attempted orderBy as stored (the encoded value).
       const newObValue = serialisedInput[orderByField]
-      values[":_tsNewOb"] = toAttributeValue(newObValue)
-
-      const casCondition = "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb"
-      let finalCondition = casCondition
+      // The user's condition is ANDed after the CAS, its names and values
+      // after the CAS's, as 1.36 sent them.
       const uc =
         userCondition !== undefined ? compileCondition(userCondition, resolveDbName) : undefined
-      if (uc) {
-        finalCondition = `(${casCondition}) AND (${uc.expression})`
-        Object.assign(names, uc.names)
-        Object.assign(values, uc.values)
-      }
-
-      const exprParts: Array<string> = []
-      if (setClauses.length > 0) exprParts.push(`SET ${setClauses.join(", ")}`)
-      if (appendRemoveClauses.length > 0) exprParts.push(`REMOVE ${appendRemoveClauses.join(", ")}`)
-      const updateExpression = exprParts.join(" ")
+      const updateExpression = [
+        ...(setClauses.length > 0 ? [`SET ${setClauses.join(", ")}`] : []),
+        ...(appendRemoveClauses.length > 0 ? [`REMOVE ${appendRemoveClauses.join(", ")}`] : []),
+      ].join(" ")
 
       // ---------- Build Put of event item ----------
-      const eventSk = KeyComposer.composeEventSk(currentSk, newObValue, schema.casing)
       // `encoded` is already in wire-form via Schema.encode; no extra
       // serialisation step is required for the Put.
       const eventItem: globalThis.Record<string, unknown> = { ...encoded }
@@ -9266,58 +9302,199 @@ const makeImpl = <
       const marshalledEventItem = toAttributeMap(eventItem)
 
       // ---------- Execute TransactWriteItems ----------
-      const appendItems: Array<TransactWriteItem> = [
-        {
-          Update: {
-            TableName: tableName,
-            Key: marshalledKey,
-            UpdateExpression: updateExpression,
-            ConditionExpression: finalCondition,
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: values,
+      /** One attempt: the UpdateItem guarded by `cas` (and the user's condition), then the event Put. */
+      const send = (cas: AppendCas) => {
+        const appendItems: Array<TransactWriteItem> = [
+          {
+            Update: {
+              TableName: tableName,
+              Key: marshalledKey,
+              UpdateExpression: updateExpression,
+              ConditionExpression: uc
+                ? `(${cas.expression}) AND (${uc.expression})`
+                : cas.expression,
+              ExpressionAttributeNames: { ...names, ...cas.names, ...uc?.names },
+              ExpressionAttributeValues: { ...values, ...cas.values, ...uc?.values },
+            },
           },
-        },
-        {
-          Put: {
-            TableName: tableName,
-            Item: marshalledEventItem,
+          {
+            Put: {
+              TableName: tableName,
+              Item: marshalledEventItem,
+            },
           },
-        },
-      ]
-      const transactResult = yield* client.transactWriteItems({ TransactItems: appendItems }).pipe(
-        // A limit DynamoDB enforced (#144) — the current item grown past
-        // 400 KB, an oversized event item, an over-long sort key — is
-        // diagnosed first: such a cancellation carries no conditional
-        // failure, so it is never a stale append.
-        diagnoseFailure({
-          sent: () => ({
-            _tag: "Transaction",
-            items: appendItems,
-            targets: () =>
-              targetsFor(appendItems, entityKeyFields(), entityType, (index) =>
-                index === 0 ? "the current item" : "the event item",
-              ),
+        ]
+        return client.transactWriteItems({ TransactItems: appendItems }).pipe(
+          // Another transaction in flight on the item (#171): nothing was
+          // judged and nothing written, so the same transaction is sent again
+          // — a re-read would find the item unchanged and take the
+          // cancellation for a stale append or the user's condition.
+          Effect.retry({
+            times: APPEND_GUARD_ATTEMPTS - 1,
+            while: (err) => isTransactionConflict(err.cause),
           }),
-          keys: entityKeys,
-          rewrite: (diagnosis, original) =>
-            diagnosedValidationError(diagnosis, original, { operation: "append", entityType }),
-        }),
-        Effect.matchEffect({
-          onSuccess: () => Effect.succeed({ stale: false as const }),
-          onFailure: (
-            err: DynamoClientError | ValidationError,
-          ): Effect.Effect<{ readonly stale: true }, DynamoClientError | ValidationError> => {
-            if (err._tag === "ValidationError") return Effect.fail(err)
-            // TransactionCancelled or ConditionalCheckFailed at the transaction
-            // level both surface here. Disambiguation between CAS and
-            // user-condition happens after the follow-up GetItem (when run).
-            if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
-              return Effect.succeed({ stale: true as const })
-            }
-            return Effect.fail(err)
-          },
-        }),
-      )
+          // A limit DynamoDB enforced (#144) — the current item grown past
+          // 400 KB, an oversized event item, an over-long sort key — is
+          // diagnosed first: such a cancellation carries no conditional
+          // failure, so it is never a stale append.
+          diagnoseFailure({
+            sent: () => ({
+              _tag: "Transaction",
+              items: appendItems,
+              targets: () =>
+                targetsFor(appendItems, entityKeyFields(), entityType, (index) =>
+                  index === 0 ? "the current item" : "the event item",
+                ),
+            }),
+            keys: entityKeys,
+            rewrite: (diagnosis, original) =>
+              diagnosedValidationError(diagnosis, original, { operation: "append", entityType }),
+          }),
+          Effect.matchEffect({
+            onSuccess: () => Effect.succeed({ stale: false as const }),
+            onFailure: (
+              err: DynamoClientError | ValidationError,
+            ): Effect.Effect<
+              { readonly stale: true; readonly error: DynamoClientError },
+              DynamoClientError | ValidationError
+            > => {
+              if (err._tag === "ValidationError") return Effect.fail(err)
+              // Still contended after every attempt: the transaction's error.
+              if (isTransactionConflict(err.cause)) return Effect.fail(err)
+              // TransactionCancelled or ConditionalCheckFailed at the transaction
+              // level both surface here. Disambiguation between CAS and
+              // user-condition happens after the follow-up GetItem (when run).
+              if (isAwsTransactionCancelled(err.cause) || isAwsConditionalCheckFailed(err.cause)) {
+                return Effect.succeed({ stale: true as const, error: err })
+              }
+              return Effect.fail(err)
+            },
+          }),
+        )
+      }
+
+      /** The current item, decoded — for a result or an error's `current`. */
+      const decodeCurrent = (item: globalThis.Record<string, AttributeValue>) =>
+        decodeAs(
+          fromAttributeMap(item) as globalThis.Record<string, unknown>,
+          item,
+          "model",
+        ) as Effect.Effect<ModelType<TModel>, ValidationError>
+
+      const staleAppend = (current: Option.Option<unknown>) =>
+        new StaleAppend({ entityType, orderByField, attemptedOrderBy: newObValue, current })
+
+      /**
+       * The post-append current item: one GetItem (skipped under
+       * `skipFollowUp`). Strongly consistent: an eventually consistent read
+       * can miss the item the append just created, or return it as it was
+       * before the append.
+       */
+      const applied = Effect.gen(function* () {
+        if (skipFollowUp) return undefined
+        const followUp = yield* client.getItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          ConsistentRead: true,
+        })
+        if (!followUp.Item) {
+          // TTL race or out-of-band delete — the previous state vanished
+          // under us. Distinct from a CAS-stale outcome.
+          return yield* new ValidationError({
+            entityType,
+            operation: "append.followUp",
+            cause: "Current item not found after append — possible TTL race or concurrent delete.",
+          })
+        }
+        return { current: yield* decodeCurrent(followUp.Item) }
+      })
+
+      if (
+        compositeKeyFormKind(schemas.inputSchema as unknown as Schema.Top, orderByField) ===
+        "type-numeric"
+      ) {
+        // A string-encoded numeric orderBy (`NumberFromString`,
+        // `BigIntFromString`) is stored as `S`, and DynamoDB compares `S` as
+        // text: `#_tsob < :_tsNewOb` refused 10 after 9 and took 9 after 10
+        // (#171 E9). So the append reads the current item (strongly
+        // consistent), compares the orderBy's key form — the number — here,
+        // and guards the write on the stored value it read (`=`, exact on
+        // text). A concurrent append moves the stored value and cancels the
+        // write; the append then reads again and decides again, up to
+        // `APPEND_GUARD_ATTEMPTS` attempts in all.
+        const attempted = appendKeyForm[orderByField] as number | bigint
+        const read = () =>
+          client
+            .getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true })
+            .pipe(Effect.map((result) => result.Item))
+        const storedKeyForm = (stored: AttributeValue) =>
+          Effect.try({
+            try: () =>
+              keyForm({ [orderByField]: fromAttributeMap({ v: stored }).v })[orderByField] as
+                | number
+                | bigint,
+            catch: (cause) => new ValidationError({ entityType, operation: "append", cause }),
+          })
+        let current = yield* read()
+        for (let attempt = 1; ; attempt++) {
+          const storedOb = current?.[orderByName]
+          // The CAS, decided on the numbers: an existing item takes the
+          // append only when its stored orderBy is below the attempted one
+          // (one without an orderBy never does, as under `<`).
+          if (
+            current !== undefined &&
+            (storedOb === undefined || !((yield* storedKeyForm(storedOb)) < attempted))
+          ) {
+            return yield* skipFollowUp
+              ? staleAppend(Option.none())
+              : staleAppend(Option.some(yield* decodeCurrent(current)))
+          }
+          const outcome = yield* send(
+            current === undefined
+              ? {
+                  expression: "attribute_not_exists(#_tspk)",
+                  names: { "#_tspk": pkName },
+                  values: {},
+                }
+              : {
+                  expression: "#_tsob = :_tsObserved",
+                  names: { "#_tsob": orderByName },
+                  values: { ":_tsObserved": storedOb! },
+                },
+          )
+          if (!outcome.stale) return yield* applied
+          const again = yield* read()
+          const moved =
+            (current === undefined) !== (again === undefined) ||
+            (again !== undefined && !attributeValueEquals(again[orderByName], storedOb))
+          if (!moved) {
+            // The guard held: the user's condition rejected the write (or
+            // something other than a condition cancelled it, which 1.36
+            // reported as stale too).
+            if (skipFollowUp) return yield* staleAppend(Option.none())
+            const decoded =
+              again === undefined ? Option.none() : Option.some(yield* decodeCurrent(again))
+            return yield* userCondition !== undefined
+              ? new ConditionalCheckFailed({
+                  entityType,
+                  key: encoded as globalThis.Record<string, unknown>,
+                  current: decoded,
+                })
+              : staleAppend(decoded)
+          }
+          // Another writer moved the item between the read and the write.
+          if (attempt >= APPEND_GUARD_ATTEMPTS) return yield* Effect.fail(outcome.error)
+          current = again
+        }
+      }
+
+      // Any other orderBy compares in DynamoDB as it orders: numbers as
+      // numbers, ISO-8601 dates and strings as text.
+      const transactResult = yield* send({
+        expression: "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+        names: { "#_tspk": pkName, "#_tsob": orderByName },
+        values: { ":_tsNewOb": toAttributeValue(newObValue) },
+      })
 
       // -----------------------------------------------------------------
       // skipFollowUp branch — no GetItem, cannot decode current, cannot
@@ -9325,73 +9502,60 @@ const makeImpl = <
       // collapse to StaleAppend(current: Option.none) — documented.
       // -----------------------------------------------------------------
       if (skipFollowUp) {
-        if (transactResult.stale) {
-          return yield* new StaleAppend({
-            entityType,
-            orderByField,
-            attemptedOrderBy: newObValue,
-            current: Option.none(),
-          })
-        }
+        if (transactResult.stale) return yield* staleAppend(Option.none())
         return undefined
       }
+      if (!transactResult.stale) return yield* applied
 
       // -----------------------------------------------------------------
-      // Default branch — one follow-up GetItem either way. Carries:
-      //   - Decoded model on success (the post-append current).
-      //   - Disambiguation data on cancellation (stored orderBy vs attempted)
-      //     plus a model snapshot to attach to the error for the caller.
+      // Cancelled — one follow-up GetItem: the stored orderBy against the
+      // attempted one tells the CAS from the user's condition, and the
+      // current item goes on the error for the caller. Strongly consistent:
+      // the CAS fails only over an item, and a read missing one just
+      // created would report the user's condition rejecting its creation.
       // -----------------------------------------------------------------
       const followUp = yield* client.getItem({
         TableName: tableName,
         Key: marshalledKey,
+        ConsistentRead: true,
       })
       if (!followUp.Item) {
-        // TTL race or out-of-band delete — the previous state vanished
-        // under us. Distinct from a CAS-stale outcome.
+        // No item: the CAS holds for a missing one, so with a condition the
+        // user's rejected the append creating it — whatever the orderBy type
+        // (#171 G5; up to 1.36 this `ValidationError`).
+        if (userCondition !== undefined) {
+          return yield* new ConditionalCheckFailed({
+            entityType,
+            key: encoded as globalThis.Record<string, unknown>,
+            current: Option.none(),
+          })
+        }
         return yield* new ValidationError({
           entityType,
           operation: "append.followUp",
           cause: "Current item not found after append — possible TTL race or concurrent delete.",
         })
       }
-
       const rawCurrent = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
       const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model")
-
-      if (transactResult.stale) {
-        // Disambiguate CAS-stale from user-condition rejection. We compare
-        // in the WIRE form (what DynamoDB actually evaluated): `newObValue`
-        // is the encoded value passed to the CAS, and `rawCurrent` carries
-        // the encoded values read back. `decodeAs` mutated `rawCurrent` to
-        // rename DB columns to domain field names, so `rawCurrent[orderByField]`
-        // is the wire-form value under its domain name. Wire-form
-        // comparison matches DynamoDB's evaluation: ISO-8601 strings sort
-        // lexicographically (= chronologically), numbers/bigints are
-        // numeric, strings are lexicographic.
-        const storedOrderBy = (rawCurrent as globalThis.Record<string, unknown>)[orderByField]
-        const attempted = newObValue
-        const casFired = isCasFailure(storedOrderBy, attempted)
-
-        if (!casFired && userCondition !== undefined) {
-          // CAS held; the user's `.condition()` is the only thing that
-          // could have rejected.
-          return yield* new ConditionalCheckFailed({
-            entityType,
-            key: encoded as globalThis.Record<string, unknown>,
-            current: Option.some(currentModel),
-          })
-        }
-        // Either CAS fired, or no user condition was supplied (CAS is the
-        // only possibility) — both map to StaleAppend.
-        return yield* new StaleAppend({
+      // Compare in the WIRE form (what DynamoDB evaluated): `newObValue` is
+      // the encoded value passed to the CAS, and `rawCurrent` carries the
+      // encoded values read back. `decodeAs` mutated `rawCurrent` to rename
+      // DB columns to domain field names, so `rawCurrent[orderByField]` is the
+      // wire-form value under its domain name.
+      const casFired = isCasFailure(rawCurrent[orderByField], newObValue)
+      if (!casFired && userCondition !== undefined) {
+        // CAS held; the user's `.condition()` is the only thing that
+        // could have rejected.
+        return yield* new ConditionalCheckFailed({
           entityType,
-          orderByField,
-          attemptedOrderBy: attempted,
+          key: encoded as globalThis.Record<string, unknown>,
           current: Option.some(currentModel),
         })
       }
-      return { current: currentModel as ModelType<TModel> }
+      // Either CAS fired, or no user condition was supplied (CAS is the
+      // only possibility) — both map to StaleAppend.
+      return yield* staleAppend(Option.some(currentModel))
     })
 
   // ---------------------------------------------------------------------------

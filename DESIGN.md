@@ -761,7 +761,7 @@ with an affected value in a key composite or a time-series `orderBy`):
 | Row | Keys holding numeric text | Rewrite |
 |---|---|---|
 | Live item | pk, sk, every index key, unique sentinels | Delete it and its sentinels under their stored keys (raw `DynamoClient.deleteItem`), `put` it again through the entity, which recomposes every key and sentinel. On a retain entity move its snapshots first, so the `put` continues after the retained history instead of restarting at version 1 |
-| Time-series event item (`<currentSk>#e#<orderBy>`) | pk, and the sk's current-item and `orderBy` parts | `.append()` can't: the current item is newer, so the append is stale and writes nothing. Re-put raw with the same attributes, the recomposed pk and `KeyComposer.composeEventSk(currentSk, orderBy, schema casing)` from the current item's recomposed sk and the stored `orderBy`; delete the old row |
+| Time-series event item (`<currentSk>#e#<orderBy>`) | pk, and the sk's current-item and `orderBy` parts — every event of a string-encoded numeric `orderBy` (`NumberFromString`, `BigIntFromString`), whose segment was the encoded text up to 1.36 | `.append()` can't: the current item is newer, so the append is stale and writes nothing. Re-put raw with the same attributes, the recomposed pk and `KeyComposer.composeEventSk(currentSk, orderBy, schema casing)` from the current item's recomposed sk and the stored `orderBy`'s key form (the number, for a string-encoded one); delete the old row |
 | Version snapshot, soft-delete tombstone | pk, and the `{item}` segment of the sk | Only when a primary-key composite changed. Re-put raw under the recomposed pk with the segment `composeHistoryItemSegment` derives from the recomposed live sk; delete the old row. The version digits and the timestamp keep their bytes |
 | `EventStore` stream | pk (stream-id composites), and a stream index attribute holding it (no `derivePartition`) | Only when a stream-id composite changed. Copy every row of the partition (events, snapshot, command sentinels) raw to the recomposed pk, sks unchanged (version, command id); delete the old rows. Appending again would renumber events and rerun projections |
 | Aggregate | pk of every row, edge / discriminator sks, list partition keys | `get` composes the new keys and can't read it. Query the old partition raw, recompose each row's keys, re-put and delete the old rows; or delete them and `create` the aggregate again from its source data |
@@ -1998,6 +1998,55 @@ like any sort key composite's, so every greater value's text extends `v` with a
 character above `#`, or differs from it before its end. The open end is `P` + U+10FFFF, not
 U+FFFF: the `orderBy` text follows `P` with no label before it, and a stamp that
 starts with an emoji (4-byte UTF-8) sorts above U+FFFF.
+
+**Event keys compose the `orderBy`'s key form.** An event key's last segment is
+the `orderBy` value as a key holds it — its key form (§7 "Composite key form"),
+serialized and escaped — the same text `.history().where()`, row checks and
+`liveRows` compose. For a string-encoded number (`NumberFromString`,
+`BigIntFromString`) that is the number's key text, so events sort numerically.
+Up to 1.36 `append` composed it from the encoded string, which sorted `"10"`
+before `"9"`, while `.where()` bounds were numeric: history read out of order
+and bounds missed events. Those event keys changed in 1.37.0.
+
+**`append` on a string-encoded numeric `orderBy`.** The stored `orderBy` is `S`,
+which DynamoDB compares as text, so the CAS `attribute_not_exists(pk) OR
+#orderBy < :new` refused `10` after `9` (and took `9` after `10`). For such an
+`orderBy` (`compositeKeyFormKind` is `type-numeric`) `append` instead:
+
+1. reads the current item, strongly consistent;
+2. decides the CAS on the numbers: an existing item whose `orderBy` is not below
+   the attempted one (or that has none) makes the append `StaleAppend`, and
+   nothing is written;
+3. sends the transaction guarded on what it read — `attribute_not_exists(pk)` for
+   a new item, `#orderBy = :observed` otherwise — ANDed with the user's condition;
+4. after a cancellation reads again: a moved `orderBy` (another append won the
+   race) goes back to step 2, at most 8 attempts (`APPEND_GUARD_ATTEMPTS`), then
+   the append fails with the transaction's error; an unmoved one means the user's
+   condition rejected the write (`ConditionalCheckFailed`, with the current item
+   when there is one) or, with no user condition, `StaleAppend`.
+
+Cost: one strongly consistent `GetItem` before each such append, and one after
+each cancellation, `.skipFollowUp()` included (its success is still `void`, and a
+stale or rejected append still `StaleAppend` with no current item). Every other
+`orderBy` keeps the single conditional transaction: DynamoDB orders `N`
+numerically and ISO-8601 text chronologically.
+
+**Cancellations every `append` tells apart (#171).** A transaction DynamoDB
+cancels for a `TransactionConflict` alone (another transaction in flight on the
+item; no condition failed, nothing written) is no verdict: on every path
+(`orderBy` of any type, an item still under its 1.36 key) it is sent again, at
+most 8 attempts (`APPEND_GUARD_ATTEMPTS`), then the append fails with the
+transaction's error. Up to 1.36 it was read as a stale append or a user
+condition's rejection, and the event dropped. A user condition that rejects an
+append creating the item fails `ConditionalCheckFailed` with no current item,
+for every `orderBy` type (up to 1.36, `ValidationError("append.followUp")`);
+under `.skipFollowUp()` it is still `StaleAppend` with none. Both reads after
+the transaction — the one that tells a cancellation's cause and the one that
+returns `current` after an applied append — are strongly consistent (up to 1.36,
+eventually consistent): such a read could miss the item the append had just
+created (a false `ValidationError("append.followUp")`, or the user's condition
+taken for rejecting its creation) or return it as it was before the append.
+Each costs one read unit per 4 KB rather than half of one.
 
 ### Request Sizing (#171)
 
