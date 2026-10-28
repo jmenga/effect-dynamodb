@@ -10,9 +10,10 @@ import type { IndexPkInput } from "@effect-dynamodb/schema/internal/EntityTypes.
 import { type DateTime, Effect, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type * as Batch from "../src/Batch.js"
-import type { DynamoClientError } from "../src/DynamoClient.js"
+import { DynamoClient, type DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
+import type { RangeBound } from "../src/index.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import type { ConditionCheckOp } from "../src/Transaction.js"
@@ -1407,5 +1408,107 @@ describe("packed fields — type level", () => {
     expectTypeOf<Entity.Marshalled<typeof Shipments>[string]["B"]>().toEqualTypeOf<
       Uint8Array | undefined
     >()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// .within() on composite accessors (#171)
+// ---------------------------------------------------------------------------
+
+describe("Entity types — .within() (#171)", () => {
+  class Listing extends Schema.Class<Listing>("Listing")({
+    storeId: Schema.String,
+    listingId: Schema.String,
+    status: Schema.Literals(["active", "sold"]),
+    price: Schema.Number,
+  }) {}
+
+  const Listings = Entity.make({
+    model: Listing,
+    entityType: "Listing",
+    primaryKey: {
+      pk: { field: "pk", composite: ["listingId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byStore: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["storeId"] },
+        sk: { field: "gsi1sk", composite: ["status", "price", "listingId"] },
+      },
+    },
+  })
+  const ListingsTable = Table.make({ schema: AppSchema, entities: { Listings } })
+  const makeDb = () => DynamoClient.make({ entities: { Listings }, tables: { ListingsTable } })
+  // Never executed — the client only feeds `typeof`.
+  const db = null as unknown as Effect.Success<ReturnType<typeof makeDb>>
+  type Has<T, K extends string> = K extends keyof T ? true : false
+
+  it("is offered while a sort key composite is open, with each bound in its own type", () => {
+    if (db === null) return
+    const query = db.entities.Listings.byStore({ storeId: "s-1" })
+    type Bounds = Parameters<typeof query.within>[0]
+    expectTypeOf<Bounds["price"]>().toEqualTypeOf<RangeBound<number> | undefined>()
+    // String literal unions widen to `string`, as `.where()` operands do.
+    expectTypeOf<Bounds["status"]>().toEqualTypeOf<RangeBound<string> | undefined>()
+    expectTypeOf<Bounds["listingId"]>().toEqualTypeOf<RangeBound<string> | undefined>()
+    expectTypeOf<keyof Bounds>().toEqualTypeOf<"status" | "price" | "listingId">()
+    // Only the composites the accessor left open.
+    const narrowed = db.entities.Listings.byStore({ storeId: "s-1", status: "active" })
+    expectTypeOf<keyof Parameters<typeof narrowed.within>[0]>().toEqualTypeOf<
+      "price" | "listingId"
+    >()
+  })
+
+  it("rejects bounds that aren't a composite's or aren't one bound shape", () => {
+    if (db === null) return
+    const query = db.entities.Listings.byStore({ storeId: "s-1" })
+    query.within({ price: { gte: 1, lt: 9 } })
+    query.within({ price: { between: [1, 9] }, status: { eq: "sold" } })
+    // @ts-expect-error a number composite takes numbers
+    query.within({ price: { gte: "1" } })
+    // @ts-expect-error a partition key composite is the accessor's
+    query.within({ storeId: { eq: "s-2" } })
+    // @ts-expect-error `lt` and `lte` together are not one bound
+    query.within({ price: { lt: 1, lte: 2 } })
+    // @ts-expect-error `eq` is not combined with another operator
+    query.within({ price: { eq: 1, gte: 2 } })
+  })
+
+  it("is absent when every composite is pinned, on scans and on indexes without composites", () => {
+    if (db === null) return
+    const pinned = db.entities.Listings.byStore({
+      storeId: "s-1",
+      status: "active",
+      price: 1,
+      listingId: "l-1",
+    })
+    expectTypeOf<Has<typeof pinned, "within">>().toEqualTypeOf<false>()
+    expectTypeOf<
+      Has<ReturnType<typeof db.entities.Listings.scan>, "within">
+    >().toEqualTypeOf<false>()
+    const primary = db.entities.Listings.primary({ listingId: "l-1" })
+    expectTypeOf<Has<typeof primary, "within">>().toEqualTypeOf<false>()
+  })
+
+  it("excludes .where(), and applies once", () => {
+    if (db === null) return
+    const query = db.entities.Listings.byStore({ storeId: "s-1" })
+    const within = query.within({ price: { gte: 1 } })
+    expectTypeOf<Has<typeof within, "where">>().toEqualTypeOf<false>()
+    expectTypeOf<Has<typeof within, "within">>().toEqualTypeOf<false>()
+    const where = query.where((t, { eq }) => eq(t.status, "active"))
+    expectTypeOf<Has<typeof where, "within">>().toEqualTypeOf<false>()
+    // Combinators before it keep it offered.
+    const limited = query.limit(5).reverse().filter({ status: "active" })
+    expectTypeOf<Has<typeof limited, "within">>().toEqualTypeOf<true>()
+  })
+
+  it("explain describes the plan without I/O", () => {
+    if (db === null) return
+    const explain = db.entities.Listings.byStore({ storeId: "s-1" })
+      .within({ price: { gte: 1 } })
+      .explain()
+    expectTypeOf(explain).toEqualTypeOf<Effect.Effect<Query.QueryExplain, never, never>>()
   })
 })

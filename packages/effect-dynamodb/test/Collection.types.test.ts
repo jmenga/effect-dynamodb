@@ -9,6 +9,7 @@ import type {
   CollectionSelected,
   CollectionStreamItem,
   DynamoClientError,
+  QueryExplain,
 } from "../src/index.js"
 
 interface Employee {
@@ -58,6 +59,16 @@ describe("CollectionQuery types", () => {
       readonly Employees: Array<Record<string, unknown>>
       readonly Tasks: Array<Record<string, unknown>>
     }>()
+  })
+
+  it("offers neither .within() nor .where(), and explains its plan (#171)", () => {
+    if (query === null) return
+    // Members can order a collection's sort key differently: a bound on one
+    // composite has no single key text across them.
+    type Has<K extends string> = K extends keyof CollectionQuery<Grouped> ? true : false
+    expectTypeOf<Has<"within">>().toEqualTypeOf<false>()
+    expectTypeOf<Has<"where">>().toEqualTypeOf<false>()
+    expectTypeOf(query.explain()).toEqualTypeOf<Effect.Effect<QueryExplain, never, never>>()
   })
 
   it("every terminal's error channel is unchanged by packed storage (#147)", () => {

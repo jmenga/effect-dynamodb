@@ -123,8 +123,13 @@ export * as Expression from "./Expression.js"
 export type {
   BoundQuery,
   BoundQueryBase,
+  BoundQueryWithin,
   BoundQueryWithWhere,
+  RangeBound,
   SkConditionOps,
+  WithinKind,
+  WithinOptions,
+  WithinSpec,
 } from "./internal/BoundQuery.js"
 export { makeBoundQuery } from "./internal/BoundQuery.js"
 export type {
@@ -158,7 +163,7 @@ export type {
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
 export * as Marshaller from "./Marshaller.js"
-export type { QueryRequestEvent } from "./Query.js"
+export type { PlanMode, QueryExplain, QueryRequestEvent } from "./Query.js"
 export * as Query from "./Query.js"
 export * as StorageEncoding from "./StorageEncoding.js"
 export type { Table as TableType, TableConfig } from "./Table.js"

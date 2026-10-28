@@ -486,7 +486,7 @@ function tryValidateQueryChain(
                 sourceFile,
                 filterProp.name,
                 DiagnosticCode.SK_IN_FILTER,
-                `\`${filterKey}\` is a sort key composite for index \`${rootInfo.indexName}\` — include it in the query input for efficient key-based filtering instead of post-read \`.filter()\`.`,
+                `\`${filterKey}\` is a sort key composite for index \`${rootInfo.indexName}\` — include it in the query input, or bound it with \`.within()\`, for efficient key-based filtering instead of post-read \`.filter()\`.`,
                 ts.DiagnosticCategory.Warning,
               ),
             )
@@ -577,7 +577,8 @@ function findQueryAccessorRoot(
         combinator === "ignoreOwnership" ||
         combinator === "filter" ||
         combinator === "filterBy" ||
-        combinator === "onRequest"
+        combinator === "onRequest" ||
+        combinator === "within"
       ) {
         return findQueryAccessorRoot(ts, callee.expression, entities)
       }

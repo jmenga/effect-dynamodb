@@ -92,4 +92,39 @@ describe("PartitionMock", () => {
       expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
     })
   })
+
+  it.effect("a probe sees every row and its sort key alone; responses record each request", () => {
+    // The `filter` stands in for a FilterExpression: a request without one
+    // (a skip-scan probe) is not filtered.
+    const partition = makePartition({ rows, filter: (row) => row.id!.S === "p-7" })
+    return Effect.gen(function* () {
+      const probe = yield* partition.query({
+        TableName: "Products",
+        KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": { S: PK },
+          ":sk1": { S: skOf(3) },
+          ":sk2": { S: skOf(9) },
+        },
+        ProjectionExpression: "#sk",
+        Limit: 1,
+      })
+      expect(probe.Items).toEqual([{ sk: { S: skOf(3) } }])
+      const read = yield* partition.query({
+        TableName: "Products",
+        KeyConditionExpression: "#pk = :pk",
+        FilterExpression: "#id = :id",
+        ExpressionAttributeNames: { "#pk": "pk", "#id": "id" },
+        ExpressionAttributeValues: { ":pk": { S: PK }, ":id": { S: "p-7" } },
+      })
+      expect(read.Items!.map((row) => row.id!.S)).toEqual(["p-7"])
+      expect(partition.responses).toEqual([
+        { scannedCount: 1, count: 1 },
+        { scannedCount: 30, count: 1 },
+      ])
+      partition.clear()
+      expect(partition.responses).toEqual([])
+    })
+  })
 })

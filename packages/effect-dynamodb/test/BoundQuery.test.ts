@@ -333,11 +333,122 @@ describe("BoundQuery", () => {
   // -----------------------------------------------------------------------
 
   describe("startFrom", () => {
-    it("sets exclusiveStartKey on the underlying query", () => {
-      const cursor = Buffer.from(JSON.stringify({ pk: { S: "abc" } })).toString("base64")
+    // The cursor is decoded when a terminal runs, once the plan it must
+    // belong to is known (#171): `startFrom` only records it.
+    it("records the cursor on the underlying query", () => {
+      const cursor = btoa(JSON.stringify({ pk: { S: "abc" }, sk: { S: "s1" } }))
       const bq = makeBoundQuery().startFrom(cursor)
-      expect(bq._query._state.exclusiveStartKey).toBeDefined()
+      expect(bq._query._state.cursorText).toBe(cursor)
+      expect(bq._query._state.exclusiveStartKey).toBeUndefined()
     })
+
+    it.effect("a terminal resumes from it with ExclusiveStartKey", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [], Count: 0 })
+        const key = { pk: { S: "abc" }, sk: { S: "s1" } }
+        yield* makeBoundQuery()
+          .startFrom(btoa(JSON.stringify(key)))
+          .fetch()
+        expect(mockQuery.mock.calls[0]![0].ExclusiveStartKey).toEqual(key)
+      }),
+    )
+
+    it.effect("a malformed cursor fails the terminal, not startFrom", () =>
+      Effect.gen(function* () {
+        const bq = makeBoundQuery().startFrom("not a cursor")
+        const error = yield* Effect.flip(bq.fetch())
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as { cause: unknown }).cause)).toContain("[EDD-9094]")
+        expect(mockQuery).not.toHaveBeenCalled()
+      }),
+    )
+  })
+
+  // -----------------------------------------------------------------------
+  // within / explain (#171)
+  // -----------------------------------------------------------------------
+
+  describe("within", () => {
+    // A stand-in planner: it records its arguments and marks the query (as
+    // reversed) so the test can see its result is the query carried on.
+    const withPlanner = () => {
+      const calls: Array<{ bounds: unknown; options: unknown }> = []
+      const bq = new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), {
+        ...makeConfigWithSk(),
+        composeSkCondition: (condition) => serializeRaw(condition),
+        planWithin: (query, bounds, options) => {
+          calls.push({ bounds, options })
+          return Query.reverse(query)
+        },
+      })
+      return { bq, calls }
+    }
+
+    it("hands the bounds and options to the accessor's planner", () => {
+      const { bq, calls } = withPlanner()
+      const within = bq.within({ count: { gte: 2 } }, { maxSkips: 4 })
+      expect(calls).toEqual([{ bounds: { count: { gte: 2 } }, options: { maxSkips: 4 } }])
+      expect(within._query._state.scanForward).toBe(false)
+      // Combinators after it keep the query planned.
+      expect(within.limit(3).onRequest(() => Effect.void)._applied).toBe("within")
+    })
+
+    it("refuses .where() after .within() and .within() after .where() [EDD-9093]", () => {
+      const { bq } = withPlanner()
+      expect(() =>
+        (bq.within({ count: { gte: 2 } }) as any).where((t: any, { eq }: any) => eq(t.sk, "a")),
+      ).toThrow(/EDD-9093.*where\(\) after \.within\(\)/)
+      expect(() =>
+        (bq.where((t, { eq }) => eq(t.sk, "a")) as any).within({ count: { gte: 2 } }),
+      ).toThrow(/EDD-9093.*within\(\) after \.where\(\)/)
+      expect(() => (bq.within({ count: { gte: 2 } }) as any).within({ count: { lte: 4 } })).toThrow(
+        /EDD-9093.*a second \.within\(\)/,
+      )
+    })
+
+    it("refuses .within() where the accessor has nothing to bound [EDD-9093]", () => {
+      expect(() => (makeBoundQuery() as any).within({ sk: { gte: "a" } })).toThrow(/EDD-9093/)
+    })
+
+    it("refuses a maxSkips that is not a non-negative integer [EDD-9095]", () => {
+      const { bq, calls } = withPlanner()
+      for (const maxSkips of [-1, 1.5, Number.NaN, "3"]) {
+        expect(() => bq.within({ count: { gte: 2 } }, { maxSkips } as any)).toThrow(/EDD-9095/)
+      }
+      expect(calls).toEqual([])
+      expect(() => bq.within({ count: { gte: 2 } }, { maxSkips: 0 })).not.toThrow()
+    })
+  })
+
+  describe("explain", () => {
+    it.effect("describes a plain query without sending anything", () =>
+      Effect.gen(function* () {
+        const explain = yield* makeBoundQuery()
+          .where((t, { beginsWith }) => beginsWith(t.sk, "a"))
+          .explain()
+        expect(explain).toEqual({
+          index: "primary",
+          plan: "key",
+          reason: "one key condition",
+          // `begins_with` shows its prefix as the lower bound, open above.
+          keyConditions: [{ lower: "a", upper: undefined, exact: true }],
+          filter: undefined,
+          rowChecks: [],
+          sizing: "natural",
+        })
+        expect(mockQuery).not.toHaveBeenCalled()
+      }),
+    )
+
+    it.effect("names the sizing a limit under a filter uses", () =>
+      Effect.gen(function* () {
+        const explain = yield* makeBoundQuery()
+          .filter((t, { eq }) => eq(t.status, "active"))
+          .limit(10)
+          .explain()
+        expect(explain.sizing).toBe("adaptive")
+      }),
+    )
   })
 
   // -----------------------------------------------------------------------

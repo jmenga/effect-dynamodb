@@ -14,8 +14,11 @@
  *   Stopping early returns a `LastEvaluatedKey`, even when no row is left —
  *   DynamoDB's contract, so the next page may be empty.
  * - `filter` stands in for the `FilterExpression` (no expression is parsed):
- *   it decides which examined rows are returned. `Count` is the rows returned,
+ *   it decides which examined rows are returned, for a request that sends
+ *   one — a skip-scan probe sends none. `Count` is the rows returned,
  *   `ScannedCount` the rows examined; `Select: "COUNT"` returns no `Items`.
+ * - `ProjectionExpression: "#sk"` (a probe's) returns the sort key alone; any
+ *   other projection is not applied.
  *
  * `test/helpers/InMemoryTables.ts` is the store for write paths; this is the
  * read side, and only one partition of it.
@@ -68,6 +71,8 @@ export interface Partition {
   readonly layer: Layer.Layer<DynamoClient>
   /** Every request received, in order (query and scan). */
   readonly inputs: Array<QueryCommandInput | ScanCommandInput>
+  /** What each request received examined and returned, in order. */
+  readonly responses: Array<{ readonly scannedCount: number; readonly count: number }>
   /** The `Limit` of every request received, in order. */
   readonly limits: () => Array<number | undefined>
   /** Rows examined across every request received. */
@@ -150,6 +155,7 @@ export const makePartition = (options: PartitionOptions): Partition => {
     .map((row) => ({ row, sk: keyBytes(row[skField]) }))
     .sort((a, b) => compareBytes(a.sk, b.sk))
   const inputs: Array<QueryCommandInput | ScanCommandInput> = []
+  const responses: Array<{ readonly scannedCount: number; readonly count: number }> = []
   let scannedTotal = 0
 
   const serve = (
@@ -181,7 +187,15 @@ export const makePartition = (options: PartitionOptions): Partition => {
       }
     }
     scannedTotal += examined.length
-    const returned = options.filter === undefined ? examined : examined.filter(options.filter)
+    const filtered =
+      options.filter === undefined || input.FilterExpression === undefined
+        ? examined
+        : examined.filter(options.filter)
+    const returned =
+      input.ProjectionExpression === "#sk"
+        ? filtered.map((row) => ({ [skField]: row[skField]! }))
+        : filtered
+    responses.push({ scannedCount: examined.length, count: returned.length })
     const last = examined[examined.length - 1]
     const lastEvaluatedKey =
       stoppedEarly && last !== undefined
@@ -216,10 +230,12 @@ export const makePartition = (options: PartitionOptions): Partition => {
     scan,
     layer: mockDynamoClientLayer({ query, scan }),
     inputs,
+    responses,
     limits: () => inputs.map((input) => input.Limit),
     scanned: () => scannedTotal,
     clear: () => {
       inputs.length = 0
+      responses.length = 0
       scannedTotal = 0
     },
   }

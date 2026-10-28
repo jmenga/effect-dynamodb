@@ -18,6 +18,7 @@ import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import * as Capacity from "./internal/Capacity.js"
+import * as Cursor from "./internal/Cursor.js"
 import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
 import {
@@ -26,6 +27,20 @@ import {
   packedProjectionRefusal,
 } from "./internal/Packed.js"
 import { compilePath } from "./internal/PathBuilder.js"
+import {
+  cursorRefusal,
+  DEFAULT_MAX_SKIPS,
+  displayKeyCondition,
+  type KeyRange,
+  type PlannerFactory,
+  type ProbeStep,
+  type RangePlanner,
+  type ReadStep,
+  type RowCheck,
+  readFrom,
+  type Step,
+  toKeyCondition,
+} from "./internal/RangePlanner.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -46,6 +61,64 @@ export type SortKeyCondition =
   | { readonly between: readonly [string, string] }
   | { readonly beginsWith: string }
 
+/**
+ * @internal A sort key operand: `S` text, or the bytes of a binary (`B`) key
+ * (#171). Planned ranges carry it; the public {@link SortKeyCondition} stays
+ * string-typed.
+ */
+export type KeyValue = string | Uint8Array
+
+/**
+ * @internal A sort key condition as a request sends it: {@link SortKeyCondition}
+ * with {@link KeyValue} operands, marshalled to `S` or `B` (#171).
+ */
+export type KeyCondition =
+  | { readonly eq: KeyValue }
+  | { readonly lt: KeyValue }
+  | { readonly lte: KeyValue }
+  | { readonly gt: KeyValue }
+  | { readonly gte: KeyValue }
+  | { readonly between: readonly [KeyValue, KeyValue] }
+  | { readonly beginsWith: KeyValue }
+
+/**
+ * How a query reads its index (#171) — one vocabulary for {@link explain} and
+ * the cursor:
+ *
+ * - `key` — one key condition.
+ * - `skip-scan` — a probe for each distinct value of the sort key composites
+ *   left of a `.within()` bound, then that value's range.
+ * - `filter` — one range, every bound checked per row.
+ * - `naive` / `jump` / `precise` / `empty` — Z-order plans.
+ */
+export type PlanMode = "key" | "skip-scan" | "filter" | "naive" | "jump" | "precise" | "empty"
+
+/** What a query will send, described without sending anything (see {@link explain}). */
+export interface QueryExplain {
+  /** The physical index queried, or `"primary"`. */
+  readonly index: string
+  readonly plan: PlanMode
+  /**
+   * Why this plan: e.g. "leading composites bounded", "delimiter-unsafe
+   * composite: status", "history rows on the primary index", "maxSkips: 0".
+   */
+  readonly reason: string
+  /** The key ranges known before anything is read (`exact: false`: rows are also checked). */
+  readonly keyConditions: ReadonlyArray<{
+    readonly lower: string | undefined
+    readonly upper: string | undefined
+    readonly exact: boolean
+  }>
+  /** The `FilterExpression` the plan adds, if any. */
+  readonly filter: string | undefined
+  /** The fields the library checks on each row, for bounds no key condition expresses. */
+  readonly rowChecks: ReadonlyArray<string>
+  /** How each request's `Limit` is sized (see {@link limit} and {@link pageSize}). */
+  readonly sizing: "fixed" | "natural" | "budget" | "adaptive"
+  /** The skip-scan probe budget, for a plan that probes. */
+  readonly maxSkips?: number
+}
+
 // ---------------------------------------------------------------------------
 // Query internal state
 // ---------------------------------------------------------------------------
@@ -58,7 +131,7 @@ interface QueryState {
   readonly skField: string | undefined
   readonly skConditions: ReadonlyArray<{
     readonly field: string
-    readonly condition: SortKeyCondition
+    readonly condition: KeyCondition
   }>
   readonly exprFilters: ReadonlyArray<Expr>
   /**
@@ -80,7 +153,31 @@ interface QueryState {
   readonly scanForward: boolean
   readonly consistentRead: boolean
   readonly ignoreOwnershipFlag: boolean
+  /**
+   * Where an unplanned query resumes: set by internal callers, or by
+   * {@link prepared} from a {@link startFrom} cursor.
+   */
   readonly exclusiveStartKey: Record<string, AttributeValue> | undefined
+  /**
+   * The cursor {@link startFrom} was given, decoded by {@link prepared} when a
+   * terminal runs — once the plan it must belong to is known (#171).
+   */
+  readonly cursorText: string | undefined
+  /**
+   * @internal The plan a `.within()` installed (#171), as a factory: `reverse`
+   * and the other combinators may follow `.within()`, so it is resolved from
+   * the final state when a terminal runs.
+   */
+  readonly planner: PlannerFactory | undefined
+  /** @internal The skip-scan probe budget `.within()` was given (default 32). */
+  readonly maxSkips: number | undefined
+  /** @internal Set by {@link prepared}: the resolved planner and the step the terminal starts at. */
+  readonly plan: PreparedPlan | undefined
+  /**
+   * @internal Set per request of a planned read (#171): the bounds its key
+   * condition can't express, checked on each raw row like {@link liveRows}.
+   */
+  readonly rowCheck: RowCheck | undefined
   readonly isScan: boolean
   readonly projection: ReadonlyArray<string> | undefined
   readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
@@ -139,6 +236,12 @@ interface QueryState {
    * as every `EventStream.*` operation does, not the stream's discriminator.
    */
   readonly operationTarget: string | undefined
+}
+
+/** @internal A planner resolved for one terminal call, and where it starts (see {@link prepared}). */
+interface PreparedPlan {
+  readonly planner: RangePlanner
+  readonly start: Step
 }
 
 /**
@@ -340,6 +443,11 @@ export const make = <A>(config: {
     consistentRead: false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
+    cursorText: undefined,
+    planner: undefined,
+    maxSkips: undefined,
+    plan: undefined,
+    rowCheck: undefined,
     isScan: false,
     projection: undefined,
     projectionPaths: undefined,
@@ -398,6 +506,11 @@ export const makeScan = <A>(config: {
     consistentRead: false,
     ignoreOwnershipFlag: false,
     exclusiveStartKey: undefined,
+    cursorText: undefined,
+    planner: undefined,
+    maxSkips: undefined,
+    plan: undefined,
+    rowCheck: undefined,
     isScan: true,
     projection: undefined,
     projectionPaths: undefined,
@@ -409,12 +522,10 @@ export const makeScan = <A>(config: {
   })
 
 // ---------------------------------------------------------------------------
-// Cursor encoding (internal)
+// Cursor encoding (internal) — see `internal/Cursor.ts`
 // ---------------------------------------------------------------------------
 
-const encodeCursor = (key: Record<string, AttributeValue>): string => btoa(JSON.stringify(key))
-
-const decodeCursor = (cursor: string): Record<string, AttributeValue> => JSON.parse(atob(cursor))
+const encodeCursor = (key: Record<string, AttributeValue>): string => Cursor.encodeKeyCursor(key)
 
 // ---------------------------------------------------------------------------
 // Combinators (all dual for data-first and data-last)
@@ -611,8 +722,12 @@ export const ignoreOwnership = <A>(self: Query<A>): Query<A> =>
 
 /**
  * Set the starting cursor for pagination. The cursor is an opaque string
- * returned by {@link execute} that encodes the DynamoDB `ExclusiveStartKey`.
- * Pass an empty string to start from the beginning.
+ * returned by {@link execute} that encodes where the query resumes. Pass an
+ * empty string to start from the beginning.
+ *
+ * The cursor is read when a terminal runs, not here: one that is malformed,
+ * or that belongs to another query, fails the terminal with a
+ * `ValidationError` (`[EDD-9094]`, `operation: "query.startFrom"`).
  */
 export const startFrom: {
   (cursor: string): <A>(self: Query<A>) => Query<A>
@@ -624,9 +739,20 @@ export const startFrom: {
       ? self
       : new QueryImpl<A>({
           ...self._state,
-          exclusiveStartKey: decodeCursor(cursor),
+          cursorText: cursor,
         }),
 )
+
+/**
+ * @internal Install a planner (#171): `.within()` on a bound query. The
+ * factory is resolved from the final state when a terminal runs, so the
+ * combinators that follow (`reverse`, `startFrom`, …) still apply.
+ */
+export const plan = <A>(
+  self: Query<A>,
+  planner: PlannerFactory,
+  maxSkips: number | undefined,
+): Query<A> => new QueryImpl<A>({ ...self._state, planner, maxSkips })
 
 /** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
 const rawRowDecoder = (
@@ -871,15 +997,18 @@ const buildFilterClauses = (state: QueryState) => {
     })
   }
 
-  // Expr-based filters (compiled from Entity.filter() callback/shorthand API).
-  // Compiled as ONE expression: each compile numbers its placeholders from
-  // zero, so two compiled apart both wrote `#e0` and the second overwrote the
-  // first's name (#133).
-  if (state.exprFilters.length > 0) {
+  // Expr-based filters (compiled from Entity.filter() callback/shorthand API),
+  // and a plan's own (#171). Compiled as ONE expression: each compile numbers
+  // its placeholders from zero, so two compiled apart both wrote `#e0` and the
+  // second overwrote the first's name (#133).
+  const planFilter = state.plan?.planner.filter
+  const exprFilters =
+    planFilter === undefined ? state.exprFilters : [...state.exprFilters, planFilter]
+  if (exprFilters.length > 0) {
     const compiled = compileExpr(
-      state.exprFilters.length === 1
-        ? state.exprFilters[0]!
-        : ({ [ExprTag]: ExprTag, _tag: "and", exprs: state.exprFilters } as Expr),
+      exprFilters.length === 1
+        ? exprFilters[0]!
+        : ({ [ExprTag]: ExprTag, _tag: "and", exprs: exprFilters } as Expr),
     )
     // Parenthesised beside the ownership clause: a top-level `OR` would
     // otherwise bind looser than the `AND` and admit other entities' rows
@@ -905,6 +1034,9 @@ const buildProjection = (
     const counter = { value: 0 }
     const projParts: Array<string> = []
     for (const segments of state.projectionPaths) {
+      // A path inside an attribute borrowed whole is read with it: DynamoDB
+      // rejects overlapping projection paths (see `selectedInside`).
+      if (segments.length > 1 && extraFields.includes(String(segments[0]))) continue
       projParts.push(compilePath(segments, names, "proj", counter))
     }
     for (const field of extraFields) {
@@ -1148,8 +1280,9 @@ const GROWTH = 2
  *   1.36's sizing ({@link legacyRequestLimit}). A capped request count keeps
  *   it because smaller requests would change what one call returns.
  * - `none` — no {@link limit}: natural pages (or `pageSize`), as in 1.36.
- * - `adaptive` — a `limit` under a filter, a predicate or rows dropped as
- *   history: each `Limit` follows the observed pass rate ({@link nextLimit}).
+ * - `adaptive` — a `limit` under a filter, a predicate, a plan's row check
+ *   or rows dropped as history: each `Limit` follows the observed pass rate
+ *   ({@link nextLimit}).
  * - `budget` — a `limit` nothing filters: every examined row is an accepted
  *   row, so `Limit` is the outstanding budget. The `__edd_e__` ownership
  *   clause alone stays here: it only rejects foreign rows, which the loop
@@ -1161,18 +1294,23 @@ const sizingMode = (state: QueryState): SizingMode => {
   if (typeof state.pageSizeValue === "number") return "fixed"
   if (state.pageSizeValue === "natural") return "natural"
   if (state.limitValue === undefined) return "none"
-  if (state.maxPagesValue !== undefined) return "natural"
+  // Planned queries (`.within()`) are new, so they adapt under `maxPages` too.
+  if (state.maxPagesValue !== undefined && state.planner === undefined) return "natural"
   if (filtered(state) || dropsRows(state)) return "adaptive"
   return "budget"
 }
 
 /**
- * @internal Whether the caller filters rows — server-side or with a client
- * predicate — so a request cannot assume every row it examines passes.
- * (#171: a planned range's own filter and row check join these, design §8.1.)
+ * @internal Whether rows are filtered — server-side (the caller's filter or a
+ * plan's own, #171), with a client predicate or by a plan's row check — so a
+ * request cannot assume every row it examines passes. (A row check also
+ * {@link dropsRows}: it is judged on the raw row.)
  */
 const filtered = (state: QueryState): boolean =>
-  state.exprFilters.length > 0 || state.predicates.length > 0
+  state.exprFilters.length > 0 ||
+  state.predicates.length > 0 ||
+  state.plan?.planner.filter !== undefined ||
+  state.rowCheck !== undefined
 
 /**
  * @internal What one terminal call's requests have observed: rows examined
@@ -1263,11 +1401,11 @@ const observeEstimator = (
 })
 
 /**
- * @internal DynamoDB `Limit` for request number `page` (1-based within the
- * terminal), `remaining` items still owed (`undefined` without a {@link limit})
- * and `est` what the earlier requests observed. Adaptive sizing is
- * {@link nextLimit}; every other mode of {@link sizingMode} is 1.36's
- * {@link legacyRequestLimit}.
+ * @internal DynamoDB `Limit` for read number `page` (1-based within the
+ * terminal; a skip-scan's probes are not reads), `remaining` items still owed
+ * (`undefined` without a {@link limit}) and `est` what the earlier reads
+ * observed. Adaptive sizing is {@link nextLimit}; every other mode of
+ * {@link sizingMode} is 1.36's {@link legacyRequestLimit}.
  */
 const requestLimit = (
   state: QueryState,
@@ -1287,17 +1425,17 @@ const requestLimit = (
  * - A numeric `pageSize` always wins as the round-trip budget.
  * - With a `limit` budget and NO user filter, every examined row is an accepted
  *   row, so the budget can be handed to DynamoDB directly (bounded by pageSize).
- * - With a user filter or a client-side predicate ({@link filterBy}), `limit`
- *   cannot be expressed as `Limit` (it bounds rows examined, and the filter
- *   runs after), so the request asks for `pageSize` — or, unset, a natural
- *   (1 MB) page.
+ * - With a user filter, a client-side predicate ({@link filterBy}) or a plan's
+ *   row check (#171), `limit` cannot be expressed as `Limit` (it bounds rows
+ *   examined, and the filter runs after), so the request asks for `pageSize`
+ *   — or, unset, a natural (1 MB) page.
  * - Rows dropped as history ({@link QueryState.liveRows}, a prepared `keep`)
  *   can't be skipped server-side, and a run of them can far outnumber the
  *   items: the first request asks for `limit` and each later one twice the
  *   last, the surplus past `limit` discarded and the cursor rebuilt from the
  *   last item returned (#133). `pageSize`, when set, is used as is.
  *
- * `page` is the request's 1-based number within the terminal.
+ * `page` is the read's 1-based number within the terminal.
  */
 const legacyRequestLimit = (
   state: QueryState,
@@ -1306,7 +1444,7 @@ const legacyRequestLimit = (
 ): number | undefined => {
   const pageSize = typeof state.pageSizeValue === "number" ? state.pageSizeValue : undefined
   if (remaining === undefined) return pageSize
-  if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
+  if (filtered(state)) return pageSize
   if (dropsRows(state)) {
     if (pageSize !== undefined) return pageSize
     const limit = state.limitValue ?? remaining
@@ -1316,17 +1454,28 @@ const legacyRequestLimit = (
 }
 
 /**
- * @internal Whether the query drops rows client-side (#133): like a predicate,
- * it rejects rows after they are read, so the `limit` budget cannot be handed
- * to DynamoDB, and a count has to read the rows.
+ * @internal Whether the query drops rows client-side (#133) — history rows, or
+ * rows a plan's row check rejects (#171): like a predicate, it rejects rows
+ * after they are read, so the `limit` budget cannot be handed to DynamoDB, and
+ * a count has to read the rows.
  */
 const dropsRows = (state: QueryState): boolean =>
-  state.keepRow !== undefined || state.liveRows !== undefined
+  state.keepRow !== undefined || state.liveRows !== undefined || state.rowCheck !== undefined
 
-/** @internal Is this raw row one the query leaves out (#133)? */
+/** @internal Is this raw row one the query leaves out (#133, #171)? */
 const isExcludedRow = (state: QueryState, row: Record<string, AttributeValue>): boolean =>
   (state.keepRow !== undefined && !state.keepRow(row)) ||
-  (state.liveRows !== undefined && !state.liveRows.isLive(row))
+  (state.liveRows !== undefined && !state.liveRows.isLive(row)) ||
+  (state.rowCheck !== undefined && !state.rowCheck.accepts(row))
+
+/** @internal The attributes a query reads to judge which rows it drops ({@link dropsRows}). */
+const judgedAttributes = (state: QueryState): ReadonlyArray<string> => [
+  ...new Set([
+    ...(state.liveRows?.reads ?? []),
+    ...(state.keepRow !== undefined && state.skField !== undefined ? [state.skField] : []),
+    ...(state.rowCheck?.reads ?? []),
+  ]),
+]
 
 /**
  * @internal A filter with an empty part where none may be (`emptyPartProblem`):
@@ -1349,36 +1498,133 @@ const refuseEmptyFilterParts = (state: QueryState): ValidationError | undefined 
 
 /**
  * @internal The state a terminal runs: {@link QueryState.prepare} applied
- * against the resolved table.
+ * against the resolved table, the planner resolved and the
+ * {@link startFrom} cursor placed — as `exclusiveStartKey`, or as the plan's
+ * first step (#171).
  */
 const prepared = (
   state: QueryState,
   tableName: string,
 ): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
+  // `.within()` is offered only where no prepare step is installed (an
+  // entity's `versions` installs one).
+  if (state.planner !== undefined && state.prepare !== undefined) {
+    return Effect.die(new Error("[internal] A planned query cannot also have a prepare step."))
+  }
   // A consistent read of a GSI — which DynamoDB only reads eventually
   // consistently — is DynamoDB's to reject: diagnosed by `send` (#144).
   // A filter with an empty part where none may be is refused before
   // anything is sent (#133).
   const filterRefusal = refuseEmptyFilterParts(state)
   if (filterRefusal !== undefined) return Effect.fail(filterRefusal)
-  return state.prepare === undefined
-    ? Effect.succeed(state)
-    : Effect.map(state.prepare(tableName), (prep) => {
+  const resumed = resume(state)
+  if (resumed instanceof ValidationError) return Effect.fail(resumed)
+  return resumed.prepare === undefined
+    ? Effect.succeed(resumed)
+    : Effect.map(resumed.prepare(tableName), (prep) => {
         const swap = prep.replaceBeginsWith
         return {
-          ...state,
+          ...resumed,
           prepare: undefined,
           keepRow: prep.keep,
           skConditions:
             swap === undefined
-              ? state.skConditions
-              : state.skConditions.map((c) =>
+              ? resumed.skConditions
+              : resumed.skConditions.map((c) =>
                   "beginsWith" in c.condition && c.condition.beginsWith === swap.from
                     ? { ...c, condition: { beginsWith: swap.to } }
                     : c,
                 ),
         }
       })
+}
+
+/** @internal The planner a `.within()` installed, resolved against the final state. */
+const resolvePlanner = (state: QueryState, factory: PlannerFactory): RangePlanner =>
+  factory({ reverse: !state.scanForward, maxSkips: state.maxSkips ?? DEFAULT_MAX_SKIPS })
+
+/**
+ * @internal Decode the {@link startFrom} cursor and place it (design §10.2):
+ * a query without a planner takes a legacy cursor or a v2 `{ k }`; with one,
+ * the planner places it in the recomputed plan. Anything else — malformed, or
+ * another query's — is `[EDD-9094]`.
+ */
+const resume = (state: QueryState): QueryState | ValidationError => {
+  const entityType = state.entityTypes.join(", ") || "unknown"
+  const cursor = state.cursorText === undefined ? undefined : Cursor.decode(state.cursorText)
+  if (state.cursorText !== undefined && cursor === undefined) {
+    return cursorRefusal(entityType, "it is not a cursor a query returned")
+  }
+  if (state.planner === undefined) {
+    if (cursor === undefined) return state
+    if (
+      cursor.k === undefined ||
+      cursor.f !== undefined ||
+      cursor.s !== undefined ||
+      cursor.t !== undefined
+    ) {
+      return cursorRefusal(
+        entityType,
+        "it comes from a query with .within(), and this one has none",
+      )
+    }
+    return { ...state, exclusiveStartKey: Cursor.keyFromWire(cursor.k) }
+  }
+  const planner = resolvePlanner(state, state.planner)
+  const start = planner.start(cursor)
+  return start instanceof ValidationError ? start : { ...state, plan: { planner, start } }
+}
+
+/** @internal The sort key condition list of a planned request over `range`. */
+const plannedConditions = (state: QueryState, range: KeyRange): QueryState["skConditions"] => {
+  const condition = toKeyCondition(range)
+  return condition === undefined || state.skField === undefined
+    ? []
+    : [{ field: state.skField, condition }]
+}
+
+/** @internal The state one planned read is sent with: its range and its row check. */
+const readState = (state: QueryState, step: ReadStep): QueryState => ({
+  ...state,
+  skConditions: plannedConditions(state, step.range),
+  rowCheck: step.rowCheck,
+})
+
+/**
+ * @internal The state a probe is sent with (design §7.2): its range, no
+ * `FilterExpression` (so `Limit: 1` returns a row whenever one exists — the
+ * partition holds only this entity's rows), no projection or hydration. It
+ * inherits `consistentRead`, so a consistent tuple read never sees a tuple
+ * the probe missed.
+ */
+const probeState = (state: QueryState, step: ProbeStep): QueryState => ({
+  ...state,
+  skConditions: plannedConditions(state, {
+    lower: step.lower,
+    upper: step.upper,
+    exact: true,
+  }),
+  exprFilters: [],
+  predicates: [],
+  ignoreOwnershipFlag: true,
+  projection: undefined,
+  projectionPaths: undefined,
+  hydration: undefined,
+  plan: undefined,
+  rowCheck: undefined,
+})
+
+/** @internal A probe's command: one row, its sort key only. */
+const probeCommand = (state: QueryState, step: ProbeStep, tableName: string) =>
+  buildDynamoCommand(probeState(state, step), tableName, {
+    Limit: 1,
+    ProjectionExpression: "#sk",
+  })
+
+/** @internal The cursor of a planned query at `step`: v2, or `null` once done. */
+const plannedCursor = (planner: RangePlanner, step: Step): string | null => {
+  const cursor = planner.cursor(step)
+  return cursor === null ? null : Cursor.encodeV2(cursor)
 }
 
 /**
@@ -1423,24 +1669,6 @@ const send = (
 }
 
 /**
- * @internal The display bounds of a sort key condition (see
- * {@link QueryRequestEvent}): `begins_with` shows its prefix as the lower bound.
- */
-const displayCondition = (
-  sk: { readonly condition: SortKeyCondition } | undefined,
-): readonly [lower: string | undefined, upper: string | undefined] => {
-  if (sk === undefined) return [undefined, undefined]
-  const condition = sk.condition
-  if ("eq" in condition) return [condition.eq, condition.eq]
-  if ("between" in condition) return [condition.between[0], condition.between[1]]
-  if ("gt" in condition) return [condition.gt, undefined]
-  if ("gte" in condition) return [condition.gte, undefined]
-  if ("lt" in condition) return [undefined, condition.lt]
-  if ("lte" in condition) return [undefined, condition.lte]
-  return [condition.beginsWith, undefined]
-}
-
-/**
  * @internal What a response says it examined and kept: `ScannedCount` and
  * `Count`, each the rows returned when the response lacks it (mocks, older
  * emulators).
@@ -1468,7 +1696,9 @@ const notify = (
   observed: Omit<QueryRequestEvent, "lower" | "upper">,
 ): Effect.Effect<void> => {
   if (state.observers.length === 0) return Effect.void
-  const [lower, upper] = displayCondition(state.isScan ? undefined : state.skConditions[0])
+  const [lower, upper] = displayKeyCondition(
+    state.isScan ? undefined : state.skConditions[0]?.condition,
+  )
   const event: QueryRequestEvent = {
     kind: observed.kind,
     request: observed.request,
@@ -1516,6 +1746,15 @@ const cursorFromItem = (
   item: Record<string, AttributeValue>,
   names: ReadonlyArray<string> | undefined,
 ): string | undefined => {
+  const key = keyOfItem(item, names)
+  return key === undefined ? undefined : encodeCursor(key)
+}
+
+/** @internal The resume key `names` pick from `item`, or `undefined` when it lacks one. */
+const keyOfItem = (
+  item: Record<string, AttributeValue>,
+  names: ReadonlyArray<string> | undefined,
+): Record<string, AttributeValue> | undefined => {
   if (!names || names.length === 0) return undefined
   const key: Record<string, AttributeValue> = {}
   for (const name of names) {
@@ -1523,7 +1762,7 @@ const cursorFromItem = (
     if (value === undefined) return undefined
     key[name] = value
   }
-  return encodeCursor(key)
+  return key
 }
 
 /**
@@ -1544,12 +1783,32 @@ const cursorProjectionFields = (
   const borrowed = new Set<string>(
     !forCursor || state.limitValue === undefined || !state.keyFields ? [] : state.keyFields,
   )
-  // A query that drops rows reads what it judges them by (#133).
-  if (state.keepRow !== undefined && state.skField !== undefined) borrowed.add(state.skField)
-  for (const attr of state.liveRows?.reads ?? []) borrowed.add(attr)
+  // A query that drops rows reads what it judges them by (#133, #171).
+  for (const attr of judgedAttributes(state)) borrowed.add(attr)
   // …and a raw-row hook reads what it dispatches on (a collection's `__edd_e__`).
   for (const attr of rawRowReads(state)) borrowed.add(attr)
-  return [...borrowed].filter((field) => !projected.has(field))
+  const inside = selectedInside(state)
+  return [...borrowed].filter((field) => !projected.has(field) || inside.has(field))
+}
+
+/**
+ * @internal The attributes a projection selects only paths inside of
+ * (`ref.name`), never whole. One a query also borrows — a row check reading a
+ * ref-derived composite from its ref (#171) — is read whole, since DynamoDB
+ * rejects overlapping projection paths, and handed back whole: stripping it
+ * would drop what the caller selected.
+ */
+const selectedInside = (state: QueryState): ReadonlySet<string> => {
+  const paths = state.projectionPaths ?? []
+  const whole = new Set<string>([
+    ...(state.projection ?? []),
+    ...paths.filter((segments) => segments.length === 1).map((segments) => String(segments[0])),
+  ])
+  return new Set(
+    paths
+      .filter((segments) => segments.length > 1 && !whole.has(String(segments[0])))
+      .map((segments) => String(segments[0])),
+  )
 }
 
 /**
@@ -1588,6 +1847,8 @@ const examinePage = <A>(
     // query — into the hydrating fetch's (see `hydrateRows`).
     const hookReads = new Set(rawRowReads(state))
     const strippedAfterHook = new Set(borrowedFields.filter((field) => hookReads.has(field)))
+    // Borrowed whole, but selected inside: handed back whole.
+    const kept = selectedInside(state)
     if (state.hydration?._tag === "BatchGet") {
       const projected = new Set<string>([
         ...(state.projection ?? []),
@@ -1618,7 +1879,9 @@ const examinePage = <A>(
         const source = sources[k]
         if (source === undefined) continue
         const raw = fromAttributeMap(source)
-        for (const field of borrowedFields) if (!hookReads.has(field)) delete raw[field]
+        for (const field of borrowedFields) {
+          if (!hookReads.has(field) && !kept.has(field)) delete raw[field]
+        }
         const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
         for (const field of strippedAfterHook) delete raw[field]
         if (hasPredicate && !accepts(state, item)) continue
@@ -1720,6 +1983,8 @@ const executeCore = <A>(
     if (limitValue !== undefined && limitValue <= 0) {
       return { items: [], cursor: null } as Page<A>
     }
+    if (state.plan !== undefined)
+      return yield* executePlanned<A>(client, tableName, state, state.plan)
 
     // Key attributes borrowed into an active projection so an over-reading
     // request can still rebuild a cursor. Stripped again before decoding.
@@ -1798,6 +2063,189 @@ const executeCore = <A>(
     return { items, cursor } as Page<A>
   })
 
+/** @internal One planned read's response, with the state it was sent with. */
+interface SentRead {
+  readonly state: QueryState
+  readonly borrowedFields: ReadonlyArray<string>
+  readonly limitSent: number | undefined
+  readonly returned: Array<Record<string, AttributeValue>>
+  readonly lastEvaluatedKey: Record<string, AttributeValue> | undefined
+  readonly counts: { readonly scannedCount: number; readonly count: number }
+}
+
+/**
+ * @internal Send one planned read (design §9.2): the step's range and start
+ * key over the query's state, its `Limit` sized as any request's — `read` is
+ * its number among the terminal's reads.
+ */
+const sendRead = (
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  step: ReadStep,
+  remaining: number | undefined,
+  est: Estimator,
+  read: number,
+  forCursor: boolean,
+): Effect.Effect<SentRead, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const sentState = readState(state, step)
+    const indexState = indexQueryState(sentState)
+    const borrowedFields = cursorProjectionFields(indexState, forCursor)
+    const limitSent = requestLimit(sentState, remaining, est, read)
+    const cmd = buildDynamoCommand(
+      indexState,
+      tableName,
+      { ExclusiveStartKey: step.startKey, Limit: limitSent },
+      borrowedFields,
+    )
+    const result = yield* send(client, sentState, cmd)
+    return {
+      state: sentState,
+      borrowedFields,
+      limitSent,
+      returned: (result.Items ?? []) as Array<Record<string, AttributeValue>>,
+      lastEvaluatedKey: result.LastEvaluatedKey as Record<string, AttributeValue> | undefined,
+      counts: responseCounts(result),
+    }
+  })
+
+/**
+ * @internal Send one probe (design §7.2) and report it: the sort key of the
+ * first row in its range, or `undefined` when the range is empty.
+ */
+const sendProbe = (
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  step: ProbeStep,
+  request: number,
+): Effect.Effect<KeyValue | undefined, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const sentState = probeState(state, step)
+    const result = yield* send(client, sentState, probeCommand(state, step, tableName))
+    yield* notify(sentState, {
+      kind: "probe",
+      request,
+      limit: 1,
+      ...responseCounts(result),
+      accepted: 0,
+    })
+    const value = state.skField === undefined ? undefined : result.Items?.[0]?.[state.skField]
+    return value?.S ?? value?.B
+  })
+
+/**
+ * @internal `execute` for a planned query (design §9.2): the planner names
+ * each step, this loop sends it. The limit and `maxPages` are checked before
+ * every request, so a probe is never sent when the call is about to return —
+ * the cursor then names the pending step instead.
+ */
+const executePlanned = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  plan: PreparedPlan,
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const { planner } = plan
+    const limitValue = state.limitValue
+    const maxPages = state.maxPagesValue
+    // Composite plans read one range at a time: `following` is empty, so a
+    // window holds the step alone.
+    const window = 1
+    const items: Array<A> = []
+    const filled = () => limitValue !== undefined && items.length >= limitValue
+    let step = plan.start
+    let requests = 0
+    let est = emptyEstimator
+
+    while (true) {
+      if (step._tag === "Done") return { items, cursor: null }
+      if (filled() || (maxPages != null && requests >= maxPages)) {
+        return { items, cursor: plannedCursor(planner, step) }
+      }
+      if (step._tag === "Probe") {
+        requests++
+        step = planner.afterProbe(step, yield* sendProbe(client, tableName, state, step, requests))
+        continue
+      }
+      // The step, plus the ranges following it within the `maxPages` budget.
+      const room = maxPages == null ? window : Math.min(window, maxPages - requests)
+      const batch = [step, ...planner.following(step, room - 1)]
+      const remainingAtSend = limitValue === undefined ? undefined : limitValue - items.length
+      const sent = yield* Effect.forEach(
+        batch,
+        (member, i) =>
+          sendRead(
+            client,
+            tableName,
+            state,
+            member,
+            remainingAtSend,
+            est,
+            est.requests + i + 1,
+            true,
+          ),
+        { concurrency: batch.length },
+      )
+      let next: Step = step
+      for (let i = 0; i < batch.length; i++) {
+        const member = batch[i]!
+        const response = sent[i]!
+        // Never examined with nothing left: the loop returns as soon as the
+        // limit is reached, discarding later members' results.
+        const remaining = limitValue === undefined ? undefined : limitValue - items.length
+        const page = yield* examinePage<A>(
+          client,
+          tableName,
+          response.state,
+          response.returned,
+          remaining,
+          response.borrowedFields,
+        )
+        items.push(...page.items)
+        est = observeEstimator(est, {
+          scanned: response.counts.scannedCount,
+          accepted: page.accepted,
+          limitSent: response.limitSent,
+        })
+        yield* notify(response.state, {
+          kind: "read",
+          request: requests + i + 1,
+          limit: response.limitSent,
+          ...response.counts,
+          accepted: page.accepted,
+        })
+        const lek = response.lastEvaluatedKey
+        if (filled()) {
+          // Stopped inside the page: resume after the last row handed back
+          // (#122), inside this member's range.
+          if (page.stoppedAt >= 0 && page.stoppedAt < response.returned.length - 1) {
+            const key =
+              keyOfItem(response.returned[page.stoppedAt]!, resumeKeyNames(state, lek)) ?? lek
+            return {
+              items,
+              cursor: plannedCursor(
+                planner,
+                key === undefined ? planner.afterRead(member, undefined) : readFrom(member, key),
+              ),
+            }
+          }
+          // The member's own next step — pure: a pending probe is not sent.
+          return { items, cursor: plannedCursor(planner, planner.afterRead(member, lek)) }
+        }
+        next = planner.afterRead(member, lek)
+        // A later member started fresh, so it can't be resumed past this one.
+        if (lek !== undefined) break
+      }
+      requests += batch.length
+      step = next
+      // Without a limit, a page is one read, as for a query without a plan.
+      if (limitValue === undefined) return { items, cursor: plannedCursor(planner, step) }
+    }
+  })
+
 /**
  * Execute the query and return a Stream of page arrays.
  * A page is one DynamoDB request (of {@link pageSize} rows, when set, or as
@@ -1846,6 +2294,7 @@ const pageStream = <A>(
   if (limitValue !== undefined && limitValue <= 0) {
     return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
   }
+  if (state.plan !== undefined) return plannedPageStream<A>(client, tableName, state, state.plan)
 
   // Cursor and sizing state travel through Stream.paginate rather than a
   // closure, so re-running the returned stream restarts from the beginning —
@@ -1923,6 +2372,161 @@ const pageStream = <A>(
 }
 
 /**
+ * @internal `pageStream` for a planned query (design §9.3). The page state is
+ * plain data, so the stream stays re-runnable:
+ *
+ * - `open` — the ranges being read, in plan order, each with its next read
+ *   and at most one page read but not yet emitted. A later range's page waits
+ *   until every earlier range is drained, so a stream never discards a read.
+ * - `step` — the plan's next step once `open` is drained: read only while
+ *   `open` is empty.
+ * - `window` — how many ranges may be open. Composite plans read one range at
+ *   a time (`following` is empty), so it stays 1.
+ *
+ * Each pull opens ranges when none is open (sending the probes before the
+ * next read), sends one read for every open range without a page, within
+ * `maxPages`, then emits the head range's pages in order. A pull that reads
+ * nothing emits nothing.
+ */
+const plannedPageStream = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  plan: PreparedPlan,
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+  const { planner } = plan
+  const limitValue = state.limitValue
+  const maxPages = state.maxPagesValue
+  /** A read sent and not yet emitted: its request number and its response. */
+  interface PendingPage {
+    readonly request: number
+    readonly response: SentRead
+  }
+  interface OpenRange {
+    readonly step: ReadStep
+    readonly page: PendingPage | undefined
+  }
+  interface PageState {
+    readonly step: Step
+    readonly open: ReadonlyArray<OpenRange>
+    readonly pageCount: number
+    readonly emitted: number
+    readonly estimator: Estimator
+    readonly window: number
+  }
+  const initial: PageState = {
+    step: plan.start,
+    open: [],
+    pageCount: 0,
+    emitted: 0,
+    estimator: emptyEstimator,
+    window: 1,
+  }
+  return Stream.paginate(initial, (pageState: PageState) =>
+    Effect.gen(function* () {
+      let { step, open, pageCount, emitted, estimator } = pageState
+      const { window } = pageState
+      const budget = () => maxPages == null || pageCount < maxPages
+      const nothing = [[], Option.none<PageState>()] as const
+
+      // Open ranges: the probes up to the next read, then the read and the
+      // ranges following it, up to the window.
+      if (open.length === 0) {
+        while (step._tag === "Probe" && budget()) {
+          pageCount++
+          step = planner.afterProbe(
+            step,
+            yield* sendProbe(client, tableName, state, step, pageCount),
+          )
+        }
+        if (step._tag !== "Read" || !budget()) return nothing
+        open = [step, ...planner.following(step, window - 1)].map((member) => ({
+          step: member,
+          page: undefined,
+        }))
+      }
+
+      // One read for every open range without a page, in plan order.
+      const unread = open.flatMap((range, i) => (range.page === undefined ? [i] : []))
+      const sending = maxPages == null ? unread : unread.slice(0, maxPages - pageCount)
+      const remainingAtSend = limitValue === undefined ? undefined : limitValue - emitted
+      // Reads sent before this pull and not yet emitted (#133 numbers reads).
+      const pending = open.length - unread.length
+      const responses = yield* Effect.forEach(
+        sending,
+        (i, n) =>
+          sendRead(
+            client,
+            tableName,
+            state,
+            open[i]!.step,
+            remainingAtSend,
+            estimator,
+            estimator.requests + pending + n + 1,
+            false,
+          ),
+        { concurrency: Math.max(sending.length, 1) },
+      )
+      const sentAt = pageCount
+      open = open.map((range, i) => {
+        const n = sending.indexOf(i)
+        return n < 0
+          ? range
+          : { ...range, page: { request: sentAt + n + 1, response: responses[n]! } }
+      })
+      pageCount += sending.length
+
+      // Emit the head range's pages, in plan order, until one needs a read.
+      const pages: Array<Array<A>> = []
+      const filled = () => limitValue !== undefined && emitted >= limitValue
+      while (open.length > 0 && open[0]!.page !== undefined && !filled()) {
+        const [head, ...rest] = open as [OpenRange, ...Array<OpenRange>]
+        const { request, response } = head.page!
+        const remaining = limitValue === undefined ? undefined : limitValue - emitted
+        const page = yield* examinePage<A>(
+          client,
+          tableName,
+          response.state,
+          response.returned,
+          remaining,
+          response.borrowedFields,
+        )
+        estimator = observeEstimator(estimator, {
+          scanned: response.counts.scannedCount,
+          accepted: page.accepted,
+          limitSent: response.limitSent,
+        })
+        yield* notify(response.state, {
+          kind: "read",
+          request,
+          limit: response.limitSent,
+          ...response.counts,
+          accepted: page.accepted,
+        })
+        pages.push(page.items)
+        emitted += page.items.length
+        const lek = response.lastEvaluatedKey
+        const next = planner.afterRead(head.step, lek)
+        if (lek !== undefined && next._tag === "Read") {
+          open = [{ step: next, page: undefined }, ...rest]
+        } else {
+          open = rest
+          if (rest.length === 0) step = next
+        }
+      }
+
+      const more = !filled() && budget() && (open.length > 0 || step._tag !== "Done")
+      return [
+        pages,
+        more
+          ? Option.some<PageState>({ step, open, pageCount, emitted, estimator, window })
+          : Option.none<PageState>(),
+      ] as const
+    }),
+  )
+}
+
+/**
  * Execute a count query. Uses `Select: "COUNT"` on DynamoDB — no items are returned.
  * Returns the total count across all requests (respects {@link maxPages}).
  *
@@ -1965,16 +2569,16 @@ const countCore = <A>(
       return items.length
     }
 
+    if (state.plan !== undefined) return yield* countPlanned(client, tableName, state, state.plan)
+
     // Rows that may be history are judged by a few attributes, so only those
     // are read — never whole items (#133).
     if (dropsRows(state)) {
-      const judged = [
-        ...new Set([
-          ...(state.liveRows?.reads ?? []),
-          ...(state.keepRow !== undefined && state.skField !== undefined ? [state.skField] : []),
-        ]),
-      ]
-      const judging: QueryState = { ...state, projection: judged, projectionPaths: undefined }
+      const judging: QueryState = {
+        ...state,
+        projection: judgedAttributes(state),
+        projectionPaths: undefined,
+      }
       let counted = 0
       let pages = 0
       let start: Record<string, AttributeValue> | undefined
@@ -2046,6 +2650,111 @@ const countCore = <A>(
   })
 
 /**
+ * @internal `count` for a planned query (design §9.4): `Select: "COUNT"` per
+ * read, probes through the same loop. A read whose rows a check judges (a row
+ * check, history rows) reads only the attributes the check needs and counts
+ * the rows it accepts.
+ */
+const countPlanned = (
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  plan: PreparedPlan,
+): Effect.Effect<number, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const { planner } = plan
+    const limitValue = state.limitValue
+    let step = plan.start
+    let total = 0
+    let requests = 0
+    let est = emptyEstimator
+    while (step._tag !== "Done") {
+      if (state.maxPagesValue != null && requests >= state.maxPagesValue) break
+      requests++
+      if (step._tag === "Probe") {
+        step = planner.afterProbe(step, yield* sendProbe(client, tableName, state, step, requests))
+        continue
+      }
+      const sentState = readState(state, step)
+      const remaining = limitValue === undefined ? undefined : limitValue - total
+      const limitSent = requestLimit(sentState, remaining, est, est.requests + 1)
+      const judging = dropsRows(sentState)
+      const cmd = judging
+        ? buildDynamoCommand(
+            { ...sentState, projection: judgedAttributes(sentState), projectionPaths: undefined },
+            tableName,
+            { ExclusiveStartKey: step.startKey, Limit: limitSent },
+          )
+        : buildDynamoCommand(sentState, tableName, {
+            ExclusiveStartKey: step.startKey,
+            Select: "COUNT",
+            Limit: limitSent,
+          })
+      const result = yield* send(client, sentState, cmd)
+      const counts = responseCounts(result)
+      const matched = judging
+        ? ((result.Items ?? []) as Array<Record<string, AttributeValue>>).filter(
+            (row) => !isExcludedRow(sentState, row),
+          ).length
+        : (result.Count ?? 0)
+      const scanned = judging ? counts.scannedCount : (result.ScannedCount ?? matched)
+      total += matched
+      est = observeEstimator(est, { scanned, accepted: matched, limitSent })
+      yield* notify(sentState, {
+        kind: "count",
+        request: requests,
+        limit: limitSent,
+        scannedCount: scanned,
+        count: judging ? counts.count : matched,
+        accepted: matched,
+      })
+      if (limitValue !== undefined && total >= limitValue) return limitValue
+      step = planner.afterRead(
+        step,
+        result.LastEvaluatedKey as Record<string, AttributeValue> | undefined,
+      )
+    }
+    return total
+  })
+
+/**
+ * Describe what a terminal would send — the plan, why it was chosen, the key
+ * ranges known up front, the bounds checked per row and how requests are
+ * sized — without sending anything (#171). Cursors are not read: the plan is
+ * described from its start.
+ */
+export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, never> =>
+  Effect.sync(() => {
+    const state = self._state
+    if (state.planner === undefined) {
+      const [lower, upper] = displayKeyCondition(state.skConditions[0]?.condition)
+      return {
+        index: state.indexName ?? "primary",
+        plan: "key",
+        reason: state.isScan ? "scan: no key condition" : "one key condition",
+        keyConditions: state.isScan ? [] : [{ lower, upper, exact: true }],
+        filter: undefined,
+        rowChecks: [],
+        sizing: explainedSizing(state),
+      } satisfies QueryExplain
+    }
+    const planner = resolvePlanner(state, state.planner)
+    const start = planner.start(undefined)
+    const planned: QueryState = {
+      ...state,
+      plan: start instanceof ValidationError ? undefined : { planner, start },
+      rowCheck: planner.rowCheck,
+    }
+    return planner.explain(explainedSizing(planned))
+  })
+
+/** @internal How `explain` names a query's sizing: no `limit` reads natural pages. */
+const explainedSizing = (state: QueryState): QueryExplain["sizing"] => {
+  const mode = sizingMode(state)
+  return mode === "none" ? "natural" : mode
+}
+
+/**
  * Return the built DynamoDB command input without executing.
  * Useful for debugging, logging, or passing to DynamoClient directly.
  * Fails with a `ValidationError` for a filter the query would refuse to send
@@ -2059,6 +2768,18 @@ export const asParams = <A>(
     const refusal = refuseEmptyFilterParts(state)
     if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
+    // A planned query shows the first request it would send from the start:
+    // its first probe, or its first read (#171).
+    if (state.planner !== undefined) {
+      const planner = resolvePlanner(state, state.planner)
+      const start = planner.start(undefined)
+      if (!(start instanceof ValidationError) && start._tag !== "Done") {
+        const planned: QueryState = { ...state, plan: { planner, start } }
+        return start._tag === "Probe"
+          ? probeCommand(planned, start, tableName)
+          : buildDynamoCommand(indexQueryState(readState(planned, start)), tableName)
+      }
+    }
     // A `BatchGet`-hydrated query shows its index query; the `BatchGetItem`
     // that follows each page is not part of these parameters.
     return buildDynamoCommand(indexQueryState(state), tableName)

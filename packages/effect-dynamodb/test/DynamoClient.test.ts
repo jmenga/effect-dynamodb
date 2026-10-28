@@ -5,7 +5,7 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Config, ConfigProvider, DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import { classifyError, DynamoClient } from "../src/DynamoClient.js"
+import { classifyError, composeRangeUnder, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
@@ -1722,4 +1722,245 @@ describe("DynamoClient", () => {
       })
     })
   })
+})
+
+// ---------------------------------------------------------------------------
+// .within() on composite accessors (#171)
+// ---------------------------------------------------------------------------
+
+describe(".within() on composite accessors (#171)", () => {
+  it("composeRangeUnder matches composeSortKeyPrefix", () => {
+    // `.where()` and `.within()` compose a bound through composeRangeUnder;
+    // the write path composes keys through KeyComposer. Every operand must be
+    // the key text `put` would write for the same composites.
+    const schema = DynamoSchema.make({ name: "parity", version: 1 })
+    const shapes = {
+      plain: {},
+      isolated: { collection: "byTenant", type: "isolated" as const },
+      clustered: { collection: "byTenant", type: "clustered" as const },
+    }
+    const values = {
+      string: "Widget A",
+      number: 42,
+      date: new Date("2026-10-27T10:00:00.000Z"),
+    }
+    for (const [shapeName, shape] of Object.entries(shapes)) {
+      for (const casing of ["lowercase", "uppercase", "preserve"] as const) {
+        for (const [kind, value] of Object.entries(values)) {
+          const context = `${shapeName} / ${casing} / ${kind}`
+          const index: KeyComposer.IndexDefinition = {
+            index: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenant"] },
+            sk: { field: "gsi1sk", composite: ["region", "value", "id"] },
+            casing,
+            ...shape,
+          }
+          const effective = KeyComposer.effectiveCasing(schema, index)
+          const pinnedKeyForm = { region: "EU-West" }
+          const recordKeyForm = { ...pinnedKeyForm, value }
+          const prefixText = KeyComposer.composeSortKeyBeginsWith(
+            schema,
+            "Thing",
+            1,
+            index,
+            pinnedKeyForm,
+          )
+          const under = (bound: any, isLast = false, prefix = prefixText) =>
+            composeRangeUnder(
+              { casing: effective, isLast },
+              prefix,
+              isLast ? "id" : "value",
+              bound,
+              {
+                clampToPrefix: true,
+              },
+            )
+          const composed = KeyComposer.composeSortKeyPrefix(
+            schema,
+            "Thing",
+            1,
+            index,
+            recordKeyForm,
+          )
+          // A lower bound starts exactly at the composed value…
+          expect(under({ gte: value }).condition, context).toEqual({
+            between: [composed, `${prefixText}￿`],
+          })
+          // …an eq bound is the value's subtree, as a begins_with of the record…
+          expect(under({ eq: value }).condition, context).toEqual({
+            beginsWith: KeyComposer.composeSortKeyBeginsWith(
+              schema,
+              "Thing",
+              1,
+              index,
+              recordKeyForm,
+            ),
+          })
+          // …and on the last composite it is the whole stored key.
+          const fullKeyForm = { ...recordKeyForm, id: "X-1" }
+          const lastPrefix = KeyComposer.composeSortKeyBeginsWith(
+            schema,
+            "Thing",
+            1,
+            index,
+            recordKeyForm,
+          )
+          expect(under({ eq: "X-1" }, true, lastPrefix).condition, context).toEqual({
+            eq: KeyComposer.composeSortKeyPrefix(schema, "Thing", 1, index, fullKeyForm),
+          })
+          // A strict lt on the last composite admits the bound itself, and says so.
+          expect(under({ lt: "X-1" }, true, lastPrefix).excludes, context).toBe(
+            KeyComposer.composeSortKeyPrefix(schema, "Thing", 1, index, fullKeyForm),
+          )
+          expect(under({ lt: value }).excludes, context).toBeUndefined()
+        }
+      }
+    }
+  })
+
+  const AppSchema = DynamoSchema.make({ name: "withintest", version: 1 })
+
+  class Order extends Schema.Class<Order>("Order")({
+    customerId: Schema.String,
+    orderId: Schema.String,
+    status: Schema.Literals(["open", "paid", "shipped"]),
+    total: Schema.Number,
+  }) {}
+
+  const Orders = Entity.make({
+    model: Order,
+    entityType: "Order",
+    primaryKey: {
+      pk: { field: "pk", composite: ["orderId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byCustomer: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["customerId"] },
+        sk: { field: "gsi1sk", composite: ["status", "total", "orderId"] },
+      },
+      byActivity: {
+        name: "gsi2",
+        collection: "activity",
+        type: "clustered",
+        pk: { field: "gsi2pk", composite: ["customerId"] },
+        sk: { field: "gsi2sk", composite: ["status", "total"] },
+      },
+    },
+  })
+
+  const WithinTable = Table.make({ schema: AppSchema, entities: { Orders } })
+  const makeDb = () => DynamoClient.make({ entities: { Orders }, tables: { WithinTable } })
+  type Db = Effect.Success<ReturnType<typeof makeDb>>
+
+  /** The first request a query sends (served empty), or the error building it threw. */
+  const capture = (build: (db: Db) => Effect.Effect<unknown, any, never>) => {
+    const captured: Array<any> = []
+    const ClientLayer = mockDynamoClientLayer({
+      query: (input) =>
+        Effect.sync(() => {
+          captured.push(input)
+          return { Items: [], Count: 0 } as never
+        }),
+    })
+    return Effect.gen(function* () {
+      const db = yield* makeDb()
+      yield* build(db)
+      return captured[0]
+    }).pipe(Effect.provide(Layer.merge(ClientLayer, WithinTable.layer({ name: "within" }))))
+  }
+
+  it.effect("a bound behind an unbounded composite probes first", () =>
+    Effect.gen(function* () {
+      const input = yield* capture((db) =>
+        db.entities.Orders.byCustomer({ customerId: "c-1" })
+          .within({ total: { gte: 100 } })
+          .collect(),
+      )
+      const P = "$withintest#v1#order#"
+      expect(input.Limit).toBe(1)
+      expect(input.ProjectionExpression).toBe("#sk")
+      expect(input.FilterExpression).toBeUndefined()
+      expect(input.ExpressionAttributeNames["#sk"]).toBe("gsi1sk")
+      expect(input.ExpressionAttributeValues[":sk1"]).toEqual({ S: P })
+      expect(input.ExpressionAttributeValues[":sk2"]).toEqual({ S: `${P}￿` })
+    }),
+  )
+
+  it.effect("an eq bound then a range is the key plan, composed as .where() composes it", () =>
+    Effect.gen(function* () {
+      const bounds = [
+        [{ gte: 100 }, (t: any, { gte }: any) => gte(t.total, 100)],
+        [{ gt: 100 }, (t: any, { gt }: any) => gt(t.total, 100)],
+        [{ lte: 100 }, (t: any, { lte }: any) => lte(t.total, 100)],
+        [{ between: [10, 100] }, (t: any, { between }: any) => between(t.total, 10, 100)],
+        [{ eq: 100 }, (t: any, { eq }: any) => eq(t.total, 100)],
+      ] as const
+      for (const [bound, where] of bounds) {
+        const within = yield* capture((db) =>
+          db.entities.Orders.byCustomer({ customerId: "c-1" })
+            .within({ status: { eq: "open" }, total: bound as any })
+            .collect(),
+        )
+        const pinned = yield* capture((db) =>
+          (db.entities.Orders.byCustomer({ customerId: "c-1", status: "open" }) as any)
+            .where(where)
+            .collect(),
+        )
+        expect(within, JSON.stringify(bound)).toEqual(pinned)
+      }
+    }),
+  )
+
+  it.effect("{} plans nothing", () =>
+    Effect.gen(function* () {
+      const within = yield* capture((db) =>
+        db.entities.Orders.byCustomer({ customerId: "c-1" }).within({}).collect(),
+      )
+      const plain = yield* capture((db) =>
+        db.entities.Orders.byCustomer({ customerId: "c-1" }).collect(),
+      )
+      expect(within).toEqual(plain)
+    }),
+  )
+
+  it.effect("a clustered collection member index skip-scans under its member prefix", () =>
+    Effect.gen(function* () {
+      const db = yield* makeDb()
+      const query = db.entities.Orders.byActivity({ customerId: "c-1" }).within({
+        total: { lt: 50 },
+      })
+      const explain = yield* query.explain()
+      expect(explain.plan).toBe("skip-scan")
+      expect(explain.reason).toBe("skip tuple: status")
+      // `total` is the last composite: the strict bound is also checked per row.
+      expect(explain.rowChecks).toEqual(["total"])
+      const P = explain.keyConditions[0]!.lower!
+      expect(P.endsWith("#")).toBe(true)
+      expect(P).toContain("order")
+    }).pipe(Effect.provide(Layer.merge(TestDynamoClient, WithinTable.layer({ name: "within" })))),
+  )
+
+  it.effect("misuse from untyped code throws EDD-9093", () =>
+    Effect.gen(function* () {
+      const db = yield* makeDb()
+      const byCustomer = (pins: object) => (db.entities.Orders.byCustomer as any)(pins)
+      const cases: Array<readonly [object, unknown, RegExp]> = [
+        [{ customerId: "c-1" }, { customerId: { eq: "c-2" } }, /partition key composite/],
+        [{ customerId: "c-1" }, { colour: { eq: "red" } }, /not a sort key composite/],
+        [{ customerId: "c-1", status: "open" }, { status: { eq: "paid" } }, /already pinned/],
+        [{ customerId: "c-1" }, { total: { lt: 1, lte: 2 } }, /is not one of/],
+        [{ customerId: "c-1" }, { total: { eq: 1, gte: 2 } }, /is not one of/],
+        [{ customerId: "c-1" }, { total: { between: [1] } }, /is not one of/],
+        [{ customerId: "c-1" }, { total: {} }, /is not one of/],
+        [{ customerId: "c-1" }, { total: { gte: "100" } }, /key form is a number/],
+        [{ customerId: "c-1" }, [{ total: { gte: 1 } }], /pass an object of bounds/],
+      ]
+      for (const [pins, bounds, message] of cases) {
+        expect(() => byCustomer(pins).within(bounds), JSON.stringify(bounds)).toThrow(/EDD-9093/)
+        expect(() => byCustomer(pins).within(bounds), JSON.stringify(bounds)).toThrow(message)
+      }
+    }).pipe(Effect.provide(Layer.merge(TestDynamoClient, WithinTable.layer({ name: "within" })))),
+  )
 })

@@ -321,7 +321,8 @@ function tryDetectV2ChainRoot(
         methodName === "consistentRead" ||
         methodName === "ignoreOwnership" ||
         methodName === "filterBy" ||
-        methodName === "onRequest"
+        methodName === "onRequest" ||
+        methodName === "within"
       ) {
         return tryDetectV2ChainRoot(ts, callee.expression, entities, collections)
       }

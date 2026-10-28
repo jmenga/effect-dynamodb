@@ -63,6 +63,12 @@ const Orders = Entity.make({
       pk: { field: "gsi1pk", composite: ["customerId"] },
       sk: { field: "gsi1sk", composite: ["orderId"] },
     },
+    // A composite sort key: `.within()` on `orderId` skip-scans `total` (#171).
+    byCustomerTotal: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["customerId"] },
+      sk: { field: "gsi3sk", composite: ["total", "orderId"] },
+    },
   },
 })
 
@@ -420,6 +426,15 @@ const cases: ReadonlyArray<Case> = [
     "Entity.query",
     ({ db }) => drainStream(db.entities.Orders.byCustomer({ customerId: "c-1" }).paginate()),
   ],
+  // A skip-scan's probes and tuple reads (#171)
+  [
+    "Entity.query",
+    ({ db }) =>
+      db.entities.Orders.byCustomerTotal({ customerId: "c-1" })
+        .within({ orderId: { gte: "o-0" } })
+        .collect(),
+    seedOrder,
+  ],
   ["Entity.scan", ({ db }) => db.entities.Orders.scan().collect()],
   ["Entity.scan", ({ orders }) => orders.scanFetch()],
   ["Entity.collect", ({ orders }) => orders.collect(ordersQuery())],
@@ -584,6 +599,27 @@ describe("consumed-capacity coverage", () => {
 })
 
 describe("consumed-capacity targets", () => {
+  it.effect("a skip-scan's probes and reads are one Entity.query report (#171)", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      const bound = yield* bindAll.pipe(Effect.provide(layer))
+      yield* seedOrder(bound).pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      const query = bound.db.entities.Orders.byCustomerTotal({ customerId: "c-1" }).within({
+        orderId: { gte: "o-0" },
+      })
+      const items = yield* query
+        .collect()
+        .pipe(Effect.provide(ConsumedCapacity.layer({ onOperation })), Effect.provide(layer))
+      expect(items.map((order) => order.orderId)).toEqual(["o-1"])
+      // A probe finds the one tuple, its read, then a probe that finds none.
+      expect(reports.map((report) => [report.operation, report.index])).toEqual([
+        ["Entity.query", "byCustomerTotal"],
+      ])
+      expect(reports[0]!.requestsByCommand).toEqual({ Query: 3 })
+    }),
+  )
+
   it.effect("a stream's queries report under the stream name, as its operations do", () =>
     Effect.gen(function* () {
       const layer = baseLayer()

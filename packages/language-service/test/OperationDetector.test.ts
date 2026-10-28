@@ -314,6 +314,17 @@ describe("OperationDetector", () => {
     expect(op!.entity?.variableName).toBe("Tasks")
   })
 
+  it("should detect a terminal through a .within() combinator (#171)", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" }).within({ status: { gte: "a" } }, { maxSkips: 4 }).limit(5).fetch()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, source.indexOf("fetch") + 1, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("bound-query-terminal")
+    expect(op!.terminalName).toBe("fetch")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
   it("should detect db.entities.Tasks.scan() via v2 path", () => {
     const source = `db.entities.Tasks.scan()`
     const sf = parseSource(source)
