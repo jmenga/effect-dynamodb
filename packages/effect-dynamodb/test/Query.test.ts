@@ -895,7 +895,29 @@ describe("Query", () => {
             .mockResolvedValueOnce({ Items: [row("c", "$myapp#v1#user#id_c")] })
           const items = yield* Query.collect(make().pipe(Query.limit(2)))
           expect(items.map((i) => i.id)).toEqual(["a", "c"])
-          // `limit` first, then twice the last: never the remainder.
+          // `limit` first; then the one item still owed over the pass rate seen
+          // (1 of 2 rows), with 25% headroom: ceil(1 / 0.5 × 1.25) = 3.
+          expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 3])
+        }
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect('pageSize("natural") keeps doubling: limit first, then twice the last', () =>
+      Effect.gen(function* () {
+        for (const [mock, make] of [
+          [mockQuery, historyQuery],
+          [mockScan, historyScan],
+        ] as const) {
+          mock.mockReset()
+          mock
+            .mockResolvedValueOnce({
+              Items: [row("a", "$myapp#v1#user#id_a"), row("a", "$myapp#v1#user#v#id_a#0000001")],
+              LastEvaluatedKey: { pk: { S: "p" }, sk: { S: "$myapp#v1#user#v#id_a#0000001" } },
+            })
+            .mockResolvedValueOnce({ Items: [row("c", "$myapp#v1#user#id_c")] })
+          const items = yield* Query.collect(make().pipe(Query.limit(2), Query.pageSize("natural")))
+          expect(items.map((i) => i.id)).toEqual(["a", "c"])
+          // 1.36's #133 growth: never the remainder.
           expect(mock.mock.calls.map((call) => call[0].Limit)).toEqual([2, 4])
         }
       }).pipe(Effect.provide(TestDynamoClient)),
@@ -1590,14 +1612,29 @@ describe("filterBy (#122)", () => {
         expect(mockQuery).toHaveBeenCalledTimes(2)
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
 
-    it("does not push `Limit` — the predicate rejects rows after they are examined", () =>
+    it("does not push `limit` as `Limit` — the predicate rejects rows after they are examined", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
 
         yield* makeTestQuery().pipe(Query.filterBy(isEven), Query.limit(3), Query.execute)
 
-        // Without this, DynamoDB would examine 3 rows and the predicate could
-        // accept as few as 0 of them.
+        // Sending `Limit: 3` would let DynamoDB examine 3 rows of which the
+        // predicate could accept as few as 0. The first request asks for twice
+        // the budget, at least 16 rows; later ones follow the pass rate.
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(16)
+      }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
+
+    it('under pageSize("natural"), sends no `Limit` at all', () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: rows(0, 6), Count: 6 })
+
+        yield* makeTestQuery().pipe(
+          Query.filterBy(isEven),
+          Query.limit(3),
+          Query.pageSize("natural"),
+          Query.execute,
+        )
+
         expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
 

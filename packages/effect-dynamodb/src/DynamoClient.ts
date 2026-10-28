@@ -727,10 +727,20 @@ export interface CollectionQuery<TResult> {
     ): CollectionQuery<TResult>
     (shorthand: import("./internal/Expr.js").ConditionShorthand): CollectionQuery<TResult>
   }
-  /** Return at most `n` items (a contract on results, not on round trips). */
+  /**
+   * Return at most `n` items (a contract on results, not on round trips).
+   * Under a filter, each request is sized from the observed pass rate.
+   */
   readonly limit: (n: number) => CollectionQuery<TResult>
-  /** Fetch in batches of `n` rows — sets DynamoDB's `Limit`. */
-  readonly pageSize: (n: number) => CollectionQuery<TResult>
+  /**
+   * Fetch in batches of `n` rows — sets DynamoDB's `Limit`. `"natural"` sizes
+   * requests exactly as 1.36 did.
+   */
+  readonly pageSize: (size: number | "natural") => CollectionQuery<TResult>
+  /** Run `observer` after every request a terminal sends (see `Query.onRequest`). */
+  readonly onRequest: (
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ) => CollectionQuery<TResult>
   /** Reverse sort order. */
   readonly reverse: () => CollectionQuery<TResult>
   /** Resume from cursor. */

@@ -8,7 +8,9 @@
  *
  * The matrix below is the specification: every terminal (`collect`, `execute`,
  * `paginate`, `count`) against `limit` alone, `pageSize` alone and both
- * together, each with and without a `FilterExpression`.
+ * together, each with and without a `FilterExpression`. How a `limit` under a
+ * filter sizes each request from the observed pass rate (#171) is specified in
+ * `QueryAdaptiveSizing.test.ts`.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -176,7 +178,7 @@ describe("Query — limit vs pageSize", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
-    it.effect("under a filter, limit is never handed to DynamoDB", () =>
+    it.effect("under a filter, the first request asks for twice the limit, at least 16 rows", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: items(1, 3), LastEvaluatedKey: undefined })
 
@@ -184,9 +186,27 @@ describe("Query — limit vs pageSize", () => {
 
         expect(result).toHaveLength(3)
         // `Limit` bounds rows EXAMINED and the filter runs after it, so the
-        // limit cannot be expressed as `Limit` — the request is unbounded.
-        expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
+        // limit itself cannot be `Limit`. Nothing is known of the pass rate
+        // yet: max(16, ceil(3 × 2)).
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(16)
         expect(mockQuery.mock.calls[0]![0].FilterExpression).toBeDefined()
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it.effect('under a filter and pageSize("natural"), limit is never handed to DynamoDB', () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: items(1, 3), LastEvaluatedKey: undefined })
+
+        const result = yield* keyedQuery().pipe(
+          activeFilter,
+          Query.limit(3),
+          Query.pageSize("natural"),
+          Query.collect,
+        )
+
+        expect(result).toHaveLength(3)
+        // 1.36's sizing: the request is unbounded — a natural 1 MB page.
+        expect(mockQuery.mock.calls[0]![0].Limit).toBeUndefined()
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -313,13 +333,16 @@ describe("Query — limit vs pageSize", () => {
 
     it.effect("over-read rebuilds the cursor from the last item returned", () =>
       Effect.gen(function* () {
-        // A filtered request cannot be sized, so it accepts 5 items when only 3
-        // were asked for. The surplus is discarded — the raw LastEvaluatedKey
-        // points past it and would skip those items on the next page.
+        // Under a filter a request examines more rows than items are owed
+        // (adaptive sizing's first `Limit` is 16), so here 5 items pass when
+        // only 3 were asked for. The surplus is discarded — the raw
+        // LastEvaluatedKey points past it and would skip those items on the
+        // next page.
         mockQuery.mockResolvedValueOnce({ Items: items(1, 5), LastEvaluatedKey: lastKey })
 
         const page = yield* keyedQuery().pipe(activeFilter, Query.limit(3), Query.execute)
 
+        expect(mockQuery.mock.calls[0]![0].Limit).toBe(16)
         expect(ids(page.items)).toEqual(["u-1", "u-2", "u-3"])
         expect(decodeCursor(page.cursor)).toEqual(toAttributeMap({ pk: PK, sk: "item#3" }))
       }).pipe(Effect.provide(TestDynamoClient)),
@@ -615,9 +638,19 @@ describe("Query — limit vs pageSize", () => {
         const withLimit = yield* keyedQuery().pipe(Query.limit(7), Query.asParams)
         expect(withLimit.Limit).toBe(7)
 
-        // ...but under a filter it is not.
+        // ...but under a filter it is not: the first request asks for
+        // max(16, ceil(7 × 2)).
         const filtered = yield* keyedQuery().pipe(activeFilter, Query.limit(7), Query.asParams)
-        expect(filtered.Limit).toBeUndefined()
+        expect(filtered.Limit).toBe(16)
+
+        // ...and under pageSize("natural"), a natural page.
+        const natural = yield* keyedQuery().pipe(
+          activeFilter,
+          Query.limit(7),
+          Query.pageSize("natural"),
+          Query.asParams,
+        )
+        expect(natural.Limit).toBeUndefined()
       }).pipe(Effect.provide(TestDynamoClient)),
     )
   })

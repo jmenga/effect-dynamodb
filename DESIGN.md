@@ -4442,7 +4442,10 @@ for unrelated errors and the collision was caught only at review.
 | 9051–9058 | Aggregate cursors, read-path descriptors, sort-key pins, client predicates, collection casing, nested aggregates, self dates |
 | 9059–9061 | Planned `transactWrite` updates and deletes: cascade, return values, vector indexes |
 | 9062–9067 | EventStore command path: snapshot mode, stream indexes |
+| 9068–9070 | EventStore `verifySnapshot`, table shared-index agreement, vector index `dimensions` |
 | 9071–9079 | Packed storage encoding (`DynamoModel.Packed`, compressors) |
+| 9080–9085 | EventStore `query.index`, projections, change feed, head proof |
+| 9086–9095 | Z-order indexes, range planning, skip-scan, cursors |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -4525,8 +4528,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9083` | `change-feed/ChangeFeed.ts` | `changeFeed` options it cannot honour: `lease.renewEvery` of half the lease `duration` or more, a `batchSize` outside 1–1000, or a `maxConcurrentReads` that is not a positive integer |
 | `EDD-9084` | `change-feed/CheckpointStore.ts` | `CheckpointStore.layerDynamoDB` / `makeDynamoDB` given a `finishedTtl` under 28 hours (`CheckpointStore.minFinishedTtl`) |
 | `EDD-9085` | `EventStore.ts` | A head proof that cannot work (#164): `headProof: "snapshot"` on a stream whose snapshot config is not `mode: "inline"` without `every` (a defect from `append`, thrown by `commandHandler` at handler construction); and, at handler construction, a malformed handler `headProof`, a `loadState` that is not a function, `loadState` with `verifySnapshot: false`, or `loadState` with `headProof: "snapshot"` |
+| `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
 
-Next free code: **`EDD-9086`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9096`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## 16. Consumed Capacity
 

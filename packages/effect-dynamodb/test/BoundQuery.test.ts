@@ -225,6 +225,63 @@ describe("BoundQuery", () => {
         expect(mockQuery.mock.calls[0]![0].Limit).toBe(2)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
+
+    it.effect('pageSize("natural") keeps 1.36\'s natural pages under a filter', () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const filtered = makeBoundQuery().filter({ status: "active" }).limit(3)
+
+        yield* filtered.collect()
+        yield* filtered.pageSize("natural").collect()
+
+        expect(filtered.pageSize("natural")._query._state.pageSizeValue).toBe("natural")
+        // Adaptive: twice the limit, at least 16 rows; natural: no Limit.
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([16, undefined])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it("rejects any other string with EDD-9095", () => {
+      expect(() => makeBoundQuery().pageSize("all" as unknown as number)).toThrow(/EDD-9095/)
+    })
+  })
+
+  // -----------------------------------------------------------------------
+  // onRequest
+  // -----------------------------------------------------------------------
+
+  describe("onRequest", () => {
+    it("registers observers in order, original unchanged", () => {
+      const original = makeBoundQuery()
+      const first = () => Effect.void
+      const second = () => Effect.void
+      const observed = original.onRequest(first).onRequest(second)
+      expect(observed._query._state.observers).toEqual([first, second])
+      expect(original._query._state.observers).toEqual([])
+    })
+
+    it.effect("each terminal reports its requests to the observer", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [{ pk: { S: "p" }, sk: { S: "s1" }, id: { S: "t-1" } }],
+          Count: 1,
+          ScannedCount: 4,
+        })
+        const events: Array<Query.QueryRequestEvent> = []
+        const bq = makeBoundQuery().onRequest((event) => Effect.sync(() => events.push(event)))
+
+        yield* bq.collect()
+        yield* bq.fetch()
+        yield* Stream.runCollect(bq.paginate())
+        yield* bq.count()
+
+        expect(events.map((event) => [event.kind, event.scannedCount, event.count])).toEqual([
+          ["read", 4, 1],
+          ["read", 4, 1],
+          ["read", 4, 1],
+          ["count", 4, 1],
+        ])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
   })
 
   // -----------------------------------------------------------------------

@@ -1676,35 +1676,28 @@ describeConnected("Connected integration tests", () => {
         yield* seedLimitTasks
         const tasks = yield* boundTasks
 
-        // A filtered request cannot be sized, so it examines the whole
-        // partition and accepts all 6 items while only 2 were asked for. The
-        // cursor must resume after the 2nd — not after the 6th, which is where
-        // LastEvaluatedKey would point.
-        const first = yield* tasks
-          .byUser({ userId: LIMIT_USER })
-          .filter({ status: "todo" })
-          .limit(2)
-          .fetch()
-        expect(first.items.map((t) => t.taskId)).toEqual(["t-lim-01", "t-lim-02"])
-        expect(first.cursor).not.toBeNull()
+        // A request under a filter reads past the items owed: a natural page
+        // examines the whole partition, and adaptive sizing's first `Limit`
+        // (at least 16) is more than its 6 rows. Either accepts all 6 items
+        // while only 2 were asked for. The cursor must resume after the 2nd —
+        // not after the 6th, which is where LastEvaluatedKey would point.
+        for (const natural of [true, false]) {
+          const todo = () => {
+            const query = tasks.byUser({ userId: LIMIT_USER }).filter({ status: "todo" }).limit(2)
+            return natural ? query.pageSize("natural") : query
+          }
+          const first = yield* todo().fetch()
+          expect(first.items.map((t) => t.taskId)).toEqual(["t-lim-01", "t-lim-02"])
+          expect(first.cursor).not.toBeNull()
 
-        const second = yield* tasks
-          .byUser({ userId: LIMIT_USER })
-          .filter({ status: "todo" })
-          .limit(2)
-          .startFrom(first.cursor!)
-          .fetch()
-        expect(second.items.map((t) => t.taskId)).toEqual(["t-lim-03", "t-lim-04"])
+          const second = yield* todo().startFrom(first.cursor!).fetch()
+          expect(second.items.map((t) => t.taskId)).toEqual(["t-lim-03", "t-lim-04"])
 
-        const third = yield* tasks
-          .byUser({ userId: LIMIT_USER })
-          .filter({ status: "todo" })
-          .limit(2)
-          .startFrom(second.cursor!)
-          .fetch()
-        expect(third.items.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
-        // Nothing left after the 6th item.
-        expect(third.cursor).toBeNull()
+          const third = yield* todo().startFrom(second.cursor!).fetch()
+          expect(third.items.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
+          // Nothing left after the 6th item.
+          expect(third.cursor).toBeNull()
+        }
       }).pipe(provide),
     )
 

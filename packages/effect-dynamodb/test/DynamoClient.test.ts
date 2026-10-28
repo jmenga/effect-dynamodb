@@ -637,9 +637,10 @@ describe("DynamoClient", () => {
         })
 
         // .filter() and .pageSize() must chain without type errors and
-        // propagate to the underlying DynamoDB query input. `pageSize` is what
-        // sets `Limit`; `.limit()` bounds the items returned, and under a
-        // filter it cannot be handed to DynamoDB at all.
+        // propagate to the underlying DynamoDB query input. A numeric
+        // `pageSize` is sent as `Limit` as given; `.limit()` bounds the items
+        // returned, and under a filter only sizes the requests from the
+        // observed pass rate when no `pageSize` is set.
         yield* db.entities.AccountChannel.primary({ accountId: "acct-1" })
           .filter({ grantedBy: "admin" })
           .pageSize(5)

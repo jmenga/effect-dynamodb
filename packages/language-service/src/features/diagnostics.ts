@@ -573,7 +573,11 @@ function findQueryAccessorRoot(
         combinator === "where" ||
         combinator === "maxPages" ||
         combinator === "startFrom" ||
-        combinator === "consistentRead"
+        combinator === "consistentRead" ||
+        combinator === "ignoreOwnership" ||
+        combinator === "filter" ||
+        combinator === "filterBy" ||
+        combinator === "onRequest"
       ) {
         return findQueryAccessorRoot(ts, callee.expression, entities)
       }

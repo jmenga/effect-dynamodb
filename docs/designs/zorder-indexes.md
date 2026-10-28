@@ -20,10 +20,16 @@ validation), `packages/effect-dynamodb` (`Query`, `internal/BoundQuery`, `Dynamo
 **Semver impact:** `minor`. Lockstep to **1.37.0** (main is at 1.36.0). Behaviour and type changes that are not
 purely additive, all listed in the changeset:
 1. **Adaptive request sizing is the default** when `limit` is set, `pageSize` and `maxPages` are
-   not, and the query filters (§8). Results and cursors are unchanged; `Limit` values and request
-   counts change. With `maxPages` set, sizing stays exactly 1.36's, because a capped request count
-   with smaller requests would change what one call returns (§8.1, §19 C6). `.pageSize("natural")`
-   restores 1.36 behaviour exactly.
+   not, and the query filters (§8). The items `collect` / `count` return, and the items a `fetch`
+   chain returns end to end, are unchanged; `Limit` values and request counts change. Three
+   things a caller can see change with them (§8.4): a `fetch` cursor's value can differ while
+   resuming at the same place; a `fetch` whose limit fills on a sized request's last returned row
+   can return a non-null cursor where 1.36 returned null, so its chain ends with one empty page
+   (§19 C9); and `Query.paginate` emits one array per request, so its page boundaries follow the
+   sized requests and only the flattened stream is unchanged (§19 C10; a bound query's
+   `.paginate()` streams items, so it is unaffected). With `maxPages` set,
+   sizing stays exactly 1.36's, because a capped request count with smaller requests would change
+   what one call returns (§8.1, §19 C6). `.pageSize("natural")` restores 1.36 behaviour exactly.
 2. **`KeyComposer` return types widen** from `string` to `string | Uint8Array` on the
    record-composing functions (`composeIndexKeys`, `tryComposeIndexKeys`, `composeAllKeys`,
    `GsiUpdateResult.sets`). Only a Z-order half ever produces a `Uint8Array`.
@@ -1203,9 +1209,9 @@ changeset was the rejected alternative). Planned queries (`.within()`) are new, 
 
 ### 8.2 The estimator
 
-State per terminal call: `{ examined, accepted, lastLimit, lastAccepted, requests }`. It lives in
-the `execute` loop's locals and in `pageStream`'s `PageState`, never in the cursor (a resumed query
-starts fresh).
+State per terminal call: `{ examined, accepted, lastLimit, lastExamined, lastAccepted, requests }`.
+It lives in the `execute` loop's locals and in `pageStream`'s `PageState`, never in the cursor (a
+resumed query starts fresh).
 
 ```
 INITIAL_FACTOR = 2   MIN_FIRST = 16   SAFETY = 1.25   GROWTH = 2   MAX_GROWN_LIMIT = 100_000
@@ -1218,13 +1224,16 @@ nextLimit(est, remaining, filteredByUser):
     L = est.lastLimit × GROWTH                                         // nothing passed yet: #133's growth
   else:
     rate = est.accepted / est.examined
+    if est.lastAccepted > 0:
+      rate = min(rate, est.lastAccepted / est.lastExamined)            // the recent rate, when lower
     L = ceil(remaining / rate × SAFETY)
     if est.lastAccepted = 0:
       L = max(L, est.lastLimit × GROWTH)                               // a run of misses grows geometrically
   return clamp(L, 1, MAX_GROWN_LIMIT)
 
 observe(est, response, acceptedThisPage, limitSent):
-  est.examined += response.ScannedCount ?? response.Items.length
+  scanned = response.ScannedCount ?? response.Items.length
+  est.examined += scanned; est.lastExamined = scanned
   est.accepted += acceptedThisPage
   est.lastAccepted = acceptedThisPage
   est.lastLimit = limitSent; est.requests += 1
@@ -1243,9 +1252,27 @@ observe(est, response, acceptedThisPage, limitSent):
   100-byte rows, `L ≈ 1.25 × examined × remaining / accepted` grows `examined` by about 0.125% per
   request: a simulation of these constants takes 4,834 requests against 96 natural 1 MB pages. The floor
   (`L ≥ lastLimit × GROWTH` after a request that accepted nothing) makes every run of misses grow
-  geometrically until DynamoDB's 1 MB cap takes over, so the worst case is `O(log rows)` requests
-  more than natural pages (108 requests in the same simulation). `QueryAdaptiveSizing.test.ts` pins this
-  "early cluster, then long desert" case.
+  geometrically until DynamoDB's 1 MB cap takes over (108 requests in the same simulation).
+  `QueryAdaptiveSizing.test.ts` pins this "early cluster, then long desert" case.
+- **The recent rate** (review of commit 2). The floor covers one run of misses, not a sparse
+  trickle after an early cluster: the cumulative rate stays near the cluster's long after the
+  matches thin out, so each isolated later match resets `L` to a few dozen rows and the doubling
+  starts over, and `k` sparse matches cost about `k × log2(gap)` requests. With `limit(1000)`, 990
+  early matches and then 10 matches 1,000 100-byte rows apart, the cumulative rate alone sends 46
+  requests against 2 natural pages; 900 early matches then 100 matches 2,000 rows apart, 61 against
+  20. Taking the lower of the cumulative rate and the last request's own sizes the request after
+  an isolated match for the gap it came from: 9 and 23 requests.
+- **The bound.** Let a request examine `L` rows without filling the limit or reaching the 1 MB
+  cap, and accept `a` of the `r` items owed. The next `Limit` is at least `2L` when `a = 0` (the
+  floor), and at least `1.25 × L × (r − a) / a` otherwise (the recent rate), which is `2L` or more
+  unless `a` is over a third of `r`. Each request of that kind cuts what is owed by over a third,
+  so there are `O(log limit)` of them, and they shrink `L` by at most the factor they cut the
+  debt. So the requests below the 1 MB cap number `O(log rows)` in all, and the rest each read
+  about a natural page: `O(log rows)` requests more than natural pages. A simulation of the
+  estimator over 36,000 random piecewise-density partitions (1 to 10 segments, densities from 0 to
+  1, limits from 1 to past the match count, rows of 100 B to 40 KB) found none past
+  `naturalPages + 0.8 × log2(rows)`.
+  `QueryAdaptiveSizing.test.ts` pins both shapes above as "early cluster then sparse trickle".
 - **Jump pages don't use the estimator** (§8.5): in `jump`, a low pass rate comes from reading into
   out-of-box gaps, and answering it with a larger `Limit` reads further into each gap.
 
@@ -1269,9 +1296,30 @@ Without `limit`, every path is unchanged. A collection query with a filter and a
 `limit` counts results; `maxPages` caps requests (and, for unplanned queries, keeps 1.36 sizing
 so one call returns what it did, §8.1); a numeric `pageSize` is used as given; the cursor is built
 from the last **accepted** item (#122), so over-reading costs read units but is never incorrect.
+What adaptive sizing does change, beyond `Limit`s and request counts (§19 C9, C10):
+
+- **A `fetch` cursor's value.** When a sized request fills the limit on its last returned row,
+  #122 keeps DynamoDB's `LastEvaluatedKey` (the request's last row, which the filter rejected or
+  which is the item itself) instead of rebuilding from the item, where a natural page would have
+  filled the limit mid-page. The cursor resumes at the same place: no row between the two
+  positions passes the filter.
+- **A `fetch` cursor's null-ness.** A natural page has usually read to the end of the partition by
+  the time it fills the limit on its last match, so 1.36 returned a null cursor. A sized request
+  stops at its `Limit`, so DynamoDB returns a `LastEvaluatedKey` (even when no row is left), and the
+  cursor is not null. The chain then ends with one empty page, which reads the tail (with the
+  estimator's doubling, about `log2(tail / 16)` requests). Restoring the null would mean reading on
+  past the limit to look for another match: up to a natural 1 MB page on every such `fetch`, which
+  is the read the sizing exists to avoid. 1.36 chains could already end with an empty page (a
+  natural page that stops at 1 MB with no match after it), so callers loop on the cursor already.
+  `QueryAdaptiveSizing.test.ts` pins this forwards and in reverse, and `connected.zorder.test.ts`
+  pins it against DynamoDB Local on a partition whose last match has a long tail.
+- **`Query.paginate` page boundaries.** It emits one array per request. Under adaptive sizing
+  each request is smaller, so `Query.paginate` piped to `Stream.take(1)` holds the matches among
+  the first sized request's rows (`max(16, 2 × limit)` under a filter) rather than every match in
+  the first 1 MB. The flattened stream is unchanged, and so is a bound query's `.paginate()`,
+  which streams items.
 The changelog states the trade-off: a low or uneven pass rate can take more round trips than one
-1 MB page (bounded by the miss floor to a logarithmic number more); `.pageSize("natural")` opts
-out.
+1 MB page (a logarithmic number more, §8.2); `.pageSize("natural")` opts out.
 
 ### 8.5 Jump run sizing
 
@@ -1734,7 +1782,8 @@ name, while a GSI's key types can't be changed in place. The migration path the 
 
 | File | Covers |
 |---|---|
-| `test/QueryAdaptiveSizing.test.ts` (new) | Limits follow the pass rate: high (≈ remaining × 1.25), low, zero then non-zero (doubling, then rate-based); the miss floor ("early cluster then long desert": request count within a logarithmic margin of natural pages); `MIN_FIRST`; cap 100,000; `ScannedCount` missing → `Items.length`; numeric `pageSize` wins; `"natural"` reproduces every 1.36 expectation; `limit` + filter + `maxPages` keeps 1.36 `Limit`s and results (pinned); `maxPages` still caps; cursor after the last accepted item; collections adapt; `count` paths 1–3 with and without `limit`; estimator state in `PageState` (re-run the stream). |
+| `test/QueryAdaptiveSizing.test.ts` (new) | Limits follow the pass rate: high (≈ remaining × 1.25), low, zero then non-zero (doubling, then rate-based); the miss floor ("early cluster then long desert") and the recent rate ("early cluster then sparse trickle", two shapes), each within `naturalPages + log2(rows)` requests; `MIN_FIRST`; cap 100,000; `ScannedCount` missing → `Items.length`; numeric `pageSize` wins; `"natural"` reproduces every 1.36 expectation; `limit` + filter + `maxPages` keeps 1.36 `Limit`s and results (pinned); `maxPages` still caps; cursor after the last accepted item; a limit filled on a sized request's last returned row (non-null cursor, then an empty page; pinned against `"natural"`'s chain), forwards and in reverse, each chain equal to `collect`; collections adapt; `count` paths 1–3 with and without `limit`; estimator state in `PageState` (re-run the stream). |
+| `test/PartitionMock.test.ts` (new) | The partition mock the sizing, skip-scan and Z-order tests share: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` and `begins_with` narrow the rows in both directions, `ExclusiveStartKey` resumes in both directions, and an unrecognised `#sk` condition is a defect (never every row). |
 | `test/QueryLimitPageSize.test.ts`, `test/Query.test.ts` | **Updated pins:** "under a filter, limit is never handed to DynamoDB" (`:179`) and "asParams reports the first request's Limit" (`:609-621`) now expect the adaptive first `Limit`, and the same cases under `.pageSize("natural")` keep `undefined`; #133 "limit is sent as Limit" (`[2, 4]` → `[2, 3]`, same request count), logarithmic bounds (`≤ 11`, `≤ 10`) unchanged; `filterBy` "Limit undefined under a predicate" (`:1593-1602`) moves under `"natural"`. "No predicate leaves every existing path byte-identical" stays green as is. |
 | `test/QueryCursor.test.ts` (new) | Legacy bytes unchanged for plain queries; v2 round-trip with `B`, with non-Latin-1 text, with every field; legacy decode; decoding deferred to the terminal (`startFrom` before or after `.within()` is the same; a malformed cursor fails the terminal, not `startFrom`); EDD-9094 (malformed, fingerprint, legacy for multi-range, v2 planner cursor on a plain query, `k` outside the recomputed plan, `t` not under `P`). |
 | `test/SkipScan.test.ts` (new; `servePartition`-style mock with BETWEEN / `ScanIndexForward` / `Limit`) | Results equal a filtered full read for random partitions; probe count = distinct tuples + 1; casings `lowercase` / `uppercase` / `preserve`; values with characters below `#`; `Schema.String` tuple composite → filter plan; primary accessor with history rows → filter plan; `maxSkips` fallback mid-way and `maxSkips: 0`; resume mid-skip and mid-fallback keeps the plan; reverse; `maxPages` counts probes (`.maxPages(1)` sends only the first probe and returns a `Start` cursor `{ t: T1 }`); no probe is sent when the limit is reached at a tuple's end; probes inherit `.consistentRead()` on a primary accessor; binary prefix skip: missing leading, missing middle (SEEK and SKIP on a given later segment), all given, and **all omitted** against a mock that rejects a zero-length `B` operand. |
@@ -1752,7 +1801,7 @@ name, while a GSI's key types can't be changed in place. The migration path the 
 | File | Covers |
 |---|---|
 | `test/connected.test.ts` | **Shapes 7, 7a, 7a′, 7b, 8, 8a, 8b, 8c** end to end (the canonical-shape rule requires this file); table create with a `B` sort key; `update` moves the entry when a dimension or prefix changes and leaves it when nothing in the key changes (asserted as eventually consistent; Local hides GSI lag, §9.6). |
-| `test/connected.zorder.test.ts` (new) | 2,000 seeded listings: every strategy and `auto` equals a brute-force filtered scan; `fetch` cursor chains (incl. limits landing on range ends); `count`; reverse; a `NumberFromString` dimension returns the same set as a brute-force scan (the stored-type case Local can show); jump `ScannedCount` on gapped data with run sizing vs a pass-rate-sized baseline; adaptive sizing returns identical results with fewer `ScannedCount` than natural pages for a selective filter with `limit(5)` (measured through `onRequest`); skip-scan over a `literals` status composite equals a filtered read with fewer rows examined; estimator constants sanity-checked here (Q5). |
+| `test/connected.zorder.test.ts` (new) | 2,000 seeded listings: every strategy and `auto` equals a brute-force filtered scan; `fetch` cursor chains (incl. limits landing on range ends); `count`; reverse; a `NumberFromString` dimension returns the same set as a brute-force scan (the stored-type case Local can show); jump `ScannedCount` on gapped data with run sizing vs a pass-rate-sized baseline; adaptive sizing returns identical results with fewer `ScannedCount` than natural pages for a selective filter with `limit(5)` (measured through `onRequest`); an adaptive `fetch` chain returns natural's pages and then one empty page when the last match has a long tail (§8.4); skip-scan over a `literals` status composite equals a filtered read with fewer rows examined; estimator constants sanity-checked here (Q5). |
 
 ### 15.4 Other gates
 
@@ -1841,11 +1890,15 @@ gains regions for adaptive sizing and `.pageSize("natural")`.
 >
 > **Behaviour change: adaptive request sizing is now the default** for queries with `.limit()`, a
 > filter, `filterBy` predicate or history rows, and no `.pageSize()` or `.maxPages()`. Each
-> request's `Limit` is sized from the observed pass rate instead of asking for a 1 MB page. Results
-> and cursors are unchanged; read units and request counts change, and a low or uneven pass rate
-> can take more round trips than one natural page (a logarithmic number more in the worst case).
-> Queries with `.maxPages()` keep the previous sizing. `.pageSize("natural")` restores the previous
-> behaviour.
+> request's `Limit` is sized from the observed pass rate instead of asking for a 1 MB page. The
+> items a query returns are unchanged; read units and request counts change, and a low or uneven
+> pass rate can take more round trips than one natural page (a logarithmic number more in the worst
+> case). A `fetch` cursor resumes at the same place, but its value can differ, and when the limit
+> fills on the last row a sized request returned the cursor can be non-null where it was null, so
+> a `fetch` chain can end with one empty page. `Query.paginate` emits one array per request, so
+> its page boundaries change; the items it streams are unchanged (a bound query's `.paginate()`
+> streams items and is unaffected). Queries with `.maxPages()` keep the previous sizing.
+> `.pageSize("natural")` restores the previous behaviour.
 >
 > **Behaviour change: numeric key encoding.** `number` and `bigint` key composites (partition, sort
 > and index keys, unique-constraint sentinels, a time-series `orderBy`) are written as text that sorts
@@ -1948,7 +2001,10 @@ branch, commits 6–10), then 6 once the changeset is pushed.
 
 Every item in the issue, plus the boundaries this design introduces. *(owner)* = decided in the
 issue's Scope section; *(confirmed 2026-10-27)* = proposed here and confirmed by the owner on
-2026-10-27, exactly as written.
+2026-10-27, exactly as written; *(confirmed 2026-10-28)* = found while reviewing the
+implementation, implemented as written here and confirmed by the owner on 2026-10-28 (C9, C10,
+C11); *(owner 2026-10-28)* = a pre-existing bug the owner chose on 2026-10-28 to fix in this PR
+(E6–E9), or a decision the owner made that day on how (F1–F4).
 
 | # | Item | Decision | Reason |
 |---|---|---|---|
@@ -1977,6 +2033,9 @@ issue's Scope section; *(confirmed 2026-10-27)* = proposed here and confirmed by
 | C6 | `maxPages` without a planner keeps 1.36 sizing *(confirmed 2026-10-27)* | **in** | Keeps the Scope's "results and cursors are unchanged" true for `limit` + filter + `maxPages` (§8.1). Alternative: adapt anyway and record the per-call result change in the changeset. |
 | C7 | `concurrency` default: 4 with a `limit`, 1 for no-limit drains *(confirmed 2026-10-27)* | **in** | Concurrency is a latency / throttling trade-off on one partition key; 4 parallel natural 1 MB drains ask for about 8× a partition's 3,000 RCU/s (§9.3). |
 | C8 | Throttling: no library retry; `fetch` returns a usable prefix when a later window member is throttled; `collect` / `count` / `paginate` fail *(confirmed 2026-10-27)* | **in** | §9.5. The SDK's retry strategy already backs off per request; a library-level back-off or drop-to-sequential is not added. |
+| C9 | Under adaptive sizing, a `fetch` whose limit fills on a sized request's last returned row returns DynamoDB's `LastEvaluatedKey`: a different cursor value, and non-null where 1.36's was null, so the chain ends with one empty page *(proposed in review of commit 2; confirmed 2026-10-28)* | **changed (recorded)** | §8.4. The Scope's "cursors are unchanged" holds for where a cursor resumes, not for its value or null-ness. Alternative: after such a fill, read on (up to a natural page) to find whether another match exists and return null when none does; that costs up to 1 MB on every such `fetch`, the read adaptive sizing exists to avoid, and still returns non-null when the tail passes 1 MB, as 1.36 did. Or `.pageSize("natural")` per query. |
+| C10 | `Query.paginate` emits one array per request, so under adaptive sizing its page boundaries follow the sized requests; only the flattened stream is unchanged (a bound query's `.paginate()` streams items, so it is unaffected) *(proposed in review of commit 2; confirmed 2026-10-28)* | **changed (recorded)** | §8.4. Alternative: keep natural sizing for `Query.paginate`; a stream has no cursor to honour, but then a selective filter with a `limit` reads a 1 MB page per pull, which is what adaptive sizing replaces. |
+| C11 | DynamoDB calls an `.onRequest()` observer makes run under `Capacity.detached`, so they are not charged to the query's consumed-capacity report *(confirmed 2026-10-28)* | **in** | §3.6. The observer is the caller's code, not the query's reads; charging its calls would make the report depend on what an observer does. Alternative: charge them to the query. |
 | C12 | E6's request cost: on a sort key composite that is not the last and is a free-form string, `lte`, `gt` and `between` sent two exact key ranges, one request after the other, where 1.36 sent one condition *(proposed in review of commit 5b, 2026-10-28)* | **rejected; superseded by F1 (owner 2026-10-28)** | A stored value sorted apart as well as a bound (`gt: "new"` must return `new york`, whose unescaped key `new york#…` sat between `new`'s key and `new#…`), so no single range over unescaped text was exact for these operators, and every such query paid a second request and was a planned read. Escaping the key text (F1) makes key order value order, so each bound is one exact range again and the split machinery (`compositeSpans`, the multi-range `key` plan, `keyTextAvoids`) is gone. |
 | D1 | `.within()` on collections and `scan` | **out** | Collections have no SK composites to bound; Z-order can't be a member. |
 | D2 | `in` / `beginsWith` bounds on composite indexes, `in` on prefix composites | **out** | `in` only on `literals` dimensions; `.where()` keeps `beginsWith`. Follow-up. |
@@ -2039,7 +2098,9 @@ issue's Scope section; *(confirmed 2026-10-27)* = proposed here and confirmed by
 10. **§9a "for every query".** `Aggregate.list` (own loop, `listRequestLimit`) and EventStore's
     direct `Limit` don't go through `computeRequestLimit` (C4).
 11. **§9a "Results and cursors are unchanged" (and Scope).** Not with `maxPages`: one call reads
-    fewer rows under smaller requests and returns fewer items. Hence C6.
+    fewer rows under smaller requests and returns fewer items. Hence C6. Without `maxPages`,
+    results are unchanged and cursors resume at the same place, but a `fetch` cursor's value and
+    null-ness, and `Query.paginate`'s page boundaries, follow the sized requests (C9, C10).
 12. **§9a "the article's fixed 16 then becomes the starting value" for `jump`.** Pass-rate sizing
     grows `jump` pages into gaps; jump pages are sized by in-box run length instead (§8.5).
 13. **§7 "Bit budget: the dimensions' total bits must fit the sort-key limit."** The prefix

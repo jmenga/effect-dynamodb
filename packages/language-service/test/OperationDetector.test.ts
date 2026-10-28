@@ -303,6 +303,17 @@ describe("OperationDetector", () => {
     expect(op!.entity?.variableName).toBe("Tasks")
   })
 
+  it("should detect a terminal through .onRequest() and .filterBy() combinators", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" }).onRequest(log).filterBy(keep).collect()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, source.indexOf("collect") + 1, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("bound-query-terminal")
+    expect(op!.terminalName).toBe("collect")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
   it("should detect db.entities.Tasks.scan() via v2 path", () => {
     const source = `db.entities.Tasks.scan()`
     const sf = parseSource(source)

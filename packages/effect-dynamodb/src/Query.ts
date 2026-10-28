@@ -69,9 +69,14 @@ interface QueryState {
   readonly entityTypes: ReadonlyArray<string>
   /** Maximum number of items to RETURN (a contract on results). */
   readonly limitValue: number | undefined
-  /** DynamoDB `Limit` — rows examined per request (a contract on round trips). */
-  readonly pageSizeValue: number | undefined
+  /**
+   * DynamoDB `Limit` — rows examined per request (a contract on round trips).
+   * `"natural"` sizes requests exactly as 1.36 did (see {@link pageSize}).
+   */
+  readonly pageSizeValue: number | "natural" | undefined
   readonly maxPagesValue: number | undefined
+  /** Called after every request a terminal sends, in order (see {@link onRequest}). */
+  readonly observers: ReadonlyArray<(event: QueryRequestEvent) => Effect.Effect<void>>
   readonly scanForward: boolean
   readonly consistentRead: boolean
   readonly ignoreOwnershipFlag: boolean
@@ -330,6 +335,7 @@ export const make = <A>(config: {
     limitValue: undefined,
     pageSizeValue: undefined,
     maxPagesValue: undefined,
+    observers: [],
     scanForward: true,
     consistentRead: false,
     ignoreOwnershipFlag: false,
@@ -387,6 +393,7 @@ export const makeScan = <A>(config: {
     limitValue: undefined,
     pageSizeValue: undefined,
     maxPagesValue: undefined,
+    observers: [],
     scanForward: true,
     consistentRead: false,
     ignoreOwnershipFlag: false,
@@ -435,8 +442,12 @@ export const where: {
  * The query accumulates across as many DynamoDB requests as it takes to reach
  * `n` accepted items (or to exhaust the key range). Under a `FilterExpression`
  * DynamoDB's own `Limit` bounds rows *examined* before the filter runs, so it
- * cannot express this — {@link pageSize} is the knob that sets `Limit`, and
- * {@link maxPages} stays the hard stop on the number of requests.
+ * cannot carry `n` itself. Instead each request's `Limit` is sized from the
+ * pass rate the earlier requests observed (rows accepted / rows examined), so
+ * a selective filter reads about what it needs rather than a 1 MB page.
+ * {@link pageSize} fixes `Limit` instead (`"natural"` restores 1.36's sizing),
+ * and {@link maxPages} stays the hard stop on the number of requests — a query
+ * with one keeps 1.36's sizing, so one call returns what it did.
  *
  * ```ts
  * query.pipe(Query.limit(3), Query.collect)               // 3 items
@@ -460,16 +471,87 @@ export const limit: {
  * A contract on round trips, not on what comes back: a request under a
  * `FilterExpression` may return fewer than `n` items, and pagination continues
  * until the key range is exhausted (or {@link limit} / {@link maxPages} stops it).
+ * A number is used as given (DynamoDB rejects one it does not accept).
+ *
+ * `"natural"` opts out of the request sizing {@link limit} does under a filter,
+ * and sizes every request exactly as 1.36 did: a natural 1 MB page under a
+ * filter or predicate, `limit` doubling per request over history rows, and the
+ * outstanding `limit` otherwise. Any other string throws `[EDD-9095]`.
  */
 export const pageSize: {
-  (n: number): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, n: number): Query<A>
+  (size: number | "natural"): <A>(self: Query<A>) => Query<A>
+  <A>(self: Query<A>, size: number | "natural"): Query<A>
+} = Function.dual(2, <A>(self: Query<A>, size: number | "natural"): Query<A> => {
+  if (typeof size === "string" && size !== "natural") {
+    throw new Error(
+      `[EDD-9095] pageSize(${JSON.stringify(size)}) is not a page size: pass the number of ` +
+        `rows each request examines (DynamoDB's Limit), or "natural" to size requests as ` +
+        `1.36 did.`,
+    )
+  }
+  return new QueryImpl<A>({
+    ...self._state,
+    pageSizeValue: size,
+  })
+})
+
+/**
+ * What a terminal reports after each request it sends (see {@link onRequest}).
+ *
+ * `lower` / `upper` show the sort key condition sent: `eq` as `[v, v]`,
+ * `between` as `[a, b]`, `gt` / `gte` as `[v, undefined]`, `lt` / `lte` as
+ * `[undefined, v]`, `begins_with` as `[prefix, undefined]`, and no condition
+ * (or a scan) as `[undefined, undefined]`.
+ */
+export interface QueryRequestEvent {
+  /**
+   * `read` for a request whose rows become items (a `count` under
+   * {@link filterBy} reads its items too); `count` for a request `count` sends
+   * to count rows; `probe` for one that only locates where to read next.
+   */
+  readonly kind: "read" | "probe" | "count"
+  /** 1-based within the terminal call. */
+  readonly request: number
+  /** Display form of the key condition's lower bound. */
+  readonly lower: string | undefined
+  /** Display form of the key condition's upper bound. */
+  readonly upper: string | undefined
+  /** The `Limit` sent, if any. */
+  readonly limit: number | undefined
+  /** Rows DynamoDB examined (`ScannedCount`; the rows returned when it is absent). */
+  readonly scannedCount: number
+  /** Rows after the FilterExpression (`Count`; the rows returned when it is absent). */
+  readonly count: number
+  /** Rows that became items: what history rows, predicates and missing items left. */
+  readonly accepted: number
+}
+
+/**
+ * Observe every request a terminal sends: `observer` runs after each one, in
+ * the terminal's fiber, with what it examined and kept. Several observers run
+ * in the order they were added. A failure of one is a defect. DynamoDB calls
+ * an observer makes are not counted in the query's consumed-capacity report.
+ *
+ * Σ `scannedCount` against Σ `accepted` is what a query read against what it
+ * returned:
+ *
+ * ```ts
+ * query.pipe(
+ *   Query.onRequest((event) => Console.log(event.request, event.limit, event.scannedCount)),
+ *   Query.limit(10),
+ *   Query.collect,
+ * )
+ * ```
+ */
+export const onRequest: {
+  (observer: (event: QueryRequestEvent) => Effect.Effect<void>): <A>(self: Query<A>) => Query<A>
+  <A>(self: Query<A>, observer: (event: QueryRequestEvent) => Effect.Effect<void>): Query<A>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, n: number): Query<A> =>
+  <A>(self: Query<A>, observer: (event: QueryRequestEvent) => Effect.Effect<void>): Query<A> =>
     new QueryImpl<A>({
       ...self._state,
-      pageSizeValue: n,
+      observers: [...self._state.observers, observer],
     }),
 )
 
@@ -911,8 +993,9 @@ const buildCommandInput = (
 /**
  * @internal Build the full DynamoDB command parameters from state and table name.
  *
- * `Limit` is NOT derived from state here — it is per-request (it shrinks as a
- * `limit` budget is consumed) and is always supplied through `overrides`.
+ * The default `Limit` is the first request's (what {@link asParams} reports).
+ * A terminal supplies each request's own through `overrides`: it shrinks as a
+ * `limit` budget is consumed and follows the observed pass rate.
  */
 const buildDynamoCommand = (
   state: QueryState,
@@ -930,7 +1013,7 @@ const buildDynamoCommand = (
     ExpressionAttributeNames: input.ExpressionAttributeNames,
     ExpressionAttributeValues: input.ExpressionAttributeValues,
     ConsistentRead: input.ConsistentRead,
-    Limit: computeRequestLimit(state, state.limitValue),
+    Limit: requestLimit(state, state.limitValue, emptyEstimator, 1),
     ScanIndexForward: state.isScan ? undefined : state.scanForward,
     // An LSI that does not project the items: DynamoDB fetches them from the
     // table. Not with a ProjectionExpression, which DynamoDB rejects beside
@@ -1048,35 +1131,180 @@ const hydrateRows = (
 /** The largest `Limit` a growing request asks for: DynamoDB stops at 1 MB anyway. */
 const MAX_GROWN_LIMIT = 100_000
 
+/** The first filtered request asks for `remaining × INITIAL_FACTOR` rows, at least `MIN_FIRST`. */
+const INITIAL_FACTOR = 2
+const MIN_FIRST = 16
+/** Headroom over the rows the observed pass rate says the outstanding items need. */
+const SAFETY = 1.25
+/** How much a request grows over the last when nothing passed it. */
+const GROWTH = 2
+
 /**
- * @internal DynamoDB `Limit` for the next request.
+ * @internal How a terminal sizes its requests' `Limit` — one mode per query:
  *
- * - `pageSize` always wins as the round-trip budget when it is set.
+ * - `fixed` — a numeric {@link pageSize}, used as given (and, as in 1.36,
+ *   capped at the outstanding `limit` when nothing filters).
+ * - `natural` — `pageSize("natural")`, or a {@link maxPages} cap: exactly
+ *   1.36's sizing ({@link legacyRequestLimit}). A capped request count keeps
+ *   it because smaller requests would change what one call returns.
+ * - `none` — no {@link limit}: natural pages (or `pageSize`), as in 1.36.
+ * - `adaptive` — a `limit` under a filter, a predicate or rows dropped as
+ *   history: each `Limit` follows the observed pass rate ({@link nextLimit}).
+ * - `budget` — a `limit` nothing filters: every examined row is an accepted
+ *   row, so `Limit` is the outstanding budget. The `__edd_e__` ownership
+ *   clause alone stays here: it only rejects foreign rows, which the loop
+ *   makes up by fetching another page.
+ */
+type SizingMode = "fixed" | "natural" | "none" | "budget" | "adaptive"
+
+const sizingMode = (state: QueryState): SizingMode => {
+  if (typeof state.pageSizeValue === "number") return "fixed"
+  if (state.pageSizeValue === "natural") return "natural"
+  if (state.limitValue === undefined) return "none"
+  if (state.maxPagesValue !== undefined) return "natural"
+  if (filtered(state) || dropsRows(state)) return "adaptive"
+  return "budget"
+}
+
+/**
+ * @internal Whether the caller filters rows — server-side or with a client
+ * predicate — so a request cannot assume every row it examines passes.
+ * (#171: a planned range's own filter and row check join these, design §8.1.)
+ */
+const filtered = (state: QueryState): boolean =>
+  state.exprFilters.length > 0 || state.predicates.length > 0
+
+/**
+ * @internal What one terminal call's requests have observed: rows examined
+ * (`ScannedCount`), rows accepted as items, and the last request's `Limit`,
+ * rows examined and acceptances. Plain data, kept in the loop (or
+ * `pageStream`'s page state) and never in a cursor: a resumed query starts
+ * fresh.
+ */
+interface Estimator {
+  readonly examined: number
+  readonly accepted: number
+  readonly lastLimit: number
+  readonly lastExamined: number
+  readonly lastAccepted: number
+  readonly requests: number
+}
+
+const emptyEstimator: Estimator = {
+  examined: 0,
+  accepted: 0,
+  lastLimit: 0,
+  lastExamined: 0,
+  lastAccepted: 0,
+  requests: 0,
+}
+
+/**
+ * @internal The adaptive `Limit` of the next request, `remaining` items still
+ * owed:
+ *
+ * - The first asks for twice `remaining` (at least 16) when the caller filters
+ *   — nothing is known of the pass rate yet — and for `remaining` when only
+ *   history rows are dropped, #133's first request.
+ * - While nothing has been accepted, each asks for twice the last, so a run of
+ *   `n` rejected rows costs about `log2(n / limit)` requests (#133).
+ * - Then `remaining` over the pass rate, with 25% headroom. The rate is the
+ *   lower of the cumulative one and the last request's own: after an early
+ *   cluster of matches the cumulative rate stays high long after the matches
+ *   thin out, and alone it would size the request after each isolated later
+ *   match at a few dozen rows. After a request that accepted nothing, the
+ *   `Limit` at least doubles (a long run of misses).
+ *
+ * So a request that neither fills the limit nor reaches DynamoDB's 1 MB cap
+ * is followed by one at least twice its size unless it accepted over a third
+ * of what was owed, and a query sends a logarithmic number of requests more
+ * than natural 1 MB pages. Clamped to 1..100,000 (DynamoDB stops at 1 MB
+ * anyway).
+ */
+const nextLimit = (est: Estimator, remaining: number, filteredByUser: boolean): number => {
+  let limit: number
+  if (est.requests === 0) {
+    limit = filteredByUser ? Math.max(MIN_FIRST, Math.ceil(remaining * INITIAL_FACTOR)) : remaining
+  } else if (est.accepted === 0) {
+    limit = est.lastLimit * GROWTH
+  } else {
+    // Never above 1, whatever a response reports as examined.
+    const cumulative = est.accepted / Math.max(est.examined, est.accepted)
+    const rate =
+      est.lastAccepted > 0
+        ? Math.min(cumulative, est.lastAccepted / Math.max(est.lastExamined, est.lastAccepted))
+        : cumulative
+    limit = Math.ceil((remaining / rate) * SAFETY)
+    if (est.lastAccepted === 0) limit = Math.max(limit, est.lastLimit * GROWTH)
+  }
+  return Math.min(Math.max(limit, 1), MAX_GROWN_LIMIT)
+}
+
+/**
+ * @internal `est` after one more request: sent with `limitSent`, it examined
+ * `scanned` rows (`ScannedCount`, or the rows returned when a response lacks
+ * it), of which `accepted` became items.
+ */
+const observeEstimator = (
+  est: Estimator,
+  observed: {
+    readonly scanned: number
+    readonly accepted: number
+    readonly limitSent: number | undefined
+  },
+): Estimator => ({
+  examined: est.examined + observed.scanned,
+  accepted: est.accepted + observed.accepted,
+  // A request without `Limit` (only outside adaptive sizing) asked for what it read.
+  lastLimit: observed.limitSent ?? observed.scanned,
+  lastExamined: observed.scanned,
+  lastAccepted: observed.accepted,
+  requests: est.requests + 1,
+})
+
+/**
+ * @internal DynamoDB `Limit` for request number `page` (1-based within the
+ * terminal), `remaining` items still owed (`undefined` without a {@link limit})
+ * and `est` what the earlier requests observed. Adaptive sizing is
+ * {@link nextLimit}; every other mode of {@link sizingMode} is 1.36's
+ * {@link legacyRequestLimit}.
+ */
+const requestLimit = (
+  state: QueryState,
+  remaining: number | undefined,
+  est: Estimator,
+  page: number,
+): number | undefined =>
+  remaining !== undefined && sizingMode(state) === "adaptive"
+    ? nextLimit(est, remaining, filtered(state))
+    : legacyRequestLimit(state, remaining, page)
+
+/**
+ * @internal DynamoDB `Limit` for the next request as 1.36 sized it — what
+ * `pageSize("natural")`, a numeric `pageSize`, a `maxPages` cap, an unfiltered
+ * `limit` and no `limit` at all still send (see {@link sizingMode}).
+ *
+ * - A numeric `pageSize` always wins as the round-trip budget.
  * - With a `limit` budget and NO user filter, every examined row is an accepted
  *   row, so the budget can be handed to DynamoDB directly (bounded by pageSize).
- *   The `__edd_e__` ownership filter is not counted here: it only ever rejects
- *   foreign items, which the accumulate loop handles by fetching another page.
- * - With a user filter, `limit` cannot be expressed as `Limit` at all (it bounds
- *   rows examined, and the filter runs after), so the request asks for
- *   `pageSize` — or, unset, a natural (1 MB) page.
- * - A client-side predicate ({@link filterBy}) rejects rows even later, after
- *   decode, so it disqualifies the budget for exactly the same reason.
+ * - With a user filter or a client-side predicate ({@link filterBy}), `limit`
+ *   cannot be expressed as `Limit` (it bounds rows examined, and the filter
+ *   runs after), so the request asks for `pageSize` — or, unset, a natural
+ *   (1 MB) page.
  * - Rows dropped as history ({@link QueryState.liveRows}, a prepared `keep`)
- *   are not: they can't be skipped server-side, and a run of them (an item's
- *   versions, its tombstones) can far outnumber the items. The first request
- *   asks for `limit`, and each later one twice the last — so a run of `n`
- *   history rows costs about `log2(n / limit)` requests, not `n / limit` — and
- *   the surplus past `limit` is discarded, the cursor rebuilt from the last
- *   item returned (#133). `pageSize`, when set, is used as is.
+ *   can't be skipped server-side, and a run of them can far outnumber the
+ *   items: the first request asks for `limit` and each later one twice the
+ *   last, the surplus past `limit` discarded and the cursor rebuilt from the
+ *   last item returned (#133). `pageSize`, when set, is used as is.
  *
  * `page` is the request's 1-based number within the terminal.
  */
-const computeRequestLimit = (
+const legacyRequestLimit = (
   state: QueryState,
   remaining: number | undefined,
   page = 1,
 ): number | undefined => {
-  const pageSize = state.pageSizeValue
+  const pageSize = typeof state.pageSizeValue === "number" ? state.pageSizeValue : undefined
   if (remaining === undefined) return pageSize
   if (state.exprFilters.length > 0 || state.predicates.length > 0) return pageSize
   if (dropsRows(state)) {
@@ -1194,6 +1422,72 @@ const send = (
   )
 }
 
+/**
+ * @internal The display bounds of a sort key condition (see
+ * {@link QueryRequestEvent}): `begins_with` shows its prefix as the lower bound.
+ */
+const displayCondition = (
+  sk: { readonly condition: SortKeyCondition } | undefined,
+): readonly [lower: string | undefined, upper: string | undefined] => {
+  if (sk === undefined) return [undefined, undefined]
+  const condition = sk.condition
+  if ("eq" in condition) return [condition.eq, condition.eq]
+  if ("between" in condition) return [condition.between[0], condition.between[1]]
+  if ("gt" in condition) return [condition.gt, undefined]
+  if ("gte" in condition) return [condition.gte, undefined]
+  if ("lt" in condition) return [undefined, condition.lt]
+  if ("lte" in condition) return [undefined, condition.lte]
+  return [condition.beginsWith, undefined]
+}
+
+/**
+ * @internal What a response says it examined and kept: `ScannedCount` and
+ * `Count`, each the rows returned when the response lacks it (mocks, older
+ * emulators).
+ */
+const responseCounts = (response: {
+  readonly Items?: ReadonlyArray<unknown> | undefined
+  readonly Count?: number | undefined
+  readonly ScannedCount?: number | undefined
+}): { readonly scannedCount: number; readonly count: number } => {
+  const returned = response.Items?.length ?? 0
+  return {
+    scannedCount: response.ScannedCount ?? returned,
+    count: response.Count ?? returned,
+  }
+}
+
+/**
+ * @internal Report one request to the query's observers ({@link onRequest}),
+ * in order, once its rows have been examined. An observer's failure (or throw)
+ * is a defect. They run outside the terminal's consumed-capacity operation, so
+ * a DynamoDB call one makes is not charged to the query.
+ */
+const notify = (
+  state: QueryState,
+  observed: Omit<QueryRequestEvent, "lower" | "upper">,
+): Effect.Effect<void> => {
+  if (state.observers.length === 0) return Effect.void
+  const [lower, upper] = displayCondition(state.isScan ? undefined : state.skConditions[0])
+  const event: QueryRequestEvent = {
+    kind: observed.kind,
+    request: observed.request,
+    lower,
+    upper,
+    limit: observed.limit,
+    scannedCount: observed.scannedCount,
+    count: observed.count,
+    accepted: observed.accepted,
+  }
+  return Capacity.detached(
+    Effect.forEach(
+      state.observers,
+      (observer) => Effect.orDie(Effect.suspend(() => observer(event))),
+      { discard: true },
+    ),
+  )
+}
+
 /** @internal Does the decoded item pass every client-side predicate? */
 const accepts = (state: QueryState, item: unknown): boolean => {
   for (const predicate of state.predicates) {
@@ -1268,6 +1562,9 @@ const cursorProjectionFields = (
  * hydration (its item gone) widens the window by one. With a predicate,
  * acceptance is only known after decode, so the whole response is examined
  * (#122). `stoppedAt` is the index of the row that filled the budget, or -1.
+ * `accepted` counts the rows that became items: an excluded row, a hydration
+ * miss and a predicate's rejection are not, and neither is a row past the
+ * budget, left unexamined.
  */
 const examinePage = <A>(
   client: DynamoClientService,
@@ -1277,10 +1574,14 @@ const examinePage = <A>(
   budget: number | undefined,
   borrowedFields: ReadonlyArray<string>,
 ): Effect.Effect<
-  { readonly items: Array<A>; readonly stoppedAt: number },
+  { readonly items: Array<A>; readonly stoppedAt: number; readonly accepted: number },
   DynamoClientError | ValidationError
 > =>
   Effect.gen(function* () {
+    // Nothing left to accept. Without this the loop below never advances
+    // (`end` stays at `next`) — or, under a predicate, accepts one row past
+    // the budget. No terminal asks; a guard all the same (#171).
+    if (budget === 0) return { items: [], stoppedAt: -1, accepted: 0 }
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
     // Borrowed attributes the raw-row hook reads are stripped after it ran:
     // borrowed into the request's projection, or — on a `BatchGet`-hydrated
@@ -1323,12 +1624,12 @@ const examinePage = <A>(
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
         if (budget !== undefined && items.length >= budget) {
-          return { items, stoppedAt: positions[k]! }
+          return { items, stoppedAt: positions[k]!, accepted: items.length }
         }
       }
       next = end
     }
-    return { items, stoppedAt: -1 }
+    return { items, stoppedAt: -1, accepted: items.length }
   })
 
 /**
@@ -1387,7 +1688,10 @@ export const collect = <A>(
  * {@link maxPages} requests have been made.
  *
  * The cursor resumes after the last item actually returned — a `null` cursor
- * means genuinely exhausted. Combine with {@link startFrom} to iterate:
+ * means genuinely exhausted. A non-null one can still lead to an empty page:
+ * a request that stops at its `Limit` cannot tell whether another match
+ * follows, which is likelier when {@link limit} sizes requests under a
+ * filter. Combine with {@link startFrom} to iterate:
  *
  * ```ts
  * const first = yield* query.pipe(Query.limit(25), Query.execute)
@@ -1425,14 +1729,16 @@ const executeCore = <A>(
     let startKey = state.exclusiveStartKey
     let pageCount = 0
     let cursor: string | null = null
+    let est = emptyEstimator
 
     while (true) {
       pageCount++
       const remaining = limitValue === undefined ? undefined : limitValue - items.length
+      const limitSent = requestLimit(state, remaining, est, pageCount)
       const cmd = buildDynamoCommand(
         indexState,
         tableName,
-        { ExclusiveStartKey: startKey, Limit: computeRequestLimit(state, remaining, pageCount) },
+        { ExclusiveStartKey: startKey, Limit: limitSent },
         borrowedFields,
       )
       const result = yield* send(client, state, cmd)
@@ -1450,6 +1756,19 @@ const executeCore = <A>(
       )
       items.push(...page.items)
       const stoppedAt = page.stoppedAt
+      const counts = responseCounts(result)
+      est = observeEstimator(est, {
+        scanned: counts.scannedCount,
+        accepted: page.accepted,
+        limitSent,
+      })
+      yield* notify(state, {
+        kind: "read",
+        request: pageCount,
+        limit: limitSent,
+        ...counts,
+        accepted: page.accepted,
+      })
 
       // Stopped inside the page: the surplus was discarded, so the cursor has
       // to be rebuilt from the last item handed back rather than from
@@ -1481,9 +1800,10 @@ const executeCore = <A>(
 
 /**
  * Execute the query and return a Stream of page arrays.
- * A page is one DynamoDB request (of {@link pageSize} rows, when set); the
- * stream ends once {@link limit} items have been emitted in total, the key
- * range is exhausted, or {@link maxPages} requests have been made.
+ * A page is one DynamoDB request (of {@link pageSize} rows, when set, or as
+ * {@link limit} sizes it under a filter); the stream ends once {@link limit}
+ * items have been emitted in total, the key range is exhausted, or
+ * {@link maxPages} requests have been made.
  */
 export const paginate = <A>(
   self: Query<A>,
@@ -1527,12 +1847,14 @@ const pageStream = <A>(
     return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
   }
 
-  // Cursor state travels through Stream.paginate rather than a closure, so
-  // re-running the returned stream restarts from the beginning.
+  // Cursor and sizing state travel through Stream.paginate rather than a
+  // closure, so re-running the returned stream restarts from the beginning —
+  // and sends the same `Limit`s.
   interface PageState {
     readonly key: Record<string, AttributeValue> | undefined
     readonly pageCount: number
     readonly emitted: number
+    readonly estimator: Estimator
   }
 
   return Stream.paginate(
@@ -1540,6 +1862,7 @@ const pageStream = <A>(
       key: state.exclusiveStartKey as Record<string, AttributeValue> | undefined,
       pageCount: 0,
       emitted: 0,
+      estimator: emptyEstimator,
     } as PageState,
     (pageState: PageState) =>
       Effect.gen(function* () {
@@ -1547,19 +1870,17 @@ const pageStream = <A>(
         const remaining = limitValue === undefined ? undefined : limitValue - pageState.emitted
         const indexState = indexQueryState(state)
         const borrowedFields = cursorProjectionFields(indexState, false)
+        const limitSent = requestLimit(state, remaining, pageState.estimator, pageCount)
         const cmd = buildDynamoCommand(
           indexState,
           tableName,
-          {
-            ExclusiveStartKey: pageState.key,
-            Limit: computeRequestLimit(state, remaining, pageCount),
-          },
+          { ExclusiveStartKey: pageState.key, Limit: limitSent },
           borrowedFields,
         )
         const result = yield* send(client, state, cmd)
 
         const returned = (result.Items ?? []) as Array<Record<string, AttributeValue>>
-        const { items: decoded } = yield* examinePage<A>(
+        const { items: decoded, accepted } = yield* examinePage<A>(
           client,
           tableName,
           state,
@@ -1567,6 +1888,19 @@ const pageStream = <A>(
           remaining,
           borrowedFields,
         )
+        const counts = responseCounts(result)
+        const estimator = observeEstimator(pageState.estimator, {
+          scanned: counts.scannedCount,
+          accepted,
+          limitSent,
+        })
+        yield* notify(state, {
+          kind: "read",
+          request: pageCount,
+          limit: limitSent,
+          ...counts,
+          accepted,
+        })
 
         const emitted = pageState.emitted + decoded.length
         const hasMorePages = result.LastEvaluatedKey != null
@@ -1579,6 +1913,7 @@ const pageStream = <A>(
                 key: result.LastEvaluatedKey as Record<string, AttributeValue>,
                 pageCount,
                 emitted,
+                estimator,
               } as PageState)
             : Option.none()
 
@@ -1594,7 +1929,9 @@ const pageStream = <A>(
  * {@link limit} caps the count, keeping `count()` equal to `collect().length`
  * for the same query: `.limit(n).count()` returns `min(matching, n)` and stops
  * counting once `n` is reached — which makes `.limit(1).count()` a cheap
- * existence check. {@link pageSize} sets the rows examined per request.
+ * existence check. Under a filter, each request of a limited count is sized
+ * from the pass rate the earlier ones showed, as {@link limit} describes.
+ * {@link pageSize} sets the rows examined per request instead.
  */
 export const count = <A>(
   self: Query<A>,
@@ -1641,16 +1978,28 @@ const countCore = <A>(
       let counted = 0
       let pages = 0
       let start: Record<string, AttributeValue> | undefined
+      let est = emptyEstimator
       do {
         pages++
         const remaining = limitValue === undefined ? undefined : limitValue - counted
+        const limitSent = requestLimit(state, remaining, est, pages)
         const cmd = buildDynamoCommand(judging, tableName, {
           ExclusiveStartKey: start,
-          Limit: computeRequestLimit(state, remaining, pages),
+          Limit: limitSent,
         })
         const result = yield* send(client, state, cmd)
         const rows = (result.Items ?? []) as Array<Record<string, AttributeValue>>
-        counted += rows.filter((row) => !isExcludedRow(state, row)).length
+        const accepted = rows.filter((row) => !isExcludedRow(state, row)).length
+        counted += accepted
+        const counts = responseCounts(result)
+        est = observeEstimator(est, { scanned: counts.scannedCount, accepted, limitSent })
+        yield* notify(state, {
+          kind: "count",
+          request: pages,
+          limit: limitSent,
+          ...counts,
+          accepted,
+        })
         start = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
         if (limitValue !== undefined && counted >= limitValue) return limitValue
         if (state.maxPagesValue != null && pages >= state.maxPagesValue) break
@@ -1661,18 +2010,32 @@ const countCore = <A>(
     let total = 0
     let pageCount = 0
     let exclusiveStartKey: Record<string, AttributeValue> | undefined
+    let est = emptyEstimator
 
     do {
       pageCount++
       const remaining = limitValue === undefined ? undefined : limitValue - total
+      // Under a filter and a `limit`, sized from the pass rate `Count` shows.
+      const limitSent = requestLimit(state, remaining, est, pageCount)
       const cmd = buildDynamoCommand(state, tableName, {
         ExclusiveStartKey: exclusiveStartKey,
         Select: "COUNT",
-        Limit: computeRequestLimit(state, remaining),
+        Limit: limitSent,
       })
       const result = yield* send(client, state, cmd)
 
-      total += result.Count ?? 0
+      const matched = result.Count ?? 0
+      total += matched
+      const scanned = result.ScannedCount ?? matched
+      est = observeEstimator(est, { scanned, accepted: matched, limitSent })
+      yield* notify(state, {
+        kind: "count",
+        request: pageCount,
+        limit: limitSent,
+        scannedCount: scanned,
+        count: matched,
+        accepted: matched,
+      })
       exclusiveStartKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
 
       if (limitValue !== undefined && total >= limitValue) return limitValue

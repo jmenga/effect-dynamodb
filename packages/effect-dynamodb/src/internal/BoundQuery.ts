@@ -233,15 +233,30 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
   /**
    * Return at most `n` items — a contract on results. The query accumulates
    * across as many requests as it takes, which is what makes it work under a
-   * `.filter()`. Use `.pageSize()` to size the requests themselves.
+   * `.filter()`, sizing each request from the pass rate the earlier ones
+   * showed. Use `.pageSize()` to size the requests themselves, or
+   * `.pageSize("natural")` for 1.36's sizing; a query with `.maxPages()` keeps
+   * 1.36's sizing too.
    */
   readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A>
 
   /**
    * Fetch in batches of `n` — sets DynamoDB's `Limit` (rows examined per
-   * request). A contract on round trips, not on what comes back.
+   * request). A contract on round trips, not on what comes back. `"natural"`
+   * sizes requests exactly as 1.36 did (natural 1 MB pages under a filter);
+   * any other string throws `[EDD-9095]`.
    */
-  readonly pageSize: (n: number) => BoundQuery<Model, SkRemaining, A>
+  readonly pageSize: (size: number | "natural") => BoundQuery<Model, SkRemaining, A>
+
+  /**
+   * Run `observer` after every request a terminal sends, with the `Limit` sent
+   * and the rows DynamoDB examined, the filter kept and the query accepted
+   * (`Query.QueryRequestEvent`). Its failure is a defect; DynamoDB calls it
+   * makes are not charged to the query's consumed capacity.
+   */
+  readonly onRequest: (
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ) => BoundQuery<Model, SkRemaining, A>
 
   /** Set the maximum number of DynamoDB pages to fetch. */
   readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A>
@@ -596,8 +611,14 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.limit(this._query, n), this._config)
   }
 
-  pageSize(n: number): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.pageSize(this._query, n), this._config)
+  pageSize(size: number | "natural"): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.pageSize(this._query, size), this._config)
+  }
+
+  onRequest(
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.onRequest(this._query, observer), this._config)
   }
 
   maxPages(n: number): BoundQueryImpl<Model, SkRemaining, A> {

@@ -158,6 +158,7 @@ export type {
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
 export * as Marshaller from "./Marshaller.js"
+export type { QueryRequestEvent } from "./Query.js"
 export * as Query from "./Query.js"
 export * as StorageEncoding from "./StorageEncoding.js"
 export type { Table as TableType, TableConfig } from "./Table.js"

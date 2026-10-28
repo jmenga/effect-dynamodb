@@ -319,7 +319,9 @@ function tryDetectV2ChainRoot(
         methodName === "maxPages" ||
         methodName === "startFrom" ||
         methodName === "consistentRead" ||
-        methodName === "ignoreOwnership"
+        methodName === "ignoreOwnership" ||
+        methodName === "filterBy" ||
+        methodName === "onRequest"
       ) {
         return tryDetectV2ChainRoot(ts, callee.expression, entities, collections)
       }
