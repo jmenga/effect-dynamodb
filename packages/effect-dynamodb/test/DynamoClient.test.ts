@@ -8,6 +8,7 @@ import * as Aggregate from "../src/Aggregate.js"
 import { classifyError, composeRangeUnder, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
+import { keyJustBelow } from "../src/internal/RangePlanner.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 import * as ZListings from "./helpers/ZOrderListings.js"
@@ -815,16 +816,29 @@ describe("DynamoClient", () => {
       DynamoClient.make({ entities: { Balls, Readings, Lookups }, tables: { WhereTable } })
     type WhereDb = Effect.Success<ReturnType<typeof makeWhereDb>>
 
-    /** Run a `.where()` query and return the captured DynamoDB input. */
-    const capture = (build: (db: WhereDb) => Effect.Effect<unknown, any, never>) => {
+    /** Run a `.where()` query and return every captured DynamoDB input. */
+    const captureAll = (build: (db: WhereDb) => Effect.Effect<unknown, any, never>) => {
       const captured: Array<any> = []
       const ClientLayer = makeQueryCapturingClient(captured)
       const TableLayer = WhereTable.layer({ name: "where-table" })
       return Effect.gen(function* () {
         const db = yield* makeWhereDb()
         yield* build(db)
-        return captured[0]
+        return captured
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+    }
+
+    /** Run a `.where()` query and return the (first) captured DynamoDB input. */
+    const capture = (build: (db: WhereDb) => Effect.Effect<unknown, any, never>) =>
+      Effect.map(captureAll(build), (captured) => captured[0])
+
+    /** A request's sort key condition, as an operator and its operand(s). */
+    const skCondition = (input: any): ReadonlyArray<string> => {
+      const values = input.ExpressionAttributeValues
+      const expression: string = input.KeyConditionExpression
+      if (expression.includes("BETWEEN")) return ["between", values[":sk1"].S, values[":sk2"].S]
+      const op = /#sk (<=|>=|=|<|>)/.exec(expression)?.[1] ?? "begins_with"
+      return [op, values[":sk"].S]
     }
 
     const skValue = (input: any) => input.ExpressionAttributeValues[":sk"].S as string
@@ -1002,6 +1016,9 @@ describe("DynamoClient", () => {
           expect(skLow(gte)).toBe(`${pinned}#seq_0042`)
           expect(skHigh(gte)).toBe(`${pinned}#${MAX}`)
 
+          // `seq` is the last composite: a greater value extends 0042's
+          // escaped text with a character above the delimiter (`0042%20b`,
+          // `0042b`), so `>` starts past `0042#`.
           const gt = yield* capture((db: any) =>
             db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
               .where((t: any, ops: any) => ops.gt(t.seq, "0042"))
@@ -1022,25 +1039,22 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("lt on a pinned terminal composite is refused (EDD-9046)", () =>
+      it.effect("lt on a pinned terminal composite ends just below the value", () =>
         Effect.gen(function* () {
-          // DynamoDB has one sort key condition, BETWEEN is inclusive at both
-          // ends, and a FilterExpression may not reference a key attribute — so
-          // `begins_with(prefix) AND sk < value` is inexpressible. Refuse rather
-          // than silently return the boundary item.
-          const ClientLayer = makeQueryCapturingClient([])
-          const TableLayer = WhereTable.layer({ name: "where-table" })
-          yield* Effect.gen(function* () {
-            const db = yield* DynamoClient.make({
-              entities: { Balls, Readings, Lookups },
-              tables: { WhereTable },
-            })
-            expect(() =>
-              (db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" }) as any).where(
-                (t: any, ops: any) => ops.lt(t.seq, "0042"),
-              ),
-            ).toThrow(/EDD-9046.*seq.*status/s)
-          }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+          // DynamoDB has one sort key condition and BETWEEN is inclusive at
+          // both ends: the high end is the greatest key text below the bound
+          // (`keyJustBelow`), so the boundary item is left out by the key
+          // condition itself. (Up to #171 this was refused, EDD-9046.)
+          const pinned = "$wheretest#v1#reading#status_done"
+          const lt = yield* capture((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1", status: "done" })
+              .where((t: any, ops: any) => ops.lt(t.seq, "0042"))
+              .collect(),
+          )
+          expect(skLow(lt)).toBe(`${pinned}#`)
+          expect(skHigh(lt)).toBe(`${pinned}#seq_0041\u{10FFFF}`)
+          expect(skHigh(lt) < `${pinned}#seq_0042`).toBe(true)
+          expect(skHigh(lt) > `${pinned}#seq_0041%20z`).toBe(true)
         }),
       )
 
@@ -1210,27 +1224,41 @@ describe("DynamoClient", () => {
 
       it.effect("inclusive upper bounds on a non-terminal composite span its subtree", () =>
         Effect.gen(function* () {
-          const lte = yield* capture((db: any) =>
+          const done = "$wheretest#v1#reading#status_done"
+          // `status` is a free-form string, whose escaped text sorts as its
+          // value (#171): `done later` is `done%20later`, above `done#…`. So
+          // `≤ done` ends past `done`'s subtree and `> done` starts there, one
+          // condition each.
+          const lte = yield* captureAll((db: any) =>
             db.entities.Readings.byDevice({ deviceId: "d-1" })
               .where((t: any, ops: any) => ops.lte(t.status, "done"))
               .collect(),
           )
-          expect(skValue(lte)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+          expect(lte.map(skCondition)).toEqual([["<=", `${done}#${MAX}`]])
 
-          const gt = yield* capture((db: any) =>
+          const gt = yield* captureAll((db: any) =>
             db.entities.Readings.byDevice({ deviceId: "d-1" })
               .where((t: any, ops: any) => ops.gt(t.status, "done"))
               .collect(),
           )
-          expect(skValue(gt)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+          expect(gt.map(skCondition)).toEqual([[">", `${done}#${MAX}`]])
 
-          const btw = yield* capture((db: any) =>
+          const btw = yield* captureAll((db: any) =>
             db.entities.Readings.byDevice({ deviceId: "d-1" })
               .where((t: any, ops: any) => ops.between(t.status, "a", "done"))
               .collect(),
           )
-          expect(skLow(btw)).toBe("$wheretest#v1#reading#status_a")
-          expect(skHigh(btw)).toBe(`$wheretest#v1#reading#status_done#${MAX}`)
+          expect(btw.map(skCondition)).toEqual([
+            ["between", "$wheretest#v1#reading#status_a", `${done}#${MAX}`],
+          ])
+
+          // A value holding a character up to `%` composes escaped.
+          const spaced = yield* captureAll((db: any) =>
+            db.entities.Readings.byDevice({ deviceId: "d-1" })
+              .where((t: any, ops: any) => ops.lte(t.status, "done later"))
+              .collect(),
+          )
+          expect(spaced.map(skCondition)).toEqual([["<=", `${done}%20later#${MAX}`]])
         }),
       )
 
@@ -1511,14 +1539,18 @@ describe("DynamoClient", () => {
       it.effect("gt on a terminal composite keeps the unconditional sentinel delimiter", () =>
         Effect.gen(function* () {
           // `compose(v)￿` alone would sort below `compose(v + "0")`, which is a
-          // strictly greater value that must stay inside a `gt`.
+          // strictly greater value that must stay inside a `gt`. `compose(v)#￿`
+          // sorts below every greater value's key, escaped or not: an escape
+          // starts with `%`, above the delimiter (#171).
           const input = yield* capture((db) =>
             db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" })
               .where((t, { gt }) => gt(t.taskId, "t2"))
               .collect(),
           )
           expect(skLow(input)).toBe(`$skprefix#v1#task#status_done#taskid_t2#${MAX}`)
-          expect(skLow(input) < "$skprefix#v1#task#status_done#taskid_t20").toBe(true)
+          for (const greater of ["t20", "t2%200", "t2%21", "t2%01"]) {
+            expect(skLow(input) < `$skprefix#v1#task#status_done#taskid_${greater}`).toBe(true)
+          }
         }),
       )
     })
@@ -1784,11 +1816,13 @@ describe(".within() on composite accessors (#171)", () => {
             recordKeyForm,
           )
           // A lower bound starts exactly at the composed value…
-          expect(under({ gte: value }).condition, context).toEqual({
+          expect(under({ gte: value }), context).toEqual({
             between: [composed, `${prefixText}￿`],
           })
+          // …an upper one ends at it…
+          expect(under({ lt: value }), context).toEqual({ between: [prefixText, composed] })
           // …an eq bound is the value's subtree, as a begins_with of the record…
-          expect(under({ eq: value }).condition, context).toEqual({
+          expect(under({ eq: value }), context).toEqual({
             beginsWith: KeyComposer.composeSortKeyBeginsWith(
               schema,
               "Thing",
@@ -1806,14 +1840,12 @@ describe(".within() on composite accessors (#171)", () => {
             index,
             recordKeyForm,
           )
-          expect(under({ eq: "X-1" }, true, lastPrefix).condition, context).toEqual({
-            eq: KeyComposer.composeSortKeyPrefix(schema, "Thing", 1, index, fullKeyForm),
+          const fullKey = KeyComposer.composeSortKeyPrefix(schema, "Thing", 1, index, fullKeyForm)
+          expect(under({ eq: "X-1" }, true, lastPrefix), context).toEqual({ eq: fullKey })
+          // A strict lt on the last composite ends just below the stored key.
+          expect(under({ lt: "X-1" }, true, lastPrefix), context).toEqual({
+            between: [lastPrefix, keyJustBelow(fullKey)],
           })
-          // A strict lt on the last composite admits the bound itself, and says so.
-          expect(under({ lt: "X-1" }, true, lastPrefix).excludes, context).toBe(
-            KeyComposer.composeSortKeyPrefix(schema, "Thing", 1, index, fullKeyForm),
-          )
-          expect(under({ lt: value }).excludes, context).toBeUndefined()
         }
       }
     }
@@ -1935,8 +1967,9 @@ describe(".within() on composite accessors (#171)", () => {
       const explain = yield* query.explain()
       expect(explain.plan).toBe("skip-scan")
       expect(explain.reason).toBe("skip tuple: status")
-      // `total` is the last composite: the strict bound is also checked per row.
-      expect(explain.rowChecks).toEqual(["total"])
+      // `total` is the last composite: the strict bound ends just below the
+      // value's key, so nothing is checked per row.
+      expect(explain.rowChecks).toEqual([])
       const P = explain.keyConditions[0]!.lower!
       expect(P.endsWith("#")).toBe(true)
       expect(P).toContain("order")

@@ -13579,18 +13579,21 @@ describeConnected("sort key conditions via .where() (closes #101)", () => {
   )
 
   it.effect(
-    "multi-composite: strict lt on a pinned terminal composite is rejected (EDD-9046)",
+    "multi-composite: strict lt on a pinned terminal composite ends just below the value",
     () =>
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({
           entities: { SkCondBalls, SkCondReadings },
           tables: { SkCondTable },
         })
-        expect(() =>
-          db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" }).where((t, ops) =>
-            ops.lt(t.seq, "0002"),
-          ),
-        ).toThrow(/EDD-9046/)
+        const key = (r: ReadingRecord) => `${r.status}/${r.seq}`
+        // Up to #171 this was refused (EDD-9046): BETWEEN is inclusive, so its
+        // high end is the greatest key text below the value's.
+        const q = db.entities.SkCondReadings.byDevice({ deviceId: "d-1", status: "done" }).where(
+          (t, ops) => ops.lt(t.seq, "0002"),
+        )
+        expect((yield* q.collect()).map(key)).toEqual(["done/0001"])
+        expect((yield* q.reverse().collect()).map(key)).toEqual(["done/0001"])
       }).pipe(provideSkCond),
   )
 })

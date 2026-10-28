@@ -216,8 +216,13 @@ export const compareUtf8 = (a: KeyValue, b: KeyValue): number => {
   return i < a.length ? 1 : j < b.length ? -1 : 0
 }
 
-/** The highest code point: above every character a key can hold but itself. */
-const TOP_CODE_POINT = String.fromCodePoint(0x10ffff)
+/**
+ * The highest code point: above every character a key can hold but itself.
+ * Where the text after a prefix is a value's own (no label precedes it),
+ * `prefix + KEY_TOP` bounds every key under the prefix; {@link KEY_MAX} does
+ * not, since an emoji (UTF-8 `F0 …`) outsorts it.
+ */
+export const KEY_TOP = String.fromCodePoint(0x10ffff)
 
 /**
  * An inclusive high end for a strict `<` on key text: below `key`, and at or
@@ -234,7 +239,7 @@ export const keyJustBelow = (key: string): string => {
   const last = key.codePointAt(key.length - width)
   if (last === undefined || last === 0) return head
   const previous = last - 1 >= 0xd800 && last - 1 <= 0xdfff ? 0xd7ff : last - 1
-  return `${head}${String.fromCodePoint(previous)}${TOP_CODE_POINT}`
+  return `${head}${String.fromCodePoint(previous)}${KEY_TOP}`
 }
 
 const startsWithKey = (value: KeyValue, prefix: KeyValue): boolean => {
@@ -474,6 +479,8 @@ export type InnerPlan = {
   readonly conditionFor: (tuple: string | undefined) => KeyRange
   /** The bounds that range can't express: the same for every tuple. */
   readonly rowCheck: RowCheck | undefined
+  /** No value satisfies the bounds (`{ gt: 3, lte: 3 }`): the plan is `empty`, and reads nothing. */
+  readonly empty: boolean
 }
 
 /** A composite sort key plan, as the accessor's `.within()` builds it. */
@@ -510,13 +517,16 @@ export const compositePlanner =
     const P = spec.filterPlan.prefix
     const UPPER = `${P}${KEY_MAX}`
     const tupled = space._tag === "string"
-    const mode: PlanMode = !tupled
-      ? "key"
-      : spec.ineligible !== undefined || maxSkips === 0
-        ? "filter"
-        : "skip-scan"
-    const reason =
-      space._tag === "none"
+    const mode: PlanMode = spec.inner.empty
+      ? "empty"
+      : !tupled
+        ? "key"
+        : spec.ineligible !== undefined || maxSkips === 0
+          ? "filter"
+          : "skip-scan"
+    const reason = spec.inner.empty
+      ? "the bounds admit no value"
+      : space._tag === "none"
         ? "leading composites bounded"
         : (spec.ineligible ??
           (maxSkips === 0 ? "maxSkips: 0" : `skip tuple: ${space.fields.join(", ")}`))
@@ -619,11 +629,13 @@ export const compositePlanner =
     })
 
     const initial = (): Step =>
-      mode === "key"
-        ? keyRead({ _tag: "Start" })
-        : mode === "filter"
-          ? filterRead(fresh(undefined, { _tag: "Start" }))
-          : probeFrom(fresh(undefined, { _tag: "Start" }))
+      mode === "empty"
+        ? done
+        : mode === "key"
+          ? keyRead({ _tag: "Start" })
+          : mode === "filter"
+            ? filterRead(fresh(undefined, { _tag: "Start" }))
+            : probeFrom(fresh(undefined, { _tag: "Start" }))
 
     // -- resume (§10.3) --
 
@@ -691,6 +703,8 @@ export const compositePlanner =
           : keyRead({ _tag: "At", startKey }, startKey)
       }
       if (cursor.f !== fingerprint) return refuse("its plan fingerprint differs")
+      // Nothing to resume: no cursor of an empty plan is ever handed out.
+      if (mode === "empty") return done
       const s = cursor.s
       if (
         s === undefined ||
@@ -805,9 +819,11 @@ export const compositePlanner =
       // The ranges known before anything is read: the key plan's one range,
       // or the span the probes (or the filter read) walk.
       keyConditions:
-        mode === "key"
-          ? [shownRange(spec.inner.conditionFor(undefined))]
-          : [{ lower: P, upper: UPPER, exact: false }],
+        mode === "empty"
+          ? []
+          : mode === "key"
+            ? [shownRange(spec.inner.conditionFor(undefined))]
+            : [{ lower: P, upper: UPPER, exact: false }],
       filter: undefined,
       rowChecks: rowCheck?.fields ?? [],
       sizing,

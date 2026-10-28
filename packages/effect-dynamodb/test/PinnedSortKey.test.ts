@@ -455,3 +455,386 @@ describe("time-series sort key conditions (#171)", () => {
     }).pipe(Effect.provide(layer)),
   )
 })
+
+// ---------------------------------------------------------------------------
+// History rows and the empty-composite half (#171 E7 audit)
+// ---------------------------------------------------------------------------
+
+const Doc = Schema.Struct({ ownerId: Schema.String, name: Schema.String, plan: Schema.String })
+type Doc = typeof Doc.Type
+
+/** Version snapshots and tombstones beside the live rows, on two index shapes. */
+const Docs = Entity.make({
+  model: Doc,
+  entityType: "Doc",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ownerId"] },
+    sk: { field: "sk", composite: ["name"] },
+  },
+  indexes: {
+    // An empty-composite half (canonical shape 6): the sort key is the
+    // entity's prefix alone.
+    byPlan: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["plan"] },
+      sk: { field: "gsi1sk", composite: [] },
+    },
+    // A clustered collection member with an empty-composite half.
+    shelf: {
+      name: "gsi2",
+      collection: "shelf",
+      type: "clustered",
+      pk: { field: "gsi2pk", composite: ["ownerId"] },
+      sk: { field: "gsi2sk", composite: [] },
+    },
+  },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+const Profile = Schema.Struct({ ownerId: Schema.String, plan: Schema.String })
+type Profile = typeof Profile.Type
+
+/** An empty-composite primary sort key, whose history rows extend the live key. */
+const Profiles = Entity.make({
+  model: Profile,
+  entityType: "Profile",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ownerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    shelf: {
+      name: "gsi2",
+      collection: "shelf",
+      type: "clustered",
+      pk: { field: "gsi2pk", composite: ["ownerId"] },
+      sk: { field: "gsi2sk", composite: ["plan"] },
+    },
+  },
+  versioned: { retain: true },
+  softDelete: true,
+})
+
+const ShelfTable = Table.make({ schema: AppSchema, entities: { Docs, Profiles } })
+
+/**
+ * A live row and its history as the write path stores them: snapshots of
+ * versions 1..n-1 and, for a deleted item, a tombstone in place of the live
+ * row — each under its own history sort key, without index keys.
+ */
+const withHistory = (
+  entity: { readonly _keyForm: (record: Record<string, unknown>) => Record<string, unknown> },
+  entityType: string,
+  item: Record<string, unknown>,
+  versions: number,
+  deleted: boolean,
+): ReadonlyArray<Row> => {
+  const indexes = indexesOf(entity)
+  const keys = KeyComposer.composeAllKeys(
+    AppSchema,
+    entityType,
+    1,
+    indexes,
+    entity._keyForm({ ...item }),
+  )
+  const liveSk = keys.sk as string
+  const segment = KeyComposer.composeHistoryItemSegment(
+    AppSchema,
+    entityType,
+    1,
+    indexes.primary!,
+    liveSk,
+  )
+  const history = segment === undefined ? undefined : { item: segment }
+  const base = { ...item, pk: keys.pk, __edd_e__: entityType }
+  const snapshots = Array.from({ length: versions - 1 }, (_, v) =>
+    toAttributeMap({
+      ...base,
+      sk: DynamoSchema.composeVersionKey(AppSchema, entityType, v + 1, history),
+      version: v + 1,
+    }),
+  )
+  const live = deleted
+    ? toAttributeMap({
+        ...base,
+        sk: DynamoSchema.composeDeletedKey(
+          AppSchema,
+          entityType,
+          "2026-10-28T00:00:00.000Z",
+          history,
+        ),
+        version: versions,
+        deletedAt: "2026-10-28T00:00:00.000Z",
+      })
+    : toAttributeMap({ ...item, ...keys, version: versions, __edd_e__: entityType })
+  return [...snapshots, live]
+}
+
+const shelfRows: ReadonlyArray<Row> = [
+  ...withHistory(Docs, "Doc", { ownerId: "o-1", name: "a", plan: "pro" }, 3, false),
+  ...withHistory(Docs, "Doc", { ownerId: "o-1", name: "ab", plan: "pro" }, 2, false),
+  ...withHistory(Docs, "Doc", { ownerId: "o-1", name: "a b", plan: "free" }, 1, false),
+  ...withHistory(Docs, "Doc", { ownerId: "o-1", name: "ac", plan: "pro" }, 2, true),
+  ...withHistory(Profiles, "Profile", { ownerId: "o-1", plan: "pro" }, 3, false),
+  ...withHistory(Profiles, "Profile", { ownerId: "o-2", plan: "free" }, 2, true),
+]
+
+/** A client serving each request from the rows its index and partition key select. */
+const serveShelf = () => {
+  const requests: Array<{ readonly index: string; readonly keyCondition: string }> = []
+  const fields: Record<string, readonly [string, string]> = {
+    primary: ["pk", "sk"],
+    gsi1: ["gsi1pk", "gsi1sk"],
+    gsi2: ["gsi2pk", "gsi2sk"],
+  }
+  const layer = Layer.merge(
+    Layer.succeed(
+      DynamoClient,
+      mockDynamoClient({
+        query: (input) => {
+          const index = input.IndexName ?? "primary"
+          requests.push({ index, keyCondition: input.KeyConditionExpression ?? "" })
+          const [pkField, skField] = fields[index]!
+          const pk = input.ExpressionAttributeValues![":pk"]!.S
+          return makePartition({
+            rows: shelfRows.filter((row) => row[pkField]?.S === pk && row[skField] !== undefined),
+            pkField,
+            skField,
+            keyFields: index === "primary" ? ["pk", "sk"] : [pkField, skField, "pk", "sk"],
+            evaluateFilter: true,
+          }).query(input)
+        },
+      }),
+    ),
+    ShelfTable.layer({ name: "shelf" }),
+  )
+  return { layer, requests }
+}
+
+describe("history rows and the empty-composite half (#171 E7 audit)", () => {
+  const { layer, requests } = serveShelf()
+  const db = DynamoClient.make({ entities: { Docs, Profiles }, tables: { ShelfTable } })
+  const names = (docs: ReadonlyArray<Doc>) => docs.map((doc) => doc.name)
+
+  it.effect(
+    "a fully pinned primary key is `=`: the live row, not its history nor longer names",
+    () =>
+      Effect.gen(function* () {
+        const { entities } = yield* db
+        for (const reverse of [false, true]) {
+          requests.length = 0
+          const query = entities.Docs.primary({ ownerId: "o-1", name: "a" })
+          const got = yield* (reverse ? query.reverse() : query).collect()
+          expect(names(got)).toEqual(["a"])
+          expect(requests).toEqual([{ index: "primary", keyCondition: "#pk = :pk AND #sk = :sk" }])
+        }
+        // A deleted item's pin finds nothing: its tombstone is history.
+        expect(yield* entities.Docs.primary({ ownerId: "o-1", name: "ac" }).collect()).toEqual([])
+      }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("an unpinned primary key reads the partition and keeps the live rows", () =>
+    Effect.gen(function* () {
+      const { entities } = yield* db
+      requests.length = 0
+      const got = yield* entities.Docs.primary({ ownerId: "o-1" }).collect()
+      expect(names(got)).toEqual(["a", "a b", "ab"])
+      expect(requests.map((r) => r.keyCondition)).toEqual(["#pk = :pk"])
+    }).pipe(Effect.provide(layer)),
+  )
+
+  // An empty-composite half pins nothing: the accessor sends the partition
+  // key alone, as before. On the primary key the item's history rows extend
+  // the live key and are dropped as rows; an index never holds history.
+  it.effect("an empty-composite primary sort key: the partition key alone, the live row kept", () =>
+    Effect.gen(function* () {
+      const { entities } = yield* db
+      for (const [ownerId, want] of [
+        ["o-1", ["pro"]],
+        ["o-2", []],
+      ] as const) {
+        requests.length = 0
+        const got: ReadonlyArray<Profile> = yield* entities.Profiles.primary({ ownerId }).collect()
+        expect(got.map((profile) => profile.plan)).toEqual(want)
+        expect(requests.map((r) => r.keyCondition)).toEqual(["#pk = :pk"])
+      }
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("an empty-composite GSI half: the partition key alone, live rows only", () =>
+    Effect.gen(function* () {
+      const { entities } = yield* db
+      requests.length = 0
+      const got = yield* entities.Docs.byPlan({ plan: "pro" }).collect()
+      expect(new Set(names(got))).toEqual(new Set(["a", "ab"]))
+      expect(requests).toEqual([{ index: "gsi1", keyCondition: "#pk = :pk" }])
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect(
+    "a clustered member with an empty-composite half: its own rows, partition key alone",
+    () =>
+      Effect.gen(function* () {
+        const { entities } = yield* db
+        requests.length = 0
+        const got = yield* entities.Docs.shelf({ ownerId: "o-1" }).collect()
+        expect(new Set(names(got))).toEqual(new Set(["a", "ab", "a b"]))
+        expect(requests).toEqual([{ index: "gsi2", keyCondition: "#pk = :pk" }])
+        // Its sibling member, fully pinned: `=`.
+        requests.length = 0
+        const profiles = yield* entities.Profiles.shelf({ ownerId: "o-1", plan: "pro" }).collect()
+        expect(profiles.map((profile) => profile.plan)).toEqual(["pro"])
+        expect(requests).toEqual([{ index: "gsi2", keyCondition: "#pk = :pk AND #sk = :sk" }])
+      }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("the collection query keeps its begins_with on the collection prefix", () =>
+    Effect.gen(function* () {
+      const { collections } = yield* db
+      requests.length = 0
+      const got = (yield* collections.shelf!({ ownerId: "o-1" }).collect()) as {
+        readonly Docs: ReadonlyArray<Doc>
+        readonly Profiles: ReadonlyArray<Profile>
+      }
+      expect(new Set(names(got.Docs))).toEqual(new Set(["a", "ab", "a b"]))
+      expect(got.Profiles.map((profile) => profile.plan)).toEqual(["pro"])
+      expect(requests).toEqual([
+        { index: "gsi2", keyCondition: "#pk = :pk AND begins_with(#sk, :sk)" },
+      ])
+    }).pipe(Effect.provide(layer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// `.history().where()` on a string orderBy (#171 sort key escaping)
+// ---------------------------------------------------------------------------
+
+const Note = Schema.Struct({
+  deviceId: Schema.String,
+  channel: Schema.String,
+  stamp: Schema.String,
+})
+type Note = typeof Note.Type
+
+const Notes = Entity.make({
+  model: Note,
+  entityType: "Note",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: ["channel"] },
+  },
+  timeSeries: { orderBy: "stamp", appendInput: Note },
+})
+const NotesTable = Table.make({ schema: AppSchema, entities: { Notes } })
+
+/**
+ * Stamps that extend `a` with characters a key escapes, and their
+ * neighbours — and ones with an emoji, whose UTF-8 sorts above U+FFFF's. The
+ * empty stamp's event key is the events' prefix itself.
+ */
+const STAMPS = [
+  "",
+  "a",
+  "a b",
+  "a!",
+  'a"',
+  "a\u0001",
+  "a$",
+  "aB",
+  "ab",
+  "a\u{1F600}",
+  "b",
+  "\u{1F600}",
+]
+
+describe(".history().where() on a string orderBy (#171 sort key escaping)", () => {
+  const primary = indexesOf(Notes).primary!
+  const rows = ["a", "b"].flatMap((channel) => {
+    const currentSk = KeyComposer.composeSk(AppSchema, "Note", 1, primary, { channel })
+    const pk = KeyComposer.composePk(AppSchema, "Note", primary, { deviceId: "d-1" })
+    return [
+      toAttributeMap({
+        deviceId: "d-1",
+        channel,
+        stamp: "b",
+        pk,
+        sk: currentSk,
+        __edd_e__: "Note",
+      }),
+      ...STAMPS.map((stamp) =>
+        toAttributeMap({
+          deviceId: "d-1",
+          channel,
+          stamp,
+          pk,
+          sk: KeyComposer.composeEventSk(currentSk, stamp, AppSchema.casing),
+          __edd_e__: "Note",
+        }),
+      ),
+    ]
+  })
+  const partition = makePartition({ rows })
+  const layer = Layer.merge(
+    Layer.succeed(DynamoClient, mockDynamoClient({ query: partition.query })),
+    NotesTable.layer({ name: "notes" }),
+  )
+  const cased = (text: string) => DynamoSchema.applyCasing(text, AppSchema.casing)
+  const order = (a: string, b: string) => compareUtf8(cased(a), cased(b))
+
+  it.effect("every operator returns exactly the events whose stamp satisfies it", () =>
+    Effect.gen(function* () {
+      const { entities } = yield* DynamoClient.make({
+        entities: { Notes },
+        tables: { NotesTable },
+      })
+      const operands = [...STAMPS, "a ", "a\u0000"]
+      for (const a of operands) {
+        for (const op of ["eq", "lt", "lte", "gt", "gte", "beginsWith"] as const) {
+          const want = STAMPS.filter((stamp) => {
+            const c = order(stamp, a)
+            return op === "eq"
+              ? c === 0
+              : op === "lt"
+                ? c < 0
+                : op === "lte"
+                  ? c <= 0
+                  : op === "gt"
+                    ? c > 0
+                    : op === "gte"
+                      ? c >= 0
+                      : cased(stamp).startsWith(cased(a))
+          }).sort(order)
+          for (const reverse of [false, true]) {
+            const query = entities.Notes.history({ deviceId: "d-1", channel: "a" }).where(
+              (t, ops) => ops[op](t.stamp, a),
+            )
+            const got: ReadonlyArray<Note> = yield* (reverse ? query.reverse() : query).collect()
+            expect(
+              got.map((note) => `${note.channel}:${note.stamp}`),
+              `${op} ${JSON.stringify(a)}${reverse ? " reversed" : ""}`,
+            ).toEqual((reverse ? [...want].reverse() : want).map((stamp) => `a:${stamp}`))
+          }
+        }
+      }
+    }).pipe(Effect.provide(layer)),
+  )
+
+  it.effect("lt('') plans empty and sends nothing: no key sorts below the events' prefix", () =>
+    Effect.gen(function* () {
+      const { entities } = yield* DynamoClient.make({
+        entities: { Notes },
+        tables: { NotesTable },
+      })
+      const query = entities.Notes.history({ deviceId: "d-1", channel: "a" }).where((t, { lt }) =>
+        lt(t.stamp, ""),
+      )
+      partition.clear()
+      expect((yield* query.explain()).plan).toBe("empty")
+      expect(yield* query.collect()).toEqual([])
+      expect(yield* query.count()).toBe(0)
+      expect(yield* query.reverse().fetch()).toEqual({ items: [], cursor: null })
+      expect(partition.inputs).toEqual([])
+    }).pipe(Effect.provide(layer)),
+  )
+})

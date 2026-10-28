@@ -11,7 +11,8 @@
  * - The key condition the library sends on `#sk` — `=`, `<`, `<=`, `>`, `>=`,
  *   `BETWEEN :sk1 AND :sk2`, `begins_with(#sk, :sk)` — selects the rows, in
  *   `ScanIndexForward` order, from after `ExclusiveStartKey`. A zero-length
- *   operand is rejected (a defect), as DynamoDB rejects one (`EmptyKeyBound`).
+ *   operand is rejected (a defect), as DynamoDB rejects one (`EmptyKeyBound`),
+ *   and so is a `BETWEEN` whose lower bound sorts after its upper bound.
  * - A request examines rows until `Limit` of them, or until the rows examined
  *   reach `pageBytes` (DynamoDB's 1 MB) when the partition gives rows a size.
  *   Stopping early returns a `LastEvaluatedKey`, even when no row is left —
@@ -140,6 +141,12 @@ const keyCondition = (
   const between = /#sk BETWEEN (:\w+) AND (:\w+)/.exec(expression)
   if (between) {
     const [low, high] = [operand(between[1]!), operand(between[2]!)]
+    if (compareBytes(low, high) > 0) {
+      throw new Error(
+        "PartitionMock: ValidationException — Invalid KeyConditionExpression: The BETWEEN " +
+          "operator requires upper bound to be greater than or equal to lower bound",
+      )
+    }
     return (sk) => compareBytes(sk, low) >= 0 && compareBytes(sk, high) <= 0
   }
   const prefix = /begins_with\(#sk, (:\w+)\)/.exec(expression)

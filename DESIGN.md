@@ -701,7 +701,7 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 
 | Type | Serialization |
 |------|---------------|
-| `string` | As-is |
+| `string` | As-is; in a sort key, code points U+0000–U+0025 escaped (sort key text, below) |
 | `number` | Numeric key text (below): a non-negative integer is zero-padded to 16 digits |
 | `bigint` | Numeric key text (below): a non-negative bigint is zero-padded to 38 digits |
 | `DateTime.Utc` | ISO 8601 string |
@@ -765,6 +765,44 @@ with an affected value in a key composite or a time-series `orderBy`):
 | Version snapshot, soft-delete tombstone | pk, and the `{item}` segment of the sk | Only when a primary-key composite changed. Re-put raw under the recomposed pk with the segment `composeHistoryItemSegment` derives from the recomposed live sk; delete the old row. The version digits and the timestamp keep their bytes |
 | `EventStore` stream | pk (stream-id composites), and a stream index attribute holding it (no `derivePartition`) | Only when a stream-id composite changed. Copy every row of the partition (events, snapshot, command sentinels) raw to the recomposed pk, sks unchanged (version, command id); delete the old rows. Appending again would renumber events and rerun projections |
 | Aggregate | pk of every row, edge / discriminator sks, list partition keys | `get` composes the new keys and can't read it. Query the old partition raw, recompose each row's keys, re-put and delete the old rows; or delete them and `create` the aggregate again from its source data |
+
+#### Sort key text
+
+A composite value's text in a **sort key** escapes every code point
+U+0000–U+0025 — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%`
+and two hex digits (`KeyComposer.sortKeyText`, `serializeSortKeyValue`):
+`new york` is `new%20york`, `a#b` is `a%23b`, `50%` is `50%25`. The value is cased
+first, then escaped; the hex digits follow the casing (`%0A`, or `%0a` under
+`"lowercase"`). Partition key text is not escaped.
+
+DynamoDB orders sort keys by UTF-8 bytes, and a composite that is not the last
+is followed by `#`. Escaped, a composite's text holds no character below `%`, so
+the `#` after it sorts below whatever an extension continues with: a value's key
+sorts before every greater value's. An escape starts with `%`, below every
+unescaped character, and escapes keep the order of the code points they replace,
+so key order is the cased values' order. The map is per character, so a value is
+a prefix of another exactly when its key text is (`begins_with` is unchanged).
+Every bound is therefore one exact key range (§ "Accessor sort key conditions"),
+and a value may hold `#`. Numbers, bigints, dates and booleans never hold an
+escaped character, and a string without one keeps its 1.36 bytes.
+
+| Key | Escaped |
+|---|---|
+| Table and index sort keys (clustered collection members included), and every condition and prefix composed from their composites | yes |
+| Time-series event sort key: the `orderBy` segment | yes |
+| Version snapshot and tombstone sort keys: the item segment, taken from the escaped live key | yes |
+| Aggregate: collection and list sort key composites, many-edge composites, discriminator values (not the discriminator names) | yes |
+| Z-order `sk.prefix` segments, before their length prefix or hash | yes |
+| Partition keys (table, index, aggregate, EventStore stream), unique-constraint sentinels (the value is in the sentinel's pk), EventStore event and command sort keys | no |
+
+The language service's params mirror it (`ParamsBuilder`, pinned by
+`KeyParity.test.ts`).
+
+**This changed stored keys in 1.37.0** for a sort key composite or time-series
+`orderBy` value holding such a character. Up to 1.36 such a value sorted apart
+from its order and `#` split it into two segments, so bounds returned wrong rows.
+Rows written by 1.36 keep their old sort keys until rewritten, row kind by row
+kind as for numeric key text above (partition keys are unaffected).
 
 ### Composite key form
 
@@ -1049,6 +1087,8 @@ When the structural rule **can compose** (leading prefix is non-empty and there'
 | **noop** (stored key may go stale) | Half touched + can't compose, policy is `'preserve'`, AND no composite is in `Entity.remove` |
 
 The roll-up is **per-key** — each half's outcome applies to its own key attribute only. PK dropping doesn't drop SK; SK dropping doesn't drop PK. The item may be invisible in the GSI during a single-half-dropped period (DDB needs both for projection — the projection invariant for readers, not a library behavior), but the surviving half's value persists. When the missing half is later composed again (e.g. telemetry writes `{ alertState, timestamp }` after a clear), the item rejoins the GSI under the still-current other half *without that other writer needing to re-fire* — the v1.7.0 multi-writer bug (#41 bug-1) is closed.
+
+**A stale key and the reads that check rows.** Under `'preserve'` the noop above can leave a half's key composed from a composite's earlier value while the attribute holds the new one. A key condition judges such a row by its key, as 1.36 did; a `.within()` row check (#171 — bounds on composites after the key condition, every bound under the `filter` plan) judges it by the stored attribute. Row checks trust the attribute: a bound on a stale composite can admit a row by its key and drop it by its value, so the `key` / `skip-scan` and `filter` plans can disagree on that row. `.where()` never checks rows.
 
 **Cascade override under preserve.** If a half is touched via `removedSet` AND the structural rule would no-op (preserve + can't-compose), the outcome is **REMOVE** instead of noop. Rationale: the consumer's explicit signal trumps stale-data preservation. `Entity.remove(["alertState"])` means "alertState is gone" — preserving the stored key with a value derived from the now-removed composite would lie to readers.
 
@@ -1893,13 +1933,49 @@ language service's params (a collection query pins no sort key composites); `Agg
 (`=` when every list sk composite is given, else `begins_with` with a trailing
 `#`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
-unaffected.
+unaffected. An index whose sort key has no composites (an empty-composite half)
+pins nothing: its accessor sends the partition key alone, and on the primary key
+the history rows that extend the live key are dropped as rows (`liveRows`).
 
 **`beginsWith` on a numeric composite is `eq`.** Numeric key text has no textual
 prefix by value (`3` is not a prefix of `35`), so `.where(beginsWith)` with a
 `number` or `bigint` operand compiles to `eq` (`composeRangeUnder`, and history
 `.where()`). That is also what 1.36 amounted to for a non-negative integer, whose
 padded text has the full width.
+
+**A bound is one exact key range.** A composite's key text is escaped (§7
+"Sort key text"), so it sorts as the cased value, and the `#` that follows a
+non-last composite sorts below every character the text holds: a value's subtree
+(`v#…`) sorts after `v` and before every greater value (`v%20x`, `v0`). So every
+`.where()` / `.within()` bound composes one condition over the composed operand
+key text `K(v)` (`composeRangeUnder`, shared by both), exact whatever characters
+the values hold:
+
+| Bound | Unclamped | Clamped under pinned composites, prefix `P` |
+|---|---|---|
+| `eq v` | `begins_with(K(v)#)`; `sk = K(v)` on the last composite | the same |
+| `beginsWith v` | `begins_with(K(v))`; `eq` for a numeric operand | the same |
+| `lt v` | `< K(v)` | `BETWEEN P AND K(v)`; `BETWEEN P AND keyJustBelow(K(v))` on the last composite |
+| `lte v` | `<= K(v)#U+FFFF`; `<= K(v)` on the last | `BETWEEN P AND` the same end |
+| `gt v` | `> K(v)#U+FFFF`; `> K(v)` on the last | `BETWEEN K(v)#U+FFFF AND P + U+FFFF` |
+| `gte v` | `>= K(v)` | `BETWEEN K(v) AND P + U+FFFF` |
+| `between a b` | `BETWEEN K(a) AND K(b)#U+FFFF`; `… K(b)` on the last | the same |
+
+These are 1.36's conditions over the escaped text: a value without a character
+U+0000–U+0025 composes byte-identical requests. Up to 1.36 the text was not
+escaped, so ` `, `!`, `"` and control characters sorted below the delimiter
+(`new york#…` < `new!#…` < `new#…` though `new` < `new york` < `new!`) and both a
+bound and a stored value could sort apart (`lte: "new york"` left out `new`,
+`gt: "new"` left out `new york`), and a value holding `#` split into two
+segments. Now `a#b` is one value (`a%23b`), and `a` neither equals nor prefixes
+it.
+
+The strict `lt` on a clamped last composite was refused up to 1.36 (`EDD-9046`,
+now retired); `keyJustBelow` makes it exact. A well-formed `.within()` interval
+no value satisfies (`{ gt: 3, lte: 3 }`, `{ gte: 4, lte: 3 }`), judged on the
+operands' key text, composes to no condition: the plan is `empty` and nothing is
+sent. A `.where(between)` given high end first keeps 1.36's request, its composed
+ends reversed too, for DynamoDB to refuse (#144).
 
 **History `.where()` stays inside `<currentSk>#e#`.** A one-sided bound would
 replace the history prefix with a bare comparison and read the current item and
@@ -1910,14 +1986,18 @@ range clamped to the prefix `P`, operand key `v` = `P` + the `orderBy` key text:
 |---|---|
 | `eq` | `sk = v` |
 | `lte` / `lt` | `BETWEEN P AND v` / `BETWEEN P AND keyJustBelow(v)` |
-| `gte` / `gt` | `BETWEEN v AND P + U+FFFF` / `BETWEEN v#U+FFFF AND P + U+FFFF` |
+| `gte` / `gt` | `BETWEEN v AND P + U+10FFFF` / `BETWEEN v#U+FFFF AND P + U+10FFFF` |
 | `between` | unchanged (both ends carry `P`) |
 | `beginsWith` | `begins_with(sk, v)`; `sk = v` for a numeric `orderBy` |
 
 `keyJustBelow(v)` (`internal/RangePlanner.ts`) steps the last code point of `v`
 down by one and appends U+10FFFF, the greatest code point, so the strict bound is
 exact on the key and keeps `Limit` on the request (no row check). `gt` uses the
-`#` + U+FFFF convention of `composeRangeUnder`.
+`#` + U+FFFF convention of `composeRangeUnder`: the `orderBy` text is escaped
+like any sort key composite's, so every greater value's text extends `v` with a
+character above `#`, or differs from it before its end. The open end is `P` + U+10FFFF, not
+U+FFFF: the `orderBy` text follows `P` with no label before it, and a stamp that
+starts with an emoji (4-byte UTF-8) sorts above U+FFFF.
 
 ### Request Sizing (#171)
 
@@ -1937,9 +2017,9 @@ The estimator lives in the terminal's loop, never in a cursor: a resumed query s
 
 `.within(bounds, { maxSkips? })` on a composite accessor bounds any sort key composite the accessor left open (`{ eq }`, `{ between }`, `gt` / `gte` and / or `lt` / `lte`, compared in key form). It excludes `.where()` and a second `.within()` (`EDD-9093`). The planner (`internal/RangePlanner.ts`, pure: it turns a plan and each response into the next `Read` / `Probe` / `Done` step; `Query.ts`'s loop sends every request) picks:
 
-- **`key`** — eq bounds extend the pinned prefix, and the first bounded composite is next: one key condition (shared with `.where()` through `composeRangeUnder`); bounds the key condition can't express become row checks.
-- **`skip-scan`** — composites left of the first bound are unbounded (the *skip tuple*): a `Limit: 1` probe (no filter, projection of the sort key) finds the next distinct tuple, its range is read with the normal loop, then a probe from just past it (`T` with its trailing `#` replaced by `$`). Probes inherit `.consistentRead()` on the primary index. After `maxSkips` probes (default 32) the rest is read as one filtered range; `maxSkips: 0` filters at once.
-- **`filter`** — one range, every bound checked per row: when a skip-tuple composite's key form can contain `#` (a free-form `Schema.String`), on a primary accessor that shares its partition with history rows (retain, soft delete, time series), at `maxSkips: 0`, or after a probed key that doesn't parse.
+- **`key`** — eq bounds extend the pinned prefix, and the first bounded composite is next: its one key condition (shared with `.where()` through `composeRangeUnder`); bounds on later composites, which no key condition can express, become row checks, which compare values (`boundHolds`), not composed key segments, and trust the stored attribute over a stale `'preserve'` key (§7). A bound no value satisfies plans `empty` and sends nothing.
+- **`skip-scan`** — composites left of the first bound are unbounded (the *skip tuple*): a `Limit: 1` probe (no filter, projection of the sort key) finds the next distinct tuple, its range is read with the normal loop, then a probe from just past it (`T` with its trailing `#` replaced by `$`: every composite's text is escaped, so no key in `T`'s subtree holds a `#` or `$` there, and `$` sorts below every character a greater tuple's text can continue with). Probes inherit `.consistentRead()` on the primary index. After `maxSkips` probes (default 32) the rest is read as one filtered range; `maxSkips: 0` filters at once.
+- **`filter`** — one range, every bound checked per row: on a primary accessor that shares its partition with history rows (retain, soft delete, time series), at `maxSkips: 0`, or after a probed key that doesn't parse.
 
 Every request, probes included, counts against `maxPages`, is observed by `onRequest` and is charged to the query's consumed-capacity operation.
 
@@ -1967,7 +2047,7 @@ Two formats (`internal/Cursor.ts`):
 - **Legacy** — `btoa(JSON.stringify(LastEvaluatedKey))`. Every query without a planner still emits it whenever it can carry the key exactly, so plain queries' cursors are byte-identical to earlier releases.
 - **v2** — `"v2." + base64url(utf8(JSON))`: emitted for keys with `B` values or text outside Latin-1, and for every planned query. It carries a fingerprint (index, entity type, partition key value, pinned and prefix values, the quantized box or bounds, the layout, `reverse`), the plan mode in force and a position: the skip tuple in progress, and either the `LastEvaluatedKey` to resume at, the last in-plan key done (*through*), or that the tuple is finished. The fingerprint excludes `maxRanges`, `concurrency`, `strategy`, `pageSize` and `maxSkips`, so a resumed query may change them; resume recomputes the plan and continues from the position, in the plan mode it recorded, with a fresh probe budget.
 
-`startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a single-range key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
+`startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
 
 ### Entity Operations (via typed client)
 
@@ -4683,7 +4763,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9043` | `Aggregate.ts` | `collection.index` and `collection.sk` must be supplied together |
 | `EDD-9044` | `internal/EntitySchemas.ts` | Timestamp `schema` carries no `DynamoEncoding` annotation |
 | `EDD-9045` | `DynamoClient.ts` | `.where()` used on an index whose sort key has no composites — unreachable from well-typed code since the `ResolveSkFields` repair (#121); retained for untyped and cast call sites |
-| `EDD-9046` | `DynamoClient.ts` | `.where()` with a strict `lt` on the last sort-key composite with an earlier composite pinned — inexpressible in one DynamoDB sort-key condition (the message points to `.within()`, which checks the bound on each row) |
+| `EDD-9046` | — | **Retired** in #171 (`.where()` with a strict `lt` on the last sort-key composite with an earlier composite pinned): the bound is a `BETWEEN` ending at `keyJustBelow` of the value, exact on the key. Do not reuse |
 | `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
 | `EDD-9048` | `internal/TransactableOps.ts` | A multi-item write path cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which these paths never read |
 | `EDD-9049` | `Batch.ts` | `Batch.write` cannot compile a write for those same configs — `BatchWriteItem` has no `ConditionExpression` (the whole basis of a uniqueness sentinel), no `UpdateRequest`, and no atomicity across chunks |
@@ -4731,7 +4811,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9091` | `Table.ts` (`Table.make`, `Table.definition`) | One physical attribute is declared with two types across table members: a Z-order (`B`) half and a string (`S`) key half, or a key attribute and a vector filter attribute |
 | `EDD-9092` | `internal/ZOrderCurve.ts`: through the write paths as a `ValidationError` (put, update, upsert, restore, append, transactional and batch writes); thrown at `.within()` (`DynamoClient.ts`) for a query bound | A value a Z-order dimension can't place: `NaN`, an unparseable date, a value outside a `literals` list |
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
-| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a single-range key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
+| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
 | `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`): a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text") | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
 

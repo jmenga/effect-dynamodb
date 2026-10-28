@@ -548,7 +548,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 
 | Method | Description |
 |--------|-------------|
-| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
+| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. Bounds compare composite values: sort key text is escaped, so key order is value order and each bound is one exact key condition (see [Sort Key Conditions](/effect-dynamodb/guides/queries/#sort-key-conditions)). |
 | `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before sending. An `isIn` with no values is sent, and DynamoDB's rejection is a `ValidationError` (`operation: "query.filter"`) naming it. |
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
@@ -1025,6 +1025,8 @@ import { KeyComposer } from "effect-dynamodb"
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
 | `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
+| `sortKeyText` | `(text, casing) => string` | A composite's text as a sort key holds it: cased, then each code point U+0000–U+0025 escaped as `%` and two hex digits ([Sort key text](/effect-dynamodb/guides/indexes/#sort-key-text)) |
+| `serializeSortKeyValue` | `(value, casing) => string` | `serializeValue`, then `sortKeyText` |
 | `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
 | `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 

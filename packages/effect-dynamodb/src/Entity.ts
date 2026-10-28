@@ -118,7 +118,7 @@ import {
   withRegistry,
 } from "./internal/Packed.js"
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
-import { KEY_MAX, keyJustBelow } from "./internal/RangePlanner.js"
+import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -10897,10 +10897,12 @@ export const bind = <
         const entityTypeRef = entityInternals.entityType
 
         // composeSkCondition: rewrite user's .where() values by prefixing
-        // with `<currentSk>#e#` and applying serialisation + casing to the
-        // user-supplied orderBy value.
+        // with `<currentSk>#e#` and applying serialisation, casing and
+        // escaping to the user-supplied orderBy value.
         const primary = entity.indexes.primary!
-        const composeSkCondition = (cond: RawSortKeyCondition): Query.SortKeyCondition => {
+        const composeSkCondition = (
+          cond: RawSortKeyCondition,
+        ): Query.SortKeyCondition | undefined => {
           // We need the `currentSk` + prefix. The user's `key` lets us derive
           // `currentSk` via the same primary SK composer used by `history()`.
           // `key` is the caller's Type-side key; the stored SK was composed
@@ -10920,10 +10922,7 @@ export const bind = <
           const keyFormOf = (v: unknown) =>
             orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy]
           const rewrite = (v: unknown) =>
-            `${prefix}${DynamoSchema.applyCasing(
-              KeyComposer.serializeValue(keyFormOf(v)),
-              schemaRef.casing,
-            )}`
+            `${prefix}${KeyComposer.serializeSortKeyValue(keyFormOf(v), schemaRef.casing)}`
           // DynamoDB allows ONE sort key condition, and this one replaces the
           // history query's `begins_with(prefix)`. Every operator therefore
           // keeps both ends inside `prefix` — the `.where()` clamp of
@@ -10931,11 +10930,19 @@ export const bind = <
           // A bare one-sided `<` / `>` ran on to the item's current row and
           // its siblings' events. Strict `<` takes the greatest key text below
           // the bound as BETWEEN's inclusive high end (`keyJustBelow`); `>`
-          // starts above every key of the bound value, as `composeRangeUnder`
-          // does.
-          const prefixMax = `${prefix}${KEY_MAX}`
+          // starts past `#￿`, above every key of the bound value and below
+          // every greater one, whose escaped text extends it with a character
+          // above `#` (`a%20b` after `a`), as `composeRangeUnder` does. The
+          // open end is `prefix` + U+10FFFF, not U+FFFF: the value follows the
+          // prefix directly, with no label before it, and one starting with an
+          // emoji sorts above U+FFFF. Below the empty string there is no key:
+          // `lt("")` plans `empty`, as BETWEEN's ends would be reversed.
+          const prefixMax = `${prefix}${KEY_TOP}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }
-          if ("lt" in cond) return { between: [prefix, keyJustBelow(rewrite(cond.lt))] }
+          if ("lt" in cond) {
+            const below = rewrite(cond.lt)
+            return below === prefix ? undefined : { between: [prefix, keyJustBelow(below)] }
+          }
           if ("lte" in cond) return { between: [prefix, rewrite(cond.lte)] }
           if ("gt" in cond) {
             return {

@@ -228,9 +228,9 @@ describe("skip-scan (#171)", () => {
   )
 
   it.effect("values with characters below #", () => {
-    // ` ` (0x20), `!` (0x21) and `"` (0x22) sort below the delimiter, so
-    // `a b#…` and `a!#…` sort before `a#…`: each tuple still parses, and the
-    // probe past it lands on the next.
+    // ` ` (0x20), `!` (0x21) and `"` (0x22) are escaped (`a%20b#…`, `a%21#…`),
+    // so each tuple sorts after `a#…` as its value after `a`: each still
+    // parses, and the probe past it lands on the next.
     const statuses = ["a", "a b", "a!", 'a"', "on hold"]
     const fixture = makeListings({ statuses })
     const items = grid(statuses)
@@ -247,23 +247,24 @@ describe("skip-scan (#171)", () => {
     )
   })
 
-  it.effect("a Schema.String tuple composite takes the filter plan", () => {
-    // A free-text composite may hold the delimiter, so its tuples can't be
-    // parsed from the key: one read under P, the price checked per row.
-    const statuses = ["active", "on#hold", "sold"]
+  it.effect("a Schema.String tuple composite skip-scans, whatever its values hold", () => {
+    // A free-text composite's key text is escaped (#171): `on#hold` is
+    // `on%23hold`, so no value holds the delimiter and every tuple parses
+    // from the key. Up to 1.36's key text this took the filter plan.
+    const statuses = ["active", "on#hold", "on hold", "on", "on!", "50%", "sold"]
     const fixture = makeListings({ statuses, status: Schema.String })
     const items = grid(statuses)
     return over(fixture, items, (byStore, partition) =>
       Effect.gen(function* () {
         const query = byStore({ storeId: STORE }).within({ price: PRICE })
         const explain = yield* query.explain()
-        expect(explain.plan).toBe("filter")
-        expect(explain.reason).toBe("delimiter-unsafe composite: status")
-        expect(explain.rowChecks).toEqual(["price"])
-        expect(explain.maxSkips).toBeUndefined()
+        expect(explain.plan).toBe("skip-scan")
+        expect(explain.reason).toBe("skip tuple: status")
         expect(ids(yield* query.collect())).toEqual(expected(fixture, items, PRICE))
-        expect(partition.inputs.filter(isProbe)).toHaveLength(0)
-        expect(partition.inputs).toHaveLength(1)
+        expect(partition.inputs.filter(isProbe)).toHaveLength(statuses.length + 1)
+        partition.clear()
+        expect(ids(yield* query.reverse().collect())).toEqual(expected(fixture, items, PRICE, true))
+        expect(partition.inputs.filter(isProbe)).toHaveLength(statuses.length + 1)
       }),
     )
   })
@@ -500,9 +501,10 @@ describe("skip-scan (#171)", () => {
     )
   })
 
-  it.effect("strict lt on the last composite inside a tuple uses lte plus a row check", () => {
+  it.effect("strict lt on the last composite inside a tuple ends just below the value", () => {
     // Price is the last composite: a key can equal `…#price_<50>`, and
-    // BETWEEN is inclusive, so the read admits it and the row check drops it.
+    // BETWEEN is inclusive, so its high end is the greatest key text below
+    // it (`keyJustBelow`): the read leaves the boundary row out itself.
     const fixture = makeListings({ sk: ["status", "price"] })
     const items: Array<ListingItem> = ["active", "pending", "sold"].flatMap((status) =>
       [10, 50, 70].map((price) => ({
@@ -519,18 +521,52 @@ describe("skip-scan (#171)", () => {
         const query = byStore({ storeId: STORE }).within({ price: bound }).onRequest(observe)
         const explain = yield* query.explain()
         expect(explain.plan).toBe("skip-scan")
-        expect(explain.rowChecks).toEqual(["price"])
+        expect(explain.rowChecks).toEqual([])
         expect(ids(yield* query.collect())).toEqual(expected(fixture, items, bound))
         const reads = partition.inputs.filter((input) => !isProbe(input))
         expect(reads).toHaveLength(3)
         for (const read of reads) {
-          expect(betweenOf(read)![1]).toMatch(/#price_0*50$/)
+          // `…price_0…050` with its last character stepped down: `…05/` + U+10FFFF.
+          expect(betweenOf(read)![1]).toMatch(/#price_0*5\/\u{10FFFF}$/u)
         }
-        // Each tuple read returns the boundary row; the check drops it.
+        // Each tuple read returns the row below the bound alone.
         for (const event of events.filter((e) => e.kind === "read")) {
-          expect(event.count).toBe(2)
+          expect(event.count).toBe(1)
           expect(event.accepted).toBe(1)
         }
+      }),
+    )
+  })
+
+  it.effect("an empty interval on the last composite plans no read", () => {
+    // Well-formed bounds no price satisfies: an inclusive BETWEEN of their
+    // composed ends would be reversed, which DynamoDB refuses.
+    const fixture = makeListings({ sk: ["status", "price"] })
+    const items = grid(["active", "pending", "sold"])
+    return over(fixture, items, (byStore, partition) =>
+      Effect.gen(function* () {
+        for (const pins of [{ storeId: STORE, status: "active" }, { storeId: STORE }]) {
+          for (const price of [
+            { gt: 40, lte: 40 },
+            { gt: 40, lt: 40 },
+            { gte: 40, lt: 40 },
+            { gte: 4, lte: 3 },
+            { between: [70, 10] },
+          ]) {
+            const context = JSON.stringify({ pins, price })
+            const query = byStore(pins).within({ price })
+            expect((yield* query.explain()).plan, context).toBe("empty")
+            expect(yield* query.collect(), context).toEqual([])
+            expect(yield* query.count(), context).toBe(0)
+            expect(yield* query.fetch(), context).toEqual({ items: [], cursor: null })
+          }
+        }
+        expect(partition.inputs).toEqual([])
+        // The same bounds a step apart hold the one price between them.
+        const one = byStore({ storeId: STORE, status: "active" }).within({
+          price: { gt: 39, lte: 40 },
+        })
+        expect(ids(yield* one.collect())).toEqual(["l-0-1"])
       }),
     )
   })
@@ -570,17 +606,15 @@ describe("sizing and streaming a planned query (#171)", () => {
         expect((yield* filterPlan.explain()).rowChecks).toEqual(["price"])
         yield* filterPlan.limit(5).fetch()
         expect(events[0]!.limit).toBe(16)
-        // Inside a skip-scan, a strict bound on the last composite is checked
-        // per row: the first read after the probe is sized as filtered too.
+        // Inside a skip-scan, a bound on a composite after the bounded one is
+        // checked per row: the first read after the probe is sized as
+        // filtered too.
         events.length = 0
-        const fixtureLast = makeListings({ sk: ["status", "price"] })
-        yield* over(fixtureLast, items, (byStoreLast) =>
-          byStoreLast({ storeId: STORE })
-            .within({ price: { lt: 50 } })
-            .onRequest(observe)
-            .limit(5)
-            .fetch(),
-        )
+        const skipPlan = byStore({ storeId: STORE })
+          .within({ price: { gte: 20 }, listingId: { gte: "l" } })
+          .onRequest(observe)
+        expect((yield* skipPlan.explain()).rowChecks).toEqual(["listingId"])
+        yield* skipPlan.limit(5).fetch()
         expect(events.map((event) => event.kind).slice(0, 2)).toEqual(["probe", "read"])
         expect(events[1]!.limit).toBe(16)
       }),
@@ -753,14 +787,18 @@ describe("a ref-derived composite bound (#171)", () => {
     ),
   )
 
-  it.effect("a strict lt on it as the last composite is checked from the stored ref", () =>
+  it.effect("a strict lt on it as the last composite is exact on the key", () =>
     run((db) =>
       Effect.gen(function* () {
         const query = byOrder(db).within({ partId: { lt: "p-3" } })
         const explain = yield* query.explain()
         expect(explain.plan).toBe("skip-scan")
-        expect(explain.rowChecks).toEqual(["partId"])
+        expect(explain.rowChecks).toEqual([])
         expect(lineIds(yield* query.collect())).toEqual(want((partId) => partId < "p-3"))
+        // A bound after another is still checked from the stored ref.
+        const later = byOrder(db).within({ stage: { gte: "p" }, partId: { lt: "p-3" } })
+        expect((yield* later.explain()).rowChecks).toEqual(["partId"])
+        expect(lineIds(yield* later.collect())).toEqual(want((partId) => partId < "p-3"))
       }),
     ),
   )

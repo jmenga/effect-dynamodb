@@ -630,12 +630,19 @@ describeConnected("#171 a ref-derived composite bound — connected", () => {
       expect(inside.map((item) => item.lineId)).toEqual(atLeast)
       expect(inside[0]!.part).toEqual({ partId: "part-30", name: "Part part-30" })
 
-      // A strict bound on the last composite is checked per row inside each tuple.
+      // A strict bound on the last composite is exact on the key inside each
+      // tuple; after a bounded composite, it is checked from the stored ref.
       const below = db.entities.OrderLines.byOrder({ orderId: ORDER }).within({
         partId: { lt: "part-05" },
       })
-      expect((yield* below.explain()).rowChecks).toEqual(["partId"])
+      expect((yield* below.explain()).rowChecks).toEqual([])
       expect(lineIdsOf(yield* below.collect())).toEqual(wanted((partId) => partId < "part-05"))
+      const later = db.entities.OrderLines.byOrder({ orderId: ORDER }).within({
+        stage: { gte: "p" },
+        partId: { lt: "part-05" },
+      })
+      expect((yield* later.explain()).rowChecks).toEqual(["partId"])
+      expect(lineIdsOf(yield* later.collect())).toEqual(wanted((partId) => partId < "part-05"))
     }).pipe(provideRef),
   )
 })

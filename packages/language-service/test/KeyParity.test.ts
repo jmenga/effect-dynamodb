@@ -4,9 +4,11 @@ import { describe, expect, it } from "vitest"
 import {
   type Casing,
   type IndexDefinition,
+  type ResolvedCollection,
   type ResolvedEntity,
   resolveEntities,
 } from "../src/core/EntityResolver"
+import type { DetectedOperation } from "../src/core/OperationDetector"
 import { buildParamsOrThrow } from "./helpers/params"
 
 // The plugin mirrors the library's key composition (it is CommonJS and cannot
@@ -138,6 +140,81 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
             "eq" in condition ? condition.eq : undefined,
           )
         })
+      }
+
+      // The bound accessor (`db.entities.Tickets.<index>(…)`) — through the
+      // index, and through a collection its index belongs to — sends the
+      // library accessor's condition: none without a sort key composite (an
+      // empty-composite half among them), `=` on a complete key, and a
+      // terminated `begins_with` on a prefix.
+      const collectionOf = (name: "byOrg" | "byRegion"): ResolvedCollection => {
+        const index = indexes[name]
+        const collectionName = typeof index.collection === "string" ? index.collection : "Region"
+        return {
+          variableName: collectionName,
+          collectionName,
+          index: index.index,
+          type: name === "byRegion" ? "clustered" : "isolated",
+          pk: index.pk,
+          sk: { field: index.sk.field },
+          members: {
+            Tickets: { entityVariableName: "Tickets", sk: { composite: index.sk.composite } },
+          },
+        }
+      }
+      for (const [name, args] of [
+        ["primary", { orgId: "Org-A", seq: 42 }],
+        ["byOwner", { ownerId: "Owner-C" }],
+        ["byTeam", { teamId: "Team-B" }],
+        ["byTeam", { teamId: "Team-B", status: "Open" }],
+        ["byTeam", { teamId: "Team-B", status: "Open", title: "Fix Keys" }],
+        ["byOrg", { orgId: "Org-A" }],
+        ["byOrg", { orgId: "Org-A", title: "Fix Keys" }],
+        ["byRegion", { regionId: "EU-1" }],
+        ["byRegion", { regionId: "EU-1", status: "Open" }],
+      ] as const) {
+        const index = indexes[name]
+        const given = index.sk.composite.filter(
+          (attr) => (args as Record<string, unknown>)[attr] !== undefined,
+        )
+        const expected =
+          given.length === 0
+            ? undefined
+            : KeyComposer.composeSortKeyCondition(schema, "Ticket", 1, index, args)
+        const ops: Array<[string, DetectedOperation]> = [
+          ["index", { entity, type: "entity-query-accessor", indexName: name, arguments: args }],
+        ]
+        if (name === "byOrg" || name === "byRegion") {
+          ops.push([
+            "collection",
+            {
+              entity,
+              type: "entity-query-accessor",
+              collection: collectionOf(name),
+              collectionName: collectionOf(name).collectionName,
+              arguments: args,
+            },
+          ])
+        }
+        for (const [via, op] of ops) {
+          it(`accessor ${name} ${JSON.stringify(args)} via the ${via} sends the library's sort key condition`, () => {
+            const params = buildParamsOrThrow(op)
+            expect(params.ExpressionAttributeValues![":pk"]).toBe(
+              KeyComposer.composePk(schema, "Ticket", index, args),
+            )
+            if (expected === undefined) {
+              expect(params.KeyConditionExpression).toBe("#pk = :pk")
+            } else if ("eq" in expected) {
+              expect(params.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
+              expect(params.ExpressionAttributeValues![":sk"]).toBe(expected.eq)
+            } else {
+              expect(params.KeyConditionExpression).toBe(
+                "#pk = :pk AND begins_with(#sk, :skPrefix)",
+              )
+              expect(params.ExpressionAttributeValues![":skPrefix"]).toBe(expected.beginsWith)
+            }
+          })
+        }
       }
     })
   }
@@ -289,4 +366,72 @@ describe("numeric key text parity with @effect-dynamodb/schema", () => {
       )
     }
   })
+})
+
+describe("sort key text escaping parity with @effect-dynamodb/schema (#171)", () => {
+  // Every escaped code point (U+0000–U+0025), the first one that isn't, and
+  // values casing maps unevenly: a sort key escapes them, a partition key
+  // keeps them as they are.
+  const values = [
+    ...Array.from({ length: 0x27 }, (_, code) => `a${String.fromCharCode(code)}b`),
+    "New York",
+    "a#b",
+    "50%",
+    "$Root",
+    "Line\nTwo",
+    "\nΣ",
+    "Straße",
+    "😀 Grin",
+  ]
+  const textIndexes = {
+    primary: {
+      pk: { field: "pk", composite: ["title"] },
+      sk: { field: "sk", composite: ["status", "title"] },
+    },
+    byStatus: {
+      index: "gsi1",
+      collection: ["Region", "Site"],
+      type: "clustered",
+      pk: { field: "gsi1pk", composite: ["teamId"] },
+      sk: { field: "gsi1sk", composite: ["status", "title"] },
+    },
+  } satisfies Record<string, IndexDefinition>
+
+  for (const casing of ["lowercase", "uppercase", "preserve"] as const) {
+    const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing })
+    const entity: ResolvedEntity = { ...entityFor(casing), indexes: textIndexes }
+
+    it(`put, the begins_with operand and the exact key match the library (${casing})`, () => {
+      for (const status of values) {
+        for (const title of ["T", "a#b c"]) {
+          const record = { title, status, teamId: "Team-B" }
+          const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+          const expected = KeyComposer.composeAllKeys(schema, "Ticket", 1, textIndexes, record)
+          for (const [field, value] of Object.entries(expected)) {
+            expect(params.Item![field], `${field} ${JSON.stringify(record)}`).toBe(value)
+          }
+          const partial = buildParamsOrThrow({
+            entity,
+            type: "query",
+            indexName: "byStatus",
+            arguments: { teamId: "Team-B", status },
+          })
+          expect(partial.ExpressionAttributeValues![":skPrefix"], JSON.stringify(status)).toBe(
+            KeyComposer.composeSortKeyBeginsWith(schema, "Ticket", 1, textIndexes.byStatus, {
+              status,
+            }),
+          )
+          const complete = buildParamsOrThrow({
+            entity,
+            type: "query",
+            indexName: "byStatus",
+            arguments: record,
+          })
+          expect(complete.ExpressionAttributeValues![":sk"], JSON.stringify(record)).toBe(
+            KeyComposer.composeSk(schema, "Ticket", 1, textIndexes.byStatus, record),
+          )
+        }
+      }
+    })
+  }
 })

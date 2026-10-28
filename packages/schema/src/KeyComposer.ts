@@ -403,6 +403,53 @@ export const serializeValue = (value: unknown): string => {
   return String(value)
 }
 
+/** The highest code point a sort key composite's text escapes: `%`. */
+const ESCAPED_MAX = 0x25
+
+/**
+ * A composite value's serialized text as a sort key holds it (#171): cased,
+ * then each code point U+0000–U+0025 — control characters, space, `!`, `"`,
+ * `#`, `$` and `%` — escaped as `%` and two hex digits (space → `%20`, `#` →
+ * `%23`, `%` → `%25`), the hex digits in upper case, or lower case under
+ * `"lowercase"` casing. Any other text is unchanged, so a value without such a
+ * character keeps its 1.36 key text.
+ *
+ * Every escaped value sorts as its cased value and starts with its cased
+ * prefixes' text: an unescaped character sorts above `%`, and an escape starts
+ * with `%` and keeps the order of the code points it replaces. A composite's
+ * text followed by the key delimiter (`#`, below `%`) therefore sorts before
+ * every key of a greater value — `new#…` before `new%20york#…` and
+ * `new%21#…` — and a bound on any composite is one exact key range.
+ *
+ * Casing comes first so the hex digits are the only text it can't reach: the
+ * composer cases the key again, which leaves cased text as it is.
+ */
+export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string => {
+  const cased = applyCasing(text, casing)
+  let escaped = ""
+  let from = 0
+  for (let i = 0; i < cased.length; i++) {
+    const code = cased.charCodeAt(i)
+    if (code > ESCAPED_MAX) continue
+    const hex = code.toString(16).padStart(2, "0")
+    escaped += `${cased.slice(from, i)}%${casing === "lowercase" ? hex : hex.toUpperCase()}`
+    from = i + 1
+  }
+  return from === 0 ? cased : `${escaped}${cased.slice(from)}`
+}
+
+/** A composite value's text in a sort key: {@link serializeValue}, then {@link sortKeyText}. */
+export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
+  sortKeyText(serializeValue(value), casing)
+
+/** {@link extractComposites} for a sort key half: each value's {@link sortKeyText}. */
+const extractSortKeyComposites = (
+  composite: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  casing: DynamoSchema.Casing,
+): ReadonlyArray<string> =>
+  extractComposites(composite, record).map((text) => sortKeyText(text, casing))
+
 /**
  * Compose a partition key for an entity index.
  *
@@ -444,7 +491,11 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   assertStringHalf(index, "composeSk")
-  const composites = extractComposites(index.sk.composite, record)
+  const composites = extractSortKeyComposites(
+    index.sk.composite,
+    record,
+    effectiveCasing(schema, index),
+  )
   const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
@@ -517,7 +568,7 @@ export const composeZOrderSk = (
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
-    return prefixSegment(applyCasing(serializeValue(value), casing), part.hash)
+    return prefixSegment(serializeSortKeyValue(value, casing), part.hash)
   })
   const levels = layout.dimensions.map((dim) => {
     const value = record[dim.field]
@@ -700,7 +751,7 @@ export const composeSkPrefixUpTo = (
 ): string => {
   assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
-  const composites = extractComposites(slice, record)
+  const composites = extractSortKeyComposites(slice, record, effectiveCasing(schema, index))
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
 
@@ -1203,12 +1254,13 @@ export const composeSortKeyPrefix = (
 ): string => {
   assertStringHalf(index, "composeSortKeyPrefix")
   // Collect available composites and their names (stop at first missing)
+  const casing = effectiveCasing(schema, index)
   const available: Array<string> = []
   const names: Array<string> = []
   for (const attr of index.sk.composite) {
     const value = record[attr]
     if (value === undefined || value === null) break
-    available.push(serializeValue(value))
+    available.push(serializeSortKeyValue(value, casing))
     names.push(attr)
   }
 
@@ -1235,9 +1287,10 @@ export const composeSortKeyPrefix = (
 
 // ---------------------------------------------------------------------------
 // Time-series key helpers (used by `Entity.append()` / `.history()`).
-// Event item SK format: `<currentSk>#e#<serialised-orderBy-value>`.
+// Event item SK format: `<currentSk>#e#<orderBy value's sort key text>`.
 // Casing is applied to both the `#e#` infix and the value for consistency with
-// the rest of the SK — matches how every other composite segment is cased.
+// the rest of the SK — matches how every other composite segment is cased —
+// and the value is escaped as every sort key composite is (`sortKeyText`).
 // ---------------------------------------------------------------------------
 
 const EVENT_SK_INFIX = "e"
@@ -1253,7 +1306,7 @@ export const composeEventSk = (
   orderByValue: unknown,
   casing: DynamoSchema.Casing = "lowercase",
 ): string =>
-  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${applyCasing(serializeValue(orderByValue), casing)}`
+  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${serializeSortKeyValue(orderByValue, casing)}`
 
 /**
  * Compose the prefix used to scope `.history()` queries to event items only.

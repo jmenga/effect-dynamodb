@@ -28,6 +28,7 @@ import {
 } from "./internal/Packed.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import {
+  compositePlanner,
   cursorRefusal,
   DEFAULT_MAX_SKIPS,
   displayKeyCondition,
@@ -91,7 +92,8 @@ export type KeyCondition =
  * - `skip-scan` — a probe for each distinct value of the sort key composites
  *   left of a `.within()` bound, then that value's range.
  * - `filter` — one range, every bound checked per row.
- * - `naive` / `jump` / `precise` / `empty` — Z-order plans.
+ * - `empty` — no value satisfies the bounds: nothing is sent.
+ * - `naive` / `jump` / `precise` — Z-order plans (`empty` too).
  */
 export type PlanMode = "key" | "skip-scan" | "filter" | "naive" | "jump" | "precise" | "empty"
 
@@ -101,8 +103,8 @@ export interface QueryExplain {
   readonly index: string
   readonly plan: PlanMode
   /**
-   * Why this plan: e.g. "leading composites bounded", "delimiter-unsafe
-   * composite: status", "history rows on the primary index", "maxSkips: 0".
+   * Why this plan: e.g. "leading composites bounded", "skip tuple: status",
+   * "history rows on the primary index", "maxSkips: 0".
    */
   readonly reason: string
   /** The key ranges known before anything is read (`exact: false`: rows are also checked). */
@@ -820,6 +822,36 @@ export const plan = <A>(
       ? { ...self._state, zorderOptions: { ...self._state.zorderOptions, ...install.zorder } }
       : { ...self._state, planner: install.planner, maxSkips: install.maxSkips },
   )
+
+/**
+ * @internal A query no stored row satisfies (#171) — a `.history()` bound with
+ * no key text below it (`lt("")` on a string orderBy) — planned `empty`, as a
+ * `.within()` whose bounds admit no value is: nothing is sent, the terminals
+ * return no items, and `explain()` reports the `empty` plan.
+ */
+export const planEmpty = <A>(self: Query<A>): Query<A> =>
+  plan(self, {
+    planner: compositePlanner({
+      entityType: self._state.entityTypes.join(", ") || "unknown",
+      index: self._state.indexName ?? "primary",
+      pkField: self._state.pkField,
+      pkValue: self._state.pkValue,
+      skField: self._state.skField ?? "",
+      fingerprint: "empty",
+      space: { _tag: "none" },
+      inner: {
+        _tag: "single",
+        conditionFor: () => {
+          throw new Error("[internal] An empty plan has no range.")
+        },
+        rowCheck: undefined,
+        empty: true,
+      },
+      filterPlan: { prefix: "", rowCheck: undefined },
+      ineligible: undefined,
+    }),
+    maxSkips: undefined,
+  })
 
 /** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
 const rawRowDecoder = (

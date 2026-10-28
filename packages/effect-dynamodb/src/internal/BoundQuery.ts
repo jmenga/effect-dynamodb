@@ -512,12 +512,13 @@ export interface BoundQueryConfig<Model> {
    *
    * `field` is the SK composite name the caller targeted (`t.status` →
    * `"status"`), or `undefined` when the callback did not go through the sk
-   * accessor.
+   * accessor. `undefined` when no stored key satisfies the condition: the
+   * query plans `empty` and sends nothing (#171).
    */
   readonly composeSkCondition?: (
     condition: RawSortKeyCondition,
     field: string | undefined,
-  ) => Query.SortKeyCondition
+  ) => Query.SortKeyCondition | undefined
   /**
    * Optional: plan `.within(bounds)` on the query (#171) — an accessor's own
    * composites and encoders turn the bounds into key ranges and row checks.
@@ -779,6 +780,13 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     const finalCondition = this._config.composeSkCondition
       ? this._config.composeSkCondition(condition, targetField())
       : serializeRawCondition(condition)
+    if (finalCondition === undefined) {
+      return new BoundQueryImpl<Model, never, A>(
+        Query.planEmpty(this._query),
+        this._config,
+        "where",
+      )
+    }
     return new BoundQueryImpl<Model, never, A>(
       Query.where(this._query, finalCondition),
       this._config,

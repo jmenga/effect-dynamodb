@@ -1535,9 +1535,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // form — `update` already did (see `newDynamo` / `oldDynamo` below), so
         // leaving `create` raw made the two write paths mirror the collection SK
         // differently for a transformed composite.
-        const collectionSkComposites = KeyComposer.extractComposites(
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembled),
+        const collectionSkComposites = sortKeyComposites(
+          config.schema,
+          KeyComposer.extractComposites(
+            config.collection.sk?.composite ?? [],
+            keyRecord(assembled),
+          ),
         )
 
         // 6. Build DynamoDB items with composed keys (create only ever PUTs).
@@ -1679,9 +1682,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
           config,
           pkValue,
-          KeyComposer.extractComposites(
-            config.collection.sk?.composite ?? [],
-            keyRecord(assembledNew),
+          sortKeyComposites(
+            config.schema,
+            KeyComposer.extractComposites(
+              config.collection.sk?.composite ?? [],
+              keyRecord(assembledNew),
+            ),
           ),
           keyRecord,
           stampFor(now, readExistingCreated(allItems)),
@@ -1690,9 +1696,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           oldGroups,
           config,
           pkValue,
-          KeyComposer.extractComposites(
-            config.collection.sk?.composite ?? [],
-            keyRecord(assembledOld),
+          sortKeyComposites(
+            config.schema,
+            KeyComposer.extractComposites(
+              config.collection.sk?.composite ?? [],
+              keyRecord(assembledOld),
+            ),
           ),
           keyRecord,
         )
@@ -1820,13 +1829,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
         )
 
         // Build SK prefix from contiguous filter values matching SK composites.
-        // `serializeValue`, NOT `String(v)` — the write side encodes numerics,
-        // so `String(5)` would look for `5` where `0000000000000005` is stored.
+        // `serializeSortKeyValue`, NOT `String(v)` — the write side encodes
+        // numerics, so `String(5)` would look for `5` where `0000000000000005`
+        // is stored, and escapes the sort key's text.
         const skValues: string[] = []
         const listSkFilter = keyRecord(filter ?? {})
         for (const attr of listConfig.sk.composite) {
           if (listSkFilter[attr] !== undefined)
-            skValues.push(KeyComposer.serializeValue(listSkFilter[attr]))
+            skValues.push(
+              KeyComposer.serializeSortKeyValue(listSkFilter[attr], config.schema.casing),
+            )
           else break // Stop at first gap (prefix matching)
         }
         const skComplete = skValues.length === listConfig.sk.composite.length
@@ -3056,7 +3068,16 @@ const decomposeAggregate = (
     // Decompose each edge
     for (const child of rootNode.children) {
       const fieldValue = assembled[child.fieldName!]
-      yield* decomposeNode(items, child, fieldValue, contextValues, "root", [], aggregateName)
+      yield* decomposeNode(
+        items,
+        child,
+        fieldValue,
+        contextValues,
+        "root",
+        [],
+        aggregateName,
+        schema.casing,
+      )
     }
 
     // Two items composing the same sort key are two writes to one row. DynamoDB
@@ -3112,7 +3133,9 @@ const mergeContextValues = (
 }
 
 /**
- * Recursively decompose a node's value into DynamoDB items.
+ * Recursively decompose a node's value into DynamoDB items. Sort key values
+ * are escaped with the schema's `casing` (`KeyComposer.sortKeyText`); the
+ * discriminator names between them are field names, kept as they are.
  */
 const decomposeNode = (
   items: DecomposedItem[],
@@ -3122,6 +3145,7 @@ const decomposeNode = (
   parentGroup: string,
   parentDiscriminatorValues: ReadonlyArray<string>,
   aggregateName: string,
+  casing: DynamoSchemaModule.Casing,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -3143,7 +3167,7 @@ const decomposeNode = (
         ...(node.ownDiscriminator
           ? Object.entries(node.ownDiscriminator)
               .filter(([, v]) => typeof v !== "function")
-              .flatMap(([k, v]) => [k, KeyComposer.serializeValue(v)])
+              .flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)])
           : []),
       ]
 
@@ -3185,6 +3209,7 @@ const decomposeNode = (
           txGroup,
           discValues,
           aggregateName,
+          casing,
         )
       }
     } else if (node.cardinality === "one") {
@@ -3203,7 +3228,7 @@ const decomposeNode = (
       const ownDiscValues = node.ownDiscriminator
         ? Object.entries(node.ownDiscriminator)
             .filter(([, v]) => typeof v !== "function")
-            .flatMap(([k, v]) => [k, KeyComposer.serializeValue(v)])
+            .flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)])
         : []
 
       items.push({
@@ -3246,7 +3271,9 @@ const decomposeNode = (
         applyNodeAttrEncoders(keyAttrs, node.keyAttrEncoders)
         withContext(keyAttrs, contextValues.key)
 
-        const itemComposites = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
+        const itemComposites = (yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)).map(
+          (text) => KeyComposer.sortKeyText(text, casing),
+        )
 
         items.push({
           entityType: node.entityType,
@@ -3276,6 +3303,17 @@ const readCompositePath = (attrs: Record<string, unknown>, path: string): unknow
   }
   return current
 }
+
+/**
+ * A collection or list sort key's composites as the key holds them: each
+ * serialized value (`KeyComposer.extractComposites` over the key-form record)
+ * cased and escaped (`KeyComposer.sortKeyText`), so the key's text sorts as
+ * its values and a value never holds the delimiter.
+ */
+const sortKeyComposites = (
+  schema: DynamoSchemaModule.DynamoSchema,
+  composites: ReadonlyArray<string>,
+): ReadonlyArray<string> => composites.map((text) => KeyComposer.sortKeyText(text, schema.casing))
 
 /**
  * Whether a resolved composite value can be a sort-key segment.
@@ -3495,9 +3533,12 @@ const buildDynamoItems = (
             listPkComposites,
           )
         }
-        const listSkComposites = KeyComposer.extractComposites(
-          config.list.sk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
+        const listSkComposites = sortKeyComposites(
+          config.schema,
+          KeyComposer.extractComposites(
+            config.list.sk.composite,
+            keyRecord(item.keyAttributes ?? item.attributes),
+          ),
         )
         attrs[config.list.sk.field] = composeCollectionKey(
           config.schema,
