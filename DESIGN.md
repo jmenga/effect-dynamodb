@@ -767,6 +767,33 @@ SK = ${schema}#{version}#{collectionName}#{entityType}_{entityVersion}#{composit
 SK = ${schema}#{version}#{parentCollection}#{childCollection}#{entityType}_{entityVersion}#{composites}
 ```
 
+### Z-order Sort Keys (#171)
+
+A secondary index's sort key half may declare `sk: { field, prefix?, zorder: [...] }` instead of `composite` (`ZOrderKeyPart`; full design in `docs/designs/zorder-indexes.md`). The physical attribute is binary (`B`):
+
+```
+gsiNsk (B) = seg(prefix_1) ‖ … ‖ seg(prefix_k) ‖ toBytes(interleave(q(dim_1), …, q(dim_m)), W)
+```
+
+- **No schema prefix, no entity type, no version byte.** Entity isolation comes from the partition key, which already carries the entity type. A Z-order index can't declare or join a collection (`EDD-9090`).
+- **Quantization `q`** maps a dimension's key-form value to a level: `int` / `float` (`min`..`max` in `step`s, out-of-range values clamped to the edge levels), `dateTime` (`2^bits` levels of one `unit` from `from`), `literals` (declared order), `string` (the first `bytes` UTF-8 bytes). Storage is resolved per entity and field at `Entity.make` (`EDD-9088`); `bits` per dimension at most 53 (128 for `string`), `Σ bits ≤ 512` (`EDD-9089`).
+- **Interleave** is MSB-aligned over unequal widths: round `r` takes bit `bits_i - 1 - r` of every dimension still that wide, in declaration order (declaration order = priority). `B = Σ bits`, `W = ceil(B / 8)`; `toBytes` is big-endian and right-aligned (the top `8W - B` bits are zero).
+- **Prefix segments** are exact-match: a bare name is `u16be(len) ‖ utf8(cased value)` (the index's effective casing; length in bytes after casing), `{ field, hash: n }` is the first `n` (1..8) bytes of FNV-1a-64 over the same bytes. Prefix-free, so skip-scan can compute successors; the order users see is the encoded order (length, then bytes), not text order.
+- **Size** counts against DynamoDB's 1,024-byte sort-key limit; no client pre-check — DynamoDB's rejection is diagnosed (`WriteDiagnosis` renders `B` as `0x…` hex).
+- `composeSk` stays string-only (a defect on a Z-order half); `composeZOrderSk` returns a plain `Uint8Array`, `composeSkValue` dispatches, and `composeIndexKeys` / `composeAllKeys` / `composeGsiKeysForUpdatePolicyAware` return `KeyValue = string | Uint8Array`. A value a dimension can't place (`NaN`, an unparseable date, a value outside a `literals` list) is `EDD-9092`, a `ValidationError` on the write.
+- **`Table.make` / `Table.definition`** declare the attribute `B`; one attribute declared `B` by one member and `S` by another throws `EDD-9091`.
+- **Changing a declaration** (dimension order, `bits`, `min` / `max` / `step`, `from`, the prefix list) changes what stored bytes mean: it needs a new index or a backfill, and the cursor fingerprint rejects old cursors. Appending `literals` values is safe while they fit the declared `bits`.
+
+**Write path.** The half's derived `composite` (prefix composites, then dimension fields) feeds the unchanged per-half skip-predicate. An evaluated Z-order half is all-or-nothing — there is no truncation, since a partial address is meaningless:
+
+| Evaluated Z-order half | `'sparse'` | `'preserve'` |
+|---|---|---|
+| every prefix composite and dimension present in the merged record | SET | SET |
+| any absent, none in `removedSet` | REMOVE | noop (may go stale) |
+| any in `removedSet` | REMOVE | REMOVE (cascade override) |
+
+A hierarchical prefix therefore does not truncate on the write side: `set({ agencyId }).remove(["officeId"])` on `prefix: [agencyId, officeId]` REMOVEs the half under both policies (the hierarchy is a query feature). `put` writes the half only when every field is present (sparse, as for string halves); `append` recomposes it only when `appendInput` (or the primary key) carries every field. A change within one quantization level writes identical bytes; a change of at least one level, or of a prefix composite, moves the entry (2 GSI writes on the shared GSI partition).
+
 ### Special Key Patterns
 
 **Unique constraint sentinel:**
@@ -1082,6 +1109,17 @@ Test coverage for the policy-aware composer must span the canonical GSI-composit
 4. **Hole pattern GSI** — optional leading composite + present trailing composite. Must collapse into the unified can't-compose rule (drop under `'sparse'`, noop or cascade-override under `'preserve'`).
 5. **All composites mutable** — every composite is a non-PK model field, and `appendInput` / update payloads carry them all. The standard case; the gate fires through the payload.
 6. **Empty-composite half** — at least one half is `composite: []` (e.g. `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }`, common in single-table designs where the SK is just the entity prefix). The per-half gate must always evaluate the empty half (the value is a constant prefix; multi-writer protection does not apply). Regression scenario for #46 — must be present in unit, entity-level integration, and connected suites.
+7. **Z-order half** (#171) — `byFacets: { pk: [region], sk: { zorder: [price, bedrooms, listedAt] } }`, every dimension a mutable model field. Full payload → SET bytes; partial payload → `'sparse'` REMOVE / `'preserve'` noop / `'preserve'` + `remove([dim])` REMOVE; untouched → skipped; never truncated; a value change within one level writes identical bytes.
+8. **Z-order half with `sk.prefix`** — `sk: { prefix: [agencyId, { field: officeId, hash: 8 }], zorder: [...] }`. A prefix change moves the entry; a prefix composite alone in the payload with dimensions missing → policy decides.
+
+Degenerate fixtures for shapes 7 and 8 (audited against the existing shapes, notably 3 and 6):
+
+- **7a (layout edge, single bit)** — one 2-member `literals` dimension: 1 bit, `B = 1`, `W = 1`; the byte is `0x00` or `0x01`.
+- **7a′ (layout edge, mixed widths)** — a 2-member `literals` dimension plus a 13-bit `int`: `B = 14`, `W = 2`; the top two bits of the first byte are always zero.
+- **7b (shape 6 analogue)** — `pk: { composite: [] }` with a Z-order sort key: the empty PK half is always evaluated and SET; under `'sparse'` a partial dimension payload gives PK SET + SK REMOVE (the item leaves the index); under `'preserve'`, PK SET + SK noop.
+- **8a (#43 analogue)** — every prefix composite and dimension is also a primary-key composite: recomposed from `keyRecord` on every write, including an update that touches none of them.
+- **8b (#41 analogue)** — prefix owned by one writer, dimensions by another: writer A's prefix-only update must not SET (`'preserve'` noop); writer B's full-dimension update SETs only if the prefix is also present (from `keyRecord` or payload), else policy.
+- **8c (shape 3 analogue)** — hierarchical `prefix: [agencyId, officeId]`; `set({ agencyId }).remove(["officeId"])` → REMOVE under `'sparse'` and under `'preserve'` (cascade override), never a truncated SET.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -1776,6 +1814,56 @@ Query.consistentRead // the table or an LSI; on a GSI DynamoDB rejects it, diagn
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
 Query.paginate   // Query<A> => Effect<Stream<A>, DynamoError, DynamoClient>
 ```
+
+### Request Sizing (#171)
+
+`limit(n)` is a contract on results; the `Limit` each request sends is chosen by one sizing mode per query (`QueryExplain.sizing`):
+
+| Mode | When | Each request's `Limit` |
+|---|---|---|
+| `fixed` | numeric `pageSize(n)` | `n`, never adapted (with a `limit` and nothing that drops rows, `min(n, owed)`) |
+| `natural` | `pageSize("natural")`, or `maxPages` on a query without a planner | 1.36's sizing: a natural 1 MB page under a filter or predicate, `limit` doubling per request over history rows, the outstanding `limit` otherwise |
+| none | no `limit` | none: natural 1 MB pages |
+| `adaptive` | a `limit` and something that drops rows: a filter, a `filterBy` predicate, a plan's row check, history rows | first `max(16, 2 × owed)` under a filter (`owed` when only history rows drop); doubling while nothing is accepted; then `⌈owed / rate × 1.25⌉`, `rate = min(cumulative, last request's)` acceptance; clamped to 1..100,000 |
+| `budget` | a `limit` nothing filters (the `__edd_e__` ownership clause alone included) | the items still owed |
+
+The estimator lives in the terminal's loop, never in a cursor: a resumed query starts fresh. Items returned by `collect()` / `count()` and by a `fetch()` chain end to end are unchanged; request counts, read units, `fetch()` cursor values (and whether the last page's cursor is null) and `Query.paginate`'s page boundaries can differ. A `.pageSize()` string other than `"natural"` throws `EDD-9095`.
+
+### `.within()` and Skip-Scan (#171)
+
+`.within(bounds, { maxSkips? })` on a composite accessor bounds any sort key composite the accessor left open (`{ eq }`, `{ between }`, `gt` / `gte` and / or `lt` / `lte`, compared in key form). It excludes `.where()` and a second `.within()` (`EDD-9093`). The planner (`internal/RangePlanner.ts`, pure: it turns a plan and each response into the next `Read` / `Probe` / `Done` step; `Query.ts`'s loop sends every request) picks:
+
+- **`key`** — eq bounds extend the pinned prefix, and the first bounded composite is next: one key condition (shared with `.where()` through `composeRangeUnder`); bounds the key condition can't express become row checks.
+- **`skip-scan`** — composites left of the first bound are unbounded (the *skip tuple*): a `Limit: 1` probe (no filter, projection of the sort key) finds the next distinct tuple, its range is read with the normal loop, then a probe from just past it (`T` with its trailing `#` replaced by `$`). Probes inherit `.consistentRead()` on the primary index. After `maxSkips` probes (default 32) the rest is read as one filtered range; `maxSkips: 0` filters at once.
+- **`filter`** — one range, every bound checked per row: when a skip-tuple composite's key form can contain `#` (a free-form `Schema.String`), on a primary accessor that shares its partition with history rows (retain, soft delete, time series), at `maxSkips: 0`, or after a probed key that doesn't parse.
+
+Every request, probes included, counts against `maxPages`, is observed by `onRequest` and is charged to the query's consumed-capacity operation.
+
+### Z-order Queries (#171)
+
+On a Z-order accessor, `.within()` bounds dimensions (a `RangeBound` in the field's own type; `in` for a `literals` dimension) and pins prefix composites (`eq`); `.where()` is absent. Bounds quantize to a box of levels; exact bounds are checked by a `FilterExpression` where the stored form compares in key order, else by a row check. Unpinned prefix composites are skip-scanned over the binary prefix (exact byte parsing of the length-prefixed or hashed segments), then the box is read inside each tuple. `.zorder({ strategy, maxRanges, pageSize, concurrency })`, later calls merging over earlier ones:
+
+| Strategy | Reads |
+|---|---|
+| `naive` | the box's hull `[zmin, zmax]` in one range, every row checked |
+| `jump` | the hull; after a page whose last key is outside the box, BIGMIN gives the next address inside it and the next request starts there. `Limit` starts at 16 and doubles with the in-box run, up to 1,000 (`pageSize` fixes it) |
+| `precise` | a capped plan of address ranges (`maxRanges`, default 16) by cell descent, with the cheapest gaps merged; ranges in flight at once: `concurrency` |
+| `auto` (default) | `precise` when the exact plan fits `maxRanges`, else `jump` |
+
+`concurrency` defaults to 4 for reads with a `limit` and 1 for drains (natural 1 MB pages against one partition). Plans are cached (LRU, 64). Results arrive in address order (prefix order, then Z-order), never sorted by any one dimension. An empty box plans `empty` and sends nothing.
+
+### Inspection: `explain()` and `onRequest()` (#171)
+
+`explain()` returns a `QueryExplain` — `index`, `plan` (`PlanMode`: `key`, `skip-scan`, `filter`, `naive`, `jump`, `precise`, `empty`), `reason`, `keyConditions` (`{ lower, upper, exact }`), `filter`, `rowChecks`, `sizing`, `zorder?` (`bits`, per-dimension `box`, `fill`, `exactRanges`), `maxSkips?` — with no I/O; a `startFrom` cursor is not read. `onRequest(observer)` runs each observer, in order, in the terminal's fiber after every request with a `QueryRequestEvent` (`kind: "read" | "probe" | "count"`, `request`, `lower`, `upper`, `limit`, `scannedCount`, `count`, `accepted`, `discarded`); a failure is a defect, and DynamoDB calls an observer makes run under `Capacity.detached`, outside the query's report. `asParams` with a planner reports the first request the terminal would send.
+
+### Cursors (#171)
+
+Two formats (`internal/Cursor.ts`):
+
+- **Legacy** — `btoa(JSON.stringify(LastEvaluatedKey))`. Every query without a planner still emits it whenever it can carry the key exactly, so plain queries' cursors are byte-identical to earlier releases.
+- **v2** — `"v2." + base64url(utf8(JSON))`: emitted for keys with `B` values or text outside Latin-1, and for every planned query. It carries a fingerprint (index, entity type, partition key value, pinned and prefix values, the quantized box or bounds, the layout, `reverse`), the plan mode in force and a position: the skip tuple in progress, and either the `LastEvaluatedKey` to resume at, the last in-plan key done (*through*), or that the tuple is finished. The fingerprint excludes `maxRanges`, `concurrency`, `strategy`, `pageSize` and `maxSkips`, so a resumed query may change them; resume recomputes the plan and continues from the position, in the plan mode it recorded, with a fresh probe budget.
+
+`startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a single-range key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
 
 ### Entity Operations (via typed client)
 

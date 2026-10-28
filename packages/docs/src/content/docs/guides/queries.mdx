@@ -85,7 +85,7 @@ const bobs = yield* db.entities.Memberships.primary({
 }).collect()
 ```
 
-Behavior is symmetric with GSI accessors: `.where()`, `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.collect()`, `.fetch()`, `.paginate()`, and `.count()` all chain off the returned `BoundQuery`.
+Behavior is symmetric with GSI accessors: `.where()`, `.within()`, `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.maxPages()`, `.reverse()`, `.startFrom()`, `.consistentRead()`, `.onRequest()`, `.collect()`, `.fetch()`, `.paginate()`, `.count()` and `.explain()` all chain off the returned `BoundQuery`.
 
 ### How much of the sort key an accessor pins
 
@@ -146,8 +146,45 @@ const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alp
 A condition on a **non-terminal** composite (`status`, with `createdAt` still to follow) covers that value's whole subtree: `eq(t.status, "active")` matches every `active` task regardless of `createdAt`, and `lte`/`between` include the far edge of the subtree.
 
 :::caution[One case DynamoDB cannot express]
-A strict `lt` on the **last** SK composite when the accessor has pinned an earlier one — `byProject({ projectId, status: "active" }).where((t, { lt }) => lt(t.createdAt, "2025-03-01"))` — needs `begins_with(prefix) AND sk < value`. DynamoDB allows only one sort key condition, `BETWEEN` is inclusive at both ends, and a `FilterExpression` may not reference a key attribute. Rather than silently returning the boundary item, this throws `EDD-9046`; use `between` or `lte` instead.
+A strict `lt` on the **last** SK composite when the accessor has pinned an earlier one — `byProject({ projectId, status: "active" }).where((t, { lt }) => lt(t.createdAt, "2025-03-01"))` — needs `begins_with(prefix) AND sk < value`. DynamoDB allows only one sort key condition, `BETWEEN` is inclusive at both ends, and a `FilterExpression` may not reference a key attribute. Rather than silently returning the boundary item, this throws `EDD-9046`; use `between` or `lte` instead, or `.within()` (below), which reads up to the value inclusively and drops the boundary rows itself.
 :::
+
+## Bounding any sort key composite: `.within()`
+
+`.where()` constrains the **first** composite the accessor left open. `.within()` bounds **any** of them, in their own types, and the library picks the plan:
+
+```typescript region="within-skip-scan" example="guide-queries.ts"
+// `.where()` can't bound createdAt without pinning status first. `.within()`
+// can: it finds each status with a one-row probe, then reads only that
+// status's createdAt range.
+const febTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+  .collect()
+```
+
+Each bound is `{ eq }`, `{ between: [low, high] }`, or a lower end (`gt` / `gte`) and / or an upper end (`lt` / `lte`). A composite left out is unbounded.
+
+| Bounds | Plan | Reads |
+|---|---|---|
+| On the next open composite (and `eq` on any that follow it, then at most one range) | `key` | One key condition, as `.where()` would send. A strict `lt` on the last composite is read inclusively and the boundary rows are dropped per row, so `EDD-9046` doesn't arise |
+| On a later composite, with open composites before it | `skip-scan` | One `Limit: 1` probe per distinct value of the open composites (a *tuple*), then that tuple's range. Results come back in sort key order |
+| The same, when skip-scan isn't sound | `filter` | The pinned range once, every bound checked per row |
+
+Skip-scan pays when the skipped composites have few distinct values relative to the rows (statuses, categories, regions). It isn't sound, and the query takes the `filter` plan, in two cases:
+
+- **A free-form string composite in the tuple.** Keys don't escape the `#` delimiter, so a value containing `#` could sort under another tuple and be skipped. Numbers, dates, booleans and literal unions whose members contain no `#` are fine.
+- **History rows.** The primary-key accessor of an entity with `versioned: { retain: true }`, `softDelete` or `timeSeries` shares its partition with snapshot, tombstone and event rows whose keys don't parse as tuples.
+
+Each probe is a request, counted by `.maxPages()`, and costs the size of the row it reads (rounded up to 4 KB), not a fixed small amount. `maxSkips` (default 32) caps the probes per terminal call: past it, the rest of the range is read once with every bound checked per row. `{ maxSkips: 0 }` takes the filter plan from the start:
+
+```typescript
+db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .within({ createdAt: { gte: "2025-02-01" } }, { maxSkips: 0 })
+```
+
+A bound the key condition can't express is checked on each row, with the same casing and number padding the keys use. `.within()` excludes `.where()` (and a second `.within()`); it isn't offered on an accessor whose composites are all pinned, on collections or on `scan()`. A value that can't be encoded throws `EDD-9050`, and a misuse reachable from untyped code (an unknown or pinned field, an operator outside the list above) throws `EDD-9093`, both at `.within()`.
+
+On a [Z-order index](/effect-dynamodb/guides/zorder/), `.within()` bounds a box over the interleaved dimensions instead.
 
 ## Post-Query Filtering
 
@@ -195,6 +232,7 @@ Two consequences worth knowing:
 | Approach | DynamoDB Mapping | Reduces Read Capacity? | Use For |
 |----------|------------------|----------------------|---------|
 | SK composites in accessor | `KeyConditionExpression` | Yes | Narrowing by sort key prefix |
+| `.within()` | `KeyConditionExpression` per tuple (skip-scan) | Yes, when the skipped composites have few values | Ranges on any sort key composite |
 | `.filter()` | `FilterExpression` | No | Any attribute (post-read) |
 | `.filterBy()` | none — runs in the client | No | Conditions DynamoDB has no operator for |
 
@@ -256,7 +294,7 @@ These are two different ideas, and they do not share a word:
 
 | Combinator | Contract | Sets DynamoDB `Limit`? |
 |---|---|---|
-| `.limit(n)` | Return **at most `n` items** — a contract on results | No |
+| `.limit(n)` | Return **at most `n` items** — a contract on results | Not as given — each request is [sized](#request-sizing) toward it |
 | `.pageSize(n)` | Fetch in **batches of `n` rows** — a contract on round trips | Yes |
 | `.maxPages(n)` | Stop after **`n` requests**, however many items that yielded | No |
 
@@ -279,10 +317,65 @@ const batchedAndCapped = yield* db.entities.TaskEntity.byProject({ projectId: "p
   .collect()
 ```
 
-`.limit(n)` works under a `.filter()` (and under a `.filterBy()`), and this is the reason the two are separate. DynamoDB's `Limit` bounds the rows **examined**, and a `FilterExpression` is applied *after* that — so `Limit` can never express "give me 3 matching items". `.limit()` is satisfied by accumulating across requests until `n` items are accepted or the key range is exhausted; `.pageSize()` is what each of those requests asks for. On a large partition with a very selective filter, pair `.limit()` with `.maxPages()` to bound the work.
+`.limit(n)` works under a `.filter()` (and under a `.filterBy()`), and this is the reason the two are separate. DynamoDB's `Limit` bounds the rows **examined**, and a `FilterExpression` is applied *after* that — so `Limit` can never express "give me 3 matching items". `.limit()` is satisfied by accumulating across requests until `n` items are accepted or the key range is exhausted; each of those requests is sized as described below, or by `.pageSize()` when you set it. To bound the work outright, add `.maxPages()`.
 
 :::caution[Changed in 1.16]
 `.limit(n)` used to set DynamoDB's per-request `Limit`, which meant `.limit(3).collect()` returned **every** matching item, fetched in pages of 3. It now returns 3. If you were using `.limit()` as a page-size hint, move to `.pageSize()` — `.limit(2).paginate()` streaming everything in pages of 2 becomes `.pageSize(2).paginate()`.
+:::
+
+### Request sizing
+
+With a `.limit()` and something that drops rows — a `.filter()`, a `.filterBy()` predicate, history rows, or a bound `.within()` checks per row — each request's `Limit` is **sized from the pass rate the earlier requests observed** (rows accepted ÷ rows examined, from DynamoDB's `ScannedCount`). The first request asks for twice the limit, and at least 16 rows (just the limit when only history rows are dropped); each later one for what the observed rate says the remaining items need, with a 25% margin. A request that accepts nothing doubles the next. Requests never ask for more than 100,000 rows, and DynamoDB still stops each at 1 MB.
+
+```typescript region="adaptive-sizing" example="guide-queries.ts"
+// Under a filter, each request's Limit is sized from the pass rate so far:
+// the first asks for max(16, 2 × limit) rows, later ones for what the
+// observed rate says the remaining items need.
+const lowPriority = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .filter({ priority: "low" })
+  .limit(2)
+  .onRequest((event) =>
+    Console.log(
+      `  request ${event.request}: Limit ${event.limit}, examined ${event.scannedCount}, accepted ${event.accepted}`,
+    ),
+  )
+  .collect()
+```
+
+```text
+  request 1: Limit 16, examined 6, accepted 2
+```
+
+| Query | Each request's `Limit` |
+|---|---|
+| `.limit(n)` with a filter, predicate, history rows or a per-row check | Sized from the pass rate (above) |
+| `.limit(n)` with nothing that drops rows | The items still owed |
+| `.pageSize(n)` | `n`, never adapted (with a `limit` and nothing that drops rows, at most the items still owed) |
+| `.pageSize("natural")` | 1.36's sizing (below) |
+| `.limit(n)` with `.maxPages()` | 1.36's sizing: a capped number of smaller requests would return fewer items per call. A `.within()` query, new in 1.37, adapts under `.maxPages()` too |
+| No `.limit()` | None: natural 1 MB pages, as before |
+
+`.pageSize("natural")` opts out, and sizes every request exactly as 1.36 did: a natural 1 MB page under a filter or predicate, doubling per request over history rows, and the items still owed otherwise.
+
+```typescript region="page-size-natural" example="guide-queries.ts"
+// Opt out: size requests exactly as 1.36 did — a natural 1 MB page under a filter.
+const lowPriorityNatural = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .filter({ priority: "low" })
+  .limit(2)
+  .pageSize("natural")
+  .collect()
+```
+
+Any other string throws `EDD-9095`.
+
+:::caution[Changed in 1.37]
+Sizing is now adaptive by default for a `.limit()` under a filter. The items `collect()` and `count()` return, and the items a `fetch()` chain returns end to end, are unchanged; request counts and read units change. A selective filter with `limit(5)` no longer reads a 1 MB page to return 5 items, but a low or uneven pass rate can take more round trips than one natural page (a logarithmic number more in the worst case). Three things you can observe change with it:
+
+- **A `fetch()` cursor's value** can differ. It resumes at the same place.
+- **A `fetch()` cursor can be non-null where it was null**: when the limit fills on the last row a sized request returned, DynamoDB reports more to read. The chain then ends with one empty page.
+- **`Query.paginate`'s page boundaries** follow the sized requests, since it emits one array per request; the items it streams are unchanged. A bound query's `.paginate()` streams items and is unaffected.
+
+`.pageSize("natural")` restores the 1.36 behaviour for one query.
 :::
 
 ### Single Page
@@ -315,6 +408,16 @@ if (page1.cursor) {
     .fetch()
 }
 ```
+
+A cursor is opaque and belongs to the query that produced it: resume with the same accessor, bounds, `.within()` and direction. It is read when the terminal runs, not by `.startFrom()`, so the order of `.startFrom()` and `.within()` in the chain doesn't matter.
+
+A malformed cursor fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`). So does a cursor that only a `.within()` query could have written, given to a query without `.within()`. A `.within()` query also checks the cursor against its plan, and fails the same way for a cursor from a `.within()` query with other bounds, another partition, the other direction or another index declaration, or one whose position lies outside the plan. A query without `.within()` can't tell another query's well-formed cursor from its own: its cursors are the same as in earlier releases, with nothing to check. DynamoDB may reject that cursor, failing the query with a `DynamoValidationError`, or the query resumes from wherever the cursor points.
+
+A `.within()` query's cursor records how far through its plan the query has got, so it stays valid if you change `maxSkips` or the [Z-order](/effect-dynamodb/guides/zorder/#cursors) strategy options between pages.
+
+:::caution[Changed in 1.37]
+A malformed cursor used to throw from `.startFrom()` itself. It now fails the query, with a `ValidationError` on the terminal's error channel. Cursors from earlier releases still work.
+:::
 
 ### Streaming
 
@@ -400,6 +503,48 @@ const recent = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha"
   .limit(3)
   .collect()
 ```
+
+## Inspecting a query: `explain()` and `onRequest()`
+
+Every bound query, collection queries included, has two inspection hooks.
+
+`.explain()` describes what the terminals would send, without sending anything: the plan, why it was chosen, the key ranges known up front, the bounds checked per row, and how requests are sized. It reads no cursor, so it describes the plan from its start, and it can't fail.
+
+```typescript region="explain" example="guide-queries.ts"
+const plan = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+  .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+  .explain()
+// plan.plan   → "skip-scan"
+// plan.reason → "skip tuple: status"
+```
+
+| Field | Meaning |
+|---|---|
+| `index` | The physical index, or `"primary"` |
+| `plan` | `"key"` (one key condition), `"skip-scan"`, `"filter"`, or a Z-order plan: `"naive"`, `"jump"`, `"precise"`, `"empty"` (nothing to read) |
+| `reason` | Why: `"one key condition"`, `"skip tuple: status"`, `"delimiter-unsafe composite: owner"`, `"history rows on the primary index"`, `"maxSkips: 0"`, `"exact plan over maxRanges"`, … |
+| `keyConditions` | The ranges known before anything is read, as `{ lower, upper, exact }`; `exact: false` means rows in it are also checked |
+| `filter` | The `FilterExpression` the plan adds, if any |
+| `rowChecks` | The fields checked on each row in the client |
+| `sizing` | `"adaptive"`, `"budget"` (the items still owed), `"fixed"` (`pageSize(n)`) or `"natural"` |
+| `zorder`, `maxSkips` | The Z-order box and address width; the skip-scan probe budget |
+
+`.onRequest(observer)` runs `observer` after every request a terminal sends, probes included, in the terminal's fiber and in the order the observers were added. Each event carries:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"read"`, `"probe"` (skip-scan) or `"count"` (`count()`'s `Select: "COUNT"` requests) |
+| `request` | 1-based, within the terminal call |
+| `lower`, `upper` | The sort key condition sent, for display |
+| `limit` | The `Limit` sent |
+| `scannedCount` | Rows DynamoDB examined (`ScannedCount`) |
+| `count` | Rows after the `FilterExpression` (`Count`) |
+| `accepted` | Rows that became items |
+| `discarded` | A read sent alongside others, then not used (its rows are counted, none became items) |
+
+Σ `scannedCount` against Σ `accepted` is what a query read against what it returned. A failure in the observer is a defect. DynamoDB calls the observer itself makes are not charged to the query's [consumed capacity](/effect-dynamodb/guides/consumed-capacity/) report.
+
+`Query.explain` and `Query.onRequest` are the same hooks for a pipeable `Query`.
 
 ## Complete Example
 

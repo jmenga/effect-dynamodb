@@ -83,6 +83,40 @@ GSI access patterns are defined directly on the entity via the `indexes` propert
 
 Several entities can overload one physical GSI (`gsi1` serving `byProject` on one entity and `byTenant` on another), but one physical index has one key schema. Every member of a table that declares it, including the auto-generated `_cascade_<field>` indexes and an aggregate's collection and list indexes, must name the same `pk.field` / `sk.field` and agree on GSI versus LSI. Entities on one table must also declare the same primary-key fields. `Table.make` and `Table.definition` throw `[EDD-9069]`, naming both declarers, when they differ; earlier releases silently kept the first declaration, so the other member's items never reached the index.
 
+### Z-order Sort Keys
+
+A secondary index's sort key half can declare `zorder` instead of `composite`: a list of dimensions whose values are bit-interleaved into one binary (`B`) sort key, so a single query can bound several attributes at once with `.within()`. Optional `prefix` composites are exact-match and sit in front of the address:
+
+```typescript region="zorder-entity" example="guide-zorder.ts"
+const Listings = Entity.make({
+  model: Listing,
+  entityType: "Listing",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    search: {
+      name: "gsi1",
+      // Exact-match facets, as for any index: one partition per region.
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: {
+        field: "gsi1sk", // a binary (B) attribute
+        prefix: ["agencyId"], // exact-match, in front of the address
+        zorder: [
+          // Declaration order is interleave priority.
+          ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }), // 13 bits
+          ZOrder.int("bedrooms", { min: 0, max: 15 }), // 4 bits
+          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), // 16 bits
+        ],
+      },
+    },
+  },
+})
+```
+
+`zorder` belongs on a secondary index's sort key half: not on the primary key, not on a partition key half, and never together with `composite` (`[EDD-9086]`). The physical attribute is declared `B` in the table definition; the partition key half stays an ordinary string key. The [Z-order Indexes guide](/effect-dynamodb/guides/zorder/) covers the dimensions, the key layout, the read strategies, and when Z-order pays; [indexPolicy](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) covers how writes keep the address current.
+
 ### Logical Names as API Surface
 
 Collection names become query accessors on the typed client:
@@ -113,6 +147,8 @@ Each composite value is prefixed with its attribute name (separated by `_`) and 
 | `["taskId"]` with value `"t-001"` | `$myapp#v1#task#taskid_t-001` |
 | `["projectId", "status"]` with values `"proj-alpha"`, `"active"` | `$myapp#v1#task#projectid_proj-alpha#status_active` |
 | `[]` (empty) | `$myapp#v1#task` |
+
+A [Z-order sort key](#z-order-sort-keys) is the exception: it is binary, holds the prefix segments and the interleaved address only, and carries no schema, version or entity type prefix.
 
 ### Empty Composites
 
@@ -471,6 +507,8 @@ When you call `DynamoClient.make({ entities, tables })`, the client auto-discove
 - All entities sharing an index must agree on the type (no mixing isolated/clustered)
 - Sub-collections sharing an index must use the same PK and SK fields
 - Every member declaring one physical index must use the same key attributes (`[EDD-9069]`, thrown by `Table.make` / `Table.definition`)
+- A Z-order index can't declare `collection` or join one (`[EDD-9090]`): its binary sort key has no entity type prefix to tell members apart
+- One physical attribute can't be a binary Z-order half on one member and a string key half on another (`[EDD-9091]`)
 - No duplicate entity types within a single collection
 
 ## Worked Example: Multi-Tenant Project Management
@@ -500,6 +538,7 @@ Each composite value in a key is prefixed with its attribute name (e.g., `employ
 ## What's Next?
 
 - [indexPolicy — Per-Half GSI Membership Rules](/effect-dynamodb/guides/index-policy/) -- Per-half sparse/preserve declaration, per-half evaluation gate, structural composition with the unified per-half can't-compose rule, set/remove asymmetry, per-half cascade, EDD-9025 invariant
+- [Z-order Indexes](/effect-dynamodb/guides/zorder/) -- Bound several attributes in one query with an interleaved binary sort key
 - [Queries](/effect-dynamodb/guides/queries/) -- Query by index, filter by sort key composites, paginate results
 - [Data Integrity](/effect-dynamodb/guides/data-integrity/) -- Unique constraints and optimistic concurrency
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete and version retention

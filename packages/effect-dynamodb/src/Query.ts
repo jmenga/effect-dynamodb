@@ -778,9 +778,14 @@ export const ignoreOwnership = <A>(self: Query<A>): Query<A> =>
  * returned by {@link execute} that encodes where the query resumes. Pass an
  * empty string to start from the beginning.
  *
- * The cursor is read when a terminal runs, not here: one that is malformed,
- * or that belongs to another query, fails the terminal with a
- * `ValidationError` (`[EDD-9094]`, `operation: "query.startFrom"`).
+ * The cursor is read when a terminal runs, not here: a malformed one fails
+ * the terminal with a `ValidationError` (`[EDD-9094]`,
+ * `operation: "query.startFrom"`), as does a `.within()` cursor on a query
+ * without `.within()`. A `.within()` query also refuses one from another
+ * plan (other bounds, partition, direction or index declaration) or
+ * positioned outside its own. A query without `.within()` can't recognise
+ * another query's well-formed cursor: DynamoDB may reject it
+ * (`DynamoValidationError`) or the query resumes from it.
  */
 export const startFrom: {
   (cursor: string): <A>(self: Query<A>) => Query<A>
@@ -1665,9 +1670,10 @@ const resolvePlanner = (state: QueryState, factory: PlannerFactory): RangePlanne
 
 /**
  * @internal Decode the {@link startFrom} cursor and place it (design §10.2):
- * a query without a planner takes a legacy cursor or a v2 `{ k }`; with one,
- * the planner places it in the recomputed plan. Anything else — malformed, or
- * another query's — is `[EDD-9094]`.
+ * a query without a planner takes a legacy cursor or a v2 `{ k }`, unchecked
+ * (it carries no fingerprint); with one, the planner places it in the
+ * recomputed plan. A malformed cursor, a planned query's cursor here without
+ * a planner, or one the planner refuses is `[EDD-9094]`.
  */
 const resume = (state: QueryState): QueryState | ValidationError => {
   const entityType = state.entityTypes.join(", ") || "unknown"

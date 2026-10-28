@@ -417,6 +417,25 @@ With per-half policy, the per-half evaluation gate, and the structural compositi
 
 Concretely: if you have a hybrid GSI with `pk = [accountId, alertState]` where `accountId` is enrichment-owned and `alertState` is ingest-owned, restructure to put each writer's composites on its own half — `pk = [accountId]`, `sk = [alertState, ...]` — so each half has a single owner. The per-half policy then expresses each writer's intent cleanly, and the per-half gate ensures one writer never disturbs the other's key.
 
+## Z-order sort keys
+
+A [Z-order sort key half](/effect-dynamodb/guides/zorder/) (`sk: { prefix?, zorder: [...] }`) goes through the same per-half gate: its composites are its prefix composites plus its dimensions. A half is skipped when none of them was removed and every one is absent from both the payload and the `keyRecord`. What differs is the structural rule. A Z-order address interleaves the bits of every dimension, so a partial address means nothing: there is no longest valid leading prefix, and no truncation.
+
+| An evaluated Z-order half | `'sparse'` | `'preserve'` |
+|---|---|---|
+| Every prefix composite and dimension present in the merged record | SET the address | SET the address |
+| Any of them absent, nothing in `Entity.remove([...])` | REMOVE the half (the item leaves the index) | noop (the stored address may go stale) |
+| Any of them in `Entity.remove([...])` | REMOVE | REMOVE (cascade override) |
+
+- **Every field is key material.** Moving a dimension by at least one quantization level, or changing a prefix composite, moves the entry: a delete plus a put in the GSI. A change within one level writes the same bytes.
+- **Hierarchical prefixes don't truncate.** For a string half, `set({ agencyId }).remove(["officeId"])` truncates the key to the parent ([§7.3](#73-hierarchical-truncation-via-setremove)). For `prefix: ["agencyId", "officeId"]` the same update REMOVEs the half under both policies, and the item leaves the index. The hierarchy is a query feature: `.within()` can bound the agency alone, or the agency and the office.
+- **Split ownership leaves the address stale or gone.** A writer that owns `price` but not `listedAt` can't recompose the address: under `'preserve'` it goes stale, under `'sparse'` the item leaves the index. Give one writer every field of a Z-order half ([multi-writer design rule](#multi-writer-entity-design-rule)).
+- **Primary-key composites recompose on every write.** A prefix composite or dimension that is also a primary-key composite arrives through the `keyRecord`, so the half is evaluated, and SET when the rest are present, on every update, as for [PK-composites-only halves](#bychannel-gsi-returns-0-items-in-v170--v171-pk-composites-only-regression-fixed-in-v172).
+- **An empty partition key half is still SET.** With `pk: { composite: [] }`, the constant partition key is SET on every write. Under `'sparse'`, a partial dimension payload SETs the partition key and REMOVEs the sort key, so the item leaves the index; under `'preserve'` the sort key is left alone.
+- **`put()` is all-or-nothing too.** A put missing any prefix composite or dimension writes no Z-order key: the item is not in that index, as for any sparse GSI.
+- **`.append()`** recomposes a Z-order half only when `appendInput` carries every prefix composite and dimension (or the primary key does). Otherwise the half is skipped, or decided by its policy as above.
+- A value a dimension can't place (`NaN`, an unparseable date, a value outside a `literals` list) fails the write with a `ValidationError` (`EDD-9092`).
+
 ## Migrating from 1.7.1 (or 1.7.0)
 
 v1.7.2 is a patch release fixing the PK-composites-only GSI regression introduced by v1.7.1's per-half evaluation gate (closes [#43](https://github.com/jmenga/effect-dynamodb/issues/43)). **No API changes** — same `indexPolicy: { pk, sk }` declaration, same `Entity.remove([...])` API, same EDD-9025 invariants.
@@ -492,5 +511,6 @@ See [`examples/guide-index-policy.ts`](https://github.com/jmenga/effect-dynamodb
 
 - [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) — the *storage* primitive (different "sparse")
 - [Indexes & Collections](/effect-dynamodb/guides/indexes/) — How GSI composites and collections are defined
+- [Z-order Indexes](/effect-dynamodb/guides/zorder/) — Interleaved binary sort keys and `.within()` box queries
 - [Time Series](/effect-dynamodb/guides/timeseries/) — `.append` details and enrichment preservation
 - [Queries](/effect-dynamodb/guides/queries/) — Query by index, filter by SK composites

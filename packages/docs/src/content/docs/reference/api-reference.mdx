@@ -455,13 +455,14 @@ import { Query } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
-| `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter) |
-| `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
+| `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter). Each request's `Limit` is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed |
+| `pageSize(n \| "natural")` | Dual | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips), never adapted. `"natural"`: size requests as 1.36 did (a natural 1 MB page under a filter). Any other string throws `EDD-9095` |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
+| `onRequest(observer)` | Dual | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. Observers run in the order added; a failure is a defect |
 | `reverse` | Combinator | Reverse sort order (descending) |
 | `consistentRead` | Combinator | Enable strongly consistent reads (the table, or an LSI). DynamoDB rejects a consistent read of a GSI: the query fails with a `ValidationError` (`operation: "query.consistentRead"`) naming the index, DynamoDB's error as its `cause` |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
-| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor |
+| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor. The cursor is decoded by the terminal: a malformed one fails it with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
 | `filterExpr(expr)` | Dual | Add an `Expr` ADT filter (from callback API) |
 | `selectPaths(paths)` | Dual | Project path segments (from callback API) |
@@ -474,6 +475,7 @@ import { Query } from "effect-dynamodb"
 | `collect` | `Effect<Array<A>>` | Execute, fetch all pages, and flatten into a single array |
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
+| `explain` | `Effect<QueryExplain, never, never>` | Describe the plan, its reason, the key ranges known up front, the fields checked per row and the request sizing, without sending anything. A `startFrom` cursor is not read |
 | `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send |
 
 ### Filter Operators
@@ -499,6 +501,16 @@ Used in entity-level `filter()`:
 | Export | Description |
 |--------|-------------|
 | `isQuery(value)` | Type guard for `Query<A>` |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Page<A>` | `{ items: Array<A>, cursor: string \| null }` — `cursor` is `null` on the last page |
+| `PlanMode` | `"key" \| "skip-scan" \| "filter" \| "naive" \| "jump" \| "precise" \| "empty"` |
+| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, maxSkips? }` |
+| `QueryRequestEvent` | `{ kind: "read" \| "probe" \| "count", request, lower, upper, limit, scannedCount, count, accepted, discarded }` |
+| `ZOrderOptions` | `{ strategy?: "auto" \| "naive" \| "jump" \| "precise", maxRanges?, pageSize?, concurrency? }` — see [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies) |
 
 ### Usage
 
@@ -541,11 +553,14 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
-| `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. |
-| `.pageSize(n)` | Fetch in batches of `n` rows — sets DynamoDB's `Limit`. A contract on round trips, not on what comes back. |
+| `.within(bounds, options?)` | Bound any sort key composite the accessor left open, not only the leading one: `{ eq }`, `{ between: [lo, hi] }`, or one or two open ends (`gt` / `gte`, `lt` / `lte`). Plans a key condition, a skip-scan or a filter (`options.maxSkips`, default 32). On a Z-order accessor it bounds the dimensions (`in` for a `literals` dimension) and pins the prefix composites. Excludes `.where()`. See [`.within()`](/effect-dynamodb/guides/queries/#bounding-any-sort-key-composite-within). |
+| `.zorder(options)` | Z-order accessors only: how the `.within()` box is read — `ZOrderOptions` (`strategy`, `maxRanges`, `pageSize`, `concurrency`). Later calls merge over earlier ones. See [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies). |
+| `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. Each request is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed. |
+| `.pageSize(n \| "natural")` | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit`, never adapted. A contract on round trips, not on what comes back. `"natural"`: size requests as 1.36 did. |
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
-| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
+| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. Decoded by the terminal: a malformed cursor fails it with a `ValidationError` (`EDD-9094`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it. See [Cursor-Based Pagination](/effect-dynamodb/guides/queries/#cursor-based-pagination). |
+| `.onRequest(observer)` | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. See [Inspecting a query](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest). |
 | `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, DynamoDB rejects the query and it fails with a `ValidationError` naming the index. An entity's indexes are GSIs when `db.tables.*.create()` creates them. |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
 
@@ -554,13 +569,27 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Returns |
 |--------|---------|
 | `.collect()` | `Effect<Array<A>, DynamoClientError \| ValidationError, never>` — drain all pages into a single array. |
-| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: string \| undefined }`. |
+| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: string \| null }`; `cursor` is `null` on the last page. |
 | `.paginate()` | `Stream<A, DynamoClientError \| ValidationError, never>` — lazy stream that paginates automatically. |
-| `.count()` | `Effect<number, DynamoClientError, never>` — count-only query (`Select: COUNT`); items are not returned. |
+| `.count()` | `Effect<number, DynamoClientError \| ValidationError, never>` — count-only query (`Select: COUNT`); items are not returned. |
+| `.explain()` | `Effect<QueryExplain, never, never>` — the plan the terminals would run, and why, without sending anything. |
 
 ### `where` typing
 
 `.where()` is conditionally available based on the `SkRemaining` type parameter. When the index's SK composites have already been fully consumed (e.g., the entity has no SK composites, or all of them were supplied to the query accessor), `.where()` is **not present** on the type — calling it is a compile error. Once called, `.where()` consumes `SkRemaining` and the resulting `BoundQuery` no longer exposes `.where()`.
+
+`.within()` is typed the same way: present only on an accessor with sort key composites left to bound, and gone once `.where()` or `.within()` is called. A Z-order accessor has no `.where()` (a binary address has no text order to compare); after its `.within()`, `.zorder()` stays available.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `BoundQueryWithin<Model, A, W>` | The `.within()` method, present when `W` names bounds |
+| `BoundQueryZOrder<Model, SkRemaining, A, W>` | The `.zorder()` method of a Z-order accessor |
+| `RangeBound<V>` | `{ eq }`, `{ between: [lo, hi] }`, a `gt` / `gte` lower bound, an `lt` / `lte` upper bound, or one of each |
+| `DimensionBound<D, V>` | A `RangeBound` in the field's own type; for a `literals` dimension, ranges follow declaration order and `{ in: [...] }` is allowed |
+| `WithinOptions` | `{ maxSkips?: number }` — the skip-scan probe budget per terminal call (default 32; `0` never skips) |
+| `WithinKind`, `WithinSpec`, `ZOrderApplied` | Type-level bookkeeping for which accessor a `.within()` belongs to |
 
 ### Usage
 
@@ -942,6 +971,36 @@ const proj = Projection.projection(["name", "email", "status"])
 
 ---
 
+## ZOrder
+
+Dimension constructors for a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each dimension quantizes one model field into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. Also exported from `@effect-dynamodb/schema`.
+
+```typescript
+import { ZOrder } from "effect-dynamodb"
+```
+
+| Export | Signature | Description |
+|--------|-----------|-------------|
+| `int` | `(field, { min, max, step? }) => Dimension<F, "int">` | Integer levels `min`..`max` in steps of `step` (default 1); bits derived from the level count. Out-of-range values share the edge levels. A `bigint` field quantizes in `bigint` arithmetic |
+| `float` | `(field, { min, max, step }) => Dimension<F, "float">` | Floating-point levels `min`..`max` in steps of `step` (at most 2^53 levels) |
+| `dateTime` | `(field, { from, unit, bits }) => Dimension<F, "dateTime">` | `2^bits` levels of one `unit` (`"milliseconds"` … `"weeks"`) from `from`. The field needs a known storage format (a `DynamoModel` date schema or an Effect date schema) |
+| `literals` | `(field, values, { bits? }) => Dimension<F, "literals", L>` | One level per listed value, in declared order; `bits` reserves room for values appended later. Bounds may use `{ in: [...] }` |
+| `string` | `(field, { bytes }) => Dimension<F, "string">` | The first `bytes` (1..16) UTF-8 bytes, in byte order |
+| `isDimension` | `(u) => u is Dimension` | Type guard |
+
+Invalid options throw `EDD-9087`; a dimension that doesn't fit its field's schema throws `EDD-9088`; more than 53 bits for one dimension (128 for `string`) or 512 in all throws `EDD-9089`.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Dimension<F, K, L>` | A declared dimension: `field`, `kind`, `bits` |
+| `DimensionKind` | `"int" \| "float" \| "dateTime" \| "literals" \| "string"` |
+| `DateTimeUnit` | `"milliseconds" \| "seconds" \| "minutes" \| "hours" \| "days" \| "weeks"` |
+| `PrefixPart` | `string \| { field: string, hash: number }` — a prefix composite: stored length-prefixed, or as the first `hash` (1..8) bytes of its FNV-1a-64 hash |
+
+---
+
 ## KeyComposer
 
 Composite key composition from index definitions. Used internally by Entity, also available for advanced use cases.
@@ -953,7 +1012,10 @@ import { KeyComposer } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `composePk` | `(schema, entity, index, record) => string` | Compose partition key value |
-| `composeSk` | `(schema, entity, index, record) => string` | Compose sort key value |
+| `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
+| `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
+| `composeSkValue` | `(schema, entityType, entityVersion, index, record) => KeyValue` | `composeSk` for a string half, `composeZOrderSk` for a Z-order half |
+| `isZOrderHalf` | `(part) => part is ZOrderSkPart` | Is this sort key half a Z-order one? |
 | `composeIndexKeys` | `(schema, entity, index, record) => Record` | Compose all key attributes for an index |
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
@@ -970,10 +1032,13 @@ import { KeyComposer } from "effect-dynamodb"
 | Type | Description |
 |------|-------------|
 | `KeyPart` | `{ field: string, composite: string[] }` |
-| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing?, indexPolicy? }` |
+| `ZOrderKeyPart` | `{ field: string, prefix?: PrefixPart[], zorder: Dimension[] }` — a Z-order sort key as declared |
+| `ZOrderSkPart` | A normalised Z-order sort key half: `{ field, composite, zorderHalf }`, where `composite` is derived (prefix composites, then dimension fields) |
+| `KeyValue` | `string \| Uint8Array` — text for a string half, bytes for a Z-order half |
+| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart \| ZOrderSkPart, index?, collection?, type?, casing?, indexPolicy? }` |
 | `IndexPolicyKey` | `"sparse" \| "preserve"` |
 | `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
-| `GsiUpdateResult` | `{ sets: Record<string, string>, removes: ReadonlyArray<string> }` |
+| `GsiUpdateResult` | `{ sets: Record<string, KeyValue>, removes: ReadonlyArray<string> }` |
 
 ---
 

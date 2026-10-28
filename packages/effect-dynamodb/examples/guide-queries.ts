@@ -5,7 +5,9 @@
  *   - Entity scan via BoundQuery: db.entities.Entity.scan()
  *   - Entity index queries via db.entities.Entity.indexName({...})
  *   - Post-query filtering (callback and shorthand)
+ *   - `.within()` on a non-leading sort key composite (skip-scan) and `.explain()`
  *   - Pagination: collect, single page (fetch), cursor-based, streaming
+ *   - Request sizing: adaptive under a filter, `.onRequest()`, `.pageSize("natural")`
  *   - Scan: basic, filtered, limited, consistent read, stream
  *   - Consistent reads on get and scan
  *   - Reverse ordering
@@ -24,6 +26,12 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+
+const assertEq = <T>(actual: T, expected: T, label: string): void => {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a !== e) throw new Error(`Assertion failed [${label}]: expected ${e}, got ${a}`)
+}
 
 // ---------------------------------------------------------------------------
 // 1. Domain models
@@ -260,6 +268,31 @@ const program = Effect.gen(function* () {
   // #endregion
   yield* Console.log(`Tasks estimated at 8h or more: ${bigTasks.length}\n`)
 
+  // #region within-skip-scan
+  // `.where()` can't bound createdAt without pinning status first. `.within()`
+  // can: it finds each status with a one-row probe, then reads only that
+  // status's createdAt range.
+  const febTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+    .collect()
+  // #endregion
+  yield* Console.log(`Created in Feb (skip-scan over status): ${febTasks.length}`)
+  assertEq(
+    febTasks.map((t) => t.taskId),
+    ["t-002", "t-003", "t-008"],
+    "within skip-scans status",
+  )
+
+  // #region explain
+  const plan = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+    .explain()
+  // plan.plan   → "skip-scan"
+  // plan.reason → "skip tuple: status"
+  // #endregion
+  yield* Console.log(`Plan: ${plan.plan} (${plan.reason})\n`)
+  assertEq(plan.plan, "skip-scan", "explain names the plan")
+
   // -------------------------------------------------------------------------
   // Post-Query Filtering
   // -------------------------------------------------------------------------
@@ -318,6 +351,37 @@ const program = Effect.gen(function* () {
   yield* Console.log(`limit(3): ${firstThree.length} tasks`)
   yield* Console.log(`pageSize(2): ${inBatches.length} tasks`)
   yield* Console.log(`pageSize(2).limit(5): ${batchedAndCapped.length} tasks`)
+
+  // #region adaptive-sizing
+  // Under a filter, each request's Limit is sized from the pass rate so far:
+  // the first asks for max(16, 2 × limit) rows, later ones for what the
+  // observed rate says the remaining items need.
+  const lowPriority = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .filter({ priority: "low" })
+    .limit(2)
+    .onRequest((event) =>
+      Console.log(
+        `  request ${event.request}: Limit ${event.limit}, examined ${event.scannedCount}, accepted ${event.accepted}`,
+      ),
+    )
+    .collect()
+  // #endregion
+  yield* Console.log(`filter + limit(2): ${lowPriority.length} tasks`)
+
+  // #region page-size-natural
+  // Opt out: size requests exactly as 1.36 did — a natural 1 MB page under a filter.
+  const lowPriorityNatural = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .filter({ priority: "low" })
+    .limit(2)
+    .pageSize("natural")
+    .collect()
+  // #endregion
+  assertEq(
+    lowPriorityNatural.map((t) => t.taskId),
+    lowPriority.map((t) => t.taskId),
+    "natural sizing returns the same items",
+  )
+  yield* Console.log(`pageSize("natural"): ${lowPriorityNatural.length} tasks`)
 
   // #region single-page
   // Single page with limit — returns page with items and cursor

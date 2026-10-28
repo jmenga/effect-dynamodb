@@ -155,7 +155,9 @@ const program = Effect.gen(function* () {
       }),
     ),
   )
-  yield* Console.log(`Stale append surfaced: applied=${"applied" in result}`)
+  yield* Console.log(
+    `Stale append surfaced: applied=${"applied" in result ? result.applied : true}`,
+  )
   // #endregion
 
   // ---------- skipFollowUp — fire-and-forget ingest ----------

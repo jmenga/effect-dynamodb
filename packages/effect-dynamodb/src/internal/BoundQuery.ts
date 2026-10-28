@@ -274,7 +274,16 @@ export interface BoundQueryBase<
   /** Reverse the sort order (ScanIndexForward = false). */
   readonly reverse: () => BoundQuery<Model, SkRemaining, A, W>
 
-  /** Resume pagination from an opaque cursor. */
+  /**
+   * Resume pagination from an opaque cursor. The cursor is decoded when a
+   * terminal runs: a malformed one fails it with a `ValidationError`
+   * (`[EDD-9094]`), as does a `.within()` cursor on a query without
+   * `.within()`. A `.within()` query also refuses one from another plan
+   * (other bounds, partition, direction or index declaration) or positioned
+   * outside its own. A query without `.within()` can't recognise another
+   * query's well-formed cursor: DynamoDB may reject it
+   * (`DynamoValidationError`) or the query resumes from it.
+   */
   readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A, W>
 
   /**
@@ -308,7 +317,8 @@ export interface BoundQueryBase<
 
   /**
    * Describe what the terminals would send — the plan (`key`, `skip-scan`,
-   * `filter`), why it was chosen, the key ranges known up front, the fields
+   * `filter`, or a Z-order `naive` / `jump` / `precise` / `empty`), why it
+   * was chosen, the key ranges known up front, the fields
    * checked per row and how requests are sized — without sending anything.
    * A `startFrom` cursor is not read: the plan is described from its start.
    */

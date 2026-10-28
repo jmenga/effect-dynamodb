@@ -39,6 +39,7 @@ export default defineConfig({
             { label: "Sparse Maps", slug: "guides/sparse-maps" },
             { label: "Packed Storage", slug: "guides/packed-storage" },
             { label: "Indexes & Collections", slug: "guides/indexes" },
+            { label: "Z-order Indexes", slug: "guides/zorder" },
             { label: "indexPolicy — Sparse & Preserved GSIs", slug: "guides/index-policy" },
             { label: "Queries", slug: "guides/queries" },
             { label: "Expressions", slug: "guides/expressions" },

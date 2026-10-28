@@ -31,6 +31,7 @@ test.describe("Navigation", () => {
     const sidebar = page.locator("nav[aria-label='Main']")
     await expect(sidebar.getByText("Modeling")).toBeVisible()
     await expect(sidebar.getByText("Indexes & Collections")).toBeVisible()
+    await expect(sidebar.getByText("Z-order Indexes")).toBeVisible()
     await expect(sidebar.getByText("Queries")).toBeVisible()
     await expect(sidebar.getByText("Expressions")).toBeVisible()
     await expect(sidebar.getByText("Data Integrity")).toBeVisible()
@@ -52,6 +53,7 @@ test.describe("Navigation", () => {
     const guides = [
       { path: "guides/modeling/", heading: "Modeling" },
       { path: "guides/indexes/", heading: "Indexes" },
+      { path: "guides/zorder/", heading: "Z-order Indexes" },
       { path: "guides/queries/", heading: "Queries" },
       { path: "guides/data-integrity/", heading: "Data Integrity" },
       { path: "guides/lifecycle/", heading: "Lifecycle" },

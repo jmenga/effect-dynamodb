@@ -99,13 +99,14 @@ export type KeyValue = string | Uint8Array
  * Per-half policy value controlling how `Entity.update` and time-series
  * `.append` handle a GSI half the writer touches but can't compose.
  *
- * Per-half evaluation gate (v1.7.1): a half is *touched* iff at least one of
- * its composite names appears in the update payload (regardless of value,
- * including `undefined`) OR appears in `Entity.remove([...])`. Untouched
- * halves are skipped entirely — no SET, no REMOVE, no policy fires.
+ * Per-half evaluation gate (v1.7.3 skip-predicate): a half is *skipped* — no
+ * SET, no REMOVE, no policy fires — iff it has composites, none of them is in
+ * `Entity.remove([...])`, and every one is absent from both the update payload
+ * and the key record. Every other half is *evaluated*.
  *
- * For *touched* halves the policy decides the outcome when the structural
- * rule can't compose (empty leading prefix OR hole pattern):
+ * For evaluated halves the policy decides the outcome when the structural
+ * rule can't compose (empty leading prefix OR hole pattern; for a Z-order
+ * half, any prefix composite or dimension absent — it never truncates):
  * - `"sparse"` — REMOVE this half's key attribute (the half drops out of the
  *   GSI). The other half follows its own per-half outcome independently —
  *   there is no GSI-wide cascade. The DDB projection rule means an item with
