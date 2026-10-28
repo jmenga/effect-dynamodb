@@ -4,8 +4,29 @@ export type Casing = "lowercase" | "uppercase" | "preserve"
 
 export interface KeyPart {
   readonly field: string
+  /**
+   * The fields feeding the key. For a Z-order sort key, derived as its prefix
+   * composites, then its dimensions (as the library derives it).
+   */
   readonly composite: ReadonlyArray<string>
+  /** Present on a Z-order sort key (#171): the key is a binary address. */
+  readonly zorder?: ZOrderMarker | undefined
 }
+
+/** The parts of a Z-order sort key, by field name. */
+export interface ZOrderMarker {
+  readonly prefix: ReadonlyArray<string>
+  readonly dimensions: ReadonlyArray<string>
+  /**
+   * Present when a part couldn't be read statically (a dimension built by a
+   * helper the checker can't name, say): `prefix` and `dimensions` then list
+   * only the parts that could. The index is kept — the half is still binary.
+   */
+  readonly unresolved?: true
+}
+
+/** Mirrors `KeyComposer.isZOrderHalf`: is this half a Z-order (binary) sort key? */
+export const isZOrderHalf = (part: KeyPart): boolean => part.zorder !== undefined
 
 export interface IndexDefinition {
   readonly index?: string | undefined
@@ -60,6 +81,7 @@ export function resolveEntities(
   // First pass: collect variable declarations and their initializers for reference tracing
   const varDecls = new Map<string, ts.Expression>()
   collectVarDecls(ts, sourceFile, varDecls)
+  const lookup = lookupOver(ts, varDecls, program)
 
   // Second pass: find Entity.make() calls (partial — no schema yet)
   const partials: Array<{
@@ -76,7 +98,7 @@ export function resolveEntities(
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (decl.initializer && ts.isIdentifier(decl.name)) {
-          const partial = tryResolveEntityMake(ts, decl.name.text, decl.initializer)
+          const partial = tryResolveEntityMake(ts, decl.name.text, decl.initializer, lookup)
           if (partial) partials.push(partial)
         }
       }
@@ -154,6 +176,51 @@ function resolveVariable(
   return expr
 }
 
+/**
+ * How an entity's config follows a name to what it stands for: same-file
+ * declarations first, then the type checker (imports, re-exports).
+ */
+export interface ExpressionLookup {
+  /** The initializer `expr` names, through `as const` and the like; `expr` when there is none. */
+  readonly resolve: (expr: ts.Expression) => ts.Expression
+  readonly checker: ts.TypeChecker | undefined
+}
+
+/** A lookup over `sourceFile`'s declarations and, given one, `program`'s. */
+export function makeLookup(
+  ts: typeof import("typescript"),
+  sourceFile: ts.SourceFile,
+  program?: ts.Program,
+): ExpressionLookup {
+  const varDecls = new Map<string, ts.Expression>()
+  collectVarDecls(ts, sourceFile, varDecls)
+  return lookupOver(ts, varDecls, program)
+}
+
+function lookupOver(
+  ts: typeof import("typescript"),
+  varDecls: Map<string, ts.Expression>,
+  program: ts.Program | undefined,
+): ExpressionLookup {
+  const unwrap = (expr: ts.Expression): ts.Expression =>
+    ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isParenthesizedExpression(expr)
+      ? unwrap(expr.expression)
+      : expr
+  return {
+    resolve: (expr) => {
+      let current = unwrap(expr)
+      // A few hops: `const facets = dims`, `const dims = [...]`; never a cycle.
+      for (let hop = 0; hop < 8 && ts.isIdentifier(current); hop++) {
+        const next = unwrap(resolveVariable(ts, current, varDecls, program))
+        if (next === current) break
+        current = next
+      }
+      return current
+    },
+    checker: program?.getTypeChecker(),
+  }
+}
+
 interface PartialEntity {
   readonly varName: string
   readonly entityType: string
@@ -168,6 +235,7 @@ function tryResolveEntityMake(
   ts: typeof import("typescript"),
   varName: string,
   expr: ts.Expression,
+  lookup?: ExpressionLookup,
 ): PartialEntity | undefined {
   // Match: Entity.make({ ... })
   if (!ts.isCallExpression(expr)) return undefined
@@ -185,13 +253,14 @@ function tryResolveEntityMake(
   const configArg = args[0]!
   if (!ts.isObjectLiteralExpression(configArg)) return undefined
 
-  return resolveEntityConfig(ts, varName, configArg)
+  return resolveEntityConfig(ts, varName, configArg, lookup)
 }
 
 function resolveEntityConfig(
   ts: typeof import("typescript"),
   varName: string,
   config: ts.ObjectLiteralExpression,
+  lookup?: ExpressionLookup,
 ): PartialEntity | undefined {
   let entityType: string | undefined
   let indexes: Record<string, IndexDefinition> | undefined
@@ -213,10 +282,12 @@ function resolveEntityConfig(
         break
       case "indexes":
         // Try new GsiConfig format first, fall back to old IndexDefinition format
-        gsiIndexes = resolveGsiIndexes(ts, prop.initializer) ?? resolveIndexes(ts, prop.initializer)
+        gsiIndexes =
+          resolveGsiIndexes(ts, prop.initializer, lookup) ??
+          resolveIndexes(ts, prop.initializer, lookup)
         break
       case "primaryKey": {
-        primaryKeyDef = resolveIndexDefinition(ts, prop.initializer)
+        primaryKeyDef = resolveIndexDefinition(ts, prop.initializer, lookup)
         break
       }
       case "timestamps":
@@ -380,13 +451,14 @@ function resolveDynamoSchema(
 function resolveIndexes(
   ts: typeof import("typescript"),
   expr: ts.Expression,
+  lookup?: ExpressionLookup,
 ): Record<string, IndexDefinition> | undefined {
   if (!ts.isObjectLiteralExpression(expr)) return undefined
   const result: Record<string, IndexDefinition> = {}
 
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
-    const indexDef = resolveIndexDefinition(ts, prop.initializer)
+    const indexDef = resolveIndexDefinition(ts, prop.initializer, lookup)
     if (indexDef) {
       result[prop.name.text] = indexDef
     }
@@ -403,13 +475,14 @@ function resolveIndexes(
 function resolveGsiIndexes(
   ts: typeof import("typescript"),
   expr: ts.Expression,
+  lookup?: ExpressionLookup,
 ): Record<string, IndexDefinition> | undefined {
   if (!ts.isObjectLiteralExpression(expr)) return undefined
   const result: Record<string, IndexDefinition> = {}
 
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
-    const indexDef = resolveGsiConfig(ts, prop.initializer)
+    const indexDef = resolveGsiConfig(ts, prop.initializer, lookup)
     if (indexDef) {
       result[prop.name.text] = indexDef
     }
@@ -426,6 +499,7 @@ function resolveGsiIndexes(
 function resolveGsiConfig(
   ts: typeof import("typescript"),
   expr: ts.Expression,
+  lookup?: ExpressionLookup,
 ): IndexDefinition | undefined {
   if (!ts.isObjectLiteralExpression(expr)) return undefined
 
@@ -443,10 +517,10 @@ function resolveGsiConfig(
         gsiName = extractStringLiteral(ts, prop.initializer)
         break
       case "pk":
-        pk = resolveKeyPart(ts, prop.initializer)
+        pk = resolveKeyPart(ts, prop.initializer, lookup)
         break
       case "sk":
-        sk = resolveKeyPart(ts, prop.initializer)
+        sk = resolveKeyPart(ts, prop.initializer, lookup)
         break
       case "collection":
         collection = extractStringOrStringArray(ts, prop.initializer)
@@ -475,6 +549,7 @@ function resolveGsiConfig(
 function resolveIndexDefinition(
   ts: typeof import("typescript"),
   expr: ts.Expression,
+  lookup?: ExpressionLookup,
 ): IndexDefinition | undefined {
   if (!ts.isObjectLiteralExpression(expr)) return undefined
 
@@ -498,10 +573,10 @@ function resolveIndexDefinition(
         type = extractStringLiteral(ts, prop.initializer) as "isolated" | "clustered" | undefined
         break
       case "pk":
-        pk = resolveKeyPart(ts, prop.initializer)
+        pk = resolveKeyPart(ts, prop.initializer, lookup)
         break
       case "sk":
-        sk = resolveKeyPart(ts, prop.initializer)
+        sk = resolveKeyPart(ts, prop.initializer, lookup)
         break
       case "casing":
         casing = extractStringLiteral(ts, prop.initializer) as Casing | undefined
@@ -513,7 +588,11 @@ function resolveIndexDefinition(
   return { index, collection, type, pk, sk, casing }
 }
 
-function resolveKeyPart(ts: typeof import("typescript"), expr: ts.Expression): KeyPart | undefined {
+function resolveKeyPart(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+  lookup?: ExpressionLookup,
+): KeyPart | undefined {
   if (!ts.isObjectLiteralExpression(expr)) return undefined
 
   let field: string | undefined
@@ -531,8 +610,141 @@ function resolveKeyPart(ts: typeof import("typescript"), expr: ts.Expression): K
     }
   }
 
-  if (!field || !composite) return undefined
-  return { field, composite }
+  if (!field) return undefined
+  if (composite) return { field, composite }
+  // A Z-order sort key (#171): `zorder` (and an optional `prefix`) instead of `composite`.
+  const zorder = resolveZOrderFields(ts, expr, lookup)
+  if (zorder === undefined) return undefined
+  return { field, composite: [...zorder.prefix, ...zorder.dimensions], zorder }
+}
+
+/**
+ * Parse a Z-order sort key's `zorder` / `prefix` from its object literal:
+ *
+ * - `zorder: [ZOrder.int("price", …), ZOrder.dateTime("listedAt", …)]` — each
+ *   dimension's field is its constructor's first (string) argument. A
+ *   dimension or list held in a variable is followed through `lookup`, and
+ *   failing that read from its type (`Dimension<"price">`'s `field`);
+ * - `prefix: ["agencyId", { field: "officeId", hash: 8 }]`, followed the same way.
+ *
+ * `undefined` when the half declares no `zorder`. A part that can't be read
+ * leaves the marker `unresolved`, never guessed.
+ */
+export function resolveZOrderFields(
+  ts: typeof import("typescript"),
+  expr: ts.ObjectLiteralExpression,
+  lookup?: ExpressionLookup,
+): ZOrderMarker | undefined {
+  let dimensions: Fields | undefined
+  let prefix: Fields = { fields: [], complete: true }
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    if (prop.name.text === "zorder") {
+      dimensions = extractDimensionFields(ts, prop.initializer, lookup)
+    }
+    if (prop.name.text === "prefix") prefix = extractPrefixFields(ts, prop.initializer, lookup)
+  }
+  if (dimensions === undefined || (dimensions.complete && dimensions.fields.length === 0)) {
+    return undefined
+  }
+  return {
+    prefix: prefix.fields,
+    dimensions: dimensions.fields,
+    ...(dimensions.complete && prefix.complete ? {} : { unresolved: true as const }),
+  }
+}
+
+/** Field names read from a list; `complete` when every element was read. */
+interface Fields {
+  readonly fields: ReadonlyArray<string>
+  readonly complete: boolean
+}
+
+function extractDimensionFields(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+  lookup: ExpressionLookup | undefined,
+): Fields {
+  const list = lookup?.resolve(expr) ?? expr
+  if (!ts.isArrayLiteralExpression(list)) {
+    // Not written as a list: the checker may still know its tuple of dimensions.
+    return dimensionTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
+  }
+  const fields: Array<string> = []
+  let complete = true
+  for (const el of list.elements) {
+    const declared = lookup?.resolve(el) ?? el
+    const field =
+      ts.isCallExpression(declared) && declared.arguments.length > 0
+        ? extractStringLiteral(ts, declared.arguments[0]!)
+        : undefined
+    const read = field ?? dimensionFieldOfType(lookup?.checker, el)
+    if (read === undefined) complete = false
+    else fields.push(read)
+  }
+  return { fields, complete }
+}
+
+/** A dimension's field from its type: `Dimension<"price">`'s `field`, when a string literal. */
+function dimensionFieldOfType(
+  checker: ts.TypeChecker | undefined,
+  node: ts.Node,
+): string | undefined {
+  if (checker === undefined) return undefined
+  return literalField(checker, checker.getTypeAtLocation(node), node)
+}
+
+function literalField(checker: ts.TypeChecker, type: ts.Type | undefined, node: ts.Node) {
+  const field = type?.getProperty("field")
+  if (field === undefined) return undefined
+  const fieldType = checker.getTypeOfSymbolAtLocation(field, node)
+  return fieldType.isStringLiteral() ? fieldType.value : undefined
+}
+
+/** The fields of a tuple of dimensions, from the type of `node`. */
+function dimensionTupleFields(
+  checker: ts.TypeChecker | undefined,
+  node: ts.Node,
+): Fields | undefined {
+  if (checker === undefined) return undefined
+  const type = checker.getTypeAtLocation(node)
+  if (type === undefined || !checker.isTupleType(type)) return undefined
+  const read = checker
+    .getTypeArguments(type as ts.TypeReference)
+    .map((element) => literalField(checker, element, node))
+  const fields = read.filter((field): field is string => field !== undefined)
+  return { fields, complete: fields.length === read.length }
+}
+
+function extractPrefixFields(
+  ts: typeof import("typescript"),
+  expr: ts.Expression,
+  lookup: ExpressionLookup | undefined,
+): Fields {
+  const list = lookup?.resolve(expr) ?? expr
+  if (!ts.isArrayLiteralExpression(list)) return { fields: [], complete: false }
+  const fields: Array<string> = []
+  let complete = true
+  for (const el of list.elements) {
+    const part = lookup?.resolve(el) ?? el
+    const name = extractStringLiteral(ts, part)
+    if (name !== undefined) {
+      fields.push(name)
+      continue
+    }
+    const fieldProp = ts.isObjectLiteralExpression(part)
+      ? part.properties.find(
+          (p): p is ts.PropertyAssignment =>
+            ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === "field",
+        )
+      : undefined
+    const field = fieldProp
+      ? extractStringLiteral(ts, lookup?.resolve(fieldProp.initializer) ?? fieldProp.initializer)
+      : undefined
+    if (field === undefined) complete = false
+    else fields.push(field)
+  }
+  return { fields, complete }
 }
 
 // --- Extraction helpers ---

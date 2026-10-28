@@ -1,9 +1,10 @@
-import type {
-  Casing,
-  IndexDefinition,
-  ResolvedCollection,
-  ResolvedEntity,
-  SchemaConfig,
+import {
+  type Casing,
+  type IndexDefinition,
+  isZOrderHalf,
+  type ResolvedCollection,
+  type ResolvedEntity,
+  type SchemaConfig,
 } from "./EntityResolver"
 import type { DetectedOperation, UpdateCombinators, WhereCondition } from "./OperationDetector"
 
@@ -444,12 +445,16 @@ function composePkValue(
   return composeKey(schema, entityType, slots, index.casing)
 }
 
+/** What a Z-order sort key (#171) shows: its value is bytes, not text. */
+export const ZORDER_KEY_PLACEHOLDER = "<binary Z-order key>"
+
 function composeSkValue(
   schema: SchemaConfig,
   entityType: string,
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  if (isZOrderHalf(index.sk)) return ZORDER_KEY_PLACEHOLDER
   return composeSkFromSlots(
     schema,
     entityType,
@@ -479,6 +484,8 @@ function composeSkPrefixValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  // A Z-order sort key has no text prefix.
+  if (isZOrderHalf(index.sk)) return ""
   return composeSkFromSlots(schema, entityType, index, availableSkSlots(index, record))
 }
 
@@ -493,6 +500,8 @@ function composeSkBeginsWithValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  // A Z-order sort key has no text prefix.
+  if (isZOrderHalf(index.sk)) return ""
   const slots = availableSkSlots(index, record)
   const prefix = composeSkFromSlots(schema, entityType, index, slots)
   return slots.length === index.sk.composite.length ? prefix : `${prefix}#`
@@ -621,12 +630,17 @@ function buildEntityIndexAccessorParams(
 
   const pkComposites = indexDef.pk.composite.join(", ")
   const skComposites = indexDef.sk.composite.join(", ")
+  const zorder = isZOrderHalf(indexDef.sk)
 
   const info = [
     `Query accessor '${indexName}'`,
     `  Index: ${indexDef.index ?? "primary"} (isolated)`,
     `  PK: ${pkComposites} (required)`,
-    skComposites ? `  SK: ${skComposites} (optional begins_with)` : undefined,
+    zorder
+      ? `  SK: ${ZORDER_KEY_PLACEHOLDER} over ${skComposites} (bound with .within())`
+      : skComposites
+        ? `  SK: ${skComposites} (optional begins_with)`
+        : undefined,
     `  Returns: BoundQuery<${entity.entityType}>`,
   ]
     .filter(Boolean)
@@ -645,7 +659,10 @@ function buildEntityIndexAccessorParams(
       : args
 
     // Add SK condition only if SK composites are actually provided
+    // A Z-order sort key is never pinned by the accessor (its fields are
+    // bounded with `.within()`), so the key condition is the partition key alone.
     const hasSkComposites =
+      !zorder &&
       indexDef.sk.composite.length > 0 &&
       indexDef.sk.composite.some((attr) => mergedArgs[attr] !== undefined)
 

@@ -119,6 +119,7 @@ import {
 } from "./internal/Packed.js"
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
+  composeKeysOrFail,
   freshIncarnationToken,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
@@ -321,8 +322,10 @@ import {
   type EntityDefinition,
   type EntityDefinitionConfig,
   type EntityDefinitionData,
+  type NormalizedIndexes,
   normalizeTtlSeconds,
   resolveUniqueTtl,
+  zorderInCollection,
 } from "@effect-dynamodb/schema/Entity.js"
 
 export { normalizeTtlSeconds }
@@ -1829,20 +1832,6 @@ export interface PutPlan {
  * })
  * ```
  */
-/** Compute the normalized indexes type from primaryKey + optional GSI configs. */
-type NormalizedIndexes<
-  TPrimaryKey extends PrimaryKeyDef,
-  TGsiIndexes extends globalThis.Record<string, GsiConfig>,
-> = keyof TGsiIndexes extends never
-  ? { readonly primary: TPrimaryKey }
-  : { readonly primary: TPrimaryKey } & {
-      readonly [K in keyof TGsiIndexes & string]: IndexDefinition & {
-        readonly collection: TGsiIndexes[K]["collection"]
-        readonly pk: { readonly composite: TGsiIndexes[K]["pk"]["composite"] }
-        readonly sk: { readonly composite: TGsiIndexes[K]["sk"]["composite"] }
-      }
-    }
-
 /** Primary key definition — used in the new `primaryKey` config form. */
 type PrimaryKeyDef = IndexDefinition &
   (
@@ -2915,8 +2904,15 @@ const makeImpl = <
     }
   }
 
-  const composeAllKeys = (record: globalThis.Record<string, unknown>) =>
-    KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, keyForm(record))
+  /**
+   * Every index's keys for `record`. A Z-order sort key can fail to place a
+   * value (`[EDD-9092]`, #171), which surfaces as a `ValidationError` for
+   * `operation`.
+   */
+  const composeAllKeys = (record: globalThis.Record<string, unknown>, operation: string) =>
+    composeKeysOrFail(entityType, operation, () =>
+      KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, keyForm(record)),
+    )
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -5351,7 +5347,10 @@ const makeImpl = <
 
           // Compose all keys from the encoded input (ID fields still present
           // and key composites are wire-format strings/numbers).
-          const keys = composeAllKeys(encodedInput as globalThis.Record<string, unknown>)
+          const keys = yield* composeAllKeys(
+            encodedInput as globalThis.Record<string, unknown>,
+            operation,
+          )
 
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded: globalThis.Record<string, unknown> = hasRefs
@@ -6021,17 +6020,20 @@ const makeImpl = <
         // emits per-half SETs/REMOVEs/noops that we apply directly to
         // `newItem` (which becomes the put-style item written back).
         //
-        // No try/catch needed — EDD-9024 was deprecated in v1.7.1 and
-        // the composer no longer throws.
+        // EDD-9024 was deprecated in v1.7.1 — hole patterns don't throw. A
+        // Z-order value the composer can't place (EDD-9092, #171) fails the
+        // update with a `ValidationError`.
         const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
-        const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
-          entityType,
-          entityVersion,
-          allIndexes,
-          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
-          keyForm(newItem),
-          retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
+        const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            entityType,
+            entityVersion,
+            allIndexes,
+            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+            keyForm(newItem),
+            retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
+          ),
         )
         for (const [field, value] of Object.entries(gsiUpdate.sets)) {
           newItem[field] = value
@@ -6051,12 +6053,14 @@ const makeImpl = <
           // decision; the other half's stored value already lives on
           // `newItem` from the read-then-write merge above.
           if (addressed.has(indexDef.pk.field) || addressed.has(indexDef.sk.field)) continue
-          const keys = KeyComposer.tryComposeIndexKeys(
-            schema,
-            entityType,
-            entityVersion,
-            indexDef,
-            keyForm(newItem),
+          const keys = yield* composeKeysOrFail(entityType, "update", () =>
+            KeyComposer.tryComposeIndexKeys(
+              schema,
+              entityType,
+              entityVersion,
+              indexDef,
+              keyForm(newItem),
+            ),
           )
           if (keys) {
             Object.assign(newItem, keys)
@@ -6918,17 +6922,19 @@ const makeImpl = <
       // per-half noops (preserve + can't-compose without cascade). See
       // DESIGN.md §7 Policy-Aware GSI Composition.
       //
-      // No try/catch — EDD-9024 was deprecated in v1.7.1 and the
-      // composer no longer throws. Hole patterns collapse into the
-      // unified can't-compose rule.
-      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-        schema,
-        entityType,
-        entityVersion,
-        allIndexes,
-        keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
-        keyForm(encodedKey as globalThis.Record<string, unknown>),
-        removedSet === undefined ? {} : { removedSet },
+      // EDD-9024 was deprecated in v1.7.1 — hole patterns collapse into the
+      // unified can't-compose rule and don't throw. A Z-order value the
+      // composer can't place (EDD-9092, #171) fails with a `ValidationError`.
+      const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(encodedKey as globalThis.Record<string, unknown>),
+          removedSet === undefined ? {} : { removedSet },
+        ),
       )
       // The key and vector attributes this update writes — a retain
       // snapshot strips them, so the post-image is rebuilt from these.
@@ -8623,7 +8629,7 @@ const makeImpl = <
           }
 
           // Add all index keys (including GSIs)
-          const allKeys = composeAllKeys(item)
+          const allKeys = yield* composeAllKeys(item, "upsert")
           for (const [field, value] of Object.entries(allKeys)) {
             // Skip primary key fields (they're in Key, not UpdateExpression)
             if (
@@ -9055,16 +9061,19 @@ const makeImpl = <
       // it's removed. The gate now broadens its "touched" check to also
       // count `keyRecord` membership, so PK-composite-only halves are
       // touched on every write and the structural rule composes them.
-      // No try/catch — EDD-9024 was deprecated in v1.7.1 and the composer
-      // no longer throws.
-      const gsiUpdate = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-        schema,
-        entityType,
-        entityVersion,
-        allIndexes,
-        keyForm(encoded),
-        keyForm(encoded),
-        removedSet !== undefined ? { removedSet } : undefined,
+      // EDD-9024 was deprecated in v1.7.1 — the composer doesn't throw for
+      // hole patterns. A Z-order value it can't place (EDD-9092, #171) fails
+      // the append with a `ValidationError`.
+      const gsiUpdate = yield* composeKeysOrFail(entityType, "append", () =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          keyForm(encoded),
+          keyForm(encoded),
+          removedSet !== undefined ? { removedSet } : undefined,
+        ),
       )
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
@@ -9399,13 +9408,31 @@ const makeImpl = <
   > = {}
   for (const indexName of Object.keys(config.indexes)) {
     if (indexName === "primary") continue
-    const indexDef = config.indexes[indexName]!
+    // The bound definition: a Z-order half carries its layout (#171).
+    const indexDef = data.initialIndexes[indexName] ?? config.indexes[indexName]!
+    const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
     queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
       // and same function the write path uses (see `CompositeCodec`).
       const pkKeyForm = keyForm(rawPk)
       const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pkKeyForm)
-      const hasSkComposites = indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
+      // A Z-order sort key has no text prefix: its prefix composites and
+      // dimensions are bounded through `.within()` on the typed accessor, never
+      // passed as accessor composites (EDD-9093).
+      const misplaced = zorder
+        ? indexDef.sk.composite.filter((attr) => pkKeyForm[attr] !== undefined)
+        : []
+      if (misplaced.length > 0) {
+        throw new Error(
+          `[EDD-9093] Entity "${entityType}" query "${indexName}": ${misplaced
+            .map((attr) => `"${attr}"`)
+            .join(", ")} feed${misplaced.length === 1 ? "s" : ""} the Z-order sort key, so ` +
+            `${misplaced.length === 1 ? "it" : "they"} can't be passed as accessor composites — ` +
+            `pass the partition key composites only and bound them with .within().`,
+        )
+      }
+      const hasSkComposites =
+        !zorder && indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
       const query = Query.make({
         tableName: "",
         indexName: indexDef.index,
@@ -9414,7 +9441,6 @@ const makeImpl = <
         skField: indexDef.sk.field,
         entityTypes: [entityType],
         decoder: (raw) => decodeRecord(raw),
-        ...packedQueryOptions,
         ...packedQueryOptions,
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
         keyFields: [
@@ -9770,7 +9796,7 @@ const makeImpl = <
           const restoredDomain = toDomainView(restoredItem)
 
           // Recompose all keys (original SK, GSI keys)
-          const restoredKeys = composeAllKeys(restoredDomain)
+          const restoredKeys = yield* composeAllKeys(restoredDomain, "restore")
           Object.assign(restoredItem, restoredKeys)
 
           // Un-stash the embedding and recompose the vector partition value —
@@ -10371,6 +10397,8 @@ const makeImpl = <
       tableTag = injectedTableTag
     },
     _injectIndex: (name: string, def: IndexDefinition) => {
+      // A collection's index is string-composed; a Z-order one never joins (#171).
+      if (KeyComposer.isZOrderHalf(def.sk)) throw zorderInCollection(entityType, name)
       const refused = packedIndexRefusal(entityType, packedFields, name, def)
       if (refused !== undefined) throw new Error(refused)
       allIndexes = { ...allIndexes, [name]: def }

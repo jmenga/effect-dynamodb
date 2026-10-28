@@ -1,6 +1,6 @@
 import ts from "typescript"
 import { describe, expect, it } from "vitest"
-import { resolveCollections, resolveEntities } from "../src/core/EntityResolver"
+import { isZOrderHalf, resolveCollections, resolveEntities } from "../src/core/EntityResolver"
 
 function parseSource(source: string): ts.SourceFile {
   return ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -291,6 +291,164 @@ describe("EntityResolver", () => {
         field: "pk",
         composite: ["userId"],
       })
+    })
+  })
+
+  describe("Z-order sort keys (#171)", () => {
+    const resolveSearch = (sk: string, preamble = "") => {
+      const source = `
+        ${preamble}
+        const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+
+        const Listings = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: {
+            pk: { field: "pk", composite: ["listingId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            search: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["region"] },
+              sk: ${sk},
+            },
+          },
+        })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Listings } })
+      `
+      return resolveEntities(ts, parseSource(source))[0]?.indexes.search
+    }
+
+    it("derives composite from prefix composites, then dimensions, and marks the half", () => {
+      const search = resolveSearch(`{
+        field: "gsi2sk",
+        prefix: ["agencyId", { field: "officeId", hash: 8 }],
+        zorder: [
+          ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
+          ZOrder.int("bedrooms", { min: 0, max: 15 }),
+          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+        ],
+      }`)
+      expect(search).toBeDefined()
+      expect(search!.sk).toEqual({
+        field: "gsi2sk",
+        composite: ["agencyId", "officeId", "price", "bedrooms", "listedAt"],
+        zorder: {
+          prefix: ["agencyId", "officeId"],
+          dimensions: ["price", "bedrooms", "listedAt"],
+        },
+      })
+      expect(isZOrderHalf(search!.sk)).toBe(true)
+      expect(isZOrderHalf(search!.pk)).toBe(false)
+    })
+
+    it("resolves a Z-order key without a prefix", () => {
+      const search = resolveSearch(
+        `{ field: "gsi2sk", zorder: [ZOrder.int("price", { min: 0, max: 9 })] }`,
+      )
+      expect(search!.sk.composite).toEqual(["price"])
+      expect(search!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"] })
+    })
+
+    it("follows dimensions, lists and prefix parts declared in the file", () => {
+      const search = resolveSearch(
+        `{ field: "gsi2sk", prefix: [agency, { field: office, hash: 2 }], zorder: facets }`,
+        `
+        const price = ZOrder.int("price", { min: 0, max: 9 })
+        const facets = [price, ZOrder.int("bedrooms", { min: 0, max: 15 })] as const
+        const agency = "agencyId"
+        const office = "officeId"
+        `,
+      )
+      expect(search!.sk).toEqual({
+        field: "gsi2sk",
+        composite: ["agencyId", "officeId", "price", "bedrooms"],
+        zorder: { prefix: ["agencyId", "officeId"], dimensions: ["price", "bedrooms"] },
+      })
+    })
+
+    it("keeps a Z-order half it can't read whole, marked unresolved", () => {
+      // Built by a helper and no checker to type it: the index stays, its parts unknown.
+      const built = resolveSearch(`{ field: "gsi2sk", zorder: makeFacets() }`)
+      expect(built!.sk).toEqual({
+        field: "gsi2sk",
+        composite: [],
+        zorder: { prefix: [], dimensions: [], unresolved: true },
+      })
+      expect(isZOrderHalf(built!.sk)).toBe(true)
+      const partly = resolveSearch(
+        `{ field: "gsi2sk", prefix: [agency], zorder: [ZOrder.int("price", { min: 0, max: 9 }), beds] }`,
+      )
+      expect(partly!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"], unresolved: true })
+      expect(partly!.sk.composite).toEqual(["price"])
+    })
+
+    it("reads a dimension's field from its type across files", () => {
+      // A real checker: the dimensions come from helpers in another module.
+      const files: Record<string, string> = {
+        "/virtual/dims.ts": `
+          type Dimension<F extends string> = { readonly field: F; readonly bits: number }
+          const int = <F extends string>(field: F): Dimension<F> => ({ field, bits: 8 })
+          export const makePrice = () => int("price")
+          export const price = makePrice()
+          export const facets = [int("bedrooms"), int("listedAt")] as const
+          export const makeFacets = () => [price, int("bedrooms")] as const
+        `,
+        "/virtual/entity.ts": `
+          import { facets, makeFacets, price } from "./dims"
+          declare const Entity: any, Table: any, DynamoSchema: any, Listing: any
+          const AppSchema = DynamoSchema.make({ name: "myapp", version: 1 })
+          const Listings = Entity.make({
+            model: Listing,
+            entityType: "Listing",
+            primaryKey: {
+              pk: { field: "pk", composite: ["listingId"] },
+              sk: { field: "sk", composite: [] },
+            },
+            indexes: {
+              byPrice: { name: "gsi1", pk: { field: "gsi1pk", composite: ["region"] }, sk: { field: "gsi1sk", zorder: [price] } },
+              byFacets: { name: "gsi2", pk: { field: "gsi2pk", composite: ["region"] }, sk: { field: "gsi2sk", zorder: facets } },
+              byBuilt: { name: "gsi3", pk: { field: "gsi3pk", composite: ["region"] }, sk: { field: "gsi3sk", zorder: makeFacets() } },
+            },
+          })
+          const MainTable = Table.make({ schema: AppSchema, entities: { Listings } })
+        `,
+      }
+      const options: ts.CompilerOptions = {
+        strict: true,
+        noEmit: true,
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+      }
+      const host = ts.createCompilerHost(options)
+      const getSourceFile = host.getSourceFile
+      host.getSourceFile = (name, version, ...rest) =>
+        files[name] === undefined
+          ? getSourceFile(name, version, ...rest)
+          : ts.createSourceFile(name, files[name]!, version, true)
+      host.fileExists = (name) => files[name] !== undefined || ts.sys.fileExists(name)
+      host.readFile = (name) => files[name] ?? ts.sys.readFile(name)
+      host.directoryExists = (dir) => dir === "/virtual" || ts.sys.directoryExists(dir)
+      const program = ts.createProgram(Object.keys(files), options, host)
+      const [listings] = resolveEntities(ts, program.getSourceFile("/virtual/entity.ts")!, program)
+      expect(listings!.indexes.byPrice!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"] })
+      expect(listings!.indexes.byFacets!.sk.zorder).toEqual({
+        prefix: [],
+        dimensions: ["bedrooms", "listedAt"],
+      })
+      expect(listings!.indexes.byBuilt!.sk.zorder).toEqual({
+        prefix: [],
+        dimensions: ["price", "bedrooms"],
+      })
+    })
+
+    it("leaves a string half unmarked", () => {
+      const search = resolveSearch(`{ field: "gsi2sk", composite: ["price"] }`)
+      expect(search!.sk).toEqual({ field: "gsi2sk", composite: ["price"] })
+      expect(isZOrderHalf(search!.sk)).toBe(false)
     })
   })
 

@@ -182,3 +182,62 @@ export const compositeKeyFormKind = (source: Schema.Top, attr: string): Composit
   if (!hasEncodingTransformation(field)) return "identity"
   return "encoded"
 }
+
+/** The JavaScript type a composite's key form takes, when its schema says. */
+export type KeyFormValueKind = "string" | "number" | "bigint" | "boolean"
+
+const astKeyFormValueKind = (ast: SchemaAST.AST): KeyFormValueKind | undefined => {
+  if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) return "string"
+  if (SchemaAST.isNumber(ast)) return "number"
+  if (SchemaAST.isBigInt(ast)) return "bigint"
+  if (SchemaAST.isBoolean(ast)) return "boolean"
+  if (SchemaAST.isLiteral(ast)) return typeof ast.literal as KeyFormValueKind
+  const kinds = SchemaAST.isEnum(ast)
+    ? ast.enums.map(([, value]) => typeof value as KeyFormValueKind)
+    : SchemaAST.isUnion(ast)
+      ? ast.types
+          .filter((member) => !SchemaAST.isUndefined(member) && !SchemaAST.isNull(member))
+          .map((member) => astKeyFormValueKind(member))
+      : [undefined]
+  const [first] = kinds
+  return first !== undefined && kinds.every((kind) => kind === first) ? first : undefined
+}
+
+/**
+ * The kind of value a field's key form is — the numeric Type for a numeric
+ * field encoded as a string (case 2), else its Encoded side — or `undefined`
+ * when the schema doesn't pin one (a union of kinds, an object, …).
+ */
+export const keyFormValueKind = (field: Schema.Top): KeyFormValueKind | undefined => {
+  if (numericTypeWithStringEncoding(field)) {
+    return SchemaAST.isBigInt(SchemaAST.toType(field.ast)) ? "bigint" : "number"
+  }
+  return astKeyFormValueKind(SchemaAST.toEncoded(field.ast))
+}
+
+/**
+ * The literal members a field's key form is limited to (a literal, a union of
+ * literals or an enum), or `undefined` when it isn't limited to literals.
+ */
+export const keyFormLiterals = (
+  field: Schema.Top,
+): ReadonlyArray<string | number | boolean> | undefined => {
+  const members = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
+    if (SchemaAST.isLiteral(ast)) return [ast.literal]
+    if (SchemaAST.isEnum(ast)) return ast.enums.map(([, value]) => value)
+    if (SchemaAST.isUnion(ast)) {
+      const found: Array<unknown> = []
+      for (const member of ast.types) {
+        if (SchemaAST.isUndefined(member) || SchemaAST.isNull(member)) continue
+        const inner = members(member)
+        if (inner === undefined) return undefined
+        found.push(...inner)
+      }
+      return found
+    }
+    return undefined
+  }
+  return members(SchemaAST.toEncoded(field.ast)) as
+    | ReadonlyArray<string | number | boolean>
+    | undefined
+}

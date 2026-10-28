@@ -68,6 +68,8 @@ describe("CollectionQuery types", () => {
     type Has<K extends string> = K extends keyof CollectionQuery<Grouped> ? true : false
     expectTypeOf<Has<"within">>().toEqualTypeOf<false>()
     expectTypeOf<Has<"where">>().toEqualTypeOf<false>()
+    // A Z-order index is never a collection's (EDD-9090): no `.zorder()` either.
+    expectTypeOf<Has<"zorder">>().toEqualTypeOf<false>()
     expectTypeOf(query.explain()).toEqualTypeOf<Effect.Effect<QueryExplain, never, never>>()
   })
 

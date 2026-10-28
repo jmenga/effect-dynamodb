@@ -90,7 +90,14 @@ export type {
   SystemFieldsType,
   VectorErrors,
 } from "./internal/EntityTypes.js"
-export type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
+export type {
+  GsiConfig,
+  IndexDefinition,
+  KeyPart,
+  KeyValue,
+  ZOrderKeyPart,
+  ZOrderSkPart,
+} from "./KeyComposer.js"
 export * as KeyComposer from "./KeyComposer.js"
 export type { ProjectionResult } from "./Projection.js"
 export * as Projection from "./Projection.js"
@@ -104,3 +111,10 @@ export type {
   VectorSourceConfig,
 } from "./VectorIndex.js"
 export * as VectorIndex from "./VectorIndex.js"
+export type {
+  DateTimeUnit,
+  Dimension,
+  DimensionKind,
+  PrefixPart,
+} from "./ZOrder.js"
+export * as ZOrder from "./ZOrder.js"

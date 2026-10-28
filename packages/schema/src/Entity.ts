@@ -37,6 +37,7 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
+import { keyFormLiterals, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -55,30 +56,50 @@ import {
   type DerivedSchemas,
   getFields,
   getSchemaFields,
+  optionalField,
   type ResolvedSystemFields,
+  resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
+  DimensionFieldNames,
   EntityRefCreateType,
   EntityRefInputType,
   EntityRefUpdateType,
+  PrefixFieldNames,
 } from "./internal/EntityTypes.js"
-import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
-import { normalizeGsiConfig } from "./KeyComposer.js"
+import { numericTypeWithStringEncoding } from "./internal/SchemaAccessors.js"
+import {
+  type BoundDimension,
+  bindDimension,
+  type DimensionStorage,
+  MAX_ADDRESS_BITS,
+  MAX_DIMENSION_BITS,
+  makeLayout,
+} from "./internal/ZOrderCurve.js"
+import type {
+  GsiConfig,
+  IndexDefinition,
+  KeyPart,
+  ZOrderKeyPart,
+  ZOrderSkPart,
+} from "./KeyComposer.js"
+import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
   normalizeVectorIndexConfig,
   validateVectorIndexes,
 } from "./VectorIndex.js"
+import type * as ZOrder from "./ZOrder.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
 // ---------------------------------------------------------------------------
 
-export type { IndexDefinition, KeyPart }
+export type { IndexDefinition, KeyPart, ZOrderKeyPart }
 
 /**
  * A ref config object: the entity and optional cascade index config.
@@ -151,16 +172,41 @@ export const resolveUniqueTtl = (
 // Index normalization types
 // ---------------------------------------------------------------------------
 
-type NormalizedIndexes<
+/**
+ * @internal The normalised indexes type from `primaryKey` + optional GSI
+ * configs. Shared with the runtime `Entity.make` in `effect-dynamodb`.
+ */
+export type NormalizedIndexes<
   TPrimaryKey extends PrimaryKeyDef,
   TGsiIndexes extends globalThis.Record<string, GsiConfig>,
 > = keyof TGsiIndexes extends never
   ? { readonly primary: TPrimaryKey }
   : { readonly primary: TPrimaryKey } & {
-      readonly [K in keyof TGsiIndexes & string]: IndexDefinition & {
-        readonly collection: TGsiIndexes[K]["collection"]
-        readonly pk: { readonly composite: TGsiIndexes[K]["pk"]["composite"] }
-        readonly sk: { readonly composite: TGsiIndexes[K]["sk"]["composite"] }
+      readonly [K in keyof TGsiIndexes & string]: NormalizedGsi<TGsiIndexes[K]>
+    }
+
+/**
+ * One normalised GSI. A Z-order sort key (#171) keeps its declaration on the
+ * type — `zorder` and `prefix` are phantom carriers for the accessor typing
+ * (the runtime value has `zorderHalf`) — beside the derived `composite`.
+ */
+type NormalizedGsi<G extends GsiConfig> = G["sk"] extends {
+  readonly zorder: infer Z extends ReadonlyArray<ZOrder.Dimension>
+}
+  ? IndexDefinition & {
+      readonly collection: G["collection"]
+      readonly pk: { readonly composite: G["pk"]["composite"] }
+      readonly sk: ZOrderSkPart & {
+        readonly composite: readonly [...PrefixFieldNames<G["sk"]>, ...DimensionFieldNames<Z>]
+        readonly zorder: Z
+        readonly prefix: G["sk"] extends { readonly prefix: infer P } ? P : readonly []
+      }
+    }
+  : IndexDefinition & {
+      readonly collection: G["collection"]
+      readonly pk: { readonly composite: G["pk"]["composite"] }
+      readonly sk: {
+        readonly composite: G["sk"] extends { readonly composite: infer C } ? C : never
       }
     }
 
@@ -436,6 +482,21 @@ export const buildEntityDefinition = (config: {
   // ---------------------------------------------------------------------------
 
   const primaryIndex = config.indexes.primary
+  // Z-order sort keys are secondary-index only (#171): the primary key is
+  // string-composed, and a misplaced `zorder` must not reach the composers.
+  for (const half of [primaryIndex.pk, primaryIndex.sk] as ReadonlyArray<object>) {
+    if ("zorder" in half || "prefix" in half || "zorderHalf" in half) {
+      throw new Error(
+        `[EDD-9086] Entity "${config.entityType}": the primary key can't be a Z-order key — ` +
+          `zorder / prefix belong on a secondary index's sort key.`,
+      )
+    }
+  }
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    if (indexDef.collection !== undefined && isZOrderHalf(indexDef.sk)) {
+      throw zorderInCollection(config.entityType, indexName)
+    }
+  }
   if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
     throw new Error(
       `[EDD-9001] Entity "${config.entityType}": primary key must have at least one composite attribute in pk or sk`,
@@ -918,6 +979,23 @@ export const buildEntityDefinition = (config: {
     for (const ttl of configuredTtls) normalizeTtlSeconds(ttl)
   }
 
+  // Bind every Z-order sort key (#171): resolve each dimension's storage from
+  // the field's schema (EDD-9088), check the bit budget (EDD-9089) and lay the
+  // address out. Unbound halves never reach the composers. Runs after the
+  // composite checks above (EDD-9002, 9025, 9072, 9022 — which read the derived
+  // `composite`), so a prefix composite or dimension reports those codes first.
+  const inputFields = getSchemaFields(schemas.inputSchema as Schema.Top) ?? modelFields
+  for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
+    if (!isZOrderHalf(indexDef.sk)) continue
+    initialIndexes[indexName] = {
+      ...indexDef,
+      sk: bindZOrderHalf(config.entityType, indexName, indexDef.sk, (field) => ({
+        schema: inputFields[field],
+        encoding: fieldEncodings[field] ?? optionalFieldEncoding(modelFields[field]),
+      })),
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
@@ -988,6 +1066,148 @@ export const buildEntityDefinition = (config: {
     vectorIndexes,
     hasVectorIndexes,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Z-order binding (#171)
+// ---------------------------------------------------------------------------
+
+/**
+ * The date encoding of an optional field's value schema. `buildFieldEncodings`
+ * reads the top-level field schema, so `Schema.optional(DynamoModel.DateString)`
+ * has no entry there; a dateTime dimension over it still needs its storage.
+ */
+const optionalFieldEncoding = (schema: Schema.Top | undefined): DynamoEncoding | undefined => {
+  const inner = schema === undefined ? undefined : optionalField(schema)?.inner
+  return inner === undefined ? undefined : (resolveFieldEncoding(inner, undefined) ?? undefined)
+}
+
+/** `[EDD-9090]`: a Z-order index is never a collection member. */
+export const zorderInCollection = (entityType: string, indexName: string): Error =>
+  new Error(
+    `[EDD-9090] Entity "${entityType}": index "${indexName}" has a Z-order sort key and ` +
+      `can't belong to a collection — a collection's members share sort-key text, and a ` +
+      `Z-order key is a binary address. Query it through its own accessor.`,
+  )
+
+/**
+ * Resolve how a dimension's field is stored (design §4.1), from the field's
+ * schema in the entity's input schema and its date encoding. `[EDD-9088]` when
+ * the dimension's kind doesn't fit the field, or the field's order is unknown.
+ */
+const resolveDimensionStorage = (
+  entityType: string,
+  indexName: string,
+  dimension: ZOrder.Dimension,
+  field: { readonly schema: Schema.Top | undefined; readonly encoding: DynamoEncoding | undefined },
+): DimensionStorage => {
+  const refuse = (why: string): never => {
+    throw new Error(
+      `[EDD-9088] Entity "${entityType}": index "${indexName}" dimension ` +
+        `ZOrder.${dimension.kind}("${dimension.field}") doesn't fit its field: ${why}`,
+    )
+  }
+  const schema = field.schema
+  if (schema === undefined) {
+    return refuse("it isn't a model field, so its stored form is unknown.")
+  }
+  const kind = keyFormValueKind(schema)
+  const spec = dimension.spec
+  switch (spec.kind) {
+    case "int":
+    case "float": {
+      if (kind !== "number" && kind !== "bigint") {
+        return refuse(`a ${spec.kind} dimension needs a number or bigint field.`)
+      }
+      if (spec.kind === "float" && kind === "bigint") {
+        return refuse("a float dimension can't quantize a bigint field; use ZOrder.int.")
+      }
+      return numericTypeWithStringEncoding(schema)
+        ? { _tag: "NumericString", numeric: kind }
+        : { _tag: "Number", numeric: kind }
+    }
+    case "dateTime": {
+      const encoding = field.encoding
+      if (encoding?.storage === "epochMs" || encoding?.storage === "epochSeconds") {
+        return { _tag: "Epoch", unit: encoding.storage }
+      }
+      if (encoding?.storage === "string") {
+        return encoding.domain === "DateTime.Zoned"
+          ? { _tag: "ZonedIsoString" }
+          : { _tag: "UtcIsoString" }
+      }
+      return refuse(
+        "a dateTime dimension needs a date field with a known storage format " +
+          "(a DynamoModel date schema, or an Effect date schema) — a plain number or " +
+          "string has no known order.",
+      )
+    }
+    case "literals": {
+      if (kind !== "string" && kind !== "number" && kind !== "boolean") {
+        return refuse("a literals dimension needs a string, number or boolean field.")
+      }
+      const foreign = spec.values.find((value) => typeof value !== kind)
+      if (foreign !== undefined) {
+        return refuse(`${JSON.stringify(foreign)} is not a ${kind}, the field's key form.`)
+      }
+      const missing = keyFormLiterals(schema)?.filter((member) => !spec.values.includes(member))
+      if (missing !== undefined && missing.length > 0) {
+        return refuse(
+          `the field's values ${missing.map((m) => JSON.stringify(m)).join(", ")} are not ` +
+            `declared, so they would have no level.`,
+        )
+      }
+      return { _tag: "Literal" }
+    }
+    case "string": {
+      if (kind !== "string") return refuse("a string dimension needs a string field.")
+      return { _tag: "RawString" }
+    }
+  }
+}
+
+/**
+ * Bind a normalised Z-order sort key to an entity's fields: resolve each
+ * dimension's storage, check the bit budget (`[EDD-9089]`) and lay the address
+ * out. One declared `Dimension` may be bound by several entities, each to its
+ * own storage.
+ */
+const bindZOrderHalf = (
+  entityType: string,
+  indexName: string,
+  half: ZOrderSkPart,
+  fieldOf: (field: string) => {
+    readonly schema: Schema.Top | undefined
+    readonly encoding: DynamoEncoding | undefined
+  },
+): ZOrderSkPart => {
+  const bound: Array<BoundDimension> = []
+  for (const dimension of half.zorderHalf.dimensions) {
+    const limit = MAX_DIMENSION_BITS[dimension.kind]
+    if (dimension.bits > limit) {
+      throw new Error(
+        `[EDD-9089] Entity "${entityType}": index "${indexName}" dimension ` +
+          `ZOrder.${dimension.kind}("${dimension.field}") needs ${dimension.bits} bits; a ` +
+          `${dimension.kind} dimension takes at most ${limit}. Widen its step or narrow its range.`,
+      )
+    }
+    const storage = resolveDimensionStorage(
+      entityType,
+      indexName,
+      dimension,
+      fieldOf(dimension.field),
+    )
+    bound.push(bindDimension(dimension.spec, storage))
+  }
+  const layout = makeLayout(bound)
+  if (layout.bits > MAX_ADDRESS_BITS) {
+    throw new Error(
+      `[EDD-9089] Entity "${entityType}": index "${indexName}" interleaves ${layout.bits} bits; ` +
+        `a Z-order address takes at most ${MAX_ADDRESS_BITS} (${MAX_ADDRESS_BITS / 8} bytes). ` +
+        `Coarsen a dimension's step or drop a dimension.`,
+    )
+  }
+  return { ...half, zorderHalf: { ...half.zorderHalf, layout } }
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,6 +1359,7 @@ const makeDefinitionImpl = (config: {
       tableTag = injectedTableTag
     },
     _injectIndex: (name: string, def: IndexDefinition) => {
+      if (isZOrderHalf(def.sk)) throw zorderInCollection(data.entityType, name)
       const refused = packedIndexRefusal(data.entityType, data.packedFields, name, def)
       if (refused !== undefined) throw new Error(refused)
       allIndexes = { ...allIndexes, [name]: def }

@@ -44,6 +44,7 @@ import {
   TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { toHex } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import {
   MAX_DIMENSIONS,
   MAX_INLINE_FILTERS,
@@ -125,7 +126,12 @@ export const transactItemTarget = (
         })()
   const parts = keyFields.map((field) => {
     const value = attributes?.[field]
-    return { field, value, text: value?.S ?? value?.N ?? JSON.stringify(value ?? null) }
+    // A Z-order sort key (#171) is binary: name it by its bytes, in hex.
+    const text =
+      value?.S ??
+      value?.N ??
+      (value?.B !== undefined ? toHex(value.B) : JSON.stringify(value ?? null))
+    return { field, value, text }
   })
   return {
     identity: [
@@ -631,11 +637,9 @@ const sortsAfter = (a: AttributeValue, b: AttributeValue): boolean => {
   return false
 }
 
-/** A key value, readable. */
+/** A key value, readable: a binary one (a Z-order sort key, #171) in hex. */
 const keyValueText = (value: AttributeValue): string =>
-  value.S ??
-  value.N ??
-  (value.B !== undefined ? `<${value.B.length} bytes>` : JSON.stringify(value))
+  value.S ?? value.N ?? (value.B !== undefined ? toHex(value.B) : JSON.stringify(value))
 
 /**
  * The comparisons of a key condition — `#a = :v`, `#a BETWEEN :l AND :h`,
@@ -1288,7 +1292,7 @@ export const explainDiagnosis = (
         `${operation}: DynamoDB rejected ${named(diagnosis.target)}: it writes an empty value ` +
         `to the key attribute "${diagnosis.attribute}"` +
         (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
-        `, and DynamoDB does not accept an empty string as a key value. ${outcome}`
+        `, and DynamoDB does not accept an empty string or binary value as a key value. ${outcome}`
       )
     case "EmptyIn":
       return diagnosis.target === undefined
@@ -1304,7 +1308,7 @@ export const explainDiagnosis = (
         `${operation}: DynamoDB rejected the query: its key condition compares the key ` +
         `attribute "${diagnosis.attribute}"` +
         (diagnosis.index === undefined ? "" : ` of index "${diagnosis.index}"`) +
-        " with an empty string, which DynamoDB does not accept as a key value."
+        " with an empty string or binary value, which DynamoDB does not accept as a key value."
       )
     case "BetweenReversed":
       return (

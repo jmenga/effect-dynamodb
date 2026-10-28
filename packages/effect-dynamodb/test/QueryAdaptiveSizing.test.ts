@@ -734,6 +734,7 @@ describe("adaptive request sizing (#171)", () => {
               scannedCount: 16,
               count: 6,
               accepted: 6,
+              discarded: false,
             },
             {
               kind: "read",
@@ -743,6 +744,7 @@ describe("adaptive request sizing (#171)", () => {
               scannedCount: 7,
               count: 2,
               accepted: 2,
+              discarded: false,
             },
           ])
 
@@ -766,6 +768,7 @@ describe("adaptive request sizing (#171)", () => {
               scannedCount: 16,
               count: 6,
               accepted: 5,
+              discarded: false,
             },
           ])
 

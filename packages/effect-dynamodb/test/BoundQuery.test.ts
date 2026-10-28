@@ -420,6 +420,58 @@ describe("BoundQuery", () => {
     })
   })
 
+  describe("zorder", () => {
+    const zorderQuery = () =>
+      new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), {
+        ...makeConfigWithSk(),
+        zorder: true,
+        planWithin: (query) => query,
+      })
+
+    it("records the options, merged over earlier calls, before or after .within()", () => {
+      const before = zorderQuery().zorder({ strategy: "jump", pageSize: 7 })
+      expect(before._query._state.zorderOptions).toEqual({ strategy: "jump", pageSize: 7 })
+      const merged = before
+        .within({ count: { gte: 2 } })
+        // An explicit `undefined` leaves the earlier value.
+        .zorder({ maxRanges: 4, pageSize: undefined })
+        .zorder({ concurrency: 2 })
+      expect(merged._query._state.zorderOptions).toEqual({
+        strategy: "jump",
+        pageSize: 7,
+        maxRanges: 4,
+        concurrency: 2,
+      })
+      // `.within()` stays applied: a second one is still refused.
+      expect(merged._applied).toBe("within")
+      expect(() => (merged as any).within({ count: { lte: 3 } })).toThrow(/EDD-9093/)
+    })
+
+    it("refuses an invalid option [EDD-9095]", () => {
+      const bq = zorderQuery()
+      for (const options of [
+        { strategy: "sideways" },
+        { maxRanges: 0 },
+        { maxRanges: 2.5 },
+        { concurrency: -1 },
+        { concurrency: "4" },
+        { pages: 3 },
+        null,
+        [],
+      ]) {
+        expect(() => bq.zorder(options as any)).toThrow(/EDD-9095/)
+      }
+      // A numeric pageSize goes to DynamoDB as `Limit` unchecked, as `.pageSize(n)` does.
+      expect(() => bq.zorder({ pageSize: 0 })).not.toThrow()
+    })
+
+    it("refuses .zorder() on an accessor without a Z-order sort key [EDD-9095]", () => {
+      expect(() => (makeBoundQuery() as any).zorder({ strategy: "precise" })).toThrow(
+        /EDD-9095.*only to a Z-order index accessor/,
+      )
+    })
+  })
+
   describe("explain", () => {
     it.effect("describes a plain query without sending anything", () =>
       Effect.gen(function* () {

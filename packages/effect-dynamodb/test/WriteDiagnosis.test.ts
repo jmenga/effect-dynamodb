@@ -1,5 +1,6 @@
 import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -7,8 +8,11 @@ import {
   TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect } from "effect"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Effect, Schema } from "effect"
 import { describe, expect, vi } from "vitest"
+import * as Entity from "../src/Entity.js"
+import { ZOrder } from "../src/index.js"
 import {
   batchEntries,
   type Diagnosis,
@@ -22,6 +26,7 @@ import {
   type SentTable,
   type SentWrite,
   targetsFor,
+  transactItemTarget,
 } from "../src/internal/WriteDiagnosis.js"
 import {
   awsTransactionCanceled,
@@ -743,6 +748,100 @@ describe("WriteDiagnosis (#144)", () => {
     })
   })
 
+  // #171: a Z-order sort key is a binary (`B`) attribute. Its size is its
+  // byte length; a long prefix segment can carry it over 1024 bytes.
+  describe("a binary (Z-order) sort key", () => {
+    const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
+    class Listing extends Schema.Class<Listing>("Listing")({
+      listingId: Schema.String,
+      region: Schema.String,
+      agencyId: Schema.String,
+      price: Schema.Number,
+    }) {}
+    const Listings = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: {
+        pk: { field: "pk", composite: ["listingId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byAgency: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["region"] },
+          sk: {
+            field: "gsi1sk",
+            prefix: ["agencyId"],
+            zorder: [ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 })],
+          },
+        },
+      },
+    })
+    const sortKey = (agencyId: string) =>
+      KeyComposer.composeZOrderSk(AppSchema, Listings.indexes.byAgency, {
+        agencyId,
+        price: 250_000,
+      })
+
+    it("over 1024 bytes from a long prefix segment: KeyTooLong, measured in bytes", () => {
+      // u16be(1030) ‖ 1030 bytes of text ‖ a 2-byte address: 1034 bytes.
+      const bytes = sortKey("a".repeat(1030))
+      expect(bytes.length).toBe(1034)
+      const item: TransactWriteItem = {
+        Put: { TableName: "t", Item: { ...put("a").Put!.Item, gsi1sk: { B: bytes } } },
+      }
+      for (const message of [DDB_SORT_KEY_LOCAL, DDB_SORT_KEY_AWS]) {
+        const d = expectTag(diagnose(rejected(message), single(item)), "KeyTooLong")
+        expect(d.attribute).toBe("gsi1sk")
+        expect(d.kind).toBe("sort")
+        expect(d.bytes).toBe(1034)
+        expect(explainDiagnosis(d, "put")).toContain(
+          "is 1034 bytes, longer than DynamoDB's 1024-byte limit for a sort key",
+        )
+      }
+      // At the limit: not attributed.
+      const fits: TransactWriteItem = {
+        Put: {
+          TableName: "t",
+          Item: { ...put("a").Put!.Item, gsi1sk: { B: sortKey("a".repeat(1020)) } },
+        },
+      }
+      expect(diagnose(rejected(DDB_SORT_KEY_LOCAL), single(fits))).toBeUndefined()
+    })
+
+    it("an empty binary key value on a write is EmptyKey", () => {
+      const item: TransactWriteItem = {
+        Put: {
+          TableName: "t",
+          Item: { pk: { S: "p#a" }, sk: { S: "s" }, gsi1sk: { B: new Uint8Array(0) } },
+        },
+      }
+      const d = expectTag(
+        diagnose(rejected(ddbEmptyIndexKey("gsi1", "gsi1sk")), single(item)),
+        "EmptyKey",
+      )
+      expect(explainDiagnosis(d, "put")).toContain(
+        "DynamoDB does not accept an empty string or binary value as a key value",
+      )
+    })
+
+    it("a binary key names its item in hex", () => {
+      const target = transactItemTarget(
+        {
+          Delete: {
+            TableName: "t",
+            Key: { pk: { S: "p#a" }, sk: { B: Uint8Array.of(0x00, 0x2a) } },
+          },
+        },
+        "t",
+        ["pk", "sk"],
+        "Listing",
+        "operation 0 (Listing)",
+      )
+      expect(target.key).toBe("pk=p#a, sk=0x002a")
+    })
+  })
+
   describe("an empty key value on a write (P11)", () => {
     it("names the item, the attribute and the index DynamoDB named", () => {
       const item: TransactWriteItem = {
@@ -877,6 +976,60 @@ describe("WriteDiagnosis (#144)", () => {
         ),
         "BetweenReversed",
       )
+    })
+
+    // #171: a Z-order sort key is binary — an empty one is refused like an
+    // empty string, and BETWEEN operands are named in hex.
+    const binaryQuery = (condition: string, values: Record<string, Uint8Array | string>) =>
+      read({
+        IndexName: "gsi1",
+        KeyConditionExpression: condition,
+        ExpressionAttributeNames: { "#pk": "gsi1pk", "#sk": "gsi1sk" },
+        ExpressionAttributeValues: Object.fromEntries(
+          Object.entries(values).map(([k, v]) => [k, typeof v === "string" ? { S: v } : { B: v }]),
+        ),
+      })
+
+    it("an empty binary key bound (#171)", () => {
+      const d = expectTag(
+        diagnoseRejection(
+          queryRejected(ddbEmptyIndexKey("gsi1", "gsi1sk")),
+          binaryQuery("#pk = :pk AND #sk >= :sk", { ":pk": "p", ":sk": new Uint8Array(0) }),
+        ),
+        "EmptyKeyBound",
+      )
+      expect(d.attribute).toBe("gsi1sk")
+      expect(explainDiagnosis(d, "query")).toContain(
+        'compares the key attribute "gsi1sk" of index "gsi1" with an empty string or binary ' +
+          "value, which DynamoDB does not accept as a key value",
+      )
+    })
+
+    it("a reversed binary BETWEEN, named in hex, compared by bytes (#171)", () => {
+      const between = "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2"
+      const d = expectTag(
+        diagnoseRejection(
+          queryRejected(ddbBetweenReversed("x", "y")),
+          binaryQuery(between, {
+            ":pk": "p",
+            ":sk1": Uint8Array.of(0x01, 0x00),
+            ":sk2": Uint8Array.of(0x00, 0xff, 0xff),
+          }),
+        ),
+        "BetweenReversed",
+      )
+      expect([d.low, d.high]).toEqual(["0x0100", "0x00ffff"])
+      // A shorter prefix sorts first: in order.
+      expect(
+        diagnoseRejection(
+          queryRejected(ddbBetweenReversed("x", "y")),
+          binaryQuery(between, {
+            ":pk": "p",
+            ":sk1": Uint8Array.of(0x01),
+            ":sk2": Uint8Array.of(0x01, 0x00),
+          }),
+        ),
+      ).toBeUndefined()
     })
 
     it("a write's message on a read, or a read's on a write: passed through", () => {

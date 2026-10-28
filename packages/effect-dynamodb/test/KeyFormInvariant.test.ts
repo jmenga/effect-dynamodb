@@ -53,6 +53,8 @@ const ENTITY_SRC = fileURLToPath(new URL("../src/Entity.ts", import.meta.url))
 const RECORD_TAKING = [
   "composePk",
   "composeSk",
+  "composeZOrderSk",
+  "composeSkValue",
   "composeAllKeys",
   "composeIndexKeys",
   "tryComposeIndexKeys",

@@ -15,7 +15,7 @@ import type {
 } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
-import { Effect, Function, Option, Pipeable, Stream } from "effect"
+import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import * as Capacity from "./internal/Capacity.js"
 import * as Cursor from "./internal/Cursor.js"
@@ -31,6 +31,8 @@ import {
   cursorRefusal,
   DEFAULT_MAX_SKIPS,
   displayKeyCondition,
+  JUMP_INITIAL,
+  JUMP_MAX_LIMIT,
   type KeyRange,
   type PlannerFactory,
   type ProbeStep,
@@ -115,8 +117,47 @@ export interface QueryExplain {
   readonly rowChecks: ReadonlyArray<string>
   /** How each request's `Limit` is sized (see {@link limit} and {@link pageSize}). */
   readonly sizing: "fixed" | "natural" | "budget" | "adaptive"
+  /** A Z-order plan's address space and box (#171). */
+  readonly zorder?: {
+    /** The address width in bits. */
+    readonly bits: number
+    /** Per dimension, the levels the box selects, as inclusive `[lo, hi]` runs. */
+    readonly box: ReadonlyArray<{
+      readonly field: string
+      readonly bits: number
+      readonly levels: ReadonlyArray<readonly [string, string]>
+    }>
+    /** The box's volume over the addresses between its corners: how much of the hull is in it. */
+    readonly fill: number
+    /** How many ranges the exact plan takes, or `"over-cap"` when it exceeds `maxRanges`. */
+    readonly exactRanges: number | "over-cap"
+  }
   /** The skip-scan probe budget, for a plan that probes. */
   readonly maxSkips?: number
+}
+
+/**
+ * How a Z-order query reads its box (#171) — `.zorder()` on a Z-order
+ * accessor. Later calls merge over earlier ones.
+ */
+export interface ZOrderOptions {
+  /**
+   * `"precise"` reads a capped plan of address ranges; `"jump"` follows each
+   * page's last examined key to the next address in the box; `"naive"` reads
+   * the box's whole hull. `"auto"` (the default) is `precise` when the exact
+   * plan fits `maxRanges`, else `jump`.
+   */
+  readonly strategy?: "auto" | "naive" | "jump" | "precise" | undefined
+  /** A fixed `Limit` for `jump` requests. Unset: sized from the in-box run, starting at 16. */
+  readonly pageSize?: number | undefined
+  /** Range cap for `precise` and for `auto`'s choice. Default 16. */
+  readonly maxRanges?: number | undefined
+  /**
+   * Planned ranges in flight at once. Unset: 4 for reads with a `limit`, 1
+   * for drains without one (natural 1 MB pages against one partition). Set:
+   * applies to both.
+   */
+  readonly concurrency?: number | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +212,8 @@ interface QueryState {
   readonly planner: PlannerFactory | undefined
   /** @internal The skip-scan probe budget `.within()` was given (default 32). */
   readonly maxSkips: number | undefined
+  /** @internal `.zorder()` options, merged over each other (#171). */
+  readonly zorderOptions: ZOrderOptions | undefined
   /** @internal Set by {@link prepared}: the resolved planner and the step the terminal starts at. */
   readonly plan: PreparedPlan | undefined
   /**
@@ -446,6 +489,7 @@ export const make = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
+    zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
     isScan: false,
@@ -509,6 +553,7 @@ export const makeScan = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
+    zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
     isScan: true,
@@ -635,6 +680,14 @@ export interface QueryRequestEvent {
   readonly count: number
   /** Rows that became items: what history rows, predicates and missing items left. */
   readonly accepted: number
+  /**
+   * A read sent alongside others (#171) and then not used: a window member
+   * after the one that filled the `limit` or returned a `LastEvaluatedKey`
+   * (`fetch`), or a page still buffered when a stream ends. Its rows were read
+   * and are counted, none became items (`accepted` is 0), and a later call
+   * reads them again.
+   */
+  readonly discarded: boolean
 }
 
 /**
@@ -744,15 +797,24 @@ export const startFrom: {
 )
 
 /**
- * @internal Install a planner (#171): `.within()` on a bound query. The
- * factory is resolved from the final state when a terminal runs, so the
- * combinators that follow (`reverse`, `startFrom`, …) still apply.
+ * @internal Install a bound query's #171 planning state: the planner its
+ * `.within()` built, with the skip-scan probe budget, or the options of its
+ * `.zorder()`, merged over earlier ones (validated there). The planner is a
+ * factory, resolved from the final state when a terminal runs, so the
+ * combinators that follow (`reverse`, `startFrom`, …) still apply. Not a
+ * combinator: Z-order and skip-scan are reached through `BoundQuery`.
  */
 export const plan = <A>(
   self: Query<A>,
-  planner: PlannerFactory,
-  maxSkips: number | undefined,
-): Query<A> => new QueryImpl<A>({ ...self._state, planner, maxSkips })
+  install:
+    | { readonly planner: PlannerFactory; readonly maxSkips: number | undefined }
+    | { readonly zorder: ZOrderOptions },
+): Query<A> =>
+  new QueryImpl<A>(
+    "zorder" in install
+      ? { ...self._state, zorderOptions: { ...self._state.zorderOptions, ...install.zorder } }
+      : { ...self._state, planner: install.planner, maxSkips: install.maxSkips },
+  )
 
 /** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
 const rawRowDecoder = (
@@ -1418,6 +1480,60 @@ const requestLimit = (
     : legacyRequestLimit(state, remaining, page)
 
 /**
+ * @internal The `Limit` of a planned read: a `jump` read's follows its in-box
+ * run (design §8.5) unless `.zorder({ pageSize })` or a numeric `.pageSize(n)`
+ * fixes it, capped near what the outstanding `limit` needs; every other read
+ * is sized as {@link requestLimit} sizes any request.
+ */
+const readLimit = (
+  state: QueryState,
+  step: ReadStep,
+  remaining: number | undefined,
+  est: Estimator,
+  read: number,
+): number | undefined => {
+  if (step.sizing._tag !== "jump") return requestLimit(state, remaining, est, read)
+  const fixed =
+    state.zorderOptions?.pageSize ??
+    (typeof state.pageSizeValue === "number" ? state.pageSizeValue : undefined)
+  if (fixed !== undefined) return fixed
+  const run =
+    remaining === undefined
+      ? step.sizing.run
+      : Math.min(step.sizing.run, Math.max(JUMP_INITIAL, Math.ceil(remaining * SAFETY)))
+  return Math.min(Math.max(run, 1), JUMP_MAX_LIMIT)
+}
+
+/**
+ * @internal How many planned ranges a terminal reads at once (design §9.3):
+ * `.zorder({ concurrency })`, else 4 with a `limit` (pages sized to it) and 1
+ * without (natural 1 MB pages, which several in flight against one partition
+ * key would throttle).
+ */
+const planConcurrency = (state: QueryState): number =>
+  state.zorderOptions?.concurrency ?? (state.limitValue !== undefined ? 4 : 1)
+
+/** @internal AWS error names that mean "throttled" (design §9.5). */
+const THROTTLING_NAMES: ReadonlySet<string> = new Set([
+  "ProvisionedThroughputExceededException",
+  "ThrottlingException",
+  "RequestLimitExceeded",
+])
+
+/**
+ * @internal Was a request refused for its rate? The client classifies the
+ * first two names as a `ThrottlingError`; `RequestLimitExceeded` (an
+ * account's on-demand request cap) reaches here as a `DynamoError`, so the
+ * AWS error's name is read too.
+ */
+const isThrottled = (error: DynamoClientError | ValidationError): boolean => {
+  if (error._tag === "ThrottlingError") return true
+  if (error._tag !== "DynamoError") return false
+  const cause = error.cause as { readonly name?: unknown } | null | undefined
+  return typeof cause?.name === "string" && THROTTLING_NAMES.has(cause.name)
+}
+
+/**
  * @internal DynamoDB `Limit` for the next request as 1.36 sized it — what
  * `pageSize("natural")`, a numeric `pageSize`, a `maxPages` cap, an unfiltered
  * `limit` and no `limit` at all still send (see {@link sizingMode}).
@@ -1541,7 +1657,11 @@ const prepared = (
 
 /** @internal The planner a `.within()` installed, resolved against the final state. */
 const resolvePlanner = (state: QueryState, factory: PlannerFactory): RangePlanner =>
-  factory({ reverse: !state.scanForward, maxSkips: state.maxSkips ?? DEFAULT_MAX_SKIPS })
+  factory({
+    reverse: !state.scanForward,
+    maxSkips: state.maxSkips ?? DEFAULT_MAX_SKIPS,
+    zorder: state.zorderOptions,
+  })
 
 /**
  * @internal Decode the {@link startFrom} cursor and place it (design §10.2):
@@ -1614,12 +1734,24 @@ const probeState = (state: QueryState, step: ProbeStep): QueryState => ({
   rowCheck: undefined,
 })
 
-/** @internal A probe's command: one row, its sort key only. */
-const probeCommand = (state: QueryState, step: ProbeStep, tableName: string) =>
-  buildDynamoCommand(probeState(state, step), tableName, {
+/**
+ * @internal A probe's command: one row, its sort key only. A probe from the
+ * start of the partition (a binary skip tuple with no prefix given, #171
+ * §7.5) has no sort key condition to declare `#sk`, so it is declared here.
+ */
+const probeCommand = (state: QueryState, step: ProbeStep, tableName: string) => {
+  const command = buildDynamoCommand(probeState(state, step), tableName, {
     Limit: 1,
     ProjectionExpression: "#sk",
   })
+  return {
+    ...command,
+    ExpressionAttributeNames: {
+      ...command.ExpressionAttributeNames,
+      ...(state.skField === undefined ? {} : { "#sk": state.skField }),
+    },
+  }
+}
 
 /** @internal The cursor of a planned query at `step`: v2, or `null` once done. */
 const plannedCursor = (planner: RangePlanner, step: Step): string | null => {
@@ -1693,7 +1825,9 @@ const responseCounts = (response: {
  */
 const notify = (
   state: QueryState,
-  observed: Omit<QueryRequestEvent, "lower" | "upper">,
+  observed: Omit<QueryRequestEvent, "lower" | "upper" | "discarded"> & {
+    readonly discarded?: boolean
+  },
 ): Effect.Effect<void> => {
   if (state.observers.length === 0) return Effect.void
   const [lower, upper] = displayKeyCondition(
@@ -1708,6 +1842,7 @@ const notify = (
     scannedCount: observed.scannedCount,
     count: observed.count,
     accepted: observed.accepted,
+    discarded: observed.discarded ?? false,
   }
   return Capacity.detached(
     Effect.forEach(
@@ -1936,11 +2071,98 @@ export const collect = <A>(
     "Query.collect",
     operationOptions(self),
     Effect.gen(function* () {
-      const stream = yield* paginateInternal(self)
-      const pages = yield* Stream.runCollect(stream)
+      const client = yield* Capacity.client
+      const tableName = self._state.resolveTableName
+        ? yield* self._state.resolveTableName
+        : self._state.tableName
+      const state = yield* prepared(self._state, tableName).pipe(
+        Effect.provideService(DynamoClient, client),
+      )
+      const ranges = drainedRanges(state)
+      if (ranges !== undefined) return yield* collectRanges<A>(client, tableName, state, ranges)
+      const pages = yield* Stream.runCollect(pageStream<A>(client, tableName, state))
       return pages.flat()
     }),
   )
+
+/**
+ * @internal The ranges a `collect` drains independently (design §9.3): a
+ * precise plan read to its end — no `limit`, no `maxPages`, no skip tuple —
+ * so every range is read whole and none can be wasted. `undefined` otherwise.
+ */
+const drainedRanges = (state: QueryState): ReadonlyArray<ReadStep> | undefined => {
+  const plan = state.plan
+  if (plan === undefined || state.limitValue !== undefined || state.maxPagesValue != null) {
+    return undefined
+  }
+  const start = plan.start
+  if (start._tag !== "Read" || start.at.mode !== "precise" || start.planIndex === undefined) {
+    return undefined
+  }
+  return [start, ...plan.planner.following(start, Number.POSITIVE_INFINITY)]
+}
+
+/**
+ * @internal `collect` over independent ranges: each drained by its own
+ * `LastEvaluatedKey` loop, up to {@link planConcurrency} at once, the items
+ * concatenated in plan order. The first failure fails the call and interrupts
+ * the other reads. Requests are numbered as they are sent.
+ */
+const collectRanges = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  ranges: ReadonlyArray<ReadStep>,
+): Effect.Effect<Array<A>, DynamoClientError | ValidationError> => {
+  let requests = 0
+  const drain = (first: ReadStep) =>
+    Effect.gen(function* () {
+      const items: Array<A> = []
+      let step = first
+      let est = emptyEstimator
+      while (true) {
+        const request = ++requests
+        const response = yield* sendRead(
+          client,
+          tableName,
+          state,
+          step,
+          undefined,
+          est,
+          est.requests + 1,
+          false,
+        )
+        const page = yield* examinePage<A>(
+          client,
+          tableName,
+          response.state,
+          response.returned,
+          undefined,
+          response.borrowedFields,
+        )
+        items.push(...page.items)
+        est = observeEstimator(est, {
+          scanned: response.counts.scannedCount,
+          accepted: page.accepted,
+          limitSent: response.limitSent,
+        })
+        yield* notify(response.state, {
+          kind: "read",
+          request,
+          limit: response.limitSent,
+          ...response.counts,
+          accepted: page.accepted,
+        })
+        const lek = response.lastEvaluatedKey
+        if (lek === undefined) return items
+        step = readFrom(step, lek)
+      }
+    })
+  return Effect.map(
+    Effect.forEach(ranges, (range) => drain(range), { concurrency: planConcurrency(state) }),
+    (pages) => pages.flat(),
+  )
+}
 
 /**
  * Execute one page and return a {@link Page} with an opaque cursor.
@@ -2092,7 +2314,7 @@ const sendRead = (
     const sentState = readState(state, step)
     const indexState = indexQueryState(sentState)
     const borrowedFields = cursorProjectionFields(indexState, forCursor)
-    const limitSent = requestLimit(sentState, remaining, est, read)
+    const limitSent = readLimit(sentState, step, remaining, est, read)
     const cmd = buildDynamoCommand(
       indexState,
       tableName,
@@ -2140,6 +2362,13 @@ const sendProbe = (
  * each step, this loop sends it. The limit and `maxPages` are checked before
  * every request, so a probe is never sent when the call is about to return —
  * the cursor then names the pending step instead.
+ *
+ * Precise ranges are read in windows: a range and those following it, sent
+ * concurrently and examined in plan order. A later member starts fresh (no
+ * start key), so its rows are usable only while every earlier member finished
+ * its range in one page; the window doubles after a window where all did (up
+ * to {@link planConcurrency}) and drops back to one on any
+ * `LastEvaluatedKey`. Without a `limit`, a page is one window.
  */
 const executePlanned = <A>(
   client: DynamoClientService,
@@ -2151,14 +2380,13 @@ const executePlanned = <A>(
     const { planner } = plan
     const limitValue = state.limitValue
     const maxPages = state.maxPagesValue
-    // Composite plans read one range at a time: `following` is empty, so a
-    // window holds the step alone.
-    const window = 1
+    const cap = planConcurrency(state)
     const items: Array<A> = []
     const filled = () => limitValue !== undefined && items.length >= limitValue
     let step = plan.start
     let requests = 0
     let est = emptyEstimator
+    let window = 1
 
     while (true) {
       if (step._tag === "Done") return { items, cursor: null }
@@ -2170,29 +2398,62 @@ const executePlanned = <A>(
         step = planner.afterProbe(step, yield* sendProbe(client, tableName, state, step, requests))
         continue
       }
-      // The step, plus the ranges following it within the `maxPages` budget.
+      // The step, plus the ranges following it within the window and the
+      // `maxPages` budget (composite and jump plans have none).
       const room = maxPages == null ? window : Math.min(window, maxPages - requests)
       const batch = [step, ...planner.following(step, room - 1)]
       const remainingAtSend = limitValue === undefined ? undefined : limitValue - items.length
       const sent = yield* Effect.forEach(
         batch,
         (member, i) =>
-          sendRead(
-            client,
-            tableName,
-            state,
-            member,
-            remainingAtSend,
-            est,
-            est.requests + i + 1,
-            true,
+          Effect.result(
+            sendRead(
+              client,
+              tableName,
+              state,
+              member,
+              remainingAtSend,
+              est,
+              est.requests + i + 1,
+              true,
+            ),
           ),
         { concurrency: batch.length },
       )
+      /** Report the members after `i` that were read and won't be used (§3.6). */
+      const discardAfter = (i: number) =>
+        Effect.forEach(
+          sent.slice(i + 1),
+          (outcome, j) =>
+            Result.isFailure(outcome)
+              ? Effect.void
+              : notify(outcome.success.state, {
+                  kind: "read",
+                  request: requests + i + j + 2,
+                  limit: outcome.success.limitSent,
+                  ...outcome.success.counts,
+                  accepted: 0,
+                  discarded: true,
+                }),
+          { discard: true },
+        )
       let next: Step = step
+      let continued = false
       for (let i = 0; i < batch.length; i++) {
         const member = batch[i]!
-        const response = sent[i]!
+        const outcome = sent[i]!
+        if (Result.isFailure(outcome)) {
+          yield* discardAfter(i)
+          // A member after a usable prefix was throttled: hand back the prefix,
+          // the cursor naming that member as not started — the next call
+          // retries it and surfaces the error if it persists (§9.5). Anything
+          // else, or the first member, fails the call.
+          if (i > 0 && isThrottled(outcome.failure)) {
+            return { items, cursor: plannedCursor(planner, member) }
+          }
+          return yield* Effect.fail(outcome.failure)
+        }
+        const response = outcome.success
         // Never examined with nothing left: the loop returns as soon as the
         // limit is reached, discarding later members' results.
         const remaining = limitValue === undefined ? undefined : limitValue - items.length
@@ -2219,6 +2480,7 @@ const executePlanned = <A>(
         })
         const lek = response.lastEvaluatedKey
         if (filled()) {
+          yield* discardAfter(i)
           // Stopped inside the page: resume after the last row handed back
           // (#122), inside this member's range.
           if (page.stoppedAt >= 0 && page.stoppedAt < response.returned.length - 1) {
@@ -2237,11 +2499,16 @@ const executePlanned = <A>(
         }
         next = planner.afterRead(member, lek)
         // A later member started fresh, so it can't be resumed past this one.
-        if (lek !== undefined) break
+        if (lek !== undefined) {
+          yield* discardAfter(i)
+          continued = true
+          break
+        }
       }
       requests += batch.length
+      window = continued ? 1 : Math.min(window * 2, cap)
       step = next
-      // Without a limit, a page is one read, as for a query without a plan.
+      // Without a limit, a page is one window, as one read is without a plan.
       if (limitValue === undefined) return { items, cursor: plannedCursor(planner, step) }
     }
   })
@@ -2380,8 +2647,9 @@ const pageStream = <A>(
  *   until every earlier range is drained, so a stream never discards a read.
  * - `step` — the plan's next step once `open` is drained: read only while
  *   `open` is empty.
- * - `window` — how many ranges may be open. Composite plans read one range at
- *   a time (`following` is empty), so it stays 1.
+ * - `window` — how many ranges may be open: {@link planConcurrency}. Only a
+ *   precise plan has ranges `following` a read; composite, naive and jump
+ *   plans read one range at a time.
  *
  * Each pull opens ranges when none is open (sending the probes before the
  * next read), sends one read for every open range without a page, within
@@ -2420,7 +2688,7 @@ const plannedPageStream = <A>(
     pageCount: 0,
     emitted: 0,
     estimator: emptyEstimator,
-    window: 1,
+    window: planConcurrency(state),
   }
   return Stream.paginate(initial, (pageState: PageState) =>
     Effect.gen(function* () {
@@ -2514,8 +2782,39 @@ const plannedPageStream = <A>(
           if (rest.length === 0) step = next
         }
       }
+      // Keep the window full: the ranges after the last open one. (When it
+      // finishes, its own next step is the first range not yet opened.)
+      const last = open[open.length - 1]
+      if (last !== undefined && open.length < window && !filled()) {
+        open = [
+          ...open,
+          ...planner.following(last.step, window - open.length).map((member) => ({
+            step: member,
+            page: undefined,
+          })),
+        ]
+      }
 
       const more = !filled() && budget() && (open.length > 0 || step._tag !== "Done")
+      if (!more) {
+        // The stream ends with pages read ahead and not emitted: report them (§3.6).
+        const unused = open
+          .flatMap((range) => (range.page === undefined ? [] : [range.page]))
+          .sort((a, b) => a.request - b.request)
+        yield* Effect.forEach(
+          unused,
+          ({ request, response }) =>
+            notify(response.state, {
+              kind: "read",
+              request,
+              limit: response.limitSent,
+              ...response.counts,
+              accepted: 0,
+              discarded: true,
+            }),
+          { discard: true },
+        )
+      }
       return [
         pages,
         more
@@ -2653,7 +2952,10 @@ const countCore = <A>(
  * @internal `count` for a planned query (design §9.4): `Select: "COUNT"` per
  * read, probes through the same loop. A read whose rows a check judges (a row
  * check, history rows) reads only the attributes the check needs and counts
- * the rows it accepts.
+ * the rows it accepts. A jump read is sized from its in-box run, as `execute`
+ * sizes it; without that, each `COUNT` would evaluate up to 1 MB into a gap.
+ * A precise plan's ranges are counted independently, up to
+ * {@link planConcurrency} at once, unless `maxPages` must cap them in order.
  */
 const countPlanned = (
   client: DynamoClientService,
@@ -2664,9 +2966,78 @@ const countPlanned = (
   Effect.gen(function* () {
     const { planner } = plan
     const limitValue = state.limitValue
-    let step = plan.start
     let total = 0
     let requests = 0
+    const reached = () => limitValue !== undefined && total >= limitValue
+
+    /** Count one read; its `LastEvaluatedKey`. */
+    const countRead = (step: ReadStep, est: Estimator, request: number) =>
+      Effect.gen(function* () {
+        const sentState = readState(state, step)
+        const remaining = limitValue === undefined ? undefined : limitValue - total
+        const limitSent = readLimit(sentState, step, remaining, est, est.requests + 1)
+        const judging = dropsRows(sentState)
+        const cmd = judging
+          ? buildDynamoCommand(
+              { ...sentState, projection: judgedAttributes(sentState), projectionPaths: undefined },
+              tableName,
+              { ExclusiveStartKey: step.startKey, Limit: limitSent },
+            )
+          : buildDynamoCommand(sentState, tableName, {
+              ExclusiveStartKey: step.startKey,
+              Select: "COUNT",
+              Limit: limitSent,
+            })
+        const result = yield* send(client, sentState, cmd)
+        const counts = responseCounts(result)
+        const matched = judging
+          ? ((result.Items ?? []) as Array<Record<string, AttributeValue>>).filter(
+              (row) => !isExcludedRow(sentState, row),
+            ).length
+          : (result.Count ?? 0)
+        const scanned = judging ? counts.scannedCount : (result.ScannedCount ?? matched)
+        total += matched
+        yield* notify(sentState, {
+          kind: "count",
+          request,
+          limit: limitSent,
+          scannedCount: scanned,
+          count: judging ? counts.count : matched,
+          accepted: matched,
+        })
+        return {
+          lastEvaluatedKey: result.LastEvaluatedKey as Record<string, AttributeValue> | undefined,
+          est: observeEstimator(est, { scanned, accepted: matched, limitSent }),
+        }
+      })
+
+    const start = plan.start
+    if (
+      state.maxPagesValue == null &&
+      start._tag === "Read" &&
+      start.at.mode === "precise" &&
+      start.planIndex !== undefined
+    ) {
+      const ranges = [start, ...planner.following(start, Number.POSITIVE_INFINITY)]
+      yield* Effect.forEach(
+        ranges,
+        (first) =>
+          Effect.gen(function* () {
+            let step: ReadStep = first
+            let est = emptyEstimator
+            while (!reached()) {
+              const counted = yield* countRead(step, est, ++requests)
+              if (counted.lastEvaluatedKey === undefined) return
+              est = counted.est
+              step = readFrom(step, counted.lastEvaluatedKey)
+            }
+          }),
+        { concurrency: planConcurrency(state), discard: true },
+      )
+      return reached() ? limitValue! : total
+    }
+
+    let step = start
     let est = emptyEstimator
     while (step._tag !== "Done") {
       if (state.maxPagesValue != null && requests >= state.maxPagesValue) break
@@ -2675,44 +3046,10 @@ const countPlanned = (
         step = planner.afterProbe(step, yield* sendProbe(client, tableName, state, step, requests))
         continue
       }
-      const sentState = readState(state, step)
-      const remaining = limitValue === undefined ? undefined : limitValue - total
-      const limitSent = requestLimit(sentState, remaining, est, est.requests + 1)
-      const judging = dropsRows(sentState)
-      const cmd = judging
-        ? buildDynamoCommand(
-            { ...sentState, projection: judgedAttributes(sentState), projectionPaths: undefined },
-            tableName,
-            { ExclusiveStartKey: step.startKey, Limit: limitSent },
-          )
-        : buildDynamoCommand(sentState, tableName, {
-            ExclusiveStartKey: step.startKey,
-            Select: "COUNT",
-            Limit: limitSent,
-          })
-      const result = yield* send(client, sentState, cmd)
-      const counts = responseCounts(result)
-      const matched = judging
-        ? ((result.Items ?? []) as Array<Record<string, AttributeValue>>).filter(
-            (row) => !isExcludedRow(sentState, row),
-          ).length
-        : (result.Count ?? 0)
-      const scanned = judging ? counts.scannedCount : (result.ScannedCount ?? matched)
-      total += matched
-      est = observeEstimator(est, { scanned, accepted: matched, limitSent })
-      yield* notify(sentState, {
-        kind: "count",
-        request: requests,
-        limit: limitSent,
-        scannedCount: scanned,
-        count: judging ? counts.count : matched,
-        accepted: matched,
-      })
-      if (limitValue !== undefined && total >= limitValue) return limitValue
-      step = planner.afterRead(
-        step,
-        result.LastEvaluatedKey as Record<string, AttributeValue> | undefined,
-      )
+      const counted = yield* countRead(step, est, requests)
+      est = counted.est
+      if (reached()) return limitValue!
+      step = planner.afterRead(step, counted.lastEvaluatedKey)
     }
     return total
   })

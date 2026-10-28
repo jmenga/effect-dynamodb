@@ -13,7 +13,7 @@ import type * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
-import type { RangeBound } from "../src/index.js"
+import { type DimensionBound, type RangeBound, ZOrder } from "../src/index.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import type { ConditionCheckOp } from "../src/Transaction.js"
@@ -1510,5 +1510,260 @@ describe("Entity types — .within() (#171)", () => {
       .within({ price: { gte: 1 } })
       .explain()
     expectTypeOf(explain).toEqualTypeOf<Effect.Effect<Query.QueryExplain, never, never>>()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Z-order sort keys (#171)
+// ---------------------------------------------------------------------------
+
+describe("Entity types — Z-order sort keys (#171)", () => {
+  class Listing extends Schema.Class<Listing>("Listing")({
+    listingId: Schema.String,
+    region: Schema.String,
+    agencyId: Schema.String,
+    officeId: Schema.String,
+    price: Schema.Number,
+    bedrooms: Schema.Number,
+  }) {}
+
+  const facets = [
+    ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
+    ZOrder.int("bedrooms", { min: 0, max: 15 }),
+  ] as const
+
+  const Listings = Entity.make({
+    model: Listing,
+    entityType: "Listing",
+    primaryKey: {
+      pk: { field: "pk", composite: ["listingId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byFacets: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["region"] },
+        sk: { field: "gsi1sk", zorder: facets },
+      },
+      byAgency: {
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: ["region"] },
+        sk: {
+          field: "gsi2sk",
+          prefix: ["agencyId", { field: "officeId", hash: 8 }],
+          zorder: facets,
+        },
+      },
+    },
+  })
+  const ListingsTable = Table.make({ schema: AppSchema, entities: { Listings } })
+  const makeDb = () => DynamoClient.make({ entities: { Listings }, tables: { ListingsTable } })
+  // Never executed — the client only feeds `typeof`.
+  const db = null as unknown as Effect.Success<ReturnType<typeof makeDb>>
+  type Has<T, K extends string> = K extends keyof T ? true : false
+
+  it("derives the half's composite: prefix composites, then dimensions, in order", () => {
+    type Facets = typeof Listings.indexes.byFacets.sk.composite
+    type Agency = typeof Listings.indexes.byAgency.sk.composite
+    expectTypeOf<Facets["length"]>().toEqualTypeOf<2>()
+    expectTypeOf<[Facets[0], Facets[1]]>().toEqualTypeOf<["price", "bedrooms"]>()
+    expectTypeOf<Agency["length"]>().toEqualTypeOf<4>()
+    expectTypeOf<[Agency[0], Agency[1], Agency[2], Agency[3]]>().toEqualTypeOf<
+      ["agencyId", "officeId", "price", "bedrooms"]
+    >()
+  })
+
+  it("the accessor takes the partition key composites only", () => {
+    type Input = IndexPkInput<typeof Listing, typeof Listings.indexes, "byAgency">
+    expectTypeOf<keyof Input>().toEqualTypeOf<"region">()
+    // @ts-expect-error a dimension feeds the Z-order key: bound it, don't pin it
+    const _dimension: Input = { region: "north", price: 250_000 }
+    // @ts-expect-error a prefix composite feeds the Z-order key too
+    const _prefix: Input = { region: "north", agencyId: "ag-1" }
+    if (db === null) return
+    db.entities.Listings.byFacets({ region: "north" })
+    // A dimension or prefix composite passed anyway is refused at run time
+    // ([EDD-9093], ZOrderEntity.test.ts): the accessor's input has none.
+    // @ts-expect-error the partition key composite is required
+    db.entities.Listings.byFacets({})
+  })
+
+  it("offers no .where() on a Z-order accessor", () => {
+    if (db === null) return
+    const query = db.entities.Listings.byFacets({ region: "north" })
+    expectTypeOf<Has<typeof query, "where">>().toEqualTypeOf<false>()
+    expectTypeOf<Has<typeof query, "collect">>().toEqualTypeOf<true>()
+  })
+
+  it("zorder / prefix are sort key declarations only", () => {
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: {
+          pk: { field: "pk", composite: ["listingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byFacets: {
+            name: "gsi1",
+            // @ts-expect-error a partition key is never a Z-order address
+            pk: { field: "gsi1pk", composite: [], zorder: facets },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        },
+      }),
+    ).toThrow(/\[EDD-9086\]/)
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: {
+          pk: { field: "pk", composite: ["listingId"] },
+          // @ts-expect-error the primary key is string-composed
+          sk: { field: "sk", composite: [], zorder: facets },
+        },
+      }),
+    ).toThrow(/\[EDD-9086\]/)
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: {
+          pk: { field: "pk", composite: ["listingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byAgency: {
+            name: "gsi1",
+            // @ts-expect-error prefix belongs to the sort key half
+            pk: { field: "gsi1pk", composite: ["region"], prefix: ["agencyId"] },
+            sk: { field: "gsi1sk", zorder: facets },
+          },
+        },
+      }),
+    ).toThrow(/\[EDD-9086\]/)
+  })
+
+  it(".within() bounds each dimension in its own type; prefix composites take a value", () => {
+    if (db === null) return
+    type Bounds = Parameters<ReturnType<typeof db.entities.Listings.byAgency>["within"]>[0]
+    expectTypeOf<keyof Bounds>().toEqualTypeOf<"agencyId" | "officeId" | "price" | "bedrooms">()
+    expectTypeOf<NonNullable<Bounds["price"]>>().toEqualTypeOf<
+      DimensionBound<(typeof facets)[0], number>
+    >()
+    expectTypeOf<NonNullable<Bounds["price"]>>().toEqualTypeOf<RangeBound<number>>()
+    const query = db.entities.Listings.byAgency({ region: "north" })
+    query.within({ agencyId: "ag-1", price: { lte: 500_000 }, bedrooms: { between: [2, 4] } })
+    query.within({})
+    // @ts-expect-error a prefix composite takes one exact value, not a range
+    query.within({ agencyId: { gte: "ag-1" } })
+    // @ts-expect-error `in` bounds only a literals dimension
+    query.within({ price: { in: [1, 2] } })
+    // @ts-expect-error the bound is in the field's own type
+    query.within({ price: { gte: "1" } })
+    // @ts-expect-error the partition key composite belongs to the accessor
+    query.within({ region: "south" })
+  })
+
+  it(".zorder() only on a Z-order accessor, before or after .within()", () => {
+    if (db === null) return
+    const query = db.entities.Listings.byFacets({ region: "north" })
+    expectTypeOf<Has<typeof query, "zorder">>().toEqualTypeOf<true>()
+    const within = query.zorder({ strategy: "jump" }).within({ price: { gte: 1 } })
+    expectTypeOf<Has<typeof within, "zorder">>().toEqualTypeOf<true>()
+    // One `.within()` per query; `.where()` never.
+    expectTypeOf<Has<typeof within, "within">>().toEqualTypeOf<false>()
+    expectTypeOf<Has<typeof within, "where">>().toEqualTypeOf<false>()
+    const tuned = within.zorder({ maxRanges: 32, concurrency: 2, pageSize: 50 }).limit(5)
+    expectTypeOf<Has<typeof tuned, "zorder">>().toEqualTypeOf<true>()
+    expectTypeOf<Effect.Success<ReturnType<typeof tuned.collect>>>().toEqualTypeOf<Array<Listing>>()
+    // Each option takes an explicit `undefined` (exactOptionalPropertyTypes): unset.
+    const configured: number | undefined = undefined
+    query.zorder({ strategy: undefined, pageSize: configured, maxRanges: undefined })
+    query.zorder({ concurrency: configured })
+    // @ts-expect-error not a strategy
+    query.zorder({ strategy: "sideways" })
+    // Neither a scan nor the primary accessor has a Z-order sort key.
+    expectTypeOf<
+      Has<ReturnType<typeof db.entities.Listings.scan>, "zorder">
+    >().toEqualTypeOf<false>()
+    const primary = db.entities.Listings.primary({ listingId: "l-1" })
+    expectTypeOf<Has<typeof primary, "zorder">>().toEqualTypeOf<false>()
+  })
+
+  it("a four-dimension key: number, date, literals and a prefix, each bounded in kind", () => {
+    class Home extends Schema.Class<Home>("Home")({
+      homeId: Schema.String,
+      region: Schema.String,
+      agencyId: Schema.String,
+      price: Schema.Number,
+      bedrooms: Schema.Number,
+      listedAt: Schema.DateTimeUtc,
+      status: Schema.Literals(["draft", "live", "sold"]),
+    }) {}
+    const statusDim = ZOrder.literals("status", ["draft", "live", "sold"])
+    const Homes = Entity.make({
+      model: Home,
+      entityType: "Home",
+      primaryKey: {
+        pk: { field: "pk", composite: ["homeId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byMarket: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["region"] },
+          sk: {
+            field: "gsi1sk",
+            prefix: ["agencyId"],
+            zorder: [
+              facets[0],
+              facets[1],
+              ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+              statusDim,
+            ],
+          },
+        },
+      },
+    })
+    const HomesTable = Table.make({ schema: AppSchema, entities: { Homes } })
+    const makeHomes = () => DynamoClient.make({ entities: { Homes }, tables: { HomesTable } })
+    const homes = null as unknown as Effect.Success<ReturnType<typeof makeHomes>>
+    type Bounds = Parameters<ReturnType<typeof homes.entities.Homes.byMarket>["within"]>[0]
+    expectTypeOf<keyof Bounds>().toEqualTypeOf<
+      "agencyId" | "price" | "bedrooms" | "listedAt" | "status"
+    >()
+    expectTypeOf<NonNullable<Bounds["agencyId"]>>().toEqualTypeOf<string>()
+    expectTypeOf<NonNullable<Bounds["listedAt"]>>().toEqualTypeOf<RangeBound<DateTime.Utc>>()
+    expectTypeOf<NonNullable<Bounds["status"]>>().toEqualTypeOf<
+      | RangeBound<"draft" | "live" | "sold">
+      | ({ readonly in: ReadonlyArray<"draft" | "live" | "sold"> } & {
+          readonly eq?: never
+          readonly between?: never
+          readonly gt?: never
+          readonly gte?: never
+          readonly lt?: never
+          readonly lte?: never
+        })
+    >()
+    if (homes === null) return
+    const market = homes.entities.Homes.byMarket({ region: "north" })
+    market.within({
+      status: { in: ["live", "sold"] },
+      listedAt: { gte: null as unknown as DateTime.Utc },
+    })
+    market.within({ status: { gte: "live" } })
+    // @ts-expect-error not a declared literal
+    market.within({ status: { eq: "archived" } })
+    // @ts-expect-error a date dimension takes the field's DateTime
+    market.within({ listedAt: { gte: 1_700_000_000 } })
+  })
+
+  it("dimension constructors carry the field name and kind", () => {
+    expectTypeOf(facets[0]).toMatchTypeOf<ZOrder.Dimension<"price", "int">>()
+    expectTypeOf(ZOrder.literals("status", ["draft", "live"])).toMatchTypeOf<
+      ZOrder.Dimension<"status", "literals">
+    >()
   })
 })

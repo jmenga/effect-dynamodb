@@ -42,6 +42,8 @@ purely additive, all listed in the changeset:
    and `CollectionQuery.pageSize`.
 6. **A malformed cursor fails the terminal** with `[EDD-9094]` (`ValidationError`) instead of
    throwing from `.startFrom()` (§10.2, §19 E4).
+7. **A key attribute and a vector filter attribute of another type now fail** with `[EDD-9091]`
+   at `Table.make` / `Table.definition`, instead of the first type being kept silently (§19 E1).
 
 **Pre-existing key bugs fixed in this PR, and the upgrade path from 1.36** (§19 E6–E9, F1–F4),
 also in the changeset:
@@ -556,6 +558,7 @@ export interface QueryRequestEvent {
   readonly scannedCount: number                           // rows DynamoDB examined
   readonly count: number                                  // rows after the FilterExpression
   readonly accepted: number                               // rows that became items (reads only)
+  readonly discarded: boolean                             // read alongside others, then not used (§9.2, §9.3)
 }
 ```
 
@@ -564,7 +567,11 @@ describes the plan from the start and ignores `.startFrom()` (cursors are decode
 read terminals, §10.2), so its error type stays `never`.
 The observer runs after every request, probes included, inside the terminal's fiber; its
 failure is a defect. "Addresses visited vs items returned" (open question 3) is
-`Σ scannedCount` vs `Σ accepted`.
+`Σ scannedCount` vs `Σ accepted`. That includes reads that were sent and then not used: a `fetch`
+window member after the one that filled the limit or returned a `LastEvaluatedKey`, and a page a
+stream read ahead and never emitted (it ends at the limit or `maxPages`). Each is reported in send
+order once its window is settled, with `accepted: 0` and `discarded: true`, so summing
+`scannedCount` or consumed capacity over the events counts every read paid for.
 
 ### 3.7 Not changing
 
@@ -721,7 +728,7 @@ quantizeBounds(within, layout):
       numbers / bigints numerically, dates as epoch ms, strings by UTF-8 bytes,
       literals as their DECLARED INDEX (never the raw value)
     raw EMPTY if lower > upper, or lower = upper with either end exclusive
-    bound absent              → I_i = [[0, levels_i - 1]]
+    bound absent              → I_i = [[0, 2^bits_i - 1]]
     eq v                      → [[q(v), q(v)]]
     between [a, b]            → [[q(a), q(b)]]
     gt/gte v (lower)          → lo = q(v)        // safe for gt too: the exact check removes v itself
@@ -729,9 +736,23 @@ quantizeBounds(within, layout):
     literals in [...]         → the member indexes, sorted, grouped into maximal runs: [[0,1],[3,3]]
     literals range            → [[index(lower), index(upper)]] (declaration order)
     level EMPTY if any interval has lo > hi
+    an interval ending at levels_i - 1 (the top level) ends at 2^bits_i - 1 instead
   if any dimension is raw or level EMPTY → EMPTY (plan "empty": no request)
   box = (I_1, …, I_m)        // product of per-dimension interval lists
 ```
+
+An open upper end runs to the top of the dimension's bits, not its top level: `quantize` clamps,
+so no stored value lies above `levels_i - 1`, and the addresses between hold no rows. An edge at
+`levels_i - 1` would cut cells that can't hold data and leave them partial, inflating the plan:
+with `price` at 5,001 levels in 13 bits, `bedrooms: { gte: 3 }` alone has an exact plan of 128
+ranges against the bit ceiling, and none within 100,000 ranges against `levels - 1`, so `auto`
+fell back to `jump` for no reason.
+
+A `DateEpochSeconds` (`Epoch`, `epochSeconds`) dimension is quantized from the whole stored seconds
+its bound holds (§11), not from its key form, which floors a sub-second end:
+`{ gte: T, lt: T + 500 ms }` would otherwise be `T ≥ T` and `T < T`, a raw-inverted pair, and plan
+`EMPTY` over a stored `T`. Converted, it is `[T, T]`; `{ gt: T, lt: T + 1 s }` is `[T + 1, T]`,
+`EMPTY`, and so is every window inside one second.
 
 Normalising first means `{ gte: 10, lte: 5 }` is `EMPTY` (no request) rather than a `BETWEEN`
 with `zmin > zmax`, which DynamoDB rejects, and `literals` `between ["pending", "active"]` over a
@@ -1416,6 +1437,22 @@ step.startKey`; `buildCommandInput`'s fixed `:sk` / `:sk1` / `:sk2` placeholders
 (`Query.ts:858-884`) take `KeyValue` operands through an internal widened `KeyCondition`.
 `prepared()` (`:1115`) resolves the planner and decodes the cursor once per terminal.
 
+**Two planner factories, one interface** *(as built; recorded 2026-10-28)*. `compositePlanner`
+(§7) and `zorderPlanner` (§5, §7.5) both produce a `RangePlanner`, and share its step types, the
+position cursor, `readFrom`, the fingerprint and the `[EDD-9094]` refusal. They do not share a
+skip-scan driver: the composite planner's `TupleSpace` / `InnerPlan` seams describe a string tuple
+and one range per tuple, and Z-order differs at every hook a shared driver would need. Its keys
+are bytes (`succ`, not a bumped delimiter; `P` may be empty, and no operand may be); its tuple
+parse SEEKs and SKIPs on given later segments (§7.5) where the string parse only reads labels; its
+inner plan is a strategy with `jump` transitions, precise windows (`following`) and run sizing;
+and its resume clips address ranges under any strategy, where a string range is kept or dropped
+whole and a straddling cursor is refused. A driver parameterised over all of that would hold
+little shared code and hide each plan's rules behind indirection. The duplicated shape (probe
+budget, filter fallback, cursor `start` dispatch) is kept in step by tests rather than structure:
+both planners are checked against brute force for every limit, direction and `maxSkips` fallback
+(`SkipScan.test.ts`, `ZOrderQuery.test.ts`), and both cursor `start`s refuse the same malformed
+positions (`QueryCursor.test.ts`).
+
 ### 9.2 `execute` (and `fetch`)
 
 ```
@@ -1451,7 +1488,8 @@ prefix is handled per §9.5: the batch is cut at that member and the call return
 
 - **The limit is checked after every window member.** `examinePage` is never called with nothing
   remaining; later members' results are discarded once the limit is reached, and the cursor names
-  the next member as *not started* (`Through` the end of the member that filled the limit). As a
+  the next member as *not started* (`Through` the end of the member that filled the limit). Each
+  discarded member is still reported to `onRequest` (`discarded: true`, §3.6): it was read. As a
   guard, `examinePage` also returns immediately when `budget === 0` (the latent infinite loop in
   §2).
 - **Probes are requests.** They are sent by the loop, counted against `maxPages`, observed by
@@ -1476,7 +1514,8 @@ plain data, so the stream stays re-runnable. Unlike `fetch`, a stream has no sin
 cursor to honour, so it **never discards**: `open` holds up to `concurrency` precise ranges in
 plan order, each with its own start key and at most one buffered page. Each `Stream.paginate` step
 sends one request for every open range that has no buffered page, then emits the head range's
-pages in order; a later range's first page waits in its buffer until every earlier range is
+pages in order (a page still buffered when the stream ends at its limit or `maxPages` is reported
+to `onRequest` as `discarded`, §3.6); a later range's first page waits in its buffer until every earlier range is
 drained. Memory is bounded by `concurrency − 1` buffered pages.
 
 `collect()`:
@@ -1643,7 +1682,10 @@ what bounds a tampered cursor.
 stands for the instant `S × 1000` ms. For a bound `v` in ms and `u = v / 1000`: `lt v` →
 `< ceil(u)`, `lte v` → `<= floor(u)`, `gt v` → `> floor(u)`, `gte v` → `>= ceil(u)`. Plain
 encoding of `.within({ listedAt: { lt: 100.5 s } })` would send `< 100` and drop a stored `100`;
-`gte: 100.5 s` would send `>= 100` and admit it. Tests pin sub-unit bounds for `epochSeconds`.
+`gte: 100.5 s` would send `>= 100` and admit it. The same conversion, made inclusive
+(`> s` → `>= s + 1`, `< s` → `<= s - 1`), decides the dimension's levels and whether any stored
+second matches (§5.1). Tests pin sub-unit bounds for `epochSeconds`, including windows inside one
+second.
 
 The **row check** is a library-owned raw-row predicate evaluated in `examinePage` next to
 `isExcludedRow` (`Query.ts:1088`). For composite and prefix bounds it computes each checked
@@ -1786,11 +1828,11 @@ name, while a GSI's key types can't be changed in place. The migration path the 
 | `test/PartitionMock.test.ts` (new) | The partition mock the sizing, skip-scan and Z-order tests share: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` and `begins_with` narrow the rows in both directions, `ExclusiveStartKey` resumes in both directions, and an unrecognised `#sk` condition is a defect (never every row). |
 | `test/QueryLimitPageSize.test.ts`, `test/Query.test.ts` | **Updated pins:** "under a filter, limit is never handed to DynamoDB" (`:179`) and "asParams reports the first request's Limit" (`:609-621`) now expect the adaptive first `Limit`, and the same cases under `.pageSize("natural")` keep `undefined`; #133 "limit is sent as Limit" (`[2, 4]` → `[2, 3]`, same request count), logarithmic bounds (`≤ 11`, `≤ 10`) unchanged; `filterBy` "Limit undefined under a predicate" (`:1593-1602`) moves under `"natural"`. "No predicate leaves every existing path byte-identical" stays green as is. |
 | `test/QueryCursor.test.ts` (new) | Legacy bytes unchanged for plain queries; v2 round-trip with `B`, with non-Latin-1 text, with every field; legacy decode; decoding deferred to the terminal (`startFrom` before or after `.within()` is the same; a malformed cursor fails the terminal, not `startFrom`); EDD-9094 (malformed, fingerprint, legacy for multi-range, v2 planner cursor on a plain query, `k` outside the recomputed plan, `t` not under `P`). |
-| `test/SkipScan.test.ts` (new; `servePartition`-style mock with BETWEEN / `ScanIndexForward` / `Limit`) | Results equal a filtered full read for random partitions; probe count = distinct tuples + 1; casings `lowercase` / `uppercase` / `preserve`; values with characters below `#`; `Schema.String` tuple composite → filter plan; primary accessor with history rows → filter plan; `maxSkips` fallback mid-way and `maxSkips: 0`; resume mid-skip and mid-fallback keeps the plan; reverse; `maxPages` counts probes (`.maxPages(1)` sends only the first probe and returns a `Start` cursor `{ t: T1 }`); no probe is sent when the limit is reached at a tuple's end; probes inherit `.consistentRead()` on a primary accessor; binary prefix skip: missing leading, missing middle (SEEK and SKIP on a given later segment), all given, and **all omitted** against a mock that rejects a zero-length `B` operand. |
-| `test/ZOrderQuery.test.ts` (new; in-memory partition mock comparing `B` as unsigned bytes) | `naive`, `jump`, `precise`, `auto` each return the brute-force filtered set; `auto` choices (exact fits → precise / over cap → jump); empty box (incl. inverted bounds) sends nothing; `limit` / `maxPages` contracts; `fetch` cursor chains equal one `collect`, **including a limit that lands exactly on a range end** for precise, jump (after an out-of-box LEK) and skip-scan (after a tuple); the limit filled exactly by the first window member (later members discarded, never examined); **cross-plan resume**: a cursor taken under `maxRanges: 16` resumed under `maxRanges: 1` and under `strategy: "naive"` returns exactly the remaining rows (the `[14,15]` / `[36,37]` example, plus a property test over random plans); adaptive `fetch` window (grows after single-page ranges, resets on LEK); stream buffering never discards; a mocked throttle on one range (`fetch` returns the prefix + cursor; `collect` fails); jump run sizing on gapped data (doubles in-box, resets after a jump) and under `count`; `NumberFromString` and `DateTimeZoned` dimensions use the row check and return in-box rows; `DateEpochSeconds` sub-second bounds; a `literals` selection over 100 members (complement `NOT IN`, and row check when both sides exceed 100); `collect` concurrency (`concurrency: 1` vs `4` same order); reverse; `count`; `explain` and `onRequest` payloads; exact filter compiled on renamed fields; `.select()` with a plan. |
+| `test/SkipScan.test.ts` (new; `servePartition`-style mock with BETWEEN / `ScanIndexForward` / `Limit`) | Results equal a filtered full read for random partitions; probe count = distinct tuples + 1; casings `lowercase` / `uppercase` / `preserve`; values with characters below `#`; `Schema.String` tuple composite → filter plan; primary accessor with history rows → filter plan; `maxSkips` fallback mid-way and `maxSkips: 0`; resume mid-skip and mid-fallback keeps the plan; reverse; `maxPages` counts probes (`.maxPages(1)` sends only the first probe and returns a `Start` cursor `{ t: T1 }`); no probe is sent when the limit is reached at a tuple's end; probes inherit `.consistentRead()` on a primary accessor; binary prefix skip: missing leading, missing middle (SEEK and SKIP on a given later segment), all given, and **all omitted** against a mock that rejects a zero-length `B` operand; binary request counts, hashed and unhashed: a SEEK costs one probe per given segment instead of one per tuple, a SKIP leaves a passed tuple unread (only the matching tuples are read), and `maxSkips` caps the probes before the filter plan. |
+| `test/ZOrderQuery.test.ts` (new; in-memory partition mock comparing `B` as unsigned bytes) | `naive`, `jump`, `precise`, `auto` each return the brute-force filtered set; `auto` choices (exact fits → precise / over cap → jump); empty box (incl. inverted bounds) sends nothing; `limit` / `maxPages` contracts; `fetch` cursor chains equal one `collect`, **including a limit that lands exactly on a range end** for precise, jump (after an out-of-box LEK) and skip-scan (after a tuple); the limit filled exactly by the first window member (later members discarded, never examined, but reported to `onRequest` as `discarded`); **cross-plan resume**: a cursor taken under `maxRanges: 16` resumed under `maxRanges: 1` and under `strategy: "naive"` returns exactly the remaining rows (the `[14,15]` / `[36,37]` example, plus a property test over random plans); adaptive `fetch` window (grows after single-page ranges, resets on LEK); stream buffering never discards; a mocked throttle on one range (`fetch` returns the prefix + cursor; `collect` fails); jump run sizing on gapped data (doubles in-box, resets after a jump) and under `count`; `NumberFromString` and `DateTimeZoned` dimensions use the row check and return in-box rows; `DateEpochSeconds` sub-second bounds, including windows inside one second (`gte: T, lt: T + 500 ms` holds `T`; `gt: T, lt: T + 1 s` sends nothing); a `literals` selection over 100 members (complement `NOT IN`, and row check when both sides exceed 100); `collect` concurrency (`concurrency: 1` vs `4` same order); reverse; `count`; `explain` and `onRequest` payloads; exact filter compiled on renamed fields; `.select()` with a plan. |
 | `test/BoundQuery.test.ts` | `within` / `zorder` / `pageSize("natural")` / `explain` / `onRequest` plumbing; `where` and `within` exclude each other; EDD-9093 / 9095 on untyped calls. |
 | `test/DynamoClient.test.ts` | Accessor typing at runtime for Z-order and composite `within`; `composeRangeUnder` shared with `.where()` (existing #115 clamping tests unchanged). |
-| `test/IndexPolicyV3.test.ts` | Shapes **7, 7a, 7a′, 7b, 8, 8a, 8b, 8c** through `Entity.update`, the retain path and `append`; the mock stores `B` key attributes (`test/helpers/MockDynamoClient.ts` compares `Uint8Array` by bytes). |
+| `test/IndexPolicyV3.test.ts` | Shapes **7, 7a, 7a′, 7b, 8, 8a, 8b, 8c** through `Entity.update`, the retain path and `append`; `B` key values are asserted with `toEqual`, which compares `Uint8Array`s by their bytes. `test/helpers/MockDynamoClient.ts` is unchanged: it records requests and never orders keys. Unsigned byte order lives in the mocks that serve queries, `test/helpers/InMemoryTables.ts` and `test/helpers/PartitionMock.ts`. |
 | `test/Table.test.ts` | `B` in `AttributeDefinitions`; two entities sharing one Z-order GSI; EDD-9091 (`B` vs `S`, key vs vector filter); synthetic table path. |
 | `test/KeyFormInvariant.test.ts` | `composeZOrderSk`, `composeSkValue` added to `RECORD_TAKING`. |
 | `test/WriteDiagnosis.test.ts` | `B` key text rendered as hex; an oversized `B` sort key (long prefix segments) attributed by the existing oversize-key diagnosis; `EmptyKeyBound` wording for a binary operand. |
@@ -1801,7 +1843,7 @@ name, while a GSI's key types can't be changed in place. The migration path the 
 | File | Covers |
 |---|---|
 | `test/connected.test.ts` | **Shapes 7, 7a, 7a′, 7b, 8, 8a, 8b, 8c** end to end (the canonical-shape rule requires this file); table create with a `B` sort key; `update` moves the entry when a dimension or prefix changes and leaves it when nothing in the key changes (asserted as eventually consistent; Local hides GSI lag, §9.6). |
-| `test/connected.zorder.test.ts` (new) | 2,000 seeded listings: every strategy and `auto` equals a brute-force filtered scan; `fetch` cursor chains (incl. limits landing on range ends); `count`; reverse; a `NumberFromString` dimension returns the same set as a brute-force scan (the stored-type case Local can show); jump `ScannedCount` on gapped data with run sizing vs a pass-rate-sized baseline; adaptive sizing returns identical results with fewer `ScannedCount` than natural pages for a selective filter with `limit(5)` (measured through `onRequest`); an adaptive `fetch` chain returns natural's pages and then one empty page when the last match has a long tail (§8.4); skip-scan over a `literals` status composite equals a filtered read with fewer rows examined; estimator constants sanity-checked here (Q5). |
+| `test/connected.zorder.test.ts` (new) | 2,000 seeded listings: every strategy and `auto` equals a brute-force filtered scan; `fetch` cursor chains (incl. limits landing on range ends); `count`; reverse; a `NumberFromString` dimension returns the same set as a brute-force scan (the stored-type case Local can show); jump `ScannedCount` on gapped data with run sizing vs a page sized to the cap, and on a selective box (about 4% of the partition) vs the pass-rate-sized filtered query over the partition, with explicit ratios (jump ≤ 2 rows examined per row returned, the filter ≥ 10× jump), for `collect` and `count`; `DateEpochSeconds` windows inside one second; adaptive sizing returns identical results with fewer `ScannedCount` than natural pages for a selective filter with `limit(5)` (measured through `onRequest`); an adaptive `fetch` chain returns natural's pages and then one empty page when the last match has a long tail (§8.4); skip-scan over a `literals` status composite equals a filtered read with fewer rows examined; estimator constants sanity-checked here (Q5). |
 
 ### 15.4 Other gates
 
@@ -1826,7 +1868,7 @@ instead of string-composing), and `npx tsx examples/guide-zorder.ts` plus
 | `src/KeyComposer.ts` | `KeyPart` gains `zorder?: never` / `prefix?: never`; `ZOrderKeyPart`, `ZOrderSkPart`, `ZOrderHalf`, `isZOrderHalf`, `KeyValue`; `IndexDefinition.sk` union; `normalizeGsiConfig` (EDD-9086, derived `composite`); `composeZOrderSk`, `composeSkValue`; widened returns; `classifyZOrderHalf` in the policy composer; asserts in string-only helpers |
 | `src/Entity.ts` | `NormalizedIndexes`; dimension binding and storage resolution (§3.1, §4.1); validation EDD-9086 / 9088 / 9089 / 9090 |
 | `src/internal/EntityTypes.ts` | `IndexSkComposites` → `never` for Z-order halves; exported `DimensionFieldNames`, `PrefixFieldNames` helpers |
-| `src/internal/CompositeCodec.ts` | none (dimensions consume its key form) |
+| `src/internal/CompositeCodec.ts` | `keyFormValueKind` and `keyFormLiterals`: the kind of value a field's key form is, and the literals it is limited to. Planned as no change; built because the EDD-9088 storage checks (`Entity.ts`) and the EDD-9093 bound-type checks (`DynamoClient.ts`) read both from the schema, and the key-form rules live here |
 
 ### `packages/effect-dynamodb`
 
@@ -1848,7 +1890,7 @@ instead of string-composing), and `npx tsx examples/guide-zorder.ts` plus
 
 | File | Change |
 |---|---|
-| `packages/language-service/src/core/EntityResolver.ts` | `resolveKeyPart` (`:515-535`) parses `zorder` (dimension calls → field names) and `prefix`; today it drops any half without a `composite` array, so a Z-order index would vanish from hovers |
+| `packages/language-service/src/core/EntityResolver.ts` | `resolveKeyPart` (`:515-535`) parses `zorder` (dimension calls → field names) and `prefix`; today it drops any half without a `composite` array, so a Z-order index would vanish from hovers. Dimensions, lists and prefix parts held in variables are followed (same file, then through the checker), and a dimension built by a helper is read from its type (`Dimension<"price">`); a half it still can't read whole is kept, marked `unresolved`, never dropped |
 | `packages/language-service/src/core/ParamsBuilder.ts`, `src/features/diagnostics.ts` | Z-order-aware hover and composite listing |
 | `packages/docs/src/content/docs/guides/zorder.mdx` (new) + `astro.config.mjs` sidebar (after "Indexes & Collections") | Z-order guide |
 | `guides/queries.mdx`, `guides/indexes.mdx`, `guides/index-policy.mdx`, `reference/api-reference.mdx` | adaptive sizing, `.pageSize("natural")`, `.within()` and skip-scan, `explain` / `onRequest`, Z-order half under `indexPolicy`, API entries |
@@ -1882,91 +1924,23 @@ three-page `fetch` chain, an `explain`, an `update` that moves the entry, and a 
 second entity's `byStatus` composite index (`status` literals, then `price`). `guide-queries.ts`
 gains regions for adaptive sizing and `.pageSize("natural")`.
 
-**Changeset** `.changeset/zorder-indexes.md`, `minor` for `effect-dynamodb` and
-`@effect-dynamodb/schema` (the fixed group moves geo and language-service with them):
+**Upgrade docs** (F3, F4): the Indexes guide's "Migrating rows written by 1.36" (what the 1.36
+key fallback keeps working, what it doesn't, what moving costs), and a new guide, "Upgrading from
+1.36" (`guides/upgrading.mdx`, regions from `examples/guide-upgrade.ts`): deploy with the fallback
+on, drain projection outboxes, dry run `rekey`, run it (segments, bounded runs, resume), rerun,
+turn the fallback off; what moves and how, event streams, conflicts, cost.
 
-> Z-order indexes (`sk.zorder`, `sk.prefix`, `ZOrder.*`) with binary sort keys and `.within()`
-> queries (`naive` / `jump` / `precise`), skip-scan for bounds on non-leading sort-key composites,
-> `.explain()` / `.onRequest()`, and cursor v2.
->
-> **Behaviour change: adaptive request sizing is now the default** for queries with `.limit()`, a
-> filter, `filterBy` predicate or history rows, and no `.pageSize()` or `.maxPages()`. Each
-> request's `Limit` is sized from the observed pass rate instead of asking for a 1 MB page. The
-> items a query returns are unchanged; read units and request counts change, and a low or uneven
-> pass rate can take more round trips than one natural page (a logarithmic number more in the worst
-> case). A `fetch` cursor resumes at the same place, but its value can differ, and when the limit
-> fills on the last row a sized request returned the cursor can be non-null where it was null, so
-> a `fetch` chain can end with one empty page. `Query.paginate` emits one array per request, so
-> its page boundaries change; the items it streams are unchanged (a bound query's `.paginate()`
-> streams items and is unaffected). Queries with `.maxPages()` keep the previous sizing.
-> `.pageSize("natural")` restores the previous behaviour.
->
-> **Behaviour change: numeric key encoding.** `number` and `bigint` key composites (partition, sort
-> and index keys, unique-constraint sentinels, a time-series `orderBy`) are written as text that sorts
-> in numeric order. Non-negative integers below 1e16 (1e38 for a bigint) keep their exact 1.36 bytes,
-> so a row whose numeric key composites all hold such values is unaffected. Negative, fractional,
-> 1e16-and-up and infinite numbers, `DateEpochMs` and `DateEpochSeconds` dates before 1970, and
-> negative or 1e38-and-up bigints compose different text: a row written by 1.36 with one keeps its old
-> key until rewritten, so `get` / `update` / `delete` by key miss it, index queries miss or misorder
-> it, and its unique-constraint sentinel no longer blocks a new duplicate. To migrate, scan for rows
-> with such a value in a key composite or a time-series `orderBy` and rewrite each by kind (Indexes
-> guide, "Migrating rows written by 1.36"): delete a live item and its sentinels under their stored
-> keys with the raw `DynamoClient` and `put` it again through the entity, which recomposes every key
-> and sentinel; re-put a time-series event item raw under `KeyComposer.composeEventSk` (with the
-> `orderBy`'s key form); move version
-> snapshots, tombstones, event-store streams and aggregate rows raw to their recomposed keys. `NaN`
-> and bigints of more than 1,000 digits can't be keys (`EDD-9096`): entity operations, `Batch` and
-> `Transaction` fail with a `ValidationError` before sending anything, `get` and `delete` included (up
-> to 1.36 they failed with `ItemNotFound` and did nothing), and query accessors, `.where()` and
-> `.within()` throw.
->
-> **Behaviour change: exact sort key matches.** An accessor or `Entity.query.<index>` given every
-> sort key composite sends `sk = key` instead of `begins_with(key)`, so `seq: 3` no longer returns
-> `3.14` or `3.5` and `name: "a"` no longer returns `"ab"`. `Aggregate.list` applies the same rule to
-> its list sort key, and its partial `begins_with` now ends on the delimiter (`owner: "alice"` no
-> longer returns `"alicex"`). `.where(beginsWith)` on a `number` or `bigint` composite compiles to
-> `eq`. `.history(key).where()` with `lt` / `lte` / `gt` / `gte` stays inside the item's own events;
-> it used to return the item's current row and other items' rows in the partition.
->
-> **Behaviour change: sort key text.** A sort key composite's text escapes every character up to `%`
-> (control characters, space, `!`, `"`, `#`, `$`, `%`) as `%` and two hex digits: `new york` is
-> stored as `new%20york` and `a#b` as `a%23b`, in table and index sort keys, time-series event keys,
-> version snapshot and tombstone keys, aggregate sort keys and Z-order prefix segments
-> (`KeyComposer.sortKeyText`). Partition keys and unique-constraint sentinels are unchanged. Key order
-> is now value order: up to 1.36 a space, `!`, `"` or control character sorted below the `#` after a
-> composite, so `lte: "new york"` left out `new` and `gt: "new"` left out `new york`, and `#` split a
-> value in two. Every `.where()` and `.within()` bound is one key condition again and returns exactly
-> the rows whose value satisfies it, values may hold `#`, and skip-scan runs over string composites
-> too. A string without such a character keeps its 1.36 key text and requests. A row written by 1.36
-> with such a string in a sort key composite or a time-series `orderBy` keeps its old sort key until
-> rewritten, as for numeric keys above. The language service's params escape the same way, and its
-> hover for an accessor named after a collection now shows the accessor's sort key condition.
->
-> **Behaviour change: time-series appends and event keys on a numeric-string `orderBy`.** For an
-> `orderBy` stored as a numeric string (`NumberFromString`, `BigIntFromString`), event keys hold the
-> number's key text, so `.history()` returns events in numeric order and `.where()` bounds return the
-> events they mean; up to 1.36 they held the string, which sorted `10` before `9`. `.append()` compares
-> such an `orderBy` as a number: up to 1.36 DynamoDB compared the strings, so appending `10` after `9`
-> failed with `StaleAppend`, and `9` after `10` was applied. It now reads the current item first (one
-> strongly consistent `GetItem` per append, `.skipFollowUp()` included) and guards the write on the
-> stored value, reading again, up to 8 times, when a concurrent append moves it. Event rows written by
-> 1.36 for such an `orderBy` keep their old keys until rewritten (Indexes guide, "Migrating rows
-> written by 1.36").
->
-> **Behaviour change:** `.where()` with a strict `lt` on the last sort key composite, with an earlier
-> one pinned, no longer throws `EDD-9046` (retired): it is sent as a `BETWEEN` ending just below the
-> value. `.history(key).where()` with `gt` / `gte` on a string `orderBy` now returns stamps that start
-> with an emoji.
->
-> **Behaviour change:** a malformed `.startFrom()` cursor now fails the query with a
-> `ValidationError` (`EDD-9094`) instead of throwing from `.startFrom()`.
->
-> **Type changes:** `KeyComposer.composeIndexKeys` / `tryComposeIndexKeys` / `composeAllKeys` and
-> `GsiUpdateResult.sets` values widen to `string | Uint8Array` (bytes only for Z-order halves).
-> `GsiConfig.sk` is `KeyPart | ZOrderKeyPart` (`composite` is optional on the union), `KeyPart`
-> gains `zorder?: never` / `prefix?: never`, and `IndexDefinition.sk` is `KeyPart | ZOrderSkPart`.
-> `IndexSkComposites` is `never` for a Z-order half. `pageSize` accepts `number | "natural"` on
-> `Query`, bound queries and collection queries.
+**Changeset** `.changeset/zorder-indexes.md`, `minor` for all four packages of the fixed group
+(`effect-dynamodb`, `@effect-dynamodb/schema`, `@effect-dynamodb/geo`,
+`@effect-dynamodb/language-service`). Commit 5 holds the whole text, 5a–5e's entries included.
+Its sections: the feature summary; behaviour changes — adaptive request sizing; sort key text
+(numbers in every key, escaped sort key strings, numeric-string event keys, and `EDD-9096`);
+`append` on a numeric-string `orderBy` (E9); exact sort key matches; "Upgrading from 1.36" (what
+the fallback keeps working and what it doesn't, its costs, strings holding `%` and two hex
+digits, `rekey`, rolling deploys, `legacyKeys: false`, `EDD-9097` / `EDD-9098`); the retired
+`EDD-9046`; malformed cursors (`EDD-9094`); key and vector attribute types (`EDD-9091`); and the
+type changes ("Semver impact" items 2–5, 12, 13). The text itself is in the changeset, not
+repeated here.
 
 Then `pnpm changeset version` → **1.37.0** in the same PR (push the changeset commit first; add
 the `release-order-override` label at PR creation if other release work is open).
@@ -2048,7 +2022,7 @@ C11); *(owner 2026-10-28)* = a pre-existing bug the owner chose on 2026-10-28 to
 | D10 | Numeric-string and zoned-date dimensions supported via the row check, not rejected *(confirmed 2026-10-27)* | **in** | Alternative: reject them with EDD-9088. The row check keeps them correct at the cost of reading the attribute. |
 | D8 | No layout/version byte in the address *(confirmed 2026-10-27)* | **in** | A declaration change needs a new index anyway; the fingerprint rejects stale cursors (§4.4). |
 | D9 | `KeyComposer` return types widen | **in (recorded)** | Changeset type note. `composeSk` stays `string`. |
-| E1 | Key-attribute vs vector-filter type conflict raised as EDD-9091 *(confirmed 2026-10-27)* | **in (adjacent debt)** | Today the vector merge silently keeps the first type (`Table.ts:702-706`). |
+| E1 | Key-attribute vs vector-filter type conflict raised as EDD-9091 *(confirmed 2026-10-27)* | **in (adjacent debt)** | Today the vector merge silently keeps the first type (`Table.ts:702-706`). Recorded in the changeset. |
 | E2 | Cursor `btoa` throwing on non-Latin-1 key text | **fixed** | v2 is emitted instead (§10.2). |
 | E3 | `WriteDiagnosis` `B` key text | **fixed** | Hex rendering; `EmptyKeyBound` wording covers binary. |
 | E4 | Malformed cursor fails the terminal (`EDD-9094`) instead of throwing from `startFrom` *(confirmed 2026-10-27)* | **changed** | Decoding moves to `prepared()` so the planner can validate the cursor and `startFrom` / `.within()` order doesn't matter (§10.2). Recorded in the changeset. |

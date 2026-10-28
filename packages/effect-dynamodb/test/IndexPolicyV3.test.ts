@@ -10,6 +10,9 @@
  * sent to `client.updateItem` / `client.transactWriteItems` and assert on
  * the SET / REMOVE clauses and key composition.
  *
+ * Canonical shapes 7 and 8 (#171, Z-order sort keys) close the file: the
+ * same three write paths, with the binary half's values compared as bytes.
+ *
  * Renamed scenarios from the v1.7.0 file:
  *   - "GSI-wide cascade" → "per-half cascade" (v1.7.1 bug-1 fix)
  *   - "EDD-9024 throw under preserve" → "noop or REMOVE depending on cascade
@@ -27,8 +30,11 @@ import type {
   UpdateItemCommandOutput,
 } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { CompositeNullableError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -431,8 +437,8 @@ const makeHolesMock = (capture: Capture): DynamoClientService =>
 // Helper for parsing the captured UpdateExpression's REMOVE clause into a
 // set of physical attribute names.
 const parseRemoves = (ui: {
-  UpdateExpression?: string
-  ExpressionAttributeNames?: Record<string, string>
+  readonly UpdateExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
 }): Set<string> => {
   const expr = ui.UpdateExpression ?? ""
   const removeIdx = expr.indexOf("REMOVE")
@@ -1192,6 +1198,745 @@ describe("Entity update — empty-composite-half GSI shape (closes #46)", () => 
         // value composes (status alone — see existing v1.7.1 truncation
         // semantics). PK gsi4pk skipped (multi-writer protection).
         expect(setSet.has("gsi4pk")).toBe(false)
+      }).pipe(Effect.provide(layer), Effect.scoped)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// #171 — Z-order halves: canonical shapes 7 and 8 (entity-level wiring)
+// ---------------------------------------------------------------------------
+//
+// A Z-order sort key is a binary address (`{ B: Uint8Array }`) interleaved
+// from every dimension, after any `sk.prefix` segments. It has no truncated
+// form, so the half is all or nothing: every field present → SET the bytes;
+// otherwise `sparse` REMOVEs, `preserve` is a noop unless a field is in
+// `remove()` (cascade override), and a half none of whose fields is in the
+// payload or key record is skipped. KeyComposer.test.ts pins the composer;
+// these tests prove the outcome reaches the wire through `Entity.update`
+// (standard path), the retain path and `.append()`.
+//
+// One entity carries a GSI per shape so every update is also checked against
+// the neighbouring shapes it must not disturb.
+// ---------------------------------------------------------------------------
+
+class ZListing extends Schema.Class<ZListing>("ZListing")({
+  listingId: Schema.String,
+  region: Schema.optional(Schema.String),
+  agencyId: Schema.optional(Schema.String),
+  officeId: Schema.optional(Schema.String),
+  price: Schema.optional(Schema.Number),
+  bedrooms: Schema.optional(Schema.Number),
+  listedAt: Schema.optional(DynamoModel.DateString),
+  status: Schema.optional(Schema.Literals(["draft", "live"])),
+  title: Schema.optional(Schema.String),
+}) {}
+
+const ZSchema = DynamoSchema.make({ name: "zorder-policy", version: 1 })
+
+const facets = [
+  ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
+  ZOrder.int("bedrooms", { min: 0, max: 15 }),
+  ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+] as const
+
+/** Every dimension of `facets`, as `.set()` takes them. */
+const zdims = {
+  price: 250_000,
+  bedrooms: 3,
+  listedAt: DateTime.makeUnsafe("2024-01-02T00:00:00.000Z"),
+}
+/** `zdims` in key form — what the composer reads. */
+const zdimsKeyForm = { price: 250_000, bedrooms: 3, listedAt: "2024-01-02T00:00:00.000Z" }
+/** `zdims` interleaved: price level 250 (13 bits), bedrooms 3 (4), listedAt hour 24 (16). */
+const ZDIMS_BYTES = Uint8Array.of(0x00, 0x02, 0x45, 0x54, 0x68)
+
+const ZListings = Entity.make({
+  model: ZListing,
+  entityType: "ZListing",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Shape 7 — every dimension a mutable model field ('preserve', the default).
+    byFacets: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["region"] },
+      sk: { field: "gsi2sk", zorder: facets },
+    },
+    // Shape 7 under 'sparse'.
+    byFacetsSparse: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", zorder: facets },
+      indexPolicy: { sk: "sparse" },
+    },
+    // Shape 8 — a prefix (one segment hashed) before the address.
+    byAgency: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["region"] },
+      sk: { field: "gsi4sk", prefix: ["agencyId", { field: "officeId", hash: 8 }], zorder: facets },
+    },
+    // Shape 8c — a hierarchical prefix under 'sparse'.
+    byOffice: {
+      name: "gsi5",
+      pk: { field: "gsi5pk", composite: ["region"] },
+      sk: { field: "gsi5sk", prefix: ["agencyId", "officeId"], zorder: [facets[0]] },
+      indexPolicy: { sk: "sparse" },
+    },
+    // Shape 7a — one 2-member literals dimension: 1 bit, 1 byte.
+    byStatus: {
+      name: "gsi6",
+      pk: { field: "gsi6pk", composite: ["region"] },
+      sk: { field: "gsi6sk", zorder: [ZOrder.literals("status", ["draft", "live"])] },
+    },
+    // Shape 7a′ — 1-bit literals + 13-bit int: 14 bits, 2 bytes.
+    byStatusPrice: {
+      name: "gsi7",
+      pk: { field: "gsi7pk", composite: ["region"] },
+      sk: {
+        field: "gsi7sk",
+        zorder: [
+          ZOrder.literals("status", ["draft", "live"]),
+          ZOrder.int("price", { min: 0, max: 8191 }),
+        ],
+      },
+    },
+    // Shape 7b — constant (empty-composite) PK half over a Z-order SK, 'sparse'.
+    byFacetsAll: {
+      name: "gsi8",
+      pk: { field: "gsi8pk", composite: [] },
+      sk: { field: "gsi8sk", zorder: facets },
+      indexPolicy: { pk: "sparse", sk: "sparse" },
+    },
+  },
+})
+
+const ZTable = Table.make({ schema: ZSchema, entities: { ZListings } })
+const ZTableLayer = ZTable.layer({ name: "zorder-policy-table" })
+
+/** The stored listing: every field present, every Z-order half composed. */
+const zStoredRecord = {
+  listingId: "l-1",
+  region: "North",
+  agencyId: "AG-1",
+  officeId: "Office-9",
+  status: "live",
+  title: "Garden flat",
+  ...zdimsKeyForm,
+}
+
+const zStoredItem = (
+  entityType: string,
+  extra: Record<string, AttributeValue> = {},
+): Record<string, AttributeValue> => ({
+  pk: { S: `$zorder-policy#v1#${entityType.toLowerCase()}#listingid_l-1` },
+  sk: { S: `$zorder-policy#v1#${entityType.toLowerCase()}` },
+  listingId: { S: "l-1" },
+  region: { S: "North" },
+  agencyId: { S: "AG-1" },
+  officeId: { S: "Office-9" },
+  price: { N: "250000" },
+  bedrooms: { N: "3" },
+  listedAt: { S: "2024-01-02T00:00:00.000Z" },
+  status: { S: "live" },
+  title: { S: "Garden flat" },
+  __edd_e__: { S: entityType },
+  ...extra,
+})
+
+const makeZMock = (capture: Capture, stored: Record<string, AttributeValue>): DynamoClientService =>
+  mockDynamoClient({
+    ...makeMockClient(capture),
+    getItem: () => Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: stored })),
+    updateItem: (input) => {
+      capture.updateItem = input
+      return Effect.succeed(mockOutput<UpdateItemCommandOutput>({ Attributes: stored }))
+    },
+  })
+
+/** The SETs (physical name → value) and REMOVEs of an UpdateExpression. */
+const wireOf = (update: {
+  readonly UpdateExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+}): { sets: Record<string, AttributeValue>; removes: Set<string> } => {
+  const expr = update.UpdateExpression ?? ""
+  const names = update.ExpressionAttributeNames ?? {}
+  const values = update.ExpressionAttributeValues ?? {}
+  const setClause = expr.match(/SET\s+(.*?)(?:\s+REMOVE|$)/i)?.[1] ?? ""
+  const sets: Record<string, AttributeValue> = {}
+  for (const [, name, value] of setClause.matchAll(/(#\w+) = (:\w+)(?=,|$)/g)) {
+    sets[names[name!] ?? name!] = values[value!]!
+  }
+  return { sets, removes: parseRemoves(update) }
+}
+
+/** An update builder, run through `.asEffect()`. */
+type ZWrite = { readonly asEffect: () => Effect.Effect<unknown, unknown> }
+
+const zClient = DynamoClient.make({ entities: { ZListings }, tables: { ZTable } })
+
+/** Run `f` against the standard-path entity; the wire form of its UpdateItem. */
+const zUpdate = (f: (db: Effect.Success<typeof zClient>) => ZWrite) => {
+  const capture: Capture = {}
+  const layer = Layer.mergeAll(
+    Layer.succeed(DynamoClient, makeZMock(capture, zStoredItem("ZListing"))),
+    ZTableLayer,
+  )
+  return Effect.gen(function* () {
+    const db = yield* zClient
+    yield* f(db).asEffect()
+    expect(capture.updateItem).toBeDefined()
+    return wireOf(capture.updateItem!)
+  }).pipe(Effect.provide(layer), Effect.scoped)
+}
+
+const zSk = (index: KeyComposer.IndexDefinition, record: Record<string, unknown>) =>
+  KeyComposer.composeZOrderSk(ZSchema, index, record)
+
+const untouched = (wire: ReturnType<typeof wireOf>, field: string) => {
+  expect(wire.sets).not.toHaveProperty(field)
+  expect(wire.removes.has(field)).toBe(false)
+}
+
+describe("Entity update — Z-order halves, canonical shapes 7 and 8 (#171)", () => {
+  describe("shape 7 — Z-order half over mutable fields", () => {
+    it.effect(
+      "full dimensions → SET { B } with the address bytes; the untouched PK half is skipped",
+      () =>
+        Effect.gen(function* () {
+          const wire = yield* zUpdate((db) =>
+            db.entities.ZListings.update({ listingId: "l-1" }).set(zdims),
+          )
+          expect(wire.sets.gsi2sk).toEqual({ B: ZDIMS_BYTES })
+          expect((wire.sets.gsi2sk as { B: unknown }).B).toBeInstanceOf(Uint8Array)
+          expect(wire.sets.gsi3sk).toEqual({ B: ZDIMS_BYTES })
+          untouched(wire, "gsi2pk")
+          untouched(wire, "gsi3pk")
+          // Neighbouring shapes: byAgency lacks its prefix ('preserve' noop),
+          // byOffice lacks its prefix ('sparse' REMOVE), byStatus has none of its
+          // fields (skipped), byStatusPrice lacks status ('preserve' noop).
+          untouched(wire, "gsi4sk")
+          expect(wire.removes.has("gsi5sk")).toBe(true)
+          untouched(wire, "gsi6sk")
+          untouched(wire, "gsi7sk")
+        }),
+    )
+
+    it.effect("partial dimensions → 'preserve' noop, 'sparse' REMOVE; never a truncated SET", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ price: 300_000, bedrooms: 2 }),
+        )
+        untouched(wire, "gsi2sk")
+        expect(wire.removes.has("gsi3sk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi3sk")
+      }),
+    )
+
+    it.effect("'preserve' + remove([dimension]) → REMOVE (cascade override)", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" })
+            .set({ price: 300_000, bedrooms: 2 })
+            .remove(["listedAt"]),
+        )
+        expect(wire.removes.has("gsi2sk")).toBe(true)
+        expect(wire.removes.has("gsi3sk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi2sk")
+      }),
+    )
+
+    it.effect("no dimension touched → every Z-order SK half skipped, even under 'sparse'", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ title: "Renovated" }),
+        )
+        for (const n of [2, 3, 4, 5, 6, 7, 8]) untouched(wire, `gsi${n}sk`)
+      }),
+    )
+
+    it.effect(
+      "a change within one level writes identical bytes; crossing a level changes them",
+      () =>
+        Effect.gen(function* () {
+          const at = (dims: Partial<typeof zdims>) =>
+            zUpdate((db) =>
+              db.entities.ZListings.update({ listingId: "l-1" }).set({ ...zdims, ...dims }),
+            ).pipe(Effect.map((wire) => wire.sets.gsi2sk))
+          expect(yield* at({ price: 250_999 })).toEqual({ B: ZDIMS_BYTES })
+          expect(yield* at({ listedAt: DateTime.makeUnsafe("2024-01-02T00:59:59.999Z") })).toEqual({
+            B: ZDIMS_BYTES,
+          })
+          const moved = yield* at({ price: 251_000 })
+          expect(moved).not.toEqual({ B: ZDIMS_BYTES })
+          expect(moved).toEqual({
+            B: zSk(ZListings.indexes.byFacets, { ...zdimsKeyForm, price: 251_000 }),
+          })
+        }),
+    )
+  })
+
+  describe("shapes 7a / 7a′ — layout edges", () => {
+    it.effect("7a: a single 1-bit dimension writes one byte, 0x00 or 0x01", () =>
+      Effect.gen(function* () {
+        const draft = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ status: "draft" }),
+        )
+        const live = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ status: "live" }),
+        )
+        expect(draft.sets.gsi6sk).toEqual({ B: Uint8Array.of(0x00) })
+        expect(live.sets.gsi6sk).toEqual({ B: Uint8Array.of(0x01) })
+        // byStatusPrice shares `status` but lacks `price` → 'preserve' noop.
+        untouched(live, "gsi7sk")
+      }),
+    )
+
+    it.effect("7a′: 1-bit literals + 13-bit int → two right-aligned bytes", () =>
+      Effect.gen(function* () {
+        const low = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ status: "draft", price: 0 }),
+        )
+        const high = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ status: "live", price: 8191 }),
+        )
+        expect(low.sets.gsi7sk).toEqual({ B: Uint8Array.of(0x00, 0x00) })
+        expect(high.sets.gsi7sk).toEqual({ B: Uint8Array.of(0x3f, 0xff) })
+      }),
+    )
+  })
+
+  describe("shape 7b — constant PK half over a Z-order SK (shape 6 analogue)", () => {
+    const constantPk = KeyComposer.composePk(ZSchema, "ZListing", ZListings.indexes.byFacetsAll, {})
+
+    it.effect(
+      "'sparse' + partial dimensions → PK SET + SK REMOVE (the item leaves the index)",
+      () =>
+        Effect.gen(function* () {
+          const wire = yield* zUpdate((db) =>
+            db.entities.ZListings.update({ listingId: "l-1" }).set({ price: 300_000 }),
+          )
+          expect(wire.sets.gsi8pk).toEqual({ S: constantPk })
+          expect(wire.removes.has("gsi8sk")).toBe(true)
+          expect(wire.sets).not.toHaveProperty("gsi8sk")
+        }),
+    )
+
+    it.effect("full dimensions → PK SET + SK SET", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set(zdims),
+        )
+        expect(wire.sets.gsi8pk).toEqual({ S: constantPk })
+        expect(wire.sets.gsi8sk).toEqual({ B: ZDIMS_BYTES })
+      }),
+    )
+
+    it.effect("no dimension touched → the constant PK is still SET; the SK half is skipped", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({ title: "Renovated" }),
+        )
+        expect(wire.sets.gsi8pk).toEqual({ S: constantPk })
+        untouched(wire, "gsi8sk")
+      }),
+    )
+  })
+
+  describe("shape 8 — Z-order half with sk.prefix", () => {
+    it.effect("prefix + every dimension → SET the prefix segments followed by the address", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({
+            agencyId: "AG-1",
+            officeId: "Office-9",
+            ...zdims,
+          }),
+        )
+        const bytes = (wire.sets.gsi4sk as { B: Uint8Array }).B
+        // u16be(4) ‖ "ag-1" (lowercase casing) ‖ 8 hash bytes of "office-9" ‖ address.
+        expect(Array.from(bytes.slice(0, 6))).toEqual([0x00, 0x04, 0x61, 0x67, 0x2d, 0x31])
+        expect(bytes.length).toBe(6 + 8 + 5)
+        expect(bytes.slice(-5)).toEqual(ZDIMS_BYTES)
+        expect(bytes).toEqual(
+          zSk(ZListings.indexes.byAgency, {
+            agencyId: "AG-1",
+            officeId: "Office-9",
+            ...zdimsKeyForm,
+          }),
+        )
+      }),
+    )
+
+    it.effect("a prefix change moves the entry (different bytes, same address)", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({
+            agencyId: "AG-2",
+            officeId: "Office-9",
+            ...zdims,
+          }),
+        )
+        const bytes = (wire.sets.gsi4sk as { B: Uint8Array }).B
+        expect(bytes).toEqual(
+          zSk(ZListings.indexes.byAgency, {
+            agencyId: "AG-2",
+            officeId: "Office-9",
+            ...zdimsKeyForm,
+          }),
+        )
+        expect(bytes).not.toEqual(
+          zSk(ZListings.indexes.byAgency, {
+            agencyId: "AG-1",
+            officeId: "Office-9",
+            ...zdimsKeyForm,
+          }),
+        )
+        expect(bytes.slice(-5)).toEqual(ZDIMS_BYTES)
+      }),
+    )
+  })
+
+  describe("shape 8b — prefix and dimensions owned by different writers (#41 analogue)", () => {
+    it.effect(
+      "writer A updates the prefix alone → never a SET ('preserve' noop, 'sparse' REMOVE)",
+      () =>
+        Effect.gen(function* () {
+          const wire = yield* zUpdate((db) =>
+            db.entities.ZListings.update({ listingId: "l-1" }).set({
+              agencyId: "AG-2",
+              officeId: "Office-1",
+            }),
+          )
+          untouched(wire, "gsi4sk")
+          expect(wire.removes.has("gsi5sk")).toBe(true)
+          expect(wire.sets).not.toHaveProperty("gsi5sk")
+        }),
+    )
+
+    it.effect("writer B's dimensions SET only with the prefix in the payload; else policy", () =>
+      Effect.gen(function* () {
+        const without = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set(zdims),
+        )
+        untouched(without, "gsi4sk")
+        const withPrefix = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" }).set({
+            ...zdims,
+            agencyId: "AG-1",
+            officeId: "Office-9",
+          }),
+        )
+        expect(withPrefix.sets.gsi4sk).toEqual({
+          B: zSk(ZListings.indexes.byAgency, {
+            agencyId: "AG-1",
+            officeId: "Office-9",
+            ...zdimsKeyForm,
+          }),
+        })
+      }),
+    )
+  })
+
+  describe("shape 8c — hierarchical prefix never truncates (shape 3 analogue)", () => {
+    it.effect("set({ agencyId }).remove(['officeId']) → REMOVE under 'sparse' and 'preserve'", () =>
+      Effect.gen(function* () {
+        const wire = yield* zUpdate((db) =>
+          db.entities.ZListings.update({ listingId: "l-1" })
+            .set({ agencyId: "AG-2", price: 250_000 })
+            .remove(["officeId"]),
+        )
+        // byOffice ('sparse'): the rule REMOVEs.
+        expect(wire.removes.has("gsi5sk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi5sk")
+        // byAgency ('preserve'): the cascade override REMOVEs.
+        expect(wire.removes.has("gsi4sk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi4sk")
+      }),
+    )
+  })
+})
+
+// Shape 8a — every prefix composite and dimension is also a primary-key
+// composite (#43 analogue): recomposed from the key record on every write.
+
+class ZKeyedListing extends Schema.Class<ZKeyedListing>("ZKeyedListing")({
+  region: Schema.String,
+  agencyId: Schema.String,
+  price: Schema.Number,
+  bedrooms: Schema.Number,
+  listedAt: DynamoModel.DateString,
+  title: Schema.optional(Schema.String),
+}) {}
+
+const ZKeyedListings = Entity.make({
+  model: ZKeyedListing,
+  entityType: "ZKeyedListing",
+  primaryKey: {
+    pk: { field: "pk", composite: ["region"] },
+    sk: { field: "sk", composite: ["agencyId", "price", "bedrooms", "listedAt"] },
+  },
+  indexes: {
+    byAgency: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", prefix: ["agencyId"], zorder: facets },
+      indexPolicy: { pk: "sparse", sk: "sparse" },
+    },
+  },
+})
+
+const ZKeyedTable = Table.make({ schema: ZSchema, entities: { ZKeyedListings } })
+
+describe("Entity update — shape 8a: every Z-order field is a primary-key composite (#43 analogue)", () => {
+  it.effect("an update touching none of them SETs both halves from the key record", () => {
+    const capture: Capture = {}
+    const stored = zStoredItem("ZKeyedListing")
+    const layer = Layer.mergeAll(
+      Layer.succeed(DynamoClient, makeZMock(capture, stored)),
+      ZKeyedTable.layer({ name: "zorder-keyed-table" }),
+    )
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { ZKeyedListings },
+        tables: { ZKeyedTable },
+      })
+      yield* db.entities.ZKeyedListings.update({
+        region: "North",
+        agencyId: "AG-1",
+        ...zdims,
+      }).set({ title: "Renovated" })
+      const wire = wireOf(capture.updateItem!)
+      const keyRecord = { region: "North", agencyId: "AG-1", ...zdimsKeyForm }
+      expect(wire.sets.gsi3pk).toEqual({
+        S: KeyComposer.composePk(
+          ZSchema,
+          "ZKeyedListing",
+          ZKeyedListings.indexes.byAgency,
+          keyRecord,
+        ),
+      })
+      expect(wire.sets.gsi3sk).toEqual({ B: zSk(ZKeyedListings.indexes.byAgency, keyRecord) })
+      expect(wire.removes.size).toBe(0)
+    }).pipe(Effect.provide(layer), Effect.scoped)
+  })
+})
+
+// Retain path — read-then-write: the composer sees the merged item, so a half
+// whose fields are all stored recomposes from one changed dimension.
+
+const ZRetainListings = Entity.make({
+  model: ZListing,
+  entityType: "ZRetainListing",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byFacets: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["region"] },
+      sk: { field: "gsi2sk", zorder: facets },
+    },
+    byOffice: {
+      name: "gsi5",
+      pk: { field: "gsi5pk", composite: ["region"] },
+      sk: { field: "gsi5sk", prefix: ["agencyId", "officeId"], zorder: [facets[0]] },
+      indexPolicy: { sk: "sparse" },
+    },
+  },
+  versioned: { retain: true },
+})
+
+const ZRetainTable = Table.make({ schema: ZSchema, entities: { ZRetainListings } })
+
+const zRetainStored = zStoredItem("ZRetainListing", {
+  version: { N: "1" },
+  gsi2pk: { S: "$zorder-policy#v1#zretainlisting#region_north" },
+  gsi2sk: { B: ZDIMS_BYTES },
+  gsi5pk: { S: "$zorder-policy#v1#zretainlisting#region_north" },
+  gsi5sk: { B: zSk(ZListings.indexes.byOffice, zStoredRecord) },
+})
+
+const zRetainClient = DynamoClient.make({
+  entities: { ZRetainListings },
+  tables: { ZRetainTable },
+})
+
+const zRetainUpdate = (f: (db: Effect.Success<typeof zRetainClient>) => ZWrite) => {
+  const capture: Capture = {}
+  const layer = Layer.mergeAll(
+    Layer.succeed(DynamoClient, makeZMock(capture, zRetainStored)),
+    ZRetainTable.layer({ name: "zorder-retain-table" }),
+  )
+  return Effect.gen(function* () {
+    const db = yield* zRetainClient
+    yield* f(db).asEffect()
+    const tx = capture.transactWriteItems as {
+      TransactItems: Array<{
+        Update?: Parameters<typeof applyUpdate>[1]
+        Put?: { Item: Record<string, AttributeValue> }
+      }>
+    }
+    expect(tx).toBeDefined()
+    const update = tx.TransactItems.find((item) => item.Update !== undefined)!.Update!
+    return { written: applyUpdate(zRetainStored, update)!, tx }
+  }).pipe(Effect.provide(layer), Effect.scoped)
+}
+
+describe("Entity update — Z-order halves on the retain path (#171)", () => {
+  it.effect("one changed dimension recomposes the address from the stored fields", () =>
+    Effect.gen(function* () {
+      const { written, tx } = yield* zRetainUpdate((db) =>
+        db.entities.ZRetainListings.update({ listingId: "l-1" }).set({ price: 300_000 }),
+      )
+      expect(written.gsi2sk).toEqual({
+        B: zSk(ZRetainListings.indexes.byFacets, { ...zdimsKeyForm, price: 300_000 }),
+      })
+      expect(written.gsi2sk).not.toEqual({ B: ZDIMS_BYTES })
+      expect(written.gsi5sk).toEqual({
+        B: zSk(ZRetainListings.indexes.byOffice, { ...zStoredRecord, price: 300_000 }),
+      })
+      // The version snapshot strips every GSI key, the binary one included.
+      const snapshot = tx.TransactItems.find((item) => item.Put !== undefined)?.Put?.Item
+      expect(snapshot).toBeDefined()
+      expect(snapshot).not.toHaveProperty("gsi2sk")
+      expect(snapshot).not.toHaveProperty("gsi5sk")
+    }),
+  )
+
+  it.effect("remove([dimension]) → REMOVE under 'preserve' (cascade override) and 'sparse'", () =>
+    Effect.gen(function* () {
+      const { written } = yield* zRetainUpdate((db) =>
+        db.entities.ZRetainListings.update({ listingId: "l-1" }).remove(["price"]),
+      )
+      expect(written.gsi2sk).toBeUndefined()
+      expect(written.gsi5sk).toBeUndefined()
+      expect(written.gsi2pk).toEqual(zRetainStored.gsi2pk)
+    }),
+  )
+
+  it.effect("8c: set({ agencyId }).remove(['officeId']) REMOVEs, never truncates", () =>
+    Effect.gen(function* () {
+      const { written } = yield* zRetainUpdate((db) =>
+        db.entities.ZRetainListings.update({ listingId: "l-1" })
+          .set({ agencyId: "AG-2" })
+          .remove(["officeId"]),
+      )
+      expect(written.gsi5sk).toBeUndefined()
+      // byFacets has neither field → untouched, the stored address stays.
+      expect(written.gsi2sk).toEqual({ B: ZDIMS_BYTES })
+    }),
+  )
+
+  it.effect("an update touching no Z-order field leaves the stored addresses", () =>
+    Effect.gen(function* () {
+      const { written } = yield* zRetainUpdate((db) =>
+        db.entities.ZRetainListings.update({ listingId: "l-1" }).set({ title: "Renovated" }),
+      )
+      expect(written.gsi2sk).toEqual({ B: ZDIMS_BYTES })
+      expect(written.gsi5sk).toEqual(zRetainStored.gsi5sk)
+    }),
+  )
+})
+
+// `.append()` — the current row's UpdateItem: a Z-order half recomposes iff
+// `appendInput` carries every one of its fields; otherwise the policy decides.
+
+class ZObservation extends Schema.Class<ZObservation>("ZObservation")({
+  listingId: Schema.String,
+  region: Schema.String,
+  price: Schema.Number,
+  bedrooms: Schema.Number,
+  observedAt: Schema.DateTimeUtc,
+  agencyId: Schema.optional(Schema.String),
+}) {}
+
+const ZObservationAppendInput = Schema.Struct({
+  listingId: Schema.String,
+  region: Schema.String,
+  price: Schema.Number,
+  bedrooms: Schema.Number,
+  observedAt: Schema.DateTimeUtc,
+})
+
+const ZObservations = Entity.make({
+  model: ZObservation,
+  entityType: "ZObservation",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byFacets: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["region"] },
+      sk: { field: "gsi2sk", zorder: [facets[0], facets[1]] },
+    },
+    byAgency: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", prefix: ["agencyId"], zorder: [facets[0]] },
+      indexPolicy: { sk: "sparse" },
+    },
+  },
+  timeSeries: {
+    orderBy: "observedAt",
+    ttl: Duration.days(7),
+    appendInput: ZObservationAppendInput,
+  },
+})
+
+const ZObservationTable = Table.make({ schema: ZSchema, entities: { ZObservations } })
+
+describe("Entity append — Z-order halves (#171)", () => {
+  it.effect(
+    "appendInput with every dimension SETs the address; a half needing a field outside it follows its policy",
+    () => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(
+          DynamoClient,
+          mockDynamoClient({
+            ...makeMockClient(capture),
+            getItem: () => Effect.die("getItem not used on append path"),
+          }),
+        ),
+        ZObservationTable.layer({ name: "zorder-append-table" }),
+      )
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { ZObservations },
+          tables: { ZObservationTable },
+        })
+        yield* db.entities.ZObservations.append({
+          listingId: "l-1",
+          region: "North",
+          price: 250_000,
+          bedrooms: 3,
+          observedAt: DateTime.makeUnsafe("2026-04-30T10:00:00.000Z"),
+        }).skipFollowUp()
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{
+            Update?: Parameters<typeof wireOf>[0]
+            Put?: { Item: Record<string, AttributeValue> }
+          }>
+        }
+        const wire = wireOf(tx.TransactItems[0]!.Update!)
+        expect(wire.sets.gsi2sk).toEqual({
+          B: zSk(ZObservations.indexes.byFacets, { price: 250_000, bedrooms: 3 }),
+        })
+        expect(wire.sets.gsi2pk).toBeDefined()
+        // byAgency needs agencyId, which appendInput doesn't carry → 'sparse' REMOVE.
+        expect(wire.removes.has("gsi3sk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi3sk")
+        // The event item carries no GSI key.
+        const event = tx.TransactItems[1]!.Put!.Item
+        expect(event).not.toHaveProperty("gsi2sk")
+        expect(event).not.toHaveProperty("gsi3sk")
       }).pipe(Effect.provide(layer), Effect.scoped)
     },
   )

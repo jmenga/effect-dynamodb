@@ -8,6 +8,7 @@
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
@@ -409,6 +410,26 @@ export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity
   })
 
 /**
+ * @internal Run a key composer, turning a Z-order value it can't place
+ * (`[EDD-9092]`, `ZOrderValueError`: `NaN`, an unparseable date, a value
+ * outside a `literals` list — #171) into a `ValidationError` for `operation`.
+ * Every write path that composes a Z-order sort key goes through this, so the
+ * failure is typed instead of a defect. Any other throw stays a defect.
+ */
+export const composeKeysOrFail = <A>(
+  entityType: string,
+  operation: string,
+  compose: () => A,
+): Effect.Effect<A, ValidationError> =>
+  Effect.try({ try: compose, catch: (error) => error }).pipe(
+    Effect.catch((error) =>
+      isZOrderValueError(error)
+        ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
+        : Effect.die(error),
+    ),
+  )
+
+/**
  * Compose the primary key for an entity item.
  */
 export const composePrimaryKey = (
@@ -491,12 +512,14 @@ export const validateAndBuildPutItem = (
     // composite composed `txn_420` here and `txn_000…0420` there, so the two
     // APIs wrote two different rows for the same logical item and neither
     // accessor could read the transact-written one (#111).
-    const keys = KeyComposer.composeAllKeys(
-      entity._schema,
-      entity.entityType,
-      1,
-      entity.indexes,
-      entity._keyForm(encoded as Record<string, unknown>),
+    const keys = yield* composeKeysOrFail(entity.entityType, operation, () =>
+      KeyComposer.composeAllKeys(
+        entity._schema,
+        entity.entityType,
+        1,
+        entity.indexes,
+        entity._keyForm(encoded as Record<string, unknown>),
+      ),
     )
     Object.assign(item, keys)
 

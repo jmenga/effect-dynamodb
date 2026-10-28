@@ -9,7 +9,8 @@ import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
 import * as Cursor from "../src/internal/Cursor.js"
 import { type ListingItem, makeListings, STORE } from "./helpers/ListingsFixture.js"
-import type { Partition } from "./helpers/PartitionMock.js"
+import { compareBytes, type Partition } from "./helpers/PartitionMock.js"
+import * as ZListings from "./helpers/ZOrderListings.js"
 
 const fixture = makeListings()
 
@@ -143,6 +144,106 @@ describe("cursor v2 (#171)", () => {
     ]) {
       expect(Cursor.decode(Cursor.encodeV2(malformed as any))).toBeUndefined()
     }
+  })
+
+  it.effect("v2 round-trip with B: a Z-order key, address and skip tuple", () => {
+    const listings = ZListings.randomZListings(33, 120)
+    const rows = ZListings.storedRows(listings)
+    const bytesOf = new Map(listings.map((l, i) => [l.listingId, rows[i]!]))
+    const order = (sk: string, picked: ReadonlyArray<ZListings.ZListing>) =>
+      [...picked]
+        .sort(
+          (a, b) =>
+            compareBytes(bytesOf.get(a.listingId)![sk]!.B!, bytesOf.get(b.listingId)![sk]!.B!) ||
+            (a.listingId < b.listingId ? -1 : 1),
+        )
+        .map((l) => l.listingId)
+    const serve = <X, E>(
+      accessor: ZListings.Accessor,
+      f: (client: Effect.Success<typeof ZListings.listings>) => Effect.Effect<X, E>,
+    ) => {
+      const { layer } = ZListings.servePartition(accessor, rows)
+      return Effect.flatMap(ZListings.listings, f).pipe(Effect.provide(layer))
+    }
+    return Effect.gen(function* () {
+      // Unplanned: the LastEvaluatedKey's binary sort key travels as `{ B }`.
+      yield* serve("byFacets", (client) =>
+        Effect.gen(function* () {
+          const plain = client.byFacets({ region: ZListings.REGION })
+          const page = yield* plain.limit(5).fetch()
+          const cursor = Cursor.decode(page.cursor!)!
+          expect(Object.keys(cursor)).toEqual(["v", "k"])
+          const sk = Cursor.wireToKeyValue(cursor.k!.gsi1sk!)
+          expect(sk).toEqual(bytesOf.get(page.items[4]!.listingId)!.gsi1sk!.B)
+          const rest = yield* plain.startFrom(page.cursor!).collect()
+          expect(ZListings.ids([...page.items, ...rest])).toEqual(ZListings.ids(listings))
+          expect([...page.items, ...rest].map((l) => l.listingId)).toEqual(
+            order("gsi1sk", listings),
+          )
+        }),
+      )
+      // Planned: `k` (stopped inside a page) and `a` (at a range end) as `{ B }`.
+      yield* serve("byFacets", (client) =>
+        Effect.gen(function* () {
+          const query = client
+            .byFacets({ region: ZListings.REGION })
+            .within({ price: { lte: 700 }, bedrooms: { gte: 3 } })
+            .zorder({ strategy: "precise", maxRanges: 4 })
+          const want = order(
+            "gsi1sk",
+            listings.filter((l) => l.price <= 700 && l.bedrooms >= 3),
+          )
+          const seen = new Set<string>()
+          for (let limit = 1; limit <= want.length; limit++) {
+            let cursor: string | null | undefined
+            const got: Array<string> = []
+            while (cursor !== null) {
+              const page = yield* (cursor === undefined ? query : query.startFrom(cursor))
+                .limit(limit)
+                .fetch()
+              got.push(...page.items.map((l) => l.listingId))
+              cursor = page.cursor
+              if (cursor !== null) {
+                const decoded = Cursor.decode(cursor)!
+                expect(decoded.s).toBe("precise")
+                if (decoded.k !== undefined) {
+                  expect("B" in decoded.k.gsi1sk!).toBe(true)
+                  seen.add("k")
+                }
+                if (decoded.a !== undefined) {
+                  expect("B" in decoded.a).toBe(true)
+                  seen.add("a")
+                }
+              }
+            }
+            expect(got).toEqual(want)
+          }
+          expect([...seen].sort()).toEqual(["a", "k"])
+        }),
+      )
+      // A binary skip tuple: `t` as `{ B }`, the prefix segments of one agency and office.
+      yield* serve("byAgency", (client) =>
+        Effect.gen(function* () {
+          const query = client
+            .byAgency({ region: ZListings.REGION })
+            .within({ price: { gte: 200 } })
+          const first = yield* query.limit(2).fetch()
+          const cursor = Cursor.decode(first.cursor!)!
+          expect(cursor.s).toBe("skip-scan")
+          const tuple = Cursor.wireToKeyValue(cursor.t!)
+          expect(tuple).toBeInstanceOf(Uint8Array)
+          const stored = bytesOf.get(first.items[0]!.listingId)!.gsi2sk!.B!
+          expect(stored.subarray(0, (tuple as Uint8Array).length)).toEqual(tuple)
+          const rest = yield* query.startFrom(first.cursor!).collect()
+          expect([...first.items, ...rest].map((l) => l.listingId)).toEqual(
+            order(
+              "gsi2sk",
+              listings.filter((l) => l.price >= 200),
+            ),
+          )
+        }),
+      )
+    })
   })
 
   it.effect("a legacy cursor resumes as At", () =>

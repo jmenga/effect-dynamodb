@@ -128,6 +128,8 @@ import {
 import {
   type CompositeKeyForm,
   compositeKeyFormKind,
+  type KeyFormValueKind,
+  keyFormValueKind,
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -137,11 +139,14 @@ import type {
   EntityKeyType,
   IndexPkInput,
   IndexSkFields,
+  IndexZOrderDimensions,
+  IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import {
   getSchemaFields,
   numericTypeWithStringEncoding,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
@@ -152,6 +157,7 @@ import {
   Config,
   Context,
   Crypto,
+  DateTime,
   Duration,
   Effect,
   Layer,
@@ -179,7 +185,7 @@ import {
 } from "./internal/BoundVectorQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
-import { createConditionOps } from "./internal/Expr.js"
+import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -189,11 +195,13 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
+  canonicalJson,
   compositePlanner,
   type KeyRange,
   keyConditionHolds,
   type RowCheck,
   type TupleSpace,
+  zorderPlanner,
 } from "./internal/RangePlanner.js"
 import {
   diagnoseFailure,
@@ -366,26 +374,6 @@ type CompositeBound =
       readonly upper: RawSortKeyCondition | undefined
     }
 
-/** The kind of value a composite's key form is, when its schema says (EDD-9093's type check). */
-type KeyFormKind = "string" | "number" | "bigint" | "boolean"
-
-const astKeyFormKind = (ast: SchemaAST.AST): KeyFormKind | undefined => {
-  if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) return "string"
-  if (SchemaAST.isNumber(ast)) return "number"
-  if (SchemaAST.isBigInt(ast)) return "bigint"
-  if (SchemaAST.isBoolean(ast)) return "boolean"
-  if (SchemaAST.isLiteral(ast)) return typeof ast.literal as KeyFormKind
-  const kinds = SchemaAST.isEnum(ast)
-    ? ast.enums.map(([, value]) => typeof value as KeyFormKind)
-    : SchemaAST.isUnion(ast)
-      ? ast.types
-          .filter((member) => !SchemaAST.isUndefined(member) && !SchemaAST.isNull(member))
-          .map((member) => astKeyFormKind(member))
-      : [undefined]
-  const [first] = kinds
-  return first !== undefined && kinds.every((kind) => kind === first) ? first : undefined
-}
-
 /** Can no key form of this AST hold the delimiter? (§7.3) */
 const astDelimiterFree = (ast: SchemaAST.AST): boolean => {
   if (SchemaAST.isNumber(ast) || SchemaAST.isBigInt(ast) || SchemaAST.isBoolean(ast)) return true
@@ -399,6 +387,62 @@ const astDelimiterFree = (ast: SchemaAST.AST): boolean => {
 }
 
 const BOUND_OPERATORS: ReadonlySet<string> = new Set(["eq", "between", "gt", "gte", "lt", "lte"])
+
+/**
+ * How a row check reads a composite's key form from a raw row (§11): its
+ * stored attribute — for a ref-derived `${ref}Id`, the referenced identifier
+ * inside the stored ref, which is the value the key was composed from —
+ * through the accessor's encoder for a numeric field stored as a string, so a
+ * stored `"950000"` reads as `950000`. `undefined` when the row lacks it.
+ */
+const storedKeyForm = (
+  args: {
+    readonly entityLike: EntityLike
+    readonly encoderSource: Schema.Top
+    readonly compositeKeyForm: CompositeKeyForm
+  },
+  field: string,
+): {
+  readonly attribute: string
+  readonly read: (row: Record<string, AttributeValue>) => unknown
+} => {
+  const resolve = args.entityLike._resolveDbName ?? ((name: string) => name)
+  const ref = args.entityLike._resolvedRefs?.find((r) => r.idFieldName === field)
+  const attribute = resolve(ref?.fieldName ?? field)
+  const schema = getSchemaFields(args.encoderSource)?.[field]
+  const wantsBigInt = schema !== undefined && SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
+  const typeNumeric = compositeKeyFormKind(args.encoderSource, field) === "type-numeric"
+  return {
+    attribute,
+    read: (row) => {
+      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.identifierField]
+      if (value === undefined) return undefined
+      const stored = value.S ?? value.N
+      if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
+      if (value.S !== undefined) return value.S
+      if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
+      if (value.BOOL !== undefined) return value.BOOL
+      return undefined
+    },
+  }
+}
+
+/** One field's per-row check (§11). */
+interface FieldCheck {
+  readonly field: string
+  readonly attribute: string
+  readonly accepts: (row: Record<string, AttributeValue>) => boolean
+}
+
+/** Field checks as one row check, every one of them passing; `undefined` for none. */
+const combineRowChecks = (checks: ReadonlyArray<FieldCheck>): RowCheck | undefined =>
+  checks.length === 0
+    ? undefined
+    : {
+        fields: checks.map((check) => check.field),
+        reads: [...new Set(checks.map((check) => check.attribute))],
+        accepts: (row) => checks.every((check) => check.accepts(row)),
+      }
 
 /**
  * Plan `.within(bounds)` on a composite sort key accessor (design §7.1):
@@ -445,13 +489,10 @@ const planCompositeWithin = <A>(args: {
   /** The ref a `${ref}Id` composite is derived from: the item stores the ref, not the id. */
   const refOf = (field: string) =>
     entityLike._resolvedRefs?.find((ref) => ref.idFieldName === field)
-  const kindOf = (field: string): KeyFormKind | undefined => {
+  /** The kind of value a composite's key form is, when its schema says (EDD-9093's type check). */
+  const kindOf = (field: string): KeyFormValueKind | undefined => {
     const schema = fields?.[field]
-    if (schema === undefined) return undefined
-    if (numericTypeWithStringEncoding(schema)) {
-      return SchemaAST.isBigInt(SchemaAST.toType(schema.ast)) ? "bigint" : "number"
-    }
-    return astKeyFormKind(SchemaAST.toEncoded(schema.ast))
+    return schema === undefined ? undefined : keyFormValueKind(schema)
   }
 
   // -- validate and normalise (EDD-9093) --
@@ -610,50 +651,27 @@ const planCompositeWithin = <A>(args: {
    * stored ref: the referenced identifier inside its map, which is the value
    * the key was composed from.
    */
-  const rowCheckFor = (indices: ReadonlyArray<number>): RowCheck | undefined => {
-    if (indices.length === 0) return undefined
-    const resolve = entityLike._resolveDbName ?? ((name: string) => name)
-    const checks = [...indices]
-      .sort((a, b) => a - b)
-      .map((i) => {
-        const field = sk[i]!
-        const ref = refOf(field)
-        const attribute = resolve(ref?.fieldName ?? field)
-        const storedOf = (row: Record<string, AttributeValue>): AttributeValue | undefined =>
-          ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.identifierField]
-        const composed = composeBound("", i)
-        const tail = i === n - 1 ? "" : DynamoSchema.KEY_DELIMITER
-        const wantsBigInt = (() => {
-          const schema = fields?.[field]
-          return schema !== undefined && SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
-        })()
-        const typeNumeric = compositeKeyFormKind(args.encoderSource, field) === "type-numeric"
-        const keyFormOf = (value: AttributeValue | undefined): unknown => {
-          if (value === undefined) return undefined
-          const stored = value.S ?? value.N
-          if (typeNumeric && stored !== undefined) return compositeKeyForm(field, stored)
-          if (value.S !== undefined) return value.S
-          if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
-          if (value.BOOL !== undefined) return value.BOOL
-          return undefined
-        }
-        return {
-          field,
-          attribute,
-          accepts: (row: Record<string, AttributeValue>): boolean => {
-            const keyForm = keyFormOf(storedOf(row))
-            if (keyForm === undefined) return false
-            const text = `${segment(i, keyForm)}${tail}`
-            return keyConditionHolds(composed.condition, text) && text !== composed.excludes
-          },
-        }
-      })
-    return {
-      fields: checks.map((check) => check.field),
-      reads: [...new Set(checks.map((check) => check.attribute))],
-      accepts: (row) => checks.every((check) => check.accepts(row)),
-    }
-  }
+  const rowCheckFor = (indices: ReadonlyArray<number>): RowCheck | undefined =>
+    combineRowChecks(
+      [...indices]
+        .sort((a, b) => a - b)
+        .map((i) => {
+          const field = sk[i]!
+          const stored = storedKeyForm(args, field)
+          const composed = composeBound("", i)
+          const tail = i === n - 1 ? "" : DynamoSchema.KEY_DELIMITER
+          return {
+            field,
+            attribute: stored.attribute,
+            accepts: (row: Record<string, AttributeValue>): boolean => {
+              const keyForm = stored.read(row)
+              if (keyForm === undefined) return false
+              const text = `${segment(i, keyForm)}${tail}`
+              return keyConditionHolds(composed.condition, text) && text !== composed.excludes
+            },
+          }
+        }),
+    )
 
   // -- plan choice (§7.1) --
   const prefix0 = KeyComposer.composeSortKeyBeginsWith(
@@ -721,9 +739,8 @@ const planCompositeWithin = <A>(args: {
         ? `delimiter-unsafe composite: ${unsafe}`
         : undefined
 
-  return Query.plan(
-    args.query,
-    compositePlanner({
+  return Query.plan(args.query, {
+    planner: compositePlanner({
       entityType: entityLike.entityType,
       index: indexDef.index ?? "primary",
       pkField: indexDef.pk.field,
@@ -748,8 +765,545 @@ const planCompositeWithin = <A>(args: {
       },
       ineligible,
     }),
-    args.options?.maxSkips,
+    maxSkips: args.options?.maxSkips,
+  })
+}
+
+/** What a Z-order dimension bound may name: a composite's operators, and `in` (literals). */
+const DIMENSION_OPERATORS: ReadonlySet<string> = new Set([...BOUND_OPERATORS, "in"])
+
+/** The most operands DynamoDB's `IN` takes. */
+const MAX_IN_OPERANDS = 100
+
+/** How many Z-order range plans an accessor keeps (§5.4). */
+const ZORDER_PLAN_CACHE = 64
+
+/** The capped range plan of a box (§5.4), as an accessor caches it. */
+type ZOrderPlans = (
+  box: ZOrderCurve.Box,
+  maxRanges: number,
+  refineFactor: number,
+) => ReturnType<typeof ZOrderCurve.plan>
+
+/**
+ * An accessor's LRU of Z-order range plans. A plan is a pure function of the
+ * layout (the accessor's), the box and the cap, so a miss only recomputes —
+ * no cursor depends on what is cached.
+ */
+const makeZOrderPlans = (layout: ZOrderCurve.Layout): ZOrderPlans => {
+  const cache = new Map<string, ReturnType<typeof ZOrderCurve.plan>>()
+  return (box, maxRanges, refineFactor) => {
+    const key = canonicalJson({ box, maxRanges, refineFactor })
+    const hit = cache.get(key)
+    if (hit !== undefined) {
+      cache.delete(key)
+      cache.set(key, hit)
+      return hit
+    }
+    const planned = ZOrderCurve.plan(layout, box, maxRanges, refineFactor)
+    cache.set(key, planned)
+    if (cache.size > ZORDER_PLAN_CACHE) cache.delete(cache.keys().next().value!)
+    return planned
+  }
+}
+
+/** A plain object of bound operators (not a value: a `Date` and a `DateTime` are values). */
+const isBoundShape = (u: unknown): u is Record<string, unknown> =>
+  typeof u === "object" &&
+  u !== null &&
+  !Array.isArray(u) &&
+  !(u instanceof Date) &&
+  !DateTime.isDateTime(u)
+
+/** One end of a range bound; `strict` excludes the value itself. */
+interface BoundEnd {
+  readonly value: unknown
+  readonly strict: boolean
+}
+
+/** A {@link BoundEnd} in a numeric unit: epoch milliseconds or stored seconds. */
+interface NumericEnd extends BoundEnd {
+  readonly value: number
+}
+
+/** The ends of a range bound (`eq` as both, inclusive). */
+const boundEnds = (
+  bound: Record<string, unknown>,
+): { readonly lower: BoundEnd | undefined; readonly upper: BoundEnd | undefined } => {
+  if ("eq" in bound && bound.eq !== undefined) {
+    return { lower: { value: bound.eq, strict: false }, upper: { value: bound.eq, strict: false } }
+  }
+  const between = bound.between as readonly [unknown, unknown] | undefined
+  if (between !== undefined) {
+    return {
+      lower: { value: between[0], strict: false },
+      upper: { value: between[1], strict: false },
+    }
+  }
+  return {
+    lower:
+      bound.gt !== undefined
+        ? { value: bound.gt, strict: true }
+        : bound.gte !== undefined
+          ? { value: bound.gte, strict: false }
+          : undefined,
+    upper:
+      bound.lt !== undefined
+        ? { value: bound.lt, strict: true }
+        : bound.lte !== undefined
+          ? { value: bound.lte, strict: false }
+          : undefined,
+  }
+}
+
+/** Numbers and bigints in numeric order (`bigint` against `bigint` exactly). */
+const compareNumeric = (a: unknown, b: unknown): number => {
+  if (typeof a === "bigint" && typeof b === "bigint") return a < b ? -1 : a > b ? 1 : 0
+  const x = Number(a)
+  const y = Number(b)
+  return x < y ? -1 : x > y ? 1 : 0
+}
+
+/** Does `value` lie between the ends, as `compare` orders them? */
+const withinEnds = (
+  value: unknown,
+  lower: BoundEnd | undefined,
+  upper: BoundEnd | undefined,
+  compare: (a: unknown, b: unknown) => number,
+): boolean => {
+  if (lower !== undefined) {
+    const order = compare(value, lower.value)
+    if (Number.isNaN(order) || order < 0 || (order === 0 && lower.strict)) return false
+  }
+  if (upper !== undefined) {
+    const order = compare(value, upper.value)
+    if (Number.isNaN(order) || order > 0 || (order === 0 && upper.strict)) return false
+  }
+  return true
+}
+
+/**
+ * Plan `.within(bounds)` on a Z-order accessor (design §3.3, §5, §7.5, §11):
+ *
+ * - each dimension bound is put into key form through the accessor's encoder
+ *   and quantized into the box (an inverted bound is the empty box: nothing
+ *   is sent);
+ * - the given leading prefix composites are the key prefix `P`; from the first
+ *   one left out, the prefix composites are a binary skip tuple, any given
+ *   later one checked as each probed key is parsed;
+ * - the exact bounds are a `FilterExpression` on the stored attributes where
+ *   DynamoDB's comparison agrees with the dimension's order, and a row check
+ *   where it doesn't (numbers stored as strings, zoned dates, a `literals`
+ *   selection too large for `IN`) and for hashed prefix values (collisions).
+ *
+ * Throws `[EDD-9093]` for misuse from untyped code, `[EDD-9050]` for a value
+ * that doesn't reach key form and `[EDD-9092]` for one no level holds — at
+ * `.within()`, so every terminal (and `explain`) has a valid box. `{}` plans
+ * nothing: the query is returned as it is.
+ */
+const planZOrderWithin = <A>(args: {
+  readonly entityLike: EntityLike
+  readonly accessor: string
+  readonly indexDef: IndexDefinition
+  readonly encoderSource: Schema.Top
+  readonly compositeKeyForm: CompositeKeyForm
+  readonly pkValue: string
+  readonly plans: ZOrderPlans
+  readonly query: Query.Query<A>
+  readonly bounds: Record<string, unknown>
+  readonly options: WithinOptions | undefined
+}): Query.Query<A> => {
+  const { entityLike, accessor, indexDef, compositeKeyForm } = args
+  const refuse = (why: string): never => {
+    throw new Error(
+      `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
+    )
+  }
+  if (!KeyComposer.isZOrderHalf(indexDef.sk) || indexDef.sk.zorderHalf.layout === undefined) {
+    throw new Error("[internal] A Z-order .within() reached a sort key that isn't bound.")
+  }
+  const { prefix } = indexDef.sk.zorderHalf
+  const layout = indexDef.sk.zorderHalf.layout
+  if (!isBoundShape(args.bounds)) {
+    return refuse("pass an object of bounds keyed by dimension or prefix composite.")
+  }
+  const dimensions = layout.dimensions
+  const named = [...prefix.map((part) => part.field), ...dimensions.map((dim) => dim.field)]
+  const fields = getSchemaFields(args.encoderSource)
+  /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
+  const keyForm = (field: string, value: unknown): unknown => {
+    const converted = compositeKeyForm(field, value)
+    const schema = fields?.[field]
+    const expected = schema === undefined ? undefined : keyFormValueKind(schema)
+    if (expected !== undefined && typeof converted !== expected) {
+      return refuse(
+        `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
+          `the field's key form is a ${expected}.`,
+      )
+    }
+    return converted
+  }
+
+  // -- validate and normalise (EDD-9093) --
+  const prefixValues = new Map<string, unknown>()
+  const bounded = new Map<
+    string,
+    { readonly raw: Record<string, unknown>; readonly keyForm: Record<string, unknown> }
+  >()
+  for (const [field, raw] of Object.entries(args.bounds)) {
+    if (raw === undefined) continue
+    const shape = isBoundShape(raw) ? raw : undefined
+    const operators =
+      shape === undefined ? [] : Object.keys(shape).filter((key) => shape[key] !== undefined)
+    if (prefix.some((part) => part.field === field)) {
+      if (operators.some((key) => DIMENSION_OPERATORS.has(key))) {
+        return refuse(
+          `"${field}" is a prefix composite: it takes one exact value, not a range bound.`,
+        )
+      }
+      prefixValues.set(field, keyForm(field, raw))
+      continue
+    }
+    const dimension = dimensions.find((dim) => dim.field === field)
+    if (dimension === undefined) {
+      return refuse(
+        indexDef.pk.composite.includes(field)
+          ? `"${field}" is a partition key composite: give it to the accessor.`
+          : `"${field}" is not a dimension or prefix composite of the index. Bound one of: ` +
+              `${named.join(", ")}.`,
+      )
+    }
+    const between = shape?.between
+    const members = shape?.in
+    const wellFormed =
+      shape !== undefined &&
+      operators.length > 0 &&
+      operators.every((key) => DIMENSION_OPERATORS.has(key)) &&
+      (["eq", "between", "in"].some((key) => operators.includes(key))
+        ? operators.length === 1
+        : true) &&
+      !(operators.includes("gt") && operators.includes("gte")) &&
+      !(operators.includes("lt") && operators.includes("lte")) &&
+      (between === undefined || (Array.isArray(between) && between.length === 2)) &&
+      (members === undefined || Array.isArray(members))
+    if (!wellFormed) {
+      return refuse(
+        `the bound on "${field}" is not one of { eq }, { between: [low, high] }, { in: [...] } ` +
+          `(a literals dimension), or { gt | gte } and / or { lt | lte }.`,
+      )
+    }
+    if (members !== undefined && dimension.spec.kind !== "literals") {
+      return refuse(
+        `"in" bounds only a literals dimension, and "${field}" is ${dimension.spec.kind}.`,
+      )
+    }
+    const converted: Record<string, unknown> = {}
+    for (const key of operators) {
+      converted[key] =
+        key === "between" || key === "in"
+          ? (shape![key] as ReadonlyArray<unknown>).map((value) => keyForm(field, value))
+          : keyForm(field, shape![key])
+    }
+    bounded.set(field, { raw: shape!, keyForm: converted })
+  }
+  if (prefixValues.size === 0 && bounded.size === 0) return args.query
+
+  /** A bound's epoch milliseconds: from the domain value when it has them, else its key form. */
+  const epochMs = (dimension: ZOrderCurve.BoundDimension, raw: unknown, key: unknown): number =>
+    DateTime.isDateTime(raw)
+      ? DateTime.toEpochMillis(raw)
+      : raw instanceof Date
+        ? raw.getTime()
+        : ZOrderCurve.epochMsOf(dimension.storage, key)
+  /** Both ends of a bound: domain values and key forms side by side. */
+  const endsOf = (field: string) => {
+    const bound = bounded.get(field)!
+    return { raw: boundEnds(bound.raw), key: boundEnds(bound.keyForm) }
+  }
+  /**
+   * An `Epoch` dimension's ends in its stored unit, exactly (§11): a stored
+   * second `s` stands for `s × 1000` ms, so each end is converted from the
+   * bound's epoch milliseconds — never from its key form, which floors.
+   */
+  const storedEnds = (
+    dimension: ZOrderCurve.BoundDimension,
+    seconds: boolean,
+  ): { readonly lower: NumericEnd | undefined; readonly upper: NumericEnd | undefined } => {
+    const { raw, key } = endsOf(dimension.field)
+    const convert = (end: "lower" | "upper"): NumericEnd | undefined => {
+      const r = raw[end]
+      const k = key[end]
+      if (r === undefined || k === undefined) return undefined
+      const ms = epochMs(dimension, r.value, k.value)
+      if (!seconds) return { value: ms, strict: r.strict }
+      const u = ms / 1000
+      return end === "lower"
+        ? { value: r.strict ? Math.floor(u) : Math.ceil(u), strict: r.strict }
+        : { value: r.strict ? Math.ceil(u) : Math.floor(u), strict: r.strict }
+    }
+    return { lower: convert("lower"), upper: convert("upper") }
+  }
+  /**
+   * The bound a dimension's levels are quantized from: its key form, except
+   * on epoch seconds, where the key form of a sub-second end is floored. There
+   * the whole stored seconds it holds decide the levels, and whether there are
+   * any: `{ gte: T, lt: T + 500 ms }` holds the second `T`, `{ gt: T, lt: T + 1 s }`
+   * none — inverted only once converted.
+   */
+  const quantizable = (dimension: ZOrderCurve.BoundDimension): ZOrderCurve.DimensionBound => {
+    const keyForm = bounded.get(dimension.field)!.keyForm as ZOrderCurve.DimensionBound
+    const storage = dimension.storage
+    if (storage._tag !== "Epoch" || storage.unit !== "epochSeconds") return keyForm
+    const { lower, upper } = storedEnds(dimension, true)
+    return {
+      ...(lower === undefined ? {} : { gte: lower.strict ? lower.value + 1 : lower.value }),
+      ...(upper === undefined ? {} : { lte: upper.strict ? upper.value - 1 : upper.value }),
+    }
+  }
+
+  // -- the box (§5.1) and each literals dimension's exact selection --
+  const literalSelection = (
+    dimension: ZOrderCurve.BoundDimension,
+    bound: Record<string, unknown>,
+  ): ReadonlyArray<number> => {
+    const index = (value: unknown) => Number(dimension.quantize(value))
+    if (bound.eq !== undefined) return [index(bound.eq)]
+    if (bound.in !== undefined) {
+      return [...new Set((bound.in as ReadonlyArray<unknown>).map(index))].sort((a, b) => a - b)
+    }
+    const between = bound.between as readonly [unknown, unknown] | undefined
+    const lo =
+      between !== undefined
+        ? index(between[0])
+        : bound.gt !== undefined
+          ? index(bound.gt) + 1
+          : bound.gte !== undefined
+            ? index(bound.gte)
+            : 0
+    const hi =
+      between !== undefined
+        ? index(between[1])
+        : bound.lt !== undefined
+          ? index(bound.lt) - 1
+          : bound.lte !== undefined
+            ? index(bound.lte)
+            : Number(dimension.levels) - 1
+    return Array.from({ length: Math.max(0, hi - lo + 1) }, (_, i) => lo + i)
+  }
+  const { box, selections } = (() => {
+    try {
+      const quantized = ZOrderCurve.quantizeBounds(
+        layout,
+        Object.fromEntries(
+          dimensions
+            .filter((dim) => bounded.has(dim.field))
+            .map((dim) => [dim.field, quantizable(dim)]),
+        ),
+      )
+      const selected = new Map(
+        dimensions
+          .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
+          .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
+      )
+      const none = [...selected.values()].some((members) => members.length === 0)
+      return { box: none ? ("empty" as const) : quantized, selections: selected }
+    } catch (error) {
+      // A value that reaches key form but no level (§3.3): thrown, like EDD-9050.
+      if (ZOrderCurve.isZOrderValueError(error)) throw new Error(error.message)
+      throw error
+    }
+  })()
+
+  // -- exact bounds (§11): a FilterExpression where DynamoDB's order agrees, else row checks --
+  const path = (field: string) => ({ _tag: "path" as const, segments: [field] })
+  const compare = (field: string, op: "eq" | "gt" | "gte" | "lt" | "lte", value: unknown): Expr =>
+    ({
+      [ExprTag]: ExprTag,
+      _tag: op,
+      left: path(field),
+      right: { _tag: "value", value },
+    }) as Expr
+  const membership = (field: string, values: ReadonlyArray<unknown>): Expr =>
+    ({
+      [ExprTag]: ExprTag,
+      _tag: "in",
+      operand: path(field),
+      values: values.map((value) => ({ _tag: "value", value })),
+    }) as Expr
+  const rangeFilter = (
+    field: string,
+    lower: BoundEnd | undefined,
+    upper: BoundEnd | undefined,
+  ): ReadonlyArray<Expr> =>
+    lower !== undefined &&
+    upper !== undefined &&
+    !lower.strict &&
+    !upper.strict &&
+    lower.value === upper.value
+      ? [compare(field, "eq", lower.value)]
+      : [
+          ...(lower === undefined
+            ? []
+            : [compare(field, lower.strict ? "gt" : "gte", lower.value)]),
+          ...(upper === undefined
+            ? []
+            : [compare(field, upper.strict ? "lt" : "lte", upper.value)]),
+        ]
+  const filters: Array<Expr> = []
+  const dimensionChecks: Array<FieldCheck> = []
+  for (const dimension of dimensions) {
+    const field = dimension.field
+    if (!bounded.has(field)) continue
+    const storage = dimension.storage
+    if (storage._tag === "Literal") {
+      const values = (dimension.spec as { readonly values: ReadonlyArray<unknown> }).values
+      const selected = selections.get(field) ?? []
+      if (selected.length === values.length) continue
+      const chosen = new Set(selected.map((i) => values[i]))
+      const complement = values.filter((value) => !chosen.has(value))
+      if (chosen.size <= MAX_IN_OPERANDS) {
+        filters.push(membership(field, [...chosen]))
+      } else if (complement.length <= MAX_IN_OPERANDS) {
+        // Exact: every item in the index carries the attribute (the half needs it).
+        filters.push({
+          [ExprTag]: ExprTag,
+          _tag: "not",
+          expr: membership(field, complement),
+        } as Expr)
+      } else {
+        const stored = storedKeyForm(args, field)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => chosen.has(stored.read(row)),
+        })
+      }
+      continue
+    }
+    const { raw, key } = endsOf(field)
+    switch (storage._tag) {
+      case "Number":
+      case "UtcIsoString":
+      case "RawString":
+        filters.push(...rangeFilter(field, key.lower, key.upper))
+        break
+      case "Epoch": {
+        const stored = storedEnds(dimension, storage.unit === "epochSeconds")
+        filters.push(...rangeFilter(field, stored.lower, stored.upper))
+        break
+      }
+      case "NumericString": {
+        // S order isn't numeric order: compared on the key form, per row.
+        const stored = storedKeyForm(args, field)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => {
+            const value = stored.read(row)
+            return value !== undefined && withinEnds(value, key.lower, key.upper, compareNumeric)
+          },
+        })
+        break
+      }
+      case "ZonedIsoString": {
+        // ISO strings with offsets don't sort chronologically: compared as epoch ms, per row.
+        const stored = storedKeyForm(args, field)
+        const toMs = (end: BoundEnd | undefined, k: BoundEnd | undefined): BoundEnd | undefined =>
+          end === undefined || k === undefined
+            ? undefined
+            : { value: epochMs(dimension, end.value, k.value), strict: end.strict }
+        const lower = toMs(raw.lower, key.lower)
+        const upper = toMs(raw.upper, key.upper)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => {
+            const ms = ZOrderCurve.epochMsOf(storage, stored.read(row))
+            return Number.isFinite(ms) && withinEnds(ms, lower, upper, compareNumeric)
+          },
+        })
+        break
+      }
+    }
+  }
+
+  // -- the prefix (§4.3, §7.5) --
+  const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
+  const textOf = (value: unknown) =>
+    DynamoSchema.applyCasing(KeyComposer.serializeValue(value), casing)
+  const segmentOf = (part: KeyComposer.ZOrderPrefixSegment) =>
+    ZOrderCurve.prefixSegment(textOf(prefixValues.get(part.field)), part.hash)
+  /** A given prefix composite, checked on the cased value — never a hash, which can collide. */
+  const prefixCheck = (part: KeyComposer.ZOrderPrefixSegment): FieldCheck => {
+    const stored = storedKeyForm(args, part.field)
+    const wanted = textOf(prefixValues.get(part.field))
+    return {
+      field: part.field,
+      attribute: stored.attribute,
+      accepts: (row) => {
+        const value = stored.read(row)
+        return value !== undefined && textOf(value) === wanted
+      },
+    }
+  }
+  const firstMissing = prefix.findIndex((part) => !prefixValues.has(part.field))
+  const leading = firstMissing === -1 ? prefix : prefix.slice(0, firstMissing)
+  const later = firstMissing === -1 ? [] : prefix.slice(firstMissing)
+  const hashed = prefix.filter((part) => part.hash !== undefined && prefixValues.has(part.field))
+  const parsedExactly = later.filter(
+    (part) => part.hash === undefined && prefixValues.has(part.field),
   )
+
+  const renameExpr = entityNaming(entityLike._resolveDbName).renameExpr ?? ((expr: Expr) => expr)
+  const filter =
+    filters.length === 0
+      ? undefined
+      : renameExpr(
+          filters.length === 1
+            ? filters[0]!
+            : ({ [ExprTag]: ExprTag, _tag: "and", exprs: filters } as Expr),
+        )
+
+  return Query.plan(args.query, {
+    planner: zorderPlanner({
+      entityType: entityLike.entityType,
+      index: indexDef.index ?? "primary",
+      pkField: indexDef.pk.field,
+      pkValue: args.pkValue,
+      skField: indexDef.sk.field,
+      fingerprint: {
+        index: indexDef.index ?? "primary",
+        entityType: entityLike.entityType,
+        pk: args.pkValue,
+        prefix: prefix.map((part) => [
+          part.field,
+          part.hash ?? null,
+          prefixValues.has(part.field) ? textOf(prefixValues.get(part.field)) : null,
+        ]),
+        box,
+        layout: dimensions.map((dim) => ({ spec: dim.spec, storage: dim.storage, bits: dim.bits })),
+      },
+      layout,
+      box,
+      bounded: bounded.size > 0,
+      prefix: ZOrderCurve.concatBytes(leading.map((part) => segmentOf(part))),
+      tuple: later.map((part) => ({
+        field: part.field,
+        hash: part.hash,
+        given: prefixValues.has(part.field) ? segmentOf(part) : undefined,
+      })),
+      filter,
+      rowCheck: combineRowChecks([...dimensionChecks, ...hashed.map(prefixCheck)]),
+      filterRowCheck: combineRowChecks([
+        ...dimensionChecks,
+        ...hashed.map(prefixCheck),
+        ...parsedExactly.map(prefixCheck),
+      ]),
+      ranges: (maxRanges, refineFactor) =>
+        box === "empty" ? { ranges: [], exact: true } : args.plans(box, maxRanges, refineFactor),
+    }),
+    maxSkips: args.options?.maxSkips,
+  })
 }
 
 /**
@@ -1473,13 +2027,40 @@ type EntityIndexAccessors<
 > = {
   readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
-  ) => import("./internal/BoundQuery.js").BoundQuery<
-    PathModel<Schema.Schema.Type<M>, P>,
-    ResolveSkFields<M, I, K, Provided, R>,
-    Schema.Schema.Type<M>,
-    CompositeWithin<ResolveSkFields<M, I, K, Provided, R>>
-  >
+  ) => I[K] extends { readonly sk: { readonly zorder: ReadonlyArray<unknown> } }
+    ? import("./internal/BoundQuery.js").BoundQuery<
+        PathModel<Schema.Schema.Type<M>, P>,
+        never,
+        Schema.Schema.Type<M>,
+        import("./internal/BoundQuery.js").WithinSpec<ZOrderWithin<M, I, K, R>, "zorder">
+      >
+    : import("./internal/BoundQuery.js").BoundQuery<
+        PathModel<Schema.Schema.Type<M>, P>,
+        ResolveSkFields<M, I, K, Provided, R>,
+        Schema.Schema.Type<M>,
+        CompositeWithin<ResolveSkFields<M, I, K, Provided, R>>
+      >
 }
+
+/**
+ * What `.within()` takes on a Z-order accessor (#171): an optional bound per
+ * dimension, in the field's model type (`DateTime.Utc` for a `dateTime`
+ * dimension, the members for a `literals` one, which also takes `in`), and an
+ * optional exact value per prefix composite.
+ */
+type ZOrderWithin<M extends Schema.Top, I, K extends keyof I, R> =
+  IndexZOrderDimensions<M, I, K, R> extends infer Dims
+    ? IndexZOrderPrefix<M, I, K, R> extends infer Prefix
+      ? {
+          readonly [F in keyof Dims]?: Dims[F] extends {
+            readonly dimension: infer D
+            readonly value: infer V
+          }
+            ? import("./internal/BoundQuery.js").DimensionBound<D, V>
+            : never
+        } & { readonly [F in keyof Prefix]?: Prefix[F] }
+      : never
+    : never
 
 /**
  * What `.within()` takes on a composite accessor (#171): an optional bound per
@@ -1895,8 +2476,34 @@ const makeFromConfig = (config: {
         )
       })
 
+      // A Z-order sort key (#171) is a binary address: its prefix composites
+      // and dimensions are bounded with `.within()`, never pinned by the
+      // accessor, which takes the partition key composites only.
+      const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
+      const accessorDef: IndexDefinition = zorder
+        ? { ...indexDef, sk: { field: indexDef.sk.field, composite: [] } }
+        : indexDef
+      // Its range plans, cached across the accessor's queries (§5.4).
+      const zorderLayout = KeyComposer.isZOrderHalf(indexDef.sk)
+        ? indexDef.sk.zorderHalf.layout
+        : undefined
+      const zorderPlans = zorderLayout === undefined ? undefined : makeZOrderPlans(zorderLayout)
+
       return (rawComposites: Record<string, unknown>) => {
-        validateQueryComposites(_indexName, indexDef, rawComposites)
+        if (zorder) {
+          const misplaced = indexDef.sk.composite.filter(
+            (attr) => rawComposites[attr] !== undefined,
+          )
+          if (misplaced.length > 0) {
+            throw new Error(
+              `[EDD-9093] Index "${_indexName}" of entity "${entityLike.entityType}" has a ` +
+                `Z-order sort key, so ${misplaced.map((attr) => `"${attr}"`).join(", ")} can't ` +
+                `be passed to its accessor: pass the partition key composites ` +
+                `(${indexDef.pk.composite.join(", ")}) and bound the rest with .within().`,
+            )
+          }
+        }
+        validateQueryComposites(_indexName, accessorDef, rawComposites)
         const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
@@ -1935,9 +2542,9 @@ const makeFromConfig = (config: {
         // must terminate on a segment boundary when composites remain, or it
         // matches sibling values that merely start with the supplied one
         // (`status_done` also matching `status_done_archived`, issue #115).
-        const hasSkComposites = indexDef.sk.composite.some(
-          (attr: string) => compositesKeyForm[attr] !== undefined,
-        )
+        const hasSkComposites =
+          !zorder &&
+          indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
         const finalQuery = hasSkComposites
           ? Query.where(query, {
               beginsWith: KeyComposer.composeSortKeyBeginsWith(
@@ -1961,6 +2568,13 @@ const makeFromConfig = (config: {
           condition: RawSortKeyCondition,
           field: string | undefined,
         ): Query.SortKeyCondition => {
+          if (zorder) {
+            throw new Error(
+              `[EDD-9093] .where() on index "${_indexName}" of entity ` +
+                `"${entityLike.entityType}": a Z-order sort key has no text order to compare ` +
+                `against — bound its prefix composites and dimensions with .within().`,
+            )
+          }
           if (skComposites.length === 0) {
             throw new Error(
               `[EDD-9045] Index "${_indexName}" has no sort key composites, so there is ` +
@@ -2097,20 +2711,41 @@ const makeFromConfig = (config: {
           conditionOps,
           provide,
           composeSkCondition,
-          planWithin: (q, bounds, options) =>
-            planCompositeWithin({
-              entityLike,
-              accessor: _indexName,
-              indexDef,
-              encoderSource,
-              compositeKeyForm,
-              pinnedKeyForm: compositesKeyForm,
-              pkValue,
-              query: q,
-              bounds,
-              options,
-            }),
-          skFields: indexDef.sk.composite,
+          // A Z-order accessor bounds its dimensions and prefix composites
+          // (#171), and takes `.zorder()`.
+          ...(zorder
+            ? {
+                zorder: true,
+                planWithin: (q, bounds, options) =>
+                  planZOrderWithin({
+                    entityLike,
+                    accessor: _indexName,
+                    indexDef,
+                    encoderSource,
+                    compositeKeyForm,
+                    pkValue,
+                    plans: zorderPlans!,
+                    query: q,
+                    bounds,
+                    options,
+                  }),
+              }
+            : {
+                planWithin: (q, bounds, options) =>
+                  planCompositeWithin({
+                    entityLike,
+                    accessor: _indexName,
+                    indexDef,
+                    encoderSource,
+                    compositeKeyForm,
+                    pinnedKeyForm: compositesKeyForm,
+                    pkValue,
+                    query: q,
+                    bounds,
+                    options,
+                  }),
+              }),
+          skFields: accessorDef.sk.composite,
           ...entityNaming(entityLike._resolveDbName),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }

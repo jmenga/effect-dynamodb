@@ -25,6 +25,7 @@ import { CheckpointStore } from "../src/change-feed/index.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { ZOrder } from "../src/index.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -188,9 +189,48 @@ const LedgerSummaries = Entity.make({
   },
 })
 
+class Parcel extends Schema.Class<Parcel>("Parcel")({
+  parcelId: Schema.String,
+  depotId: Schema.String,
+  weight: Schema.Number,
+  volume: Schema.Number,
+}) {}
+
+/** A Z-order sort key: a box of parcels by weight and volume is a few address ranges (#171). */
+const Parcels = Entity.make({
+  model: Parcel,
+  entityType: "Parcel",
+  primaryKey: {
+    pk: { field: "pk", composite: ["parcelId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byDepot: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["depotId"] },
+      sk: {
+        field: "gsi4sk",
+        zorder: [
+          ZOrder.int("weight", { min: 0, max: 7 }),
+          ZOrder.int("volume", { min: 0, max: 7 }),
+        ],
+      },
+    },
+  },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Orders, Invoices, Profiles, Readings, Products, LedgerSummaries, LedgerTotals },
+  entities: {
+    Orders,
+    Invoices,
+    Profiles,
+    Readings,
+    Products,
+    Parcels,
+    LedgerSummaries,
+    LedgerTotals,
+  },
 })
 
 class Deposited extends Schema.Class<Deposited>("Deposited")({ amount: Schema.Number }) {}
@@ -297,7 +337,7 @@ const baseLayer = () =>
 
 const bindAll = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
-    entities: { Orders, Invoices, Profiles, Readings, Products },
+    entities: { Orders, Invoices, Profiles, Readings, Products, Parcels },
     tables: { MainTable },
   })
   const orders = yield* Entity.bind(Orders)
@@ -319,6 +359,23 @@ const drainStream = <A, E, R>(stream: Stream.Stream<A, E, R>) => Stream.runDrain
 
 const seedOrder = ({ db }: Bound) =>
   db.entities.Orders.put({ orderId: "o-1", customerId: "c-1", total: 1 }).asEffect()
+/** A parcel in every weight × volume cell of depot d-1. */
+const seedParcels = ({ db }: Bound) =>
+  Effect.forEach(
+    Array.from({ length: 64 }, (_, n) => n),
+    (n) =>
+      db.entities.Parcels.put({
+        parcelId: `p-${n}`,
+        depotId: "d-1",
+        weight: n >> 3,
+        volume: n & 7,
+      }).asEffect(),
+  )
+/** Weight 1–4, volume 2–3: three address ranges, read concurrently by `collect`. */
+const parcelBox = ({ db }: Bound) =>
+  db.entities.Parcels.byDepot({ depotId: "d-1" })
+    .within({ weight: { between: [1, 4] }, volume: { between: [2, 3] } })
+    .zorder({ strategy: "precise", concurrency: 4 })
 const seedProfile = ({ db }: Bound) =>
   Effect.gen(function* () {
     yield* db.entities.Profiles.put({ profileId: "p-1", name: "Ada" })
@@ -435,6 +492,8 @@ const cases: ReadonlyArray<Case> = [
         .collect(),
     seedOrder,
   ],
+  // A Z-order plan's ranges, drained concurrently by collect (#171)
+  ["Entity.query", (bound) => parcelBox(bound).collect(), seedParcels],
   ["Entity.scan", ({ db }) => db.entities.Orders.scan().collect()],
   ["Entity.scan", ({ orders }) => orders.scanFetch()],
   ["Entity.collect", ({ orders }) => orders.collect(ordersQuery())],
@@ -616,6 +675,24 @@ describe("consumed-capacity targets", () => {
       expect(reports.map((report) => [report.operation, report.index])).toEqual([
         ["Entity.query", "byCustomerTotal"],
       ])
+      expect(reports[0]!.requestsByCommand).toEqual({ Query: 3 })
+    }),
+  )
+
+  it.effect("a Z-order plan's concurrent range reads are one Entity.query report (#171)", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      const bound = yield* bindAll.pipe(Effect.provide(layer))
+      yield* seedParcels(bound).pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      const items = yield* parcelBox(bound)
+        .collect()
+        .pipe(Effect.provide(ConsumedCapacity.layer({ onOperation })), Effect.provide(layer))
+      expect(items.length).toBe(8)
+      expect(reports.map((report) => [report.operation, report.index])).toEqual([
+        ["Entity.query", "byDepot"],
+      ])
+      // One read per range — [6, 7], [12, 15], [36, 37] — and no implicit root.
       expect(reports[0]!.requestsByCommand).toEqual({ Query: 3 })
     }),
   )

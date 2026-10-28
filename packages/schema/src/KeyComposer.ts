@@ -17,12 +17,83 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
+import {
+  concatBytes,
+  interleave,
+  type Layout,
+  prefixSegment,
+  toBytes,
+} from "./internal/ZOrderCurve.js"
+import * as ZOrder from "./ZOrder.js"
 
-/** Index key part definition (pk or sk of an index) */
+/**
+ * Index key part definition (pk or sk of an index). `zorder` / `prefix` belong
+ * to a Z-order sort key ({@link ZOrderKeyPart}) and are a type error here — on
+ * a partition key half or on the primary key.
+ */
 export interface KeyPart {
   readonly field: string
   readonly composite: ReadonlyArray<string>
+  readonly zorder?: never
+  readonly prefix?: never
 }
+
+/**
+ * A Z-order sort key, as declared on a secondary index (#171): the bits of the
+ * `zorder` dimensions interleaved into one binary (`B`) value, behind the
+ * exact-match `prefix` composites. It has no `composite`: the fields that feed
+ * it are the prefix composites and the dimensions' fields.
+ */
+export interface ZOrderKeyPart<
+  Dims extends ReadonlyArray<ZOrder.Dimension> = ReadonlyArray<ZOrder.Dimension>,
+  Prefix extends ReadonlyArray<ZOrder.PrefixPart> = ReadonlyArray<ZOrder.PrefixPart>,
+> {
+  /** Physical attribute name, stored as `B`. */
+  readonly field: string
+  /** Exact-match composites, in front of the address. */
+  readonly prefix?: Prefix
+  /** The interleaved dimensions; declaration order is interleave priority. */
+  readonly zorder: Dims
+  readonly composite?: never
+}
+
+/** One normalised prefix composite: its field, and its hash width when hashed. */
+export interface ZOrderPrefixSegment {
+  readonly field: string
+  readonly hash: number | undefined
+}
+
+/** The Z-order specifics of a normalised sort key half. */
+export interface ZOrderHalf {
+  readonly prefix: ReadonlyArray<ZOrderPrefixSegment>
+  /** The dimensions as declared, in interleave order. */
+  readonly dimensions: ReadonlyArray<ZOrder.Dimension>
+  /**
+   * The dimensions bound to the entity's fields (internal). `undefined` on the
+   * half `normalizeGsiConfig` returns, until `Entity.make` binds it.
+   */
+  readonly layout: Layout | undefined
+}
+
+/**
+ * A normalised Z-order sort key half. Built only by `normalizeGsiConfig` and
+ * bound by `Entity.make`. `composite` is derived — the prefix composites, then
+ * the dimensions' fields — so every check that reads "the fields feeding this
+ * key" covers it; only the sites that string-compose a key branch on
+ * {@link isZOrderHalf}.
+ */
+export interface ZOrderSkPart {
+  readonly field: string
+  readonly composite: ReadonlyArray<string>
+  readonly zorderHalf: ZOrderHalf
+}
+
+/** Is this sort key half a Z-order one? */
+export const isZOrderHalf = (part: KeyPart | ZOrderSkPart): part is ZOrderSkPart =>
+  "zorderHalf" in part && part.zorderHalf !== undefined
+
+/** A composed key value: text for a string half, bytes for a Z-order half. */
+export type KeyValue = string | Uint8Array
 
 /**
  * Per-half policy value controlling how `Entity.update` and time-series
@@ -74,7 +145,7 @@ export interface IndexDefinition {
   readonly collection?: string | ReadonlyArray<string>
   readonly type?: "isolated" | "clustered" | undefined // Default: "isolated"
   readonly pk: KeyPart
-  readonly sk: KeyPart
+  readonly sk: KeyPart | ZOrderSkPart
   /** Key casing override; see {@link GsiConfig.casing}. Defaults to the schema's. */
   readonly casing?: DynamoSchema.Casing
   /**
@@ -96,8 +167,11 @@ export interface GsiConfig {
   readonly type?: "isolated" | "clustered"
   /** Partition key: physical field name + composite attributes. */
   readonly pk: KeyPart
-  /** Sort key: physical field name + composite attributes. */
-  readonly sk: KeyPart
+  /**
+   * Sort key: physical field name + composite attributes — or a Z-order key
+   * (`zorder`, optional `prefix`; see {@link ZOrderKeyPart}).
+   */
+  readonly sk: KeyPart | ZOrderKeyPart
   /**
    * Key casing for this index, overriding the schema's `casing`. Applies to the
    * entity type / collection name and the composite names and values in both
@@ -157,15 +231,106 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
       `[EDD-9003] Invalid GsiConfig: requires name, pk: { field, composite }, sk: { field, composite }`,
     )
   }
+  const pkHalf = config.pk as { readonly zorder?: unknown; readonly prefix?: unknown }
+  if (pkHalf.zorder !== undefined || pkHalf.prefix !== undefined) {
+    throw zorderMalformed(
+      config.name,
+      "zorder / prefix belong on the sort key; a partition key is always composed from its composites.",
+    )
+  }
+  const sk = config.sk as {
+    readonly field: string
+    readonly composite?: ReadonlyArray<string>
+    readonly zorder?: unknown
+    readonly prefix?: unknown
+  }
+  const isZOrder = sk.zorder !== undefined || sk.prefix !== undefined
   return {
     index: config.name,
     ...(config.collection !== undefined && { collection: config.collection }),
     type: config.type ?? "isolated",
     pk: { field: config.pk.field, composite: [...config.pk.composite] },
-    sk: { field: config.sk.field, composite: [...config.sk.composite] },
+    sk: isZOrder
+      ? normalizeZOrderHalf(config, sk)
+      : { field: sk.field, composite: [...sk.composite!] },
     ...(config.casing !== undefined && { casing: config.casing }),
     ...(config.indexPolicy !== undefined && { indexPolicy: config.indexPolicy }),
   }
+}
+
+const zorderMalformed = (index: string, why: string): Error =>
+  new Error(`[EDD-9086] Index "${index}" declares a malformed Z-order sort key: ${why}`)
+
+/**
+ * Normalise a declared Z-order sort key: the prefix as `{ field, hash }`, the
+ * dimensions as declared, and the derived `composite`. Unbound — `Entity.make`
+ * resolves each dimension's storage from the model and lays the address out.
+ * Raises the structural `[EDD-9086]` cases visible without the model, and
+ * `[EDD-9087]` for a `hash` outside 1..8.
+ */
+const normalizeZOrderHalf = (
+  config: GsiConfig,
+  sk: {
+    readonly field: string
+    readonly composite?: ReadonlyArray<string>
+    readonly zorder?: unknown
+    readonly prefix?: unknown
+  },
+): ZOrderSkPart => {
+  const index = config.name
+  if (sk.composite !== undefined) {
+    throw zorderMalformed(
+      index,
+      "composite can't be combined with zorder or prefix — the fields feeding a Z-order key are its prefix composites and dimensions.",
+    )
+  }
+  if (sk.zorder === undefined) {
+    throw zorderMalformed(index, "prefix needs zorder: a prefix is the front of a Z-order key.")
+  }
+  if (
+    !Array.isArray(sk.zorder) ||
+    sk.zorder.length === 0 ||
+    !sk.zorder.every((d) => ZOrder.isDimension(d))
+  ) {
+    throw zorderMalformed(
+      index,
+      "zorder must be a non-empty array of dimensions (ZOrder.int, ZOrder.dateTime, …).",
+    )
+  }
+  if (config.type === "clustered") {
+    throw zorderMalformed(
+      index,
+      'type "clustered" orders a collection\'s keys; a Z-order key carries no entity type to cluster on.',
+    )
+  }
+  const declaredPrefix = sk.prefix ?? []
+  if (!Array.isArray(declaredPrefix)) {
+    throw zorderMalformed(index, "prefix must be an array of field names or { field, hash }.")
+  }
+  const prefix = declaredPrefix.map((part: unknown): ZOrderPrefixSegment => {
+    if (typeof part === "string") return { field: part, hash: undefined }
+    const p = part as { readonly field?: unknown; readonly hash?: unknown }
+    if (typeof p !== "object" || p === null || typeof p.field !== "string") {
+      throw zorderMalformed(index, "each prefix part is a field name or { field, hash }.")
+    }
+    if (typeof p.hash !== "number" || !Number.isInteger(p.hash) || p.hash < 1 || p.hash > 8) {
+      throw new Error(
+        `[EDD-9087] Index "${index}" prefix composite "${p.field}": hash ${JSON.stringify(p.hash)} ` +
+          `must be an integer from 1 to 8 (bytes of its FNV-1a-64 hash).`,
+      )
+    }
+    return { field: p.field, hash: p.hash }
+  })
+  const dimensions = sk.zorder as ReadonlyArray<ZOrder.Dimension>
+  const composite = [...prefix.map((p) => p.field), ...dimensions.map((d) => d.field)]
+  const twice = composite.find((field, i) => composite.indexOf(field) !== i)
+  if (twice !== undefined) {
+    throw zorderMalformed(
+      index,
+      `"${twice}" is listed twice; each field feeds a Z-order key once, as a prefix composite or a dimension.`,
+    )
+  }
+  return { field: sk.field, composite, zorderHalf: { prefix, dimensions, layout: undefined } }
 }
 
 /**
@@ -270,6 +435,7 @@ export const composeSk = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
+  assertStringHalf(index, "composeSk")
   const composites = extractComposites(index.sk.composite, record)
   const names = [...index.sk.composite]
   const collection = index.collection
@@ -294,6 +460,78 @@ export const composeSk = (
   // Non-collection — simple entity key
   return composeKey(schema, entityType, composites, { casing: index.casing, names })
 }
+
+/**
+ * Refuse a Z-order half in a function that composes key text. Such a half is a
+ * binary address with no text form, so reaching one here is a library bug.
+ */
+const assertStringHalf = (index: IndexDefinition, fn: string): void => {
+  if (isZOrderHalf(index.sk)) {
+    throw new Error(
+      `KeyComposer.${fn}: index "${index.index ?? "primary"}" has a Z-order sort key, which ` +
+        `has no text form — compose it with composeZOrderSk / composeSkValue.`,
+    )
+  }
+}
+
+/**
+ * Compose the bytes of a Z-order sort key half from a key-form record:
+ *
+ * ```
+ * seg(prefix_1) ‖ … ‖ seg(prefix_k) ‖ toBytes(interleave(q(dim_1), …, q(dim_m)), W)
+ * ```
+ *
+ * No schema prefix, no entity type, no version byte: the partition key keeps
+ * entities apart. Prefix values are cased like any composite (the index's
+ * effective casing). Throws `[EDD-9092]` (`ZOrderValueError`) for a value a
+ * dimension can't quantize; the record must carry every field.
+ */
+export const composeZOrderSk = (
+  schema: DynamoSchema.DynamoSchema,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): Uint8Array => {
+  if (!isZOrderHalf(index.sk)) {
+    throw new Error(
+      `KeyComposer.composeZOrderSk: index "${index.index ?? "primary"}" has no Z-order sort key.`,
+    )
+  }
+  const { prefix, layout } = index.sk.zorderHalf
+  if (layout === undefined) {
+    throw new Error(
+      `KeyComposer.composeZOrderSk: index "${index.index}" was never bound to an entity — ` +
+        `Entity.make binds a Z-order sort key's dimensions to the model's fields.`,
+    )
+  }
+  const casing = effectiveCasing(schema, index)
+  const segments = prefix.map((part) => {
+    const value = record[part.field]
+    if (value === undefined || value === null) {
+      throw new Error(`Missing composite attribute "${part.field}" in record`)
+    }
+    return prefixSegment(applyCasing(serializeValue(value), casing), part.hash)
+  })
+  const levels = layout.dimensions.map((dim) => {
+    const value = record[dim.field]
+    if (value === undefined || value === null) {
+      throw new Error(`Missing composite attribute "${dim.field}" in record`)
+    }
+    return dim.quantize(value)
+  })
+  return concatBytes([...segments, toBytes(interleave(layout, levels), layout.bytes)])
+}
+
+/** {@link composeSk} for a string half, {@link composeZOrderSk} for a Z-order half. */
+export const composeSkValue = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): KeyValue =>
+  isZOrderHalf(index.sk)
+    ? composeZOrderSk(schema, index, record)
+    : composeSk(schema, entityType, entityVersion, index, record)
 
 /**
  * The item segment of an entity's history keys (version snapshots and
@@ -331,9 +569,9 @@ export const composeIndexKeys = (
   entityVersion: number,
   index: IndexDefinition,
   record: Record<string, unknown>,
-): Record<string, string> => ({
+): Record<string, KeyValue> => ({
   [index.pk.field]: composePk(schema, entityType, index, record),
-  [index.sk.field]: composeSk(schema, entityType, entityVersion, index, record),
+  [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record),
 })
 
 /**
@@ -346,7 +584,7 @@ export const tryComposeIndexKeys = (
   entityVersion: number,
   index: IndexDefinition,
   record: Record<string, unknown>,
-): Record<string, string> | undefined => {
+): Record<string, KeyValue> | undefined => {
   if (tryExtractComposites(index.pk.composite, record) === undefined) return undefined
   if (tryExtractComposites(index.sk.composite, record) === undefined) return undefined
   return composeIndexKeys(schema, entityType, entityVersion, index, record)
@@ -362,8 +600,8 @@ export const composeAllKeys = (
   entityVersion: number,
   indexes: Record<string, IndexDefinition>,
   record: Record<string, unknown>,
-): Record<string, string> => {
-  const result: Record<string, string> = {}
+): Record<string, KeyValue> => {
+  const result: Record<string, KeyValue> = {}
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") {
       // Primary index always required — throws on missing composites
@@ -387,7 +625,7 @@ export const composeAllKeys = (
  * in both for the same update.
  */
 export interface GsiUpdateResult {
-  readonly sets: Record<string, string>
+  readonly sets: Record<string, KeyValue>
   readonly removes: ReadonlyArray<string>
 }
 
@@ -446,6 +684,7 @@ export const composeSkPrefixUpTo = (
   record: Record<string, unknown>,
   stopBefore: number,
 ): string => {
+  assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
   const composites = extractComposites(slice, record)
   const collection = index.collection
@@ -568,6 +807,27 @@ const classifyHalf = (
 }
 
 /**
+ * Classify a Z-order sort key half the skip-predicate decided not to skip —
+ * all or nothing. Every field feeds the address, so a partial record can't
+ * compose a meaningful one and there is no truncation:
+ *
+ * - every prefix composite and dimension present in `record` → SET;
+ * - otherwise `'sparse'` → drop (REMOVE);
+ * - otherwise a field of the half in `removedSet` → drop (cascade override);
+ * - otherwise noop (`'preserve'`: the stored address may go stale).
+ */
+const classifyZOrderHalf = (
+  fields: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  policy: IndexPolicyKey,
+  halfHasRemoved: boolean,
+): "set" | "drop" | "noop" => {
+  if (fields.every((field) => record[field] !== undefined && record[field] !== null)) return "set"
+  if (policy === "sparse" || halfHasRemoved) return "drop"
+  return "noop"
+}
+
+/**
  * Resolve the per-half policy for an index. Defaults each half to `"preserve"`
  * when omitted (or when `indexPolicy` is omitted entirely).
  */
@@ -649,7 +909,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
     readonly removedSet?: ReadonlySet<string>
   },
 ): GsiUpdateResult => {
-  const sets: Record<string, string> = {}
+  const sets: Record<string, KeyValue> = {}
   const removes: Array<string> = []
   const removedSet = options?.removedSet
 
@@ -731,7 +991,13 @@ export const composeGsiKeysForUpdatePolicyAware = (
       // noop — emit nothing for this half.
     }
 
-    if (!skipSk) {
+    if (!skipSk && isZOrderHalf(index.sk)) {
+      // A Z-order half is all or nothing (#171): its address follows every
+      // field, so it is never truncated.
+      const outcome = classifyZOrderHalf(skComposites, merged, policy.sk, skHasRemoved)
+      if (outcome === "drop") removes.push(index.sk.field)
+      else if (outcome === "set") sets[index.sk.field] = composeZOrderSk(schema, index, merged)
+    } else if (!skipSk) {
       const skOutcome = classifyHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (skOutcome.kind === "drop") {
         removes.push(index.sk.field)
@@ -819,6 +1085,7 @@ export type { CompositeKeyHoleError }
  * missing one — the same walk `composeSortKeyPrefix` performs.
  */
 const availableSkCount = (index: IndexDefinition, record: Record<string, unknown>): number => {
+  assertStringHalf(index, "availableSkCount")
   let n = 0
   for (const attr of index.sk.composite) {
     const value = record[attr]
@@ -863,6 +1130,7 @@ export const composeSortKeyBeginsWith = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
+  assertStringHalf(index, "composeSortKeyBeginsWith")
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
   const complete = availableSkCount(index, record) === index.sk.composite.length
   return complete ? prefix : `${prefix}${KEY_DELIMITER}`
@@ -886,6 +1154,7 @@ export const composeSortKeyPrefix = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
+  assertStringHalf(index, "composeSortKeyPrefix")
   // Collect available composites and their names (stop at first missing)
   const available: Array<string> = []
   const names: Array<string> = []

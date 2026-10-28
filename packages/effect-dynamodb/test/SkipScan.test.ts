@@ -16,6 +16,7 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { ZOrder } from "../src/index.js"
 import * as Cursor from "../src/internal/Cursor.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
@@ -31,7 +32,8 @@ import {
   randomListings,
   STORE,
 } from "./helpers/ListingsFixture.js"
-import { makePartition, type Partition, type Row } from "./helpers/PartitionMock.js"
+import { compareBytes, makePartition, type Partition, type Row } from "./helpers/PartitionMock.js"
+import { capturePuts } from "./helpers/ZOrderListings.js"
 
 const ids = (items: ReadonlyArray<{ readonly listingId: string }>) =>
   items.map((item) => item.listingId)
@@ -798,4 +800,317 @@ describe("a ref-derived composite bound (#171)", () => {
       }),
     ),
   )
+})
+
+// ---------------------------------------------------------------------------
+// Binary prefix skip-scan (Z-order `sk.prefix`, design §7.5)
+// ---------------------------------------------------------------------------
+
+class Desk extends Schema.Class<Desk>("Desk")({
+  deskId: Schema.String,
+  site: Schema.String,
+  floor: Schema.String,
+  wing: Schema.String,
+  room: Schema.String,
+  x: Schema.Number,
+  y: Schema.Number,
+}) {}
+
+const deskDimensions = [
+  ZOrder.int("x", { min: 0, max: 7 }),
+  ZOrder.int("y", { min: 0, max: 7 }),
+] as const
+
+/** Desks by site, then floor, wing and room — once with `wing` stored as a 2-byte hash. */
+const Desks = Entity.make({
+  model: Desk,
+  entityType: "Desk",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deskId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byRoom: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["site"] },
+      sk: { field: "gsi1sk", prefix: ["floor", "wing", "room"], zorder: deskDimensions },
+    },
+    byHashedWing: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["site"] },
+      sk: {
+        field: "gsi2sk",
+        prefix: ["floor", { field: "wing", hash: 2 }, "room"],
+        zorder: deskDimensions,
+      },
+    },
+  },
+})
+
+const DeskTable = Table.make({
+  schema: DynamoSchema.make({ name: "desks", version: 1 }),
+  entities: { Desks },
+})
+const DeskTableLayer = DeskTable.layer({ name: "desks-table" })
+
+/** Desks on three floors, three wings and two rooms each, at random cells. */
+const DESKS = (() => {
+  const next = random(75)
+  const desks: Array<Desk> = []
+  for (const floor of ["1", "2", "3"]) {
+    for (const wing of ["east", "north", "west"]) {
+      for (const room of ["r1", "r2"]) {
+        for (let n = 0; n < 6; n++) {
+          desks.push(
+            new Desk({
+              deskId: `${floor}-${wing}-${room}-${n}`,
+              site: "hq",
+              floor,
+              wing,
+              room,
+              x: Math.floor(next() * 8),
+              y: Math.floor(next() * 8),
+            }),
+          )
+        }
+      }
+    }
+  }
+  return desks
+})()
+const DESK_ROWS = capturePuts(
+  DeskTableLayer,
+  Effect.gen(function* () {
+    const db = yield* DynamoClient.make({ entities: { Desks }, tables: { DeskTable } })
+    for (const desk of DESKS) yield* db.entities.Desks.put(desk)
+  }),
+)
+
+type DeskIndex = "byRoom" | "byHashedWing"
+const DESK_KEYS = { byRoom: "gsi1", byHashedWing: "gsi2" } as const
+
+/** Run `f` over `index`'s partition: a mock that rejects a zero-length key operand. */
+const overDesks = <X, E>(
+  index: DeskIndex,
+  f: (desks: DesksClient, partition: Partition) => Effect.Effect<X, E>,
+): Effect.Effect<X, E> => {
+  const key = DESK_KEYS[index]
+  const partition = makePartition({
+    rows: DESK_ROWS,
+    pkField: `${key}pk`,
+    skField: `${key}sk`,
+    keyFields: [`${key}pk`, `${key}sk`, "pk", "sk"],
+    evaluateFilter: true,
+  })
+  return Effect.flatMap(desksClient, (desks) => f(desks, partition)).pipe(
+    Effect.provide(Layer.merge(partition.layer, DeskTableLayer)),
+  )
+}
+
+const desksClient = Effect.map(
+  DynamoClient.make({ entities: { Desks }, tables: { DeskTable } }),
+  (db) => db.entities.Desks,
+)
+type DesksClient = Effect.Success<typeof desksClient>
+
+/** `desks` in `index`'s order: sort key bytes, then the table key. */
+const deskOrder = (index: DeskIndex, desks: ReadonlyArray<Desk>): Array<string> => {
+  const sk = `${DESK_KEYS[index]}sk`
+  const rowOf = new Map(DESKS.map((desk, i) => [desk.deskId, DESK_ROWS[i]!]))
+  const bytes = (desk: Desk) => rowOf.get(desk.deskId)![sk]!.B!
+  return [...desks]
+    .sort(
+      (a, b) =>
+        compareBytes(bytes(a), bytes(b)) ||
+        (a.deskId < b.deskId ? -1 : a.deskId > b.deskId ? 1 : 0),
+    )
+    .map((desk) => desk.deskId)
+}
+
+const deskIds = (desks: ReadonlyArray<{ readonly deskId: string }>) =>
+  desks.map((desk) => desk.deskId)
+
+const hexOf = (bytes: Uint8Array): string =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+
+const X = { between: [2, 5] } as const
+const inX = (desk: Desk) => desk.x >= 2 && desk.x <= 5
+
+describe("binary prefix skip-scan (#171 §7.5)", () => {
+  const cases: ReadonlyArray<
+    readonly [string, Record<string, unknown>, (desk: Desk) => boolean, string]
+  > = [
+    [
+      "missing leading: SEEK and SKIP on the given later segments",
+      { wing: "north", room: "r2", x: X },
+      (desk) => desk.wing === "north" && desk.room === "r2" && inX(desk),
+      "skip tuple: floor, wing, room",
+    ],
+    [
+      "missing middle: the leading segment is the prefix, the later one is sought",
+      { floor: "2", room: "r1", x: X },
+      (desk) => desk.floor === "2" && desk.room === "r1" && inX(desk),
+      "skip tuple: wing, room",
+    ],
+    [
+      "all given: no skip tuple",
+      { floor: "3", wing: "west", room: "r1", x: X },
+      (desk) => desk.floor === "3" && desk.wing === "west" && desk.room === "r1" && inX(desk),
+      "",
+    ],
+    [
+      "all omitted: never a zero-length operand",
+      { x: X },
+      (desk) => inX(desk),
+      "skip tuple: floor, wing, room",
+    ],
+    [
+      "a given prefix and no dimension: each tuple read whole",
+      { room: "r2" },
+      (desk) => desk.room === "r2",
+      "skip tuple: floor, wing, room",
+    ],
+  ]
+
+  for (const index of ["byRoom", "byHashedWing"] as const) {
+    for (const [name, bounds, holds, reason] of cases) {
+      it.effect(`${index}: ${name}`, () =>
+        overDesks(index, (desks, partition) =>
+          Effect.gen(function* () {
+            const query = desks[index]({ site: "hq" }).within(bounds as never)
+            const explain = yield* query.explain()
+            if (reason === "") expect(explain.plan).not.toBe("skip-scan")
+            else {
+              expect(explain.plan).toBe("skip-scan")
+              expect(explain.reason.startsWith(reason)).toBe(true)
+            }
+            const want = deskOrder(index, DESKS.filter(holds))
+            expect(want.length).toBeGreaterThan(0)
+            expect(deskIds(yield* query.collect())).toEqual(want)
+            expect(deskIds(yield* query.reverse().collect())).toEqual([...want].reverse())
+            for (const limit of [1, 2, 5]) {
+              const pages = yield* fetchAll(query.limit(limit)) as unknown as Effect.Effect<
+                Array<{ readonly items: Array<Desk> }>,
+                unknown
+              >
+              expect(deskIds(pages.flatMap((page) => page.items))).toEqual(want)
+            }
+            // The fallback after one probe returns the same rows.
+            const fallback = desks[index]({ site: "hq" }).within(bounds as never, { maxSkips: 1 })
+            expect(deskIds(yield* fallback.collect())).toEqual(want)
+            expect(partition.inputs.length).toBeGreaterThan(0)
+          }),
+        ),
+      )
+    }
+  }
+
+  it.effect("all omitted: probe count = distinct tuples + 1", () =>
+    overDesks("byRoom", (desks, partition) =>
+      Effect.gen(function* () {
+        yield* desks.byRoom({ site: "hq" }).within({ x: X }).collect()
+        const tuples = new Set(DESKS.map((desk) => `${desk.floor}|${desk.wing}|${desk.room}`))
+        expect(partition.inputs.filter(isProbe).length).toBe(tuples.size + 1)
+      }),
+    ),
+  )
+
+  /** The skip tuples reads were sent under: each read's lower operand, less the address. */
+  const tuplesRead = (partition: Partition) =>
+    new Set(
+      partition.inputs
+        .filter((input) => !isProbe(input))
+        .map((input: any) => {
+          const lower = /#sk BETWEEN (:\w+)/.exec(input.KeyConditionExpression)![1]!
+          return hexOf(input.ExpressionAttributeValues[lower].B.subarray(0, -1))
+        }),
+    )
+  /** The skip tuples of the desks `holds` keeps, from their stored sort keys. */
+  const tuplesOf = (index: DeskIndex, holds: (desk: Desk) => boolean) => {
+    const sk = `${DESK_KEYS[index]}sk`
+    return new Set(
+      DESKS.flatMap((desk, i) =>
+        holds(desk) ? [hexOf(DESK_ROWS[i]![sk]!.B!.subarray(0, -1))] : [],
+      ),
+    )
+  }
+
+  it.effect("SEEK: a given later segment is probed for directly, never tuple by tuple", () =>
+    overDesks("byRoom", (desks, partition) =>
+      Effect.gen(function* () {
+        const want = (desk: Desk) => desk.wing === "north" && desk.room === "r2" && inX(desk)
+        const got = yield* desks
+          .byRoom({ site: "hq" })
+          .within({ wing: "north", room: "r2", x: X })
+          .collect()
+        expect(deskIds(got)).toEqual(deskOrder("byRoom", DESKS.filter(want)))
+        // Per floor, wings sort east, west, north (length first): the probe
+        // lands on (east, r1), SEEKs to north, lands on (north, r1), SEEKs to
+        // r2 and lands on the tuple — 3 probes, then 1 that finds nothing.
+        // Probing tuple by tuple would take 18 + 1.
+        expect(partition.inputs.filter(isProbe)).toHaveLength(3 * 3 + 1)
+        // Only the three matching tuples are read.
+        expect(tuplesRead(partition)).toEqual(
+          tuplesOf("byRoom", (desk) => desk.wing === "north" && desk.room === "r2"),
+        )
+      }),
+    ),
+  )
+
+  for (const index of ["byRoom", "byHashedWing"] as const) {
+    it.effect(`${index}: SKIP: a tuple whose given segment is passed is skipped whole`, () =>
+      overDesks(index, (desks, partition) =>
+        Effect.gen(function* () {
+          const want = (desk: Desk) => desk.floor === "2" && desk.room === "r1" && inX(desk)
+          const query = desks[index]({ site: "hq" }).within({ floor: "2", room: "r1", x: X })
+          expect(deskIds(yield* query.collect())).toEqual(deskOrder(index, DESKS.filter(want)))
+          // Per wing: a probe lands on (wing, r1), the tuple; after its reads
+          // one lands on (wing, r2), past r1, and SKIPs the wing. Then 1 more.
+          expect(partition.inputs.filter(isProbe)).toHaveLength(1 + 2 * 3)
+          // (wing, r2) is never read.
+          expect(tuplesRead(partition)).toEqual(
+            tuplesOf(index, (desk) => desk.floor === "2" && desk.room === "r1"),
+          )
+        }),
+      ),
+    )
+  }
+
+  it.effect("byHashedWing: SEEK on a hashed segment reads only the matching tuples", () =>
+    overDesks("byHashedWing", (desks, partition) =>
+      Effect.gen(function* () {
+        const want = (desk: Desk) => desk.wing === "north" && desk.room === "r2" && inX(desk)
+        const query = desks.byHashedWing({ site: "hq" }).within({ wing: "north", room: "r2", x: X })
+        expect(deskIds(yield* query.collect())).toEqual(
+          deskOrder("byHashedWing", DESKS.filter(want)),
+        )
+        // Hash order puts north anywhere among the wings: at most a SEEK to
+        // north and one to r2 before the tuple, per floor.
+        expect(partition.inputs.filter(isProbe).length).toBeLessThanOrEqual(3 * 3 + 1)
+        expect(tuplesRead(partition)).toEqual(
+          tuplesOf("byHashedWing", (desk) => desk.wing === "north" && desk.room === "r2"),
+        )
+      }),
+    ),
+  )
+
+  for (const index of ["byRoom", "byHashedWing"] as const) {
+    it.effect(`${index}: maxSkips caps the probes, then the filter plan reads the rest`, () =>
+      overDesks(index, (desks, partition) =>
+        Effect.gen(function* () {
+          const want = (desk: Desk) => desk.wing === "north" && desk.room === "r2" && inX(desk)
+          const { events, observe } = recorder()
+          const query = desks[index]({ site: "hq" })
+            .within({ wing: "north", room: "r2", x: X }, { maxSkips: 4 })
+            .onRequest(observe)
+          expect(deskIds(yield* query.collect())).toEqual(deskOrder(index, DESKS.filter(want)))
+          expect(partition.inputs.filter(isProbe)).toHaveLength(4)
+          // Every probe is sent before the fallback: none follows a filter read.
+          const kinds = events.map((event) => event.kind)
+          expect(kinds.lastIndexOf("probe")).toBeLessThan(kinds.lastIndexOf("read"))
+          expect(kinds.filter((kind) => kind === "probe")).toHaveLength(4)
+        }),
+      ),
+    )
+  }
 })

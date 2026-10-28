@@ -380,12 +380,53 @@ export type IndexPkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] 
   ? PKC[number]
   : never
 
-/** Extract sk composite names (union) for a specific index */
+/**
+ * Extract sk composite names (union) for a specific index — `never` for a
+ * Z-order sort key (#171): its derived `composite` lists the fields feeding the
+ * address, which are bounded through `.within()`, never pinned or compared as
+ * key text. Tested before `composite`, which the normalised Z-order half also
+ * carries.
+ */
 export type IndexSkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] extends {
-  readonly sk: { readonly composite: infer SKC extends ReadonlyArray<string> }
+  readonly sk: { readonly zorder: ReadonlyArray<unknown> }
 }
-  ? SKC[number]
-  : never
+  ? never
+  : TIndexes[K] extends {
+        readonly sk: { readonly composite: infer SKC extends ReadonlyArray<string> }
+      }
+    ? SKC[number]
+    : never
+
+/** The field names of a Z-order key's declared dimensions, in declaration order. */
+export type DimensionFieldNames<Z> = Z extends readonly []
+  ? readonly []
+  : Z extends readonly [infer Head, ...infer Tail]
+    ? readonly [
+        Head extends { readonly field: infer F extends string } ? F : never,
+        ...DimensionFieldNames<Tail>,
+      ]
+    : Z extends ReadonlyArray<{ readonly field: infer F extends string }>
+      ? ReadonlyArray<F>
+      : readonly []
+
+type PrefixPartField<P> = P extends string
+  ? P
+  : P extends { readonly field: infer F extends string }
+    ? F
+    : never
+
+type PrefixPartFields<P> = P extends readonly []
+  ? readonly []
+  : P extends readonly [infer Head, ...infer Tail]
+    ? readonly [PrefixPartField<Head>, ...PrefixPartFields<Tail>]
+    : P extends ReadonlyArray<infer Part>
+      ? ReadonlyArray<PrefixPartField<Part>>
+      : readonly []
+
+/** The field names of a Z-order key's `prefix` composites (`readonly []` without one). */
+export type PrefixFieldNames<SK> = SK extends { readonly prefix: infer P }
+  ? PrefixPartFields<P>
+  : readonly []
 
 /**
  * Map a refs config object to its derived `${ref}Id` field map.
@@ -422,10 +463,58 @@ export type IndexSkFields<
  * queries should accept both `"Male"` and `"male"` for indexed attributes.
  * Non-string types pass through unchanged.
  */
-type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
+export type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
 
 /** Apply CaseInsensitive to all properties of an object type */
 type CaseInsensitiveProps<T> = { [K in keyof T]: CaseInsensitive<T[K]> }
+
+/**
+ * The dimensions of index `K`'s Z-order sort key (#171), keyed by field: each
+ * one's declared `Dimension` (a `literals` dimension carries its members) and
+ * the field's model value type. `never` for any other sort key.
+ */
+export type IndexZOrderDimensions<
+  TModel extends Schema.Top,
+  TIndexes,
+  K extends keyof TIndexes,
+  TRefs = undefined,
+> = TIndexes[K] extends {
+  readonly sk: { readonly zorder: infer Z extends ReadonlyArray<unknown> }
+}
+  ? {
+      readonly [D in Z[number] as D extends { readonly field: infer F extends string }
+        ? F
+        : never]: {
+        readonly dimension: D
+        readonly value: D extends {
+          readonly field: infer F extends keyof CompositeFields<TModel, TRefs>
+        }
+          ? CompositeFields<TModel, TRefs>[F]
+          : never
+      }
+    }
+  : never
+
+/**
+ * The prefix composites of index `K`'s Z-order sort key (#171) with their
+ * model value types, case-insensitive like an accessor's composites. `never`
+ * for any other sort key.
+ */
+export type IndexZOrderPrefix<
+  TModel extends Schema.Top,
+  TIndexes,
+  K extends keyof TIndexes,
+  TRefs = undefined,
+> = TIndexes[K] extends {
+  readonly sk: infer SK extends { readonly zorder: ReadonlyArray<unknown> }
+}
+  ? CaseInsensitiveProps<
+      Pick<
+        CompositeFields<TModel, TRefs>,
+        PrefixFieldNames<SK>[number] & keyof CompositeFields<TModel, TRefs>
+      >
+    >
+  : never
 
 /**
  * Compute the typed query input for a specific index.

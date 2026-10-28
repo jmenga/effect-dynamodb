@@ -8,13 +8,15 @@
  * - `where` consumes `SkRemaining` → `BoundQuery<Model, never, A, never>`.
  * - `where` is only available when `SkRemaining` is not `never`.
  * - `within` (#171) bounds the sort key composites `W` names; it and `where`
- *   exclude each other.
+ *   exclude each other. On a Z-order accessor it bounds the dimensions and
+ *   prefix composites, and `zorder` chooses how the box is read.
  * - Terminals: `fetch`, `collect`, `paginate`, `count`; `explain` describes
  *   the plan without sending anything.
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import type * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
@@ -348,7 +350,7 @@ export interface WithinSpec<B, K extends WithinKind> {
 /** `.within()` consumed on a Z-order accessor: `.zorder()` stays available. */
 export type ZOrderApplied = WithinSpec<never, "zorder">
 
-type BoundOperator = "eq" | "between" | "gt" | "gte" | "lt" | "lte"
+type BoundOperator = "eq" | "between" | "gt" | "gte" | "lt" | "lte" | "in"
 
 /**
  * `T`, every other operator ruled out — so `{ eq, gte }` or `{ lt, lte }` is
@@ -376,6 +378,16 @@ export type RangeBound<V> =
   | Only<{ readonly gt: V; readonly lte: V }>
   | Only<{ readonly gte: V; readonly lt: V }>
   | Only<{ readonly gte: V; readonly lte: V }>
+
+/**
+ * A `.within()` bound on one dimension of a Z-order sort key (#171): a
+ * {@link RangeBound} in the field's own type — for a `literals` dimension by
+ * declaration order — and, for a `literals` dimension only, a set of members.
+ */
+export type DimensionBound<D, V> =
+  D extends ZOrder.Dimension<any, "literals", infer L>
+    ? RangeBound<L> | Only<{ readonly in: ReadonlyArray<L> }>
+    : RangeBound<V>
 
 export interface WithinOptions {
   /**
@@ -406,12 +418,41 @@ export interface BoundQueryWithin<Model, A, W extends WithinSpec<any, WithinKind
    * can't be skipped soundly: the range is read once with every bound checked
    * per row (`explain()` says which plan runs, and why).
    *
+   * On a Z-order accessor (#171), the dimensions bound a box — any of them, in
+   * the fields' own types (`in` for a `literals` dimension) — and the prefix
+   * composites take one exact value each. The box is read as address ranges
+   * (`.zorder()` picks how); a prefix composite left out is skip-scanned.
+   * Every bound is exact: a `FilterExpression` where DynamoDB's comparison
+   * agrees with the dimension's order, a per-row check where it doesn't.
+   *
    * Excludes `.where()`. Values are the composites' own types.
    */
   readonly within: (
     bounds: W["bounds"],
     options?: WithinOptions,
   ) => BoundQuery<Model, never, A, W["kind"] extends "zorder" ? ZOrderApplied : never>
+}
+
+// ---------------------------------------------------------------------------
+// ZOrder method — only on a Z-order accessor (#171)
+// ---------------------------------------------------------------------------
+
+export interface BoundQueryZOrder<Model, SkRemaining, A, W extends WithinSpec<any, WithinKind>> {
+  /**
+   * How the box `.within()` bounds is read — before or after `.within()`;
+   * later calls merge over earlier ones:
+   *
+   * ```ts
+   * db.entities.Listings.byFacets({ region: "north" })
+   *   .within({ price: { lte: 500_000 }, bedrooms: { gte: 3 } })
+   *   .zorder({ strategy: "precise", maxRanges: 32 })
+   *   .collect()
+   * ```
+   *
+   * An unknown `strategy`, or a `maxRanges` / `concurrency` that isn't a
+   * positive integer, throws `[EDD-9095]`.
+   */
+  readonly zorder: (options: Query.ZOrderOptions) => BoundQuery<Model, SkRemaining, A, W>
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +466,12 @@ export type BoundQuery<
   W extends WithinSpec<any, WithinKind> = never,
 > = BoundQueryBase<Model, SkRemaining, A, W> &
   ([SkRemaining] extends [never] ? {} : BoundQueryWithWhere<Model, SkRemaining, A>) &
-  ([W] extends [never] ? {} : [W["bounds"]] extends [never] ? {} : BoundQueryWithin<Model, A, W>)
+  ([W] extends [never] ? {} : [W["bounds"]] extends [never] ? {} : BoundQueryWithin<Model, A, W>) &
+  ([W] extends [never]
+    ? {}
+    : W["kind"] extends "zorder"
+      ? BoundQueryZOrder<Model, SkRemaining, A, W>
+      : {})
 
 // ---------------------------------------------------------------------------
 // BoundQuery config — passed to impl at construction
@@ -473,6 +519,8 @@ export interface BoundQueryConfig<Model> {
     bounds: Record<string, unknown>,
     options: WithinOptions | undefined,
   ) => Query.Query<X>
+  /** Optional: the accessor reads a Z-order sort key, so `.zorder()` applies (#171). */
+  readonly zorder?: boolean | undefined
   /**
    * Optional: how `collect()` shapes the items — a collection groups them by
    * member. Carried through every combinator, so `.filter().collect()` groups
@@ -662,6 +710,43 @@ const refuseWithin = (what: string): never => {
   )
 }
 
+const ZORDER_STRATEGIES: ReadonlySet<unknown> = new Set(["auto", "naive", "jump", "precise"])
+
+/**
+ * `.zorder(options)`'s options (#171), the ones given: library options that
+ * can't be honoured throw `[EDD-9095]`; `pageSize` is DynamoDB's `Limit`,
+ * passed on unchecked as `pageSize(n)`'s number is.
+ */
+const zorderOptions = (options: Query.ZOrderOptions): Query.ZOrderOptions => {
+  const refuse = (what: string): never => {
+    throw new Error(`[EDD-9095] .zorder() ${what}`)
+  }
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    return refuse("takes an object of options: { strategy, pageSize, maxRanges, concurrency }.")
+  }
+  const given = Object.fromEntries(
+    Object.entries(options).filter(([, value]) => value !== undefined),
+  ) as Query.ZOrderOptions
+  const unknown = Object.keys(given).filter(
+    (key) => !["strategy", "pageSize", "maxRanges", "concurrency"].includes(key),
+  )
+  if (unknown.length > 0) {
+    return refuse(`has no option ${unknown.map((key) => JSON.stringify(key)).join(", ")}.`)
+  }
+  if (given.strategy !== undefined && !ZORDER_STRATEGIES.has(given.strategy)) {
+    return refuse(
+      `strategy ${JSON.stringify(given.strategy)} is not one of "auto", "naive", "jump", "precise".`,
+    )
+  }
+  for (const key of ["maxRanges", "concurrency"] as const) {
+    const value = given[key]
+    if (value !== undefined && !(Number.isInteger(value) && value > 0)) {
+      return refuse(`${key} ${JSON.stringify(value)} is not a positive integer.`)
+    }
+  }
+  return given
+}
+
 /** @internal */
 export class BoundQueryImpl<Model, SkRemaining, A> {
   constructor(
@@ -712,6 +797,21 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
       plan!(this._query, bounds, options),
       this._config,
       "within",
+    )
+  }
+
+  // --- zorder ---
+  zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    if (this._config.zorder !== true) {
+      throw new Error(
+        `[EDD-9095] .zorder() applies only to a Z-order index accessor: this query's index ` +
+          `has no Z-order sort key.`,
+      )
+    }
+    return new BoundQueryImpl(
+      Query.plan(this._query, { zorder: zorderOptions(options) }),
+      this._config,
+      this._applied,
     )
   }
 

@@ -4,7 +4,8 @@
  * TransactWriteItems), with condition expressions evaluated: `AND` / `OR` /
  * `NOT`, parentheses, `attribute_exists` / `attribute_not_exists`, and
  * `=` / `<>` / `<` / `<=` / `>` / `>=` on scalar attributes (`#a.#b` paths
- * included).
+ * included). A query's sort key condition — `BETWEEN`, `begins_with` or a
+ * comparison — orders `S` keys as text and `B` keys by their bytes (#171).
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -184,6 +185,27 @@ export const holds = (
 // Operations
 // ---------------------------------------------------------------------------
 
+/**
+ * Order two key values as DynamoDB does: a `B` value by its bytes, unsigned
+ * (#171); an `S` value as text (every key these tests store is ASCII).
+ */
+const compareKey = (a: AttributeValue | undefined, b: AttributeValue | undefined): number => {
+  if (a?.B !== undefined && b?.B !== undefined) {
+    const n = Math.min(a.B.length, b.B.length)
+    for (let i = 0; i < n; i++) if (a.B[i] !== b.B[i]) return a.B[i]! - b.B[i]!
+    return a.B.length - b.B.length
+  }
+  const x = a?.S ?? ""
+  const y = b?.S ?? ""
+  return x < y ? -1 : x > y ? 1 : 0
+}
+
+const startsWithKey = (value: AttributeValue | undefined, prefix: AttributeValue): boolean =>
+  value?.B !== undefined && prefix.B !== undefined
+    ? prefix.B.length <= value.B.length &&
+      compareKey({ B: value.B.subarray(0, prefix.B.length) }, prefix) === 0
+    : value?.S !== undefined && prefix.S !== undefined && value.S.startsWith(prefix.S)
+
 const runQuery = (input: {
   readonly TableName?: string | undefined
   readonly IndexName?: string | undefined
@@ -205,23 +227,46 @@ const runQuery = (input: {
     .filter(([key, item]) => key.startsWith(`${input.TableName}|`) && item[pkAttr]?.S === pkValue)
     .map(([, item]) => item)
   const sortAttr = skAttr ?? Object.values(names).find((n) => n !== pkAttr) ?? keys.sk
-  rows.sort((a, b) => {
-    const x = a[sortAttr]?.S ?? ""
-    const y = b[sortAttr]?.S ?? ""
-    return x < y ? -1 : x > y ? 1 : 0
-  })
+  rows.sort((a, b) => compareKey(a[sortAttr], b[sortAttr]))
   const cond = kc[3]
   if (cond !== undefined) {
     const between = /^(#\w+) BETWEEN (:\w+) AND (:\w+)$/.exec(cond)
     const begins = /^begins_with\((#\w+), (:\w+)\)$/.exec(cond)
+    const comparison = /^(#\w+) (<=|>=|=|<|>) (:\w+)$/.exec(cond)
     if (between) {
       const attr = names[between[1]!]!
-      const low = values[between[2]!]!.S!
-      const high = values[between[3]!]!.S!
-      rows = rows.filter((item) => item[attr]!.S! >= low && item[attr]!.S! <= high)
+      const low = values[between[2]!]!
+      const high = values[between[3]!]!
+      rows = rows.filter(
+        (item) =>
+          item[attr] !== undefined &&
+          compareKey(item[attr], low) >= 0 &&
+          compareKey(item[attr], high) <= 0,
+      )
     } else if (begins) {
       const attr = names[begins[1]!]!
-      rows = rows.filter((item) => item[attr]?.S?.startsWith(values[begins[2]!]!.S!))
+      const prefix = values[begins[2]!]!
+      rows = rows.filter((item) => startsWithKey(item[attr], prefix))
+    } else if (comparison) {
+      const attr = names[comparison[1]!]!
+      const operand = values[comparison[3]!]!
+      const holdsFor = (order: number): boolean => {
+        switch (comparison[2]) {
+          case "=":
+            return order === 0
+          case "<":
+            return order < 0
+          case "<=":
+            return order <= 0
+          case ">":
+            return order > 0
+          default:
+            return order >= 0
+        }
+      }
+      rows = rows.filter(
+        (item) => item[attr] !== undefined && holdsFor(compareKey(item[attr], operand)),
+      )
     } else throw new Error(`mock: unsupported key condition ${cond}`)
   }
   if (input.FilterExpression !== undefined) {

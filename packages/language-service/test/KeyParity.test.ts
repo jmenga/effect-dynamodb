@@ -12,6 +12,10 @@ import { buildParamsOrThrow } from "./helpers/params"
 // The plugin mirrors the library's key composition (it is CommonJS and cannot
 // load the ESM-only schema package). These cases pin the mirror to the library:
 // any change to key composition must land in both, or this fails.
+//
+// String keys only. A Z-order sort key (#171) is a binary address the plugin
+// never composes — it shows `<binary Z-order key>` (see ParamsBuilder.test.ts) —
+// so there is no text for parity to pin.
 
 const indexes = {
   primary: {

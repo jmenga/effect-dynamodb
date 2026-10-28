@@ -10,7 +10,7 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer } from "effect"
@@ -168,7 +168,12 @@ export const make = <
   // table shares its primary key. Refuse members that disagree (EDD-9069) here,
   // so tables deployed with CDK or Terraform — which never call
   // `Table.definition` — fail at definition time too.
-  mergeSecondaryIndexes(entities, aggregates, resolvePrimaryKey(entities))
+  const primary = resolvePrimaryKey(entities)
+  mergeSecondaryIndexes(entities, aggregates, primary)
+  // One attribute has one `AttributeDefinitions` type: a Z-order (`B`) sort key
+  // can't share its attribute with a string key half or a vector filter
+  // attribute of another type (EDD-9091).
+  resolveKeyAttributeTypes(entities, aggregates, primary)
 
   // Configure all entities with this table's schema and tag — only once the
   // table is valid, so a rejected `Table.make` leaves its members bound to
@@ -580,6 +585,88 @@ export const mergeSecondaryIndexes = (
   return merged
 }
 
+// ---------------------------------------------------------------------------
+// Key attribute types
+// ---------------------------------------------------------------------------
+
+/** An `AttributeDefinitions` scalar type. */
+export type KeyAttributeType = "S" | "N" | "B"
+
+const describeAttributeType = (type: KeyAttributeType): string =>
+  type === "B" ? `"B" (a Z-order sort key)` : `"${type}"`
+
+/**
+ * The `AttributeDefinitions` type of every attribute the table's members use
+ * in a key or a vector index's `SearchSchema`, by attribute name:
+ *
+ * - primary key halves, entity index halves and every aggregate index half:
+ *   `S` — composed key text;
+ * - a Z-order sort key half (#171): `B` — a binary address;
+ * - a vector index's partition attribute: `S`; its filter attributes: the type
+ *   derived from the model (`S` | `N`, EDD-9039).
+ *
+ * DynamoDB types an attribute once per table, so two members declaring one
+ * attribute with different types can't both be served: a GSI keyed on it would
+ * leave one member's items out (index-key violations) and reject its writes.
+ *
+ * @throws when one attribute is declared with two types (EDD-9091), naming
+ *   both declarers.
+ */
+export const resolveKeyAttributeTypes = (
+  entities: Record<string, EntityLike>,
+  aggregates: Record<string, AggregateLike>,
+  primary: { readonly pk: string; readonly sk: string | undefined } | undefined,
+): Map<string, KeyAttributeType> => {
+  const declared = new Map<string, { readonly type: KeyAttributeType; readonly owner: string }>()
+  const add = (name: string, type: KeyAttributeType, owner: string): void => {
+    const existing = declared.get(name)
+    if (existing === undefined) {
+      declared.set(name, { type, owner })
+      return
+    }
+    if (existing.type !== type) {
+      throw new Error(
+        `[EDD-9091] Attribute "${name}" is declared with type ` +
+          `${describeAttributeType(existing.type)} by ${existing.owner} and with type ` +
+          `${describeAttributeType(type)} by ${owner}. DynamoDB types an attribute once per ` +
+          `table, so every member using it must agree — give one of them its own attribute name.`,
+      )
+    }
+  }
+
+  if (primary !== undefined) {
+    add(primary.pk, "S", "the table's primary key")
+    if (primary.sk !== undefined) add(primary.sk, "S", "the table's primary key")
+  }
+  for (const [entityKey, entity] of Object.entries(entities)) {
+    const name = entity.entityType ?? entityKey
+    for (const [indexName, index] of Object.entries(entity.indexes)) {
+      if (!index) continue
+      const owner = `entity "${name}" (index "${indexName}")`
+      add(index.pk.field, "S", owner)
+      add(index.sk.field, isZOrderHalf(index.sk) ? "B" : "S", owner)
+    }
+  }
+  for (const [aggregateKey, agg] of Object.entries(aggregates)) {
+    add(agg.pkField, "S", `aggregate "${aggregateKey}"`)
+    if (agg.collection.index !== undefined && agg.collection.sk !== undefined) {
+      add(agg.collection.sk.field, "S", `aggregate "${aggregateKey}" (collection index)`)
+    }
+    if (agg.listIndex) {
+      const owner = `aggregate "${aggregateKey}" (list index)`
+      add(agg.listIndex.pk.field, "S", owner)
+      add(agg.listIndex.sk.field, "S", owner)
+    }
+  }
+  for (const [indexName, entry] of mergeVectorIndexes(entities)) {
+    const owner = `vector index "${indexName}" (entity "${entry.owner}")`
+    add(entry.definition.partitionField, "S", owner)
+    for (const [stored, type] of Object.entries(entry.filterStoredTypes)) add(stored, type, owner)
+  }
+
+  return new Map(Array.from(declared, ([name, { type }]) => [name, type]))
+}
+
 /**
  * Derive CreateTable input from a table's registered members.
  *
@@ -592,7 +679,10 @@ export const mergeSecondaryIndexes = (
  *   table PK — DynamoDB LSIs by definition share the base table's partition key)
  *
  * The physical table name is omitted — that's deployment config.
- * All key attributes are typed as "S" (String) since generated keys are always strings.
+ * Every key attribute is typed "S" (String) — generated keys are strings — or "B"
+ * for a Z-order sort key (#171); vector filter attributes take their model's
+ * type. One attribute declared with two types fails (EDD-9091, see
+ * {@link resolveKeyAttributeTypes}).
  *
  * LSI auto-detection: an aggregate's `collection` GSI config is emitted as an LSI
  * iff `agg.pkField` equals the table's primary PK field (determined from the first
@@ -628,6 +718,9 @@ export const definition = (table: Table): TableDefinition => {
   // Pass 2: classify secondary indexes (GSI vs LSI), refusing members that
   // disagree on one physical index's key schema (EDD-9069).
   const secondaryIndexes = mergeSecondaryIndexes(table.entities, table.aggregates, primary)
+  // Every attribute's one type: S, or B for a Z-order sort key (EDD-9091 on a
+  // conflict). Also reached by the synthetic tables `DynamoClient.make` builds.
+  const attributeTypes = resolveKeyAttributeTypes(table.entities, table.aggregates, primary)
   const gsiMap = new Map<string, { pk: string; sk: string }>()
   const lsiMap = new Map<string, { pk: string; sk: string }>()
   for (const [indexName, index] of secondaryIndexes) {
@@ -688,16 +781,18 @@ export const definition = (table: Table): TableDefinition => {
 
   const AttributeDefinitions: Array<AttributeDefinition> = Array.from(attributeNames)
     .sort()
-    .map((name) => ({ AttributeName: name, AttributeType: "S" as const }))
+    .map((name) => ({ AttributeName: name, AttributeType: attributeTypes.get(name) ?? "S" }))
 
   // Every SearchSchema element must appear in AttributeDefinitions (verified
   // against the live service; DynamoDB Local silently accepts their absence).
   // The composed HASH partition attribute is always a string; filter types are
-  // derived from the model schema at Entity.make (EDD-9039).
+  // derived from the model schema at Entity.make (EDD-9039). An attribute
+  // already defined above is skipped: `resolveKeyAttributeTypes` refused any
+  // whose types differ (EDD-9091).
   const vectorAttributeDefs = (
     merged: Map<string, MergedVectorIndex>,
   ): Array<AttributeDefinition> => {
-    const defs = new Map<string, "S" | "N">()
+    const defs = new Map<string, KeyAttributeType>()
     for (const entry of merged.values()) {
       if (!attributeNames.has(entry.definition.partitionField)) {
         defs.set(entry.definition.partitionField, "S")

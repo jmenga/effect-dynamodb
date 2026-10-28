@@ -1,9 +1,13 @@
 import type ts from "typescript"
 import {
+  type ExpressionLookup,
   extractStringArray,
   extractStringLiteral,
+  isZOrderHalf,
+  makeLookup,
   type ResolvedEntity,
   resolveEntities,
+  resolveZOrderFields,
 } from "../core/EntityResolver"
 
 // ---------------------------------------------------------------------------
@@ -25,6 +29,8 @@ export const DiagnosticCode = {
   UNKNOWN_QUERY_PROPERTY: 9006,
   /** DynamoModel.configure: field rename target collides with existing model field */
   FIELD_RENAME_COLLISION: 9007,
+  /** Query accessor: a Z-order sort key field passed as an accessor composite (#171) */
+  ZORDER_FIELD_IN_ACCESSOR: 9093,
 } as const
 
 // ---------------------------------------------------------------------------
@@ -156,12 +162,13 @@ function validateEntityMakeCalls(
   program: ts.Program,
 ): ts.Diagnostic[] {
   const diagnostics: ts.Diagnostic[] = []
+  const lookup = makeLookup(ts, sourceFile, program)
 
   ts.forEachChild(sourceFile, function visit(node) {
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (decl.initializer && ts.isIdentifier(decl.name)) {
-          const diags = tryValidateEntityMake(ts, sourceFile, decl.initializer, program)
+          const diags = tryValidateEntityMake(ts, sourceFile, decl.initializer, program, lookup)
           diagnostics.push(...diags)
         }
       }
@@ -177,6 +184,7 @@ function tryValidateEntityMake(
   sourceFile: ts.SourceFile,
   expr: ts.Expression,
   program: ts.Program,
+  lookup: ExpressionLookup,
 ): ts.Diagnostic[] {
   if (!ts.isCallExpression(expr)) return []
   const callee = expr.expression
@@ -227,7 +235,9 @@ function tryValidateEntityMake(
 
   // Validate GSI indexes
   if (indexesNode && ts.isObjectLiteralExpression(indexesNode)) {
-    diagnostics.push(...validateGsiIndexes(ts, sourceFile, entityType, indexesNode, modelFields))
+    diagnostics.push(
+      ...validateGsiIndexes(ts, sourceFile, entityType, indexesNode, modelFields, lookup),
+    )
   }
 
   return diagnostics
@@ -326,6 +336,7 @@ function validateGsiIndexes(
   entityType: string,
   indexesNode: ts.ObjectLiteralExpression,
   modelFields: ReadonlySet<string> | undefined,
+  lookup: ExpressionLookup,
 ): ts.Diagnostic[] {
   const diagnostics: ts.Diagnostic[] = []
 
@@ -381,6 +392,10 @@ function validateGsiIndexes(
                 skCompositeNode = skProp.initializer
               }
             }
+            // A Z-order sort key (#171): its prefix composites and dimensions
+            // are the fields it reads.
+            const zorder = resolveZOrderFields(ts, idxProp.initializer, lookup)
+            if (zorder !== undefined) skCompositeAttrs = [...zorder.prefix, ...zorder.dimensions]
           }
           break
       }
@@ -486,7 +501,9 @@ function tryValidateQueryChain(
                 sourceFile,
                 filterProp.name,
                 DiagnosticCode.SK_IN_FILTER,
-                `\`${filterKey}\` is a sort key composite for index \`${rootInfo.indexName}\` — include it in the query input, or bound it with \`.within()\`, for efficient key-based filtering instead of post-read \`.filter()\`.`,
+                rootInfo.zorder
+                  ? `\`${filterKey}\` feeds the Z-order sort key of index \`${rootInfo.indexName}\` — bound it with \`.within()\` to read only the matching key ranges instead of post-read \`.filter()\`.`
+                  : `\`${filterKey}\` is a sort key composite for index \`${rootInfo.indexName}\` — include it in the query input, or bound it with \`.within()\`, for efficient key-based filtering instead of post-read \`.filter()\`.`,
                 ts.DiagnosticCategory.Warning,
               ),
             )
@@ -522,6 +539,8 @@ interface QueryAccessorInfo {
   entity: ResolvedEntity
   indexName: string
   skComposites: ReadonlyArray<string>
+  /** The index's sort key is a Z-order key: its fields are bounded with `.within()`. */
+  zorder: boolean
   providedArgs: Set<string>
 }
 
@@ -556,6 +575,7 @@ function findQueryAccessorRoot(
                 entity,
                 indexName,
                 skComposites: indexDef.sk.composite,
+                zorder: isZOrderHalf(indexDef.sk),
                 providedArgs,
               }
             }
@@ -597,11 +617,10 @@ function validateQueryInput(
   ts: typeof import("typescript"),
   sourceFile: ts.SourceFile,
   indexName: string,
-  indexDef: { pk: { composite: ReadonlyArray<string> }; sk: { composite: ReadonlyArray<string> } },
+  indexDef: ResolvedEntity["indexes"][string],
   queryArg: ts.ObjectLiteralExpression,
 ): ts.Diagnostic[] {
   const diagnostics: ts.Diagnostic[] = []
-  const validKeys = new Set([...indexDef.pk.composite, ...indexDef.sk.composite])
   const providedKeys = new Map<string, ts.Node>()
 
   for (const prop of queryArg.properties) {
@@ -609,6 +628,38 @@ function validateQueryInput(
       providedKeys.set(prop.name.text, prop.name)
     }
   }
+
+  // EDD-9093: a Z-order accessor takes the partition key composites only; its
+  // sort key's fields are bounded with `.within()` (#171).
+  if (isZOrderHalf(indexDef.sk)) {
+    const zorderFields = new Set(indexDef.sk.composite)
+    for (const [key, node] of providedKeys) {
+      if (zorderFields.has(key)) {
+        diagnostics.push(
+          makeDiagnostic(
+            sourceFile,
+            node,
+            DiagnosticCode.ZORDER_FIELD_IN_ACCESSOR,
+            `\`${key}\` feeds the Z-order sort key of index \`${indexName}\`, so it can't be passed to the accessor. Pass the partition key composites (${indexDef.pk.composite.map((k) => `\`${k}\``).join(", ")}) and bound \`${key}\` with \`.within()\`.`,
+            ts.DiagnosticCategory.Error,
+          ),
+        )
+      } else if (!indexDef.pk.composite.includes(key)) {
+        diagnostics.push(
+          makeDiagnostic(
+            sourceFile,
+            node,
+            DiagnosticCode.UNKNOWN_QUERY_PROPERTY,
+            `Unknown composite attribute \`${key}\` for index \`${indexName}\`. Valid attributes: ${indexDef.pk.composite.map((k) => `\`${k}\``).join(", ")}`,
+            ts.DiagnosticCategory.Error,
+          ),
+        )
+      }
+    }
+    return diagnostics
+  }
+
+  const validKeys = new Set([...indexDef.pk.composite, ...indexDef.sk.composite])
 
   // EDD-9006: Unknown properties
   for (const [key, node] of providedKeys) {

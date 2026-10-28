@@ -28,6 +28,7 @@ import {
   Layer,
   Option,
   Redacted,
+  Schedule,
   Schema,
   SchemaGetter,
   Stream,
@@ -57,6 +58,7 @@ import type {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
@@ -64,6 +66,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
+import { ZOrder } from "../src/index.js"
 import {
   attributeBytes,
   ITEM_MAX_BYTES,
@@ -5819,6 +5822,489 @@ describeConnected("Empty-composite-half GSI shape (closes #46)", () => {
         expect(raw.Item!.gsi3pk).toBeUndefined()
         expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")
       }).pipe(provideVehicle),
+  )
+})
+
+// ===========================================================================
+// Z-order canonical shapes 7 / 8 (#171)
+// ===========================================================================
+//
+// A Z-order GSI sort key is a binary (`B`) attribute — prefix segments, then
+// the interleaved address. These scenarios run the canonical shapes 7, 7a,
+// 7a′, 7b, 8, 8a, 8b and 8c end to end: the table is created from
+// `Table.definition` (the `B` attribute definitions included), every stored
+// key is compared byte for byte with `KeyComposer.composeZOrderSk`, and the
+// accessor (partition key only) is checked to find — or no longer find — the
+// item. GSI reads are eventually consistent; DynamoDB Local hides the lag, so
+// index reads retry briefly rather than assume it away.
+// ===========================================================================
+
+class ZListingConnected extends Schema.Class<ZListingConnected>("ZListingConnected")({
+  listingId: Schema.String,
+  region: Schema.optional(Schema.String),
+  agencyId: Schema.optional(Schema.String),
+  officeId: Schema.optional(Schema.String),
+  price: Schema.optional(Schema.Number),
+  bedrooms: Schema.optional(Schema.Number),
+  listedAt: Schema.optional(DynamoModel.DateString),
+  status: Schema.optional(Schema.Literals(["draft", "live"])),
+  title: Schema.optional(Schema.String),
+}) {}
+
+const zSchema = DynamoSchema.make({ name: "zorder-shapes", version: 1 })
+const zTableName = `zorder-shapes-${Date.now()}`
+
+const zFacets = [
+  ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
+  ZOrder.int("bedrooms", { min: 0, max: 15 }),
+  ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+] as const
+
+const ZShapes = Entity.make({
+  model: ZListingConnected,
+  entityType: "ZShape",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // 7 — every dimension a mutable model field ('preserve').
+    byFacets: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: { field: "gsi1sk", zorder: zFacets },
+    },
+    // 7 under 'sparse'.
+    byFacetsSparse: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["region"] },
+      sk: { field: "gsi2sk", zorder: zFacets },
+      indexPolicy: { sk: "sparse" },
+    },
+    // 8 / 8b — a prefix (one segment hashed) before the address ('preserve').
+    byAgency: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: {
+        field: "gsi3sk",
+        prefix: ["agencyId", { field: "officeId", hash: 8 }],
+        zorder: zFacets,
+      },
+    },
+    // 8c — a hierarchical prefix ('sparse').
+    byOffice: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["region"] },
+      sk: { field: "gsi4sk", prefix: ["agencyId", "officeId"], zorder: [zFacets[0]] },
+      indexPolicy: { sk: "sparse" },
+    },
+    // 7a — one 2-member literals dimension: 1 bit, 1 byte.
+    byStatus: {
+      name: "gsi5",
+      pk: { field: "gsi5pk", composite: ["region"] },
+      sk: { field: "gsi5sk", zorder: [ZOrder.literals("status", ["draft", "live"])] },
+    },
+    // 7a′ — 1-bit literals + 13-bit int: 14 bits, 2 bytes.
+    byStatusPrice: {
+      name: "gsi6",
+      pk: { field: "gsi6pk", composite: ["region"] },
+      sk: {
+        field: "gsi6sk",
+        zorder: [
+          ZOrder.literals("status", ["draft", "live"]),
+          ZOrder.int("price", { min: 0, max: 8191 }),
+        ],
+      },
+    },
+    // 7b — a constant (empty-composite) PK half over a Z-order SK ('sparse').
+    byFacetsAll: {
+      name: "gsi7",
+      pk: { field: "gsi7pk", composite: [] },
+      sk: { field: "gsi7sk", zorder: zFacets },
+      indexPolicy: { pk: "sparse", sk: "sparse" },
+    },
+  },
+})
+
+// 8a — every prefix composite and dimension is a primary-key composite. It
+// shares the physical gsi3 (a `B` sort key) with ZShapes.byAgency.
+class ZKeyedConnected extends Schema.Class<ZKeyedConnected>("ZKeyedConnected")({
+  region: Schema.String,
+  agencyId: Schema.String,
+  price: Schema.Number,
+  bedrooms: Schema.Number,
+  listedAt: DynamoModel.DateString,
+  title: Schema.optional(Schema.String),
+}) {}
+
+const ZKeyed = Entity.make({
+  model: ZKeyedConnected,
+  entityType: "ZKeyed",
+  primaryKey: {
+    pk: { field: "pk", composite: ["region"] },
+    sk: { field: "sk", composite: ["agencyId", "price", "bedrooms", "listedAt"] },
+  },
+  indexes: {
+    byAgency: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", prefix: ["agencyId"], zorder: zFacets },
+      indexPolicy: { pk: "sparse", sk: "sparse" },
+    },
+  },
+})
+
+const ZTable = Table.make({ schema: zSchema, entities: { ZShapes, ZKeyed } })
+const ZTestLayer = Layer.mergeAll(ClientLayer, ZTable.layer({ name: zTableName }))
+const provideZ = Effect.provide(ZTestLayer)
+
+const zClient = DynamoClient.make({ entities: { ZShapes, ZKeyed }, tables: { ZTable } })
+
+/** A complete listing; `listedAt` as the model takes it. */
+const zListing = (listingId: string, region: string) => ({
+  listingId,
+  region,
+  agencyId: "AG-1",
+  officeId: "Office-9",
+  price: 250_000,
+  bedrooms: 3,
+  listedAt: DateTime.makeUnsafe("2024-01-02T00:00:00.000Z"),
+  status: "live" as const,
+})
+
+/** A listing's fields in key form — what the composer reads. */
+const zKeyForm = (fields: Record<string, unknown>): Record<string, unknown> =>
+  Object.fromEntries(
+    Object.entries(fields).map(([field, value]) => [
+      field,
+      DateTime.isDateTime(value) ? DateTime.formatIso(value) : value,
+    ]),
+  )
+
+const zSk = (index: KeyComposer.IndexDefinition, fields: Record<string, unknown>) =>
+  Array.from(KeyComposer.composeZOrderSk(zSchema, index, zKeyForm(fields)))
+
+/** The stored row of a ZShape listing. */
+const zRow = (listingId: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const out = yield* client.getItem({
+      TableName: zTableName,
+      Key: {
+        pk: { S: `$zorder-shapes#v1#zshape#listingid_${listingId.toLowerCase()}` },
+        sk: { S: "$zorder-shapes#v1#zshape" },
+      },
+      ConsistentRead: true,
+    })
+    expect(out.Item).toBeDefined()
+    return out.Item!
+  })
+
+/** A stored binary key's bytes (`undefined` when the attribute is absent). */
+const zBytes = (value: AttributeValue | undefined): Array<number> | undefined =>
+  value === undefined ? undefined : Array.from(value.B!)
+
+/** Retry an index read until `check` holds — GSIs are eventually consistent. */
+const eventually = <A, E, R>(read: Effect.Effect<A, E, R>, check: (a: A) => boolean) =>
+  read.pipe(
+    Effect.flatMap((a) => (check(a) ? Effect.succeed(a) : Effect.fail("index not caught up"))),
+    Effect.retry({ schedule: Schedule.spaced("50 millis"), times: 40 }),
+  )
+
+const ids = (rows: ReadonlyArray<{ readonly listingId: string }>) =>
+  rows.map((row) => row.listingId).sort()
+
+describeConnected("Z-order canonical shapes 7 / 8 (#171)", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        const definition = Table.definition(ZTable)
+        // Every Z-order sort key attribute is binary.
+        for (const n of [1, 2, 3, 4, 5, 6, 7]) {
+          expect(
+            definition.AttributeDefinitions.find((a) => a.AttributeName === `gsi${n}sk`)
+              ?.AttributeType,
+          ).toBe("B")
+        }
+        yield* client.createTable({
+          TableName: zTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...definition,
+        })
+      }).pipe(provideZ, Effect.scoped),
+    )
+  }, 15000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: zTableName })
+      }).pipe(
+        provideZ,
+        Effect.scoped,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 15000)
+
+  it.live("put stores every shape's B sort key; the partition-key-only accessors find it", () =>
+    Effect.gen(function* () {
+      const db = yield* zClient
+      const listing = zListing("z-put", "put-region")
+      yield* db.entities.ZShapes.put(listing)
+      const row = yield* zRow("z-put")
+      const indexes = ZShapes.indexes
+      expect(zBytes(row.gsi1sk)).toEqual(zSk(indexes.byFacets, listing))
+      // Golden: price level 250, bedrooms 3, listedAt hour 24, interleaved.
+      expect(zBytes(row.gsi1sk)).toEqual([0x00, 0x02, 0x45, 0x54, 0x68])
+      expect(zBytes(row.gsi2sk)).toEqual(zSk(indexes.byFacetsSparse, listing))
+      expect(zBytes(row.gsi3sk)).toEqual(zSk(indexes.byAgency, listing))
+      expect(zBytes(row.gsi4sk)).toEqual(zSk(indexes.byOffice, listing))
+      expect(zBytes(row.gsi5sk)).toEqual([0x01])
+      expect(zBytes(row.gsi6sk)).toEqual(zSk(indexes.byStatusPrice, listing))
+      expect(row.gsi7pk?.S).toBe(KeyComposer.composePk(zSchema, "ZShape", indexes.byFacetsAll, {}))
+      expect(zBytes(row.gsi7sk)).toEqual(zSk(indexes.byFacetsAll, listing))
+
+      for (const query of [
+        db.entities.ZShapes.byFacets({ region: "put-region" }),
+        db.entities.ZShapes.byAgency({ region: "put-region" }),
+        db.entities.ZShapes.byOffice({ region: "put-region" }),
+        db.entities.ZShapes.byStatus({ region: "put-region" }),
+        db.entities.ZShapes.byStatusPrice({ region: "put-region" }),
+      ]) {
+        const rows = yield* eventually(query.collect(), (r) => r.length === 1)
+        expect(ids(rows)).toEqual(["z-put"])
+      }
+      const all = yield* eventually(db.entities.ZShapes.byFacetsAll({}).collect(), (r) =>
+        r.some((item) => item.listingId === "z-put"),
+      )
+      expect(all.map((item) => item.listingId)).toContain("z-put")
+    }).pipe(provideZ),
+  )
+
+  it.live(
+    "7: a full update across a level moves the entry; within a level, or touching no dimension, it stays",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zClient
+        const listing = zListing("z-move", "move-region")
+        yield* db.entities.ZShapes.put(listing)
+        const before = zBytes((yield* zRow("z-move")).gsi1sk)
+
+        // Within one level (price step 1,000): the same bytes.
+        yield* db.entities.ZShapes.update({ listingId: "z-move" }).set({
+          price: 250_999,
+          bedrooms: 3,
+          listedAt: listing.listedAt,
+        })
+        expect(zBytes((yield* zRow("z-move")).gsi1sk)).toEqual(before)
+
+        // No dimension in the update: the half is skipped, the bytes stay.
+        yield* db.entities.ZShapes.update({ listingId: "z-move" }).set({ title: "Renovated" })
+        expect(zBytes((yield* zRow("z-move")).gsi1sk)).toEqual(before)
+
+        // Across a level: the entry moves, and the accessor still finds it.
+        const moved = { ...listing, price: 400_000 }
+        yield* db.entities.ZShapes.update({ listingId: "z-move" }).set({
+          price: 400_000,
+          bedrooms: 3,
+          listedAt: listing.listedAt,
+        })
+        const row = yield* zRow("z-move")
+        expect(zBytes(row.gsi1sk)).toEqual(zSk(ZShapes.indexes.byFacets, moved))
+        expect(zBytes(row.gsi1sk)).not.toEqual(before)
+        const rows = yield* eventually(
+          db.entities.ZShapes.byFacets({ region: "move-region" }).collect(),
+          (r) => r.length === 1 && r[0]!.price === 400_000,
+        )
+        expect(ids(rows)).toEqual(["z-move"])
+      }).pipe(provideZ),
+  )
+
+  it.live(
+    "7 / 7b: a partial update — 'preserve' keeps the address, 'sparse' drops the item; 7b keeps its constant PK",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zClient
+        const listing = zListing("z-partial", "partial-region")
+        yield* db.entities.ZShapes.put(listing)
+        const before = yield* zRow("z-partial")
+
+        yield* db.entities.ZShapes.update({ listingId: "z-partial" }).set({ price: 300_000 })
+        const row = yield* zRow("z-partial")
+        // 'preserve': the stored (now stale) address stays — never truncated.
+        expect(zBytes(row.gsi1sk)).toEqual(zBytes(before.gsi1sk))
+        // 'sparse': REMOVE — the item leaves the index.
+        expect(row.gsi2sk).toBeUndefined()
+        // 7b: the constant PK is SET, the SK REMOVEd.
+        expect(row.gsi7pk?.S).toBe(before.gsi7pk?.S)
+        expect(row.gsi7sk).toBeUndefined()
+        const sparse = yield* eventually(
+          db.entities.ZShapes.byFacetsSparse({ region: "partial-region" }).collect(),
+          (r) => r.length === 0,
+        )
+        expect(sparse).toEqual([])
+        const preserved = yield* eventually(
+          db.entities.ZShapes.byFacets({ region: "partial-region" }).collect(),
+          (r) => r.length === 1,
+        )
+        expect(ids(preserved)).toEqual(["z-partial"])
+
+        // 'preserve' + remove([dimension]): the cascade override REMOVEs.
+        yield* db.entities.ZShapes.update({ listingId: "z-partial" })
+          .set({ price: 300_000, bedrooms: 2 })
+          .remove(["listedAt"])
+        expect((yield* zRow("z-partial")).gsi1sk).toBeUndefined()
+        const gone = yield* eventually(
+          db.entities.ZShapes.byFacets({ region: "partial-region" }).collect(),
+          (r) => r.length === 0,
+        )
+        expect(gone).toEqual([])
+      }).pipe(provideZ),
+  )
+
+  it.live("7a / 7a′: layout edges — one bit in one byte; 14 bits right-aligned in two", () =>
+    Effect.gen(function* () {
+      const db = yield* zClient
+      yield* db.entities.ZShapes.put({ ...zListing("z-edge", "edge-region"), status: "draft" })
+      expect(zBytes((yield* zRow("z-edge")).gsi5sk)).toEqual([0x00])
+      yield* db.entities.ZShapes.update({ listingId: "z-edge" }).set({ status: "live" })
+      expect(zBytes((yield* zRow("z-edge")).gsi5sk)).toEqual([0x01])
+
+      yield* db.entities.ZShapes.update({ listingId: "z-edge" }).set({
+        status: "draft",
+        price: 0,
+      })
+      expect(zBytes((yield* zRow("z-edge")).gsi6sk)).toEqual([0x00, 0x00])
+      yield* db.entities.ZShapes.update({ listingId: "z-edge" }).set({
+        status: "live",
+        price: 8191,
+      })
+      expect(zBytes((yield* zRow("z-edge")).gsi6sk)).toEqual([0x3f, 0xff])
+      const rows = yield* eventually(
+        db.entities.ZShapes.byStatusPrice({ region: "edge-region" }).collect(),
+        (r) => r.length === 1 && r[0]!.price === 8191,
+      )
+      expect(ids(rows)).toEqual(["z-edge"])
+    }).pipe(provideZ),
+  )
+
+  it.live(
+    "8 / 8b: the prefix alone never SETs; prefix + dimensions moves the entry to the new prefix",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zClient
+        const listing = zListing("z-prefix", "prefix-region")
+        yield* db.entities.ZShapes.put(listing)
+        const before = yield* zRow("z-prefix")
+        expect(Array.from(before.gsi3sk!.B!.slice(0, 6))).toEqual([
+          0x00, 0x04, 0x61, 0x67, 0x2d, 0x31,
+        ])
+
+        // Writer A: the prefix alone — 'preserve' noop, 'sparse' REMOVE.
+        yield* db.entities.ZShapes.update({ listingId: "z-prefix" }).set({
+          agencyId: "AG-2",
+          officeId: "Office-1",
+        })
+        const afterA = yield* zRow("z-prefix")
+        expect(zBytes(afterA.gsi3sk)).toEqual(zBytes(before.gsi3sk))
+        expect(afterA.gsi4sk).toBeUndefined()
+
+        // Writer B with the prefix in the payload: SET at the new prefix.
+        const moved = { ...listing, agencyId: "AG-2", officeId: "Office-1" }
+        yield* db.entities.ZShapes.update({ listingId: "z-prefix" }).set({
+          agencyId: "AG-2",
+          officeId: "Office-1",
+          price: listing.price,
+          bedrooms: listing.bedrooms,
+          listedAt: listing.listedAt,
+        })
+        const afterB = yield* zRow("z-prefix")
+        expect(zBytes(afterB.gsi3sk)).toEqual(zSk(ZShapes.indexes.byAgency, moved))
+        expect(zBytes(afterB.gsi3sk)).not.toEqual(zBytes(before.gsi3sk))
+        // Same address, different prefix.
+        expect(zBytes(afterB.gsi3sk)!.slice(-5)).toEqual(zBytes(before.gsi3sk)!.slice(-5))
+        const rows = yield* eventually(
+          db.entities.ZShapes.byAgency({ region: "prefix-region" }).collect(),
+          (r) => r.length === 1 && r[0]!.agencyId === "AG-2",
+        )
+        expect(ids(rows)).toEqual(["z-prefix"])
+      }).pipe(provideZ),
+  )
+
+  it.live("8c: removing the leaf of a hierarchical prefix REMOVEs, never truncates", () =>
+    Effect.gen(function* () {
+      const db = yield* zClient
+      yield* db.entities.ZShapes.put(zListing("z-leaf", "leaf-region"))
+      yield* db.entities.ZShapes.update({ listingId: "z-leaf" })
+        .set({ agencyId: "AG-3", price: 250_000 })
+        .remove(["officeId"])
+      const row = yield* zRow("z-leaf")
+      // 'sparse' (byOffice) by rule, 'preserve' (byAgency) by the cascade override.
+      expect(row.gsi4sk).toBeUndefined()
+      expect(row.gsi3sk).toBeUndefined()
+      for (const query of [
+        db.entities.ZShapes.byOffice({ region: "leaf-region" }),
+        db.entities.ZShapes.byAgency({ region: "leaf-region" }),
+      ]) {
+        expect(yield* eventually(query.collect(), (r) => r.length === 0)).toEqual([])
+      }
+    }).pipe(provideZ),
+  )
+
+  it.live(
+    "8a: every Z-order field a primary-key composite — recomposed on an unrelated update",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zClient
+        const client = yield* DynamoClient
+        const keyed = {
+          region: "keyed-region",
+          agencyId: "AG-1",
+          price: 250_000,
+          bedrooms: 3,
+          listedAt: DateTime.makeUnsafe("2024-01-02T00:00:00.000Z"),
+        }
+        yield* db.entities.ZKeyed.put(keyed)
+        const expected = zSk(ZKeyed.indexes.byAgency, keyed)
+        const key = toAttributeMap(
+          KeyComposer.composeIndexKeys(
+            zSchema,
+            "ZKeyed",
+            1,
+            ZKeyed.indexes.primary,
+            zKeyForm(keyed),
+          ),
+        )
+        const stored = yield* client.getItem({
+          TableName: zTableName,
+          Key: key,
+          ConsistentRead: true,
+        })
+        expect(zBytes(stored.Item!.gsi3sk)).toEqual(expected)
+
+        // Drop the index keys out of band (as an item written before the index
+        // existed would lack them), then update a field no key uses.
+        yield* client.updateItem({
+          TableName: zTableName,
+          Key: key,
+          UpdateExpression: "REMOVE gsi3pk, gsi3sk",
+        })
+        yield* db.entities.ZKeyed.update(keyed).set({ title: "Renovated" })
+        const row = yield* client.getItem({ TableName: zTableName, Key: key, ConsistentRead: true })
+        expect(zBytes(row.Item!.gsi3sk)).toEqual(expected)
+        expect(row.Item!.gsi3pk?.S).toBe(
+          KeyComposer.composePk(zSchema, "ZKeyed", ZKeyed.indexes.byAgency, zKeyForm(keyed)),
+        )
+        // ZKeyed shares gsi3 with ZShapes; the accessor reads its own items only.
+        const rows = yield* eventually(
+          db.entities.ZKeyed.byAgency({ region: "keyed-region" }).collect(),
+          (r) => r.length === 1,
+        )
+        expect(rows[0]!.title).toBe("Renovated")
+      }).pipe(provideZ),
   )
 })
 

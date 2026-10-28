@@ -1,6 +1,8 @@
 /**
  * #171: adaptive request sizing, skip-scan and Z-order indexes — connected
- * tests against DynamoDB Local.
+ * tests against DynamoDB Local. The Z-order cases seed 2,600 listings
+ * (`helpers/ZOrderListings.ts`) and compare every strategy against a
+ * brute-force scan, in the index order the stored binary keys give.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -17,7 +19,7 @@
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, Effect, Layer, Schema } from "effect"
+import { Config, DateTime, Effect, Layer, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -25,6 +27,8 @@ import * as Entity from "../src/Entity.js"
 import * as Cursor from "../src/internal/Cursor.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import { compareBytes } from "./helpers/PartitionMock.js"
+import * as ZListings from "./helpers/ZOrderListings.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -633,5 +637,371 @@ describeConnected("#171 a ref-derived composite bound — connected", () => {
       expect((yield* below.explain()).rowChecks).toEqual(["partId"])
       expect(lineIdsOf(yield* below.collect())).toEqual(wanted((partId) => partId < "part-05"))
     }).pipe(provideRef),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Z-order indexes (design §5, §8.5, §11)
+// ---------------------------------------------------------------------------
+
+const zTableName = `zorder-conn-${Date.now()}`
+const provideZ = Effect.provide(
+  Layer.mergeAll(ClientLayer, ZListings.MainTable.layer({ name: zTableName })),
+)
+const zListingsDb = () =>
+  DynamoClient.make({
+    entities: { Listings: ZListings.Listings },
+    tables: { MainTable: ZListings.MainTable },
+  })
+
+/** 2,000 listings in one region, every field drawn at random. */
+const NORTH = ZListings.randomZListings(2_026, 2_000)
+/** A second region, gapped: prices in two narrow clusters, so the box's hull is mostly gap. */
+const SOUTH = ZListings.randomZListings(1_717, 600, {
+  prices: [
+    ...Array.from({ length: 20 }, (_, i) => 200 + i),
+    ...Array.from({ length: 20 }, (_, i) => 800 + i),
+  ],
+}).map((l) => ({ ...l, region: "south", listingId: `s-${l.listingId}` }))
+/** The stored rows, composed by the entity's own puts (no DynamoDB involved). */
+const Z_ROW_OF = (() => {
+  const all = [...NORTH, ...SOUTH]
+  const rows = ZListings.storedRows(all)
+  return new Map(all.map((l, i) => [l.listingId, rows[i]!]))
+})()
+
+const zIds = (items: ReadonlyArray<{ readonly listingId: string }>) =>
+  items.map((item) => item.listingId)
+
+/**
+ * `got` is exactly `want`, in `accessor`'s index order: sort key bytes
+ * ascending (descending in reverse). Rows with the same sort key come back in
+ * an order DynamoDB doesn't document, so only the keys' order is asserted.
+ */
+const expectIndexOrder = (
+  accessor: ZListings.Accessor,
+  got: ReadonlyArray<{ readonly listingId: string }>,
+  want: ReadonlyArray<{ readonly listingId: string }>,
+  reverse = false,
+  label = "",
+) => {
+  expect([...zIds(got)].sort(), label).toEqual([...zIds(want)].sort())
+  const sk = ZListings.INDEX[accessor].sk
+  const keys = got.map((item) => Z_ROW_OF.get(item.listingId)![sk]!.B!)
+  for (let i = 1; i < keys.length; i++) {
+    const order = compareBytes(keys[i - 1]!, keys[i]!)
+    expect(reverse ? order >= 0 : order <= 0, `${label} at ${i}`).toBe(true)
+  }
+}
+
+const STRATEGIES = ["naive", "jump", "precise", "auto"] as const
+
+describeConnected("#171 Z-order indexes — connected", () => {
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: zTableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(ZListings.MainTable),
+        })
+        yield* Batch.write([...NORTH, ...SOUTH].map((l) => ZListings.Listings.put(l)))
+      }).pipe(provideZ),
+    )
+  }, 300_000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: zTableName })
+      }).pipe(
+        provideZ,
+        Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+      ),
+    )
+  }, 30_000)
+
+  it.effect(
+    "every strategy and auto equals a brute-force filtered scan, in index order, both ways",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zListingsDb()
+        const scanned = (yield* db.entities.Listings.scan().collect()).filter(
+          (l) => l.region === ZListings.REGION,
+        )
+        expect(scanned.length).toBe(NORTH.length)
+        const boxes = [
+          [
+            [100, 400],
+            [2, 5],
+          ],
+          [
+            [0, 1023],
+            [9, 9],
+          ],
+          [
+            [700, 760],
+            [0, 15],
+          ],
+        ] as const
+        for (const [prices, beds] of boxes) {
+          const want = scanned.filter(
+            (l) =>
+              l.price >= prices[0] &&
+              l.price <= prices[1] &&
+              l.bedrooms >= beds[0] &&
+              l.bedrooms <= beds[1],
+          )
+          expect(want.length).toBeGreaterThan(0)
+          for (const strategy of STRATEGIES) {
+            for (const reverse of [false, true]) {
+              const base = db.entities.Listings.byFacets({ region: ZListings.REGION })
+                .within({ price: { between: prices }, bedrooms: { between: beds } })
+                .zorder({ strategy })
+              const got = yield* (reverse ? base.reverse() : base).collect()
+              expectIndexOrder("byFacets", got, want, reverse, `${strategy} ${reverse}`)
+              expect(yield* base.count(), `${strategy} count`).toBe(want.length)
+            }
+          }
+        }
+      }).pipe(provideZ),
+    60_000,
+  )
+
+  it.effect(
+    "fetch chains equal one collect, with limits landing exactly on precise range ends",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zListingsDb()
+        for (const strategy of ["precise", "jump", "naive"] as const) {
+          const query = db.entities.Listings.byFacets({ region: ZListings.REGION })
+            .within({ price: { between: [300, 520] }, bedrooms: { gte: 6, lte: 12 } })
+            .zorder({ strategy, maxRanges: 8 })
+          const events: Array<Query.QueryRequestEvent> = []
+          const all = zIds(
+            yield* query.onRequest((event) => Effect.sync(() => void events.push(event))).collect(),
+          )
+          expect(all.length).toBeGreaterThan(10)
+          // Each precise range is one natural page: its accepted rows end exactly at the range end.
+          const rangeEnds = strategy === "precise" ? events.map((event) => event.accepted) : []
+          const limits = new Set([1, 7, ...rangeEnds.filter((n) => n > 0)])
+          for (const limit of limits) {
+            const pages = yield* fetchChain(query.limit(limit))
+            expect(zIds(pages.flatMap((page) => page.items)), `${strategy} ${limit}`).toEqual(all)
+          }
+          if (strategy === "precise") {
+            const first = rangeEnds.find((n) => n > 0)!
+            const page = yield* query.limit(first).fetch()
+            expect(page.items.length).toBe(first)
+            // Through the end of a range, not inside one.
+            const cursor = Cursor.decode(page.cursor!)!
+            expect(cursor.k).toBeUndefined()
+          }
+        }
+      }).pipe(provideZ),
+    60_000,
+  )
+
+  it.effect("a NumberFromString dimension returns the same set as a brute-force scan", () =>
+    Effect.gen(function* () {
+      const db = yield* zListingsDb()
+      const scanned = (yield* db.entities.Listings.scan().collect()).filter(
+        (l) => l.region === ZListings.REGION,
+      )
+      // Stored as S: "95" sorts after "610" as text, so only a per-row numeric check is exact.
+      const want = scanned.filter((l) => l.priceText >= 95 && l.priceText < 610 && l.bedrooms <= 6)
+      for (const strategy of STRATEGIES) {
+        const got = yield* db.entities.Listings.byText({ region: ZListings.REGION })
+          .within({ priceText: { gte: 95, lt: 610 }, bedrooms: { lte: 6 } })
+          .zorder({ strategy })
+          .collect()
+        expectIndexOrder("byText", got, want, false, strategy)
+      }
+    }).pipe(provideZ),
+  )
+
+  it.effect("a binary prefix skip-scans each agency and office, and checks a hashed office", () =>
+    Effect.gen(function* () {
+      const db = yield* zListingsDb()
+      const skipped = observed()
+      const query = db.entities.Listings.byAgency({ region: ZListings.REGION })
+        .within({ officeId: "o-2", price: { lte: 400 } })
+        .onRequest(skipped.observer)
+      const explain = yield* query.explain()
+      expect(explain.plan).toBe("skip-scan")
+      expect(explain.rowChecks).toEqual(["officeId"])
+      const want = NORTH.filter((l) => l.officeId === "o-2" && l.price <= 400)
+      const all = yield* query.collect()
+      expectIndexOrder("byAgency", all, want)
+      expect(skipped.scanned()).toBeLessThan(NORTH.length / 2)
+      const pages = yield* fetchChain(query.limit(9))
+      expect(zIds(pages.flatMap((page) => page.items))).toEqual(zIds(all))
+    }).pipe(provideZ),
+  )
+
+  it.effect(
+    "jump on gapped data: run sizing examines fewer rows than a page sized to the cap",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zListingsDb()
+        const box = { price: { between: [150, 900] }, bedrooms: { between: [3, 12] } } as const
+        const want = SOUTH.filter(
+          (l) => l.price >= 150 && l.price <= 900 && l.bedrooms >= 3 && l.bedrooms <= 12,
+        )
+        const query = db.entities.Listings.byFacets({ region: "south" })
+          .within(box)
+          .zorder({ strategy: "jump" })
+        const run = observed()
+        const capped = observed()
+        const hull = observed()
+        const sized = yield* query.limit(50).onRequest(run.observer).collect()
+        // Where pass-rate sizing grows on a selective box: the 1,000-row cap.
+        const fixed = yield* query
+          .zorder({ pageSize: 1_000 })
+          .limit(50)
+          .onRequest(capped.observer)
+          .collect()
+        const naive = yield* query
+          .zorder({ strategy: "naive" })
+          .limit(50)
+          .onRequest(hull.observer)
+          .collect()
+        const all = yield* query.collect()
+        expectIndexOrder("byFacets", all, want)
+        const first50 = zIds(all).slice(0, 50)
+        expect(zIds(sized)).toEqual(first50)
+        expect(zIds(fixed)).toEqual(first50)
+        expect(zIds(naive)).toEqual(first50)
+        // §8.5's worked case: a page sized to the cap reads deep into the gaps (564 rows here).
+        expect(run.scanned() * 5).toBeLessThanOrEqual(capped.scanned())
+        expect(run.scanned()).toBeLessThan(hull.scanned())
+        // Estimator constants (Q5): jump requests start at 16 and never pass 1,000.
+        expect(run.events[0]!.limit).toBe(16)
+        expect(run.events.every((event) => event.limit! <= 1_000)).toBe(true)
+        // count sizes its COUNT requests the same way.
+        const counted = observed()
+        expect(yield* query.onRequest(counted.observer).count()).toBe(want.length)
+        expect(counted.events[0]!.limit).toBe(16)
+        expect(counted.scanned()).toBeLessThan(capped.scanned() + want.length * 4)
+      }).pipe(provideZ),
+    60_000,
+  )
+
+  it.effect(
+    "jump on a selective box: a small multiple of what it returns, against a pass-rate-sized filter",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* zListingsDb()
+        // 8 of the 40 prices and 3 of the 16 bedroom counts: about 4% of the partition.
+        const holds = (l: ZListings.ZListing) =>
+          l.price >= 805 && l.price <= 812 && l.bedrooms >= 2 && l.bedrooms <= 4
+        const want = SOUTH.filter(holds)
+        expect(want.length / SOUTH.length).toBeLessThan(0.05)
+        const jump = db.entities.Listings.byFacets({ region: "south" })
+          .within({ price: { between: [805, 812] }, bedrooms: { between: [2, 4] } })
+          .zorder({ strategy: "jump" })
+        // The same rows without `.within()`: one range over the partition, the
+        // bounds a filter, each request sized from the pass rate so far (§8).
+        const filtered = db.entities.Listings.byFacets({ region: "south" }).filter(
+          (t, { and, between }) => and(between(t.price, 805, 812), between(t.bedrooms, 2, 4)),
+        )
+        for (const limit of [10, want.length]) {
+          const run = observed()
+          const pass = observed()
+          const got = yield* jump.limit(limit).onRequest(run.observer).collect()
+          const baseline = yield* filtered.limit(limit).onRequest(pass.observer).collect()
+          expect(got.length).toBe(limit)
+          expect(zIds(got), `${limit}`).toEqual(zIds(baseline))
+          // Jump examines the box's rows and at most a run into each gap: at
+          // most 2 rows per row returned. The filter skips nothing: it reads
+          // up to its last match, at least 10 times what jump read.
+          expect(run.scanned(), `${limit}`).toBeLessThanOrEqual(2 * got.length)
+          expect(pass.scanned(), `${limit}`).toBeGreaterThanOrEqual(10 * run.scanned())
+          const runCount = observed()
+          const passCount = observed()
+          expect(yield* jump.limit(limit).onRequest(runCount.observer).count()).toBe(limit)
+          expect(yield* filtered.limit(limit).onRequest(passCount.observer).count()).toBe(limit)
+          expect(runCount.scanned()).toBeLessThanOrEqual(2 * limit)
+          expect(passCount.scanned()).toBeGreaterThanOrEqual(10 * runCount.scanned())
+        }
+      }).pipe(provideZ),
+    60_000,
+  )
+
+  it.effect("DateEpochSeconds: a window inside one second holds the listing stored at it", () =>
+    Effect.gen(function* () {
+      const db = yield* zListingsDb()
+      // Its own partition: listings at whole seconds T - 1, T and T + 1.
+      const T = ZListings.EPOCH_MS + 100_000 * 1000
+      const listed = [-1, 0, 1].map((n) => ({
+        ...NORTH[n + 1]!,
+        region: "east",
+        listingId: `e-${n + 1}`,
+        listedAt: DateTime.makeUnsafe(T + n * 1000),
+      }))
+      for (const listing of listed) yield* db.entities.Listings.put(listing)
+      const at = (plus: number) => DateTime.makeUnsafe(T + plus)
+      const cases = [
+        [{ gte: at(0), lt: at(500) }, ["e-1"]],
+        [{ gt: at(-500), lte: at(0) }, ["e-1"]],
+        [{ gt: at(-1_000), lt: at(1_000) }, ["e-1"]],
+        [{ gt: at(0), lt: at(1_000) }, []],
+        [{ gte: at(500), lte: at(900) }, []],
+      ] as const
+      for (const [bound, want] of cases) {
+        const sent = observed()
+        const got = yield* db.entities.Listings.byListed({ region: "east" })
+          .within({ listedAt: bound })
+          .onRequest(sent.observer)
+          .collect()
+        expect(zIds(got), JSON.stringify(bound)).toEqual(want)
+        // No stored second in the window: nothing is sent.
+        if (want.length === 0) expect(sent.events).toEqual([])
+      }
+    }).pipe(provideZ),
+  )
+
+  it.effect("an empty box sends nothing; a DateTimeZoned and a literals bound are exact", () =>
+    Effect.gen(function* () {
+      const db = yield* zListingsDb()
+      const nothing = observed()
+      expect(
+        yield* db.entities.Listings.byFacets({ region: ZListings.REGION })
+          .within({ price: { gte: 600, lte: 100 } })
+          .onRequest(nothing.observer)
+          .collect(),
+      ).toEqual([])
+      expect(nothing.events).toEqual([])
+
+      const scanned = (yield* db.entities.Listings.scan().collect()).filter(
+        (l) => l.region === ZListings.REGION,
+      )
+      const ms = (value: { readonly epochMilliseconds: number }) => value.epochMilliseconds
+      const from = ZListings.EPOCH_MS + 200 * 3_600_000
+      const to = ZListings.EPOCH_MS + 500 * 3_600_000
+      const opened = yield* db.entities.Listings.byOpened({ region: ZListings.REGION })
+        .within({
+          openedAt: {
+            gte: DateTime.makeZonedUnsafe(from, { timeZone: "Europe/London" }),
+            lt: DateTime.makeZonedUnsafe(to, { timeZone: "Europe/London" }),
+          },
+        })
+        .collect()
+      expectIndexOrder(
+        "byOpened",
+        opened,
+        scanned.filter((l) => ms(l.openedAt) >= from && ms(l.openedAt) < to),
+      )
+      const codes = yield* db.entities.Listings.byCode({ region: ZListings.REGION })
+        .within({ code: { gte: "c010" }, bedrooms: { lte: 3 } })
+        .collect()
+      expectIndexOrder(
+        "byCode",
+        codes,
+        scanned.filter((l) => ZListings.CODES.indexOf(l.code) >= 10 && l.bedrooms <= 3),
+      )
+    }).pipe(provideZ),
   )
 })

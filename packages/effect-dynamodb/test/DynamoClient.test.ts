@@ -10,6 +10,7 @@ import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
+import * as ZListings from "./helpers/ZOrderListings.js"
 
 const configFromMap = (entries: Record<string, string>) =>
   ConfigProvider.layer(ConfigProvider.fromUnknown(entries))
@@ -1962,5 +1963,82 @@ describe(".within() on composite accessors (#171)", () => {
         expect(() => byCustomer(pins).within(bounds), JSON.stringify(bounds)).toThrow(message)
       }
     }).pipe(Effect.provide(Layer.merge(TestDynamoClient, WithinTable.layer({ name: "within" })))),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// .within() on Z-order accessors (#171)
+// ---------------------------------------------------------------------------
+
+describe(".within() on Z-order accessors (#171)", () => {
+  const rows = ZListings.storedRows(ZListings.randomZListings(3, 40))
+  const run = <X, E>(
+    body: (listings: Effect.Success<typeof ZListings.listings>) => Effect.Effect<X, E>,
+  ) => {
+    const { layer } = ZListings.servePartition("byFacets", rows)
+    return Effect.flatMap(ZListings.listings, body).pipe(Effect.provide(layer))
+  }
+
+  it.effect("plans the box at .within(): explain and a terminal see one plan", () =>
+    run((listings) =>
+      Effect.gen(function* () {
+        const query = listings
+          .byFacets({ region: ZListings.REGION })
+          .within({ price: { lte: 300 }, bedrooms: { gte: 2 } })
+        const explain = yield* query.explain()
+        expect(explain.index).toBe("gsi1")
+        expect(explain.zorder?.box.map((dim) => [dim.field, dim.levels])).toEqual([
+          ["price", [["0", "300"]]],
+          ["bedrooms", [["2", "15"]]],
+        ])
+        const zorder = yield* query.zorder({ strategy: "naive" }).explain()
+        expect([zorder.plan, zorder.keyConditions.length]).toEqual(["naive", 1])
+      }),
+    ),
+  )
+
+  it.effect("misuse from untyped code throws EDD-9093 at .within()", () =>
+    run((listings) =>
+      Effect.gen(function* () {
+        const byAgency = (bounds: unknown) =>
+          (listings.byAgency({ region: ZListings.REGION }) as any).within(bounds)
+        const cases: Array<readonly [unknown, RegExp]> = [
+          [[{ price: { gte: 1 } }], /pass an object of bounds/],
+          [{ region: { eq: "south" } }, /partition key composite/],
+          [{ colour: { eq: "red" } }, /not a dimension or prefix composite/],
+          [{ agencyId: { gte: "ag-1" } }, /takes one exact value, not a range bound/],
+          [{ price: { lt: 1, lte: 2 } }, /is not one of/],
+          [{ price: { eq: 1, gte: 0 } }, /is not one of/],
+          [{ price: {} }, /is not one of/],
+          [{ price: { between: [1] } }, /is not one of/],
+          [{ price: { in: [1, 2] } }, /"in" bounds only a literals dimension/],
+          [{ price: { gte: "100" } }, /key form is a number/],
+        ]
+        for (const [bounds, message] of cases) {
+          expect(() => byAgency(bounds), JSON.stringify(bounds)).toThrow(/\[EDD-9093\]/)
+          expect(() => byAgency(bounds), JSON.stringify(bounds)).toThrow(message)
+        }
+      }),
+    ),
+  )
+
+  it.effect("a value no level holds throws EDD-9092 at .within()", () =>
+    run((listings) =>
+      Effect.gen(function* () {
+        const byStatus = listings.byStatus({ region: ZListings.REGION }) as any
+        expect(() => byStatus.within({ status: { eq: "archived" } })).toThrow(
+          /\[EDD-9092\] Z-order dimension "status" can't place "archived"/,
+        )
+        expect(() => byStatus.within({ status: { in: ["live", "archived"] } })).toThrow(
+          /\[EDD-9092\]/,
+        )
+        const byFacets = listings.byFacets({ region: ZListings.REGION }) as any
+        expect(() => byFacets.within({ price: { gte: Number.NaN } })).toThrow(
+          /\[EDD-9092\] Z-order dimension "price" can't place NaN/,
+        )
+        // Out of range is clamped into the box, never refused: the filter is exact.
+        expect(() => byFacets.within({ price: { gte: 5_000 } })).not.toThrow()
+      }),
+    ),
   )
 })

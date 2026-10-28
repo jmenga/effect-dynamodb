@@ -234,6 +234,72 @@ describe("ParamsBuilder", () => {
     })
   })
 
+  describe("Z-order sort keys (#171)", () => {
+    const listingEntity: ResolvedEntity = {
+      variableName: "Listings",
+      entityType: "Listing",
+      schema: { name: "myapp", version: 1, casing: "lowercase" },
+      indexes: {
+        primary: {
+          pk: { field: "pk", composite: ["listingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        search: {
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["region"] },
+          sk: {
+            field: "gsi2sk",
+            composite: ["agencyId", "price", "bedrooms"],
+            zorder: { prefix: ["agencyId"], dimensions: ["price", "bedrooms"] },
+          },
+        },
+      },
+      timestamps: false,
+      versioned: false,
+      softDelete: false,
+      unique: undefined,
+    }
+
+    it("put shows the Z-order sort key as a binary placeholder", () => {
+      const params = buildParamsOrThrow({
+        entity: listingEntity,
+        type: "put",
+        arguments: {
+          listingId: "l-1",
+          region: "north",
+          agencyId: "ag-1",
+          price: 250000,
+          bedrooms: 3,
+        },
+      })
+      expect(params.Item!.gsi2sk).toBe("<binary Z-order key>")
+      expect(params.Item!.gsi2pk).toBe("$myapp#v1#listing#region_north")
+    })
+
+    it("an accessor query conditions on the partition key alone", () => {
+      const params = buildParamsOrThrow({
+        entity: listingEntity,
+        type: "entity-query-accessor",
+        indexName: "search",
+        arguments: { region: "north" },
+      })
+      expect(params.KeyConditionExpression).toBe("#pk = :pk")
+      expect(params.ExpressionAttributeNames).toEqual({ "#pk": "gsi2pk" })
+      expect(params.info).toContain("SK: <binary Z-order key> over agencyId, price, bedrooms")
+      expect(params.info).toContain(".within()")
+    })
+
+    it("the legacy query builder adds no begins_with on a Z-order key", () => {
+      const params = buildParamsOrThrow({
+        entity: listingEntity,
+        type: "query",
+        indexName: "search",
+        arguments: { region: "north", agencyId: "ag-1" },
+      })
+      expect(params.KeyConditionExpression).toBe("#pk = :pk")
+    })
+  })
+
   describe("Scan", () => {
     it("should build ScanCommand params with filter expression", () => {
       const op: DetectedOperation = {
