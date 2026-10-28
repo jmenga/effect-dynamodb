@@ -38,12 +38,12 @@ import {
   Schedule,
   type Schema,
 } from "effect"
-import { DynamoClient } from "../DynamoClient.js"
 import { decodeMarshalledItem } from "../Entity.js"
 import type { StreamEvent } from "../EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 import type * as Query from "../Query.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
 import {
@@ -361,7 +361,7 @@ export const makeEngine = (config: EngineConfig) => {
   /** The row, read strongly consistent — raw, so a tombstone reads as one. */
   const readRow = (key: unknown): Effect.Effect<Option.Option<Row>, any, any> =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const TableName = yield* tableName
       const result = yield* client.getItem({
         TableName,
@@ -647,7 +647,7 @@ export const makeEngine = (config: EngineConfig) => {
     revision: number | undefined,
   ): Effect.Effect<Option.Option<unknown>, any, any> =>
     Effect.gen(function* () {
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const TableName = yield* tableName
       const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
       const condition = guard(row)
@@ -1197,7 +1197,7 @@ export const makeEngine = (config: EngineConfig) => {
   ): Effect.Effect<DrainResult<E>, any, any> =>
     Effect.gen(function* () {
       const outbox = config.outbox!
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const TableName = yield* outboxTable
       const keys = outboxKeys()
       let delivered = 0
@@ -1306,7 +1306,7 @@ export const makeEngine = (config: EngineConfig) => {
           cause: "`drainPending` needs `outbox.index` (a sparse index over the outbox items).",
         })
       }
-      const client = yield* DynamoClient
+      const client = yield* Capacity.client
       const TableName = yield* outboxTable
       const rows = new Map<string, readonly [string, string]>()
       let start: Record<string, AttributeValue> | undefined

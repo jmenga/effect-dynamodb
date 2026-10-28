@@ -16,10 +16,11 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
-import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
+import * as Capacity from "./internal/Capacity.js"
 import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./internal/ItemSize.js"
 import {
@@ -94,6 +95,15 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
   BatchGetResult<T>,
   DynamoClientError | ValidationError,
   DynamoClient | TableConfig
+> => Capacity.operation("Batch.get", undefined, getCore(items, config))
+
+const getCore = <const T extends ReadonlyArray<AnyGet>>(
+  items: T,
+  config?: BatchRetryConfig,
+): Effect.Effect<
+  BatchGetResult<T>,
+  DynamoClientError | ValidationError,
+  DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     const maxRetries = config?.maxRetries ?? MAX_RETRIES
@@ -102,7 +112,7 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
     // TypeScript cannot infer that [] satisfies a mapped tuple type, so we cast.
     if (items.length === 0) return [] as unknown as BatchGetResult<T>
 
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
 
     // Unwrap each position to its get descriptor. A rejection belongs on the
     // error channel, not as a defect — a thrown Error is neither catchable nor
@@ -287,12 +297,18 @@ export const write = (
   operations: ReadonlyArray<BatchWriteOp>,
   config?: BatchRetryConfig,
 ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  Capacity.operation("Batch.write", undefined, writeCore(operations, config))
+
+const writeCore = (
+  operations: ReadonlyArray<BatchWriteOp>,
+  config?: BatchRetryConfig,
+): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     if (operations.length === 0) return
     const maxRetries = config?.maxRetries ?? MAX_RETRIES
     const baseDelayMs = config?.baseDelayMs ?? BASE_DELAY_MS
 
-    const client = yield* DynamoClient
+    const client = yield* Capacity.client
 
     // Build write requests
     const versionedPuts: Array<VersionedPut> = []
