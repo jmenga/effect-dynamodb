@@ -118,6 +118,7 @@ import {
   withRegistry,
 } from "./internal/Packed.js"
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import { KEY_MAX, keyJustBelow } from "./internal/RangePlanner.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -1287,6 +1288,19 @@ export interface Entity<
  * ```
  */
 /**
+ * What `.history(key).where()` accepts for the `orderBy` attribute: its model
+ * type, as `.where()` on an accessor takes, plus the stored text form for a
+ * non-numeric one (an ISO string for a `DateTime`, as the history guide
+ * shows). A `number` or `bigint` `orderBy` takes a number: it was typed
+ * `string` only, so a numeric history bound did not compile.
+ */
+type HistoryOrderByOperand<M, K extends string> = K extends keyof M
+  ? [M[K]] extends [number | bigint]
+    ? M[K]
+    : M[K] | string
+  : string
+
+/**
  * The logical vector index names an entity declares, as a string union.
  *
  * Resolves to `never` for entities without `vectorIndexes`, which makes
@@ -1640,11 +1654,14 @@ export interface BoundEntity<
    * Only available when the entity was built with `timeSeries: { ... }`.
    */
   readonly history: [TTimeSeries] extends [TimeSeriesConfig<any>]
-    ? (
-        key: TKey,
-      ) => import("./internal/BoundQuery.js").BoundQuery<
+    ? (key: TKey) => import("./internal/BoundQuery.js").BoundQuery<
         PathModel<ModelType<TModel>, TPackedFields>,
-        { readonly [K in NonNullable<TTimeSeries>["orderBy"] & string]: string },
+        {
+          readonly [K in NonNullable<TTimeSeries>["orderBy"] & string]: HistoryOrderByOperand<
+            ModelType<TModel>,
+            K
+          >
+        },
         ModelType<TModel>
       >
     : never
@@ -2769,6 +2786,11 @@ const makeImpl = <
     Schema.encodeUnknownEffect(schemas.keySchema as Schema.Codec<any>)(key).pipe(
       Effect.map((encoded) => encoded as globalThis.Record<string, unknown>),
       Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+      // A composite with no key text (`NaN`, `[EDD-9096]`) fails here, as a
+      // `ValidationError`, not as a defect where the caller composes the key.
+      Effect.tap((encoded) =>
+        composeKeysOrFail(entityType, operation, () => composePrimaryKey(encoded)),
+      ),
     )
 
   /**
@@ -2906,13 +2928,31 @@ const makeImpl = <
 
   /**
    * Every index's keys for `record`. A Z-order sort key can fail to place a
-   * value (`[EDD-9092]`, #171), which surfaces as a `ValidationError` for
-   * `operation`.
+   * value (`[EDD-9092]`, #171), and a composite can have no key text (`NaN`,
+   * `[EDD-9096]`), which surface as a `ValidationError` for `operation`. So
+   * does a unique field with no key text: its sentinel key is composed later,
+   * on the guarded path after the item is marshalled, and the marshaller
+   * would refuse a `NaN` as a defect.
    */
   const composeAllKeys = (record: globalThis.Record<string, unknown>, operation: string) =>
-    composeKeysOrFail(entityType, operation, () =>
-      KeyComposer.composeAllKeys(schema, entityType, entityVersion, allIndexes, keyForm(record)),
-    )
+    composeKeysOrFail(entityType, operation, () => {
+      const keys = KeyComposer.composeAllKeys(
+        schema,
+        entityType,
+        entityVersion,
+        allIndexes,
+        keyForm(record),
+      )
+      for (const constraintDef of Object.values(
+        (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+      )) {
+        for (const field of resolveUniqueFields(constraintDef)) {
+          const value = record[field]
+          if (value !== undefined && value !== null) KeyComposer.serializeValue(value)
+        }
+      }
+      return keys
+    })
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -5748,6 +5788,23 @@ const makeImpl = <
         }
       }
 
+      // The index keys the payload feeds, composed once before anything is
+      // marshalled: a composite with no key text (`NaN`, `[EDD-9096]`) or
+      // Z-order level (`[EDD-9092]`) fails the update with a
+      // `ValidationError`, where the marshaller would refuse the attribute as
+      // a defect. Each branch below composes the keys it writes itself.
+      yield* composeKeysOrFail(entityType, "update", () =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(encodedKey as globalThis.Record<string, unknown>),
+          uState.remove === undefined ? {} : { removedSet: new Set(uState.remove) },
+        ),
+      )
+
       // Compose primary key
       const primaryKey = composePrimaryKey(encodedKey)
       const marshalledKey = toAttributeMap(primaryKey)
@@ -8540,7 +8597,11 @@ const makeImpl = <
 
           const item = encoded as globalThis.Record<string, unknown>
 
-          // Compose primary key
+          // Every index's keys, composed before anything is marshalled: a
+          // composite with no key text (`NaN`, `[EDD-9096]`) or Z-order level
+          // (`[EDD-9092]`) fails the upsert with a `ValidationError`, where the
+          // marshaller would refuse the attribute as a defect.
+          const allKeys = yield* composeAllKeys(item, "upsert")
           const primaryKey = composePrimaryKey(item)
           const marshalledKey = toAttributeMap(primaryKey)
 
@@ -8629,7 +8690,6 @@ const makeImpl = <
           }
 
           // Add all index keys (including GSIs)
-          const allKeys = yield* composeAllKeys(item, "upsert")
           for (const [field, value] of Object.entries(allKeys)) {
             // Skip primary key fields (they're in Key, not UpdateExpression)
             if (
@@ -8994,17 +9054,26 @@ const makeImpl = <
         }
       }
 
-      // Compose current-item primary key (pk + sk derived from PK/SK composites)
+      // Compose current-item primary key (pk + sk derived from PK/SK composites),
+      // and the event key's orderBy text, before anything is marshalled: a
+      // value with no key text (`NaN`, `[EDD-9096]`) fails the append with a
+      // `ValidationError`, where the marshaller would refuse it as a defect.
       const primary = config.indexes.primary
       const appendKeyForm = keyForm(encoded)
-      const pkValue = KeyComposer.composePk(schema, entityType, primary, appendKeyForm)
-      const currentSk = KeyComposer.composeSk(
-        schema,
-        entityType,
-        entityVersion,
-        primary,
-        appendKeyForm,
-      )
+      const { pkValue, currentSk } = yield* composeKeysOrFail(entityType, "append", () => {
+        const currentSk = KeyComposer.composeSk(
+          schema,
+          entityType,
+          entityVersion,
+          primary,
+          appendKeyForm,
+        )
+        KeyComposer.composeEventSk(currentSk, encoded[orderByField], schema.casing)
+        return {
+          pkValue: KeyComposer.composePk(schema, entityType, primary, appendKeyForm),
+          currentSk,
+        }
+      })
       const marshalledKey = toAttributeMap({
         [primary.pk.field]: pkValue,
         [primary.sk.field]: currentSk,
@@ -9453,18 +9522,21 @@ const makeImpl = <
         keyConditionDiagnosis: { operation: "query", label: `${entityType}.query.${indexName}` },
       })
       if (hasSkComposites) {
-        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
-        // must terminate on a segment boundary when composites remain, or it
-        // matches sibling values that merely start with the supplied one
-        // (`status_done` also matching `status_done_archived`, issue #115).
-        const skPrefix = KeyComposer.composeSortKeyBeginsWith(
-          schema,
-          entityType,
-          entityVersion,
-          indexDef,
-          pkKeyForm,
+        // `composeSortKeyCondition`: a partial prefix terminates on a segment
+        // boundary, or it matches sibling values that merely start with the
+        // supplied one (`status_done` also matching `status_done_archived`,
+        // issue #115); a complete key is an exact `=`, or `seq: 3` also
+        // matches 3.14.
+        return Query.where(
+          query,
+          KeyComposer.composeSortKeyCondition(
+            schema,
+            entityType,
+            entityVersion,
+            indexDef,
+            pkKeyForm,
+          ),
         )
-        return Query.where(query, { beginsWith: skPrefix })
       }
       return query
     }
@@ -10845,21 +10917,43 @@ export const bind = <
           // Key form first: the event SK is composed from the key form of the
           // orderBy value (`Entity.append` composes from `serialisedInput`), so
           // a transformed orderBy composite must take the same route here.
+          const keyFormOf = (v: unknown) =>
+            orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy]
           const rewrite = (v: unknown) =>
             `${prefix}${DynamoSchema.applyCasing(
-              KeyComposer.serializeValue(
-                orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy],
-              ),
+              KeyComposer.serializeValue(keyFormOf(v)),
               schemaRef.casing,
             )}`
+          // DynamoDB allows ONE sort key condition, and this one replaces the
+          // history query's `begins_with(prefix)`. Every operator therefore
+          // keeps both ends inside `prefix` — the `.where()` clamp of
+          // `composeRangeUnder`, for a value that is the key's last segment.
+          // A bare one-sided `<` / `>` ran on to the item's current row and
+          // its siblings' events. Strict `<` takes the greatest key text below
+          // the bound as BETWEEN's inclusive high end (`keyJustBelow`); `>`
+          // starts above every key of the bound value, as `composeRangeUnder`
+          // does.
+          const prefixMax = `${prefix}${KEY_MAX}`
           if ("eq" in cond) return { eq: rewrite(cond.eq) }
-          if ("lt" in cond) return { lt: rewrite(cond.lt) }
-          if ("lte" in cond) return { lte: rewrite(cond.lte) }
-          if ("gt" in cond) return { gt: rewrite(cond.gt) }
-          if ("gte" in cond) return { gte: rewrite(cond.gte) }
+          if ("lt" in cond) return { between: [prefix, keyJustBelow(rewrite(cond.lt))] }
+          if ("lte" in cond) return { between: [prefix, rewrite(cond.lte)] }
+          if ("gt" in cond) {
+            return {
+              between: [`${rewrite(cond.gt)}${DynamoSchema.KEY_DELIMITER}${KEY_MAX}`, prefixMax],
+            }
+          }
+          if ("gte" in cond) return { between: [rewrite(cond.gte), prefixMax] }
           if ("between" in cond)
             return { between: [rewrite(cond.between[0]), rewrite(cond.between[1])] }
-          if ("beginsWith" in cond) return { beginsWith: rewrite(cond.beginsWith) }
+          if ("beginsWith" in cond) {
+            // A number has no text prefix: its key text is not its digits
+            // (`-3` is `-9999999999999996:`), and an integer's text prefixes
+            // its fractions'. `beginsWith` on a numeric orderBy is `eq`.
+            const operand = keyFormOf(cond.beginsWith)
+            return typeof operand === "number" || typeof operand === "bigint"
+              ? { eq: rewrite(cond.beginsWith) }
+              : { beginsWith: rewrite(cond.beginsWith) }
+          }
           return cond
         }
 

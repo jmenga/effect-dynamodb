@@ -41,7 +41,7 @@ import type { BoundUpdateOp, BoundWriteOp } from "./BoundCrud.js"
 import { withGuard } from "./EntityOps.js"
 import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
 import {
-  composePrimaryKey,
+  composePrimaryKeyOrFail,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -681,7 +681,9 @@ export const buildTransactWriteItems = (
           {
             Delete: {
               TableName: tableName,
-              Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
+              Key: toAttributeMap(
+                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.delete`),
+              ),
               ...conditionFields(op.condition),
             },
           },
@@ -692,7 +694,9 @@ export const buildTransactWriteItems = (
           {
             ConditionCheck: {
               TableName: tableName,
-              Key: toAttributeMap(composePrimaryKey(op.entity, op.key!)),
+              Key: toAttributeMap(
+                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.check`),
+              ),
               ConditionExpression: op.condition!.expression,
               ...conditionFields(op.condition),
             },

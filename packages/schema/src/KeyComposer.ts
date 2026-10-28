@@ -17,6 +17,7 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
+import { encodeBigInt, encodeNumber } from "./internal/NumericKey.js"
 import {
   concatBytes,
   interleave,
@@ -373,9 +374,15 @@ export const tryExtractComposites = (
 /**
  * Serialize a value for use in a composite key.
  *
- * Numeric values are zero-padded for correct lexicographic sort order:
- * - number → 16-digit zero-padded string (covers Number.MAX_SAFE_INTEGER)
- * - bigint → 38-digit zero-padded string (covers DynamoDB's max precision)
+ * Numeric values are encoded so their key text sorts in numeric order
+ * (`internal/NumericKey.ts` has the format):
+ * - number → a non-negative integer below 1e16 (or `-0`) is zero-padded to 16
+ *   digits, as up to 1.36; negatives, fractions, larger values and ±Infinity
+ *   take the order-preserving forms (`-3.14` → `-9999999999999996.85:`)
+ * - bigint → the same, zero-padded to 38 digits below 1e38
+ *
+ * Throws `[EDD-9096]` (`KeyValueError`) for `NaN`, which has no order, and for
+ * a bigint of more than 1,000 digits.
  *
  * DateTime values are formatted as ISO strings for correct sort order:
  * - DateTime.Zoned → ISO string with offset (preserves timezone info)
@@ -384,8 +391,8 @@ export const tryExtractComposites = (
  */
 export const serializeValue = (value: unknown): string => {
   if (typeof value === "string") return value
-  if (typeof value === "number") return String(value).padStart(16, "0")
-  if (typeof value === "bigint") return String(value).padStart(38, "0")
+  if (typeof value === "number") return encodeNumber(value)
+  if (typeof value === "bigint") return encodeBigInt(value)
   if (typeof value === "boolean") return value ? "true" : "false"
   // DateTime types → ISO string (Zoned normalized to UTC for sort order)
   if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
@@ -578,6 +585,11 @@ export const composeIndexKeys = (
 /**
  * Non-throwing variant of composeIndexKeys. Returns undefined if any composite
  * attribute is missing. Used for sparse GSI support.
+ *
+ * The presence check reads values without serializing them: a present value
+ * that has no key text (`NaN`, `[EDD-9096]`) or no Z-order level
+ * (`[EDD-9092]`) must reach the composer that refuses it, not be serialized
+ * as text first — a Z-order half's `composite` lists its dimension fields.
  */
 export const tryComposeIndexKeys = (
   schema: DynamoSchema.DynamoSchema,
@@ -586,8 +598,9 @@ export const tryComposeIndexKeys = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): Record<string, KeyValue> | undefined => {
-  if (tryExtractComposites(index.pk.composite, record) === undefined) return undefined
-  if (tryExtractComposites(index.sk.composite, record) === undefined) return undefined
+  const present = (composite: ReadonlyArray<string>) =>
+    composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
+  if (!present(index.pk.composite) || !present(index.sk.composite)) return undefined
   return composeIndexKeys(schema, entityType, entityVersion, index, record)
 }
 
@@ -1112,12 +1125,18 @@ const availableSkCount = (index: IndexDefinition, record: Record<string, unknown
  *   the supplied one: `status_done` would also match `status_done_archived`
  *   and `status_doneish` (issue #115).
  * - **Complete key** — every composite was supplied, so the stored key ends
- *   here. Appending a delimiter would match nothing.
+ *   here. Appending a delimiter would match nothing — and leaving it off makes
+ *   `begins_with` match every longer value of the last composite (`a` also
+ *   matching `ab`). A complete key is matched with `=` instead: see
+ *   {@link composeSortKeyCondition}, which query accessors use.
  *
- * Padded composites (numbers, bigints) are fixed-width by construction, so
- * they cannot be prefixes of one another and were never affected — do NOT
- * "simplify" the rule away on the grounds that the numeric fixtures pass
- * either way. The string and free-text composites are what it protects.
+ * Numeric composites need both halves of the rule: an integer's text is a
+ * prefix of a fraction's (`0000000000000003` of `0000000000000003.14`), so
+ * `{ seq: 3 }` as a bare `begins_with` operand would also match `seq` 3.14
+ * and 3.5 — whether `seq` is followed by further composites (the delimiter
+ * stops it) or is the last one (`=` stops it). Only non-negative integers are
+ * fixed-width — do NOT "simplify" the rule away on the grounds that integer
+ * fixtures pass either way.
  *
  * Every consumer that turns SK composites into a key *prefix* must use this
  * function (or the same rule) — the entity/GSI query accessors and the
@@ -1135,6 +1154,33 @@ export const composeSortKeyBeginsWith = (
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
   const complete = availableSkCount(index, record) === index.sk.composite.length
   return complete ? prefix : `${prefix}${KEY_DELIMITER}`
+}
+
+/**
+ * The sort key condition a query accessor sends for the leading SK composites
+ * present in `record` (the caller has checked at least one is):
+ *
+ * - **Complete key** — every composite supplied: `{ eq }` on the composed
+ *   key, which is exactly the key `composeSk` writes. `begins_with` on it
+ *   would also match every longer value of the last composite — `name: "a"`
+ *   matching `"ab"`, and `seq: 3` matching 3.14 and 3.5, whose key text
+ *   extends 3's. On the primary index `=` also leaves out the item's history
+ *   rows, whose keys extend the current one.
+ * - **Partial prefix** — `{ beginsWith }` on {@link composeSortKeyBeginsWith}:
+ *   the prefix and the delimiter, so it stops on a segment boundary.
+ */
+export const composeSortKeyCondition = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): { readonly eq: string } | { readonly beginsWith: string } => {
+  assertStringHalf(index, "composeSortKeyCondition")
+  const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
+  return availableSkCount(index, record) === index.sk.composite.length
+    ? { eq: prefix }
+    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
 }
 
 /**

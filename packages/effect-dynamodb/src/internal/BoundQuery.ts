@@ -56,13 +56,13 @@ const renamePaths = (node: unknown, resolve: (name: string) => string): unknown 
  *   `"todo" | "done"`) widen to `string`, so open bounds and `beginsWith`
  *   prefixes that are not themselves valid values still typecheck.
  * - **Every other composite** keeps its own type. That is the point of
- *   issue #114: `serializeValue` zero-pads numbers to 16 digits and bigints
- *   to 38 on the write path, so a stringly-typed `"42"` compares against
- *   `"0000000000000042"` and sorts *after* every stored value — a silent
- *   mismatch. Requiring the composite's own type also lets the operand run
- *   through the composite's own codec, which is what makes a transformed
- *   composite (`Schema.BigIntFromString`) compare against the value that was
- *   actually stored.
+ *   issue #114: `serializeValue` encodes numbers and bigints in numeric order
+ *   on the write path (`42` as `"0000000000000042"`), so a stringly-typed
+ *   `"42"` compares against that text and sorts *after* every stored value —
+ *   a silent mismatch. Requiring the composite's own type also lets the
+ *   operand run through the composite's own codec, which is what makes a
+ *   transformed composite (`Schema.BigIntFromString`) compare against the
+ *   value that was actually stored.
  */
 export type SkOperand<V> = [V] extends [string] ? string : V
 
@@ -121,8 +121,8 @@ export interface SkConditionOps<SK = Record<string, unknown>> {
  * composing keys — and then composes, so both sides of the comparison come out
  * of one pipeline (issues #114 and the encoded/decoded gap it exposed).
  * Without a hook there is no model to consult, so `KeyComposer.serializeValue`
- * is applied directly: the same zero-padding / ISO formatting the write path
- * uses. Casing is never applied here — it belongs to key composition.
+ * is applied directly: the same numeric encoding / ISO formatting the write
+ * path uses. Casing is never applied here — it belongs to key composition.
  *
  * The callback is invoked synchronously and exactly once, so a closed-over
  * mutable slot is safe here.

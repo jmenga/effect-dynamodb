@@ -81,7 +81,7 @@ const TaskEntity = Entity.make({
       pk: { field: "gsi2pk", composite: ["assigneeId"] },
       sk: { field: "gsi2sk", composite: ["status", "createdAt"] },
     },
-    // Numeric sort key composite — zero-padded in the key so it sorts
+    // Numeric sort key composite — encoded in the key so it sorts
     // numerically, and `.where()` takes a `number`.
     byEstimate: {
       name: "gsi3",
@@ -261,7 +261,7 @@ const program = Effect.gen(function* () {
 
   // #region sk-typed-operands
   // `estimateHours` is a number, so `.where()` takes a number — not a string.
-  // The library zero-pads it exactly as the stored key was padded.
+  // The library encodes it exactly as the stored key was encoded.
   const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
     .where((t, { gte }) => gte(t.estimateHours, 8))
     .collect()

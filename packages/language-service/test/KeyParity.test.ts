@@ -117,6 +117,28 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
           )
         })
       }
+
+      // Every SK composite given: the library sends `=` on the complete key.
+      for (const [name, args] of [
+        ["byTeam", { teamId: "Team-B", status: "Open", title: "Fix Keys" }],
+        ["byOrg", { orgId: "Org-A", title: "Fix Keys" }],
+        ["byRegion", { regionId: "EU-1", status: "Open" }],
+      ] as const) {
+        it(`query ${name} ${JSON.stringify(args)} uses the same exact sort key condition`, () => {
+          const index = indexes[name]
+          const params = buildParamsOrThrow({
+            entity,
+            type: "query",
+            indexName: name,
+            arguments: args,
+          })
+          const condition = KeyComposer.composeSortKeyCondition(schema, "Ticket", 1, index, args)
+          expect(params.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
+          expect(params.ExpressionAttributeValues![":sk"]).toBe(
+            "eq" in condition ? condition.eq : undefined,
+          )
+        })
+      }
     })
   }
 })
@@ -176,6 +198,95 @@ describe("index-level casing from source matches Entity.make", () => {
     expect(expected.gsi1pk).toBe("$help-desk#v3#Ticket#teamId_Team-B")
     for (const [field, value] of Object.entries(expected)) {
       expect(params.Item![field], field).toBe(value)
+    }
+  })
+})
+
+// Numeric composites (#171 E8): the mirror's order-preserving numeric encoding
+// against the library's, over the edge values and a seeded spread of doubles
+// and bigints (this package has no property-test runner).
+describe("numeric key text parity with @effect-dynamodb/schema", () => {
+  const numericIndexes = {
+    primary: {
+      pk: { field: "pk", composite: ["n"] },
+      sk: { field: "sk", composite: ["b", "n"] },
+    },
+  } satisfies Record<string, IndexDefinition>
+  const schema = DynamoSchema.make({ name: "Help-Desk", version: 3 })
+  const entity: ResolvedEntity = {
+    ...entityFor("lowercase"),
+    indexes: numericIndexes,
+  }
+
+  // A deterministic xorshift spread: doubles from raw bit patterns (every
+  // exponent, subnormals included) and bigints of up to 60 digits.
+  let state = 0x2545f491
+  const next = () => {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    return state >>> 0
+  }
+  const view = new DataView(new ArrayBuffer(8))
+  const doubles: Array<number> = []
+  while (doubles.length < 300) {
+    view.setUint32(0, next())
+    view.setUint32(4, next())
+    const x = view.getFloat64(0)
+    if (Number.isFinite(x)) doubles.push(x)
+  }
+  const bigints = Array.from({ length: 100 }, (_, i) => {
+    const digits = Array.from({ length: 1 + (next() % 60) }, () => String(next() % 10)).join("")
+    return (i % 2 === 0 ? 1n : -1n) * BigInt(digits)
+  })
+  const edges = [
+    0,
+    -0,
+    1,
+    -1,
+    3,
+    3.1,
+    3.14,
+    -3,
+    -3.1,
+    -3.14,
+    0.5,
+    -0.5,
+    1e-7,
+    -1e-7,
+    10.5,
+    19.99,
+    2 ** 53 - 1,
+    2 ** 53 + 2,
+    1e16 - 2,
+    1e16,
+    1e16 + 2,
+    -1e16,
+    -1.5e16,
+    1e21,
+    Number.MIN_VALUE,
+    -Number.MIN_VALUE,
+    Number.MAX_VALUE,
+    -Number.MAX_VALUE,
+  ]
+  const bigEdges = [0n, 1n, -1n, 10n ** 38n - 1n, 10n ** 38n, 10n ** 38n + 1n, -(10n ** 38n)]
+
+  it("put composes the library's keys for every value", () => {
+    for (const n of [...edges, ...doubles]) {
+      for (const b of [...bigEdges, ...bigints.slice(0, 3)]) {
+        const record = { n, b }
+        const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+        const expected = KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record)
+        expect(params.Item!.pk, String(n)).toBe(expected.pk)
+        expect(params.Item!.sk, `${b} ${n}`).toBe(expected.sk)
+      }
+    }
+    for (const b of bigints) {
+      const record = { n: 1, b }
+      const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+      expect(params.Item!.sk, String(b)).toBe(
+        KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record).sk,
+      )
     }
   })
 })

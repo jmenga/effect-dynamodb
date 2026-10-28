@@ -60,6 +60,7 @@ const RECORD_TAKING = [
   "tryComposeIndexKeys",
   "composeSortKeyPrefix",
   "composeSortKeyBeginsWith",
+  "composeSortKeyCondition",
   "composeGsiKeysForUpdatePolicyAware",
   "composeVectorPartition",
   "tryComposeVectorPartition",

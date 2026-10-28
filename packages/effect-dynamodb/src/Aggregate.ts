@@ -14,7 +14,11 @@ import { TypeId as SchemaAggregateTypeId } from "@effect-dynamodb/schema/Aggrega
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.js"
-import { composeCollectionKey, composeKey } from "@effect-dynamodb/schema/DynamoSchema.js"
+import {
+  composeCollectionKey,
+  composeKey,
+  KEY_DELIMITER,
+} from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
   AggregateAssemblyError,
@@ -1816,8 +1820,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         )
 
         // Build SK prefix from contiguous filter values matching SK composites.
-        // `serializeValue`, NOT `String(v)` — the write side pads numerics, so
-        // `String(5)` would look for `5` where `0000000000000005` is stored.
+        // `serializeValue`, NOT `String(v)` — the write side encodes numerics,
+        // so `String(5)` would look for `5` where `0000000000000005` is stored.
         const skValues: string[] = []
         const listSkFilter = keyRecord(filter ?? {})
         for (const attr of listConfig.sk.composite) {
@@ -1825,6 +1829,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             skValues.push(KeyComposer.serializeValue(listSkFilter[attr]))
           else break // Stop at first gap (prefix matching)
         }
+        const skComplete = skValues.length === listConfig.sk.composite.length
 
         let rootItems: Array<Record<string, unknown>>
         let nextKey: Record<string, AttributeValue> | undefined
@@ -1866,6 +1871,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               {
                 pkValue: shardPkValue,
                 skValues,
+                skComplete,
                 limit,
                 pageSize,
                 filter: rootFilter,
@@ -1895,6 +1901,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             {
               pkValue: listPkValue,
               skValues,
+              skComplete,
               limit,
               pageSize,
               startKey,
@@ -3817,8 +3824,10 @@ interface ListPartitionResult {
 interface ListPartitionOptions {
   /** Composed GSI partition key value. */
   readonly pkValue: string
-  /** Serialized SK composites forming a `begins_with` prefix (may be empty). */
+  /** Serialized leading SK composites of the filter (may be empty). */
   readonly skValues: ReadonlyArray<string>
+  /** Whether `skValues` holds every list SK composite: the key is complete. */
+  readonly skComplete: boolean
   /** At most this many items — accumulated across requests, filter or not. */
   readonly limit?: number | undefined
   /** DynamoDB `Limit` per request (rows examined). */
@@ -3884,11 +3893,21 @@ const queryListPartition = (
     const exprValues: Record<string, AttributeValue> = { ":pk": toAttributeValue(pkValue) }
     let keyCondition = "#pk = :pk"
 
+    // The rule `KeyComposer.composeSortKeyCondition` applies to entity
+    // accessors: a complete key is matched with `=`, a partial one with
+    // `begins_with` on the prefix and the delimiter. A bare `begins_with` on
+    // the composed values matches longer siblings — `alice` also matching
+    // `alicex`, and `rate: 3` matching 3.5, whose key text extends 3's.
     if (skValues.length > 0) {
-      const skPrefix = composeCollectionKey(schema, listConfig.name, skValues)
+      const skText = composeCollectionKey(schema, listConfig.name, skValues)
       exprNames["#sk"] = listConfig.sk.field
-      exprValues[":skPrefix"] = toAttributeValue(skPrefix)
-      keyCondition += " AND begins_with(#sk, :skPrefix)"
+      if (options.skComplete) {
+        exprValues[":sk"] = toAttributeValue(skText)
+        keyCondition += " AND #sk = :sk"
+      } else {
+        exprValues[":skPrefix"] = toAttributeValue(`${skText}${KEY_DELIMITER}`)
+        keyCondition += " AND begins_with(#sk, :skPrefix)"
+      }
     }
 
     if (filter !== undefined) {

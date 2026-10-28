@@ -167,7 +167,15 @@ function buildQueryParams(
   values[":pk"] = pkValue
   let keyCondition = "#pk = :pk"
 
-  if (skPrefix) {
+  // Mirrors `KeyComposer.composeSortKeyCondition`: a complete key is an exact
+  // `=` — `begins_with` on it would also match longer values (`seq: 3`
+  // matching 3.14) — and a partial prefix a terminated `begins_with`.
+  const pinned = isZOrderHalf(index.sk) ? 0 : availableSkSlots(index, args).length
+  if (skPrefix && pinned > 0 && pinned === index.sk.composite.length) {
+    names["#sk"] = index.sk.field
+    values[":sk"] = skPrefix
+    keyCondition += " AND #sk = :sk"
+  } else if (skPrefix) {
     names["#sk"] = index.sk.field
     values[":skPrefix"] = skPrefix
     keyCondition += " AND begins_with(#sk, :skPrefix)"
@@ -342,10 +350,57 @@ function schemaPrefix(schema: SchemaConfig): string {
 /** Mirrors `KeyComposer.serializeValue` for the values a source literal can hold. */
 function serializeValue(value: unknown): string {
   if (typeof value === "string") return value
-  if (typeof value === "number") return String(value).padStart(16, "0")
-  if (typeof value === "bigint") return String(value).padStart(38, "0")
+  if (typeof value === "number") return encodeNumber(value)
+  if (typeof value === "bigint") return encodeBigInt(value)
   if (typeof value === "boolean") return value ? "true" : "false"
   return String(value)
+}
+
+// Mirrors `@effect-dynamodb/schema/internal/NumericKey.ts`, which documents the
+// format: numeric key text that sorts in numeric order, keeping the zero-padded
+// text of a non-negative integer below the pad width. A hover never throws, so
+// what the library refuses (`NaN`, a bigint past 1,000 digits) is shown as is.
+
+/** `x = 0.<digits> × 10^point` for the shortest round-trip decimal of positive `x`. */
+function decimalOf(x: number): { readonly digits: string; readonly point: number } {
+  const [mantissa = "", exponent = "0"] = String(x).split("e")
+  const [int = "", frac = ""] = mantissa.split(".")
+  const all = `${int}${frac}`
+  const significant = all.replace(/^0+/, "")
+  return {
+    digits: significant.replace(/0+$/, ""),
+    point: int.length + Number(exponent) - (all.length - significant.length),
+  }
+}
+
+function magnitude(digits: string, point: number, width: number): string {
+  if (point > width) return `:${String(point - 1).padStart(3, "0")}${digits}`
+  const int = point <= 0 ? "" : digits.slice(0, point).padEnd(point, "0")
+  const frac = `${"0".repeat(Math.max(0, -point))}${digits.slice(Math.max(0, point))}`
+  return `${int.padStart(width, "0")}${frac === "" ? "" : `.${frac}`}`
+}
+
+function negate(text: string): string {
+  const complement = (t: string) => t.replace(/[0-9]/g, (digit) => String(9 - Number(digit)))
+  return text.startsWith(":") ? `-*${complement(text.slice(1))}:` : `-${complement(text)}:`
+}
+
+function encodeNumber(n: number): string {
+  if (Number.isNaN(n)) return String(n)
+  if (n === Number.POSITIVE_INFINITY) return ";"
+  if (n === Number.NEGATIVE_INFINITY) return "-)"
+  if (n === 0) return "0".repeat(16)
+  const { digits, point } = decimalOf(Math.abs(n))
+  const text = magnitude(digits, point, 16)
+  return n < 0 ? negate(text) : text
+}
+
+function encodeBigInt(n: bigint): string {
+  if (n === 0n) return "0".repeat(38)
+  const abs = (n < 0n ? -n : n).toString()
+  if (abs.length > 1000) return String(n)
+  const text = magnitude(abs.replace(/0+$/, ""), abs.length, 38)
+  return n < 0n ? negate(text) : text
 }
 
 function formatComposites(

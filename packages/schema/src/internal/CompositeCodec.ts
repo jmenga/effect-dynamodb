@@ -10,24 +10,25 @@
  *
  * **The rule.** Compose from the **Encoded** form, EXCEPT when the domain type
  * is numeric (`number` / `bigint`) and the encoded form is a **string** — then
- * compose from the numeric **Type** form so `KeyComposer.serializeValue` pads
- * it.
+ * compose from the numeric **Type** form so `KeyComposer.serializeValue`
+ * encodes it in numeric order.
  *
  * | composite | Type | Encoded | key uses |
  * |---|---|---|---|
- * | `Schema.Number` | number | number | encoded (already padded) |
- * | `Schema.BigInt` | bigint | bigint | encoded (already padded) |
- * | `Schema.BigIntFromString` | bigint | string | **Type** — a string would not pad |
+ * | `Schema.Number` | number | number | encoded (already numeric) |
+ * | `Schema.BigInt` | bigint | bigint | encoded (already numeric) |
+ * | `Schema.BigIntFromString` | bigint | string | **Type** — a string would sort as text |
  * | `Schema.NumberFromString` | number | string | **Type** — same shape |
- * | `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, padded |
+ * | `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, numeric |
  * | `Schema.Date` / `DateTimeUtc` | Date | ISO string | encoded — ISO sorts correctly |
  * | untransformed string | string | string | encoded (identical) |
  *
- * The exception exists because `serializeValue` pads numbers to 16 digits and
- * bigints to 38 so they sort lexicographically in numeric order, and does
- * nothing to a string. Composing the encoded `"42"` of a `BigIntFromString`
- * stored `txn_42` alongside `txn_100` and `txn_5`, which DynamoDB orders
- * 100 < 42 < 5 — so `gte(42n)` returned 42 and 5 instead of 42 and 100.
+ * The exception exists because `serializeValue` encodes numbers and bigints so
+ * their key text sorts in numeric order (a non-negative integer zero-padded to
+ * 16 digits, 38 for a bigint), and does nothing to a string. Composing the
+ * encoded `"42"` of a `BigIntFromString` stored `txn_42` alongside `txn_100`
+ * and `txn_5`, which DynamoDB orders 100 < 42 < 5 — so `gte(42n)` returned 42
+ * and 5 instead of 42 and 100.
  *
  * Not part of the public API.
  */
@@ -91,14 +92,14 @@ export const makeCompositeKeyForm = (
     // Case 2 — the numeric exception. Target is the Type side, and it must be
     // the DECLARED numeric kind, not merely "some number".
     //
-    // `KeyComposer.serializeValue` pads by JS type — 16 digits for a number, 38
-    // for a bigint — so a `bigint` composite handed a `number` composes a
-    // 16-wide key where the write composed 38. That is not hypothetical: a
-    // stored `bigint` attribute marshalls to `{ N: "420" }` and unmarshalls
-    // back as a **number**, so any path that re-derives a key from a stored row
-    // (`Aggregate.list`) lands here with the wrong kind and silently finds
-    // nothing. Coercing to the declared kind is the same rule, applied
-    // exactly; a value already of the right kind is unaffected.
+    // `KeyComposer.serializeValue` encodes by JS type — a number zero-padded to
+    // 16 digits, a bigint to 38 — so a `bigint` composite handed a `number`
+    // composes a 16-wide key where the write composed 38. That is not
+    // hypothetical: a stored `bigint` attribute marshalls to `{ N: "420" }` and
+    // unmarshalls back as a **number**, so any path that re-derives a key from
+    // a stored row (`Aggregate.list`) lands here with the wrong kind and
+    // silently finds nothing. Coercing to the declared kind is the same rule,
+    // applied exactly; a value already of the right kind is unaffected.
     if (numericTypeWithStringEncoding(field)) {
       const wantsBigInt = SchemaAST.isBigInt(SchemaAST.toType(field.ast))
       const decode = Schema.decodeUnknownOption(codec)

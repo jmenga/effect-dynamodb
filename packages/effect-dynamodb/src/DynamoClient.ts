@@ -322,7 +322,18 @@ export const composeRangeUnder = (
 
   // `beginsWith` / `between` / `eq` carry the prefix in BOTH operands, so they
   // never escape it.
-  if ("beginsWith" in bound) return exact({ beginsWith: compose(bound.beginsWith) })
+  if ("beginsWith" in bound) {
+    // A number has no text prefix: its key text is not its digits (`-3` is
+    // `-9999999999999996:`), and an integer's text prefixes its fractions'
+    // (3 of 3.14). `beginsWith` on a numeric composite is `eq` — what it
+    // amounted to up to 1.36 for non-negative integers, whose key text was
+    // fixed-width.
+    const operand = bound.beginsWith
+    if (typeof operand === "number" || typeof operand === "bigint") {
+      return composeRangeUnder(index, prefixText, field, { eq: operand }, options)
+    }
+    return exact({ beginsWith: compose(operand) })
+  }
   if ("eq" in bound) {
     return exact(
       index.isLast ? { eq: compose(bound.eq) } : { beginsWith: subtreeBeginsWith(bound.eq) },
@@ -2537,24 +2548,26 @@ const makeFromConfig = (config: {
           },
         })
 
-        // Apply SK prefix from the provided composites.
-        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
-        // must terminate on a segment boundary when composites remain, or it
-        // matches sibling values that merely start with the supplied one
-        // (`status_done` also matching `status_done_archived`, issue #115).
+        // Apply the SK condition from the provided composites
+        // (`composeSortKeyCondition`): a partial prefix is a `begins_with`
+        // terminated on a segment boundary, or it matches sibling values that
+        // merely start with the supplied one (`status_done` also matching
+        // `status_done_archived`, issue #115); a complete key is an exact `=`,
+        // or `seq: 3` also matches 3.14 and `name: "a"` also matches "ab".
         const hasSkComposites =
           !zorder &&
           indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
         const finalQuery = hasSkComposites
-          ? Query.where(query, {
-              beginsWith: KeyComposer.composeSortKeyBeginsWith(
+          ? Query.where(
+              query,
+              KeyComposer.composeSortKeyCondition(
                 entityLike._schema,
                 entityLike.entityType,
                 1,
                 indexDef,
                 compositesKeyForm,
               ),
-            })
+            )
           : query
 
         const pathBuilder = createPathBuilder()

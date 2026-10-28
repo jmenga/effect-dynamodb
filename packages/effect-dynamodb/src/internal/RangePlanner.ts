@@ -216,6 +216,27 @@ export const compareUtf8 = (a: KeyValue, b: KeyValue): number => {
   return i < a.length ? 1 : j < b.length ? -1 : 0
 }
 
+/** The highest code point: above every character a key can hold but itself. */
+const TOP_CODE_POINT = String.fromCodePoint(0x10ffff)
+
+/**
+ * An inclusive high end for a strict `<` on key text: below `key`, and at or
+ * above every key below `key` that does not hold U+10FFFF. Its last code
+ * point is stepped down one (past the surrogates) and followed by U+10FFFF: a
+ * key below `key` either stops short of it — a prefix, which the bound keeps —
+ * or is smaller at some character, and from there sorts under the bound. A
+ * last code point of U+0000 has no predecessor; `key` without it is then the
+ * bound. (U+10FFFF rather than {@link KEY_MAX}, which an emoji outsorts.)
+ */
+export const keyJustBelow = (key: string): string => {
+  const width = key.length > 1 && key.codePointAt(key.length - 2)! > 0xffff ? 2 : 1
+  const head = key.slice(0, key.length - width)
+  const last = key.codePointAt(key.length - width)
+  if (last === undefined || last === 0) return head
+  const previous = last - 1 >= 0xd800 && last - 1 <= 0xdfff ? 0xd7ff : last - 1
+  return `${head}${String.fromCodePoint(previous)}${TOP_CODE_POINT}`
+}
+
 const startsWithKey = (value: KeyValue, prefix: KeyValue): boolean => {
   if (typeof value === "string" && typeof prefix === "string") return value.startsWith(prefix)
   const v = typeof value === "string" ? encoder.encode(value) : value

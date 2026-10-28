@@ -31,7 +31,7 @@ import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
-  composePrimaryKey,
+  composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
   resolveTableNames,
@@ -175,12 +175,11 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
 
     const tableNames = yield* resolveTableNames(infos)
 
-    const transactItems = infos.map((info) => ({
-      Get: {
-        TableName: tableNames.get(info.entity)!,
-        Key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
-      },
-    }))
+    const transactItems = yield* Effect.forEach(infos, (info) =>
+      Effect.map(composePrimaryKeyOrFail(info.entity, info.key!, "transactGet"), (key) => ({
+        Get: { TableName: tableNames.get(info.entity)!, Key: toAttributeMap(key) },
+      })),
+    )
 
     const result = yield* client.transactGetItems({ TransactItems: transactItems }).pipe(
       Effect.mapError((error) => {

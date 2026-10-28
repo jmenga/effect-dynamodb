@@ -13798,20 +13798,20 @@ describeConnected("sort key prefix + typed operands (closes #114, closes #115)",
     }).pipe(provideSkp),
   )
 
-  it.effect("#115 single-composite sort key is a complete key — still a prefix match", () =>
+  it.effect("#115 single-composite sort key is a complete key — an exact match (#171 E7)", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: skpEntities, tables: skpTables })
-      // Documented behaviour, unchanged by #115: with every composite supplied
-      // the accessor still issues `begins_with` on the full composed key, so
-      // longer sibling values match. Use `.get()` for a single exact item.
+      // With every composite supplied the accessor sends `sk = …#label_ship`.
+      // Up to 1.36 it sent `begins_with` on the full composed key, so the
+      // longer sibling values `ship_it` and `shipped` matched too.
       const rows = yield* db.entities.PrefixNotes.byBoard({
         boardId: "b1",
         label: "ship",
       }).collect()
-      expect(rows.map((r) => r.label).sort()).toEqual(["ship", "ship_it", "shipped"])
+      expect(rows.map((r) => r.label)).toEqual(["ship"])
 
-      // The documented escape hatch: leave the composite off the accessor and
-      // let `.where()` compose an exact `sk = …#label_ship`.
+      // Leaving the composite off the accessor and passing it to `.where()`
+      // composes the same exact condition.
       const exact = yield* db.entities.PrefixNotes.byBoard({ boardId: "b1" })
         .where((t, ops) => ops.eq(t.label, "ship"))
         .collect()

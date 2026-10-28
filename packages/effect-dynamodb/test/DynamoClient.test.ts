@@ -598,7 +598,7 @@ describe("DynamoClient", () => {
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
     })
 
-    it.effect("PK + partial SK applies begins_with on the composed SK prefix", () => {
+    it.effect("PK + every SK composite matches the composed SK exactly", () => {
       const captured: Array<any> = []
       const ClientLayer = makeQueryCapturingClient(captured)
       const TableLayer = MainTable.layer({ name: "primary-test-table" })
@@ -617,12 +617,12 @@ describe("DynamoClient", () => {
         expect(captured).toHaveLength(1)
         const input = captured[0]
         expect(input.IndexName).toBeUndefined()
-        // begins_with is used even when the full SK composite is provided — the
-        // accessor treats any SK composite value as a prefix, consistent with
-        // how GSI accessors handle partial SK composites.
-        expect(input.KeyConditionExpression).toContain("begins_with")
+        // Every SK composite given: the key is complete, so it is matched with
+        // `=`. `begins_with` on it would also match a longer channel id
+        // (`ch-420`), and the item's history rows, whose keys extend it.
+        expect(input.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
         const skValue = input.ExpressionAttributeValues[":sk"].S as string
-        expect(skValue).toContain("ch-42")
+        expect(skValue.endsWith("ch-42")).toBe(true)
       }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
     })
 

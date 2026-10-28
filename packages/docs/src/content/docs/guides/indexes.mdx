@@ -166,10 +166,42 @@ Both `pk.composite` and `sk.composite` can be empty arrays. The entity type pref
 | Type | Key Value |
 |------|-----------|
 | `string` | As-is |
-| `number` | Zero-padded |
+| `number`, `bigint` | Numeric key text (below) |
 | `DateTime.Utc` | ISO 8601 |
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying value |
+
+### Numeric composites
+
+DynamoDB orders sort keys as text, byte by byte, so numbers are written as text that sorts in numeric order. Ranges with `.where()` and `.within()` over a numeric composite return rows in numeric order, negatives and fractions included.
+
+| Value | Key text |
+|-------|----------|
+| `42` | `0000000000000042` (16 digits; a `bigint` is padded to 38) |
+| `3.14` | `0000000000000003.14` |
+| `1e21` | `:0211` (exponent and digits, for 1e16 and up; 1e38 and up for a `bigint`) |
+| `-3.14` | `-9999999999999996.85:` (each digit complemented, so larger magnitudes sort first) |
+| `Infinity` / `-Infinity` | `;` / `-)` |
+
+The text holds no letters and no `#`, so casing never changes it. A composite holding one numeric value matches only that value: a query accessor given every sort key composite sends `sk = …`, so `seq: 3` never returns `3.14` or `3.5` (see [Queries](/effect-dynamodb/guides/queries/#how-much-of-the-sort-key-an-accessor-pins)).
+
+`NaN` has no order and can't be a key composite. An entity operation given one — `put`, `create`, `upsert`, `update`, `get`, `delete`, `restore`, `purge`, `append`, or a batch or transaction — fails with a `ValidationError` (`EDD-9096`) before anything is sent, and a query accessor, `.where()` or `.within()` given one throws it. Up to 1.36 a `get` by a `NaN` key failed with `ItemNotFound` and a `delete` did nothing. A bigint of more than 1,000 digits is refused the same way. Aggregates and event stores don't convert it: there it is a defect.
+
+:::caution[Stored keys changed in 1.37.0]
+Up to 1.36, a number was zero-padded as text (`String(n).padStart(16, "0")`), which sorted `-3` above `-5` and `10.5` below `3.14`. Non-negative integers below 1e16 (below 1e38 for a `bigint`) keep the same key text. Every other value composes different text: negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970. A row written by 1.36 with one in a key keeps its old key until it is rewritten: `get`, `update` and `delete` by key miss it, index queries miss or misorder it, and its unique-constraint sentinel doesn't block a new duplicate.
+:::
+
+#### Migrating rows written by 1.36
+
+Find the affected rows with a scan: those with such a value in a key composite or a time-series `orderBy`. Each kind of row is rewritten differently, because only a live item can be written again through its entity:
+
+| Row | Which keys hold numeric text | Rewrite |
+|-----|------------------------------|---------|
+| Live item | Partition key, sort key, every index key, its unique sentinels | Delete it and its sentinels under their stored keys with the raw `DynamoClient`, and `put` it again through the entity, which recomposes every key and sentinel. On a `versioned` entity, move its snapshots first (see the snapshot row below): the `put` then continues the version sequence after them instead of starting again at 1. |
+| Time-series event item (`<current sort key>#e#<orderBy>`) | Partition key, and the sort key's current-item part and `orderBy` part | `.append()` can't rewrite a past event: the current item is newer, so the append is stale and writes nothing. Put the row again raw, with the same attributes, the recomposed partition key and the sort key `KeyComposer.composeEventSk(currentSk, orderBy, casing)`. `currentSk` is the current item's recomposed sort key, `orderBy` the value the row stores and `casing` the schema's. Then delete the old row. A numeric `orderBy` that is negative, fractional or 1e16 and up changes every event's key even when the current item's doesn't. |
+| Version snapshot (`#v#…`) and soft-delete tombstone (`#deleted#…`) | Partition key, and the item segment of the sort key (an entity with sort key composites) | Only when a primary key composite changed. Put each row again raw under the recomposed partition key, with the item segment `KeyComposer.composeHistoryItemSegment(…)` derives from the item's recomposed sort key, and delete the old row. The version number and the timestamp are not numeric key text and keep their bytes. Left in place, `versions()`, `getVersion()`, `deleted.get()` and `restore()` don't find them, and `purge()` leaves them behind. |
+| Event store stream | The partition key (its stream-id composites), and any stream index attribute that stores it (an index without `derivePartition`) | Only when a stream-id composite changed. Copy every row of the partition (events, the snapshot, command sentinels) raw to the partition key the stream composes now, and delete the old rows. Event sort keys hold the version and command sentinels the command id, so they keep their bytes. Appending the events again would renumber them and run projections again. |
+| Aggregate | Every row's partition key, edge and discriminator sort keys, and list partition keys | `get` composes the new keys, so the aggregate can't be read whole. Query its old partition raw, recompose each row's keys as the aggregate composes them, put the rows back and delete the old ones. Or delete them and `create` the aggregate again from its source data. |
 
 ### Casing Resolution
 

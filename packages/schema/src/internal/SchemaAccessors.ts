@@ -211,11 +211,12 @@ export const hasEncodingTransformation = (schema: Schema.Top): boolean =>
  * **Encoded** side is a `string`.
  *
  * This is the one shape where key composition must use the Type value rather
- * than the encoded one: `KeyComposer.serializeValue` zero-pads numbers and
- * bigints so they sort correctly, but treats a string as text. Composing
- * `Schema.BigIntFromString`'s encoded `"42"` therefore stored `txn_42` next to
- * `txn_100` and `txn_5`, which sorts as 100 < 42 < 5 — a range query returned
- * the wrong rows. Composing the Type value `42n` pads it instead.
+ * than the encoded one: `KeyComposer.serializeValue` encodes numbers and
+ * bigints so their key text sorts in numeric order, but treats a string as
+ * text. Composing `Schema.BigIntFromString`'s encoded `"42"` therefore stored
+ * `txn_42` next to `txn_100` and `txn_5`, which sorts as 100 < 42 < 5 — a
+ * range query returned the wrong rows. Composing the Type value `42n` encodes
+ * it instead.
  *
  * `SchemaAST.toType` / `toEncoded` are Effect's public AST projections; the
  * `SchemaAST.test.ts` canary pins the tags this reads.

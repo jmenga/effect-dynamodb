@@ -35,15 +35,21 @@ describe("KeyComposer", () => {
       expect(KeyComposer.serializeValue("hello")).toBe("hello")
     })
 
-    it("numbers are zero-padded to 16 digits", () => {
+    it("non-negative integer numbers are zero-padded to 16 digits", () => {
       expect(KeyComposer.serializeValue(42)).toBe("0000000000000042")
       expect(KeyComposer.serializeValue(0)).toBe("0000000000000000")
       expect(KeyComposer.serializeValue(9007199254740991)).toBe("9007199254740991") // MAX_SAFE_INTEGER
     })
 
-    it("bigints are zero-padded to 38 digits", () => {
+    it("non-negative bigints are zero-padded to 38 digits", () => {
       expect(KeyComposer.serializeValue(42n)).toBe("00000000000000000000000000000000000042")
       expect(KeyComposer.serializeValue(0n)).toBe("00000000000000000000000000000000000000")
+    })
+
+    it("negative, fractional and large numbers sort in numeric order (NumericKey.test.ts)", () => {
+      expect(KeyComposer.serializeValue(-3.14)).toBe("-9999999999999996.85:")
+      expect(KeyComposer.serializeValue(3.14)).toBe("0000000000000003.14")
+      expect(KeyComposer.serializeValue(1e21)).toBe(":0211")
     })
 
     it("booleans stringify", () => {
@@ -2410,19 +2416,27 @@ describe("KeyComposer", () => {
       )
     })
 
-    it("padded composites are fixed-width, so the rule is a no-op for them", () => {
-      // Numbers/bigints cannot be prefixes of one another once padded — the
-      // delimiter protects the string and free-text composites. Recorded here so
-      // nobody concludes from numeric fixtures that the rule is unnecessary.
+    it("numeric composites need the rule too: an integer's text prefixes a fraction's", () => {
+      // Only non-negative integers are fixed-width; `42`'s text is a prefix of
+      // `42.5`'s, so without the delimiter `{ seq: 42 }` would match seq 42.5.
+      // Recorded here so nobody concludes from integer fixtures that the rule
+      // is unnecessary for numbers.
       const numericSk: KeyComposer.IndexDefinition = {
         index: "gsi1",
         pk: { field: "gsi1pk", composite: ["deviceId"] },
         sk: { field: "gsi1sk", composite: ["seq", "part"] },
       }
-      expect(
-        KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, { seq: 42 }),
-      ).toBe("$myapp#v1#reading#seq_0000000000000042#")
-      expect(KeyComposer.serializeValue(42).length).toBe(KeyComposer.serializeValue(4242).length)
+      const operand = KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, {
+        seq: 42,
+      })
+      expect(operand).toBe("$myapp#v1#reading#seq_0000000000000042#")
+      const fraction = KeyComposer.composeSk(schema, "Reading", 1, numericSk, {
+        seq: 42.5,
+        part: "a",
+      })
+      expect(fraction).toBe("$myapp#v1#reading#seq_0000000000000042.5#part_a")
+      expect(fraction.startsWith(operand)).toBe(false)
+      expect(fraction.startsWith(operand.slice(0, -1))).toBe(true)
     })
 
     it("isolated collection index keeps the entity_version segment", () => {
@@ -2451,6 +2465,85 @@ describe("KeyComposer", () => {
       expect(
         KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, clustered, { status: "done" }),
       ).toBe("$myapp#v1#org#team#task_1#status_done#")
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // composeSortKeyCondition — `=` on a complete key, `begins_with` on a prefix
+  // (#171 E7)
+  // ---------------------------------------------------------------------------
+
+  describe("composeSortKeyCondition", () => {
+    const onIndex = (
+      sk: ReadonlyArray<string>,
+      collection?: { readonly collection: string | ReadonlyArray<string>; readonly type: string },
+    ): KeyComposer.IndexDefinition =>
+      ({
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["deviceId"] },
+        sk: { field: "gsi1sk", composite: [...sk] },
+        ...collection,
+      }) as KeyComposer.IndexDefinition
+
+    it("partial prefix — begins_with on the prefix and the delimiter", () => {
+      const index = onIndex(["status", "taskId"])
+      expect(
+        KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, { status: "done" }),
+      ).toEqual({
+        beginsWith: KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, index, {
+          status: "done",
+        }),
+      })
+    })
+
+    it("complete key — eq on exactly the key composeSk writes", () => {
+      const index = onIndex(["status", "taskId"])
+      const record = { status: "done", taskId: "t1" }
+      expect(KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, record)).toEqual({
+        eq: KeyComposer.composeSk(schema, "Task", 1, index, record),
+      })
+    })
+
+    // A complete key is a prefix of every longer value of its last composite.
+    // `=` keeps exactly the pinned value, on every index shape.
+    const shapes = [
+      ["entity index", undefined],
+      ["isolated collection index", { collection: "feed", type: "isolated" }],
+      ["clustered collection index", { collection: ["site", "feed"], type: "clustered" }],
+    ] as const
+    for (const [shape, collection] of shapes) {
+      it(`${shape}: a pinned number matches neither its fractions nor longer digits`, () => {
+        const index = onIndex(["tag", "seq"], collection)
+        const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+          tag: "a",
+          seq: 3,
+        })
+        expect("eq" in condition).toBe(true)
+        const eq = (condition as { readonly eq: string }).eq
+        const stored = (seq: number) =>
+          KeyComposer.composeSk(schema, "Reading", 1, index, { tag: "a", seq })
+        expect(stored(3)).toBe(eq)
+        for (const sibling of [3.14, 3.5, 30, -3, -3.14]) {
+          expect(stored(sibling) === eq, String(sibling)).toBe(false)
+        }
+        // What the bare `begins_with` of 1.36 also matched under the new text:
+        expect(stored(3.14).startsWith(eq)).toBe(true)
+        expect(stored(3.5).startsWith(eq)).toBe(true)
+      })
+    }
+
+    it("a pinned bigint of 1e38 or more does not match its digit-prefix siblings", () => {
+      // `:0381` (1e38) is a prefix of `:03815` (1.5e38) and `:03812` (1.2e38).
+      const index = onIndex(["level"])
+      const stored = (level: bigint) =>
+        KeyComposer.composeSk(schema, "Reading", 1, index, { level })
+      const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        level: 10n ** 38n,
+      })
+      expect(condition).toEqual({ eq: stored(10n ** 38n) })
+      expect(stored(10n ** 38n)).toBe("$myapp#v1#reading#level_:0381")
+      expect(stored(15n * 10n ** 37n).startsWith(stored(10n ** 38n))).toBe(true)
+      expect(stored(12n * 10n ** 37n).startsWith(stored(10n ** 38n))).toBe(true)
     })
   })
 })

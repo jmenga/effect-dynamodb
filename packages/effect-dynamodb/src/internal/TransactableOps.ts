@@ -8,6 +8,9 @@
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
@@ -410,11 +413,13 @@ export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity
   })
 
 /**
- * @internal Run a key composer, turning a Z-order value it can't place
- * (`[EDD-9092]`, `ZOrderValueError`: `NaN`, an unparseable date, a value
- * outside a `literals` list — #171) into a `ValidationError` for `operation`.
- * Every write path that composes a Z-order sort key goes through this, so the
- * failure is typed instead of a defect. Any other throw stays a defect.
+ * @internal Run a key composer, turning a value it can't place into a
+ * `ValidationError` for `operation`: a Z-order value (`[EDD-9092]`,
+ * `ZOrderValueError`: `NaN`, an unparseable date, a value outside a `literals`
+ * list — #171), or a composite with no key text (`[EDD-9096]`,
+ * `KeyValueError`: `NaN`, a bigint past 1,000 digits). Every write path that
+ * composes an item's keys goes through this, so the failure is typed instead
+ * of a defect. Any other throw stays a defect.
  */
 export const composeKeysOrFail = <A>(
   entityType: string,
@@ -423,7 +428,7 @@ export const composeKeysOrFail = <A>(
 ): Effect.Effect<A, ValidationError> =>
   Effect.try({ try: compose, catch: (error) => error }).pipe(
     Effect.catch((error) =>
-      isZOrderValueError(error)
+      isZOrderValueError(error) || isKeyValueError(error)
         ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
         : Effect.die(error),
     ),
@@ -449,6 +454,20 @@ export const composePrimaryKey = (
     [primary.sk.field]: KeyComposer.composeSk(schema, entity.entityType, 1, primary, recordKeyForm),
   }
 }
+
+/**
+ * {@link composePrimaryKey}, failing with a `ValidationError` for `operation`
+ * where a composite has no key text (`NaN`, `[EDD-9096]`) — the key-taking
+ * multi-item ops (`Batch.get`, `Batch.write` deletes, `transactGet`,
+ * `transactWrite` deletes and condition checks), as an entity's own `get` and
+ * `delete` do.
+ */
+export const composePrimaryKeyOrFail = (
+  entity: Entity,
+  key: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<Record<string, unknown>, ValidationError> =>
+  composeKeysOrFail(entity.entityType, operation, () => composePrimaryKey(entity, key))
 
 /**
  * Validate input, compose all keys, and build a marshalled put item.
@@ -522,6 +541,18 @@ export const validateAndBuildPutItem = (
       ),
     )
     Object.assign(item, keys)
+    // A unique field's sentinel key is composed from its value later, on the
+    // guarded path, after this item is marshalled. One with no key text
+    // (`NaN`, `[EDD-9096]`) is refused here, as `Entity.put` refuses it, not
+    // by the marshaller as a defect.
+    yield* composeKeysOrFail(entity.entityType, operation, () => {
+      for (const def of Object.values(entity.unique ?? {})) {
+        for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
+          const value = (encoded as Record<string, unknown>)[field]
+          if (value !== undefined && value !== null) KeyComposer.serializeValue(value)
+        }
+      }
+    })
 
     // System fields (collision-aware). When a timestamp field collides with a
     // model-declared field, the user may have supplied their own value

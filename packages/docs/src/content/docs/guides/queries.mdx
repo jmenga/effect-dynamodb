@@ -43,7 +43,7 @@ const assigneeTasks = yield* db.entities.TaskEntity.byAssignee({
 }).collect()
 ```
 
-Every entity also exposes a `.primary(...)` accessor for the primary index — same contract as GSI accessors (required PK composites, optional SK composites with `begins_with` prefix matching):
+Every entity also exposes a `.primary(...)` accessor for the primary index — same contract as GSI accessors (required PK composites, optional SK composites: a partial sort key is a `begins_with` prefix match, a complete one an exact match):
 
 ```typescript
 // Primary-index query — list every item under a shared primary partition.
@@ -56,7 +56,7 @@ const allMembers = yield* db.entities.Memberships.primary({
 
 ### Generated Accessor Mapping
 
-Every index — **including `primary`** — gets a query accessor. Accessors accept required PK composites and optional SK composites (partial SK composites apply `begins_with` prefix matching). `.get(fullKey)` remains the dedicated `GetItem` path for single-item fetches by full primary key.
+Every index — **including `primary`** — gets a query accessor. Accessors accept required PK composites and optional SK composites (partial SK composites apply `begins_with` prefix matching; supplying every SK composite matches that key exactly). `.get(fullKey)` remains the dedicated `GetItem` path for single-item fetches by full primary key.
 
 | Definition | Accessor | Argument Type |
 |-----------|----------|---------------|
@@ -77,8 +77,8 @@ const allMembers = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 }).collect()
 
-// Narrow by sort-key prefix — the full SK composite is provided, so this
-// returns an array (possibly empty) rather than failing with `ItemNotFound`.
+// Pin the whole sort key — this matches `u-bob` exactly and returns an
+// array (empty or one item) rather than failing with `ItemNotFound`.
 const bobs = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
   userId: "u-bob",
@@ -91,17 +91,21 @@ Behavior is symmetric with GSI accessors: `.where()`, `.within()`, `.filter()`, 
 
 Supplying **some** of the sort key composites narrows to exactly those composite values. The generated `begins_with` stops on a segment boundary, so a value is never confused with a longer sibling — `byTenant({ tenantId, status: "done" })` on `sk: ["status", "taskId"]` matches `done` only, not `done_archived` or `doneish`.
 
-Supplying **all** of them is still a prefix match, not an exact one: the stored key ends there, so there is no boundary left to stop on and a longer sibling value can match. On `sk: ["label"]`, `byBoard({ boardId, label: "ship" })` also returns `shipped` and `ship_it`. Use `.get()` when you want exactly one item, or leave the composite off the accessor and pass it to `.where()` instead — `byBoard({ boardId }).where((t, { eq }) => eq(t.label, "ship"))` compiles to `sk = …#label_ship`, an exact match.
+Supplying **all** of them is an exact match. The stored key ends there, so there is no boundary to stop on, and the accessor sends `sk = …#label_ship` instead of a `begins_with`. On `sk: ["label"]`, `byBoard({ boardId, label: "ship" })` returns `ship` only, not `shipped` or `ship_it`, and on a numeric composite `seq: 3` returns `3` only, not `3.14` or `3.5`. Up to 1.36 a full pin was still a `begins_with` and did return those longer siblings.
+
+The same rule applies to the primary accessor, every GSI accessor (an index that holds an isolated or a clustered collection included) and `Entity.query.<index>`. `Aggregate.list` follows it too. A collection query takes partition key composites only, so it is unaffected. A full pin on the primary accessor of a [time-series](/effect-dynamodb/guides/timeseries/) entity returns the current item only, never its `#e#` event rows.
 
 ## Sort Key Conditions
 
 `.where()` adds a `KeyConditionExpression` against a remaining sort key composite — DynamoDB evaluates it on the index server-side, so it **does** reduce read capacity. Use it whenever the condition is on a sort-key composite the accessor hasn't already pinned. Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`.
 
+`beginsWith` is a text-prefix test, and a number has no text prefix: `3` is not a prefix of `35` by value. On a `number` or `bigint` composite `beginsWith(t.seq, 3)` therefore compiles to `eq` and matches `3` only. Use `between` for a numeric range.
+
 "Hasn't already pinned" is enforced, not advice. DynamoDB allows exactly one sort key condition, and `.where()` **replaces** the `begins_with` the accessor installed for its pinned prefix — so a condition on a composite the accessor already fixed would discard that prefix and return rows outside it, not narrow within it. `byBoard({ boardId, label: "ship" }).where((t, { eq }) => eq(t.label, "shine"))` would have matched `shine` rows. It is now refused with `EDD-9053`, and on an accessor that pins every composite `.where()` is not offered at all.
 
 The operand you pass is a **composite attribute value**, not a raw sort key. The library runs it through the same pipeline the write path used — the composite's own codec, then serialization, then casing — and drops the result into the same `$schema#v1#entity#<name>_<value>` shape, so `gte(t.createdAt, "2025-02-10")` compares like-for-like against the stored key.
 
-That includes the composite's **type**. A composite typed `number`, `bigint`, `boolean`, `Date` or `DateTime` takes a value of that type, not a string, because the write path zero-pads numbers (16 digits) and bigints (38 digits) and formats dates as ISO strings. Passing `"42"` for a numeric composite is a compile error rather than a query that silently matches nothing.
+That includes the composite's **type**. A composite typed `number`, `bigint`, `boolean`, `Date` or `DateTime` takes a value of that type, not a string, because the write path writes numbers and bigints as key text that sorts in numeric order (`42` as `0000000000000042`, negatives and fractions included; see [Indexes](/effect-dynamodb/guides/indexes/#numeric-composites)) and formats dates as ISO strings. Passing `"42"` for a numeric composite is a compile error rather than a query that silently matches nothing.
 
 It also covers composites whose schema **transforms** between its domain type and what DynamoDB stores. `Schema.BigIntFromString` has a `bigint` domain type and a string wire form, so a `420n` composite is stored as `txn_420`; `.where((t, { eq }) => eq(t.txn, 420n))` encodes the operand the same way and finds it. A value that cannot be encoded at all — a prefix string against a `bigint` composite, say — is refused with `EDD-9050` rather than silently compared against nothing.
 
@@ -135,7 +139,7 @@ const activeInFeb = yield* db.entities.TaskEntity.byProject({
 
 ```typescript region="sk-typed-operands" example="guide-queries.ts"
 // `estimateHours` is a number, so `.where()` takes a number — not a string.
-// The library zero-pads it exactly as the stored key was padded.
+// The library encodes it exactly as the stored key was encoded.
 const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
   .where((t, { gte }) => gte(t.estimateHours, 8))
   .collect()

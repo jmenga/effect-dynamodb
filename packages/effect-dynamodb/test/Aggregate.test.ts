@@ -3504,13 +3504,34 @@ describe("Aggregate write path", () => {
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.author).toBe("Alice")
 
-        // Verify begins_with on SK
+        // Verify begins_with on SK — ending on the delimiter, as `title`
+        // remains: a bare `…#alice` would also match an author `alicex`.
         const gsiInput = mockListQuery.mock.calls[0]![0]
         expect(gsiInput.KeyConditionExpression).toBe("#pk = :pk AND begins_with(#sk, :skPrefix)")
         expect(gsiInput.ExpressionAttributeNames["#sk"]).toBe("gsi1sk")
         expect(gsiInput.ExpressionAttributeValues[":skPrefix"]).toEqual({
-          S: "$myapp#v1#articlelist#alice",
+          S: "$myapp#v1#articlelist#alice#",
         })
+        expect(
+          "$myapp#v1#articlelist#alicex#first".startsWith("$myapp#v1#articlelist#alice#"),
+        ).toBe(false)
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("GSI query: every list SK composite given matches the key exactly", () =>
+      Effect.gen(function* () {
+        mockListQuery.mockResolvedValueOnce({ Items: [] })
+
+        yield* ListAggregate.list({ author: "Alice", title: "First" })
+
+        // `=`, not `begins_with`: the key is complete, and `begins_with` on it
+        // would also match a title `Firstly` (or, for a number, 3.5 under 3).
+        const gsiInput = mockListQuery.mock.calls[0]![0]
+        expect(gsiInput.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
+        expect(gsiInput.ExpressionAttributeValues[":sk"]).toEqual({
+          S: "$myapp#v1#articlelist#alice#first",
+        })
+        expect(gsiInput.ExpressionAttributeValues[":skPrefix"]).toBeUndefined()
       }).pipe(Effect.provide(ListLayer)),
     )
 

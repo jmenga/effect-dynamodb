@@ -702,10 +702,69 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 | Type | Serialization |
 |------|---------------|
 | `string` | As-is |
-| `number` | Zero-padded to fixed width |
+| `number` | Numeric key text (below): a non-negative integer is zero-padded to 16 digits |
+| `bigint` | Numeric key text (below): a non-negative bigint is zero-padded to 38 digits |
 | `DateTime.Utc` | ISO 8601 string |
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying string value |
+
+#### Numeric key text
+
+DynamoDB orders sort keys by their UTF-8 bytes, so `KeyComposer.serializeValue`
+writes a number or bigint as text that sorts in numeric order
+(`packages/schema/src/internal/NumericKey.ts`). `x` is the magnitude, `W` the pad
+width (16 for a number, 38 for a bigint):
+
+| Value | Key text | Example |
+|---|---|---|
+| `0`, `-0`, integer `x < 10^W` | `x` zero-padded to `W` digits | `42` → `0000000000000042` |
+| non-integer `x < 10^W` | padded integer part, `.`, fraction digits | `3.14` → `0000000000000003.14` |
+| `x ≥ 10^W` | `:`, 3-digit exponent, significant digits | `1e21` → `:0211` |
+| negative, `x < 10^W` | `-`, 9's complement of the positive text (`.` kept), `:` | `-3.14` → `-9999999999999996.85:` |
+| negative, `x ≥ 10^W` | `-*`, complemented exponent and digits, `:` | `-1e16` → `-*9838:` |
+| `Infinity` / `-Infinity` | `;` / `-)` | |
+
+The fraction is the number's shortest round-trip decimal (`String(n)`) written out
+without an exponent, so `0.1` is `.1`; trailing zeros are dropped. The leading byte
+orders the forms (`-` < digits < `:` < `;`; under `-`, `)` < `*` < digits), and a
+negative's `:` terminator sorts its shorter text last, so `-3.14 < -3.1 < -3`. Every
+byte is above the `#` delimiter and none is a letter, so casing never changes it and
+a composite that continues with `#<next>` keeps the order. `NaN` has no order and a
+bigint of more than 1,000 digits overflows the exponent: both throw `[EDD-9096]`
+(`KeyValueError`). Where that surfaces:
+
+| Path | Result |
+|---|---|
+| Entity writes and key-taking operations: `put`, `create`, `upsert`, `update` (key, or a `.set()` index composite), `get`, `delete`, `restore`, `purge`, time-series `append` (key or `orderBy`); unique-constraint values on `put`, `create`, `upsert` and `restore` | `ValidationError` for the operation, cause the `KeyValueError`, before anything is marshalled or sent (`composeKeysOrFail`) |
+| `Batch.get` / `Batch.write`, `Transaction.transactGet` / `transactWrite` | `ValidationError`, nothing sent (`composePrimaryKeyOrFail`, and the put builder's unique-value check) |
+| Query accessors, `.where()` and `.within()` operands | Thrown when called, as other unusable accessor composites are |
+| `Aggregate`, `EventStore` | Not converted: a defect |
+| A `NaN` in a number attribute that is not a key composite | Refused by the marshaller (a defect), as in 1.36 |
+
+Up to 1.36 `NaN` composed the text `0000000000000NaN` (then cased): a `get` by a `NaN` key failed with
+`ItemNotFound` and a `delete` did nothing, where they now fail with the
+`ValidationError`; a write died in the marshaller, as it still would without the
+check.
+
+**This changed stored keys in 1.37.0.** Up to 1.36 the text was
+`String(n).padStart(16, "0")` (38 for a bigint), which sorted `-3` above `-5`, `10.5`
+below `3.14`, `1e-7` above `3` and `1e21` below `1e16`. Non-negative integers below
+`10^W` keep their exact bytes; every other number (negative, fractional,
+`≥ 1e16`, `±Infinity`) and every negative or `≥ 1e38` bigint now composes different
+text — including `DateEpochMs` and `DateEpochSeconds` composites before 1970. Items
+written by 1.36 with such a composite keep their old keys until rewritten: `get` /
+`update` / `delete` by key miss them, index queries miss or misorder them, and their
+unique-constraint sentinels no longer block a new duplicate. Only a live item can be
+written again through its entity, so the migration is per row kind (scan for rows
+with an affected value in a key composite or a time-series `orderBy`):
+
+| Row | Keys holding numeric text | Rewrite |
+|---|---|---|
+| Live item | pk, sk, every index key, unique sentinels | Delete it and its sentinels under their stored keys (raw `DynamoClient.deleteItem`), `put` it again through the entity, which recomposes every key and sentinel. On a retain entity move its snapshots first, so the `put` continues after the retained history instead of restarting at version 1 |
+| Time-series event item (`<currentSk>#e#<orderBy>`) | pk, and the sk's current-item and `orderBy` parts | `.append()` can't: the current item is newer, so the append is stale and writes nothing. Re-put raw with the same attributes, the recomposed pk and `KeyComposer.composeEventSk(currentSk, orderBy, schema casing)` from the current item's recomposed sk and the stored `orderBy`; delete the old row |
+| Version snapshot, soft-delete tombstone | pk, and the `{item}` segment of the sk | Only when a primary-key composite changed. Re-put raw under the recomposed pk with the segment `composeHistoryItemSegment` derives from the recomposed live sk; delete the old row. The version digits and the timestamp keep their bytes |
+| `EventStore` stream | pk (stream-id composites), and a stream index attribute holding it (no `derivePartition`) | Only when a stream-id composite changed. Copy every row of the partition (events, snapshot, command sentinels) raw to the recomposed pk, sks unchanged (version, command id); delete the old rows. Appending again would renumber events and rerun projections |
+| Aggregate | pk of every row, edge / discriminator sks, list partition keys | `get` composes the new keys and can't read it. Query the old partition raw, recompose each row's keys, re-put and delete the old rows; or delete them and `create` the aggregate again from its source data |
 
 ### Composite key form
 
@@ -717,21 +776,22 @@ which form to use has been the root cause of every key bug in this area.
 
 **The rule.** Compose from the **Encoded** form, EXCEPT when the domain type is
 numeric (`number` / `bigint`) and the encoded form is a **string** — then
-compose from the numeric **Type** form so `serializeValue` pads it.
+compose from the numeric **Type** form so `serializeValue` encodes it in numeric
+order.
 
 | composite | Type | Encoded | key uses |
 |---|---|---|---|
-| `Schema.Number` | number | number | encoded (already padded) |
-| `Schema.BigInt` | bigint | bigint | encoded (already padded) |
-| `Schema.BigIntFromString` | bigint | string | **Type** — a string would not pad |
+| `Schema.Number` | number | number | encoded (already numeric) |
+| `Schema.BigInt` | bigint | bigint | encoded (already numeric) |
+| `Schema.BigIntFromString` | bigint | string | **Type** — a string would sort as text |
 | `Schema.NumberFromString` | number | string | **Type** — same shape |
-| `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, padded |
+| `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, numeric |
 | `Schema.Date` / `DateTimeUtc` | Date | ISO string | encoded — ISO sorts correctly |
 | untransformed string | string | string | encoded (identical) |
 
-The exception exists because `serializeValue` pads numbers to 16 digits and
-bigints to 38 so they sort lexicographically in numeric order, and leaves a
-string alone. Composing the encoded `"42"` of a `BigIntFromString` stored
+The exception exists because `serializeValue` writes numbers and bigints as
+numeric key text (above), which sorts in numeric order, and leaves a string
+alone. Composing the encoded `"42"` of a `BigIntFromString` stored
 `txn_42` beside `txn_100` and `txn_5`, which DynamoDB orders 100 < 42 < 5 — so
 `gte(42n)` returned 42 and 5 instead of 42 and 100.
 
@@ -1814,6 +1874,50 @@ Query.consistentRead // the table or an LSI; on a GSI DynamoDB rejects it, diagn
 Query.execute    // Query<A> => Effect<A, DynamoError, DynamoClient>
 Query.paginate   // Query<A> => Effect<Stream<A>, DynamoError, DynamoClient>
 ```
+
+### Accessor sort key conditions (#171)
+
+An accessor that pins sort key composites sends ONE sort key condition
+(`KeyComposer.composeSortKeyCondition`), and a value never matches a longer
+sibling:
+
+| Pinned | Condition |
+|---|---|
+| some composites | `begins_with(sk, <prefix>#)` — the delimiter ends the last value, so `done` never matches `done_archived` |
+| every composite | `sk = <key>` — the stored key ends at the last value, so there is no delimiter to stop on; `seq: 3` never matches `3.14` / `3.5`, `ship` never `shipped` |
+
+Up to 1.36 a complete key was still `begins_with(<key>)` and matched those
+siblings. The rule covers the primary accessor, every GSI accessor (on an
+isolated or a clustered collection index too), `Entity.query.<index>` and the
+language service's params (a collection query pins no sort key composites); `Aggregate.list` applies the same rule to its list sort key
+(`=` when every list sk composite is given, else `begins_with` with a trailing
+`#`). A full pin on a time-series entity's primary accessor reads the current item
+only, never its `#e#` rows. Z-order halves pin prefix segments only and are
+unaffected.
+
+**`beginsWith` on a numeric composite is `eq`.** Numeric key text has no textual
+prefix by value (`3` is not a prefix of `35`), so `.where(beginsWith)` with a
+`number` or `bigint` operand compiles to `eq` (`composeRangeUnder`, and history
+`.where()`). That is also what 1.36 amounted to for a non-negative integer, whose
+padded text has the full width.
+
+**History `.where()` stays inside `<currentSk>#e#`.** A one-sided bound would
+replace the history prefix with a bare comparison and read the current item and
+other items' rows in the partition (as 1.36 did), so each operator becomes a
+range clamped to the prefix `P`, operand key `v` = `P` + the `orderBy` key text:
+
+| Operator | Condition |
+|---|---|
+| `eq` | `sk = v` |
+| `lte` / `lt` | `BETWEEN P AND v` / `BETWEEN P AND keyJustBelow(v)` |
+| `gte` / `gt` | `BETWEEN v AND P + U+FFFF` / `BETWEEN v#U+FFFF AND P + U+FFFF` |
+| `between` | unchanged (both ends carry `P`) |
+| `beginsWith` | `begins_with(sk, v)`; `sk = v` for a numeric `orderBy` |
+
+`keyJustBelow(v)` (`internal/RangePlanner.ts`) steps the last code point of `v`
+down by one and appends U+10FFFF, the greatest code point, so the strict bound is
+exact on the key and keeps `Limit` on the request (no row check). `gt` uses the
+`#` + U+FFFF convention of `composeRangeUnder`.
 
 ### Request Sizing (#171)
 
@@ -4479,12 +4583,13 @@ Both paths compose keys through the same rule:
 
 > Compose from the **Encoded** form, EXCEPT when the domain type is numeric
 > (`number`/`bigint`) and the encoded form is a **string** — then compose from the
-> numeric **Type** form so `serializeValue` pads it.
+> numeric **Type** form so `serializeValue` encodes it in numeric order.
 
-`serializeValue` zero-pads numbers to 16 digits and bigints to 38 so they sort
-correctly; a numeric composite stored via its string wire form would skip that padding
-and sort lexicographically (`100 < 42 < 5`). `DynamoModel.DateEpochMs` composites use
-the encoded epoch, which pads as a number.
+`serializeValue` writes numbers and bigints as numeric key text ("Numeric key text"
+above) so they sort correctly; a numeric composite stored via its string wire form
+would skip that encoding and sort lexicographically (`100 < 42 < 5`).
+`DynamoModel.DateEpochMs` composites use the encoded epoch, which is encoded as a
+number.
 
 Every composition site routes through this one function. `test/KeyFormInvariant.test.ts`
 reads each module as source text and fails if a `KeyComposer` call receives a record
@@ -4506,7 +4611,8 @@ succeeds and writes `seq_420`. Only reads were broken, so callers do have rows i
 old format.
 
 Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`,
-`DateTimeUtc`, literals — are byte-identical and need no migration.
+`DateTimeUtc`, literals — are byte-identical and need no migration. (1.37.0 later
+changed the text of negative, fractional and large numbers: see "Numeric key text".)
 ### Diagnostic Code Registry (`EDD-xxxx`)
 
 Configuration and usage mistakes carry a stable `EDD-xxxx` code in the message, so an
@@ -4534,6 +4640,7 @@ for unrelated errors and the collision was caught only at review.
 | 9071–9079 | Packed storage encoding (`DynamoModel.Packed`, compressors) |
 | 9080–9085 | EventStore `query.index`, projections, change feed, head proof |
 | 9086–9095 | Z-order indexes, range planning, skip-scan, cursors |
+| 9096 | Numeric key text |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -4626,8 +4733,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
 | `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a single-range key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
+| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`): a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text") | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
 
-Next free code: **`EDD-9096`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9097`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## 16. Consumed Capacity
 

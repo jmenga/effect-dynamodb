@@ -277,7 +277,9 @@ const alerts = yield* db.entities.Telemetries.history({ channel, deviceId })
   .collect()
 ```
 
-Terminals are the standard `BoundQuery` set: `.collect()`, `.fetch()`, `.paginate()`, `.count()`. Ordering is lexicographic on the stored `orderBy` value — for `DateTime.Utc` this equals chronological ordering. Call `.reverse()` to iterate newest-first.
+Every `.where()` operator stays inside the item's own events. DynamoDB allows one sort key condition, so a one-sided bound is sent as a range that starts or ends at the `#e#` prefix: `gte(t.at, x)` reads from `x` to the last event, `lt(t.at, x)` from the first event up to the key just below `x`. Up to 1.36 `lt`, `lte`, `gt` and `gte` replaced the prefix with a bare `sk < x` (or `>`, `<=`, `>=`), and returned rows outside the item's events: its current item, and other items' rows in the same partition.
+
+Terminals are the standard `BoundQuery` set: `.collect()`, `.fetch()`, `.paginate()`, `.count()`. Ordering is the stored `orderBy` key text — for `DateTime.Utc` this equals chronological ordering, and a `number` or `bigint` `orderBy` is written as key text that sorts in numeric order, negatives and fractions included ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)). `beginsWith` on a numeric `orderBy` matches that one value, as `eq` does. Call `.reverse()` to iterate newest-first.
 
 ## TTL and retention
 

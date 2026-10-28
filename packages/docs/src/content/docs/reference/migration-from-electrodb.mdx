@@ -383,7 +383,7 @@ Features in ElectroDB that work differently or are not available in effect-dynam
 | **Getter/setter hooks** | `get`/`set` callbacks per attribute | Use Effect `Schema.transform` for equivalent functionality |
 | **Calculated/virtual attributes** | Via watch + set/get | Compute at application layer or with `Schema.transform` |
 | **Key templates** | `"USER#${userId}"` template strings | Attribute-list composition (`composite: ["userId"]`) — more predictable |
-| **Attribute padding** | `padding: { length, char }` | Automatic zero-padding for numeric composites in sort keys |
+| **Attribute padding** | `padding: { length, char }` | Automatic numeric key text for numeric composites: sorts in numeric order, negatives and fractions included |
 | **Fluent chaining** | `entity.query.byEmail(pk).where(...).go()` | Fluent BoundQuery: `db.entities.E.byEmail(pk).where(...).collect()` |
 | **Async/Promise** | Returns Promises | Returns Effects — run via `Effect.runPromise` at the edge |
 

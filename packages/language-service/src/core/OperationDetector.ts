@@ -489,6 +489,12 @@ function extractCallArgs(
 function extractArgValue(ts: typeof import("typescript"), expr: ts.Expression): unknown {
   if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text
   if (ts.isNumericLiteral(expr)) return Number(expr.text)
+  if (ts.isBigIntLiteral(expr)) return BigInt(expr.text.slice(0, -1))
+  // A negative literal (`-3`, `-42n`) is a prefix unary minus on a literal.
+  if (ts.isPrefixUnaryExpression(expr) && expr.operator === ts.SyntaxKind.MinusToken) {
+    if (ts.isNumericLiteral(expr.operand)) return -Number(expr.operand.text)
+    if (ts.isBigIntLiteral(expr.operand)) return -BigInt(expr.operand.text.slice(0, -1))
+  }
   if (expr.kind === ts.SyntaxKind.TrueKeyword) return true
   if (expr.kind === ts.SyntaxKind.FalseKeyword) return false
   // For non-literal expressions, return placeholder

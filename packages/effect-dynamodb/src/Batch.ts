@@ -25,7 +25,7 @@ import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./internal/ItemSize.js"
 import {
   batchRejectReason,
-  composePrimaryKey,
+  composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
   rejectUnsupportedOp,
@@ -135,10 +135,12 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
 
     // Compose each position's primary key. `BatchGetItem` does not preserve
     // order, so `batchGetRaw` matches responses back to positions by key.
-    const requests = infos.map((info) => ({
-      tableName: tableNames.get(info.entity)!,
-      key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
-    }))
+    const requests = yield* Effect.forEach(infos, (info) =>
+      Effect.map(composePrimaryKeyOrFail(info.entity, info.key!, "batchGet"), (key) => ({
+        tableName: tableNames.get(info.entity)!,
+        key: toAttributeMap(key),
+      })),
+    )
     const fetched = yield* batchGetRaw(client, requests, {
       maxRetries,
       baseDelayMs,
@@ -428,7 +430,9 @@ const writeCore = (
         }
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
-        const composed = toAttributeMap(composePrimaryKey(entity, info.key!))
+        const composed = toAttributeMap(
+          yield* composePrimaryKeyOrFail(entity, info.key!, "batchWrite.delete"),
+        )
         const key = keyOf(tableName, entity, composed)
         touched.set(key, (touched.get(key) ?? 0) + 1)
         writeRequests.push({

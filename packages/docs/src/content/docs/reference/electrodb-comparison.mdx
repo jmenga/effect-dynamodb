@@ -27,7 +27,7 @@ ElectroDB is the most feature-rich existing DynamoDB ORM for TypeScript. This co
 | Opaque/branded types | `CustomAttributeType<T>`, `OpaquePrimitiveType` | Effect Schema branded types | **Advantage** — first-class support with compile-time enforcement |
 | Date/time handling | Manual (string/number attributes) | 9 built-in date schemas (`DateString`, `DateEpochMs`, `DateEpochSeconds`, `DateTimeZoned`, etc.) with `storedAs` modifier | **Advantage** — type-safe date handling with configurable storage |
 | Attribute labels for keys | `label: "customPrefix"` | Not supported (attribute name used) | ElectroDB only |
-| Attribute padding in keys | `padding: { length, char }` | Automatic zero-padding for numeric composites (16 digits for numbers, 38 for bigints) | Parity |
+| Attribute padding in keys | `padding: { length, char }` | Automatic numeric key text for numeric composites: sorts in numeric order, negatives and fractions included | Parity |
 | Getter/setter hooks | `get`/`set` callbacks per attribute | Use `Schema.decodeTo` with `SchemaGetter.transform` / `SchemaGetter.transformEffect` | Different approach — see note 1 |
 | Watch attribute changes | `watch: ["attr1"] \| "*"` | Not applicable | Different approach — see note 1 |
 | Calculated attributes | Via watch + set | Not applicable | Different approach — see note 1 |
@@ -244,7 +244,7 @@ Features in ElectroDB that are not available in effect-dynamodb, with workaround
 | Custom key templates | Attribute-list composition covers standard patterns |
 | Getter/setter hooks | `Schema.decodeTo` with `SchemaGetter.transform` / `SchemaGetter.transformEffect` provide equivalent power |
 | Watch/calculated/virtual attributes | Compute at application layer or use `Schema.decodeTo` |
-| Attribute padding | Automatic zero-padding for numeric composites in sort keys |
+| Attribute padding | Automatic numeric key text for numeric composites (sorts in numeric order) |
 | Composite index type | DynamoDB feature from Nov 2025 — can be added in a future release |
 | Key casting (numeric keys) | All keys are strings by design |
 | Index scope | Key namespacing provides sufficient isolation |

@@ -74,6 +74,14 @@ describe("OperationDetector", () => {
     expect(op!.arguments?.userId).toBe("u-bob")
   })
 
+  it("reads negative and bigint literals as key values", () => {
+    const source = `Users.get({ userId: -3.5, a: 42n, b: -42n, c: -7 })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 6, entities)
+
+    expect(op!.arguments).toEqual({ userId: -3.5, a: 42n, b: -42n, c: -7 })
+  })
+
   it("should detect Users.create() operation", () => {
     const source = `Users.create({ userId: "u-new", email: "new@example.com" })`
     const sf = parseSource(source)

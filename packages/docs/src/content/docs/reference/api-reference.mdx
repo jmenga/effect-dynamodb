@@ -1020,10 +1020,11 @@ import { KeyComposer } from "effect-dynamodb"
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
 | `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append. Implements v3 per-half structural composition + policy-aware hole detection (see `indexPolicy` guide). |
-| `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | Partial SK prefix for `begins_with` queries |
+| `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | The composed SK up to the last composite supplied, with no trailing delimiter |
+| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied, else `{ beginsWith: prefix + "#" }`, so a value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
-| `serializeValue` | `(value) => string` | Serialize a value for key composition |
+| `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
 | `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
 | `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 
