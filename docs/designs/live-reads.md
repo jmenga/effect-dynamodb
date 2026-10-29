@@ -1,7 +1,7 @@
 # Design: live reads — streaming changes to connected clients (#180)
 
 **Issue:** [#180](https://github.com/jmenga/effect-dynamodb/issues/180)
-**Status:** Proposed. Scoping decisions (§14) and spikes (§13) open for owner review before implementation.
+**Status:** Proposed. Spikes run 2026-10-29 (§13); scoping decisions (§14) open for owner review before implementation.
 **Builds on:** `change-feed.md` (#156), `stream-seal.md` (#166), Effect's `Reactivity` (`effect/unstable/reactivity`).
 **Affected packages:** `packages/effect-dynamodb` (core: keys, write invalidation, live reads, `Live`; new subpath `effect-dynamodb/live/appsync`).
 **Semver impact:** `minor`. Purely additive: new methods, a new layer and a new subpath. Existing operations don't change unless `Reactivity` is provided, in which case writes also invalidate (§4.2).
@@ -120,11 +120,13 @@ What each stream view type supports:
 - GSI query watches need `NEW_IMAGE` to see items enter or change in a partition, and `NEW_AND_OLD_IMAGES` to see them leave one.
 - The guide recommends `NEW_AND_OLD_IMAGES`.
 
-Wire format: compact, versioned JSON, a few hundred bytes. Notifications for several records on one channel are packed up to AppSync's 5 events per publish.
+Wire format: compact, versioned JSON. One AppSync event carries **all the notifications of a stream batch** (spike 2, §13). Each notification is a few hundred bytes, so a batch of 100 records is one publish of about 30 KB, well under AppSync's 240 KB event limit.
 
 ```json
-{"f":1,"t":"main-table","i":["$app#v1#order#o-1","$app#v1#order"],
- "p":[["pk","$app#v1#order#o-1"],["gsi1pk","$app#v1#customer#c-9"]],"n":42}
+{"f":1,"n":[
+  {"t":"main-table","i":["$app#v1#order#o-1","$app#v1#order"],
+   "p":[["pk","$app#v1#order#o-1"],["gsi1pk","$app#v1#customer#c-9"]],"v":42}
+]}
 ```
 
 ## 5. Live reads
@@ -235,17 +237,25 @@ AppSyncEvents.receiver({
 
 ### 6.3 Publishing
 
-Each option below takes one of the stream's two reader slots (§2.2). They share a pure core: `ChangeNotification.fromStreamRecords` (§4.3), plus `AppSyncEvents.publishBodies(channel, notifications)`, which packs at most 5 events per body, each a stringified JSON value.
+Each option below takes one of the stream's two reader slots (§2.2). They share a pure core:
+- `ChangeNotification.fromStreamRecords` (§4.3);
+- `AppSyncEvents.publishBody(channel, notifications)`, which builds a single publish body whose one event (a stringified JSON value) carries every notification. It's escaped by `JSON.stringify`, so any key value is safe.
 
 1. **Pipe with an enrichment Lambda (recommended).**
    - **Source:** the table's stream. **Filter:** the item types that matter (e.g. `__edd_e__`).
-   - **Enrichment:** a Lambda that calls `AppSyncEvents.enrich({ tables, channel })(records)` and returns publish bodies.
+   - **Enrichment:** a Lambda that calls `AppSyncEvents.enrich({ tables, channel })(records)`. It returns **one** publish body per batch, never an array (spike 2).
    - **Target:** an API destination posting to `https://<httpHost>/event`, through a connection that carries the `x-api-key` header.
-   - Subject to spike 2 (§13).
-2. **Pipe with only an input transformer** (no code). Offered only if spike 1 shows the transformer can produce the stringified-event body safely for key values containing `$`, `#`, quotes and backslashes. If so, `AppSyncEvents.pipeTemplate(tables)` generates the filter and template for infrastructure-as-code.
-3. **A `changeFeed` sink:** `Live.publishChangeFeed(feed, publish)` runs `fromStreamRecords` on each batch, publishes it, then commits the batch. It's for deployments already running a leased change-feed consumer (§6 of `change-feed.md`), and needs no Pipe. On Web Functions the lease moves between environments as they come and go; the sweep covers the handover.
+   - **Required Pipe settings**, which the guide documents and an infrastructure-as-code snippet carries:
+     - `BatchSize` ≤ 100, which keeps one batch's notifications inside one 240 KB event;
+     - `MaximumBatchingWindowInSeconds: 0` (latency);
+     - a bounded `MaximumRetryAttempts` (e.g. 5) and `MaximumRecordAgeInSeconds` (e.g. 300). By default a Pipe retries a failed batch indefinitely, which stalls every later notification on that shard. A dropped batch is healed by the sweep.
+2. **A `changeFeed` sink:** `Live.publishChangeFeed(feed, publish)` runs `fromStreamRecords` on each batch, publishes it, then commits the batch. It's for deployments already running a leased change-feed consumer (§6 of `change-feed.md`), and needs no Pipe. On Web Functions the lease moves between environments as they come and go; the sweep covers the handover. A batch larger than one event allows is split across several publishes, because the sink makes its own HTTP calls.
 
-Publish failures are retried by the Pipe (or by the change-feed's batch retry), and a dead-letter queue catches persistent ones. A notification lost for good is healed by the sweep.
+**No Pipe without code.** A Pipe that uses only an input transformer was dropped after spike 1. The transformer escapes a value once, for the outer JSON, so a key containing a quote, backslash or control character becomes an invalid event. AppSync then reports the bad event in its `failed` array with HTTP 200, so the Pipe records success and the notification is lost with no retry and no dead-letter queue.
+
+**AppSync's HTTP 200 can still mean failure.** AppSync's publish endpoint returns 200 even when it rejects an event, listing it in `failed`. The library's publishers (the change-feed sink, and anything built on `publishBody`) treat a non-empty `failed` as a publish error.
+
+Publish failures are retried by the Pipe (bounded, as above) or by the change-feed's batch retry. A notification lost for good is healed by the sweep. A newly created or updated Pipe that starts at `LATEST` can miss writes made in its first minute or two (§13), which the sweep also covers.
 
 ## 7. Effect RPC end to end (illustrative)
 
@@ -298,10 +308,11 @@ const followOrder = (client: RpcClient.FromGroup<typeof LiveRpcs>, orderId: stri
 
 ## 8. Platform notes
 
-- **Lambda Web Functions**
-  - The transport receiver and followers run as background fibers in the `Live` layer's scope. They live as long as the environment.
-  - Requests are capped at `timeoutSeconds`, so clients resume as in §7.
-  - Spikes 3 and 4 (§13) must confirm that an environment can hold an outgoing WebSocket, and that Effect RPC's chunked `application/ndjson` responses (not `text/event-stream`) stream without buffering.
+- **Lambda Web Functions** (confirmed by spikes 3 and 4, §13)
+  - The transport receiver and followers run as background fibers in the `Live` layer's scope. They keep receiving while no request is in flight, and live as long as the environment.
+  - An idle environment is still reclaimed even with the receiver's WebSocket open, so scale-to-zero and memory billing are unaffected. The next environment's receiver connects on start-up.
+  - Effect RPC's chunked `application/ndjson` responses (not `text/event-stream`) stream as they're written.
+  - Requests are cut at `timeoutSeconds`. The Effect RPC client sees the cut as a stream failure, `RpcClientError` (*"HTTP response ended before RPC request completed"*), not as a clean end. So the `Stream.retry` resume recipe in §7 catches it, and clients resume from their last version.
 - **ECS:** the same design, with no request cap; load-balancer idle timeouts apply.
 - **Single instance:** `Live.polling` alone, or local invalidation alone if every write goes through the one instance.
 
@@ -327,7 +338,7 @@ const followOrder = (client: RpcClient.FromGroup<typeof LiveRpcs>, orderId: stri
 **This issue, one PR:**
 1. **Foundation:** change keys, local-write invalidation on every write path, the registry and followers, `Live.layer`, `Live.polling`, `Live.memory`, `ChangeNotification.fromStreamRecords` and `Live.publishChangeFeed`.
 2. **Live reads:** `eventStream.subscribe`, `entity.watch` and `query.watch()`.
-3. **AppSync Events:** receiver, auth, `publishBodies`, `enrich`, and `pipeTemplate` if spike 1 passes. Plus the guide (`guides/live-reads.mdx`), an example (`examples/guide-live-reads.ts`) using `Live.polling` against DynamoDB Local, and a `DESIGN.md` section.
+3. **AppSync Events:** receiver, auth, `publishBody` and `enrich`. Plus the guide (`guides/live-reads.mdx`), an example (`examples/guide-live-reads.ts`) using `Live.polling` against DynamoDB Local, and a `DESIGN.md` section.
 
 **Follow-up issues:**
 - live collection queries, aggregate `watch` (re-assembled on change), time-series `history().watch()`, geo queries and `readIndex` subscriptions;
@@ -362,20 +373,46 @@ const followOrder = (client: RpcClient.FromGroup<typeof LiveRpcs>, orderId: stri
     - keep-alive timeout and reconnect;
     - `subscribe_error` and `broadcast_error`;
     - SigV4 headers for a fixed clock and credentials;
-    - `publishBodies` packing and escaping.
+    - `publishBody` packing and escaping (quote, backslash, control characters and Unicode in key values: the spike 1 failure cases);
+    - a 200 response with a non-empty `failed` array treated as a publish error.
 - **Connected (DynamoDB Local):** two bound clients, one writing and one watching.
   - Writes are delivered through local invalidation.
   - A `changeFeed` publishing to `Live.memory` delivers writes from the other client, including a GSI partition move.
   - `Live.polling` delivers them with no publisher.
 - **Gap:** AppSync has no local emulator, so its adapter is covered by unit tests only. A manual script against a real AppSync Events API goes in the guide.
 
-## 13. Spikes before implementation
+## 13. Spike results (2026-10-29)
 
-1. Can a Pipe input transformer emit `{"channel": …, "events": ["<stringified JSON>"]}` safely for key values containing `$`, `#`, `"` and `\`? This decides whether option 2 of §6.3 is offered.
-2. Does a Pipe with an enrichment Lambda deliver each element of the returned array to an API destination target separately, and at what batch size?
-3. Can a Web Function environment hold an outgoing WebSocket in a background fiber across idle periods between requests?
-4. Do Web Functions stream Effect RPC's chunked `application/ndjson` responses incrementally?
-5. What sustained delivery rate does one AppSync Events connection get on one channel? This sets when bucketed channels become necessary.
+The spikes ran in us-east-1 against real services:
+- a DynamoDB table (`NEW_AND_OLD_IMAGES`);
+- an AppSync Events API (API key);
+- two EventBridge Pipes through an API destination;
+- a Lambda Web Function running Effect `4.0.0-rc.109` with `@effect/platform-node`.
+
+Latencies were measured from the client machine (6 ms from the CloudFront edge). Everything was deleted afterwards.
+
+| # | Question | Result |
+|---|---|---|
+| 1 | Can a Pipe input transformer emit AppSync's stringified-event body safely? | **No.** Plain and Unicode keys arrived. Keys containing a quote, backslash, newline or tab were silently dropped: the transformer escapes once, for the outer JSON. AppSync answered 200 and listed the event in `failed`, and the Pipe logged a successful target invocation. The no-code Pipe option was removed (§6.3). |
+| 2 | Does a Pipe deliver each element of an enrichment Lambda's array to an API destination? | **No.** An API destination accepts exactly one event per invocation. A Lambda returning 2 or more elements fails the batch (*"Events received a batch size of 2 events and only accepts 1"*, HTTP 400), and the default retry policy then stalled the shard (30 failed attempts). Returning **one object per batch, with all notifications in one event**, delivered 45 of 45, quote, backslash, newline, tab and Unicode keys included, in batches up to the configured 10. The wire format and the enrichment contract were changed accordingly (§4.3, §6.3). |
+| 3 | Can a Web Function environment keep an outgoing WebSocket going in the background while idle? | **Yes.** Over 3 minutes with no request in flight, the background receiver got 35 of 35 events (p50 253 ms, max 420 ms, from publish to receipt). Keep-alives kept arriving and nothing disconnected. The receiver connected as soon as the environment started. |
+| 3b | Does an open background WebSocket keep an idle environment alive? | **No.** After 8 minutes with no requests, the environment had been reclaimed. The next request cold-started a new environment, whose receiver connected immediately. Scale-to-zero still works. |
+| 4 | Do Web Functions stream Effect RPC's chunked `application/ndjson` responses as they're written? | **Yes.** A streaming RPC sending an element every 500 ms delivered 20 of 20, with arrival gaps of 493–508 ms (first element at 359 ms). A raw `application/ndjson` route behaved the same. |
+| 4b | What does the client see when `timeoutSeconds` cuts a stream? | A 1-per-second stream on a 120 s timeout delivered 120 elements. The client's stream then **failed** at 120.3 s with `RpcClientError` (*"HTTP response ended before RPC request completed"*), a typed failure that `Stream.retry` catches (§7, §8). |
+| 5 | What delivery rate does one AppSync Events connection sustain on one channel? | **No ceiling found up to 5,000 events/s.** At 50, 200, 500, 1,000, 2,000 and 5,000 events/s for 10 s each, 100% of events were delivered (50,000 of 50,000 at the top rate), with p50 about 150 ms and p99 about 420 ms. Because notifications are batched one event per stream batch, the event rate is far below the write rate. The single channel stands; bucketing stays a follow-up. |
+
+**End-to-end latency** was measured from the write call to an AppSync receiver, over 10 writes spaced 3 s apart, with a batching window of 0:
+
+| Path | p50 | min | max |
+|---|---|---|---|
+| Transformer-only Pipe | 506 ms | 357 ms | 1,473 ms |
+| Enrichment Pipe | 585 ms | 412 ms | 1,500 ms |
+
+The enrichment Lambda adds about 80 ms. A 2 s batching window raised p50 to about 2 s.
+
+**Pipe start-up.** A Pipe created, or just updated, with `StartingPosition: LATEST` processed nothing written in its first minute or two after reporting `RUNNING`. This is an operational note, and the sweep covers it.
+
+**Web Functions.** The minimum for `--max-environments` is 2. `aws lambda-web deploy` creates an execution role named `awscli-lambdaweb-<name>` and uploads into a managed bucket, `awscli-lambdaweb-<account>-<region>-an`.
 
 ## 14. Scoping decisions (for owner review)
 
@@ -391,7 +428,8 @@ const followOrder = (client: RpcClient.FromGroup<typeof LiveRpcs>, orderId: stri
 | S8 | `query.watch()` defaults to `maxPages(1)` when unbounded | In |
 | S9 | Transports: polling and memory (core), AppSync Events (subpath) | In |
 | S10 | AppSync auth: API key, IAM (optional peer dependencies, caller-supplied credentials), bearer token | In |
-| S11 | Publishers: enrichment function, `changeFeed` sink; input-transformer template only if spike 1 passes | In / conditional |
+| S11 | Publishers: enrichment function (one body per batch) and `changeFeed` sink. The input-transformer template is dropped (spike 1) | In |
+| S20 | Documented Pipe settings: `BatchSize` ≤ 100, no batching window, bounded retries and record age (spike 2) | In |
 | S12 | Single fixed channel; bucketed channels deferred | Out (follow-up) |
 | S13 | Collections, aggregates, time-series `history`, geo, `readIndex` subscriptions | Out (follow-up) |
 | S14 | IoT Core and Valkey transports | Out (follow-up) |
