@@ -8,20 +8,21 @@ test.describe("Navigation", () => {
     await expect(page.locator("h1")).toContainText("Introduction")
     const content = page.locator("main")
     await expect(content).toBeVisible()
-    await expect(content.getByText("Core Concepts")).toBeVisible()
+    await expect(content.getByRole("heading", { name: "Core Concepts" })).toBeVisible()
   })
 
   test("sidebar contains Introduction and Getting Started", async ({ page }) => {
     await page.goto(`${BASE}/`)
     const sidebar = page.locator("nav[aria-label='Main']")
     await expect(sidebar.getByText("Introduction")).toBeVisible()
-    await expect(sidebar.getByText("Getting Started")).toBeVisible()
+    // "Getting Started" also labels the first tutorial — match the top-level page by its link
+    await expect(sidebar.locator(`a[href="${BASE}/getting-started/"]`)).toBeVisible()
   })
 
   test("Getting Started link navigates from sidebar", async ({ page }) => {
     await page.goto(`${BASE}/`)
     const sidebar = page.locator("nav[aria-label='Main']")
-    await sidebar.getByText("Getting Started").click()
+    await sidebar.locator(`a[href="${BASE}/getting-started/"]`).click()
     await expect(page).toHaveURL(/getting-started/)
     await expect(page.locator("h1")).toContainText("Getting Started")
   })
