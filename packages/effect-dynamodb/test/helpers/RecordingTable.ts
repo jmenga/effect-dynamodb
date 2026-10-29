@@ -5,7 +5,8 @@
  * UpdateItem (`MockDynamoClient.applyUpdate`'s expression shapes), DeleteItem,
  * Query (on the table's keys or a declared secondary index, `Limit` counting
  * rows examined before the filter, paged by `ExclusiveStartKey` /
- * `LastEvaluatedKey`), BatchGetItem, BatchWriteItem,
+ * `LastEvaluatedKey`), Scan (in key order, split into `TotalSegments` by a
+ * hash of the key, paged the same way), BatchGetItem, BatchWriteItem,
  * TransactGetItems and TransactWriteItems (`Put` / `Update` / `Delete` /
  * `ConditionCheck`). A failed condition answers `ALL_OLD` when the request
  * asked for it, as DynamoDB does.
@@ -221,6 +222,30 @@ export const makeRecordingTable = (options?: {
               [index.sk]: last[index.sk]!,
             },
           }),
+        } as never
+      }),
+    scan: (input) =>
+      Effect.sync(() => {
+        record("Scan", input)
+        const total = input.TotalSegments ?? 1
+        const segmentOf = (key: string) => {
+          let hash = 0
+          for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0
+          return hash % total
+        }
+        let rows = [...items.entries()]
+          .filter(([key]) => segmentOf(key) === (input.Segment ?? 0))
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        const start = input.ExclusiveStartKey as Item | undefined
+        if (start !== undefined) rows = rows.filter(([key]) => key > keyOf(start))
+        const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
+        const last = examined[examined.length - 1]
+        const more = examined.length < rows.length && last !== undefined
+        return {
+          Items: examined.map(([, item]) => item),
+          Count: examined.length,
+          ScannedCount: examined.length,
+          ...(more && { LastEvaluatedKey: { pk: last[1].pk!, sk: last[1].sk! } }),
         } as never
       }),
     batchGetItem: (input) =>

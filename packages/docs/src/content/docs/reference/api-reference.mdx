@@ -144,7 +144,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `legacyKeys: false` to turn off the 1.36 key fallback ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)) |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `legacyKeys: false` to turn off the 1.36 key fallback once `rekey` has moved every row ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136), [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -197,6 +197,25 @@ Both `make` and `definition` check the members against each other. Every member 
 | `Table` | Interface with `schema`, `entities`, `aggregates`, `layer()`, `layerConfig()`, and `Tag` for DI |
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
+| `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
+| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume }` |
+| `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
+| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed", key, target, message }` — a row `rekey` left as it is |
+| `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
+
+### Table operations
+
+The typed client's `db.tables.<Table>` binds the table's operations:
+
+| Operation | Description |
+|-----------|-------------|
+| `create(options?)` / `delete()` / `describe()` / `update(input)` | Create the table from its members' key and index declarations, delete it, describe it, update its settings |
+| `backup(name)` / `listBackups()` / `restoreFromBackup(backupArn)` | On-demand backups |
+| `enablePointInTimeRecovery()` / `disablePointInTimeRecovery()` / `restoreToPointInTime(date)` / `exportToS3(bucket, options?)` | Point-in-time recovery and export |
+| `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
+| `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
+| `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row 1.36 wrote whose key text changed to its current key: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, so a concurrent write wins, and conflicts are reported and left; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 

@@ -15,6 +15,8 @@ import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
+import type { BoundEventStream, EventStream } from "./EventStore.js"
+import type { CapacityTotals } from "./internal/Capacity.js"
 
 /** Runtime table configuration injected via Effect Layer. */
 export interface TableConfig {
@@ -868,6 +870,166 @@ export const definition = (table: Table): TableDefinition => {
 /** Options for table creation. */
 export interface CreateTableOptions {
   readonly billingMode?: "PAY_PER_REQUEST" | "PROVISIONED" | undefined
+}
+
+// ---------------------------------------------------------------------------
+// rekey — move rows still under their 1.36 keys (#171)
+// ---------------------------------------------------------------------------
+
+/**
+ * The rows `db.tables.<Table>.rekey()` moves, by kind:
+ *
+ * - `item` — an entity's item (its unique sentinels move with it, counted in
+ *   {@link RekeyReport.sentinelsMoved})
+ * - `snapshot` — a version snapshot (`versioned: { retain: true }`)
+ * - `tombstone` — a soft-deleted item (the unique sentinels it kept,
+ *   `preserveUnique`, move to their current keys and name the item's current
+ *   key, counted in {@link RekeyReport.sentinelsMoved}), or a projection's
+ *   row tombstone
+ * - `outbox` — a projection's outbox item, to its read-model row's current
+ *   key (an outbox on another table moves with that table's `rekey`)
+ * - `event` — a time-series event
+ * - `aggregate` — a row of an aggregate
+ * - `stream` — a row of an event stream: events, snapshot, command sentinels
+ */
+export type RekeyRowKind =
+  | "item"
+  | "snapshot"
+  | "tombstone"
+  | "outbox"
+  | "event"
+  | "aggregate"
+  | "stream"
+
+/** Rows moved (or, in a dry run, that would move), by kind. */
+export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
+
+/**
+ * Why `rekey` left a row alone without judging its keys:
+ *
+ * - `notLibrary` — it has no `__edd_e__`: the library did not write it
+ * - `unregistered` — its `__edd_e__` names no entity, aggregate or stream
+ *   the client knows (pass event streams in {@link RekeyOptions.streams}),
+ *   or it is an outbox item on another table than its read model's, of a
+ *   projection not defined where `rekey` runs
+ * - `unrecognizedKey` — its member's, but stored neither under the key its
+ *   values compose now nor under the one 1.36 composed for them
+ */
+export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
+
+/**
+ * A row `rekey` did not move, and why. A row is moved only where nothing is
+ * (or, a stream's snapshot, over an older one), and deleted only while it is
+ * as `rekey` read it, so a write that lands in between wins:
+ *
+ * - `bothKeys` — the same row (the same item, version, event, …) is also
+ *   under its current key — for an aggregate, any of its rows is, or which
+ *   of them are where can't be told; both are left as they are
+ * - `taken` — another row holds its current key
+ * - `contended` — concurrent writes changed it on every attempt
+ * - `failed` — it could not be moved as stored (its values no longer decode,
+ *   a stream id reads as more than one id, or a write was refused);
+ *   `message` says why
+ */
+export interface RekeyConflict {
+  /** The entity type, aggregate or stream name. */
+  readonly member: string
+  readonly kind: RekeyRowKind
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed"
+  /** The row's primary key, as stored. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** Its current key: where it would move. */
+  readonly target: Readonly<Record<string, unknown>> | undefined
+  readonly message: string
+}
+
+/** One member's share of a {@link RekeyReport}. */
+export interface RekeyMemberReport {
+  readonly unchanged: number
+  readonly moved: RekeyCounts
+  readonly indexKeysRewritten: number
+  readonly sentinelsMoved: number
+  readonly conflicts: number
+}
+
+/**
+ * What a `rekey` run did — or, with `dryRun`, would do. Counts are of rows
+ * acted on: a row the scan reads after the run moved it (at its current key)
+ * is `unchanged`, so `scanned` is not the sum of the others. A row an
+ * application write moved between the scan and the move is `unchanged` too:
+ * `moved` counts the rows this run moved.
+ */
+export interface RekeyReport {
+  readonly dryRun: boolean
+  /** Rows the scan returned. */
+  readonly scanned: number
+  /** Rows of a known member already under their current keys, with nothing to rewrite. */
+  readonly unchanged: number
+  /** Rows moved to their current keys (a dry run: rows that would move), by kind. */
+  readonly moved: RekeyCounts
+  /**
+   * Items under their current table key whose index keys or vector partition
+   * held 1.36 text, rewritten in place (`UpdateItem`).
+   */
+  readonly indexKeysRewritten: number
+  /** Unique-constraint sentinels moved to their current keys. */
+  readonly sentinelsMoved: number
+  /** Rows left where they are — see {@link RekeyConflict}. */
+  readonly conflicts: ReadonlyArray<RekeyConflict>
+  /** Rows no member owns, by reason. */
+  readonly skipped: { readonly [R in RekeySkipReason]: number }
+  /** Per entity type, aggregate and stream name. */
+  readonly byMember: Readonly<Record<string, RekeyMemberReport>>
+  /** What the run consumed — always measured, whatever `ConsumedCapacity` reporting is set to. */
+  readonly capacity: CapacityTotals
+  /**
+   * Where the scan stopped, when it stopped before the end of the table
+   * (`maxPages`): pass it as {@link RekeyOptions.resume} to go on.
+   * `undefined` when the run covered the whole table.
+   */
+  readonly resume: string | undefined
+}
+
+/** Options for `db.tables.<Table>.rekey()`. */
+export interface RekeyOptions {
+  /** Count what would move, reading but writing nothing. Default `false`. */
+  readonly dryRun?: boolean | undefined
+  /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
+  readonly segments?: number | undefined
+  /** Rows of one scan page handled at once, per segment. Default 4. */
+  readonly concurrency?: number | undefined
+  /** The scan's page size (`Limit`). Default: DynamoDB's (1 MB pages). */
+  readonly pageSize?: number | undefined
+  /**
+   * Stop after this many scan pages (all segments together) and return a
+   * {@link RekeyReport.resume} token: bound a run to a time slot and go on
+   * in the next one.
+   */
+  readonly maxPages?: number | undefined
+  /**
+   * A {@link RekeyReport.resume} token — of an earlier run, or the last one
+   * {@link onProgress} received before a run was interrupted. Its segment
+   * count wins; a different `segments` fails (`EDD-9098`).
+   */
+  readonly resume?: string | undefined
+  /**
+   * The event streams on the table, bound or not. `DynamoClient.make` does
+   * not register streams, so a stream's rows are `unregistered` (skipped)
+   * unless it is listed here. A stream on another table is ignored.
+   */
+  readonly streams?:
+    | ReadonlyArray<
+        | EventStream<any, any, any, any, any, any, any>
+        | BoundEventStream<any, any, any, any, any, any, any>
+      >
+    | undefined
+  /**
+   * Called after each scan page, once every row of it is handled, with the
+   * report so far and a `resume` token from that point: a run that is
+   * interrupted resumes from the last token it delivered, redoing at most
+   * the pages in flight (`rekey` is idempotent).
+   */
+  readonly onProgress?: ((progress: RekeyReport) => Effect.Effect<void>) | undefined
 }
 
 /**

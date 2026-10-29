@@ -492,8 +492,12 @@ const runScope = <A, E, R>(
   settings: Settings,
   parent: OperationScope | undefined,
   effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => runIn(newScope(name, options, settings, parent), effect)
+
+const runIn = <A, E, R>(
+  scope: OperationScope,
+  effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> => {
-  const scope = newScope(name, options, settings, parent)
   const body = Effect.provideService(effect, CurrentOperation, scope)
   // Success and failure report after the effect, as ordinary (interruptible)
   // code; only an interrupted operation reports from the exit finalizer.
@@ -501,9 +505,9 @@ const runScope = <A, E, R>(
     Effect.flatMap(Effect.exit(body), (exit) => Effect.flatMap(finish(scope, exit), () => exit)),
     (exit) => (scope.closed ? Effect.void : finish(scope, exit)),
   )
-  if (!settings.spans) return finished
+  if (!scope.settings.spans) return finished
   return Effect.useSpan(
-    spanName(name),
+    spanName(scope.name),
     { kind: spanKind(scope), attributes: startAttributes(scope) },
     (span) => {
       scope.span = span
@@ -533,6 +537,32 @@ export const operation = <A, E, R>(
     const current = fiber.getRef(CurrentOperation)
     if (current === SUPPRESSED) return effect
     return runScope(name, options, settings, liveScope(current), effect)
+  })
+
+/**
+ * Run `body` as the named library operation with reporting on whatever the
+ * setting in context — every request it sends asks for its capacity — and
+ * give it the totals so far (`rekey`'s report carries them, #171). The span
+ * and the observer follow the context's setting: with reporting off there is
+ * neither, and nothing outside `body` is touched.
+ */
+export const measured = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  body: (totals: () => CapacityTotals) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.withFiber((fiber) => {
+    const configured = fiber.getRef(Reporting)
+    const settings: Settings = configured.enabled ? configured : { ...off, enabled: true }
+    const current = fiber.getRef(CurrentOperation)
+    const scope = newScope(name, options, settings, liveScope(current))
+    const totals = (): CapacityTotals => {
+      const sum = zeroTotals()
+      addTotals(sum, scope.totals)
+      addTotals(sum, scope.carried.totals)
+      return freezeTotals(sum)
+    }
+    return runIn(scope, Effect.provideService(body(totals), Reporting, settings))
   })
 
 /**

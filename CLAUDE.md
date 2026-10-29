@@ -93,7 +93,9 @@ packages/effect-dynamodb/src/
 │   ├── Expr.ts         # Expr ADT — 16 expression node types, ConditionOps, compileExpr, parseShorthand
 │   ├── PathBuilder.ts  # PathBuilder — recursive Proxy for type-safe attribute path access
 │   ├── BoundQuery.ts   # BoundQuery fluent builder — wraps Query<A> with pre-resolved services; .within() / .zorder() / .explain() / .onRequest()
-│   ├── RangePlanner.ts # Pure planner for .within(): key / skip-scan / filter plans, Z-order naive / jump / precise; probe + read steps, plan LRU
+│   ├── RangePlanner.ts # Pure planner for .within(): key / skip-scan / filter plans, Z-order naive / jump / precise; probe + read steps, plan LRU; the 1.36 key passes (keyPassesPlanner)
+│   ├── Rekey.ts        # rekey driver (#171): parallel Scan, each row to its member's RekeyHandler, resume tokens, the report
+│   ├── KeyText136.ts   # (schema pkg) The exact key text 1.36 composed, for the 1.36 key fallback and rekey (#171)
 │   ├── Cursor.ts       # Opaque cursors: legacy btoa(LastEvaluatedKey) and v2 ("v2." + base64url JSON: fingerprint, mode, position)
 │   ├── ZOrderCurve.ts  # (schema pkg) Z-order algebra: quantize, MSB-aligned interleave, address bytes, boxes, BIGMIN/LITMAX, capped range plan, prefix segments
 │   ├── BoundCrud.ts    # Bound CRUD builders (BoundPut/Update/Delete/Append) + BoundGet (an Effect), all carrying BoundOpTypeId for the one unwrap protocol
@@ -301,6 +303,7 @@ Do NOT:
 - Casing (default: `"lowercase"`) applied to the **entire key** including composite attribute values — `"Male"` and `"male"` produce identical keys. Stored attribute values retain original casing.
 - Numeric composites (`number` / `bigint`) compose order-preserving key text (`schema/src/internal/NumericKey.ts`, DESIGN.md "Numeric key text"): non-negative integers below 1e16 (bigint: 1e38) keep the 1.36 zero-padded bytes; negatives (`-` + 9's complement + `:`), fractions (`.` + digits) and larger values (`:` + exponent + digits) sort numerically since 1.37.0. No byte is a letter or below `#`. `NaN` (and a bigint over 1,000 digits) throws EDD-9096, surfaced as a `ValidationError` by entity writes and key-taking ops, `Batch` and `Transaction` (`composeKeysOrFail` / `composePrimaryKeyOrFail`, before marshalling). An accessor given every SK composite sends `sk = key` (`KeyComposer.composeSortKeyCondition`), a partial one `begins_with(prefix#)`; `beginsWith` on a numeric composite compiles to `eq`; history `.where()` bounds are clamped to `<currentSk>#e#`.
 - Sort key composite text is escaped (`KeyComposer.sortKeyText`, DESIGN.md "Sort key text"): every code point U+0000–U+0025 (control characters, space, `!`, `"`, `#`, `$`, `%`) becomes `%` + two hex digits after casing (the digits follow the casing), so key order is value order, every `.where()` / `.within()` bound is one exact key condition, and values may hold `#`. Applies to every sort key built from composites (indexes, event `orderBy`, snapshot / tombstone item segments, aggregate sort keys and discriminator values, Z-order prefix segments, the language service's params); partition keys, unique sentinels and EventStore keys are not escaped. A string without such a character keeps its 1.36 bytes.
+- Rows written by 1.36 (#171, DESIGN.md "Rows written by 1.36" and "`rekey`"): `schema/src/internal/KeyText136.ts` composes the exact key text 1.36 wrote, pinned by `schema/test/fixtures/key-text-1.36.0.json` (generated once from the published 1.36.0 — never regenerate or "fix" it). An op whose key text differs from its 1.36 text falls back to / moves from the 1.36 key; an op whose text did not change must send exactly the requests it sends under `DynamoSchema.make({ legacyKeys: false })` (request capture in `LegacyKeys*.test.ts`), and with the switch off no request names a 1.36 key. A new key-taking path needs the same fallback (`KeyFormInvariant.test.ts` covers the `KeyText136` call sites). Projection row tombstones and outbox items hold no values: 1.37 marks them (`__edd_kt__`), and an unmarked one's key is read back as 1.36 text (`KeyText136.readIndexKeys`). `db.tables.<Table>.rekey()` (`internal/Rekey.ts`, a `RekeyHandler` per member) moves the remaining rows whatever `legacyKeys` says. The fallback and `legacyKeys` go in the next major.
 - `__edd_e__` entity type discriminator on every item, enforced via FilterExpression on all queries
 - Index overloading — generic GSI names (gsi1, gsi2) serve different patterns per entity type. Logical names (`byTenant`) map to physical GSI names.
 - Item collections group multiple entity types under the same index for cross-entity queries.
@@ -349,6 +352,7 @@ Do NOT:
 | `guides/packed-storage.mdx` | `examples/guide-packed-storage.ts` |
 | `guides/vector-search.mdx` | `examples/guide-vector-search.ts` |
 | `guides/consumed-capacity.mdx` | `examples/guide-consumed-capacity.ts` |
+| `guides/upgrading.mdx` | `examples/guide-upgrade.ts` |
 | ... (all other tutorials/guides follow the same pattern) | |
 
 ### Sync normalization

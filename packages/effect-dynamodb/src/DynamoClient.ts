@@ -201,6 +201,7 @@ import {
   type TupleSpace,
   zorderPlanner,
 } from "./internal/RangePlanner.js"
+import * as Rekey from "./internal/Rekey.js"
 import {
   diagnoseFailure,
   explainDiagnosis,
@@ -208,7 +209,7 @@ import {
   withCause,
 } from "./internal/WriteDiagnosis.js"
 import * as Query from "./Query.js"
-import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
+import type { CreateTableOptions, RekeyOptions, RekeyReport, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
 
 /**
@@ -2269,6 +2270,27 @@ export interface TableOperations {
       readonly timeout?: Duration.Input | undefined
     },
   ) => Effect.Effect<void, DynamoClientError>
+
+  // --- 1.36 keys (#171) ---
+
+  /**
+   * Move every row 1.36 wrote whose key text changed to its current key:
+   * items with their unique sentinels, version snapshots, tombstones,
+   * time-series events, aggregates, and the event streams passed in
+   * `options.streams` (copied, flipped, then deleted, while writers append).
+   * Index keys and vector partitions still holding 1.36 text are rewritten in
+   * place. Scans the table (`segments` in parallel); a row is moved only when
+   * it is stored under the key 1.36 composed for its values, so a rerun moves
+   * nothing. Conflicts are reported, never overwritten. `dryRun` counts what
+   * would move. See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
+   *
+   * Fails with `ValidationError` (`EDD-9098`) for a bad option or resume
+   * token, and with the `DynamoClientError` of a request that failed — resume
+   * from the last `onProgress` token.
+   */
+  readonly rekey: (
+    options?: RekeyOptions,
+  ) => Effect.Effect<RekeyReport, DynamoClientError | ValidationError>
 }
 
 // ---------------------------------------------------------------------------
@@ -3149,6 +3171,54 @@ const makeFromConfig = (config: {
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
+    // `rekey` (#171) hands each row to the member owning it: the table's
+    // entities and aggregates, those the client binds on the same table, and
+    // the streams the caller passes (`DynamoClient.make` binds no streams).
+    const rekeyFor =
+      (tableName: string, tagKey: string, registered: ReadonlyArray<unknown>) =>
+      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> => {
+        const onTable = (member: unknown) =>
+          (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key === tagKey
+        const handlers = new Set<Rekey.RekeyMember>()
+        for (const member of [
+          ...registered,
+          ...Object.values(config.entities).filter(onTable),
+          ...Object.values(config.aggregates ?? {}).filter(onTable),
+          ...(options?.streams ?? []),
+        ]) {
+          const handler = Rekey.handlerOf(member)
+          if (handler !== undefined) handlers.add(handler)
+        }
+        // A projection's outbox on this table, of a read model on another (#171).
+        const outboxOf = new Set<unknown>()
+        for (const entity of [...registered, ...Object.values(config.entities)]) {
+          const outbox = (
+            entity as {
+              readonly _projectionOutbox?: {
+                readonly table: { readonly Tag: { readonly key: string } }
+                readonly pk: string
+                readonly sk: string
+              }
+            }
+          )._projectionOutbox
+          if (outbox === undefined || outbox.table.Tag.key !== tagKey || outboxOf.has(entity)) {
+            continue
+          }
+          outboxOf.add(entity)
+          const readModel = entity as unknown as Pick<
+            EntityType,
+            "entityType" | "_rekeyProjectionRow"
+          >
+          handlers.add({
+            name: readModel.entityType,
+            types: [`${readModel.entityType}#outbox`],
+            row: (row, ctx) =>
+              readModel._rekeyProjectionRow(row, ctx, { pk: outbox.pk, sk: outbox.sk }),
+          })
+        }
+        return provide(Rekey.run({ tableName, members: [...handlers], options }))
+      }
+
     if (config.tables) {
       for (const [tableKey, table] of Object.entries(config.tables)) {
         const tableConfig = yield* table.Tag
@@ -3183,7 +3253,13 @@ const makeFromConfig = (config: {
             } as unknown as Table
           }
         }
-        tables[tableKey] = buildTableOperationsFromTable(tableConfig.name, mergedTable, client)
+        tables[tableKey] = {
+          ...buildTableOperationsFromTable(tableConfig.name, mergedTable, client),
+          rekey: rekeyFor(tableConfig.name, table.Tag.key, [
+            ...Object.values(mergedTable.entities as Record<string, unknown>),
+            ...Object.values(mergedTable.aggregates as Record<string, unknown>),
+          ]),
+        }
       }
     } else {
       // Group entities by table tag so we can derive full table schema for create().
@@ -3231,11 +3307,10 @@ const makeFromConfig = (config: {
             ]),
           ),
         } as unknown as Table
-        tables[tableConfig.name] = buildTableOperationsFromTable(
-          tableConfig.name,
-          syntheticTable,
-          client,
-        )
+        tables[tableConfig.name] = {
+          ...buildTableOperationsFromTable(tableConfig.name, syntheticTable, client),
+          rekey: rekeyFor(tableConfig.name, tag.key, [...tableEntities, ...tableAggregates]),
+        }
       }
     }
 
@@ -3294,8 +3369,11 @@ const buildTableOperationsFromTable = (
   tableName: string,
   table: Table,
   client: DynamoClientService,
-): TableOperations => {
-  const def = tableDefinition(table)
+): Omit<TableOperations, "rekey"> => {
+  // Composed when a table is created: a table holding only event streams or a
+  // projection's outbox has no definition to give, but its other operations
+  // (`rekey` among them) still work.
+  const definition = () => tableDefinition(table)
   const vectorIndexes = mergeVectorIndexes(
     table.entities as unknown as Record<string, Parameters<typeof mergeVectorIndexes>[0][string]>,
   )
@@ -3303,22 +3381,25 @@ const buildTableOperationsFromTable = (
   return {
     ...buildTableOperations(tableName, client),
     create: (options?: CreateTableOptions) =>
-      idempotentCreate(
-        client
-          .createTable({
-            TableName: tableName,
-            BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-            ...def,
-          })
-          .pipe(
-            Effect.asVoid,
-            diagnoseVectorLimits("CreateTable", `db.tables create of "${tableName}"`, {
-              vectorIndexes: def.VectorIndexes ?? [],
-              sharers,
-              declared: vectorIndexes.size,
-            }),
-          ),
-      ),
+      Effect.suspend(() => {
+        const def = definition()
+        return idempotentCreate(
+          client
+            .createTable({
+              TableName: tableName,
+              BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+              ...def,
+            })
+            .pipe(
+              Effect.asVoid,
+              diagnoseVectorLimits("CreateTable", `db.tables create of "${tableName}"`, {
+                vectorIndexes: def.VectorIndexes ?? [],
+                sharers,
+                declared: vectorIndexes.size,
+              }),
+            ),
+        )
+      }),
     addVectorIndex: (indexName) => {
       const entry = vectorIndexes.get(indexName)
       if (entry === undefined) {
@@ -3376,7 +3457,10 @@ const buildTableOperationsFromTable = (
   }
 }
 
-const buildTableOperations = (tableName: string, client: DynamoClientService): TableOperations => ({
+const buildTableOperations = (
+  tableName: string,
+  client: DynamoClientService,
+): Omit<TableOperations, "rekey"> => ({
   create: (options?: CreateTableOptions) =>
     idempotentCreate(
       client

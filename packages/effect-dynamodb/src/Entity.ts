@@ -124,6 +124,7 @@ import {
 } from "./internal/Packed.js"
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
+import * as Rekey from "./internal/Rekey.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -874,6 +875,17 @@ export interface Entity<
     DynamoClientError | ValidationError | ConcurrentModification,
     DynamoClient | TableConfig
   >
+
+  /**
+   * @internal `rekey`'s handler for a projection's row tombstone or outbox
+   * item of this read model (#171) — `keys`: the table key attributes of an
+   * outbox on another table.
+   */
+  readonly _rekeyProjectionRow: (
+    row: globalThis.Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+    keys?: { readonly pk: string; readonly sk: string } | undefined,
+  ) => Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig>
 
   /**
    * @internal Where a stored row's values key it in `index` now (#171): how a
@@ -4880,15 +4892,18 @@ const makeImpl = <
   /**
    * The 1.36 primary key of the item at `encodedKey`, when its text changed.
    * A key that doesn't compose has none: the op refuses it on its own (or it
-   * is a put whose generated id is not filled in yet — a new item).
+   * is a put whose generated id is not filled in yet — a new item). `force`
+   * answers with the fallback turned off too: `rekey` moves rows whatever it
+   * is set to.
    */
   const primaryKey136 = (
     encodedKey: globalThis.Record<string, unknown>,
+    force = false,
   ): globalThis.Record<string, string> | undefined => {
-    if (!KeyText136.enabled(schema)) return undefined
+    if (!force && !KeyText136.enabled(schema)) return undefined
     try {
       return KeyText136.changedPrimaryKey(
-        schema,
+        force ? DynamoSchema.make({ ...schema, legacyKeys: true }) : schema,
         entityType,
         entityVersion,
         config.indexes.primary,
@@ -4937,15 +4952,16 @@ const makeImpl = <
   /**
    * A unique sentinel's 1.36 key for `source`'s values, when its text differs
    * from `current` — the sentinel's key now. Only a number's text can differ:
-   * a sentinel's values are not escaped.
+   * a sentinel's values are not escaped. `force`: as {@link primaryKey136}.
    */
   const sentinel136 = (
     constraintName: string,
     constraintDef: UniqueConstraintDef,
     source: globalThis.Record<string, unknown>,
     current: { readonly pk: string; readonly sk: string },
+    force = false,
   ): { readonly pk: string; readonly sk: string } | undefined => {
-    if (!KeyText136.enabled(schema)) return undefined
+    if (!force && !KeyText136.enabled(schema)) return undefined
     const key = KeyText136.composeUniqueKey(
       schema,
       entityType,
@@ -4983,13 +4999,15 @@ const makeImpl = <
    * current text is put under its current key and released under the 1.36 one;
    * one whose text is unchanged gets its back-pointer updated. Each is
    * conditioned on `from` still owning it, and the Put on its current key being
-   * free (`reserves` lists the Puts' positions).
+   * free (`reserves` lists the Puts' positions). `force`: as
+   * {@link primaryKey136}.
    */
   const sentinelMoves = (
     tableName: string,
     source: globalThis.Record<string, unknown>,
     from: { readonly pk: unknown; readonly sk: unknown },
     to: { readonly pk: unknown; readonly sk: unknown },
+    force = false,
   ) =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -5006,7 +5024,7 @@ const makeImpl = <
           source,
         )
         if (current === undefined) return []
-        const old = sentinel136(constraintName, constraintDef, source, current.key)
+        const old = sentinel136(constraintName, constraintDef, source, current.key, force)
         return [{ constraintName, current: current.key, old }]
       })
       const reads = yield* Effect.forEach(
@@ -5405,6 +5423,7 @@ const makeImpl = <
     row: globalThis.Record<string, AttributeValue>,
     operation: string,
     depth: number,
+    force = false,
   ): Effect.Effect<
     void,
     DynamoClientError | ValidationError | ConcurrentModification,
@@ -5433,7 +5452,7 @@ const makeImpl = <
           current: Option.none(),
         })
       }
-      yield* moveFrom136(values, operation, depth + 1)
+      yield* moveFrom136Detailed(values, operation, { depth: depth + 1, force })
     })
 
   /**
@@ -5655,7 +5674,8 @@ const makeImpl = <
    * moves without it.
    *
    * `"moved"` when the item is at its current key now — moved, or found there
-   * by the Put (a concurrent move); `"absent"` when nothing of the item is at
+   * by the Put (a concurrent move, or the item stored under both keys: see
+   * {@link moveFrom136Detailed}); `"absent"` when nothing of the item is at
    * the 1.36 key, which includes an item another writer moved since the
    * caller missed it at its current key: callers read the current key again.
    * A 1.36 row of another value holding the current key is moved out of the
@@ -5673,9 +5693,36 @@ const makeImpl = <
     DynamoClientError | ValidationError | ConcurrentModification,
     DynamoClient | TableConfig
   > =>
+    moveFrom136Detailed(encodedKey, operation, { depth }).pipe(
+      Effect.map((moved) => (moved.outcome === "absent" ? "absent" : "moved")),
+    )
+
+  /**
+   * {@link moveFrom136}, telling apart what it folds into `"moved"`: `"both"`
+   * when the Put found the item at its current key while the 1.36 row was
+   * still as read — stored under both keys, which an op takes as moved (it
+   * works on the current row) and `rekey` reports, leaving both. `sentinels`
+   * counts the sentinels moved to their current keys; `snapshot` is where the
+   * snapshot that moved with the item landed. `force`: as {@link primaryKey136}.
+   */
+  const moveFrom136Detailed = (
+    encodedKey: globalThis.Record<string, unknown>,
+    operation: string,
+    options: { readonly depth?: number | undefined; readonly force?: boolean | undefined },
+  ): Effect.Effect<
+    {
+      readonly outcome: "moved" | "absent" | "both"
+      readonly sentinels: number
+      readonly snapshot?: globalThis.Record<string, string> | undefined
+    },
+    DynamoClientError | ValidationError | ConcurrentModification,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
-      const old = primaryKey136(encodedKey)
-      if (old === undefined) return "absent"
+      const depth = options.depth ?? 0
+      const force = options.force === true
+      const old = primaryKey136(encodedKey, force)
+      if (old === undefined) return { outcome: "absent" as const, sentinels: 0 }
       const client = yield* Capacity.client
       const { name: tableName } = yield* tableTag
       const pkField = config.indexes.primary.pk.field
@@ -5692,19 +5739,25 @@ const makeImpl = <
         })
         // Nothing there — or a row 1.36 wrote for another value whose text it
         // shares (1.36 did not escape `#`), which is not this item.
-        if (read === undefined || rowOwner(encodedKey, old, read) === "foreign") return "absent"
+        if (read === undefined || rowOwner(encodedKey, old, read) === "foreign") {
+          return { outcome: "absent" as const, sentinels: 0 }
+        }
         // A projection's row tombstone holds no values to compose keys from:
         // it moves as a row, marked as under its current key — or is found
         // there with the item, which an op takes as moved.
         if (isProjectionTombstone(read, entityType)) {
           const keys = { pk: pkField, sk: skField }
-          if (yield* displaceValueless136(tableName, keys, read, operation, depth)) return "moved"
+          if (yield* displaceValueless136(tableName, keys, read, operation, depth)) {
+            return { outcome: "moved" as const, sentinels: 0 }
+          }
           const { Item: there } = yield* client.getItem({
             TableName: tableName,
             Key: toAttributeMap(current),
             ConsistentRead: true,
           })
-          if (there !== undefined && rowOwner(encodedKey, current, there) === "own") return "moved"
+          if (there !== undefined && rowOwner(encodedKey, current, there) === "own") {
+            return { outcome: "both" as const, sentinels: 0 }
+          }
           continue
         }
         const stored = toDomainView(fromAttributeMap(read) as globalThis.Record<string, unknown>)
@@ -5741,6 +5794,7 @@ const makeImpl = <
           stored,
           { pk: old[pkField], sk: old[skField] },
           { pk: current[pkField], sk: current[skField] },
+          force,
         )
         const snapshot = withSnapshot
           ? yield* snapshotMove136(
@@ -5777,22 +5831,27 @@ const makeImpl = <
         ]
         const snapshotAt = 2 + sentinels.items.length
         type Outcome =
-          | { readonly _tag: "Moved" }
+          | { readonly _tag: "Moved"; readonly concurrently: boolean }
+          | { readonly _tag: "Both" }
           | { readonly _tag: "Raced" }
           | { readonly _tag: "Held"; readonly row: globalThis.Record<string, AttributeValue> }
         const outcome = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
-          Effect.as<Outcome>({ _tag: "Moved" }),
+          Effect.as<Outcome>({ _tag: "Moved", concurrently: false }),
           Effect.catch((err: DynamoClientError): Effect.Effect<Outcome, DynamoClientError> => {
             if (!isAwsTransactionCancelled(err.cause)) return Effect.fail(err)
             const reasons = err.cause.CancellationReasons ?? []
             if (reasons[0]?.Code === "ConditionalCheckFailed") {
-              // The current key is taken: by the item — a concurrent move —
-              // or by a 1.36 row of another value, which moves out first.
+              // The current key is taken: by the item — a concurrent move,
+              // unless the 1.36 row is still as read (stored under both
+              // keys) — or by a 1.36 row of another value, which moves out
+              // first.
               const held = reasons[0].Item as globalThis.Record<string, AttributeValue> | undefined
               return Effect.succeed(
                 held !== undefined && rowOwner(encodedKey, current, held) === "foreign"
                   ? { _tag: "Held", row: held }
-                  : { _tag: "Moved" },
+                  : reasons[1]?.Code === "None"
+                    ? { _tag: "Both" }
+                    : { _tag: "Moved", concurrently: true },
               )
             }
             taken = sentinels.reserves
@@ -5807,8 +5866,15 @@ const makeImpl = <
             Effect.fail(new ValidationError({ entityType, operation, cause })),
           ),
         )
-        if (outcome._tag === "Moved") return "moved"
-        if (outcome._tag === "Held") yield* displace(outcome.row, operation, depth)
+        if (outcome._tag === "Moved") {
+          return {
+            outcome: "moved" as const,
+            sentinels: sentinels.reserves.length,
+            snapshot: outcome.concurrently ? undefined : snapshot.to,
+          }
+        }
+        if (outcome._tag === "Both") return { outcome: "both" as const, sentinels: 0 }
+        if (outcome._tag === "Held") yield* displace(outcome.row, operation, depth, force)
       }
       return yield* new ConcurrentModification({
         entityType,
@@ -13059,6 +13125,1005 @@ const makeImpl = <
     )
 
   // ---------------------------------------------------------------------------
+  // rekey (#171): the entity's part in `db.tables.<Table>.rekey()`
+  //
+  // A scanned row of the entity is judged by its own values. Under the key
+  // they compose now it is current — its GSI keys, vector partitions and
+  // unique sentinels may still hold 1.36 text, rewritten in place. Under the
+  // key 1.36 composed for them it moves: an item with the code an op moves it
+  // with (`moveFrom136Detailed`), a version snapshot, tombstone or time-series
+  // event as a row, keeping its layout. Under neither it is reported. Nothing
+  // is overwritten: a row whose current key another row holds is a conflict —
+  // unless that row is itself another value's 1.36 row, which moves first.
+  // ---------------------------------------------------------------------------
+
+  type StoredRow = globalThis.Record<string, AttributeValue>
+  type StoredKey = globalThis.Record<string, string>
+  type RowKind = "item" | "snapshot" | "tombstone" | "outbox" | "event"
+
+  const rekeyPk = config.indexes.primary.pk.field
+  const rekeySk = config.indexes.primary.sk.field
+  const keyAt = (pk: string, sk: string): StoredKey => ({ [rekeyPk]: pk, [rekeySk]: sk })
+  const sameStoredKey = (a: globalThis.Record<string, unknown>, b: StoredKey): boolean =>
+    a[rekeyPk] === b[rekeyPk] && a[rekeySk] === b[rekeySk]
+  /** A stored key as a sentinel's back-pointer names it. */
+  const ownerOf = (key: StoredKey) => ({ pk: key[rekeyPk], sk: key[rekeySk] })
+  const storedKeyOf = (row: StoredRow): StoredKey | undefined => {
+    const pk = row[rekeyPk]?.S
+    const sk = row[rekeySk]?.S
+    return pk === undefined || sk === undefined ? undefined : keyAt(pk, sk)
+  }
+
+  /**
+   * Where a row of the entity belongs now and where 1.36 put it, from its
+   * values and the layout of its sort key — `undefined` for a row whose
+   * values compose no key, or of no layout the entity writes. A history row
+   * keeps its layout: one an earlier release wrote without an item segment
+   * (#133) moves only its partition key.
+   */
+  const rowTargets = (
+    row: StoredRow,
+  ):
+    | {
+        readonly kind: RowKind
+        readonly current: StoredKey
+        readonly old: StoredKey
+        /** The item's key now and 1.36's: a tombstone's sentinels name the item. */
+        readonly live: StoredKey
+        readonly live136: StoredKey
+      }
+    | undefined => {
+    if (row.__edd_e__?.S !== entityType) return undefined
+    const stored = storedKeyOf(row)
+    if (stored === undefined) return undefined
+    try {
+      const primary = config.indexes.primary
+      const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+      const rowKeyForm = keyForm(values)
+      const live = composePrimaryKey(values) as StoredKey
+      const live136 = KeyText136.composeIndexKeys(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        rowKeyForm,
+      )
+      if (sameStoredKey(stored, live) || sameStoredKey(stored, live136)) {
+        return { kind: "item", current: live, old: live136, live, live136 }
+      }
+      const sk = stored[rekeySk]!
+      const currentPk = live[rekeyPk]!
+      const oldPk = live136[rekeyPk]!
+      const segment136 = KeyComposer.composeHistoryItemSegment(
+        schema,
+        entityType,
+        entityVersion,
+        primary,
+        live136[rekeySk]!,
+      )
+      const options136 = segment136 === undefined ? undefined : { item: segment136 }
+      const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+      if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
+        if (!sk.slice(versions.length).includes("#")) {
+          return {
+            kind: "snapshot",
+            current: keyAt(currentPk, sk),
+            old: keyAt(oldPk, sk),
+            live,
+            live136,
+          }
+        }
+        const version = versionOfSk(sk)
+        return {
+          kind: "snapshot",
+          current: keyAt(
+            currentPk,
+            DynamoSchema.composeVersionKey(
+              schema,
+              entityType,
+              version,
+              historyKeyOptions(live[rekeySk]),
+            ),
+          ),
+          old: keyAt(
+            oldPk,
+            DynamoSchema.composeVersionKey(schema, entityType, version, options136),
+          ),
+          live,
+          live136,
+        }
+      }
+      const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+      if (
+        sk.startsWith(tombstones) &&
+        /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
+      ) {
+        if (!sk.slice(tombstones.length).includes("#")) {
+          return {
+            kind: "tombstone",
+            current: keyAt(currentPk, sk),
+            old: keyAt(oldPk, sk),
+            live,
+            live136,
+          }
+        }
+        const timestamp = sk.slice(sk.lastIndexOf("#") + 1)
+        return {
+          kind: "tombstone",
+          current: keyAt(
+            currentPk,
+            DynamoSchema.composeDeletedKey(
+              schema,
+              entityType,
+              timestamp,
+              historyKeyOptions(live[rekeySk]),
+            ),
+          ),
+          old: keyAt(
+            oldPk,
+            DynamoSchema.composeDeletedKey(schema, entityType, timestamp, options136),
+          ),
+          live,
+          live136,
+        }
+      }
+      if (timeSeriesConfig !== undefined) {
+        const orderBy = timeSeriesConfig.orderBy
+        if (values[orderBy] === undefined || values[orderBy] === null) return undefined
+        return {
+          kind: "event",
+          current: keyAt(
+            currentPk,
+            KeyComposer.composeEventSk(live[rekeySk]!, rowKeyForm[orderBy], schema.casing),
+          ),
+          old: keyAt(
+            oldPk,
+            KeyText136.composeEventSk(live136[rekeySk]!, values[orderBy], schema.casing),
+          ),
+          live,
+          live136,
+        }
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Who holds `at`, a row's current key: the same row (stored under both
+   * keys, or moved there since), another value's row still under its 1.36
+   * key — which moves out first — or another row. A projection's row
+   * tombstone or outbox item is stale when 1.36 wrote it (unmarked) for
+   * values that compose another key now ({@link rekeyProjectionRow}).
+   */
+  const occupantOf = (held: StoredRow, at: StoredKey): "same" | "stale" | "other" => {
+    if (
+      held.__edd_e__?.S === `${entityType}#tombstone` ||
+      held.__edd_e__?.S === `${entityType}#outbox`
+    ) {
+      const rowKey =
+        held.__edd_e__.S === `${entityType}#outbox`
+          ? keyAt(held[OUTBOX_ROW_PK]?.S ?? "", held[OUTBOX_ROW_SK]?.S ?? "")
+          : at
+      return held[KEY_TEXT] === undefined && typeof currentKeyOf136(rowKey, true) === "object"
+        ? "stale"
+        : "other"
+    }
+    const targets = rowTargets(held)
+    if (targets === undefined) return "other"
+    if (sameStoredKey(targets.current, at)) return "same"
+    if (sameStoredKey(targets.old, at)) return "stale"
+    return "other"
+  }
+
+  /** Is `held` the same snapshot state as `read` ({@link sameSnapshotAs}, as values)? */
+  const sameSnapshotHeld = (held: StoredRow, read: StoredRow): boolean =>
+    [systemFields.version, INCARNATION_TOKEN, systemFields.updatedAt].every(
+      (attr) => typeof attr !== "string" || attributeValueEquals(held[attr], read[attr]),
+    )
+
+  const rekeyConflict = (
+    kind: RowKind,
+    reason: "bothKeys" | "taken" | "contended" | "failed",
+    key: StoredKey,
+    target: StoredKey | undefined,
+    message: string,
+  ): Rekey.RekeyTally => ({
+    conflicts: [{ member: entityType, kind, reason, key, target, message }],
+  })
+
+  /** A row counted once per run, however many handlers see it move. */
+  const countMove = (
+    ctx: Rekey.RekeyRowContext,
+    kind: RowKind,
+    to: StoredKey,
+    extra?: Rekey.RekeyTally,
+  ): Rekey.RekeyTally =>
+    Rekey.mergeTallies(
+      ctx.claim(`${entityType}\u0000moved\u0000${to[rekeyPk]}\u0000${to[rekeySk]}`)
+        ? { moved: { [kind]: 1 } }
+        : {},
+      extra ?? {},
+    )
+
+  /**
+   * A row moved since the scan read it — by this run, or by a write. Moved by
+   * a write, it is `unchanged`, as a row the scan reads at its current key
+   * is: `moved` counts the rows this run moved. Moved by this run, it was
+   * counted by the move.
+   */
+  const movedAway = (ctx: Rekey.RekeyRowContext, to: StoredKey) =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const { Item: there } = yield* client.getItem({
+        TableName: ctx.tableName,
+        Key: toAttributeMap(to),
+        ConsistentRead: true,
+      })
+      return there !== undefined &&
+        occupantOf(there, to) === "same" &&
+        ctx.claim(`${entityType}\u0000moved\u0000${to[rekeyPk]}\u0000${to[rekeySk]}`)
+        ? { unchanged: 1 }
+        : {}
+    })
+
+  /**
+   * Make room at `to` for a row moving there: a stale row (another value's,
+   * under its 1.36 key) moves out first. A tally of what moved, or the
+   * conflict that leaves the row where it is. `copy`: whether the row at `to`
+   * is a copy of the moving one, which the move then only deletes (`twin`).
+   */
+  const clearTarget = (
+    ctx: Rekey.RekeyRowContext,
+    kind: RowKind,
+    from: StoredKey,
+    to: StoredKey,
+    depth: number,
+    copy?: (held: StoredRow) => boolean,
+  ): Effect.Effect<
+    | { readonly cleared: true; readonly tally: Rekey.RekeyTally }
+    | { readonly cleared: false; readonly tally: Rekey.RekeyTally }
+    | { readonly cleared: "twin"; readonly tally: Rekey.RekeyTally },
+    DynamoClientError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const { Item: held } = yield* client.getItem({
+        TableName: ctx.tableName,
+        Key: toAttributeMap(to),
+        ConsistentRead: true,
+      })
+      if (held === undefined) return { cleared: true, tally: {} }
+      const occupant = occupantOf(held, to)
+      if (occupant === "same" && copy?.(held) === true) return { cleared: "twin", tally: {} }
+      if (occupant === "same") {
+        return {
+          cleared: false,
+          tally: rekeyConflict(
+            kind,
+            "bothKeys",
+            from,
+            to,
+            "The row is also stored under its current key.",
+          ),
+        }
+      }
+      if (occupant === "other") {
+        return {
+          cleared: false,
+          tally: rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
+        }
+      }
+      // A dry run counts the stale row when the scan reaches it.
+      if (ctx.dryRun) return { cleared: true, tally: {} }
+      if (depth >= DISPLACE_DEPTH) {
+        return {
+          cleared: false,
+          tally: rekeyConflict(
+            kind,
+            "contended",
+            from,
+            to,
+            "Too many rows under 1.36 keys hold each other's current keys.",
+          ),
+        }
+      }
+      return { cleared: true, tally: (yield* rekeyRow(held, ctx, depth + 1)) ?? {} }
+    })
+
+  /**
+   * Move a history row (snapshot, tombstone, event) from its 1.36 key `from`
+   * to `to`: one transaction puts it there — nothing else may be — and
+   * deletes it at `from`, guarded on the row as read. A tombstone's unique
+   * sentinels (`preserveUnique`) move in the same transaction: they name the
+   * item's live key, not the tombstone's ({@link sentinelRekeys}). A snapshot
+   * whose current key holds the same snapshot (`sameSnapshotAs`: a write of
+   * the item re-put it there before the item moved) is a copy: its 1.36 row
+   * is deleted, while that one is still there and the same, and counted as
+   * moved.
+   */
+  const moveHistoryRow = (
+    ctx: Rekey.RekeyRowContext,
+    kind: RowKind,
+    from: StoredKey,
+    to: StoredKey,
+    depth: number,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      let tally: Rekey.RekeyTally = {}
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        // The scan's read is eventually consistent: act on a consistent one.
+        const { Item: read } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(from),
+          ConsistentRead: true,
+        })
+        const targets = read === undefined ? undefined : rowTargets(read)
+        if (targets === undefined || !sameStoredKey(targets.current, to)) {
+          return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
+        }
+        const same = kind === "snapshot" ? sameSnapshotAs(read!) : undefined
+        const room = yield* clearTarget(
+          ctx,
+          kind,
+          from,
+          to,
+          depth,
+          same === undefined ? undefined : (held) => sameSnapshotHeld(held, read!),
+        )
+        tally = Rekey.mergeTallies(tally, room.tally)
+        if (room.cleared === "twin") {
+          if (ctx.dryRun) return countMove(ctx, kind, to, tally)
+          const guard = deleteGuard(read!, "item", undefined)
+          const items: ReadonlyArray<TransactWriteItem> = [
+            {
+              ConditionCheck: {
+                TableName: ctx.tableName,
+                Key: toAttributeMap(to),
+                ConditionExpression: `attribute_exists(#snap) AND (${same!.expression})`,
+                ExpressionAttributeNames: same!.names,
+                ...(Object.keys(same!.values).length > 0 && {
+                  ExpressionAttributeValues: same!.values,
+                }),
+              },
+            },
+            {
+              Delete: {
+                TableName: ctx.tableName,
+                Key: toAttributeMap(from),
+                ConditionExpression: guard.expression,
+                ExpressionAttributeNames: guard.names,
+                ...(Object.keys(guard.values).length > 0 && {
+                  ExpressionAttributeValues: guard.values,
+                }),
+              },
+            },
+          ]
+          const deleted = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
+            Effect.as(true),
+            Effect.catch((err: DynamoClientError) =>
+              isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+            ),
+          )
+          if (deleted) return countMove(ctx, kind, to, tally)
+          // Either row changed between the reads and the write: read again.
+          continue
+        }
+        if (!room.cleared) return tally
+        const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
+        const sentinels =
+          kind === "tombstone"
+            ? yield* sentinelRekeys(ctx, kind, values, liveOwners(targets), targets.live)
+            : NO_SENTINEL_REKEYS
+        if (ctx.dryRun) {
+          return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
+            sentinelsMoved: sentinels.count,
+          })
+        }
+        const guard = deleteGuard(read!, "item", undefined)
+        const items: ReadonlyArray<TransactWriteItem> = [
+          {
+            Put: {
+              TableName: ctx.tableName,
+              Item: { ...read!, ...toAttributeMap(to) },
+              ConditionExpression: "attribute_not_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": rekeyPk },
+            },
+          },
+          {
+            Delete: {
+              TableName: ctx.tableName,
+              Key: toAttributeMap(from),
+              ConditionExpression: guard.expression,
+              ExpressionAttributeNames: guard.names,
+              ...(Object.keys(guard.values).length > 0 && {
+                ExpressionAttributeValues: guard.values,
+              }),
+            },
+          },
+          ...sentinels.items,
+        ]
+        const done = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
+          Effect.as(true),
+          Effect.catch((err: DynamoClientError) =>
+            isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+          ),
+        )
+        if (done) {
+          return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
+            sentinelsMoved: sentinels.count,
+          })
+        }
+        // Something changed between the read and the write: read again.
+      }
+      return Rekey.mergeTallies(
+        tally,
+        rekeyConflict(
+          kind,
+          "contended",
+          from,
+          to,
+          "Concurrent writes changed it on every attempt.",
+        ),
+      )
+    })
+
+  /**
+   * Move an item from its 1.36 key: the ops' move (`moveFrom136Detailed`),
+   * after making room at its current key.
+   */
+  const moveItem = (
+    ctx: Rekey.RekeyRowContext,
+    from: StoredKey,
+    to: StoredKey,
+    depth: number,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      // The scan's read is eventually consistent, and a move this run made
+      // since — another row's, making room — can have taken the item along:
+      // act on a consistent read.
+      const client = yield* Capacity.client
+      const { Item: read } = yield* client.getItem({
+        TableName: ctx.tableName,
+        Key: toAttributeMap(from),
+        ConsistentRead: true,
+      })
+      const targets = read === undefined ? undefined : rowTargets(read)
+      if (targets?.kind !== "item" || !sameStoredKey(targets.current, to)) {
+        return yield* movedAway(ctx, to)
+      }
+      const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
+      const room = yield* clearTarget(ctx, "item", from, to, depth)
+      if (!room.cleared) return room.tally
+      if (ctx.dryRun) {
+        const sentinels = yield* sentinelMoves(
+          ctx.tableName,
+          values,
+          ownerOf(from),
+          ownerOf(to),
+          true,
+        )
+        return Rekey.mergeTallies(countMove(ctx, "item", to, room.tally), {
+          sentinelsMoved: sentinels.reserves.length,
+        })
+      }
+      const moved = yield* moveFrom136Detailed(values, "rekey", { depth, force: true }).pipe(
+        Effect.map((result) => ({ _tag: "Done" as const, result })),
+        Effect.catchTag("ConcurrentModification", () =>
+          Effect.succeed({ _tag: "Contended" as const }),
+        ),
+        Effect.catchTag("ValidationError", (error) =>
+          Effect.succeed({
+            _tag: "Failed" as const,
+            message: String(error.cause ?? error.message),
+          }),
+        ),
+      )
+      if (moved._tag === "Contended") {
+        return Rekey.mergeTallies(
+          room.tally,
+          rekeyConflict(
+            "item",
+            "contended",
+            from,
+            to,
+            "Concurrent writes changed it on every attempt.",
+          ),
+        )
+      }
+      if (moved._tag === "Failed") {
+        return Rekey.mergeTallies(
+          room.tally,
+          rekeyConflict("item", "failed", from, to, moved.message),
+        )
+      }
+      switch (moved.result.outcome) {
+        case "moved": {
+          const snapshot = moved.result.snapshot
+          return Rekey.mergeTallies(
+            countMove(ctx, "item", to, room.tally),
+            snapshot === undefined ? {} : countMove(ctx, "snapshot", snapshot),
+            { sentinelsMoved: moved.result.sentinels },
+          )
+        }
+        case "both":
+          return Rekey.mergeTallies(
+            room.tally,
+            rekeyConflict(
+              "item",
+              "bothKeys",
+              from,
+              to,
+              "The item is also stored under its current key.",
+            ),
+          )
+        case "absent":
+          return Rekey.mergeTallies(room.tally, yield* movedAway(ctx, to))
+      }
+    })
+
+  /**
+   * The index keys and vector partitions of an item under its current table
+   * key that still hold the text 1.36 composed for its values. A half is
+   * rewritten only when its stored text is exactly that: a half the index
+   * policy left as it was, or a Z-order half (new in 1.37), is not.
+   */
+  const staleIndexKeys = (row: StoredRow) => {
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+    const rowKeyForm = keyForm(values)
+    const sets: globalThis.Record<string, string> = {}
+    const olds: globalThis.Record<string, string> = {}
+    const composites = new Set<string>()
+    const present = (attrs: ReadonlyArray<string>) =>
+      attrs.every((attr) => rowKeyForm[attr] !== undefined && rowKeyForm[attr] !== null)
+    const consider = (
+      field: string,
+      attrs: ReadonlyArray<string>,
+      now: () => string | undefined,
+      then: () => string | undefined,
+    ) => {
+      const stored = row[field]?.S
+      if (stored === undefined || !present(attrs)) return
+      try {
+        const text136 = then()
+        const text = now()
+        if (text === undefined || text136 === undefined) return
+        if (stored !== text136 || text136 === text) return
+        sets[field] = text
+        olds[field] = text136
+        for (const attr of attrs) composites.add(resolveDbName(attr))
+      } catch {
+        // Its values compose no key now: left as stored.
+      }
+    }
+    for (const [name, index] of Object.entries(allIndexes)) {
+      if (name === "primary" || KeyComposer.isZOrderHalf(index.sk)) continue
+      consider(
+        index.pk.field,
+        index.pk.composite,
+        () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
+        () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
+      )
+      consider(
+        index.sk.field,
+        index.sk.composite,
+        () => KeyComposer.composeSk(schema, entityType, entityVersion, index, rowKeyForm),
+        () => KeyText136.composeSk(schema, entityType, entityVersion, index, rowKeyForm),
+      )
+    }
+    for (const [, definition] of vectorIndexEntries) {
+      consider(
+        definition.partitionField,
+        definition.partition,
+        () => KeyComposer.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
+        () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
+      )
+    }
+    return { sets, olds, composites: [...composites] }
+  }
+
+  /**
+   * An item under its current table key: rewrite index keys still holding
+   * 1.36 text in place — `UpdateItem` conditioned on each still holding it and
+   * the composites they are composed from unchanged — and move its unique
+   * sentinels whose text changed.
+   */
+  const rekeyCurrentItem = (
+    ctx: Rekey.RekeyRowContext,
+    scanned: StoredRow,
+    at: StoredKey,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      let row = scanned
+      let rewritten = false
+      for (let attempt = 0; ; attempt++) {
+        const stale = staleIndexKeys(row)
+        const fields = Object.keys(stale.sets)
+        if (fields.length === 0) break
+        if (ctx.dryRun) {
+          rewritten = true
+          break
+        }
+        if (attempt >= GUARDED_PUT_ATTEMPTS) {
+          return rekeyConflict(
+            "item",
+            "contended",
+            at,
+            at,
+            "Concurrent writes changed its index keys on every attempt.",
+          )
+        }
+        const names: globalThis.Record<string, string> = { "#pk": rekeyPk }
+        const operands: globalThis.Record<string, AttributeValue> = {}
+        const sets: Array<string> = []
+        const guards: Array<string> = ["attribute_exists(#pk)"]
+        for (const [i, field] of fields.entries()) {
+          names[`#k${i}`] = field
+          operands[`:n${i}`] = { S: stale.sets[field]! }
+          operands[`:o${i}`] = { S: stale.olds[field]! }
+          sets.push(`#k${i} = :n${i}`)
+          guards.push(`#k${i} = :o${i}`)
+        }
+        for (const [i, attr] of stale.composites.entries()) {
+          names[`#c${i}`] = attr
+          operands[`:c${i}`] = row[attr]!
+          guards.push(`#c${i} = :c${i}`)
+        }
+        const updated = yield* client
+          .updateItem({
+            TableName: ctx.tableName,
+            Key: toAttributeMap(at),
+            UpdateExpression: `SET ${sets.join(", ")}`,
+            ConditionExpression: guards.join(" AND "),
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: operands,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catch((err: DynamoClientError) =>
+              isAwsConditionalCheckFailed(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+            ),
+          )
+        if (updated) {
+          rewritten = true
+          break
+        }
+        // Written in between: judge the item as it is now.
+        const { Item: fresh } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(at),
+          ConsistentRead: true,
+        })
+        if (fresh === undefined) return {}
+        row = fresh
+      }
+      const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at)
+      return Rekey.mergeTallies(
+        rewritten || (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
+          ? {}
+          : { unchanged: 1 },
+        rewritten ? { indexKeysRewritten: 1 } : {},
+        sentinels,
+      )
+    })
+
+  /** The live keys a row's unique sentinels may name: 1.36's and the current one. */
+  const liveOwners = (targets: {
+    readonly live: StoredKey
+    readonly live136: StoredKey
+  }): ReadonlyArray<StoredKey> =>
+    sameStoredKey(targets.live136, targets.live) ? [targets.live] : [targets.live136, targets.live]
+
+  const NO_SENTINEL_REKEYS: {
+    readonly items: ReadonlyArray<TransactWriteItem>
+    readonly count: number
+    readonly tally: Rekey.RekeyTally
+  } = { items: [], count: 0, tally: {} }
+
+  /**
+   * The writes that bring the unique sentinels of `values` to their current
+   * keys, naming `to` (#171), from consistent reads: a sentinel whose text
+   * changed and that one of `owners` holds under its 1.36 key is put under
+   * its current key — which nothing may hold — and released under the 1.36
+   * one; one under its current key naming another of `owners` is re-pointed
+   * to `to`. Each write is conditioned on the sentinel as read. An item's
+   * owners are its own key; a tombstone's (`preserveUnique`) are the item's
+   * live keys, 1.36's and the current one — the sentinels name the item, not
+   * the tombstone. `count` is the sentinels written; a sentinel whose
+   * current key another row holds is a conflict, left as it is.
+   */
+  const sentinelRekeys = (
+    ctx: Rekey.RekeyRowContext,
+    kind: RowKind,
+    values: globalThis.Record<string, unknown>,
+    owners: ReadonlyArray<StoredKey>,
+    to: StoredKey,
+  ) =>
+    Effect.gen(function* () {
+      if (config.unique === undefined) return NO_SENTINEL_REKEYS
+      const client = yield* Capacity.client
+      const readAt = (key: { readonly pk: string; readonly sk: string }) =>
+        Effect.map(
+          client.getItem({
+            TableName: ctx.tableName,
+            Key: toAttributeMap(sentinelKeyRecord(key)),
+            ConsistentRead: true,
+          }),
+          (result) => result.Item,
+        )
+      const ownerIn = (held: StoredRow | undefined): StoredKey | undefined =>
+        held === undefined
+          ? undefined
+          : owners.find(
+              (owner) =>
+                held._entity_pk?.S === owner[rekeyPk] && held._entity_sk?.S === owner[rekeySk],
+            )
+      // Only a tombstone's sentinels can name a key other than `to`.
+      const repoint = owners.some((owner) => !sameStoredKey(owner, to))
+      const items: Array<TransactWriteItem> = []
+      let count = 0
+      let tally: Rekey.RekeyTally = {}
+      for (const [constraintName, constraintDef] of Object.entries(
+        config.unique as globalThis.Record<string, UniqueConstraintDef>,
+      )) {
+        const current = composeUniqueSentinel(
+          schema,
+          entityType,
+          constraintName,
+          constraintDef,
+          values,
+        )
+        if (current === undefined) continue
+        const old = sentinel136(constraintName, constraintDef, values, current.key, true)
+        if (old === undefined && !repoint) continue
+        const [heldOld, heldNow] = yield* Effect.all(
+          [old === undefined ? Effect.succeed(undefined) : readAt(old), readAt(current.key)],
+          { concurrency: "unbounded" },
+        )
+        const ownerOld = ownerIn(heldOld)
+        const ownerNow = ownerIn(heldNow)
+        if (old !== undefined && ownerOld !== undefined) {
+          if (heldNow !== undefined) {
+            tally = Rekey.mergeTallies(
+              tally,
+              rekeyConflict(
+                kind,
+                ownerNow === undefined ? "taken" : "bothKeys",
+                sentinelKeyRecord(old),
+                sentinelKeyRecord(current.key),
+                `Unique constraint "${constraintName}": its sentinel's current key is ` +
+                  (ownerNow === undefined ? "held by another item." : "also held by the item."),
+              ),
+            )
+            continue
+          }
+          items.push(
+            {
+              Put: {
+                TableName: ctx.tableName,
+                Item: {
+                  ...heldOld!,
+                  ...toAttributeMap({
+                    ...sentinelKeyRecord(current.key),
+                    _entity_pk: to[rekeyPk],
+                    _entity_sk: to[rekeySk],
+                  }),
+                },
+                ...sentinelGuard(),
+              },
+            },
+            sentinelRelease(ctx.tableName, old, ownerOf(ownerOld)),
+          )
+          count++
+          continue
+        }
+        if (ownerNow !== undefined && !sameStoredKey(ownerNow, to)) {
+          items.push({
+            Update: {
+              TableName: ctx.tableName,
+              Key: toAttributeMap(sentinelKeyRecord(current.key)),
+              UpdateExpression: "SET #epk = :npk, #esk = :nsk",
+              ConditionExpression: "#epk = :epk AND #esk = :esk",
+              ExpressionAttributeNames: { "#epk": "_entity_pk", "#esk": "_entity_sk" },
+              ExpressionAttributeValues: toAttributeMap({
+                ":epk": ownerNow[rekeyPk],
+                ":esk": ownerNow[rekeySk],
+                ":npk": to[rekeyPk],
+                ":nsk": to[rekeySk],
+              }),
+            },
+          })
+          count++
+        }
+      }
+      return { items, count, tally }
+    })
+
+  /**
+   * The unique sentinels of a row under its current key that still hold 1.36
+   * text or name a 1.36 key — an item's, or a tombstone's — brought to their
+   * current keys in one transaction ({@link sentinelRekeys}), read again when
+   * a write changed one in between.
+   */
+  const rekeySentinels = (
+    ctx: Rekey.RekeyRowContext,
+    kind: RowKind,
+    row: StoredRow,
+    owners: ReadonlyArray<StoredKey>,
+    to: StoredKey,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      if (config.unique === undefined) return {}
+      const client = yield* Capacity.client
+      const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        const planned = yield* sentinelRekeys(ctx, kind, values, owners, to)
+        const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
+        if (planned.items.length === 0 || ctx.dryRun) {
+          return Rekey.mergeTallies(planned.tally, moved)
+        }
+        const done = yield* client.transactWriteItems({ TransactItems: [...planned.items] }).pipe(
+          Effect.as(true),
+          Effect.catch((err: DynamoClientError) =>
+            isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+          ),
+        )
+        if (done) return Rekey.mergeTallies(planned.tally, moved)
+        // A sentinel changed between the read and the write: read again.
+      }
+      return rekeyConflict(
+        kind,
+        "contended",
+        to,
+        to,
+        "Its unique sentinels changed while they were moved, on every attempt.",
+      )
+    })
+
+  /** The entity's `rekey` handler: one scanned row — or one displaced by a move. */
+  const rekeyRow = (
+    row: StoredRow,
+    ctx: Rekey.RekeyRowContext,
+    depth = 0,
+  ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const type = row.__edd_e__?.S
+      if (isValueless(row)) return yield* rekeyProjectionRow(row, ctx, undefined, depth)
+      // A unique sentinel holds no values: it moves with its item.
+      if (type !== entityType) return type?.startsWith(`${entityType}._unique.`) ? {} : undefined
+      const stored = storedKeyOf(row)
+      const targets = rowTargets(row)
+      if (stored === undefined || targets === undefined) {
+        return { skipped: { unrecognizedKey: 1 } }
+      }
+      if (sameStoredKey(stored, targets.current)) {
+        if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored)
+        if (targets.kind !== "tombstone") return { unchanged: 1 }
+        // A tombstone under its current key: its sentinels may still hold
+        // 1.36 text or name the item's 1.36 key.
+        const sentinels = yield* rekeySentinels(
+          ctx,
+          "tombstone",
+          row,
+          liveOwners(targets),
+          targets.live,
+        )
+        return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
+          ? sentinels
+          : { unchanged: 1 }
+      }
+      if (!sameStoredKey(stored, targets.old)) return { skipped: { unrecognizedKey: 1 } }
+      return targets.kind === "item"
+        ? yield* moveItem(ctx, stored, targets.current, depth)
+        : yield* moveHistoryRow(ctx, targets.kind, stored, targets.current, depth)
+    })
+
+  /**
+   * A projection's row tombstone or outbox item, which holds no values: where
+   * it belongs is read back from its key ({@link valuelessMove136}). One 1.36
+   * wrote for values that compose another key now moves there as a row
+   * ({@link moveValueless136}); another value's row 1.36 left at that key
+   * moves first, by its kind. One a drainer holds is left, a conflict until a
+   * rerun finds it delivered. `keys`: the item's table key attributes.
+   */
+  const rekeyProjectionRow = (
+    row: StoredRow,
+    ctx: Rekey.RekeyRowContext,
+    keys: { readonly pk: string; readonly sk: string } = { pk: rekeyPk, sk: rekeySk },
+    depth = 0,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const move = valuelessMove136(row, keys)
+      if (move === undefined) return { skipped: { unrecognizedKey: 1 } }
+      if (move === "current") return { unchanged: 1 }
+      const { kind, from, to } = move
+      const client = yield* Capacity.client
+      const counted = keyAt(to[keys.pk]!, to[keys.sk]!)
+      let tally: Rekey.RekeyTally = {}
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        // The scan's read is eventually consistent: act on a consistent one.
+        const { Item: read } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(from),
+          ConsistentRead: true,
+        })
+        // Gone since the scan — delivered, or moved by a write or by this run
+        // (counted then), and its key may hold another row now.
+        if (
+          read === undefined ||
+          read.__edd_e__?.S !== row.__edd_e__?.S ||
+          read[KEY_TEXT] !== undefined
+        ) {
+          return tally
+        }
+        if (yield* claimedNow(read)) {
+          return Rekey.mergeTallies(
+            tally,
+            rekeyConflict(kind, "contended", from, to, "A drainer holds it."),
+          )
+        }
+        if (ctx.dryRun) return countMove(ctx, kind, counted, tally)
+        if (yield* moveValueless136(ctx.tableName, keys.pk, from, read, move.moved(read))) {
+          return countMove(ctx, kind, counted, tally)
+        }
+        const { Item: there } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(to),
+          ConsistentRead: true,
+        })
+        if (there !== undefined) {
+          // Another value's row 1.36 left at its current key moves out first.
+          if (occupantOf(there, counted) !== "stale") {
+            return Rekey.mergeTallies(
+              tally,
+              rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
+            )
+          }
+          if (depth >= DISPLACE_DEPTH) {
+            return Rekey.mergeTallies(
+              tally,
+              rekeyConflict(
+                kind,
+                "contended",
+                from,
+                to,
+                "Too many rows under 1.36 keys hold each other's current keys.",
+              ),
+            )
+          }
+          tally = Rekey.mergeTallies(
+            tally,
+            isValueless(there)
+              ? yield* rekeyProjectionRow(there, ctx, keys, depth + 1)
+              : ((yield* rekeyRow(there, ctx, depth + 1)) ?? {}),
+          )
+        }
+        // It changed between the read and the write, or made room: read again.
+      }
+      return Rekey.mergeTallies(
+        tally,
+        rekeyConflict(
+          kind,
+          "contended",
+          from,
+          to,
+          "Concurrent writes changed it on every attempt.",
+        ),
+      )
+    })
+
+  const rekeyHandler: Rekey.RekeyMember = {
+    name: entityType,
+    types: [entityType, `${entityType}#tombstone`, `${entityType}#outbox`],
+    typePrefixes: [`${entityType}._unique.`],
+    row: (row, ctx) => rekeyRow(row, ctx),
+  }
+
+  // ---------------------------------------------------------------------------
   // Expression combinators: condition, filter, select
   // ---------------------------------------------------------------------------
 
@@ -13215,6 +14280,8 @@ const makeImpl = <
       }),
     _displaceValueless136: displaceValueless136,
     _indexRows136: indexRows136,
+    _rekeyProjectionRow: rekeyProjectionRow,
+    [Rekey.RekeyHandler]: rekeyHandler,
     _history136: (key: unknown) => history136(keyForm(encodeKeySync(key))),
     _attachPrototype: attachPrototype,
     _overTombstone: (tableName: string, item: globalThis.Record<string, unknown>) =>

@@ -385,6 +385,15 @@ export const makeEngine = (config: EngineConfig) => {
     }
   }
 
+  // An outbox on another table: that table's `rekey` moves its items (#171).
+  if (config.outbox?.table !== undefined) {
+    ;(readModel as { _projectionOutbox?: unknown })._projectionOutbox = {
+      table: config.outbox.table,
+      pk: config.outbox.pk,
+      sk: config.outbox.sk,
+    }
+  }
+
   const tableName = Effect.suspend(() =>
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )

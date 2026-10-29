@@ -233,7 +233,7 @@ const AppSchema = DynamoSchema.make({
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
 | `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
-| `legacyKeys` | `boolean` | `true` | `false` turns off the 1.36 key fallback (§7 "Rows written by 1.36"): operations stop reading and moving rows stored under the key text 1.36 composed. 1.37.x only; removed with the fallback in the next major |
+| `legacyKeys` | `boolean` | `true` | `false` turns off the 1.36 key fallback (§7 "Rows written by 1.36"): operations stop reading and moving rows stored under the key text 1.36 composed (`rekey` moves rows whatever it is set to). 1.37.x only; removed with the fallback in the next major |
 
 ### Casing Rules
 
@@ -753,21 +753,12 @@ below `3.14`, `1e-7` above `3` and `1e21` below `1e16`. Non-negative integers be
 `10^W` keep their exact bytes; every other number (negative, fractional,
 `≥ 1e16`, `±Infinity`) and every negative or `≥ 1e38` bigint now composes different
 text — including `DateEpochMs` and `DateEpochSeconds` composites before 1970. Items
-written by 1.36 with such a composite keep their old keys until rewritten. While the
+written by 1.36 with such a composite keep their old keys until they move. While the
 1.36 key fallback is on ("Rows written by 1.36" below) single-item operations find and
 move them, queries that pin a key prefix read them, aggregates are read and moved, and
 an `EventStore` stream is read and appended where it lives; a range bound still misses
-or misorders them. Rewriting a row moves it for good, per row
-kind (scan for rows with an affected value in a key composite or a time-series
-`orderBy`):
-
-| Row | Keys holding numeric text | Rewrite |
-|---|---|---|
-| Live item | pk, sk, every index key, unique sentinels | Delete it and its sentinels under their stored keys (raw `DynamoClient.deleteItem`), `put` it again through the entity, which recomposes every key and sentinel and first moves another value's 1.36 row it finds at the current key ("Aliasing" below). On a retain entity move its snapshots first, so the `put` continues after the retained history instead of restarting at version 1 |
-| Time-series event item (`<currentSk>#e#<orderBy>`) | pk, and the sk's current-item and `orderBy` parts — every event of a string-encoded numeric `orderBy` (`NumberFromString`, `BigIntFromString`), whose segment was the encoded text up to 1.36 | `.append()` can't: the current item is newer, so the append is stale and writes nothing. Re-put raw with the same attributes, the recomposed pk and `KeyComposer.composeEventSk(currentSk, orderBy, schema casing)` from the current item's recomposed sk and the stored `orderBy`'s key form (the number, for a string-encoded one); delete the old row |
-| Version snapshot, soft-delete tombstone | pk, and the `{item}` segment of the sk | Only when a primary-key composite changed. Re-put raw under the recomposed pk with the segment `composeHistoryItemSegment` derives from the recomposed live sk; delete the old row. The version digits and the timestamp keep their bytes |
-| `EventStore` stream | pk (stream-id composites), and a stream index attribute holding it (no `derivePartition`) | Only when a stream-id composite changed — typed as strings, so a number an untyped caller passed. Copy every row of the partition (events, snapshot, command sentinels) raw to the recomposed pk, sks unchanged (version, command id); delete the old rows. Appending again would renumber events and rerun projections. Until then the stream is read and appended under its 1.36 key |
-| Aggregate | pk of every row, edge / discriminator sks, list keys | `update` moves every row it reads under a 1.36 key, in the row's own transaction group, and rewrites a root at its current key whose list or collection index key holds 1.36 text — an update that changes nothing moves and recomposes them too |
+or misorders them. `rekey` ("Rows written by 1.36", "`rekey`") moves every remaining
+row, row kind by row kind.
 
 #### Sort key text
 
@@ -804,8 +795,8 @@ The language service's params mirror it (`ParamsBuilder`, pinned by
 **This changed stored keys in 1.37.0** for a sort key composite or time-series
 `orderBy` value holding such a character. Up to 1.36 such a value sorted apart
 from its order and `#` split it into two segments, so bounds returned wrong rows.
-Rows written by 1.36 keep their old sort keys until rewritten, row kind by row
-kind as for numeric key text above (partition keys are unaffected).
+Rows written by 1.36 keep their old sort keys until they move — a write, or
+`rekey` — as for numeric key text above (partition keys are unaffected).
 
 #### Rows written by 1.36 (#171)
 
@@ -931,9 +922,9 @@ item; one whose values compose another key is another value's.
   values are the item's: under a 1.36 partition `a b`'s rows are a key prefix of
   `a b#c`'s, and stay `a b#c`'s.
 
-Rewriting rows by hand (the migration table above), move a row that sits at
-another value's current key before that value's row is written there — the
-entity's `put` does it — and `rekey` must move such rows first.
+A row that sits at another value's current key moves before that value's row
+is written there: the entity's `put` does it, and `rekey` makes room the same
+way before it moves a row to a key such a row holds.
 
 **Queries.** A query that pins a key prefix also reads the key 1.36 composed
 for the same pins, when its text differs: an entity accessor (the partition key,
@@ -1010,7 +1001,15 @@ whose text changed). Such a stream is read and appended there — its events,
 snapshot, seal, command sentinels, stream-scoped indexes, the version-contiguity
 check and `headProof` — until `rekey` moves it whole; a stream is never split
 across the two keys, and a new stream starts under its current key. A derived
-stream index filters on both partition keys.
+stream index filters on both partition keys. An append located at the 1.36 key
+carries a location check (`AppendParts.locationCheck`): its first event is not
+marked moved (`__edd_moved__`, set by `rekey`'s flip). For a head of 1 it is
+folded into the contiguity check on that event; otherwise it is one more
+`ConditionCheck` on `(pk136, event 1)`, `attribute_exists(pk) AND
+attribute_not_exists(__edd_moved__)`, in the contiguity range of the
+transaction. An append that loses the race to a flip fails `VersionConflict`
+and, retried, locates the current key: `locateStream` reads the marker with the
+first event and takes a marked stream as moved.
 
 **Projections.** `projection` and `multiProjection` read a read-model row raw
 (`ProjectionEngine.readRow`, strongly consistent): at its current key, then —
@@ -1093,6 +1092,118 @@ read) and runs again (`clearingSnapshotAlias`, the guarded put's loop), up to
 
 **Capacity.** Fallback reads and moves run on the operation's own client, so
 they are charged to its consumed-capacity report (§16).
+
+#### `rekey`
+
+`db.tables.<Table>.rekey(options?)` (`TableOperations.rekey`) moves every row
+1.36 wrote whose key text changed to its current key, so the fallback can be
+turned off. Run it once every instance runs 1.37 (a 1.36 instance writes 1.36
+keys again, and misses moved rows); dry run first. It returns a `RekeyReport`
+(`Table.ts`) and fails with `ValidationError` (`EDD-9098`) for a bad option or
+resume token, or with the `DynamoClientError` of a request that failed.
+
+**Driver** (`internal/Rekey.ts`). A `Scan` of the table — `segments` fibers
+(`Segment` / `TotalSegments` when more than one), `pageSize` as `Limit`, a
+`maxPages` budget shared by all segments — hands each row to the member owning
+it by `__edd_e__` (exact types, then sentinel prefixes `<type>._unique.`), up
+to `concurrency` rows of a page at once. Members are the table's entities and
+aggregates, those passed to `DynamoClient.make` on the same table, and
+`options.streams` (bound or unbound; `DynamoClient.make` registers no stream),
+each carrying a handler under the `RekeyHandler` symbol that `Entity.make`,
+`Aggregate.make` and `EventStore.makeStream` attach. A row without `__edd_e__`
+is `notLibrary`; one no member claims is `unregistered`. A read model's entity
+also claims its projection row tombstones (`<type>#tombstone`) and outbox
+items (`<type>#outbox`); an outbox on another table is claimed on that table,
+for a read model whose projection registered it (`_projectionOutbox`, set when
+the projection is defined). A row of a
+member stored under neither its current key nor its 1.36 key is
+`unrecognizedKey`. A unit that moves together (an aggregate, a stream, a moved
+row's target) is claimed once per run (`claim`), so it is moved and counted
+once whichever of its rows the scan reaches first, and a row reached after it
+moved — by this run, or by an application write between the scan and the
+move — is `unchanged`: `moved` counts what the run moved.
+
+**Idempotence.** A row moves only when it is stored under the key 1.36
+composed for its values (`KeyText136`, forced on whatever `legacyKeys` says)
+and that key differs from the one they compose now. The scan is eventually
+consistent: each move acts on a consistent read and is conditioned on what it
+read. A rerun finds every moved row current and moves nothing.
+
+**Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
+position per segment: `0` not started, `1` done, or the segment's
+`LastEvaluatedKey` in the cursor wire form (`internal/Cursor.ts`). A run that
+stops at `maxPages` returns it as `resume`; `onProgress` receives the report
+so far and a token after each page, once every row of the page is handled, so
+an interrupted run resumes redoing at most the pages in flight. The token's
+segment count wins; a different `segments`, another table's token or a
+malformed one is `EDD-9098`.
+
+**Per row kind.** Every write is conditioned on what the move read: a Put
+lands only where nothing is (a stream's snapshot: over an older one; a stream
+row: over one whose TTL has passed), a Delete or in-place rewrite only while
+the row is as read. A write that lands in between wins, and the move reads
+again or reports the row (`contended`). A row in the way that is another
+value's 1.36 row (Aliasing) is moved first, never overwritten.
+
+| Row | Move |
+|---|---|
+| Item under its 1.36 key | A consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then the ops' move (`moveFrom136Detailed`, forced): consistent read, one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the 1.36 item under `deleteGuard`, sentinels moved or re-pointed, the snapshot of the version it is at moved with it (counted in `moved.snapshot`). A row at the target that is another value's 1.36 row (Aliasing) is displaced first (`displace`, `DISPLACE_DEPTH`). A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys` |
+| Item at its current key | GSI halves and vector partitions whose stored text is exactly their 1.36 text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites as read (`indexKeysRewritten`); a Z-order half, or one the index policy left, is not touched. Unique sentinels whose text changed (a numeric unique value) are put at the current key and the 1.36 sentinel released (`sentinelsMoved`) |
+| Version snapshot, soft-delete tombstone, time-series event | Consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the 1.36 row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the 1.36 row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
+| Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's 1.36 or current live key under its 1.36 key is put at its current key and the 1.36 one released; one at its current key naming the 1.36 live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: both partitions read consistently whatever `legacyKeys` says; each built row placed — under its current key, its 1.36 key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its 1.36 key moves (Put at the current key `attribute_not_exists`, Delete of the 1.36 row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold 1.36 text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written |
+| Projection row tombstone, outbox item | `rekeyProjectionRow`. A marked one (`__edd_kt__`) is current. An unmarked one names its row's key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — read back as 1.36 text (`_currentKeyOf136`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless136`): Put, marked, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the 1.36 row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's 1.36 row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
+| Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
+
+**Stream move.** A stream row's keys come from its `streamId` text: every way
+to split it at `#` into the stream's composites (a string composite may hold
+`#`; up to 256 splits), each part read as its text, number or bigint; the
+readings whose current or 1.36 key is the row's partition key say where it
+belongs, and readings that disagree are a `failed` conflict. `moveStream` reads
+both partitions consistently; a row whose TTL attribute has passed is absent,
+whether or not DynamoDB has deleted it yet. Rows under the current key that the
+1.36 partition doesn't have, or has differently (a snapshot aside), are another
+stream's: `taken` / `bothKeys`. COPY puts every row the current key lacks
+(`attribute_not_exists`, or over a row whose TTL has passed), and a snapshot
+over an older one (`asOfVersion <`) — never the other way (`__edd_moved__`
+stripped; a GSI stream index attribute holding the 1.36 partition rewritten). A
+copy that loses to a write copies again. FLIP is one transaction: Update of
+event 1 `SET __edd_moved__` (`attribute_not_exists`, and the seal state when the
+head is event 1), a ConditionCheck that event N+1 is absent, one that the
+head's seal state is as copied (N > 1), and one that the snapshot's
+`asOfVersion` and `timestamp` are as copied (or that it is absent). A cancelled
+flip copies again, up to `STREAM_MOVE_ATTEMPTS` (8) attempts in all, then `contended`. DELETE
+(also the whole move, for rows left under the 1.36 key once event 1 there is
+moved or gone — a run that stopped after the flip, a write beside it) reads
+both partitions again: a row the current key lacks is copied (a command
+sentinel), a snapshot newer than the current one copied over it, and a row the
+current key holds differently is `bothKeys` and nothing is deleted. Then each
+1.36 row is deleted while it is as read (`asReadGuard`): events from the head
+down, the other rows, event 1 last — until it goes, the stream is located at
+the 1.36 key and an append (events, or a command sentinel alone) or snapshot
+write there fails its location check (`VersionConflict`; `writeSnapshot`
+re-locates and writes again). A delete that loses to a write reads again.
+Readers that located the stream before the flip may read a prefix of it while
+the rows are deleted.
+
+**Conflicts** (`RekeyConflict`: member, kind, stored key, target, message):
+`bothKeys` (the row is also under its current key; for a snapshot, a
+different snapshot of the version), `taken` (another row
+holds the target), `contended` (concurrent writes on every attempt — a
+`ConcurrentModification` from the item move, or the attempts exhausted),
+`failed` (a `ValidationError` from the move, e.g. values that no longer decode,
+or an aggregate that doesn't assemble). An aggregate whose root is under both
+partition keys ("Multiple root items found") is `bothKeys`; one whose root or
+rows are gone since the scan read them (moved or deleted by a write) is
+nothing. A `DynamoClientError` fails the run.
+
+**Capacity.** The run is one `Table.rekey` operation measured whatever the
+`ConsumedCapacity` setting (`Capacity.measured`): every request asks for its
+capacity, and `report.capacity` carries the totals; the span and the observer
+follow the context's setting.
+
+**Dry run.** The same scan and consistent reads, no writes: an item's
+sentinels are read to count them, a stream's both partitions to judge it.
 
 ### Composite key form
 
@@ -5065,6 +5176,8 @@ for unrelated errors and the collision was caught only at review.
 | 9080–9085 | EventStore `query.index`, projections, change feed, head proof |
 | 9086–9095 | Z-order indexes, range planning, skip-scan, cursors |
 | 9096 | Numeric key text |
+| 9097 | Transactions over rows still under their 1.36 keys (`ItemNotMoved`) |
+| 9098 | `rekey` options and resume tokens |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -5159,8 +5272,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
 | `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`): a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text") | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
 | `EDD-9097` | `Errors.ts` (schema): `ItemNotMoved`, from `internal/TransactWriteOps.ts` (a `Transaction.transactWrite` or `EventStore` `additionalItems` put / delete / check) and `Entity.ts` (`planned`: a transactional update, patch or planned delete) | An op inside a transaction whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row (#171, "Aliasing"): a transaction can't move either. Write the item named once through the entity (or run `rekey`), then run the transaction again. Nothing is written |
+| `EDD-9098` | `internal/Rekey.ts` (`ValidationError`, `entityType: "Table"`, `operation: "rekey"`) | A `rekey` option that is not a positive integer (`segments`, `concurrency`, `pageSize`, `maxPages`), a malformed resume token, a token of another table, or a `segments` other than the token's. Nothing is read |
 
-Next free code: **`EDD-9098`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9099`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## 16. Consumed Capacity
 

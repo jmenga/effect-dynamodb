@@ -57,6 +57,7 @@ export default defineConfig({
             },
             { label: "Change Feed outside Lambda", slug: "guides/change-feed" },
             { label: "Consumed Capacity", slug: "guides/consumed-capacity" },
+            { label: "Upgrading from 1.36", slug: "guides/upgrading" },
             { label: "Testing", slug: "guides/testing" },
             { label: "Validations", slug: "guides/validations" },
             { label: "Advanced", slug: "guides/advanced" },

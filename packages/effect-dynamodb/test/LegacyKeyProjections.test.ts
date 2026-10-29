@@ -18,6 +18,9 @@
  *   revision carry over; a redelivery is still recognised.
  * - **Outboxes drain in one order.** `drain(key)` and `drainPending` deliver
  *   a row's effects under its 1.36 key and its current key by revision.
+ * - **`rekey` moves them.** A tombstone or outbox item 1.36 wrote moves to
+ *   its row's current key, marked — an outbox on a table of its own with that
+ *   table's `rekey`; a dry run counts them; ones 1.37 wrote are left alone.
  *
  * `connected.legacy-key-projections.test.ts` runs the same against DynamoDB
  * Local.
@@ -29,6 +32,7 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Option, Schema } from "effect"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
@@ -104,7 +108,12 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
     timestamps: true,
   })
   const Sums = Entity.make({ model: Sum, entityType: "Sum", primaryKey })
-  const ReadTable = Table.make({ schema, entities: { Tallies, Totals, Sums } })
+  // An outbox on another table.
+  const Ledgers = Entity.make({ model: Tally, entityType: "Ledger", primaryKey })
+  // Removal alone: a live row is written through the entity, a tombstone by the projection.
+  const Rems = Entity.make({ model: Tally, entityType: "Rem", primaryKey, timestamps: true })
+  const ReadTable = Table.make({ schema, entities: { Tallies, Totals, Sums, Ledgers, Rems } })
+  const OutboxTable = Table.make({ schema, entities: {} })
 
   const key = (id: { readonly account: string }) => ROWS[id.account]!
   const initial = (id: { readonly account: string }): Tally => ({
@@ -132,6 +141,21 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
       index: { name: "outbox", pk: "obpk", sk: "obsk" },
     },
   })
+  const Remote = EventStore.projection({
+    stream: Accounts,
+    readModel: Ledgers,
+    key,
+    initial,
+    evolve: (state, event) => Effect.succeed(add(state, event)),
+    checkpoint: "version",
+    revision: "rev",
+    outbox: {
+      schema: Notice,
+      effects: (event, next) =>
+        event.data._tag === "Added" ? [{ account: event.streamId, total: next?.total ?? -1 }] : [],
+      table: OutboxTable,
+    },
+  })
   const Plain = EventStore.projection({
     stream: Accounts,
     readModel: Totals,
@@ -140,6 +164,17 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
     evolve: (state, event) => Effect.succeed(add(state, event)),
     checkpoint: "version",
     revision: "rev",
+  })
+  const Removing = EventStore.projection({
+    stream: Accounts,
+    readModel: Rems,
+    key,
+    initial,
+    evolve: (state, event) =>
+      Effect.succeed(event.data._tag === "Closed" ? EventStore.removeRow : add(state, event)),
+    checkpoint: "version",
+    revision: "rev",
+    removal: {},
   })
   const Multi = EventStore.multiProjection({
     readModel: Sums,
@@ -167,12 +202,17 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
     schema,
     EventsTable,
     ReadTable,
+    OutboxTable,
     Accounts,
     Tallies,
     Totals,
     Sums,
+    Ledgers,
+    Rems,
     Notifying,
+    Remote,
     Plain,
+    Removing,
     Multi,
   }
 }
@@ -193,6 +233,7 @@ const inTable = <A, E>(w: World, body: (table: RecordingTable) => Effect.Effect<
           table.layer,
           w.EventsTable.layer({ name: "t" }),
           w.ReadTable.layer({ name: "t" }),
+          w.OutboxTable.layer({ name: "o" }),
         ),
       ),
     ) as Effect.Effect<A, E>
@@ -203,9 +244,19 @@ type Keys = Record<string, string>
 const at = (key: Keys) => `${key.pk}|${key.sk}`
 
 /** A row's current key and the key 1.36 composed for it. */
-const keysOf = (w: World, entityType: "Tally" | "Total" | "Sum", account: string) => {
+const keysOf = (
+  w: World,
+  entityType: "Tally" | "Total" | "Sum" | "Ledger" | "Rem",
+  account: string,
+) => {
   const record = ROWS[account]!
-  const entity = { Tally: w.Tallies, Total: w.Totals, Sum: w.Sums }[entityType]
+  const entity = {
+    Tally: w.Tallies,
+    Total: w.Totals,
+    Sum: w.Sums,
+    Ledger: w.Ledgers,
+    Rem: w.Rems,
+  }[entityType]
   const primary = entity.indexes.primary
   return {
     current: KeyComposer.composeIndexKeys(w.schema, entityType, 1, primary, record) as Keys,
@@ -718,6 +769,511 @@ describe("legacy keys, projections — a tombstone at a key two values share", (
           // The tombstone still holds `a%20b`'s checkpoint: a redelivery is recognised.
           const late = yield* On.Notifying.apply(removed[1]!)
           expect(late.alreadyApplied.map((e) => e.version)).toEqual([2])
+        }),
+      )
+    }),
+  )
+})
+
+describe("legacy keys, projections — outbox items and tombstones at a key two values share", () => {
+  /** `a%20b`'s row and its pending effect, as 1.36 left them: under `a b`'s current key. */
+  const escapedPending = (
+    table: RecordingTable,
+    projection: typeof On.Notifying | typeof On.Remote,
+    entityType: "Tally" | "Ledger",
+  ) =>
+    Effect.gen(function* () {
+      const opened = yield* seed(On, "escaped", [new Opened(), new Added({ amount: 2 })], 0)
+      yield* projection.applyBatch(opened)
+      demote(table, keysOf(On, entityType, "escaped"))
+      table.take()
+    })
+  /** `item`s of `type` in `table`: each at its key, marked or not. */
+  const placedOf = (table: RecordingTable, type: string) =>
+    rowsOf(table, type)
+      .map(([stored, row]) => `${stored}${row.__edd_kt__ === 1 ? " KT" : ""}`)
+      .sort()
+  const deliveries = () => {
+    const delivered: Array<number> = []
+    return {
+      delivered,
+      deliver: (effect: Notice) => Effect.sync(() => void delivered.push(effect.total)),
+    }
+  }
+
+  // On the live clock: the write that finds another value's item in its way retries.
+  it.live(
+    "an outbox write never replaces another value's pending 1.36 effect at its key: it moves it first",
+    () =>
+      Effect.gen(function* () {
+        yield* inTable(On, (table) =>
+          Effect.gen(function* () {
+            yield* escapedPending(table, On.Notifying, "Tally")
+            const escaped = keysOf(On, "Tally", "escaped")
+            const moved = keysOf(On, "Tally", "moved")
+            expect(moved.current).toEqual(escaped.old)
+            const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 10 })], 0)
+            yield* On.Notifying.applyBatch(events)
+            // Each outbox Put at a key that reads back as another value's 1.36 key requires it empty.
+            const puts = table
+              .take()
+              .filter((r) => r.command === "TransactWriteItems")
+              .flatMap((r) => r.input.TransactItems as Array<any>)
+              .filter((item) => item.Put?.Item?.__edd_row_sk__?.S === moved.current.sk)
+            expect(puts.length).toBeGreaterThan(0)
+            for (const { Put } of puts) {
+              expect(Put.ConditionExpression).toBe("attribute_not_exists(#opk)")
+              expect(Put.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
+            }
+            // `a%20b`'s effect moved to its own current key, marked; `a b`'s is at its own.
+            expect(placedOf(table, "Tally#outbox")).toEqual(
+              [
+                `${at(escaped.current)}#outbox#000000000001#0000 KT`,
+                `${at(moved.current)}#outbox#000000000001#0000 KT`,
+              ].sort(),
+            )
+            const first = deliveries()
+            yield* On.Notifying.drain(ROWS.escaped!, first.deliver)
+            expect(first.delivered).toEqual([2])
+            const second = deliveries()
+            yield* On.Notifying.drain(ROWS.moved!, second.deliver)
+            expect(second.delivered).toEqual([10])
+          }),
+        )
+      }),
+  )
+
+  it.live("so does an outbox on a table of its own", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          yield* escapedPending(table, On.Remote, "Ledger")
+          const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 10 })], 0)
+          yield* On.Remote.applyBatch(events)
+          expect(placedOf(table, "Ledger#outbox")).toEqual(
+            [
+              `${at(keysOf(On, "Ledger", "escaped").current)}#outbox#000000000001#0000 KT`,
+              `${at(keysOf(On, "Ledger", "moved").current)}#outbox#000000000001#0000 KT`,
+            ].sort(),
+          )
+          const first = deliveries()
+          yield* On.Remote.drain(ROWS.escaped!, first.deliver)
+          expect(first.delivered).toEqual([2])
+          const second = deliveries()
+          yield* On.Remote.drain(ROWS.moved!, second.deliver)
+          expect(second.delivered).toEqual([10])
+        }),
+      )
+    }),
+  )
+
+  it.live(
+    "drain(key) of a value whose 1.36 key is another value's current key delivers both keys in order",
+    () =>
+      Effect.gen(function* () {
+        for (const [projection, entityType] of [
+          [On.Notifying, "Tally"],
+          [On.Remote, "Ledger"],
+        ] as const) {
+          yield* inTable(On, (table) =>
+            Effect.gen(function* () {
+              yield* escapedPending(table, projection, entityType)
+              const more = yield* seed(On, "escaped", [new Added({ amount: 3 })], 2)
+              yield* projection.apply(more[2]!)
+              // `a b`'s own item at the same key: not `a%20b`'s to deliver.
+              const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 10 })], 0)
+              yield* projection.applyBatch(events)
+              const { delivered, deliver } = deliveries()
+              yield* projection.drain(ROWS.escaped!, deliver)
+              expect(delivered).toEqual([2, 5])
+            }),
+          )
+        }
+      }),
+  )
+
+  it.effect(
+    "an effect-less write over a 1.36 tombstone moves it in the projection's own transaction",
+    () =>
+      Effect.gen(function* () {
+        yield* inTable(On, (table) =>
+          Effect.gen(function* () {
+            const removed = yield* seed(
+              On,
+              "moved",
+              [new Opened(), new Added({ amount: 2 }), new Closed()],
+              0,
+            )
+            yield* On.Notifying.applyBatch(removed)
+            const keys = keysOf(On, "Tally", "moved")
+            demote(table, keys)
+            // `Opened` enqueues no effect.
+            const reopened = yield* seed(On, "moved", [new Opened()], 3)
+            table.take()
+            const result = yield* On.Notifying.apply(reopened[3]!)
+            expect(result.applied.map((e) => e.version)).toEqual([4])
+            expect(Option.getOrThrow(result.state)).toMatchObject({ total: 0, version: 4, rev: 2 })
+            const writes = shape(table.take()).filter((r) => !r.startsWith("GetItem"))
+            expect(writes).toEqual([
+              `TransactWriteItems Put ${at(keys.current)}, Delete ${at(keys.old)}`,
+            ])
+            // No tombstone is left anywhere; the 1.36 effect is still delivered, once.
+            expect(rowsOf(table, "Tally#tombstone")).toEqual([])
+            expect(rowsOf(table, "Tally").map(([stored]) => stored)).toEqual([at(keys.current)])
+            const { delivered, deliver } = deliveries()
+            yield* On.Notifying.drain(ROWS.moved!, deliver)
+            expect(delivered).toEqual([2])
+          }),
+        )
+      }),
+  )
+
+  it.effect(
+    "a removal-only projection over a 1.36 tombstone: the next event starts the row again, and no tombstone lands on another value's key",
+    () =>
+      Effect.gen(function* () {
+        yield* inTable(On, (table) =>
+          Effect.gen(function* () {
+            const removed = yield* seed(
+              On,
+              "moved",
+              [new Opened(), new Added({ amount: 3 }), new Closed()],
+              0,
+            )
+            yield* On.Removing.applyBatch(removed)
+            const keys = keysOf(On, "Rem", "moved")
+            demote(table, keys)
+            const more = yield* seed(On, "moved", [new Added({ amount: 4 })], 3)
+            const result = yield* On.Removing.apply(more[3]!)
+            expect(Option.getOrThrow(result.state)).toMatchObject({ total: 4, version: 4, rev: 2 })
+            expect(rowsOf(table, "Rem#tombstone")).toEqual([])
+            expect(rowsOf(table, "Rem").map(([stored]) => stored)).toEqual([at(keys.current)])
+            // `a%20b`'s row, whose current key no tombstone took: its events apply.
+            const escaped = yield* seed(On, "escaped", [new Opened(), new Added({ amount: 5 })], 0)
+            const fresh = yield* On.Removing.applyBatch(escaped)
+            expect(fresh.outcomes.map((o) => o._tag)).toEqual(["Applied"])
+            expect(
+              rowsOf(table, "Rem")
+                .map(([stored, row]) => `${stored} ${row.total}`)
+                .sort(),
+            ).toEqual(
+              [`${at(keys.current)} 4`, `${at(keysOf(On, "Rem", "escaped").current)} 5`].sort(),
+            )
+          }),
+        )
+      }),
+  )
+
+  it.effect("a removed row whose key text changed is written again over its own tombstone", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          const events = yield* seed(
+            On,
+            "moved",
+            [new Opened(), new Added({ amount: 1 }), new Closed(), new Added({ amount: 4 })],
+            0,
+          )
+          yield* On.Removing.applyBatch(events.slice(0, 3))
+          expect(rowsOf(table, "Rem#tombstone").map(([, row]) => row.__edd_kt__)).toEqual([1])
+          const result = yield* On.Removing.apply(events[3]!)
+          expect(Option.getOrThrow(result.state)).toMatchObject({ total: 4, version: 4, rev: 2 })
+          expect(rowsOf(table, "Rem#tombstone")).toEqual([])
+        }),
+      )
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// rekey
+// ---------------------------------------------------------------------------
+
+const ZERO = { item: 0, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
+
+/** `rekey` of the read model's table — or, with `outbox`, of the other table's. */
+const rekey = (w: World, options?: Table.RekeyOptions & { readonly outbox?: boolean }) =>
+  Effect.gen(function* () {
+    const db = yield* DynamoClient.make({
+      entities: { Tallies: w.Tallies, Totals: w.Totals, Sums: w.Sums, Ledgers: w.Ledgers },
+      tables: { ReadTable: w.ReadTable, OutboxTable: w.OutboxTable },
+    })
+    const { outbox, ...rest } = options ?? {}
+    return yield* (outbox ? db.tables.OutboxTable : db.tables.ReadTable).rekey({
+      streams: [w.Accounts],
+      ...rest,
+    })
+  })
+
+describe("legacy keys, projections — rekey", () => {
+  /**
+   * `moved`'s row and two effects under its 1.36 key (`a b`); then `escaped`'s
+   * tombstone and effect under theirs (`a%20b`) — `moved`'s current key.
+   */
+  const layout = (table: RecordingTable) =>
+    Effect.gen(function* () {
+      const moved = yield* seed(
+        On,
+        "moved",
+        [new Opened(), new Added({ amount: 2 }), new Added({ amount: 3 })],
+        0,
+      )
+      yield* On.Notifying.applyBatch(moved)
+      demote(table, keysOf(On, "Tally", "moved"))
+      const escaped = yield* seed(
+        On,
+        "escaped",
+        [new Opened(), new Added({ amount: 4 }), new Closed()],
+        0,
+      )
+      yield* On.Notifying.applyBatch(escaped)
+      demote(table, keysOf(On, "Tally", "escaped"))
+      expect(
+        rowsOf(table, "Tally#outbox")
+          .map(([stored]) => stored)
+          .sort(),
+      ).toEqual(
+        [
+          `${keysOf(On, "Tally", "moved").old.pk}|${keysOf(On, "Tally", "moved").old.sk}#outbox#000000000001#0000`,
+          `${keysOf(On, "Tally", "moved").old.pk}|${keysOf(On, "Tally", "moved").old.sk}#outbox#000000000001#0001`,
+          // At the key `moved`'s first effect moves to.
+          `${keysOf(On, "Tally", "escaped").old.pk}|${keysOf(On, "Tally", "escaped").old.sk}#outbox#000000000001#0000`,
+        ].sort(),
+      )
+      table.take()
+      return { escaped }
+    })
+
+  it.effect("a dry run counts the tombstone and the outbox items, and writes nothing", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          yield* layout(table)
+          const before = new Map(table.items)
+          const report = yield* rekey(On, { dryRun: true })
+          expect(report.moved).toEqual({ ...ZERO, item: 1, tombstone: 1, outbox: 3 })
+          expect(report.byMember.Tally?.moved).toEqual({
+            ...ZERO,
+            item: 1,
+            tombstone: 1,
+            outbox: 3,
+          })
+          expect(report.conflicts).toEqual([])
+          expect(report.skipped.unregistered).toBe(0)
+          expect(table.items).toEqual(before)
+        }),
+      )
+    }),
+  )
+
+  it.effect("moves each to its row's current key, marked; a rerun moves nothing", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          const { escaped } = yield* layout(table)
+          const report = yield* rekey(On)
+          expect(report.moved).toEqual({ ...ZERO, item: 1, tombstone: 1, outbox: 3 })
+          expect(report.conflicts).toEqual([])
+          const moved = keysOf(On, "Tally", "moved").current
+          const gone = keysOf(On, "Tally", "escaped").current
+          expect(rowsOf(table, "Tally").map(([stored]) => stored)).toEqual([at(moved)])
+          expect(
+            rowsOf(table, "Tally#tombstone").map(([stored, row]) => [stored, row.__edd_kt__]),
+          ).toEqual([[at(gone), 1]])
+          // Each outbox item names its row's current key, and so does the sparse index.
+          expect(
+            rowsOf(table, "Tally#outbox")
+              .map(([stored, row]) => [
+                stored,
+                row.__edd_row_pk__,
+                row.__edd_row_sk__,
+                row.obsk,
+                row.__edd_kt__,
+              ])
+              .sort(),
+          ).toEqual(
+            [
+              [moved, "000000000001#0000"],
+              [moved, "000000000001#0001"],
+              [gone, "000000000001#0000"],
+            ]
+              .map(([key, n]) => {
+                const { pk, sk } = key as Keys
+                return [`${pk}|${sk}#outbox#${n}`, pk, sk, `${pk}#${sk}#outbox#${n}`, 1]
+              })
+              .sort(),
+          )
+          const again = yield* rekey(On)
+          expect(again.moved).toEqual(ZERO)
+          expect(again.conflicts).toEqual([])
+          // In one order per row; `a%20b`'s tombstone still recognises a redelivery.
+          const delivered: Array<number> = []
+          const swept = yield* On.Notifying.drainPending((effect) =>
+            Effect.sync(() => void delivered.push(effect.total)),
+          )
+          expect(swept.delivered).toBe(3)
+          expect(delivered).toEqual([2, 5, 4])
+          const late = yield* On.Notifying.apply(escaped[1]!)
+          expect(late.alreadyApplied.map((e) => e.version)).toEqual([2])
+        }),
+      )
+    }),
+  )
+
+  it.effect("an outbox item a drainer holds is left, a conflict until it is delivered", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          yield* layout(table)
+          const old = keysOf(On, "Tally", "moved").old
+          const claimed = `${old.pk}|${old.sk}#outbox#000000000001#0000`
+          const until = Date.now() + 60_000
+          table.items.set(claimed, {
+            ...table.items.get(claimed)!,
+            ...toAttributeMap({ __edd_claim__: "drainer-1", __edd_claimed_until__: until }),
+          })
+          const report = yield* rekey(On)
+          expect(report.moved).toEqual({ ...ZERO, item: 1, tombstone: 1, outbox: 2 })
+          expect(report.conflicts.map((c) => [c.kind, c.reason, c.message])).toEqual([
+            ["outbox", "contended", "A drainer holds it."],
+          ])
+          expect(rowsOf(table, "Tally#outbox").map(([stored]) => stored)).toContain(claimed)
+        }),
+      )
+    }),
+  )
+
+  it.effect("a claim taken between rekey's read and its move cancels the move", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable({ indexes: { outbox: { pk: "obpk", sk: "obsk" } } })
+      let injected: string | undefined
+      // A drainer claims the item as the move is sent: after rekey read it unclaimed.
+      const Racing = Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const base = yield* DynamoClient
+          return {
+            ...base,
+            transactWriteItems: (input: any) =>
+              Effect.gen(function* () {
+                const del = (input.TransactItems as Array<any>).find((i) => i.Delete)?.Delete
+                if (injected === undefined && del?.Key?.sk?.S?.includes("#outbox#")) {
+                  injected = `${del.Key.pk.S}|${del.Key.sk.S}`
+                  table.items.set(injected, {
+                    ...table.items.get(injected)!,
+                    ...toAttributeMap({
+                      __edd_claim__: "drainer-1",
+                      __edd_claimed_until__: Date.now() + 60_000,
+                    }),
+                  })
+                }
+                return yield* base.transactWriteItems(input)
+              }),
+          }
+        }),
+      ).pipe(Layer.provide(table.layer))
+      yield* Effect.gen(function* () {
+        yield* layout(table)
+        const report = yield* rekey(On)
+        expect(injected).toBeDefined()
+        // Not moved: the claim holds where the drainer took it.
+        expect(table.items.get(injected!)?.__edd_claim__).toEqual({ S: "drainer-1" })
+        expect(report.conflicts.map((c) => [c.kind, c.reason])).toEqual([["outbox", "contended"]])
+        expect(
+          rowsOf(table, "Tally#outbox").filter(([, row]) => row.__edd_claim__ !== undefined),
+        ).toHaveLength(1)
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Racing,
+            On.EventsTable.layer({ name: "t" }),
+            On.ReadTable.layer({ name: "t" }),
+            On.OutboxTable.layer({ name: "o" }),
+          ),
+        ),
+      )
+    }),
+  )
+
+  it.effect(
+    "a tombstone whose current key holds another value's 1.36 row moves that row first, one at a time",
+    () =>
+      Effect.gen(function* () {
+        yield* inTable(On, (table) =>
+          Effect.gen(function* () {
+            // `a b` removed and `a%20b` live, both as 1.36 left them: `a%20b`'s row at `a b`'s key.
+            yield* On.Notifying.applyBatch(
+              yield* seed(On, "moved", [new Opened(), new Added({ amount: 2 }), new Closed()], 0),
+            )
+            demote(table, keysOf(On, "Tally", "moved"))
+            yield* On.Notifying.applyBatch(
+              yield* seed(On, "escaped", [new Opened(), new Added({ amount: 4 })], 0),
+            )
+            demote(table, keysOf(On, "Tally", "escaped"))
+            const report = yield* rekey(On, { concurrency: 1 })
+            expect(report.moved).toEqual({ ...ZERO, item: 1, tombstone: 1, outbox: 2 })
+            expect(report.skipped.unrecognizedKey).toBe(0)
+            expect(report.conflicts).toEqual([])
+            expect(rowsOf(table, "Tally").map(([stored]) => stored)).toEqual([
+              at(keysOf(On, "Tally", "escaped").current),
+            ])
+            expect(rowsOf(table, "Tally#tombstone").map(([stored]) => stored)).toEqual([
+              at(keysOf(On, "Tally", "moved").current),
+            ])
+          }),
+        )
+      }),
+  )
+
+  it.effect("rows 1.37 wrote are left alone, though their key is another value's 1.36 key", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          const events = yield* seed(
+            On,
+            "moved",
+            [new Opened(), new Added({ amount: 2 }), new Closed()],
+            0,
+          )
+          yield* On.Notifying.applyBatch(events)
+          const before = new Map(table.items)
+          const report = yield* rekey(On)
+          expect(report.moved).toEqual(ZERO)
+          expect(report.byMember.Tally?.unchanged).toBe(2)
+          expect(table.items).toEqual(before)
+        }),
+      )
+    }),
+  )
+
+  it.effect("an outbox on another table moves with that table's rekey", () =>
+    Effect.gen(function* () {
+      yield* inTable(On, (table) =>
+        Effect.gen(function* () {
+          const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+          yield* On.Remote.applyBatch(events)
+          const keys = keysOf(On, "Ledger", "moved")
+          demote(table, keys)
+          const item = `${keys.current.pk}|${keys.current.sk}#outbox#000000000001#0000`
+          expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual([
+            `${keys.old.pk}|${keys.old.sk}#outbox#000000000001#0000`,
+          ])
+          table.take()
+          const report = yield* rekey(On, { outbox: true })
+          expect(report.byMember.Ledger?.moved).toEqual({ ...ZERO, outbox: 1 })
+          const sent = table.take().filter((r) => r.command === "TransactWriteItems")
+          expect(sent.map((r) => (r.input.TransactItems as Array<any>)[0].Put.TableName)).toEqual([
+            "o",
+          ])
+          expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual([item])
+          // The read model's own table: its row moves; the outbox item isn't its to move.
+          const own = yield* rekey(On)
+          expect(own.byMember.Ledger?.moved).toEqual({ ...ZERO, item: 1 })
+          const delivered: Array<number> = []
+          yield* On.Remote.drain(ROWS.moved!, (effect) =>
+            Effect.sync(() => void delivered.push(effect.total)),
+          )
+          expect(delivered).toEqual([2])
         }),
       )
     }),

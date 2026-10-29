@@ -87,7 +87,7 @@ export const fromBase64 = (text: string, url = false): Uint8Array => {
   return bytes
 }
 
-const toBase64Url = (bytes: Uint8Array): string =>
+export const toBase64Url = (bytes: Uint8Array): string =>
   toBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 
 /** A key attribute as a cursor carries it; `undefined` for a type no key has. */
@@ -178,7 +178,8 @@ const isWireValue = (u: unknown): u is WireValue => {
   return false
 }
 
-const isWireKey = (u: unknown): u is Record<string, WireValue> =>
+/** A key as a cursor carries it: every value a valid {@link WireValue}. */
+export const isWireKey = (u: unknown): u is Record<string, WireValue> =>
   isRecord(u) && Object.keys(u).length > 0 && Object.values(u).every(isWireValue)
 
 /**

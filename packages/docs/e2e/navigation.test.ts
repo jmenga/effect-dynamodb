@@ -38,6 +38,7 @@ test.describe("Navigation", () => {
     await expect(sidebar.getByText("Lifecycle")).toBeVisible()
     await expect(sidebar.getByText("Aggregates & Refs")).toBeVisible()
     await expect(sidebar.getByText("Geospatial")).toBeVisible()
+    await expect(sidebar.getByText("Upgrading from 1.36")).toBeVisible()
     await expect(sidebar.getByText("Advanced")).toBeVisible()
   })
 
@@ -59,6 +60,7 @@ test.describe("Navigation", () => {
       { path: "guides/lifecycle/", heading: "Lifecycle" },
       { path: "guides/aggregates/", heading: "Aggregates" },
       { path: "guides/geospatial/", heading: "Geospatial" },
+      { path: "guides/upgrading/", heading: "Upgrading from 1.36" },
       { path: "guides/advanced/", heading: "Advanced" },
     ]
 
