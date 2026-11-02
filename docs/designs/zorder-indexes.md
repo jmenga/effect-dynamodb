@@ -28,7 +28,7 @@ purely additive, all listed in the changeset:
    chain returns end to end, are unchanged; `Limit` values and request counts change. Three
    things a caller can see change with them (§8.4): a `fetch` cursor's value can differ while
    resuming at the same place; a `fetch` whose limit fills on a sized request's last returned row
-   can return a non-null cursor where 1.36 returned null, so its chain ends with one empty page
+   can return a `Some` cursor where 1.36 returned null, so its chain ends with one empty page
    (§19 C9); and `Query.paginate` emits one array per request, so its page boundaries follow the
    sized requests and only the flattened stream is unchanged (§19 C10; a bound query's
    `.paginate()` streams items, so it is unaffected). With `maxPages` set,
@@ -589,8 +589,10 @@ order once its window is settled, with `accepted: 0` and `discarded: true`, so s
 - `Query.SortKeyCondition` stays `string`-typed. Planned ranges use an internal
   `KeyCondition` with `KeyValue = string | Uint8Array` operands.
 - `.where()` is unchanged on composite indexes and absent on Z-order ones.
-- `Page.cursor: string | null` keeps its type; `null` still means genuinely exhausted, now across
-  every range.
+- A cursor still means the same thing: `None` (`null` in 1.36) means genuinely exhausted, now
+  across every range. Its type changes: `Page.cursor`, a collection page's `cursor` and an
+  aggregate `ListResult.cursor` are `Option<string>`, and so is `RekeyReport.resume` (§19 A15).
+  `startFrom(cursor: string)` and `list({ cursor })` keep their string inputs.
 - Legacy unbound `Entity.query.<index>` (`Entity.ts:9375-9420`) gets no `.within()` (§19, D6).
 
 ---
@@ -917,7 +919,7 @@ everything: ranges in reverse, `ScanIndexForward: false`, `prevInBox` / `litmax`
 
 ```
 choose(box):
-  if EMPTY:                               plan "empty": no request, items [], cursor null
+  if EMPTY:                               plan "empty": no request, items [], cursor None
   if no dimension bounded:                one range covering T (begins_with T, or no SK condition when T is empty)
   p = plan(box, maxRanges) with REFINE_FACTOR = 1
   if p.exact:                             "precise" with p.ranges     // the exact plan fits maxRanges
@@ -1336,10 +1338,10 @@ What adaptive sizing does change, beyond `Limit`s and request counts (§19 C9, C
   which is the item itself) instead of rebuilding from the item, where a natural page would have
   filled the limit mid-page. The cursor resumes at the same place: no row between the two
   positions passes the filter.
-- **A `fetch` cursor's null-ness.** A natural page has usually read to the end of the partition by
-  the time it fills the limit on its last match, so 1.36 returned a null cursor. A sized request
-  stops at its `Limit`, so DynamoDB returns a `LastEvaluatedKey` (even when no row is left), and the
-  cursor is not null. The chain then ends with one empty page, which reads the tail (with the
+- **Whether a `fetch` cursor is `None`.** A natural page has usually read to the end of the
+  partition by the time it fills the limit on its last match, so 1.36 returned a null cursor. A
+  sized request stops at its `Limit`, so DynamoDB returns a `LastEvaluatedKey` (even when no row is
+  left), and the cursor is `Some`. The chain then ends with one empty page, which reads the tail (with the
   estimator's doubling, about `log2(tail / 16)` requests). Restoring the null would mean reading on
   past the limit to look for another match: up to a natural 1 MB page on every such `fetch`, which
   is the read the sizing exists to avoid. 1.36 chains could already end with an empty page (a
@@ -1471,9 +1473,9 @@ positions (`QueryCursor.test.ts`).
 step = planner.start(decodedCursor)                  // EDD-9094 fails the terminal here
 requests = 0;  items = [];  window = 1                // precise window size, per terminal
 loop:
-  if step is Done:                                   return { items, cursor: null }
+  if step is Done:                                   return { items, cursor: None }
   if limit reached or (maxPages and requests ≥ maxPages):
-                                                     return { items, cursor: planner.cursor(step) }   // never sent
+                                                     return { items, cursor: Some(planner.cursor(step)) }   // never sent
   if step is Probe:
     key = send probe (requests += 1, observe);  step = planner.afterProbe(step, key);  continue
   // Read: step, plus up to window-1 following precise ranges, within the maxPages budget
@@ -1484,15 +1486,15 @@ loop:
     { items+, stoppedAt } = examinePage(res.Items, remaining)       // remaining ≥ 1 here, always
     if limit reached:
       if stoppedAt < res.Items.length - 1:           // stopped inside the page
-        return { items, cursor: At(key of res.Items[stoppedAt]) }    // as today (#122)
+        return { items, cursor: Some(At(key of res.Items[stoppedAt])) }    // as today (#122)
       next = planner.afterRead(member, res.LEK)                       // pure: no probe is sent
-      return { items, cursor: next is Done ? null : planner.cursor(next) }
+      return { items, cursor: next is Done ? None : Some(planner.cursor(next)) }
     step = planner.afterRead(member, res.LEK)
     if res.LEK: window = 1; discard the rest of the batch; break     // later members can't be resumed
   else: window = min(window × 2, concurrencyCap)                    // every member finished in one page
   if no limit:                                       // single-page fetch, as today: one window per call
-    return { items, cursor: step is Done ? null : planner.cursor(step) }
-return { items, cursor: null }
+    return { items, cursor: step is Done ? None : Some(planner.cursor(step)) }
+return { items, cursor: None }
 ```
 
 (`maxPages - requests` is unbounded when `maxPages` is unset. A throttled member after a usable
@@ -1507,7 +1509,7 @@ prefix is handled per §9.5: the batch is cut at that member and the call return
 - **Probes are requests.** They are sent by the loop, counted against `maxPages`, observed by
   `onRequest`, and never sent when the call is about to return: `afterRead` returns a pending
   `Probe` step, and `cursor(Probe)` encodes `TupleDone`. When the limit is hit exactly at a tuple's
-  end, the cursor is therefore non-null even if no further tuple exists, and the next call may
+  end, the cursor is therefore `Some` even if no further tuple exists, and the next call may
   return an empty page, the same contract as DynamoDB's own `LastEvaluatedKey`.
 - **Adaptive window for `fetch`.** A window member other than the first starts fresh (no start
   key), so its results are usable only while every earlier member finished its range in one page.
@@ -2017,6 +2019,7 @@ confirmed by the owner on 2026-11-01 as proposed. *(owner 2026-11-01)* = decided
 | A12 | ~~Public `ZOrder` surface = dimension constructors and types only~~ *(confirmed 2026-10-27; superseded by A13)* | **replaced** | The curve algebra (`interleave`, `bigmin`, `plan`, …) stays internal (`internal/ZOrderCurve.ts`) so its signatures and the stored layout aren't semver-bound before the geo follow-up needs them (§3.1). That part stands; the constructors are gone (A13). |
 | A13 | Dimensions declared as plain entries in `sk.zorder`, typed from the model; public `ZOrder` = types only *(owner 2026-11-01)* | **in** | A constructor (`ZOrder.int("price", …)`) restated a type the model already declares, and a free function can't complete or check its field name against the model. An entry is a bare field name or `{ field, ...options }`; its options follow the field's model type (`DimensionFor`, §3.1): a range for `number` / `bigint` (int or float by whether the options are integers), a time window for a date, the bare name or `{ values?, bits? }` for a literal union or `boolean`, `{ bytes }` or `{ values, bits? }` for a plain `string` (a plain `number` takes a range only; `values` on it is `[EDD-9088]`, *owner 2026-11-01*). `[EDD-9087]` moves from the constructors to `Entity.make` (`normalizeGsiConfig`), and also refuses an unknown option (as a type error too, through a guard on each entry, `ZOrderEntriesGuard`, which leaves the editor's completions intact). `.within()` bounds are typed from the entry and the field as before. Type change: an entry or key config declared outside `Entity.make` needs `as const`. |
 | A14 | Every definition position that names a model attribute is typed from the model *(owner 2026-11-01)* | **in** | The owner's rule: "The field declarations for all fields MUST validate attribute names." The editor completes the names; a misspelled one is a compile error on that entry; the runtime checks stay for untyped callers. Covered: `Entity.make` key and index composites, `sk.prefix` / `sk.zorder`, `refs` keys, `unique`, `timeSeries.orderBy` / `appendInput`, `generatedId.field`, vector index fields; `DynamoModel.configure` keys; `Aggregate.make` `pk` / `collection` / `list` composites, `context`, `edges` keys, `many` edges' `sk.composite`; `Collections.member` / `Collections.make`; `GeoIndex.make` `index` / `fields`. Physical names stay strings (key `field`s, `configure` renames, timestamp / version / TTL names), as do labels that name no attribute (discriminator keys). `one` / `many`'s first argument and `many`'s `edgeAttributes`, never read, are deprecated in favour of `one(config)` / `many(config)` *(owner 2026-11-01)*, removed in the next major. Pre-existing gaps closed with it: a `unique` field or an `appendInput` field the model lacks was accepted at runtime and is now refused (`[EDD-9002]`, `[EDD-9013]`). DESIGN.md §5 lists the positions. |
+| A15 | Resume cursors handed to callers are `Option<string>`: `Query.Page.cursor`, a collection page's `cursor`, `Aggregate.ListResult.cursor`, `RekeyReport.resume` *(owner 2026-11-01)* | **in** | Repo convention: Option over nullable in services; the caller's HTTP handler is the boundary, not the library (`Option.getOrNull(page.cursor)` or a `Schema.OptionFromNullOr` field there). The inputs stay strings — `startFrom(cursor: string)`, `list({ cursor?: string })`, `rekey({ resume?: string })` — since an `Option` input would make `None` mean "restart", conflating the first page with no more pages. Out: the aggregate `update` context's `cursor` (an optic), internal cursor state and the wire formats. |
 | B1 | General binary keys for composite halves *(owner)* | **out** | Per the issue. |
 | B2 | Z-order on the table primary key *(owner)* | **out** | Per the issue; EDD-9086. Follow-up candidate: append-only event items. |
 | B3 | Z-order as a collection member *(owner)* | **out** | EDD-9090. |
@@ -2030,7 +2033,7 @@ confirmed by the owner on 2026-11-01 as proposed. *(owner 2026-11-01)* = decided
 | C6 | `maxPages` without a planner keeps 1.36 sizing *(confirmed 2026-10-27)* | **in** | Keeps the Scope's "results and cursors are unchanged" true for `limit` + filter + `maxPages` (§8.1). Alternative: adapt anyway and record the per-call result change in the changeset. |
 | C7 | `concurrency` default: 4 with a `limit`, 1 for no-limit drains *(confirmed 2026-10-27)* | **in** | Concurrency is a latency / throttling trade-off on one partition key; 4 parallel natural 1 MB drains ask for about 8× a partition's 3,000 RCU/s (§9.3). |
 | C8 | Throttling: no library retry; `fetch` returns a usable prefix when a later window member is throttled; `collect` / `count` / `paginate` fail *(confirmed 2026-10-27)* | **in** | §9.5. The SDK's retry strategy already backs off per request; a library-level back-off or drop-to-sequential is not added. |
-| C9 | Under adaptive sizing, a `fetch` whose limit fills on a sized request's last returned row returns DynamoDB's `LastEvaluatedKey`: a different cursor value, and non-null where 1.36's was null, so the chain ends with one empty page *(proposed in review of commit 2; confirmed 2026-10-28)* | **changed (recorded)** | §8.4. The Scope's "cursors are unchanged" holds for where a cursor resumes, not for its value or null-ness. Alternative: after such a fill, read on (up to a natural page) to find whether another match exists and return null when none does; that costs up to 1 MB on every such `fetch`, the read adaptive sizing exists to avoid, and still returns non-null when the tail passes 1 MB, as 1.36 did. Or `.pageSize("natural")` per query. |
+| C9 | Under adaptive sizing, a `fetch` whose limit fills on a sized request's last returned row returns DynamoDB's `LastEvaluatedKey`: a different cursor value, and `Some` where 1.36's was null, so the chain ends with one empty page *(proposed in review of commit 2; confirmed 2026-10-28)* | **changed (recorded)** | §8.4. The Scope's "cursors are unchanged" holds for where a cursor resumes, not for its value or null-ness. Alternative: after such a fill, read on (up to a natural page) to find whether another match exists and return null when none does; that costs up to 1 MB on every such `fetch`, the read adaptive sizing exists to avoid, and still returns non-null when the tail passes 1 MB, as 1.36 did. Or `.pageSize("natural")` per query. |
 | C10 | `Query.paginate` emits one array per request, so under adaptive sizing its page boundaries follow the sized requests; only the flattened stream is unchanged (a bound query's `.paginate()` streams items, so it is unaffected) *(proposed in review of commit 2; confirmed 2026-10-28)* | **changed (recorded)** | §8.4. Alternative: keep natural sizing for `Query.paginate`; a stream has no cursor to honour, but then a selective filter with a `limit` reads a 1 MB page per pull, which is what adaptive sizing replaces. |
 | C11 | DynamoDB calls an `.onRequest()` observer makes run under `Capacity.detached`, so they are not charged to the query's consumed-capacity report *(confirmed 2026-10-28)* | **in** | §3.6. The observer is the caller's code, not the query's reads; charging its calls would make the report depend on what an observer does. Alternative: charge them to the query. |
 | C12 | E6's request cost: on a sort key composite that is not the last and is a free-form string, `lte`, `gt` and `between` sent two exact key ranges, one request after the other, where 1.36 sent one condition *(proposed in review of commit 5b, 2026-10-28)* | **rejected; superseded by F1 (owner 2026-10-28)** | A stored value sorted apart as well as a bound (`gt: "new"` must return `new york`, whose unescaped key `new york#…` sat between `new`'s key and `new#…`), so no single range over unescaped text was exact for these operators, and every such query paid a second request and was a planned read. Escaping the key text (F1) makes key order value order, so each bound is one exact range again and the split machinery (`compositeSpans`, the multi-range `key` plan, `keyTextAvoids`) is gone. |

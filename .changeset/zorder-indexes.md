@@ -33,8 +33,8 @@ request's `Limit` is sized from the observed pass rate instead of asking for a 1
 items a query returns are unchanged; read units and request counts change, and a low or uneven
 pass rate can take more round trips than one natural page (a logarithmic number more in the worst
 case). A `fetch` cursor resumes at the same place, but its value can differ, and when the limit
-fills on the last row a sized request returned the cursor can be non-null where it was null, so
-a `fetch` chain can end with one empty page. `Query.paginate` emits one array per request, so
+fills on the last row a sized request returned the cursor can be `Some` where it was `None` (null
+before 1.37), so a `fetch` chain can end with one empty page. `Query.paginate` emits one array per request, so
 its page boundaries change; the items it streams are unchanged (a bound query's `.paginate()`
 streams items and is unaffected). Queries with `.maxPages()` keep the previous sizing.
 `.pageSize("natural")` restores the previous behaviour.
@@ -235,6 +235,16 @@ names. `DynamoModel.configure` refuses a key the model doesn't have even beside 
 `TEntityType` and has no default (left out, refs still resolve to `undefined`), and
 `Aggregate.make` lists its top-level overload first, so `Parameters<typeof Aggregate.make>` reads
 the sub-aggregate form.
+
+**Type changes: page cursors are `Option<string>`.** `cursor` on query pages (`Query.Page`, every
+`fetch()` and `Query.execute`), on collection pages (`db.collections.<name>(…).fetch()`) and on
+aggregate list results (`Aggregate.ListResult`) was `string | null` and is now
+`Option.Option<string>`: `Some` while there is more, `None` when there are no more results.
+Where a nullable is needed, such as a JSON response, use `Option.getOrNull(page.cursor)` (or a
+`Schema.OptionFromNullOr(Schema.String)` field); otherwise `Option.match` / `Option.map`, such
+as `Option.map(page.cursor, (cursor) => query.startFrom(cursor))` as `Stream.paginate`'s next
+state. `.startFrom()` and `list({ cursor })` still take a string. The new `RekeyReport.resume` is an `Option<string>` too,
+and `rekey({ resume })` takes the token's string.
 
 **Type changes:** `KeyComposer.composeIndexKeys` / `tryComposeIndexKeys` / `composeAllKeys` and
 `GsiUpdateResult.sets` values widen to `string | Uint8Array` (bytes only for Z-order halves).

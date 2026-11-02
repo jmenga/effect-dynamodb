@@ -472,7 +472,7 @@ program.pipe(
   Effect.provide(Layer.succeed(TeamService, {
     get: () => Effect.succeed(fakeTeam),
     create: () => Effect.succeed(fakeTeam),
-    list: () => Effect.succeed({ data: [], count: 0, cursor: null }),
+    list: () => Effect.succeed({ data: [], count: 0, cursor: Option.none() }),
   }))
 )
 ```
@@ -1146,7 +1146,8 @@ read. A rerun finds every moved row current and moves nothing.
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
 `LastEvaluatedKey` in the cursor wire form (`internal/Cursor.ts`). A run that
-stops at `maxPages` returns it as `resume`; `onProgress` receives the report
+stops at `maxPages` returns it as `resume` (`Some(token)`; `None` once the
+whole table is covered), and `rekey({ resume })` takes the token's text; `onProgress` receives the report
 so far and a token after each page, once every row of the page is handled, so
 an interrupted run resumes redoing at most the pages in flight. The token's
 segment count wins; a different `segments`, another table's token or a
@@ -2476,7 +2477,7 @@ Each costs one read unit per 4 KB rather than half of one.
 | `adaptive` | a `limit` and something that drops rows: a filter, a `filterBy` predicate, a plan's row check, history rows | first `max(16, 2 × owed)` under a filter (`owed` when only history rows drop); doubling while nothing is accepted; then `⌈owed / rate × 1.25⌉`, `rate = min(cumulative, last request's)` acceptance; clamped to 1..100,000 |
 | `budget` | a `limit` nothing filters (the `__edd_e__` ownership clause alone included) | the items still owed |
 
-The estimator lives in the terminal's loop, never in a cursor: a resumed query starts fresh. Items returned by `collect()` / `count()` and by a `fetch()` chain end to end are unchanged; request counts, read units, `fetch()` cursor values (and whether the last page's cursor is null) and `Query.paginate`'s page boundaries can differ. A `.pageSize()` string other than `"natural"` throws `EDD-9095`.
+The estimator lives in the terminal's loop, never in a cursor: a resumed query starts fresh. Items returned by `collect()` / `count()` and by a `fetch()` chain end to end are unchanged; request counts, read units, `fetch()` cursor values (and whether the last page's cursor is `None`) and `Query.paginate`'s page boundaries can differ. A `.pageSize()` string other than `"natural"` throws `EDD-9095`.
 
 ### `.within()` and Skip-Scan (#171)
 
@@ -2511,6 +2512,8 @@ Two formats (`internal/Cursor.ts`):
 
 - **Legacy** — `btoa(JSON.stringify(LastEvaluatedKey))`. Every query without a planner still emits it whenever it can carry the key exactly, so plain queries' cursors are byte-identical to earlier releases.
 - **v2** — `"v2." + base64url(utf8(JSON))`: emitted for keys with `B` values or text outside Latin-1, and for every planned query. It carries a fingerprint (index, entity type, partition key value, pinned and prefix values, the quantized box or bounds, the layout, `reverse`), the plan mode in force and a position: the skip tuple in progress, and either the `LastEvaluatedKey` to resume at, the last in-plan key done (*through*), or that the tuple is finished. The fingerprint excludes `maxRanges`, `concurrency`, `strategy`, `pageSize` and `maxSkips`, so a resumed query may change them; resume recomputes the plan and continues from the position, in the plan mode it recorded, with a fresh probe budget.
+
+A page hands its cursor out as an `Option<string>`: `Query.Page.cursor` (every `fetch()` / `Query.execute`), a collection's `fetch()` and an aggregate `ListResult.cursor` are `Some(text)` while there is more and `None` once the range is exhausted. The inputs take the text: `startFrom(cursor: string)` and `list({ cursor })`, so `None` never stands for "start again". Internally the loops keep `string | null` and wrap it at the terminal.
 
 `startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
 
