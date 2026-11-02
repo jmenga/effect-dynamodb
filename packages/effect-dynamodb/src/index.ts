@@ -122,6 +122,7 @@ export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"
+export * as BlobGc from "./BlobGc.js"
 export type {
   BlobChecksum,
   BlobCopyRequest,

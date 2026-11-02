@@ -120,6 +120,7 @@ import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { asReadGuard, wholeRowGuard } from "./internal/ExpressionLimits.js"
+import * as GcSupport from "./internal/GcSupport.js"
 import {
   itemBytes,
   jsonBytes,
@@ -6131,6 +6132,35 @@ export const makeStream = <
   // Return EventStream
   // ---------------------------------------------------------------------------
 
+  /**
+   * What `BlobGc` reads of the stream (#179, design §11): one partition per
+   * stream, its rows keyed `pk` / `sk`, its objects under the stream family.
+   * The partition is the current key's: a stream still under its 1.36 key
+   * keeps its offloaded values inline there (design §11.10).
+   */
+  const gcSupport: GcSupport.StreamGcSupport = {
+    kind: "stream",
+    name: config.streamName,
+    tableTag: () => config.table.Tag,
+    pkField: "pk",
+    skField: "sk",
+    eventType: entityType,
+    snapshotType: snapshotEntityType,
+    event: eventOffload,
+    snapshot: snapshotOffload,
+    prefix: offloadOptions.prefix,
+    partitionOfKey: (streamId, operation) =>
+      Effect.try({
+        try: () => {
+          if (typeof streamId !== "object" || streamId === null) {
+            throw new Error(`A stream id must be an object, got ${typeof streamId}`)
+          }
+          return composeStreamPk(streamId as Record<string, unknown>)
+        },
+        catch: (cause) => new ValidationError({ entityType, operation, cause }),
+      }),
+  }
+
   // Cast rationale: makeStream builds the stream object from closures that capture
   // the generic config. The Table.Tag service has a dynamically-created tag whose R
   // type parameter is opaque, causing Effect.gen to infer `unknown` for R. The cast
@@ -6834,6 +6864,7 @@ export const makeStream = <
     [CommandSentinelProbe]: checked(hasCommandSentinel),
     [HeadAboveProbe]: checked(headAbove),
     [Rekey.RekeyHandler]: rekeyHandler,
+    [GcSupport.GcSupportId]: gcSupport,
   } as unknown as EventStream<
     TEvent,
     TStreamIdFields,

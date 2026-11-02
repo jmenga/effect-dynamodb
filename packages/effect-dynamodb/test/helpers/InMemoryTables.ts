@@ -5,7 +5,8 @@
  * transaction's items taken in order. A request DynamoDB refuses fails with DynamoDB Local's
  * `ValidationException`, as the library's client reports it (`DynamoValidationError`); a failed
  * condition with `ConditionalCheckFailedException`; a request this doesn't read is a defect naming
- * it, found before anything is written. A transaction is checked whole, then written whole.
+ * it, found before anything is written. A transaction is checked whole, then written whole, and
+ * a `BatchWriteItem` applies its puts and deletes (nothing unprocessed).
  * `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's; what it
  * doesn't model is listed at the top of `DynamoExpressions.ts`.
  *
@@ -23,6 +24,7 @@ import { Effect } from "effect"
 import { classifyError, type DynamoClientService } from "../../src/DynamoClient.js"
 import {
   answering,
+  batchWrite,
   deleteItem,
   getItem,
   type IndexSchema,
@@ -52,6 +54,7 @@ export const calls = {
   deleteItem: 0,
   executeStatement: 0,
   executeTransaction: 0,
+  batchWriteItem: 0,
 }
 /** Every query's expression values, for asserting the range read. */
 export const queried: Array<Record<string, AttributeValue>> = []
@@ -60,8 +63,17 @@ export const sent = {
   getItem: [] as Array<GetItemCommandInput>,
   transactWriteItems: [] as Array<TransactWriteItemsCommandInput>,
 }
-/** Hooks run once after the next `getItem` — a concurrent writer between read and write. */
-export const hooks = { afterGet: [] as Array<(table: string) => void> }
+/**
+ * Hooks run once after the next `getItem` (or `query`) — a concurrent writer
+ * between a read and the write it informs. The read's result is the one taken
+ * before the hooks ran. The effect hooks run library operations (another
+ * fiber's writes, a GC pass) against the same tables.
+ */
+export const hooks = {
+  afterGet: [] as Array<(table: string) => void>,
+  afterGetEffect: [] as Array<(table: string) => Effect.Effect<void>>,
+  afterQueryEffect: [] as Array<(table: string) => Effect.Effect<void>>,
+}
 /** Fail every conditional write, as if another writer always won. */
 export const rejection = { all: false, next: 0 }
 /**
@@ -75,6 +87,8 @@ export const resetStore = () => {
   store.clear()
   resetCalls()
   hooks.afterGet = []
+  hooks.afterGetEffect = []
+  hooks.afterQueryEffect = []
   rejection.all = false
   rejection.next = 0
   contention.next = 0
@@ -149,6 +163,17 @@ const tables: Tables = {
   read: (table, key) => store.get(keyOf(table, key)),
 }
 
+/** Run the effect hooks queued in `queue` once, emptying it first. */
+const runEffectHooks = (
+  queue: "afterGetEffect" | "afterQueryEffect",
+  table: string | undefined,
+): Effect.Effect<void> =>
+  Effect.suspend(() => {
+    const run = hooks[queue]
+    hooks[queue] = []
+    return Effect.forEach(run, (hook) => hook(table ?? ""), { discard: true })
+  })
+
 /** A refusal as the library's client reports it. */
 const failure = (operation: string) => (error: Error) =>
   Effect.fail(classifyError(operation)(error))
@@ -185,7 +210,10 @@ const operations: Partial<DynamoClientService> = {
       const table = input.TableName
       const rows = rowsOf(table)
       return answering(
-        () => Effect.succeed(query(input as never, rows, keysOf(table), indexesOf(table)) as never),
+        () =>
+          Effect.succeed(
+            query(input as never, rows, keysOf(table), indexesOf(table)) as never,
+          ).pipe(Effect.tap(() => runEffectHooks("afterQueryEffect", table))),
         failure("Query"),
       )
     }),
@@ -199,8 +227,25 @@ const operations: Partial<DynamoClientService> = {
         const run = hooks.afterGet
         hooks.afterGet = []
         for (const hook of run) hook(table)
-        return Effect.succeed(output as never)
+        return Effect.succeed(output as never).pipe(
+          Effect.tap(() => runEffectHooks("afterGetEffect", table)),
+        )
       }, failure("GetItem"))
+    }),
+  batchWriteItem: (input) =>
+    Effect.suspend(() => {
+      calls.batchWriteItem++
+      return answering(() => {
+        // Every request's store key found before any write is made.
+        const placed = batchWrite(input as never, tables).map(
+          (each) => [keyOf(each.table, each.key), each.item] as const,
+        )
+        for (const [key, item] of placed) {
+          if (item === undefined) store.delete(key)
+          else store.set(key, item)
+        }
+        return Effect.succeed({ UnprocessedItems: {} } as never)
+      }, failure("BatchWriteItem"))
     }),
   putItem: (input) =>
     Effect.suspend(() => {

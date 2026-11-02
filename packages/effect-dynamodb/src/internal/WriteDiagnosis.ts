@@ -80,6 +80,7 @@ import {
   transactWriteBodyBytes,
 } from "./ItemSize.js"
 import * as SentRequest from "./SentRequest.js"
+import { compareBytes, compareUtf8 } from "./Utf8Order.js"
 
 /** DynamoDB's limit on a partition (hash) key value, in UTF-8 bytes. */
 export const PARTITION_KEY_MAX_BYTES = 2048
@@ -713,24 +714,6 @@ const expressionOf = (
     item.Delete?.ConditionExpression ??
     item.ConditionCheck?.ConditionExpression
   )
-}
-
-/**
- * UTF-8 byte order — the order DynamoDB sorts (and evaluates `BETWEEN` on)
- * string keys. JavaScript's `<` compares UTF-16 code units, which disagrees
- * for characters outside the BMP.
- */
-const utf8 = new TextEncoder()
-export const compareUtf8 = (a: string, b: string): number =>
-  compareBytes(utf8.encode(a), utf8.encode(b))
-
-const compareBytes = (left: Uint8Array, right: Uint8Array): number => {
-  const length = Math.min(left.length, right.length)
-  for (let i = 0; i < length; i++) {
-    const diff = left[i]! - right[i]!
-    if (diff !== 0) return diff
-  }
-  return left.length - right.length
 }
 
 /** `a` sorts after `b` as DynamoDB orders key values of their (shared) type. */

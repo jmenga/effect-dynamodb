@@ -5,8 +5,9 @@
  * operation's context — the entity type, the stored attribute, the operation
  * and whether the DynamoDB write already committed (§6.13).
  *
- * Shared by the upload ledger (`put`, `delete`) and the resolver (`get`,
- * `presign`). Not part of the public API.
+ * Shared by the upload ledger (`put`, `delete`), the resolver (`get`,
+ * `presign`) and blob GC (`list`, `head`, `mark`, `delete`). Not part of the
+ * public API.
  */
 
 import {
@@ -134,19 +135,19 @@ export const call = <A>(
     }),
   )
 
-/** {@link call} for a call that streams (a `get`). */
+/** {@link call} for a call that streams (a `get`, a `list` of a prefix `key`). */
 export const callStream = <A>(
   store: BlobStoreService,
   action: BlobStoreAction,
   ctx: BlobCallContext,
-  ref: BlobRef,
+  target: { readonly key?: string | undefined; readonly ref?: BlobRef | undefined },
   stream: () => Stream.Stream<A, unknown>,
 ): Stream.Stream<A, BlobStoreError> =>
   Stream.suspend(stream).pipe(
-    Stream.mapError(fromFailure(ctx, action, ref)),
+    Stream.mapError(fromFailure(ctx, action, target.ref)),
     Stream.withSpan(blobSpanName(action), {
       kind: "client",
-      attributes: spanAttributes(store, action, ctx, undefined, ref),
+      attributes: spanAttributes(store, action, ctx, target.key, target.ref),
     }),
   )
 

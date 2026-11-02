@@ -70,6 +70,7 @@ import {
   utf8Bytes,
 } from "./BlobStoreContract.js"
 import * as Multipart from "./Multipart.js"
+import { compareUtf8 } from "./Utf8Order.js"
 
 // ---------------------------------------------------------------------------
 // Options
@@ -266,21 +267,6 @@ interface StoredVersion {
   readonly metadata: Readonly<Record<string, string>>
   readonly lastModified: number
   mark: number | undefined
-}
-
-/** Order strings as their UTF-8 bytes (code points), as S3 orders keys. */
-export const compareUtf8 = (a: string, b: string): number => {
-  const n = Math.min(a.length, b.length)
-  for (let i = 0; i < n; i++) {
-    const x = a.charCodeAt(i)
-    const y = b.charCodeAt(i)
-    if (x === y) continue
-    // Surrogates (supplementary code points) sort above U+E000–U+FFFF.
-    const fx = x >= 0xd800 && x <= 0xdfff ? x + 0x2000 : x >= 0xe000 ? x - 0x800 : x
-    const fy = y >= 0xd800 && y <= 0xdfff ? y + 0x2000 : y >= 0xe000 ? y - 0x800 : y
-    return fx - fy
-  }
-  return a.length - b.length
 }
 
 const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"

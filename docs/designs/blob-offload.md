@@ -612,7 +612,8 @@ const gc = yield* BlobGc.make({
 })
 // R = never once made; requires DynamoClient | TableConfig(s) | BlobStore to make
 
-gc.reap(records: Iterable<StreamRecordLike>): Effect<ReapReport, DynamoClientError | BlobStoreError | ValidationError>
+gc.reap(records: Iterable<StreamRecordLike>, options?: { table? }):
+                                              Effect<ReapReport, DynamoClientError | BlobStoreError | ValidationError>
 gc.sweep(member, key):                        Effect<SweepReport, DynamoClientError | BlobStoreError | ValidationError>
 gc.sweepPartition(member, partitionKey):      Effect<SweepReport, …>
 gc.sweepStore(options?: { prefix?; startAfter?; maxFamilies? }):
@@ -620,7 +621,8 @@ gc.sweepStore(options?: { prefix?; startAfter?; maxFamilies? }):
 ```
 
 `reap` is a records-to-Effect batch processor, usable from a Lambda handler, an EventBridge
-Pipe target, or the polled change feed's `runChangeFeed({ onBatch })`. `sweepStore` is the
+Pipe target, or the polled change feed's `runChangeFeed({ onBatch })` (passing
+`{ table: batch.streamArn }`: the SDK's records do not name their table, §11.3). `sweepStore` is the
 backstop for leaks no row records (§11.5). Details in §11.
 
 ### 3.11 `StorageEncoding` additions
@@ -1898,15 +1900,19 @@ either table must not delete the other's live data. So every GC path (reaper, sw
 acts only on **own** versions: a version is own to a member when its key's `P` and `F`
 (§4.5) are the ones the member computes from **its own physical table name** and the row's
 partition and family. Any other pointer a GC'd row holds is **foreign**: never a candidate,
-never listed, never deleted (reported as `foreign`). A changed `offload.prefix` or store
+never listed, never deleted (reported as `foreign`). The rule needs the row to be the member's
+table's: a copied row read as the source table's member would make the copy's pointers look
+own. Sweeps and purge read their own table; the reaper reads a stream record only as the
+members on the table the record came from (§11.3). A changed `offload.prefix` or store
 prefix keeps the same `P/F`, so its older objects stay own and are still swept.
 
 **The item family's rows.** An item family is not one sort-key range. For an entity with sort-key
 composites it spans disjoint ranges of the partition, with sibling items' rows in between
 (`DynamoSchema.ts:298-320`); purge already reads them by querying the whole partition and
 classifying rows with `belongsToItem` (`Entity.ts:10010-10066`). GC reads them as explicit
-strongly consistent `Query` ranges, each projecting keys and offloaded attributes, and filters
-with the same classification:
+strongly consistent `Query` ranges, reading rows whole (a pointer on any attribute is a holder,
+so a field whose `external` was switched off still holds its versions — commit 16), and
+filters with the same classification:
 
 | # | Range (key condition) | Rows |
 |---|---|---|
@@ -1924,13 +1930,23 @@ filtered by `__edd_e__`, as purge does. Ranges with no rows cost one read unit e
 `gc.reap(records)`:
 
 1. **Check** every record's view type and images (§10.4).
-2. **Candidates.** For every record of a configured member, every **own** pointer in `OldImage`
-   whose ref does not appear in `NewImage` for the same attribute (all of them on `REMOVE`,
-   including TTL deletes) is a candidate. `INSERT` produces none. Records of other types, rows
-   that are not a member's (sentinels), and foreign pointers are ignored.
+2. **Candidates.** A record is read only by the members on the table it came from: the table
+   its `eventSourceARN` (Lambda, EventBridge Pipes) or `tableName` (Kinesis Data Streams)
+   names, else `reap`'s `table` option (a name, or a table or stream ARN — the change feed's
+   `streamArn`), else the collector's one table. A record whose table contradicts the option
+   or itself, or that names none while the collector's members are on several tables, is
+   refused before anything is freed (`[EDD-9118]`). A collector fed another table's records
+   that name no table takes them for its own, so it must be fed only its own tables'
+   records — the docs say so. For every record of a configured member, every **own** pointer
+   in `OldImage` whose ref does not appear in `NewImage` for the same attribute (all of them
+   on `REMOVE`, including TTL deletes) is a candidate. `INSERT` produces none. Records of other
+   types or tables, rows that are not a member's (sentinels), and foreign pointers are ignored.
 3. **Grace.** Wait until `ApproximateCreationDateTime + gracePeriod ≤ now` for the newest
    candidate record of the call (`Effect.sleep`; default grace **15 minutes**, ≥ 0,
-   `[EDD-9118]`). The grace covers GSI and eventually consistent reads, replica-region reads
+   `[EDD-9118]`). The time is a `Date` (the SDK), epoch seconds (Lambda, Pipes), or epoch
+   milliseconds or microseconds (Kinesis Data Streams, per
+   `ApproximateCreationDateTimePrecision`); a time later than now counts as now, so a
+   malformed one never delays a batch by more than the grace. The grace covers GSI and eventually consistent reads, replica-region reads
    (§16), lazy handles captured from the superseded row, and presigned URLs: the default equals
    `presignedUrl`'s default `expiresIn` (§3.7). The docs recommend a grace at least as long as
    the longest presign expiry an application issues and the slowest stream consumer's
@@ -2046,7 +2062,8 @@ stream):
    | not in `R`, marked at least `gracePeriod` ago | **delete** |
    | not in `R`, marked less than `gracePeriod` ago | keep |
 
-4. Report `SweepReport { referenced, listed, marked, deleted, retainedYoung, foreign }`.
+4. Report `SweepReport { referenced, listed, marked, deleted, retainedYoung, foreign, busy }`
+   (`busy`: the bracket never settled, so nothing was listed, marked or deleted — commit 16).
 
 Why the marks:
 
@@ -2069,7 +2086,8 @@ Why the marks:
   version already has. Tagging does not create a version. This is the store's `marks`
   capability (§12.1); the memory store implements it too.
 
-Settings: default grace 24 hours, at least 1 hour (`[EDD-9118]`). A sweep needs a store with
+Settings: default grace the larger of 24 hours and `maxUploadAge` + 15 minutes, at least 1
+hour and at least `maxUploadAge` + 15 minutes (`[EDD-9118]`). A sweep needs a store with
 `list` and `marks`. Run periodically (daily with the default grace removes a version 24–48
 hours after it was first seen unreferenced). Key-per-write stores work the same way (marks
 are per ref).
@@ -2098,7 +2116,10 @@ type StoreSweepFamily =
   | { readonly _tag: "Unattributable"; readonly familyPrefix: string; readonly versions: number; readonly bytes: number }
 ```
 
-1. `store.list` in key order; the versions of one item family are contiguous (`…P/F/…`).
+1. `store.list` in key order; the versions of one item family are contiguous (`…P/F/…`). A
+   key's `P/F/O` is read right after the store prefix or a member's `offload.prefix` it starts
+   with (longest first), so a prefix with a 32-hex-character segment of its own is not taken
+   for `P`; a key under none of them (an earlier prefix) is read at its first `P/F/O`.
 2. Per family, `store.head` of one version gives its metadata (§4.6). A table that is not a
    member's, or an entity that is not a configured member, is `Foreign` — skipped, never
    deleted. A version without `edd-item` (the key was too long for metadata) makes the family
@@ -2575,7 +2596,8 @@ the `[EDD-9078]` pattern:
 **Escaped key text (`[EDD-9146]`, owner decision 2026-11-14).** Offloading requires the table's
 schema to set `escapeKeys: true` (§11.10). Wherever a member is bound with the store check above —
 `DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind` / `bindProjection`,
-`GeoIndex.bind` (through its entity), and `rekey`'s binding of the streams it is given — a member
+`GeoIndex.bind` (through its entity), `BlobGc.make` (its members), and `rekey`'s binding of the
+streams it is given — a member
 with an offloaded field on a schema without it is the `[EDD-9146]` defect, naming every such
 member and field, before the store check (a store doesn't make the key text right). `Table.make`
 binds nothing and checks nothing. An unbound write is refused where it routes (§11.10, 1): a
@@ -2651,13 +2673,13 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9115` | `DynamoClient.ts`, `EventStore.ts`, `GeoIndex.ts` (geo), `BlobGc.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`) | A member with an offloaded field is bound (`DynamoClient.make`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `Entity.bind`, `Aggregate.bind`, `BlobGc.make`), or an unbound stream or `EventStore.processBatch` / `runChangeFeed` runs its first operation, with no `BlobStore` resolvable |
 | `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, S3 store options with an unknown key, both `client` and `clientConfig`, or an invalid `client`, `serverSideEncryption`, `storageClass`, `notFoundRetry` or `presign` (*commit 15*), or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts`, `internal/EventProjection.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key — on a read, or a projection's `offloaded` (at definition) — or `.offloaded()` after `.filterBy()` |
-| `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
+| `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: an unknown option; a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member that is not an effect-dynamodb entity / aggregate / stream, is not registered on a table, or has no offloaded fields; an aggregate and a stream sharing a name; no member; or, at a call, an unknown member name, invalid `sweepStore` or `reap` options (a `table` that is not a name or a DynamoDB table or stream ARN), a `reap` record whose table contradicts the `table` option or itself (`eventSourceARN` against `tableName`), or names none while the collector's members are on several tables, or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) — all defects |
 | `EDD-9119` | `internal/OffloadChange.ts` (`recordImages`, shared by the reaper and `decodeStreamRecord`), `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is present and not `NEW_AND_OLD_IMAGES`, or — whatever its view type — a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
 | `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream`, handle or source for an aggregate edge (or an `OffloadedValue` for its overflow field); or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
 | `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty printable US-ASCII string ≤ 255 bytes |
 | `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, a GSI's `shards.by` source, `timeSeries.orderBy`), a unique-constraint field, a ref field, the entity's identifier, a vector index source, partition or filter field, or an aggregate discriminator / `many` sort-key composite. (An aggregate's list and collection composites are root fields, and a root model takes no `configure`, so none can be `External`: there is nothing to check there.) |
 | `EDD-9143` | `Entity.ts` (schema), `Aggregate.ts` | A ref (entity ref, aggregate ref edge, or the ref a `many` edge's element wraps — `PlayerSheet { player }`, which hydration fills by name — at any depth) whose schema includes a field the referenced entity offloads — the denormalised copy would inline it (400 KB risk), need to marshal a lazy handle, or copy a pointer across item families (§11.2). Reference a subset model without the field |
-| `EDD-9146` | `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts`, `GeoIndex.ts` (geo), `internal/OffloadWrite.ts` (`route`), `internal/Rekey.ts` | A member with an offloaded field on a table whose schema doesn't set `escapeKeys: true`: bound (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, the streams given to `rekey`) — a defect naming every such member and field; or written unbound — a `ValidationError` from the routing, nothing uploaded or sent. Also `rekey` about to move a row that holds a blob pointer — a `ValidationError` naming the row's key, nothing written (only after `escapeKeys` was turned off over rows offloading wrote, §11.10) |
+| `EDD-9146` | `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts`, `GeoIndex.ts` (geo), `BlobGc.ts` (`make`), `internal/OffloadWrite.ts` (`route`), `internal/Rekey.ts` | A member with an offloaded field on a table whose schema doesn't set `escapeKeys: true`: bound (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `BlobGc.make`, the streams given to `rekey`) — a defect naming every such member and field; or written unbound — a `ValidationError` from the routing, nothing uploaded or sent. Also `rekey` about to move a row that holds a blob pointer — a `ValidationError` naming the row's key, nothing written (only after `escapeKeys` was turned off over rows offloading wrote, §11.10) |
 
 **Extended, not new:** `EDD-9076` (expressions / projections) and `EDD-9077` (update ops) now
 also cover `External` binary fields — the same condition (an attribute DynamoDB sees as one
@@ -2903,25 +2925,32 @@ in-doubt outcomes are **kept and reported**:
     segment) — every holder found, no sibling's version freed;
   - **table-local**: a second table holding copies of the first table's pointers — its reaper,
     sweeps and purge never delete them (`foreign`), and the first table's GC ignores the copy;
+    one collector covering both tables reads each record only as its own table's members
+    (`eventSourceARN`, `tableName` or `reap`'s `table`; a record naming no table refused), and
+    a collector fed another table's records skips them;
   - **every-record view check**: a batch whose first record is an `INSERT` and whose later
     `MODIFY` lacks `OldImage` dies before any delete;
   - duplicate and reordered records;
-  - grace waiting (`TestClock`); the 15-minute default;
+  - grace waiting (`TestClock`); the 15-minute default; record times in seconds, milliseconds
+    and microseconds (Kinesis `ApproximateCreationDateTimePrecision`), a future time as now;
   - the per-item sweep, two passes (`TestClock`): referenced kept; unreferenced younger than
     `maxUploadAge` + 15 minutes kept unmarked; older marked, kept; marked less than the grace
     ago kept; marked at least the grace ago deleted; a last version with no successor is not
     deleted on the first pass; key-per-write mode; own older-prefix versions listed, foreign
-    pointers never listed;
-  - `gc.sweepStore`: own families swept; a foreign table's family and an unconfigured entity's
-    family skipped; a version without `edd-item` reported unattributable; `startAfter` and
-    `maxFamilies` resume;
+    pointers never listed; versions held only by a snapshot (segmented or legacy), a
+    tombstone or a time-series event kept; a busy family or aggregate partition left alone;
+  - `gc.sweepStore`: own families swept — entity, time-series (event-keyed objects),
+    aggregate edge and stream; a foreign table's family and an unconfigured entity's family
+    skipped; a version without `edd-item` reported unattributable; `startAfter` and
+    `maxFamilies` resume; a member prefix with a 32-hex-character segment;
   - `EDD-9118` for a sweep grace under `maxUploadAge` + 15 minutes and for stores without
     `list` / `marks` / `head`.
 - **Purge** (`test/Entity.purge.offload.test.ts`): versions are deleted only after every
   DynamoDB delete succeeded; a partial purge leaves the store untouched; a **concurrent
   `create` and a concurrent time-series `append`** between the row deletes and the store step
   keep their new versions (re-read finds them; young unnamed versions are left for the sweep);
-  on a store without `list`, only versions the purged rows named are deleted.
+  a re-read that never settles leaves every version to the sweep; on a store without `list`,
+  only versions the purged rows named are deleted.
 - **Aggregates** (`test/Aggregate.offload.test.ts`):
   - an unchanged group uploads nothing (diff before upload);
   - a changed group re-uploads its offloaded fields (no read-pointer reuse);
@@ -4379,6 +4408,170 @@ a write path, deletes the gate.
     `sweepStore`, purge integration, `EDD-9118` / `9119`; `test/Offload.interleaving.test.ts`
     (§19, moved from commit 9): the unique-constraint and aggregate-edge interleavings, which
     need the reaper.
+    *Implementation notes (commit 16):*
+    - `src/BlobGc.ts` is the public module (`BlobGc` in the barrel): `make({ entities?,
+      aggregates?, streams?, reaper?: { gracePeriod?, confirm? }, sweep?: { gracePeriod? } })`
+      (`Effect<Collector, never, DynamoClient | TableConfig>`) resolves the `BlobStore`
+      (`[EDD-9115]` without one, through the context as `serviceOption` would), the
+      `DynamoClient` and each member's table name once; the `Collector`'s `reap`, `sweep`,
+      `sweepPartition` and `sweepStore` have no requirements (the captured context is
+      detached from any caller's capacity collector and provided back, as bound clients do),
+      each under `Capacity.operation` / `operationStream` (`BlobGc.reap`, `BlobGc.sweep`,
+      `BlobGc.sweepPartition`, `BlobGc.sweepStore`) — rows of `consumed-capacity.md` §9.1,
+      each driven by `test/ConsumedCapacity.coverage.test.ts`. `ReapReport`, `SweepReport`,
+      `StoreSweepFamily`, `SweepStoreOptions`, `ConfirmMode` and `GcError` are §11's shapes.
+    - `src/internal/GcSupport.ts` holds what the collector and `purge` share: ownership by
+      `P/F` segment under any leading prefix, pointer recognition on any stored form (`B`
+      bytes or base64, the `~edbp:` text of §4.2 — `internal/StoredPointer.ts`, the one reader
+      `StorageEncoding.pointer` uses too; its listings run through `BlobCalls.callStream`, whose
+      target is now `{ key?, ref? }` like `call`'s, so a list span carries the same attributes
+      as every other store call), the bracketed `confirmRead` (3 attempts,
+      `Option.none()` when the live row never settles), the two-pass `sweepVersions`, purge's
+      `purgeVersions`, and each member kind's support record. `Entity.ts`, `Aggregate.ts` and
+      `EventStore.ts` build their record inside their closures (where the key composers and
+      the history-key helpers live) and expose it under a `Symbol.for` key, non-enumerable on
+      entities: no public type changes. An entity's `readFamily` runs §11.2's ranges as
+      strongly consistent paginated queries with purge's classification; a pure definition
+      (`@effect-dynamodb/schema`'s `Entity.make`) is promoted by `BlobGc.make`, as
+      `DynamoClient.make` promotes it.
+    - **Reaper.** Every record is checked first (`recordImages`, `[EDD-9119]` as a defect before
+      any delete). Each record is tied to the table it came from — its `eventSourceARN`
+      (Lambda, Pipes; a DynamoDB table or stream ARN's name part) or `tableName` (Kinesis
+      Data Streams), else `reap(records, { table })` (a name or a table / stream ARN, such as
+      the change feed's `batch.streamArn`), else the collector's one table; a contradiction,
+      or no table while the members are on several, is `[EDD-9118]` before any delete — and
+      is read by every member **on that table** whose type it carries (entity type, aggregate
+      edge type, a stream's event / snapshot type). The table matters: ownership is computed
+      from the member's own table and the record's keys, so a copy's record read as the
+      source's member would make the copy's pointers (the source's versions) look own, and
+      the source's live row would then read `NotFound`. The interpretations merge: skip wins,
+      confirm beats direct, a pointer is foreign only when no member owns it. The grace is
+      waited once, from the newest candidate record (`ApproximateCreationDateTime` as a
+      `Date`; a number in the unit `ApproximateCreationDateTimePrecision` names — Kinesis'
+      `MILLISECOND` / `MICROSECOND` — else by magnitude: epoch seconds, as the Streams API and
+      Lambda give it, below `1e11`, milliseconds below `1e14`, microseconds above; absent →
+      now; never later than now, so a malformed time cannot stall the batch). Confirm-reads
+      run once per item family per call; a busy family's candidates count as `retained`,
+      logged at `Warning`. One `store.delete` per call.
+    - **Sweeps.** `gc.sweep(name, key)` (an entity member) and `gc.sweepPartition(name, key)` (an
+      aggregate's key, a stream's id) take the member's **name** in `make`, so the collector
+      can name it in reports and `sweepStore`'s `member`. The capabilities are checked at the
+      call (`[EDD-9118]`, a defect): `list` and `marks`; `sweepStore` also `head`. An aggregate
+      partition is read twice, strongly consistently, and the reads compared (up to three
+      attempts) — the partition has no single live row to bracket on, and aggregate writes
+      are transactions over the partition; an EventStore partition is read once (its rows
+      never gain a holder: events are immutable and the snapshot row is rewritten in place).
+      An aggregate partition sweep lists the partition's own prefixes (`<prefix>P/`, every
+      edge family in it, under each edge entity's prefix) and decides against the partition's
+      references; a stream's lists its stream family. `sweepStore` reads an
+      aggregate edge family with a consistent `GetItem` of the edge row.
+    - **`sweepStore`** lists the roots (the store prefix and every member's `offload.prefix`,
+      reduced to the minimal set, in UTF-8 order), groups adjacent versions by family
+      (`…P/F/`), `head`s one version, parses its metadata (§4.6) and attributes it: metadata
+      the library did not write → `Foreign` with no table; another table or no member of that
+      type → `Foreign` naming the table; no row key → `Unattributable`; a row key whose own
+      `P/F` is not the listed prefix → `Foreign`. A key's `P/F/O` is read right after the
+      longest known prefix (the store's or a member's `offload.prefix`) it starts with, so a
+      prefix with a 32-hex-character segment of its own is not taken for `P`; a key under an
+      earlier, unknown prefix is read at its first `P/F/O`. A time-series event row is attributed to its
+      current item through the event marker; an EventStore row to the stream family
+      (`STREAM_FAMILY_SK`). Non-library keys under a root (no `P/F/` shape) are passed over.
+      `startAfter: familyPrefix` resumes at `…P/F0` (the first key after the family);
+      `maxFamilies` bounds the stream.
+    - **Purge** (`Entity.purge`): with an offloading entity it resolves the store
+      (`serviceOption`) before deleting anything — none is a `BlobStoreError` `NotProvided`
+      with no row touched — projects the offloaded attributes, and once every batch delete
+      succeeded runs §11.6: a bracketed re-read of every range, then `purgeVersions` over the
+      own prefixes (current plus the leading prefixes the purged pointers name). A busy re-read
+      leaves the versions to the sweep (logged). Without `list` it deletes the named versions
+      not re-referenced.
+    - **Tests.** `test/BlobGc.test.ts` (37): the free rules per member (plain direct with no
+      reads; an aggregate edge of a `retain` entity direct; a `retain` live-row `MODIFY` skipped
+      and its snapshot's TTL expiry confirmed; `softDelete` tombstone and restore; time-series
+      event expiry, append and `.update()`; EventStore snapshot direct, events skipped;
+      `confirm: "always"`), the bracket (a restore committing mid-read retried, a churning
+      family `busy`, disjoint sort-key ranges with a legacy unsegmented snapshot),
+      `[EDD-9119]` before any delete, duplicates and reordering, the default grace on the
+      `TestClock`, record times (epoch seconds; Kinesis `MICROSECOND` / `MILLISECOND`
+      precision and microseconds by magnitude; a future time counting as now),
+      table-locality (a copy table's pointers foreign; one collector over a table and its
+      copy reading each record only as its table's members — by `eventSourceARN`, `tableName`
+      or the `table` option, a record naming no table refused, contradictions refused; a
+      collector fed another table's records skipping them), the two-pass sweep (also
+      key-per-write and an earlier prefix), sweeps keeping history-held versions (`retain` +
+      `softDelete` with sort-key composites: a legacy snapshot, a segmented snapshot and a
+      tombstone each the only holder; `retain` without sort-key composites; time-series
+      events), a busy sweep (nothing listed, logged), aggregate partition sweeps (orphans; a
+      write between the two reads re-read; a churning partition `busy`) and stream partition
+      sweeps, `sweepStore`'s four outcomes, `startAfter` / `maxFamilies`, its time-series
+      (event-keyed objects), aggregate-edge and stream families, and a member prefix with a
+      32-hex-character segment, and the `[EDD-9118]` (including stores without `list`,
+      `marks` or `head` for each sweep) / `[EDD-9115]` checks.
+      `test/Entity.purge.offload.test.ts` (7): the store touched only after every row delete,
+      a partial purge leaving the store untouched, a racing create's upload kept, old unnamed
+      versions deleted while a racing append's is kept, a writer churning the re-created live
+      row leaving every version to the sweep (logged), a store without `list`, and no store.
+      `test/Offload.interleaving.test.ts` (4): §19.2's interleavings, below.
+    - **Interleavings** (§19.2), scripted with the in-memory tables' one-shot effect hooks
+      (after a `GetItem`, after a `Query`) and the memory store's `failures` hook (before a
+      `put`): an unversioned, unique-constrained update that names the field uploads its own
+      version after writer B replaced it and the reaper freed `V1`; the same update carrying
+      `V1` through the wide (whole-item `Put`) fallback is refused by its guard
+      (`ConcurrentModification` naming the offloaded attribute); an aggregate update whose read
+      version is freed before its eager decode fails `NotFound` and writes nothing; one whose
+      version is freed after the decode commits its own re-upload of the changed group (never
+      `V1`), and the reaper then frees what it superseded.
+    *Deviations (commit 16):*
+    - **Holders are whole rows, every attribute.** §11.2 has the family read project keys and
+      offloaded attributes. A projection would miss a pointer held by an attribute that is no
+      longer configured offloaded (§4.7: `external` switched off, existing pointers still
+      decoding), and a sweep would delete the version it names. Rows are read whole and a
+      pointer on any top-level attribute counts as a holder; a query's read units are charged
+      on item size whatever the projection, so this costs only transfer. (Purge's own delete
+      projection adds the offloaded attributes, as §11.6 says: it names `N` from them.)
+    - **`SweepReport` gains `busy: boolean`.** §11.4's bracket can fail to settle; the report
+      had no way to say so. A busy sweep lists, marks and deletes nothing.
+    - **The default sweep grace is the larger of 24 hours and `maxUploadAge` + 15 minutes.**
+      §11.4's 24-hour default is itself invalid on a store whose `maxUploadAge` exceeds 23 h
+      45 min (up to 7 days), so a collector built with defaults would fail `[EDD-9118]`.
+    - **Partition sweeps bracket by double read** (aggregates; above), not by the live-row
+      `GetItem`s §11.4 names: an aggregate partition has no single live row, and an
+      EventStore partition needs no bracket.
+    - **`[EDD-9118]` covers more** than its registry row listed: unknown option keys, a member
+      that is not an effect-dynamodb member or not registered on a table, an aggregate and a
+      stream sharing a name (`sweepPartition` takes one name), no member at all, an unknown
+      member name at a call, and invalid `sweepStore` options. All are defects, as the row says.
+    - **Aggregate edge interleaving: last writer wins.** §19.2 says "the changed group
+      re-uploads"; it does, and the aggregate update then commits over writer B's change (its
+      edge write has no optimistic condition, as before #179). The invariant the test asserts
+      is §6.4's — the row is never re-pointed at the freed version — and B's superseded version
+      is freed by the reaper from A's record.
+    - **The aggregate-edge interleaving has two aggregate writers.** Commit 11's follow-up
+      asked for an aggregate update against an *edge-entity* write on the same S3 keys. That
+      cannot happen: an edge item carries its own `__edd_e__` (`MatchVenue`) and the
+      aggregate's partition key, while the edge entity's own writes (`Venues`) key under its
+      own type and partition, so they never touch the edge items' keys. The interleaving is
+      tested with two aggregate writers of the same edge.
+    - **`reap` ties each record to its table** (`reap(records, { table? })`, and
+      `StreamRecordLike` gains `eventSourceARN`, `tableName` and
+      `dynamodb.ApproximateCreationDateTimePrecision`, all optional and structural). §11.3 did
+      not say how a record is matched to a member's table, and matching by type alone lets a
+      collector covering a table and its copy — or fed another table's records — free the
+      source's live versions from the copy's records (§11.2). Records that name no table are
+      taken for the collector's one table, or refused (`[EDD-9118]`) when it has several.
+    *Debt fixed (commit 16):*
+    - UTF-8 key order had four copies: `internal/WriteDiagnosis.ts`'s `compareUtf8` (encoding
+      both strings on every comparison), `internal/RangePlanner.ts`'s (#171, non-allocating),
+      `internal/ConditionHolds.ts`'s byte comparison, and the in-memory store's, from which
+      `BlobGc` imported. One copy now lives in `internal/Utf8Order.ts` (`compareUtf8`,
+      `compareBytes`), runtime-neutral so the memory store's import graph stays free of the
+      AWS SDK (`BlobStore.test.ts`); the range planner (which re-exports it), write diagnosis,
+      condition evaluation, the memory store, `BlobGc` and the S3 stub all use it.
+    - `test/helpers/InMemoryTables.ts` never returned the stored item on a rejected condition.
+      On 1.42.2 it answers through `test/helpers/DynamoExpressions.ts`, which does (`ALL_OLD`
+      on `PutItem` / `UpdateItem` / `DeleteItem` failures and in `TransactWriteItems`
+      cancellation reasons); it gains `BatchWriteItem` (through the same model) and one-shot
+      effect hooks after a `GetItem` / `Query`.
 17. **End-to-end connected** — `connected.blob-offload.test.ts`.
 18. **Docs** — the §20 table: the new guide and its sidebar entry, the example, the guide and
     tutorial updates, `api-reference.mdx` (including the `PackedConfig | ExternalPackedConfig`

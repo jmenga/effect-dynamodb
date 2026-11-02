@@ -99,19 +99,35 @@ export type StoredAttributeValue = {
 export type RecordImage = { readonly [attribute: string]: unknown }
 
 /**
- * A DynamoDB Streams record — only the members change detection reads.
- * Structural: the SDK's `_Record` (the change feed's records), a Lambda
- * `DynamoDBRecord` and an EventBridge Pipes record all fit.
+ * A DynamoDB Streams record — only the members change detection and the
+ * blob reaper read. Structural: the SDK's `_Record` (the change feed's
+ * records), a Lambda `DynamoDBRecord`, an EventBridge Pipes record and a
+ * Kinesis Data Streams for DynamoDB record all fit.
  */
 export interface StreamRecordLike {
   readonly eventName?: string | undefined
+  /**
+   * The ARN of the stream the record was read from
+   * (`arn:…:dynamodb:…:table/<name>/stream/<label>`), as Lambda and
+   * EventBridge Pipes deliver it.
+   */
+  readonly eventSourceARN?: string | undefined
+  /** The table the record was written to, as a Kinesis Data Streams record carries it. */
+  readonly tableName?: string | undefined
   readonly dynamodb?:
     | {
         readonly Keys?: RecordImage | undefined
         readonly OldImage?: RecordImage | undefined
         readonly NewImage?: RecordImage | undefined
         readonly StreamViewType?: string | undefined
+        /**
+         * A `Date` (the SDK), epoch seconds (DynamoDB Streams JSON: Lambda,
+         * Pipes), or epoch milliseconds or microseconds (Kinesis Data
+         * Streams, per `ApproximateCreationDateTimePrecision`).
+         */
         readonly ApproximateCreationDateTime?: Date | number | undefined
+        /** `"MILLISECOND"` or `"MICROSECOND"`: a Kinesis Data Streams record's time unit. */
+        readonly ApproximateCreationDateTimePrecision?: string | undefined
       }
     | undefined
 }

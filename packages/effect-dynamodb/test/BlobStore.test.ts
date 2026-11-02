@@ -36,7 +36,7 @@ import {
 import * as Barrel from "../src/index.js"
 import { build as buildMetadata } from "../src/internal/BlobMetadata.js"
 import { MAX_KEY_SUFFIX_BYTES } from "../src/internal/BlobStoreContract.js"
-import { compareUtf8 } from "../src/internal/MemoryBlobStore.js"
+import { compareUtf8 } from "../src/internal/Utf8Order.js"
 
 const bytesOf = (text: string): Uint8Array => new TextEncoder().encode(text)
 

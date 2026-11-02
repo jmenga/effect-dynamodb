@@ -219,7 +219,7 @@ const getRange = (
   range: ByteRange,
 ): Effect.Effect<Uint8Array, BlobStoreError> =>
   Effect.map(
-    Stream.runCollect(callStream(store, "get", ctx, ref, () => store.get(ref, { range }))),
+    Stream.runCollect(callStream(store, "get", ctx, { ref }, () => store.get(ref, { range }))),
     (chunks) => concat(chunks),
   )
 
@@ -236,7 +236,7 @@ const getObject = (
   Effect.suspend(() => {
     const chunks: Array<Uint8Array> = []
     let size = 0
-    return callStream(store, "get", ctx, pointer.ref, () => store.get(pointer.ref)).pipe(
+    return callStream(store, "get", ctx, { ref: pointer.ref }, () => store.get(pointer.ref)).pipe(
       Stream.runForEach((chunk) => {
         size += chunk.length
         if (size > pointer.objectSize) {
@@ -414,7 +414,7 @@ const verifiedStream = (
   Stream.suspend(() => {
     const hasher = makeCrc64nvme()
     let size = 0
-    return callStream(store, "get", ctx, pointer.ref, () => store.get(pointer.ref)).pipe(
+    return callStream(store, "get", ctx, { ref: pointer.ref }, () => store.get(pointer.ref)).pipe(
       Stream.map((chunk) => {
         hasher.update(chunk)
         size += chunk.length
@@ -507,7 +507,9 @@ const lazyBinary = (env: Environment, pending: PendingBlob, ctx: BlobCallContext
       if (store === undefined) return Stream.fail(notProvided(readCtx, "get", pointer.ref))
       return range === undefined
         ? verifiedStream(store, pointer, readCtx)
-        : callStream(store, "get", readCtx, pointer.ref, () => store.get(pointer.ref, { range }))
+        : callStream(store, "get", readCtx, { ref: pointer.ref }, () =>
+            store.get(pointer.ref, { range }),
+          )
     },
     presignedUrl: (options) => presignedUrl(store, pointer.ref, readCtx, options?.expiresIn),
   })

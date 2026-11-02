@@ -52,10 +52,7 @@ import type { ExternalPackedConfig, PackedConfig } from "@effect-dynamodb/schema
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   type BlobPointer,
-  decode as decodePointer,
-  decodeText as decodePointerText,
   isBlobPointer,
-  isPointerHeader,
   isPointerText,
 } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import {
@@ -65,8 +62,7 @@ import {
   unpackStoredSync,
   unresolvedPointer,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Effect, Option, Result, Schema } from "effect"
-import { Base64 } from "effect/encoding"
+import { Effect, type Option, Schema } from "effect"
 import { EAGER_MODES, makePendingBlob, resolveAll } from "./internal/BlobResolver.js"
 import {
   attributeBytes,
@@ -82,6 +78,7 @@ import {
   toBytesSync,
   withRegistry,
 } from "./internal/Packed.js"
+import { storedPointer } from "./internal/StoredPointer.js"
 import { toAttributeValue } from "./Marshaller.js"
 
 export type { BlobChecksum, BlobRef } from "@effect-dynamodb/schema/internal/BlobPointer.js"
@@ -365,43 +362,7 @@ export const decodeUnmarshalledSync = (stored: unknown, options?: SyncOptions): 
  */
 export const pointer = (
   stored: AttributeValue | { readonly B: string } | Uint8Array | string,
-): Option.Option<BlobPointer> => {
-  if (typeof stored === "string") {
-    if (isPointerText(stored)) return textPointer(stored)
-    // Base64 of a `B` value (an unmarshalled stream image's), else JSON text.
-    return isBase64PackedText(stored) ? base64Pointer(stored) : Option.none()
-  }
-  if (stored instanceof Uint8Array) return bytesPointer(stored)
-  if (typeof stored !== "object" || stored === null) return Option.none()
-  const text = (stored as { readonly S?: unknown }).S
-  if (typeof text === "string") return textPointer(text)
-  const bytes = (stored as { readonly B?: unknown }).B
-  if (bytes instanceof Uint8Array) return bytesPointer(bytes)
-  return typeof bytes === "string" ? base64Pointer(bytes) : Option.none()
-}
-
-/** A `B` value given as base64 text: its json pointer. */
-const base64Pointer = (text: string): Option.Option<BlobPointer> => {
-  const decoded = Base64.decode(text)
-  return Result.isSuccess(decoded) ? bytesPointer(decoded.success) : Option.none()
-}
-
-/** A layout-`010` `B` value's json pointer. */
-const bytesPointer = (bytes: Uint8Array): Option.Option<BlobPointer> => {
-  if (bytes.length === 0 || !isPointerHeader(bytes[0]!)) return Option.none()
-  const decoded = decodePointer(bytes)
-  return typeof decoded !== "string" && decoded.kind === "json"
-    ? Option.some(decoded)
-    : Option.none()
-}
-
-/** A binary field's `~edbp:` bytes pointer. */
-const textPointer = (text: string): Option.Option<BlobPointer> => {
-  const decoded = decodePointerText(text)
-  return decoded !== undefined && typeof decoded !== "string" && decoded.kind === "bytes"
-    ? Option.some(decoded)
-    : Option.none()
-}
+): Option.Option<BlobPointer> => storedPointer(stored)
 
 /**
  * The DynamoDB size, in bytes, of a value's attribute **value** as stored

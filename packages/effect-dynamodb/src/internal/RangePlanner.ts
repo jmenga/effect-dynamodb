@@ -49,6 +49,7 @@ import { SORT_KEY_MAX } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { KeyCondition, KeyValue, PlanMode, QueryExplain, ZOrderOptions } from "../Query.js"
 import * as Cursor from "./Cursor.js"
 import { compileExpr, type Expr } from "./Expr.js"
+import { compareBytes, compareUtf8 } from "./Utf8Order.js"
 
 // ---------------------------------------------------------------------------
 // Steps and positions (§9.1)
@@ -185,37 +186,8 @@ export const KEY_MAX = SORT_KEY_MAX
 
 const encoder = new TextEncoder()
 
-const compareBytes = (a: Uint8Array, b: Uint8Array): number => {
-  const n = Math.min(a.length, b.length)
-  for (let i = 0; i < n; i++) {
-    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1
-  }
-  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1
-}
-
-/**
- * Order two key values as DynamoDB does: by UTF-8 bytes. For text that is
- * code point order, which JS string comparison (UTF-16 code units) is not
- * above U+FFFF — so it is never used for keys.
- */
-export const compareUtf8 = (a: KeyValue, b: KeyValue): number => {
-  if (typeof a !== "string" || typeof b !== "string") {
-    return compareBytes(
-      typeof a === "string" ? encoder.encode(a) : a,
-      typeof b === "string" ? encoder.encode(b) : b,
-    )
-  }
-  let i = 0
-  let j = 0
-  while (i < a.length && j < b.length) {
-    const x = a.codePointAt(i)!
-    const y = b.codePointAt(j)!
-    if (x !== y) return x < y ? -1 : 1
-    i += x > 0xffff ? 2 : 1
-    j += y > 0xffff ? 2 : 1
-  }
-  return i < a.length ? 1 : j < b.length ? -1 : 0
-}
+/** Key values in DynamoDB's order (`internal/Utf8Order.ts`, shared with the blob store). */
+export { compareUtf8 }
 
 /**
  * The highest code point: above every character a key can hold but itself.

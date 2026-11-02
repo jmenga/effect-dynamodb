@@ -156,6 +156,7 @@ import {
   type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
+import * as GcSupport from "./internal/GcSupport.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
 import { isBlobSource } from "./internal/OffloadInput.js"
 import * as OffloadRead from "./internal/OffloadRead.js"
@@ -5719,7 +5720,42 @@ const makeAggregate = <TSchema extends Schema.Top>(
     finish: rekeyFinish,
   }
 
-  return Rekey.carry(
+  /**
+   * What `BlobGc` reads of the aggregate (#179, design §11): its edge items
+   * live in one base-table partition, keyed `pk.field` / `sk` (the collection
+   * index, when there is one, is a local index of that partition). The
+   * partition is the current key's: a row under a 1.36 key never holds a
+   * pointer (design §11.10).
+   */
+  const gcSupport: GcSupport.AggregateGcSupport = {
+    kind: "aggregate",
+    name: aggregateName,
+    tableTag: () => config.table.Tag,
+    pkField: config.pk.field,
+    skField: "sk",
+    edges: offloadInfoByType,
+    ownsPartition: (pk) =>
+      config.pk.composite.length === 0 ? pk === partitionHead : pk.startsWith(`${partitionHead}#`),
+    partitionOfKey: (key, operation) =>
+      Effect.try({
+        try: () => {
+          if (typeof key !== "object" || key === null) {
+            throw new Error(`An aggregate key must be an object, got ${typeof key}`)
+          }
+          return composeCollectionKey(
+            config.schema,
+            config.collection.name,
+            KeyComposer.extractComposites(
+              config.pk.composite,
+              keyRecord(key as Record<string, unknown>),
+            ),
+          )
+        },
+        catch: (cause) => new ValidationError({ entityType: aggregateName, operation, cause }),
+      }),
+  }
+
+  const aggregate = Rekey.carry(
     rekeyHandler,
     withOperations<RuntimeAggregate<TSchema>>(aggregateName, {
       [TypeId]: TypeId,
@@ -6202,6 +6238,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }),
     }),
   )
+  // Hidden, not part of the aggregate's type.
+  Object.defineProperty(aggregate, GcSupport.GcSupportId, { value: gcSupport, enumerable: false })
+  return aggregate
 }
 
 /**

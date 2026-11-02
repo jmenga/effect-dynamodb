@@ -58,6 +58,7 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import type { RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
 import { keyValueOf, refIdAttribute } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
+import type { BlobRef } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import {
   compositeKeyFormKind,
   keyFormValueKind,
@@ -126,6 +127,7 @@ import type {
 import { deriveSourceText } from "@effect-dynamodb/schema/VectorIndex.js"
 import {
   Cause,
+  Clock,
   Context,
   Data,
   DateTime,
@@ -142,10 +144,12 @@ import {
 } from "effect"
 import { SecureRandom } from "effect/crypto"
 import { BlobStore } from "./BlobStore.js"
-import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
+import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
+import { blobError } from "./internal/BlobCalls.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
+import type { BlobStoreService } from "./internal/BlobStoreContract.js"
 import {
   isBoundOp,
   makeBoundAppend,
@@ -194,6 +198,7 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
+import * as GcSupport from "./internal/GcSupport.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
@@ -9187,6 +9192,220 @@ const makeImpl = <
       keyForm(encodedKey as globalThis.Record<string, unknown>),
     )
 
+  // ---------------------------------------------------------------------------
+  // Garbage collection (#179, design §11): how `BlobGc` and `purge` read this
+  // entity's item families — see `internal/GcSupport.ts`.
+  // ---------------------------------------------------------------------------
+
+  /** `EntityGcSupport.liveSkOfRow`: the live SK the row's sort-key composites compose. */
+  const gcLiveSkOfRow = (row: Readonly<globalThis.Record<string, unknown>>): string | undefined => {
+    try {
+      // The whole row: a ref's id in the sort key is read from the ref it stores (`toDomainView`),
+      // never from a top-level attribute the row doesn't hold.
+      return liveSkOf(toDomainView(row as globalThis.Record<string, unknown>))
+    } catch {
+      return undefined
+    }
+  }
+
+  /** `EntityGcSupport.liveSkCandidates`: the row SK, and its prefix before each event marker. */
+  const gcLiveSkCandidates = (rowSk: string): ReadonlyArray<string> => {
+    const marker = KeyComposer.composeEventSkPrefix("", schema.casing)
+    const candidates = [rowSk]
+    for (let at = rowSk.indexOf(marker); at >= 0; at = rowSk.indexOf(marker, at + 1)) {
+      candidates.push(rowSk.slice(0, at))
+    }
+    return candidates
+  }
+
+  /** `EntityGcSupport.familyOfKey`: the partition and live SK of a caller's key. */
+  const gcFamilyOfKey = (
+    key: unknown,
+    operation: string,
+  ): Effect.Effect<GcSupport.EntityFamily, ValidationError> =>
+    Effect.map(encodeKey(key, operation), (encoded) => ({
+      pk: KeyComposer.composePk(schema, entityType, config.indexes.primary, keyForm(encoded)),
+      liveSk: liveSkOf(encoded),
+    }))
+
+  /**
+   * `EntityGcSupport.readFamily`: the item family's rows in `ranges` (design
+   * §11.2), each range one strongly consistent query, classified as `purge`
+   * classifies them — this entity's type, the live row and the events under
+   * it, the item's own history, and unsegmented history whose composites
+   * compose the item's live key. Without sort-key composites the partition
+   * holds one item: its rows of this type, whatever the ranges.
+   */
+  const gcReadFamily = (
+    client: DynamoClientService,
+    tableName: string,
+    family: GcSupport.EntityFamily,
+    ranges: ReadonlySet<GcSupport.FamilyRange>,
+  ): Effect.Effect<ReadonlyArray<globalThis.Record<string, AttributeValue>>, DynamoClientError> =>
+    Effect.gen(function* () {
+      const primary = config.indexes.primary
+      const rows: Array<globalThis.Record<string, AttributeValue>> = []
+      const read = (
+        condition:
+          | {
+              readonly expression: string
+              readonly values: globalThis.Record<string, AttributeValue>
+            }
+          | undefined,
+        keep: (row: globalThis.Record<string, AttributeValue>, sk: string) => boolean,
+      ) =>
+        Effect.gen(function* () {
+          let start: globalThis.Record<string, AttributeValue> | undefined
+          do {
+            const result = yield* client.query({
+              TableName: tableName,
+              KeyConditionExpression:
+                condition === undefined ? "#pk = :pk" : `#pk = :pk AND ${condition.expression}`,
+              ExpressionAttributeNames:
+                condition === undefined
+                  ? { "#pk": primary.pk.field }
+                  : { "#pk": primary.pk.field, "#sk": primary.sk.field },
+              ExpressionAttributeValues: { ":pk": { S: family.pk }, ...condition?.values },
+              ConsistentRead: true,
+              ExclusiveStartKey: start,
+            })
+            for (const row of (result.Items ?? []) as Array<
+              globalThis.Record<string, AttributeValue>
+            >) {
+              const sk = row[primary.sk.field]?.S
+              if (row.__edd_e__?.S !== entityType || sk === undefined || !keep(row, sk)) continue
+              rows.push(row)
+            }
+            start = result.LastEvaluatedKey as globalThis.Record<string, AttributeValue> | undefined
+          } while (start !== undefined)
+        })
+      if (!hasItemHistory) {
+        yield* read(undefined, () => true)
+        return rows
+      }
+      const { liveSk } = family
+      const history = historyKeyOptions(liveSk)
+      const beginsWith = (prefix: string) => ({
+        expression: "begins_with(#sk, :prefix)",
+        values: { ":prefix": { S: prefix } },
+      })
+      if (ranges.has("live")) {
+        yield* read(beginsWith(liveSk), (_, sk) => sk === liveSk || sk.startsWith(`${liveSk}#`))
+      }
+      if (ranges.has("snapshots")) {
+        yield* read(
+          beginsWith(DynamoSchema.composeVersionKeyPrefix(schema, entityType, history)),
+          () => true,
+        )
+      }
+      if (ranges.has("tombstones")) {
+        yield* read(
+          beginsWith(DynamoSchema.composeDeletedKeyPrefix(schema, entityType, history)),
+          () => true,
+        )
+      }
+      for (const [range, prefix] of [
+        ["legacySnapshots", DynamoSchema.composeVersionKeyPrefix(schema, entityType)],
+        ["legacyTombstones", DynamoSchema.composeDeletedKeyPrefix(schema, entityType)],
+      ] as const) {
+        if (!ranges.has(range)) continue
+        // Unsegmented history ends in a version or timestamp, which starts
+        // with a digit: the range bounds it (as `legacyHistory` reads it).
+        yield* read(
+          {
+            expression: "#sk BETWEEN :lo AND :hi",
+            values: { ":lo": { S: `${prefix}0` }, ":hi": { S: `${prefix}:` } },
+          },
+          (row, sk) => !sk.slice(prefix.length).includes("#") && isItemsRow(row, liveSk),
+        )
+      }
+      return rows
+    })
+
+  const gcSupport: GcSupport.EntityGcSupport = {
+    kind: "entity",
+    entityType,
+    tableTag: () => tableTag,
+    pkField: config.indexes.primary.pk.field,
+    skField: config.indexes.primary.sk.field,
+    offload: offloadInfo,
+    lifecycle: {
+      retain: isRetainEnabled(),
+      softDelete: isSoftDeleteEnabled(),
+      timeSeries: config.timeSeries !== undefined,
+    },
+    familyOfKey: gcFamilyOfKey,
+    liveSkOfRow: gcLiveSkOfRow,
+    liveSkCandidates: gcLiveSkCandidates,
+    readFamily: gcReadFamily,
+  }
+
+  /**
+   * Purge's store step (#179, design §11.6), once every DynamoDB delete of
+   * the item's rows succeeded: re-read the family (bracketed, every range),
+   * then delete each own version no row references that the purged rows
+   * named or that is too old to be in flight — a younger unnamed one may be
+   * the upload of a write racing the purge, left for the sweep. A family
+   * whose live row kept changing meanwhile is left to the sweep whole.
+   * Foreign pointers (another table's versions, §11.2) are never touched.
+   */
+  const purgeOffloaded = (args: {
+    readonly client: DynamoClientService
+    readonly store: BlobStoreService
+    readonly info: OffloadWrite.OffloadInfo
+    readonly tableName: string
+    readonly family: GcSupport.EntityFamily
+    readonly purged: ReadonlyArray<globalThis.Record<string, AttributeValue>>
+  }): Effect.Effect<void, DynamoClientError | BlobStoreError> =>
+    Effect.gen(function* () {
+      const { client, store, info, tableName, family } = args
+      const primary = config.indexes.primary
+      const segment = GcSupport.familySegment(tableName, { S: family.pk }, { S: family.liveSk })
+      const prefixes = new Set([`${info.prefix ?? store.prefix}${segment}`])
+      const named: Array<BlobRef> = []
+      for (const row of args.purged) {
+        for (const attribute of offloadedAttributeNames) {
+          const pointer = GcSupport.pointerOf(row[attribute])
+          if (pointer === undefined) continue
+          const leading = GcSupport.leadingPrefix(pointer.ref.key, segment, GcSupport.FAMILY_REST)
+          if (leading === undefined) continue
+          named.push(pointer.ref)
+          prefixes.add(`${leading}${segment}`)
+        }
+      }
+      const referenced = yield* GcSupport.confirmRead({
+        client,
+        table: tableName,
+        liveKey: {
+          [primary.pk.field]: { S: family.pk },
+          [primary.sk.field]: { S: family.liveSk },
+        },
+        readRows: gcReadFamily(client, tableName, family, GcSupport.ALL_RANGES),
+      })
+      if (Option.isNone(referenced)) {
+        return yield* Effect.logWarning(
+          `effect-dynamodb: purge of a ${entityType} item left its offloaded versions to the ` +
+            "sweep: the item's live row changed while the purge re-read its family " +
+            `(${GcSupport.CONFIRM_ATTEMPTS} attempts) — a writer is racing the purge.`,
+        ).pipe(Effect.annotateLogs({ table: tableName, pk: family.pk, sk: family.liveSk }))
+      }
+      const now = yield* Clock.currentTimeMillis
+      yield* GcSupport.purgeVersions({
+        store,
+        ctx: {
+          entityType,
+          attribute:
+            offloadedAttributeNames.length === 1 ? offloadedAttributeNames[0]! : "(several)",
+          operation: "Entity.purge",
+          committed: true,
+        },
+        named,
+        prefixes,
+        referenced: referenced.value,
+        now,
+      })
+    })
+
   /**
    * Build a version snapshot item: same PK, version SK, stripped GSI keys,
    * keeps __edd_e__ for entity type filtering.
@@ -17176,6 +17395,31 @@ const makeImpl = <
           // Caller key: Type side in, ENCODED out (see `encodeKey`).
           const encodedKey = yield* encodeKey(key, "purge.decode")
 
+          // An entity that offloads deletes the purged item's versions once
+          // its rows are gone (#179, design §11.6): without a store that step
+          // could not run, so the purge fails before deleting anything rather
+          // than leave the versions behind with no row to name them.
+          const store =
+            offloadInfo === undefined
+              ? undefined
+              : Option.getOrUndefined(yield* Effect.serviceOption(BlobStore))
+          if (offloadInfo !== undefined && store === undefined) {
+            return yield* blobError(
+              {
+                entityType,
+                attribute:
+                  offloadedAttributeNames.length === 1 ? offloadedAttributeNames[0]! : "(several)",
+                operation: "Entity.purge",
+              },
+              "delete",
+              "NotProvided",
+              undefined,
+              "no BlobStore is in context: purge deletes the item's offloaded versions after its " +
+                "rows, so provide one (DynamoClient.make({ blobStore }), BlobStore.layer, or the " +
+                "S3 store's layer) where the operation runs or the client is bound",
+            )
+          }
+
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const liveSk = liveSkOf(encodedKey)
@@ -17230,13 +17474,18 @@ const makeImpl = <
 
           // Query ALL items in this partition (current + versions + deleted).
           // Keys and entity type only — plus, with sort key composites, the
-          // composites that attribute an unsegmented history row to its item.
+          // composites that attribute an unsegmented history row to its item,
+          // and the offloaded attributes, whose pointers name the versions the
+          // store step deletes (#179).
           const projected: globalThis.Record<string, string> = { "#ent": "__edd_e__" }
           if (history !== undefined) {
             primary.sk.composite.forEach((attr, i) => {
               projected[`#c${i}`] = resolveDbName(attr)
             })
           }
+          offloadedAttributeNames.forEach((attr, i) => {
+            projected[`#o${i}`] = attr
+          })
           let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
 
           do {
@@ -17407,6 +17656,22 @@ const makeImpl = <
               yield* Effect.sleep(`${BASE_DELAY_MS * 2 ** (retries - 1)} millis`)
               requestItems = unprocessed
             }
+          }
+
+          // Every DynamoDB delete succeeded: now the store (#179, §11.6). A
+          // failure above leaves it untouched — a partial purge is finished by
+          // purging again. The family is the item's key text: offloading
+          // requires `escapeKeys`, so every row holding a pointer was written
+          // there (design §11.10).
+          if (offloadInfo !== undefined && store !== undefined) {
+            yield* purgeOffloaded({
+              client,
+              store,
+              info: offloadInfo,
+              tableName,
+              family: { pk: pkValue, liveSk },
+              purged: allItems,
+            })
           }
         }),
       self,
@@ -22025,6 +22290,8 @@ const makeImpl = <
   // which makes it incompatible with the default Entity (Schema.Top).
   // This is safe — self is only used internally for extractTransactable.
   self = entity as unknown as Entity
+  // What `BlobGc` reads of the entity (#179): hidden, not part of its type.
+  Object.defineProperty(entity, GcSupport.GcSupportId, { value: gcSupport, enumerable: false })
   return entity
 }
 

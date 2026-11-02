@@ -24,6 +24,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { compareBytes, compareUtf8 } from "./Utf8Order.js"
 
 type Item = Readonly<Record<string, AttributeValue>>
 type Segment = string | number
@@ -156,12 +157,6 @@ const at = (item: Item, segments: ReadonlyArray<Segment>): AttributeValue | unde
 const kindOf = (value: AttributeValue): string => Object.keys(value)[0]!
 
 const utf8 = new TextEncoder()
-const compareBytes = (a: Uint8Array, b: Uint8Array): number => {
-  for (let i = 0; i < Math.min(a.length, b.length); i++) {
-    if (a[i] !== b[i]) return a[i]! - b[i]!
-  }
-  return a.length - b.length
-}
 
 /** A decimal as sign, significant digits and the power of ten of the first digit. */
 const decimal = (text: string) => {
@@ -200,7 +195,7 @@ const bytesOf = (value: unknown): Uint8Array | undefined =>
 const order = (a: AttributeValue, b: AttributeValue): number | undefined => {
   if (a.N !== undefined && b.N !== undefined) return compareNumbers(a.N, b.N)
   if (a.S !== undefined && b.S !== undefined) {
-    return compareBytes(utf8.encode(a.S), utf8.encode(b.S))
+    return compareUtf8(a.S, b.S)
   }
   const x = bytesOf(a.B)
   const y = bytesOf(b.B)

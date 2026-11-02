@@ -15,7 +15,7 @@
 
 import { S3ServiceException } from "@aws-sdk/client-s3"
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
-import { compareUtf8 } from "../../src/internal/MemoryBlobStore.js"
+import { compareUtf8 } from "../../src/internal/Utf8Order.js"
 
 /** How the stubbed bucket versions what is written to it. */
 export type StubVersioning = "Enabled" | "Suspended" | "Unversioned"

@@ -1328,6 +1328,7 @@ describe("what the tables don't model fails by name", () => {
         "updateItem",
         "deleteItem",
         "query",
+        "batchWriteItem",
         "transactWriteItems",
         "executeStatement",
         "executeTransaction",
