@@ -790,6 +790,31 @@ export const buildEntityDefinition = (config: {
         }
       }
     }
+    for (const field of appendInputFields) {
+      if (!(field in modelFields)) {
+        throw new Error(
+          `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput field "${field}" is not a ` +
+            `model field. .append() writes each appendInput field to the current item. ` +
+            `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
+        )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validate unique constraint fields (EDD-9002)
+  // ---------------------------------------------------------------------------
+  if (config.unique) {
+    for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+      for (const field of resolveUniqueFields(constraintDef)) {
+        if (!(field in modelFields)) {
+          throw new Error(
+            `[EDD-9002] Entity "${config.entityType}": unique constraint "${constraintName}" references ` +
+              `unknown attribute "${field}". Valid attributes: ${Object.keys(modelFields).sort().join(", ")}`,
+          )
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
