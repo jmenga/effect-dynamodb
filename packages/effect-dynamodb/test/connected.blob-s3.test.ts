@@ -178,8 +178,21 @@ const raw = admin as unknown as {
   readonly send: (command: object, options?: object) => Promise<unknown>
 }
 
-const send = <O>(command: object): Effect.Effect<O> =>
-  Effect.promise(() => raw.send(command) as Promise<O>)
+const send = <O>(command: object): Effect.Effect<O, Error> =>
+  Effect.tryPromise({
+    try: () => raw.send(command) as Promise<O>,
+    catch: (cause) => new Error(`S3 admin call failed: ${String(cause)}`),
+  })
+
+/** A `fetch` and its body, failing (not dying) on a transport error. */
+const fetchBytes = (url: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const res = await fetch(url)
+      return { res, body: new Uint8Array(await res.arrayBuffer()) }
+    },
+    catch: (cause) => new Error(`fetch failed: ${String(cause)}`),
+  })
 
 /** Every version and delete marker under `prefix`. */
 const versionsUnder = (bucket: string, prefix: string) =>
@@ -526,10 +539,10 @@ describeConnected("S3 store (connected) — a versioned bucket", () => {
         expiresIn: Duration.minutes(5),
         contentType: "application/octet-stream",
       })
-      const res = yield* Effect.promise(() => fetch(url))
+      const { res, body } = yield* fetchBytes(url)
       expect(res.status).toBe(200)
       expect(res.headers.get("content-type")).toBe("application/octet-stream")
-      expect(new Uint8Array(yield* Effect.promise(() => res.arrayBuffer()))).toEqual(content)
+      expect(body).toEqual(content)
     }),
   )
 

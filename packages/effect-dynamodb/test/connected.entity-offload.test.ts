@@ -7,7 +7,8 @@
  * mode — gets, index queries with projections and `limit`, scans, batch and
  * transactional gets, lifecycle reads and stream-image decoding. Objects go
  * to the in-memory blob store, whose call counts say what each read fetched
- * (the S3 store and MinIO are later commits'). Binary inputs (§3.8, §7):
+ * (`connected.blob-offload.test.ts` runs the same paths over the S3 store and
+ * MinIO, with GC). Binary inputs (§3.8, §7):
  * streams through the store's multipart simulation, single use, handle
  * copies and source failures. Aggregates (§6.9, §8.4): offloading edges
  * hydrated eagerly and re-uploaded per edge item (only the offloaded fields

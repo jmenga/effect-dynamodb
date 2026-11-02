@@ -4,7 +4,8 @@
  * `S` "~edbp:" text) and `nearby` reads both kinds eagerly through the
  * entity's own decoder, as it reads packed fields and renamed attributes.
  * Objects go to the in-memory blob store, whose call counts say what each
- * search fetched (the S3 store and MinIO are later commits').
+ * search fetched (`connected.blob-offload.test.ts` runs `nearby` over the S3
+ * store and MinIO).
  */
 
 import { Config, Effect, Layer, Schema } from "effect"

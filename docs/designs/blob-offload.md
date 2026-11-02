@@ -2285,7 +2285,12 @@ with `escapeKeys` turned off refuses the row naming its key, a dry run included)
 aggregate, EventStore and geo suites for their members (`EventStore.offload.test.ts`: `[EDD-9146]`
 from `EventStore.bind`, `bindProjection`, `rekey`'s `streams` and an unbound append's routing, and
 `rekey` refusing to move a stream row that holds a pointer, a dry run included;
-`GeoIndex.offload.test.ts`: `[EDD-9146]` from `GeoIndex.bind`).
+`GeoIndex.offload.test.ts`: `[EDD-9146]` from `GeoIndex.bind`; `BlobGc.test.ts` ("[EDD-9146]: a
+member on a table without escapeKeys, before the store"): from `BlobGc.make`); and, over DynamoDB Local and
+MinIO, by `connected.blob-offload.test.ts` ("key text": `[EDD-9146]` from `DynamoClient.make` and
+from an unbound write's routing with nothing in the bucket, `rekey` over the escaped table moving
+nothing, and, with `escapeKeys` turned off over rows offloading wrote, `rekey` refusing the
+pointer row by its key, a dry run included, with the row and its version left as they were).
 
 ---
 
@@ -3083,12 +3088,18 @@ in-doubt outcomes are **kept and reported**:
 - an aggregate with an offloaded edge field;
 - an EventStore stream with external `data` and an external inline snapshot, read through
   `read`, `readLatest`, `readIndex` and raw rows;
-- a geo entity with an offloaded field through `nearby`;
+- a geo entity with an offloaded field through `nearby` — *commit 17*: in the geo package's
+  `test/connected.blob-offload.test.ts` (see its deviations);
 - `decodeStreamRecord` and `gc.reap` over records built from items fetched with the raw client
   and rewritten into Lambda's DynamoDB-JSON shape (as #147 simulated stream records; no
   Streams dev dependency);
 - `gc.sweep` (two passes, with marks as MinIO version tags) after a simulated crashed rollback,
-  and `gc.sweepStore` over the bucket.
+  and `gc.sweepStore` over the bucket;
+- the key text requirement (§11.10): `[EDD-9146]` from `DynamoClient.make` and from an unbound
+  write's routing (nothing uploaded or written), and `rekey` with `escapeKeys` turned off over
+  rows offloading wrote refusing the pointer row (dry run included), moving nothing;
+- `insert()` (§6.2): its uploads and read-back; a duplicate item's and a taken unique value's
+  (`ExecuteTransaction`) uploads rolled back.
 
 Canonical GSI-composite shapes: **not applicable** — the composer is untouched (§15), and the
 guard tests prove an offloaded field cannot enter a composite.
@@ -4573,6 +4584,87 @@ a write path, deletes the gate.
       cancellation reasons); it gains `BatchWriteItem` (through the same model) and one-shot
       effect hooks after a `GetItem` / `Query`.
 17. **End-to-end connected** — `connected.blob-offload.test.ts`.
+    *Implementation notes (commit 17):*
+    - `packages/effect-dynamodb/test/connected.blob-offload.test.ts` (17 tests) runs §19.4's
+      list against DynamoDB Local and MinIO through the S3 store (`S3BlobStore.make` over the
+      setup's admin `S3Client`) on a versioned bucket the setup makes, over four tables: the
+      main one, a copy of it, an events table with the stream's LSI, and a table for the key
+      text cases. Every schema sets `escapeKeys: true` but the one the key text cases refuse. Each test writes under
+      its own store prefix, so a listing or `sweepStore` sees only its own objects. Both
+      endpoints and the S3 credentials are read through `Config`; the suite is skipped when
+      either is unreachable. What S3 holds is checked with the admin client
+      (`ListObjectVersions`, `HeadObject` with the stored `ChecksumCRC64NVME`, the parts count,
+      content type and §4.6 metadata, `GetObjectTagging`), and every version a test shows
+      deleted is checked to leave no delete marker.
+    - **Counting and faults** come from a store wrapper over the S3 store: call counts (no GET
+      for a `select` that omits the offloaded fields; one per pointer for eager reads; a failed
+      write's upload shown landing and deleted, one PUT and one DELETE) and deletes that fail on
+      request (the crashed rollback).
+    - **Time.** The GC tests set the `TestClock` to the wall clock — MinIO dates every version
+      with real time — and move it past `maxUploadAge` + 15 minutes, then past the sweep grace,
+      between passes; a mark is read back as the version's `edd-unref-since` tag, equal to the
+      marking pass's clock.
+    - **Stream records** are built from a partition's rows read strongly consistently with the
+      raw client before and after each write, rewritten into Lambda's DynamoDB JSON (`B` as
+      base64, `ApproximateCreationDateTime` in epoch seconds, the table's stream ARN as
+      `eventSourceARN`); a TTL expiry is a raw `DeleteItem` and its `REMOVE` record.
+    - **Cases.** Entities (zstd overflow inline under / pointer over its threshold, binary `S`
+      text, a 12 MB stream uploaded in two parts with S3's CRC-64/NVME equal to the pointer's,
+      a ranged read; reads per mode; `update().set()`; a refused create's upload deleted); a
+      cancelled `transactWrite` (four uploads, none left), `Batch.write`, a stale append; retain
+      + softDelete + restore (two uploads in all); a handle read before an update presigning a
+      GET (`presign: { getSignedUrl }`) of the version it read, with the field's content type;
+      an aggregate edge re-uploaded by its changed
+      group and swept by partition; a stream's event `data` and inline snapshot through `read`,
+      `readLatest`, `readIndex`, raw rows and a lazy read, its superseded snapshot state reaped
+      directly; `decodeStreamRecord` (`added`, `changed`, `rewritten`, `unchanged`; lazy and
+      eager) and `gc.reap` (exact report; redelivery idempotent; a `REMOVE` emptying the family
+      prefix); sort-key composites with prefix-colliding siblings (`n-1`, `n-10`): the reaper
+      keeps the deleted `n-1`'s last version (its tombstone and a snapshot hold it), frees
+      `n-10`'s history-only version once its last snapshot expires and touches nothing of
+      `n-1`'s, and two sweep passes over `n-1` delete nothing; a copy table sharing the bucket
+      (the copy's superseded source version `foreign` to its reaper, the copy's records skipped
+      by the main table's reaper, each table's sweeps listing only its own versions, each
+      `sweepStore` reporting the other's families `Foreign` by table name, and a purge of the
+      copy emptying its family prefix while the source's version its row names is kept); a
+      refused create whose rollback delete fails, reported to `Offload.layerObserver`
+      (`rollbackFailed`, with the version) and swept in two passes; `sweepStore` over a prefix
+      holding every member kind, another table's family, objects without library metadata and a
+      non-library key, resumed with `maxFamilies` / `startAfter`; purge with a create racing it
+      (run from a `DynamoClient` wrapper right after the purge's `BatchWriteItem` lands, as the
+      unit test does) keeping only the racing version, then a second purge emptying the family
+      prefix; the key text requirement (§11.10, below); and `insert()` (§6.2): a PartiQL
+      `INSERT` uploading two versions and reading them back, a duplicate item's upload deleted
+      (one PUT, one DELETE, no delete marker), and a unique-constrained insert, sent as an
+      `ExecuteTransaction`, whose taken value rolls its upload back while the first insert's
+      version is kept.
+    - **Key text** (*port onto 1.42.2, owner decision 2026-11-14*; it replaces the 1.37-based
+      "rows 1.36 wrote" case, whose machinery 1.39 removed). A ticket entity with a numeric key
+      composite (whose text `escapeKeys` changes) on its own table: `DynamoClient.make` over the
+      same entity on the schema with `escapeKeys` off dies with `[EDD-9146]`, and its unbound
+      `put` fails with a `ValidationError` (`[EDD-9146]`) before any upload or request — the
+      bucket prefix and both key texts' partitions stay empty. A put on the escaped table, then
+      `rekey` there, moves nothing; `rekey` through the same table bound with `escapeKeys` off
+      and the offloaded declarations removed refuses the row by its key, dry run and real, and
+      the row, its two versions and its values are as they were.
+    - `packages/effect-dynamodb-geo/test/connected.blob-offload.test.ts` (1 test): a geo entity's
+      overflow and binary fields stored as S3 versions with the library's metadata (each
+      pointer decoded by a lazy read of the row and its version read back by `HeadObject`), and
+      `nearby` reading both eagerly — one GET per pointer, counted by a store wrapper.
+    *Deviations (commit 17):*
+    - **The geo case is in the geo package**, not in core's `connected.blob-offload.test.ts` as
+      §19.4 lists it: `@effect-dynamodb/geo` depends on `effect-dynamodb`, so core's tests cannot
+      import it (core's tests run on core's source, geo on core's build, and a cross import
+      would mix the two). It runs in the same `test:connected` pass (`pnpm -r`). The geo package
+      gains `@aws-sdk/client-s3` as a dev dependency for its bucket setup (the lockfile gains
+      only that importer entry).
+    *Debt fixed (commit 17):*
+    - The headers of `connected.entity-offload.test.ts` and the geo package's
+      `connected.offload.test.ts` still said the S3 store and MinIO were later commits'; they now
+      point at the end-to-end files.
+    - `connected.blob-s3.test.ts` ran its fallible admin S3 calls and its presigned-URL fetch
+      through `Effect.promise`, against the project's rule (a rejection became a defect); they
+      now use `Effect.tryPromise`.
 18. **Docs** — the §20 table: the new guide and its sidebar entry, the example, the guide and
     tutorial updates, `api-reference.mdx` (including the `PackedConfig | ExternalPackedConfig`
     signatures of `Packed`, `isPackedConfig`, `getPackedFields` and `stream.storedAs`, §3.1),
