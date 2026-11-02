@@ -4,10 +4,10 @@
  * Extracted from Aggregate.ts for decomposition. Not part of the public API.
  */
 
-import type { Schema } from "effect"
+import type { DateTime, Schema } from "effect"
 import type { DiscriminatorConfig, UpdateContext } from "./AggregateCursor.js"
 import type { AggregateEdge, ManyEdge, OneEdge, RefEdge, RefEntity } from "./AggregateEdges.js"
-import type { RefEntityIdentifierValue } from "./EntityTypes.js"
+import type { ModelFieldName, ModelFields, RefEntityIdentifierValue } from "./EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // Sub-aggregate / Bound sub-aggregate
@@ -225,3 +225,80 @@ type _StripUndefined<T> = undefined extends T ? Exclude<T, undefined> : T
 
 /** Flatten intersection types — `extends infer O` breaks the alias chain for eager IDE expansion */
 type _Simplify<T> = T extends infer O ? { [K in keyof O]: O[K] } : never
+
+/**
+ * @internal An aggregate's `edges`: keyed by fields of its schema. The record
+ * half keeps it an edges record; the last half, over the edges as written
+ * (`TEdges`, the constraint naming its own parameter), turns a key that is not
+ * a schema field into `never`, so the error lands on that key.
+ */
+export type AggregateEdgesConfig<TSchema extends Schema.Top, TEdges = {}> = Record<
+  string,
+  AggregateEdge | BoundSubAggregate<any, any>
+> & {
+  readonly [K in Exclude<keyof TEdges, ModelFieldName<TSchema>>]: never
+} & {
+  readonly [K in keyof TEdges & ModelFieldName<TSchema>]: ManyEdgeSkCheck<
+    TEdges[K],
+    ModelFields<TSchema>[K]
+  >
+}
+
+/**
+ * The attribute paths of a many edge's element that `sk.composite` may name:
+ * its scalar fields, and the scalar fields one level into an object field (a
+ * hydrated ref: `"umpire.id"`) — not the object itself, which the runtime
+ * refuses as a non-scalar composite. Any name when the element's type is
+ * unknown.
+ */
+export type ManyEdgeSkPaths<TField> = unknown extends TField
+  ? string
+  : ElementPaths<NonNullable<TField> extends ReadonlyArray<infer El> ? El : never>
+
+/** A value a key composes from as one scalar: a primitive, or a date. */
+type IsScalar<V> = V extends string | number | bigint | boolean
+  ? true
+  : V extends Date | DateTime.DateTime
+    ? true
+    : false
+
+/** A nested object whose fields a dotted path reaches (not a collection or a date). */
+type IsRecordLike<V> =
+  IsScalar<V> extends true
+    ? false
+    : V extends
+          | ReadonlyArray<unknown>
+          | ReadonlySet<unknown>
+          | ReadonlyMap<unknown, unknown>
+          | Uint8Array
+          | ((...args: ReadonlyArray<any>) => unknown)
+      ? false
+      : V extends object
+        ? true
+        : false
+
+type ScalarKeys<O> = {
+  readonly [K in keyof O & string]: IsScalar<NonNullable<O[K]>> extends true ? K : never
+}[keyof O & string]
+
+type ElementPaths<El> = unknown extends El
+  ? string
+  : [El] extends [never]
+    ? never
+    : {
+        readonly [K in keyof El & string]: IsScalar<NonNullable<El[K]>> extends true
+          ? K
+          : IsRecordLike<NonNullable<El[K]>> extends true
+            ? `${K}.${ScalarKeys<NonNullable<El[K]>>}`
+            : never
+      }[keyof El & string]
+
+/** A many edge whose `sk.composite` names something its element lacks: the paths it may name. */
+type ManyEdgeSkCheck<TEdge, TField> = TEdge extends {
+  readonly _tag: "ManyEdge"
+  readonly sk: { readonly composite: infer C extends ReadonlyArray<string> }
+}
+  ? [Exclude<C[number], ManyEdgeSkPaths<TField>>] extends [never]
+    ? unknown
+    : { readonly sk: { readonly composite: ReadonlyArray<ManyEdgeSkPaths<TField>> } }
+  : unknown

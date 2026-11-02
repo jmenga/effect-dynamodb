@@ -34,15 +34,23 @@ const BUCKET_MS: Record<TimeBucket, number> = {
   hourly: H3.HOURLY_BUCKET_MS,
 }
 
-export interface GeoFields {
-  readonly cell: { readonly field: string; readonly resolution: number }
-  readonly parentCell: { readonly field: string; readonly resolution: number }
+/**
+ * The geo attributes `GeoIndex.make` computes and reads. `F` is the entity
+ * input's field names: each `field` is a model field the index composes, and
+ * `timePartition.source` the model field holding the epoch-ms timestamp.
+ */
+export interface GeoFields<F extends string = string> {
+  readonly cell: { readonly field: F; readonly resolution: number }
+  readonly parentCell: { readonly field: F; readonly resolution: number }
   readonly timePartition: {
-    readonly field: string
-    readonly source: string
+    readonly field: F
+    readonly source: F
     readonly bucket: TimeBucket
   }
 }
+
+/** The field names of an entity input `A`: any name when `A` is unknown. */
+export type GeoFieldName<A> = unknown extends A ? string : keyof A & string
 
 export interface Coordinates {
   readonly latitude: number
@@ -128,11 +136,19 @@ export interface GeoIndex<A, P> {
  * const results = yield* VehicleGeo.nearby({ center, radius: 2000, unit: "m" })
  * ```
  */
-export const make = <A, P>(config: {
-  readonly entity: GeoEntity<A, P>
-  readonly index: string
+export const make = <
+  A,
+  P,
+  TIndexes extends Record<string, KeyComposer.IndexDefinition> = Record<
+    string,
+    KeyComposer.IndexDefinition
+  >,
+>(config: {
+  readonly entity: GeoEntity<A, P> & { readonly indexes: TIndexes }
+  /** One of the entity's indexes, by name. */
+  readonly index: keyof TIndexes & string
   readonly coordinates: (item: A) => Coordinates | undefined
-  readonly fields: GeoFields
+  readonly fields: GeoFields<GeoFieldName<A>>
 }): GeoIndex<A, P> => {
   const indexDef = config.entity.indexes[config.index] as KeyComposer.IndexDefinition | undefined
   if (!indexDef) {

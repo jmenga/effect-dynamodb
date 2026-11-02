@@ -875,6 +875,19 @@ type ValidateFieldRenames<Fields extends string, A> = {
 }
 
 /**
+ * Compile-time validation: a key that is not a model field takes only an
+ * error message, so a misspelled field is a type error on that key.
+ * (`ConfigureAttributes` alone lets an extra key through beside a valid one.)
+ */
+type OnlyModelFields<M extends Schema.Top, A> =
+  unknown extends Schema.Schema.Type<M>
+    ? unknown
+    : {
+        readonly [K in Exclude<keyof A, keyof Schema.Schema.Type<M>>]: `${K &
+          string} is not a field of the model`
+      }
+
+/**
  * Create a configured model with per-field DynamoDB overrides.
  *
  * Separates DynamoDB infrastructure (storage format, field renaming) from
@@ -895,7 +908,9 @@ type ValidateFieldRenames<Fields extends string, A> = {
  */
 export const configure = <M extends Schema.Top, const A extends ConfigureAttributes<M>>(
   model: M,
-  attributes: A & ValidateFieldRenames<keyof Schema.Schema.Type<M> & string, A>,
+  attributes: A &
+    ValidateFieldRenames<keyof Schema.Schema.Type<M> & string, A> &
+    OnlyModelFields<M, A>,
 ): ConfiguredModel<M, A> => {
   const resolved: globalThis.Record<
     string,

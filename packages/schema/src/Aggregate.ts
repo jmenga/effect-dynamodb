@@ -22,11 +22,13 @@ import type { DiscriminatorConfig } from "./internal/AggregateCursor.js"
 import type { AggregateEdge } from "./internal/AggregateEdges.js"
 import { deriveAggregateSchemas } from "./internal/AggregateSchemas.js"
 import type {
+  AggregateEdgesConfig,
   AggregateInputType,
   BoundSubAggregate,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
+import type { ModelFieldName } from "./internal/EntityTypes.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
 export {
@@ -90,19 +92,20 @@ interface SubAggregateConfig<
   readonly edges: TEdges
 }
 
-interface CollectionConfig {
+/** `F`: the aggregate schema's fields, which the composites name. */
+interface CollectionConfig<F extends string = string> {
   readonly index: string
   readonly name: string
   readonly sk: {
     readonly field: string
-    readonly composite: ReadonlyArray<string>
+    readonly composite: ReadonlyArray<F>
   }
 }
 
-interface ListCollectionConfig extends CollectionConfig {
+interface ListCollectionConfig<F extends string = string> extends CollectionConfig<F> {
   readonly pk: {
     readonly field: string
-    readonly composite: ReadonlyArray<string>
+    readonly composite: ReadonlyArray<F>
   }
   readonly cardinality?: number
 }
@@ -118,9 +121,9 @@ interface AggregateConfig<
   readonly table: AggregateTableLike
   readonly schema: DynamoSchemaModule.DynamoSchema
   readonly pk: { readonly field: string; readonly composite: TPK }
-  readonly collection: CollectionConfig
-  readonly list?: ListCollectionConfig
-  readonly context?: ReadonlyArray<string>
+  readonly collection: CollectionConfig<ModelFieldName<_TSchema>>
+  readonly list?: ListCollectionConfig<ModelFieldName<_TSchema>>
+  readonly context?: ReadonlyArray<ModelFieldName<_TSchema>>
   /**
    * Auto-managed `created` / `updated` attributes on every row the aggregate
    * writes. Accepted here for parity with the operational `Aggregate.make` in
@@ -200,15 +203,15 @@ export interface AggregateDefinition<TSchema extends Schema.Top, TInput = unknow
  */
 export function make<
   TSchema extends Schema.Top,
-  const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
 >(
   schema: TSchema,
   config: SubAggregateConfig<TEdges> & { readonly table?: undefined },
 ): SubAggregate<TSchema, TEdges>
 export function make<
   TSchema extends Schema.Top,
-  const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
-  const TPK extends ReadonlyArray<string>,
+  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
+  const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK>,

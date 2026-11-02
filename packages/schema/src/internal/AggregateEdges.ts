@@ -132,15 +132,33 @@ export const one = <const E extends RefEntity = RefEntity>(
   ...(config.discriminator !== undefined && { discriminator: config.discriminator }),
 })
 
-/** Create a one-to-many edge descriptor */
-export function many<const E extends RefEntity, const IF extends string>(
+/**
+ * The declared `sk.composite` of a many edge, kept on its type so
+ * `Aggregate.make` can check each name against the edge field's element
+ * (`ManyEdgeSkPaths`); nothing when none is declared.
+ */
+export type ManyEdgeSk<SK> = [SK] extends [never] ? {} : { readonly sk: { readonly composite: SK } }
+
+/**
+ * Create a one-to-many edge descriptor. `sk.composite` names attributes of the
+ * edge field's element (a dotted path reaches into a hydrated ref:
+ * `"umpire.id"`); `Aggregate.make` checks them against its schema.
+ */
+export function many<
+  const E extends RefEntity,
+  const IF extends string,
+  const SK extends ReadonlyArray<string> = never,
+>(
   name: string,
-  config: ManyEdgeConfig<E> & { readonly inputField: IF },
-): ManyEdge<E> & { readonly inputField: IF }
-export function many<const E extends RefEntity>(
+  config: ManyEdgeConfig<E> & {
+    readonly inputField: IF
+    readonly sk?: { readonly composite: SK }
+  },
+): ManyEdge<E> & { readonly inputField: IF } & ManyEdgeSk<SK>
+export function many<const E extends RefEntity, const SK extends ReadonlyArray<string> = never>(
   name: string,
-  config: ManyEdgeConfig<E>,
-): ManyEdge<E>
+  config: ManyEdgeConfig<E> & { readonly sk?: { readonly composite: SK } },
+): ManyEdge<E> & ManyEdgeSk<SK>
 export function many(name: string, config: ManyEdgeConfig): ManyEdge {
   return {
     _tag: "ManyEdge",

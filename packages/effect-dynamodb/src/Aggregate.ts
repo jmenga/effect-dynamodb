@@ -150,10 +150,12 @@ import {
   deriveEntityFieldName,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
+  AggregateEdgesConfig,
   AggregateInputType,
   BoundSubAggregate,
   SubAggregate,
 } from "@effect-dynamodb/schema/internal/AggregateTypes.js"
+import type { ModelFieldName } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // TypeId
@@ -561,7 +563,8 @@ interface SubAggregateConfig<
 // Aggregate.make — top-level form
 // ---------------------------------------------------------------------------
 
-interface CollectionConfig {
+/** `F`: the aggregate schema's fields, which the composites name. */
+interface CollectionConfig<F extends string = string> {
   /**
    * Physical index backing the collection query.
    *
@@ -588,20 +591,20 @@ interface CollectionConfig {
    */
   readonly sk?: {
     readonly field: string
-    readonly composite: ReadonlyArray<string>
+    readonly composite: ReadonlyArray<F>
   }
 }
 
-interface ListCollectionConfig extends CollectionConfig {
+interface ListCollectionConfig<F extends string = string> extends CollectionConfig<F> {
   /** The list index is always a GSI — it has its own partition key. */
   readonly index: string
   readonly sk: {
     readonly field: string
-    readonly composite: ReadonlyArray<string>
+    readonly composite: ReadonlyArray<F>
   }
   readonly pk: {
     readonly field: string
-    readonly composite: ReadonlyArray<string>
+    readonly composite: ReadonlyArray<F>
   }
   readonly cardinality?: number
 }
@@ -617,8 +620,8 @@ interface AggregateConfig<
   readonly table: Table
   readonly schema: DynamoSchemaModule.DynamoSchema
   readonly pk: { readonly field: string; readonly composite: TPK }
-  readonly collection: CollectionConfig
-  readonly list?: ListCollectionConfig
+  readonly collection: CollectionConfig<ModelFieldName<_TSchema>>
+  readonly list?: ListCollectionConfig<ModelFieldName<_TSchema>>
   /**
    * Use strongly consistent reads when assembling this aggregate. Defaults to `false`,
    * matching DynamoDB and `Entity`.
@@ -638,7 +641,8 @@ interface AggregateConfig<
    * `make()` time (#144).
    */
   readonly consistentRead?: boolean
-  readonly context?: ReadonlyArray<string>
+  /** Aggregate fields whose change rewrites every edge group. */
+  readonly context?: ReadonlyArray<ModelFieldName<_TSchema>>
   /**
    * Auto-managed `created` / `updated` attributes on every row this aggregate
    * writes — the root item and all edge items, sub-aggregate groups included.
@@ -673,15 +677,15 @@ interface AggregateConfig<
  */
 export function make<
   TSchema extends Schema.Top,
-  const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
 >(
   schema: TSchema,
   config: SubAggregateConfig<TEdges> & { readonly table?: undefined },
 ): SubAggregate<TSchema, TEdges>
 export function make<
   TSchema extends Schema.Top,
-  const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
-  const TPK extends ReadonlyArray<string>,
+  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
+  const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK>,

@@ -2782,7 +2782,11 @@ describe("Aggregate write path", () => {
       officials: Schema.Array(Appointment),
     }) {}
 
-    /** Build the aggregate with a given (or absent) declared sort key. */
+    /**
+     * Build the aggregate with a given (or absent) declared sort key. Some
+     * cases name paths the element lacks on purpose, to reach the runtime
+     * checks, so the composite is not checked against the schema here.
+     */
     const makeMatchAggregate = (sk?: { readonly composite: ReadonlyArray<string> }) =>
       Aggregate.make(OfficiatedMatch, {
         table: MainTable,
@@ -2798,7 +2802,7 @@ describe("Aggregate write path", () => {
           officials: Aggregate.many("officials", {
             entityType: "MatchOfficial",
             entity: OfficialEntity,
-            ...(sk !== undefined && { sk }),
+            ...(sk !== undefined && { sk: sk as never }),
           }),
         },
       })

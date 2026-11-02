@@ -234,6 +234,7 @@ describe("Aggregate — packed edge fields", () => {
         collection: { name: "tour" },
         root: { entityType: "TourItem" },
         edges: {
+          // @ts-expect-error `layout` is an object, not a scalar path: a type error too
           venues: Aggregate.many("venues", {
             entityType: "TourVenue",
             entity: Venues,
