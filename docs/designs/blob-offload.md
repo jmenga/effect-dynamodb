@@ -452,10 +452,11 @@ A member with an offloaded field needs a store where it is first resolvable (§1
 
 **Observer**. `Offload.layerObserver({ onUnsettled })` (a `Context.Reference`, off by default,
 like `ConsumedCapacity`'s `onOperation`) receives every upload the library could not settle —
-in-doubt outcomes, failed rollback deletes, lost multipart completions and (*added in
-commit 6*) store answers refused as naming no version of the requested key (`answerRefused`,
-§6.2) — with the table, entity type, attribute, row key and ref (§6.2), so an application can
-queue those items for `gc.sweep`.
+in-doubt outcomes, failed rollback deletes, lost multipart completions, (*added in commit
+15*) store uploads an interruption cut short (`interrupted`) and (*added in commit 6*) store
+answers refused as naming no version of the requested key (`answerRefused`, §6.2) — with the
+table, entity type, attribute, row key and ref (§6.2), so an application can queue those items
+for `gc.sweep`.
 
 ### 3.7 Read modes and result types — `.offloaded(mode)`
 
@@ -1068,7 +1069,9 @@ consumed capacity's `CurrentOperation`:
   delivered to the `Offload.layerObserver({ onUnsettled })` observer when one is provided
   (§3.6), so the application can queue the item for `gc.sweep`. So are, when the root exits,
   uploads whose version no entry names (*as built in commit 6*): a lost multipart completion
-  (`completeLost`, §7) and a store `put` answer refused as naming no version of the requested
+  (`completeLost`, §7), (*commit 15*) a store `put` or `copy` an interruption cut short
+  (`interrupted`, §7: every interrupted call, since the ledger cannot see whether the store
+  wrote) and a store `put` answer refused as naming no version of the requested
   key (`answerRefused`: no ref, a ref outside the key, a ref already returned for another
   upload), reported by the requested key with no ref — the answer's ref is never deleted. Leaks no process could report
   (a crash between upload and exit) are found by `gc.sweepStore` (§11.5). The library never
@@ -1427,6 +1430,13 @@ minimum sweep grace (§11.4).
   the SDK's retry, leaving a version the library never learned of. That version has no
   pointer. The library reports it to the observer (`reason: "completeLost"`, with the object
   key and row key, §6.2) and the per-item sweep, or the store-wide sweep, reclaims it.
+- *(commit 15)* `CompleteMultipartUpload` runs uninterruptibly, so a sent `Complete` runs to
+  its answer and a completed upload is never aborted. An interruption that arrives meanwhile is
+  delivered when it ends, which discards the answer: the version has no pointer. Likewise a
+  `PutObject` or `CopyObject` S3 received before the interruption aborted its request. The
+  ledger reports every store `put` or `copy` an interruption cut short (`reason:
+  "interrupted"`, by the requested key, §6.2) — whether or not anything was written, since it
+  cannot see inside the call; a sweep of an item with nothing left behind deletes nothing.
 
 **Single PUT** of buffered content sends `ChecksumAlgorithm: "CRC64NVME"` and the precomputed
 `ChecksumCRC64NVME`; S3 validates it (`BadDigest` / MinIO `XAmzContentChecksumMismatch` →
@@ -2323,11 +2333,14 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
 }> {}
 ```
 
-- **`completeLost`** (*added in commit 10*): a store's `put` sets it on a failure after which
+- **`completeLost`** (*added in commit 10*): a store's `put` (or `copy`, *commit 15*: a copy
+  over S3's single-request limit is a multipart upload too) sets it on a failure after which
   its multipart upload may have completed with no ref reported — a `CompleteMultipartUpload`
   whose response was lost, or whose retry found no upload (§7). The library cannot tell that
   from any other failed put through the rest of the contract, so the store says it; the
-  ledger reports the requested key to the observer (`completeLost`) for `gc.sweep`.
+  ledger reports the requested key to the observer (`completeLost`) for `gc.sweep`. An
+  interrupted call carries no flag: *(commit 15)* the ledger reports every `put` or `copy`
+  that exits interrupted itself (`interrupted`, §7).
 - **`BlobSourceFailure`** (commit 5) is `BlobStoreFailure & { reason: "SourceFailed" }`: the
   library wraps the input `Stream`'s error (its `cause`) before handing the body to the store,
   so a store's `put` lets a source failure through as its own failure, with no second error
@@ -2365,16 +2378,30 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
     which removes exactly that object and creates no delete marker (F20). If the deletion is
     refused, a plain `DeleteObject` of the key follows, which leaves a `null` delete marker
     (harmless, §11.7).
-  - No `VersionId` (versioning never enabled): a plain `DeleteObject` of the key.
+  - No `VersionId` (versioning never enabled — or suspended on MinIO, which omits it, F15):
+    *(commit 15)* the same `VersionId: "null"` delete first — a never-versioned object is the
+    `null` version, so it is removed with no delete marker either way — and a plain
+    `DeleteObject` only if that is refused. A cleanup that fails entirely is logged and named
+    in the error's message.
   No pointer can name either object. No `GetBucketVersioning` pre-check. S3 Express One Zone
   directory buckets have no versioning and are refused the same way.
 - **Copy.** `CopyObject` with `CopySource: bucket/key?versionId=…` (≤ 5 GB; larger via
   `UploadPartCopy` parts and `CompleteMultipartUpload`). The response's `VersionId` is checked
   exactly as for a put — on `CopyObject`, and on the `Complete` that ends an `UploadPartCopy`
-  sequence — with the same cleanup.
+  sequence — with the same cleanup. *(commit 15)* `MetadataDirective` and `TaggingDirective`
+  are `REPLACE`: the copy carries the request's content type and metadata, and never the
+  source's tags — in particular not its `edd-unref-since` mark (§11.4). An `UploadPartCopy`
+  sequence creates its upload **without** a checksum algorithm (a server-side part has no
+  client checksum to send, and MinIO refuses part copies into a checksummed upload); the
+  library verifies every full read itself (§8.6). A copy whose size the request does not give
+  learns it from `HeadObject`.
 - **Get.** `GetObject` with `VersionId` and `Range`. The body is read through
   `transformToWebStream()` (runtime-neutral) into an Effect `Stream`. `ChecksumMode` is not set
-  (the library verifies itself, §8.6).
+  (the library verifies itself, §8.6); *(commit 15)* a client the store builds defaults
+  `responseChecksumValidation` to `"WHEN_REQUIRED"` for the same reason. Chunks are handed on
+  as plain `Uint8Array` views of the SDK's buffers. A range starting at the object's end is
+  empty and one past it is `Rejected` (S3's 416, diagnosed by the version's size); a
+  zero-length range sends no request but `HeadObject`, for the same check.
 - **Delete.** `DeleteObjects` with `VersionId`s, ≤ 1,000 per request. Per-key errors are
   classified, and `NoSuchVersion` / `NoSuchKey` count as success.
 - **List.** `ListObjectVersions(Prefix, KeyMarker)` (delete markers excluded).
@@ -2400,15 +2427,20 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
 
   | Reason | From |
   |---|---|
-  | `NotFound` | `NoSuchVersion`, `NoSuchKey`, `NoSuchBucket` |
-  | `AccessDenied` | `AccessDenied` (incl. an Object Lock or MFA Delete refusal on delete, F13) |
-  | `Throttled` | `SlowDown`, 503 |
+  | `NotFound` | `NoSuchVersion`, `NoSuchKey`, `NoSuchBucket`; a `HeadObject` 404 (no body to name it) |
+  | `AccessDenied` | `AccessDenied`, any 403 (incl. an Object Lock or MFA Delete refusal on delete, F13) |
+  | `Throttled` | `SlowDown`, `Throttling`, `TooManyRequests`, 503, 429 |
   | `ChecksumMismatch` | `BadDigest`, `XAmzContentChecksumMismatch`, `InvalidDigest` |
-  | `Unavailable` | 5xx and transport failures after the SDK's retries |
-  | `TooLarge` | `EntityTooLarge`, part number out of range |
-  | `Rejected` | other 4xx |
+  | `Unavailable` | 5xx and transport failures after the SDK's retries (no response) |
+  | `TooLarge` | `EntityTooLarge`, a part number past the limit refused (diagnosed, not pre-checked) |
+  | `Rejected` | other 4xx (`NoSuchUpload` included) |
 
-  The SDK error is the `cause`.
+  The SDK error is the `cause`, after `redactCredentialRefusal` (#186) replaces a signature or
+  credential refusal with its name, `$fault` and `$metadata` only: S3's `SignatureDoesNotMatch`
+  quotes the canonical request, signed `x-amz-security-token` included, and S3 can echo a
+  refused token as `Token-0`, so S3's `InvalidAccessKeyId`, `InvalidToken` and
+  `TokenRefreshRequired` join the helper's names. A `DeleteObjects` per-key error (a code with no status) is
+  `Unavailable` for `InternalError` / `ServiceUnavailable`, else by the table, else `Rejected`.
 - **Unsupported bucket settings.** Object Lock and MFA Delete make rollback and GC deletes fail.
   Writes and reads work, deletes surface as `AccessDenied`, and the docs list these settings
   as unsupported for GC.
@@ -2615,7 +2647,7 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9111` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field does not exist on the model, or its encoded side is not `Uint8Array` (e.g. `Uint8ArrayFromBase64`, a string, a union with a non-binary member) |
 | `EDD-9114` | `Entity.ts` (schema), `EventStore.ts` | `offload` options invalid: an unknown key, `itemBudget` not a safe integer in 1 … 409,600, `prefix` not a non-empty string of unreserved characters and `/` ≤ 256 bytes, `itemBudget` without an overflow field, or `offload` on a member without an offloaded field |
 | `EDD-9115` | `DynamoClient.ts`, `EventStore.ts`, `GeoIndex.ts` (geo), `BlobGc.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`) | A member with an offloaded field is bound (`DynamoClient.make`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `Entity.bind`, `Aggregate.bind`, `BlobGc.make`), or an unbound stream or `EventStore.processBatch` / `runChangeFeed` runs its first operation, with no `BlobStore` resolvable |
-| `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
+| `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, S3 store options with an unknown key, both `client` and `clientConfig`, or an invalid `client`, `serverSideEncryption`, `storageClass`, `notFoundRetry` or `presign` (*commit 15*), or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts`, `internal/EventProjection.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key — on a read, or a projection's `offloaded` (at definition) — or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
 | `EDD-9119` | `internal/OffloadChange.ts` (`recordImages`, shared by the reaper and `decodeStreamRecord`), `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is present and not `NEW_AND_OLD_IMAGES`, or — whatever its view type — a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
@@ -2844,7 +2876,8 @@ in-doubt outcomes are **kept and reported**:
   - single PUT and multipart give the **same checksum** for the same bytes;
   - part-size adaptation from `contentLength`;
   - interruption aborts the upload (Abort called, no Complete);
-  - a part failure retried;
+  - a part failure retried (*commit 15*: in-memory only — over the stubbed `S3Client` the
+    SDK's retry middleware never runs, §21 item 15's deviations);
   - a source failure → `SourceFailed`, nothing written to DynamoDB;
   - a store `put` that fails outright after consuming the stream (in-memory `failures` hook) →
     the operation fails, nothing is written, a reuse of the stream → `EDD-9120`;
@@ -2965,7 +2998,8 @@ in-doubt outcomes are **kept and reported**:
 ### 19.4 Connected (mandatory — gate 4) — MinIO beside DynamoDB Local
 
 - **CI.** `.github/workflows/ci.yml` adds a service container (`command:` is supported for
-  services; a `docker run -d -p 9000:9000 … server /data` step is the fallback):
+  services; a `docker run -d -p 9000:9000 … server /data` step is the fallback — *commit 15
+  uses the fallback*, see its deviations):
 
   ```yaml
   minio:
@@ -2995,7 +3029,8 @@ in-doubt outcomes are **kept and reported**:
   value and to the one S3 returns;
 - a wrong checksum is rejected;
 - a store-side outright upload failure (a part upload refused by a bucket policy denying
-  `PutObject` on the key) fails the put with no completed upload;
+  `PutObject` on the key) fails the put with no completed upload — *commit 15*: a part S3
+  refuses for its checksum (MinIO's root user bypasses bucket policies; see its deviations);
 - interruption mid-multipart leaves no upload in `ListMultipartUploads`.
 
 `test/connected.blob-offload.test.ts` (end to end):
@@ -4185,6 +4220,157 @@ a write path, deletes the gate.
 15. **S3 store + CI** — `src/blob/s3.ts` (put / copy `VersionId` checks and cleanup, list, head,
     tag marks), subpath export, optional peer, guard test, unit tests on a stubbed `S3Client`;
     MinIO in CI; `connected.blob-s3.test.ts`.
+    *Implementation notes (commit 15):*
+    - `src/blob/s3.ts` is the public subpath module (`effect-dynamodb/blob/s3`): `make(options)`
+      (`Effect<BlobStoreService, never, Scope>`), `layer(options)` (`Layer<BlobStore>`), and
+      `layerConfig(config)` (`Layer<BlobStore, ConfigError>`: `bucket`, `prefix`, `region`,
+      `endpoint`, `forcePathStyle`, `credentials`, `partSize`, the concurrencies and
+      `maxUploadAge` read from Effect `Config` — a missing optional one takes its default —
+      with the static options alongside; `credentials` is read as `DynamoClient.layerConfig`
+      reads its own — main's `Credentials` and `readCredentials` (`internal/ClientOptions.ts`,
+      #254 / #255): an optional `sessionToken` for temporary credentials, none configured is
+      the SDK's default chain, credentials given in part fail the layer — and handed to the
+      client as given). `make` and `layer` check the options when called;
+      `layerConfig` when built, as a defect. `src/blob/S3BlobStore.ts` is the internal
+      implementation (`resolveOptions`, `classify`, `makeService`, `acquireClient`), which the
+      tests drive with an `S3Tuning` (`maxCopyObjectBytes`, `maxParts`) to reach the multipart
+      copy and part 10,001 with small bodies. The service is checked by `validateService`, and
+      the option checks reuse `checkPrefix`, `checkPositiveInteger` and
+      `checkMaxUploadAgeOption` (`internal/BlobStoreContract.ts`).
+    - **Options.** `bucket`, `prefix`, `client` *or* `clientConfig` (a client the store builds
+      is destroyed with the layer's scope; the caller's is never touched), `partSize` (default
+      8 MiB, 5 MiB … 5 GiB), `uploadConcurrency` (4), `readConcurrency` (16),
+      `writeConcurrency` (8), `maxUploadAge` (1 hour), `serverSideEncryption`
+      (`ServerSideEncryption`, `SSEKMSKeyId`, `BucketKeyEnabled`) and `storageClass` (passed to
+      `PutObject`, `CreateMultipartUpload` and `CopyObject`), `notFoundRetry` (retries a read
+      that finds `NotFound`, only that), `presign: { getSignedUrl }`. `name` is
+      `s3://<bucket>/<prefix>`; `limits` are `{ maxVersionBytes: 1024, maxKeySuffixBytes: 0 }`.
+    - **Put** runs `internal/Multipart.ts` (§7) with S3's protocol: `PutObject` for a body of
+      at most one part, else `CreateMultipartUpload` (`ChecksumType: "FULL_OBJECT"`),
+      `UploadPart` with each part's CRC-64/NVME, and `CompleteMultipartUpload` with the parts,
+      the whole body's checksum and `MpuObjectSize`. The driver runs the `Complete` (with its
+      `VersionId` check and any unversioned cleanup) uninterruptibly and marks the upload
+      completed in the same region, so a sent `Complete` runs to its answer and a completed
+      upload is never aborted; a multipart copy's `Complete` does the same. An interruption
+      that arrives meanwhile is delivered when the region ends and discards the answer, so the
+      ledger reports the call as `interrupted` (below). A `Complete`'s failure is
+      `completeLost` unless S3 refused it outright — a 4xx other than 429 and `NoSuchUpload`
+      on the SDK's only attempt (`$metadata.attempts === 1`) — since a lost or throttled
+      answer, a transport failure, a retry finding the upload gone, or a refusal of a resent
+      request (or one reporting no attempt count) may each follow a completion nobody
+      reported. An abort finding `NoSuchUpload` succeeds. A part numbered past `maxParts` that
+      S3 refuses is `TooLarge`, naming the part size.
+    - **Copy** learns the source's size from `HeadObject` first when the request gives no
+      `contentLength` (the path depends on it, and nothing is written before it is known),
+      then runs `CopyObject` or, over 5 GiB, `UploadPartCopy` ranges.
+    - **Delete** dedupes its refs and sends `DeleteObjects` (`Quiet`) in requests of at most
+      1,000, one after another; the first per-key error other than `NoSuchVersion` /
+      `NoSuchKey` fails it, naming that version, the message listing up to five. **List**
+      pages `ListObjectVersions` by `KeyMarker` / `VersionIdMarker` (passed back verbatim:
+      MinIO's are opaque), `startAfter` as the first `KeyMarker`; a version without a key,
+      version id, size or `LastModified`, or a truncated page without a next marker, is
+      `Rejected` (never an invented date). **Marks** merge the version's other tags; an
+      unparseable mark reads as none; `clear` writes only when a mark is present; an absent
+      version is `undefined` / success. **Presign** signs a `GetObjectCommand` (with
+      `ResponseContentType` when asked) through the given presigner, `expiresIn` in whole
+      seconds (at least 1); an expiry that is not a positive finite `Duration`, or a presigner
+      that throws, is `Rejected`. A ref whose version is `""` is sent without `VersionId`.
+    - **Ledger.** `internal/BlobLedger.ts`'s `completeLost` report is `reportCompleteLost`,
+      used by `putCall` and now also by the copy path (deviation below). A store `put` or
+      `copy` call whose exit is an interruption only (no failure) is reported at exit as
+      `interrupted` (`UnsettledReason` gains it; deviation below).
+    - **Tests.** `test/helpers/StubS3.ts` — a stubbed `S3Client` whose `send` serves the
+      commands from an in-memory bucket (enabled / suspended / never-versioned, CRC-64/NVME
+      validation of uploads and parts, full-object checksums, ranges, tags, delete markers,
+      paginated listings) with a `faults` hook (fail before, lose the answer after, respond,
+      or pause). `test/blob-s3.test.ts` (45): the `[EDD-9116]` checks, every command's shape,
+      single PUT vs multipart checksums, part-size adaptation and part 10,001, interruption and
+      part failures aborting, the `completeLost` rule per answer, unversioned and suspended
+      cleanup (and its fallbacks), copies (encoding, directives, tags, the source's size from
+      `HeadObject` first and the path it picks, `UploadPartCopy`), a `Complete` (of a put and
+      of a multipart copy) held while the call is interrupted running to its answer, never
+      aborted, the `completeLost` rule by attempt count, reads (chunks, ranges,
+      `notFoundRetry`), deletes, listings, marks, presign with a stub and with the real
+      presigner (locally), the classification table, the layers (owned and caller clients)
+      and `layerConfig` (47). `test/Offload.stream.test.ts` gains the §19.2 stubbed-`S3Client`
+      half (14): the same checksum single vs multipart, adaptation and `TooLarge`,
+      interruption, a refused part and a source failure aborting, a lost `Complete` reported,
+      an interruption while a `Complete` (of a put and of a multipart copy) or a `PutObject` is
+      in flight reported as `interrupted`, unversioned buckets, handle copies by `CopyObject`
+      and streamed, the copy's `VersionId` checked, and a multipart copy's lost `Complete`
+      reported; its in-memory half gains a put interrupted after the store wrote, reported by
+      its key. `test/blob-s3.test.ts` also checks that `layerConfig` reads
+      credentials as `DynamoClient.layerConfig` does (none, all, and a key without its secret).
+      `test/CredentialRefusal.test.ts` gains S3's own refusal names (`InvalidAccessKeyId`,
+      `InvalidToken`, `TokenRefreshRequired`), which `redactCredentialRefusal` now lists: every
+      S3 call, the body stream of a read and the presigner run their failures through it.
+      `test/blob-s3-subpath-guard.test.ts` (4). `test/connected.blob-s3.test.ts` (13) against
+      MinIO: §19.4's list, plus a multipart copy, a presigned GET and `layerConfig`.
+    *Deviations (commit 15):*
+    - **Cleanup of a response without a `VersionId`** deletes by `VersionId: "null"` first, as
+      for `"null"` (§12.2 said a plain `DeleteObject`): MinIO omits the `VersionId` in a
+      *suspended* bucket too (F15), where a plain delete would leave a `null` delete marker;
+      in a never-versioned bucket the object is the `null` version, so the delete is exact
+      either way. The plain delete remains the fallback.
+    - **A multipart copy's upload has no checksum algorithm**, and `CopyObject` uses
+      `TaggingDirective: "REPLACE"` (§12.2 above): MinIO refuses `UploadPartCopy` into a
+      checksummed upload, and a copy must not inherit the source's `edd-unref-since` mark.
+    - **`completeLost` on copies.** §12.1 named only a `put`; an `UploadPartCopy` sequence (a
+      copy over 5 GiB) ends in the same `CompleteMultipartUpload`, so the store sets it on a
+      copy too and the ledger reports it (`BlobStoreFailure`'s doc and §12.1 updated).
+    - **`completeLost` is set unless the `Complete` was refused outright** (a 4xx other than
+      429 and `NoSuchUpload`, on the SDK's only attempt) — §7 named only a lost response and
+      `NoSuchUpload`; a throttled answer, a transport failure, or a refusal of a request the
+      SDK resent (a 403 `ExpiredToken`, a 400 `RequestTimeout` on attempt 2 says nothing of
+      attempt 1, which may have completed) may equally follow a completion. It is §6.2's
+      DynamoDB rule (a refusal proves nothing was applied only when `$metadata.attempts === 1`;
+      none reported counts as more) applied to the `Complete`.
+    - **`interrupted` (a new `UnsettledReason`).** §6.2 reported only `completeLost` and
+      `answerRefused` among uploads no entry names, and the uninterruptible `Complete` was
+      meant to keep its answer through an interruption — it cannot: Effect delivers a pending
+      interruption when the uninterruptible region ends and discards the region's result, so
+      a version S3 completed reached no ledger entry and no report (a single `PutObject` or
+      `CopyObject` S3 received before its request was aborted is the same case). The ledger
+      now reports every store `put` / `copy` call that exits interrupted, by its requested key:
+      it cannot see inside the call, so it reports the ones that wrote nothing too (an
+      upload interrupted between its parts, which the driver aborts) — a `gc.sweep` of such an
+      item deletes nothing. A precise report (the store telling the ledger that a committing
+      request was sent) would need a channel outside the `BlobStore` contract, which custom
+      stores could not join, so it was not built. `completeLost` keeps its meaning (a failure,
+      never an interruption).
+    - **Parts are retried by the AWS SDK, not by the store.** §19.2 lists "a part failure
+      retried" for the in-memory simulation and the stubbed `S3Client` alike. The S3 store
+      sends each part once through `S3Client.send`; the SDK's retry strategy resends a failed
+      one from its buffered body (§7). The stub replaces `send`, so the SDK's retry middleware
+      never runs over it: the bullet is covered only by the in-memory store's test (its
+      `partAttempts` simulate the SDK's retry, commit 10), and by the SDK itself.
+    - **CI starts MinIO with a `docker run` step**, not a service container (§19.4's fallback):
+      the pinned `cgr.dev/chainguard/minio` image has no default command (its entrypoint is
+      `minio`), so it needs `server /data` as arguments, which a `docker run` step passes
+      plainly. The step runs first, so MinIO boots while dependencies install, and a wait
+      loop on `/minio/health/live` precedes the connected tests (`S3_ENDPOINT:
+      http://localhost:9000`).
+    - **The connected "outright part failure"** is a part whose checksum is corrupted on its
+      way (a proxy client), which MinIO refuses, not a bucket policy denying `PutObject`:
+      MinIO's root user — the only credentials CI has — bypasses bucket policies. It is the
+      same path: a part S3 refuses after the upload was created.
+    - **`@aws-sdk/s3-request-presigner` is a dev dependency** (tests sign with it); `src`
+      never imports it (guarded), so it is not a peer.
+    - The connected tests list open uploads by **exact key**: MinIO's
+      `ListMultipartUploads` matches a prefix only as a whole key.
+    *Debt fixed (commit 15):*
+    - `.github/workflows/ci.yml`'s "Require changeset or version bump" step checked three of
+      the four lockstep packages' versions (not `packages/schema`, which the release-order
+      gate below it checks); it checks all four.
+    - `internal/BlobLedger.ts`'s `completeLost` report was inline in `putCall`; it is one
+      helper now, shared with the copy path.
+    *Port onto 1.42 (commit 15):* the static-credentials widening this commit made
+      (`internal/AwsCredentials.ts`, `Redacted` secrets) is dropped: main's #254 / #255 gave
+      `DynamoClient` and `DynamoStreamsClient` session tokens and partial-credential checks
+      (`internal/ClientOptions.ts`), and the S3 store's `layerConfig` uses those. MinIO runs
+      in the `connected` job (each shard, both passes), `S3_ENDPOINT` in its environment;
+      `@aws-sdk/client-s3` is an optional peer (not lockstep, so `.pnpmfile.cjs` leaves it),
+      `@aws-sdk/s3-request-presigner` and `@aws-sdk/crc64-nvme` dev dependencies only.
 16. **GC** — `BlobGc`: reaper (table-local candidates, every-record view check, free rules,
     bracketed confirm-read, `confirm` option), per-item two-pass sweep and `sweepPartition`,
     `sweepStore`, purge integration, `EDD-9118` / `9119`; `test/Offload.interleaving.test.ts`

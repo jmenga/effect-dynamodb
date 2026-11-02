@@ -35,6 +35,9 @@ const CREDENTIAL_REFUSALS = [
   "ExpiredTokenException",
   "ExpiredToken",
   "RequestExpired",
+  "InvalidAccessKeyId",
+  "InvalidToken",
+  "TokenRefreshRequired",
 ]
 
 type SdkError = Error & {

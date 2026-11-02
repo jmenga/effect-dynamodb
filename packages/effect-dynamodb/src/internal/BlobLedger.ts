@@ -18,8 +18,9 @@
  *   second key, a later operation or a retry after its upload failed is
  *   refused (`[EDD-9120]`). A handle's content is copied into a new version
  *   (the store's `copy` within the handle's own store, else streamed into a
- *   `put`), never shared. A `put` failure that says its multipart upload may
- *   have completed (`completeLost`) is reported at exit.
+ *   `put`), never shared. A `put` (or `copy`) failure that says its multipart
+ *   upload may have completed (`completeLost`), and a `put` or `copy` an
+ *   interruption cut short (`interrupted`), are reported at exit.
  * - **Settling.** `Capacity.client`, the one place every library DynamoDB
  *   request goes through, hands each write request of a ledger with entries to
  *   {@link guard}: it refuses a request carrying an upload older than its
@@ -36,9 +37,10 @@
  *   `pending` and `rejected` entries are deleted (uninterruptibly, one
  *   `store.delete` per store, best-effort: a failed delete never replaces the
  *   operation's outcome). `inDoubt` entries, failed deletes and uploads whose
- *   version no entry names (a lost multipart completion; a store answer that
- *   names no version of the requested key, which is refused and never
- *   deleted) are logged at `Warning` and delivered to the
+ *   version no entry names (a lost multipart completion; a store call an
+ *   interruption cut short; a store answer that names no version of the
+ *   requested key, which is refused and never deleted) are logged at
+ *   `Warning` and delivered to the
  *   `Offload.layerObserver` observer.
  * - **Read cache.** Each buffered entry's content (the JSON text, or the
  *   bytes) is kept by ref, so decoding what the operation just wrote never
@@ -101,6 +103,14 @@ export type UnsettledReason =
   /** A multipart upload completed but its response was lost: the version has no pointer. */
   | "completeLost"
   /**
+   * The operation was interrupted while a store call (`put` or `copy`) was in
+   * flight: whatever version the store wrote — a `PutObject` or `CopyObject`
+   * it received, a `CompleteMultipartUpload` that answered as the
+   * interruption arrived — has no pointer. Reported for every interrupted
+   * call, written or not: the library cannot see inside the call.
+   */
+  | "interrupted"
+  /**
    * The store's answer to the upload broke the contract (no ref, a ref outside
    * the requested key, a ref it had already returned): whatever version it
    * wrote has no pointer.
@@ -126,7 +136,10 @@ export interface UnsettledUpload {
   readonly rowKey: Readonly<Record<string, unknown>>
   /** The object key. */
   readonly key: string
-  /** The object version; `undefined` when it is unknown (`completeLost`, `answerRefused`). */
+  /**
+   * The object version; `undefined` when it is unknown (`completeLost`,
+   * `interrupted`, `answerRefused`).
+   */
   readonly ref: BlobRef | undefined
   /** The store's `name`. */
   readonly store: string
@@ -227,7 +240,10 @@ export interface Ledger {
   readonly permits: Map<BlobStoreService, Semaphore.Semaphore>
   /** The `ClientRequestToken`s this ledger gave transactions. */
   readonly tokens: Set<string>
-  /** Uploads whose version no entry names (`completeLost`, `answerRefused`): reported at exit. */
+  /**
+   * Uploads whose version no entry names (`completeLost`, `interrupted`,
+   * `answerRefused`): reported at exit.
+   */
   readonly lost: Array<UnsettledUpload>
   closed: boolean
 }
@@ -547,9 +563,47 @@ const record = (
   })
 
 /**
- * A store `put`, its failure wrapped. A failure that says its multipart
- * upload may have completed (`completeLost`) is reported at exit: a version
- * may exist that no ref names (design §7).
+ * Report a failed upload whose multipart upload may have completed
+ * (`completeLost`) at exit: a version may exist that no ref names (design §7).
+ */
+const reportCompleteLost = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  error: BlobStoreError,
+): Effect.Effect<void> =>
+  Effect.sync(() => {
+    if ((error.cause as { readonly completeLost?: unknown } | null)?.completeLost === true) {
+      ledger.lost.push(
+        unsettledOf(spec.target, spec.store, "completeLost", spec.key, undefined, error),
+      )
+    }
+  })
+
+/**
+ * Report a store call (`put` or `copy`) that the operation's interruption
+ * cut short (`interrupted`) at exit. An interruption discards the call's
+ * answer even when the store wrote a version — a `PutObject` it received
+ * before the request was aborted, a `CompleteMultipartUpload` that answered
+ * as the interruption arrived (the S3 store completes uninterruptibly, so the
+ * answer comes, but the caller never sees it). The ledger cannot tell from
+ * outside the call whether anything was written, so it reports every
+ * interrupted call: a `gc.sweep` of an item with nothing left behind deletes
+ * nothing. A call that also failed is the failure's to report.
+ */
+const reportInterrupted =
+  (ledger: Ledger, spec: UploadSpec) =>
+  <A>(exit: Exit.Exit<A, BlobStoreError>): Effect.Effect<void> =>
+    Effect.sync(() => {
+      if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
+        ledger.lost.push(
+          unsettledOf(spec.target, spec.store, "interrupted", spec.key, undefined, undefined),
+        )
+      }
+    })
+
+/**
+ * A store `put`, its failure wrapped (and reported when its completion may be
+ * lost, or when an interruption cut it short).
  */
 const putCall = (
   ledger: Ledger,
@@ -558,15 +612,8 @@ const putCall = (
   request: BlobPutRequest,
 ): Effect.Effect<BlobPutResult, BlobStoreError> =>
   call(spec.store, "put", ctx, { key: spec.key }, () => spec.store.put(request)).pipe(
-    Effect.tapError((error) =>
-      Effect.sync(() => {
-        if ((error.cause as { readonly completeLost?: unknown } | null)?.completeLost === true) {
-          ledger.lost.push(
-            unsettledOf(spec.target, spec.store, "completeLost", spec.key, undefined, error),
-          )
-        }
-      }),
-    ),
+    Effect.tapError((error) => reportCompleteLost(ledger, spec, error)),
+    Effect.onExit(reportInterrupted(ledger, spec)),
   )
 
 const memoOf = (ledger: Ledger, store: BlobStoreService): Map<string, Memo> => {
@@ -888,6 +935,10 @@ const copyUpload = (
               contentType: spec.contentType,
               metadata: metadataOf(spec, handle.checksum),
             }),
+          ).pipe(
+            // A copy over the store's single-request limit is a multipart one too.
+            Effect.tapError((error) => reportCompleteLost(ledger, spec, error)),
+            Effect.onExit(reportInterrupted(ledger, spec)),
           ),
         )
         return yield* record(ledger, spec, ctx, {
@@ -1427,6 +1478,9 @@ const MESSAGES: Readonly<Record<UnsettledReason, string>> = {
   completeLost:
     "its multipart upload completed but the response was lost, so the version it made has no " +
     "pointer; it is left for gc.sweep",
+  interrupted:
+    "the operation was interrupted while the store call was in flight, so a version the store " +
+    "may have written has no pointer; it is left for gc.sweep",
   answerRefused:
     "the store's answer to it broke the BlobStore contract and was refused, so the version it " +
     "wrote, if any, has no pointer; it is left for gc.sweep",

@@ -33,11 +33,13 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
   /** The object version involved, when there is one. */
   readonly ref?: BlobRef | undefined
   /**
-   * A `put` whose multipart upload may have completed although its response
-   * was lost (a `CompleteMultipartUpload` that failed without an answer, or
-   * whose retry found no upload): a version may exist that no ref names. The
-   * library reports the requested key to the observer (`completeLost`) for
-   * `gc.sweep`.
+   * A `put` (or a `copy`) whose multipart upload may have completed although
+   * its response was lost (a `CompleteMultipartUpload` that failed without an
+   * answer, or whose retry found no upload): a version may exist that no ref
+   * names. The library reports the requested key to the observer
+   * (`completeLost`) for `gc.sweep`. An interrupted call needs no flag: the
+   * library reports every `put` or `copy` that exits interrupted itself
+   * (`interrupted`).
    */
   readonly completeLost?: boolean | undefined
   /** The store's own error (for the S3 store, the SDK error). */

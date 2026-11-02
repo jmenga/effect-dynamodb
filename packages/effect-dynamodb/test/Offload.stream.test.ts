@@ -8,9 +8,16 @@
  * is not bytes, a put that answers before its body ended, an upload past
  * `maxUploadAge`), a version DynamoDB refused is rolled back, a lost
  * `Complete` is reported, handles are copied (with and without `copy`, the
- * copy's answer checked), and streams are single-use (`[EDD-9120]`).
+ * copy's answer checked), and streams are single-use (`[EDD-9120]`). The
+ * same paths run through the S3 store over a stubbed `S3Client`
+ * (`test/helpers/StubS3.ts`): the checksum S3 is sent, part-size adaptation
+ * and part 10,001, aborts on interruption and on part and source failures, a
+ * lost `Complete` (of a put and of a multipart copy), an interruption while
+ * a `Complete` or a `PutObject` is in flight reported, unversioned buckets,
+ * and handle copies by `CopyObject` (its `VersionId` checked) or streamed.
  *
- * Rows are the in-memory tables'; objects the in-memory store's.
+ * Rows are the in-memory tables'; objects the in-memory store's or the
+ * stubbed bucket's.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -25,6 +32,12 @@ import { TestClock } from "effect/testing"
 import { beforeEach } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { BlobStore, type BlobStoreService, type MemoryBlobStoreOptions } from "../src/BlobStore.js"
+import {
+  copySourceOf,
+  makeService,
+  resolveOptions,
+  type S3Tuning,
+} from "../src/blob/S3BlobStore.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as BlobLedger from "../src/internal/BlobLedger.js"
@@ -38,6 +51,7 @@ import {
   resetStore,
   store as rows,
 } from "./helpers/InMemoryTables.js"
+import { makeGate, makeStubS3, type StubS3, s3Error, transportError } from "./helpers/StubS3.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -324,6 +338,34 @@ describe("Offload — binary inputs and streaming", () => {
       })
       expect(store.inspect().versions).toEqual([])
       expect(rows.size).toBe(0)
+      // The library cannot see inside the store call: an interrupted one is
+      // reported whether or not the store wrote anything.
+      expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
+    }),
+  )
+
+  it.effect("a put interrupted after the store wrote is reported (interrupted), by its key", () =>
+    Effect.gen(function* () {
+      const store = memory({
+        failures: (call) =>
+          call.action === "put" ? { _tag: "Interrupt", at: "response" } : undefined,
+      })
+      const exit = yield* Effect.exit(
+        withDb(store, (db) => db.entities.Docs.put(doc("a", { scan: bytes(20) }))),
+      )
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(rows.size).toBe(0)
+      expect(reports).toHaveLength(1)
+      expect(reports[0]).toMatchObject({
+        reason: "interrupted",
+        entityType: "Doc",
+        attribute: "scan",
+        operation: "Entity.put",
+        ref: undefined,
+      })
+      // The version the store wrote has no pointer: under the reported key, for gc.sweep.
+      const [orphan] = store.inspect().versions
+      expect(orphan!.ref.key).toBe(reports[0]!.key)
     }),
   )
 
@@ -908,6 +950,385 @@ describe("Offload — sources, refusals and single-use streams", () => {
       const refs = readings.map((item) => pointerOf(item.raw).ref)
       expect(refs[0]).toEqual(refs[1])
       expect(store.inspect().calls.put).toBe(3)
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Through the S3 store (a stubbed S3Client)
+// ---------------------------------------------------------------------------
+
+describe("Offload — streaming through the S3 store (stubbed S3Client)", () => {
+  /**
+   * The S3 store over `stub`, its parts `partSize` bytes (S3's 5 MiB minimum
+   * is the bucket's to enforce; the stub does not).
+   */
+  const s3 = (stub: StubS3, partSize = 8, tuning: Partial<S3Tuning> = {}): BlobStoreService =>
+    makeService(
+      {
+        ...resolveOptions("test", { bucket: "test-bucket", prefix: "app/", client: stub.client }),
+        partSize,
+      },
+      stub.client,
+      { maxCopyObjectBytes: 5 * 1024 ** 3, maxParts: 10_000, ...tuning },
+    )
+
+  const count = (stub: StubS3, name: string): number => stub.inputs(name).length
+
+  /**
+   * Interrupt `fiber` while one of its calls is held by a gate, then release
+   * the gate: the interruption is registered before the call answers.
+   */
+  const interruptWhileHeld = <A, E>(fiber: Fiber.Fiber<A, E>, release: () => void) =>
+    Effect.gen(function* () {
+      const interrupter = yield* Effect.forkChild(Fiber.interrupt(fiber), {
+        startImmediately: true,
+      })
+      release()
+      const exit = yield* Fiber.await(fiber)
+      yield* Fiber.join(interrupter)
+      return exit
+    })
+
+  /** Put `a` with `content`, then read its lazy handle. */
+  const handleOf = (store: BlobStoreService, content: Uint8Array) =>
+    withDb(store, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Docs.put(doc("a", { scan: content }))
+        const read = yield* db.entities.Docs.get({ docId: "a" })
+        return read.scan!
+      }),
+    )
+
+  it.effect("single PUT and multipart give the same checksum, sent to S3 and in the pointer", () =>
+    Effect.gen(function* () {
+      const content = bytes(30)
+      const singleStub = makeStubS3()
+      yield* withDb(s3(singleStub, 64), (db) => db.entities.Docs.put(doc("a", { scan: content })))
+      const viaSingle = pointerOf(live("Doc", "docId", "a")!.scan)
+      resetStore()
+      const multiStub = makeStubS3()
+      const multi = s3(multiStub)
+      yield* withDb(multi, (db) => db.entities.Docs.put(doc("a", { scan: chunked(content, 7) })))
+      const viaMulti = pointerOf(live("Doc", "docId", "a")!.scan)
+      expect(singleStub.names()).toEqual(["PutObject"])
+      expect(count(multiStub, "UploadPart")).toBe(4)
+      expect(count(multiStub, "CompleteMultipartUpload")).toBe(1)
+      expect(viaMulti.checksum.value).toEqual(crc64nvme(content))
+      expect(viaMulti.checksum.value).toEqual(viaSingle.checksum.value)
+      // S3 was sent (and the stub validated) the same full-object value.
+      expect(multiStub.inputs("CompleteMultipartUpload")[0].ChecksumCRC64NVME).toBe(
+        singleStub.inputs("PutObject")[0].ChecksumCRC64NVME,
+      )
+      // The pointer names the version S3 answered.
+      expect(multiStub.version(viaMulti.ref.key, viaMulti.ref.version)?.bytes).toEqual(content)
+      const read = yield* withDb(multi, (db) =>
+        db.entities.Docs.get({ docId: "a" }).offloaded("eager"),
+      )
+      expect(read.scan).toEqual(content)
+    }),
+  )
+
+  it.effect("adapts the part size to a known contentLength; part maxParts + 1 is TooLarge", () =>
+    Effect.gen(function* () {
+      const content = bytes(40)
+      const stub = makeStubS3({ maxParts: 5 })
+      const store = s3(stub, 4, { maxParts: 5 })
+      yield* withDb(store, (db) =>
+        db.entities.Docs.put(
+          doc("a", { scan: Offload.source(chunked(content, 9), { contentLength: 40 }) }),
+        ),
+      )
+      // ceil(40 / 5) = 8-byte parts: five of them.
+      expect(stub.inputs("UploadPart").map((part) => part.Body.length)).toEqual([8, 8, 8, 8, 8])
+      const error = blobFailure(
+        yield* Effect.exit(
+          withDb(store, (db) => db.entities.Docs.put(doc("b", { scan: chunked(content, 9) }))),
+        ),
+      )
+      expect(error.reason).toBe("TooLarge")
+      expect(error.action).toBe("put")
+      expect(live("Doc", "docId", "b")).toBeUndefined()
+      expect(count(stub, "AbortMultipartUpload")).toBe(1)
+      expect(stub.uploads.size).toBe(0)
+      expect(stub.objects.size).toBe(1)
+    }),
+  )
+
+  it.effect("interrupting an upload aborts it: no Complete, nothing written", () =>
+    Effect.gen(function* () {
+      let started: () => void = () => undefined
+      const partTwo = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      const stub = makeStubS3({
+        faults: (call) => {
+          if (call.name !== "UploadPart" || call.input.PartNumber !== 2) return undefined
+          started()
+          // Never answers: only the interruption's abort signal ends it.
+          return new Promise<never>(() => undefined)
+        },
+      })
+      const fiber = yield* withDb(s3(stub), (db) =>
+        db.entities.Docs.put(doc("a", { scan: chunked(bytes(40), 8) })),
+      ).pipe(Effect.forkChild)
+      yield* Effect.promise(() => partTwo)
+      yield* Fiber.interrupt(fiber)
+      expect(count(stub, "CreateMultipartUpload")).toBe(1)
+      expect(count(stub, "AbortMultipartUpload")).toBe(1)
+      expect(count(stub, "CompleteMultipartUpload")).toBe(0)
+      expect(stub.uploads.size).toBe(0)
+      expect(stub.objects.size).toBe(0)
+      expect(rows.size).toBe(0)
+      expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
+    }),
+  )
+
+  it.effect("an upload interrupted while its Complete is in flight is reported (interrupted)", () =>
+    Effect.gen(function* () {
+      const gate = makeGate()
+      const stub = makeStubS3({
+        faults: (call) => (call.name === "CompleteMultipartUpload" ? gate.hold() : undefined),
+      })
+      const fiber = yield* withDb(s3(stub), (db) =>
+        db.entities.Docs.put(doc("a", { scan: chunked(bytes(40), 8) })),
+      ).pipe(Effect.forkChild)
+      yield* Effect.promise(() => gate.reached)
+      const exit = yield* interruptWhileHeld(fiber, gate.release)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(rows.size).toBe(0)
+      // S3 completed it, and the upload is never aborted; the answer was lost
+      // to the interruption, so the version has no pointer: reported by key.
+      expect(count(stub, "AbortMultipartUpload")).toBe(0)
+      expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
+      expect(reports[0]).toMatchObject({ entityType: "Doc", attribute: "scan", ref: undefined })
+      const [complete] = stub.inputs("CompleteMultipartUpload")
+      expect(reports[0]!.key).toBe(complete.Key)
+      expect(stub.objects.get(complete.Key)).toHaveLength(1)
+    }),
+  )
+
+  it.effect("a single PutObject interrupted mid-flight is reported (interrupted)", () =>
+    Effect.gen(function* () {
+      const gate = makeGate()
+      const stub = makeStubS3({
+        // Never answers: only the interruption's abort signal ends it.
+        faults: (call) => (call.name === "PutObject" ? gate.hold() : undefined),
+      })
+      const fiber = yield* withDb(s3(stub, 64), (db) =>
+        db.entities.Docs.put(doc("a", { scan: bytes(30) })),
+      ).pipe(Effect.forkChild)
+      yield* Effect.promise(() => gate.reached)
+      yield* Fiber.interrupt(fiber)
+      expect(rows.size).toBe(0)
+      // S3 may have stored the body before the request was aborted.
+      expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
+      expect(reports[0]!.key).toBe(stub.inputs("PutObject")[0].Key)
+    }),
+  )
+
+  it.effect("a part S3 refuses fails the write and aborts the upload; nothing is written", () =>
+    Effect.gen(function* () {
+      const stub = makeStubS3({
+        faults: (call) =>
+          call.name === "UploadPart" && call.input.PartNumber === 2
+            ? { _tag: "fail", error: s3Error("AccessDenied", 403) }
+            : undefined,
+      })
+      const error = blobFailure(
+        yield* Effect.exit(
+          withDb(s3(stub), (db) => db.entities.Docs.put(doc("a", { scan: chunked(bytes(40), 8) }))),
+        ),
+      )
+      expect(error.reason).toBe("AccessDenied")
+      expect(error.action).toBe("put")
+      expect(count(stub, "AbortMultipartUpload")).toBe(1)
+      expect(count(stub, "CompleteMultipartUpload")).toBe(0)
+      expect(stub.uploads.size).toBe(0)
+      expect(stub.objects.size).toBe(0)
+      expect(rows.size).toBe(0)
+    }),
+  )
+
+  it.effect("a source failure is SourceFailed: every upload created is aborted", () =>
+    Effect.gen(function* () {
+      const stub = makeStubS3()
+      const source = Stream.concat(chunked(bytes(20), 4), Stream.fail(new Error("disk gone")))
+      const error = blobFailure(
+        yield* Effect.exit(
+          withDb(s3(stub), (db) => db.entities.Docs.put(doc("a", { scan: source }))),
+        ),
+      )
+      expect(error.reason).toBe("SourceFailed")
+      expect(String((error.cause as { readonly cause?: unknown }).cause)).toMatch(/disk gone/)
+      expect(count(stub, "AbortMultipartUpload")).toBe(count(stub, "CreateMultipartUpload"))
+      expect(count(stub, "CompleteMultipartUpload")).toBe(0)
+      expect(stub.uploads.size).toBe(0)
+      expect(stub.objects.size).toBe(0)
+      expect(rows.size).toBe(0)
+    }),
+  )
+
+  it.effect(
+    "a Complete whose response is lost is reported (completeLost); nothing is written",
+    () =>
+      Effect.gen(function* () {
+        const stub = makeStubS3({
+          faults: (call) =>
+            call.name === "CompleteMultipartUpload"
+              ? { _tag: "lost", error: transportError() }
+              : undefined,
+        })
+        const error = blobFailure(
+          yield* Effect.exit(
+            withDb(s3(stub), (db) =>
+              db.entities.Docs.put(doc("a", { scan: chunked(bytes(20), 6) })),
+            ),
+          ),
+        )
+        expect(error.reason).toBe("Unavailable")
+        expect(rows.size).toBe(0)
+        expect(reports).toHaveLength(1)
+        expect(reports[0]).toMatchObject({
+          reason: "completeLost",
+          entityType: "Doc",
+          attribute: "scan",
+          ref: undefined,
+        })
+        // S3 completed it: a version no pointer names, under the reported key, for gc.sweep.
+        expect(stub.objects.get(reports[0]!.key)).toHaveLength(1)
+        expect(stub.objects.size).toBe(1)
+      }),
+  )
+
+  it.effect("a put into a bucket without versioning is Unversioned; nothing is left", () =>
+    Effect.gen(function* () {
+      for (const versioning of ["Unversioned", "Suspended"] as const) {
+        resetStore()
+        const stub = makeStubS3({ versioning })
+        const error = blobFailure(
+          yield* Effect.exit(
+            withDb(s3(stub, 64), (db) => db.entities.Docs.put(doc("a", { scan: bytes(30) }))),
+          ),
+        )
+        expect(error.reason).toBe("Unversioned")
+        expect(error.action).toBe("put")
+        expect(rows.size).toBe(0)
+        expect(stub.objects.size).toBe(0)
+        expect(stub.deleteMarkers.size).toBe(0)
+      }
+    }),
+  )
+
+  it.effect("copies a handle with CopyObject, by its version; the pointer names the copy", () =>
+    Effect.gen(function* () {
+      const stub = makeStubS3()
+      const store = s3(stub)
+      const content = bytes(12)
+      const handle = yield* handleOf(store, content)
+      const source = Option.getOrThrow(handle.ref)
+      yield* withDb(store, (db) => db.entities.Docs.put(doc("b", { scan: handle })))
+      const [copy] = stub.inputs("CopyObject")
+      expect(copy.CopySource).toBe(copySourceOf("test-bucket", source))
+      expect(copy.MetadataDirective).toBe("REPLACE")
+      const pointer = pointerOf(live("Doc", "docId", "b")!.scan)
+      expect(pointer.ref.key).toBe(copy.Key)
+      expect(pointer.ref.key).not.toBe(source.key)
+      expect(stub.version(pointer.ref.key, pointer.ref.version)?.bytes).toEqual(content)
+      expect(pointer.checksum.value).toEqual(handle.checksum.value)
+      const read = yield* withDb(store, (db) =>
+        db.entities.Docs.get({ docId: "b" }).offloaded("eager"),
+      )
+      expect(read.scan).toEqual(content)
+    }),
+  )
+
+  it.effect("streams a handle into a PutObject without the copy capability", () =>
+    Effect.gen(function* () {
+      const stub = makeStubS3()
+      const { copy: _copy, ...noCopy } = s3(stub, 64)
+      const content = bytes(12)
+      const handle = yield* handleOf(noCopy, content)
+      yield* withDb(noCopy, (db) => db.entities.Docs.put(doc("b", { scan: handle })))
+      expect(count(stub, "CopyObject")).toBe(0)
+      expect(count(stub, "GetObject")).toBe(1)
+      expect(count(stub, "PutObject")).toBe(2)
+      const pointer = pointerOf(live("Doc", "docId", "b")!.scan)
+      expect(stub.version(pointer.ref.key, pointer.ref.version)?.bytes).toEqual(content)
+    }),
+  )
+
+  it.effect("checks the copy's VersionId: a copy into a suspended bucket is Unversioned", () =>
+    Effect.gen(function* () {
+      const stub = makeStubS3()
+      const store = s3(stub)
+      const handle = yield* handleOf(store, bytes(12))
+      const source = Option.getOrThrow(handle.ref)
+      stub.versioning = "Suspended"
+      const error = blobFailure(
+        yield* Effect.exit(withDb(store, (db) => db.entities.Docs.put(doc("b", { scan: handle })))),
+      )
+      expect(error.reason).toBe("Unversioned")
+      expect(error.action).toBe("copy")
+      expect(live("Doc", "docId", "b")).toBeUndefined()
+      // The copy was deleted; its source is untouched.
+      const [copy] = stub.inputs("CopyObject")
+      expect(stub.objects.get(copy.Key)).toBeUndefined()
+      expect(stub.version(source.key, source.version)).toBeDefined()
+      expect(stub.deleteMarkers.size).toBe(0)
+    }),
+  )
+
+  it.effect("a multipart copy whose Complete response is lost is reported (completeLost)", () =>
+    Effect.gen(function* () {
+      // The second Complete (the copy's; the first is the source's put) is lost.
+      const stub = makeStubS3({
+        faults: (call) =>
+          call.name === "CompleteMultipartUpload" && call.n === 2
+            ? { _tag: "lost", error: transportError() }
+            : undefined,
+      })
+      // Copies over 16 bytes run as UploadPartCopy ranges.
+      const store = s3(stub, 8, { maxCopyObjectBytes: 16 })
+      const handle = yield* handleOf(store, bytes(40))
+      const error = blobFailure(
+        yield* Effect.exit(withDb(store, (db) => db.entities.Docs.put(doc("b", { scan: handle })))),
+      )
+      expect(error.reason).toBe("Unavailable")
+      expect(error.action).toBe("copy")
+      expect(count(stub, "UploadPartCopy")).toBe(5)
+      expect(live("Doc", "docId", "b")).toBeUndefined()
+      expect(reports.map((report) => report.reason)).toEqual(["completeLost"])
+      const [create] = stub.inputs("CreateMultipartUpload").slice(-1)
+      expect(reports[0]!.key).toBe(create.Key)
+      // S3 completed it: a version no pointer names, for gc.sweep.
+      expect(stub.objects.get(create.Key)).toHaveLength(1)
+    }),
+  )
+
+  it.effect("a multipart copy interrupted while its Complete is in flight is reported", () =>
+    Effect.gen(function* () {
+      const gate = makeGate()
+      // The second Complete (the copy's; the first is the source's put) is held.
+      const stub = makeStubS3({
+        faults: (call) =>
+          call.name === "CompleteMultipartUpload" && call.n === 2 ? gate.hold() : undefined,
+      })
+      const store = s3(stub, 8, { maxCopyObjectBytes: 16 })
+      const handle = yield* handleOf(store, bytes(40))
+      reports.length = 0
+      const fiber = yield* withDb(store, (db) =>
+        db.entities.Docs.put(doc("b", { scan: handle })),
+      ).pipe(Effect.forkChild)
+      yield* Effect.promise(() => gate.reached)
+      const exit = yield* interruptWhileHeld(fiber, gate.release)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(live("Doc", "docId", "b")).toBeUndefined()
+      expect(count(stub, "AbortMultipartUpload")).toBe(0)
+      expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
+      const [create] = stub.inputs("CreateMultipartUpload").slice(-1)
+      expect(reports[0]!.key).toBe(create.Key)
+      expect(stub.objects.get(create.Key)).toHaveLength(1)
     }),
   )
 })

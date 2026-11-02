@@ -197,6 +197,9 @@ export type ViewOf<O extends OffloadState> = View<O["item"], O["fields"], O["mod
  *   version failed: the version is left behind;
  * - `completeLost` — a multipart upload completed but its response was lost:
  *   the version it made has no pointer;
+ * - `interrupted` — the operation was interrupted while an upload was in
+ *   flight: a version the store may have written has no pointer (reported
+ *   for every interrupted upload, since the library cannot tell);
  * - `answerRefused` — the store's answer to an upload broke the `BlobStore`
  *   contract (no ref, a ref outside the requested key, a ref it had already
  *   returned) and was refused: the version it wrote, if any, has no pointer.

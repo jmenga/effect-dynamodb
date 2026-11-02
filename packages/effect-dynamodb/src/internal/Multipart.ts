@@ -3,9 +3,9 @@
  * §7): it decides between one `PutObject`-like call and a multipart upload,
  * re-chunks the body into parts of exactly `partSize` bytes (the last may be
  * shorter), uploads them at the store's `uploadConcurrency`, completes the
- * upload, and aborts it — in an uninterruptible finalizer, after in-flight
- * parts are interrupted — on any failure or interruption between create and
- * complete.
+ * upload (uninterruptibly), and aborts it — in an uninterruptible finalizer,
+ * after in-flight parts are interrupted — on any failure or interruption
+ * between create and complete.
  *
  * ```
  * body ≤ partSize (buffered, or a stream that ends within one part) → single
@@ -143,7 +143,10 @@ export interface MultipartProtocol<U, P> {
   readonly create: Effect.Effect<U, BlobStoreFailure>
   /** Upload one part (retrying as the store's client does). */
   readonly part: (upload: U, request: PartRequest) => Effect.Effect<P, BlobStoreFailure>
-  /** Complete the upload from its parts, in order. */
+  /**
+   * Complete the upload from its parts, in order. The driver runs it
+   * uninterruptibly, so a sent `Complete` is never abandoned mid-request.
+   */
   readonly complete: (
     upload: U,
     parts: ReadonlyArray<P>,
@@ -217,9 +220,18 @@ export const upload = <U, P>(
       if (first._tag === "Single") return first.result
       const handle = yield* create
       const parts = outcomes.flatMap((outcome) => (outcome._tag === "Part" ? [outcome.part] : []))
-      const result = yield* protocol.complete(handle, parts)
-      completed = true
-      return result
+      // Uninterruptible, with `completed` set in the same region: a sent
+      // Complete runs to its answer, and a completed upload is never aborted.
+      // An interruption that arrives meanwhile is delivered when the region
+      // ends, so the caller never sees that answer: the upload ledger reports
+      // an interrupted put by its key (`interrupted`).
+      return yield* Effect.uninterruptible(
+        Effect.tap(protocol.complete(handle, parts), () =>
+          Effect.sync(() => {
+            completed = true
+          }),
+        ),
+      )
     })
     return run.pipe(
       Effect.onExit((exit) => {
