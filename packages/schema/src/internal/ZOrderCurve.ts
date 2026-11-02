@@ -1,8 +1,9 @@
 /**
  * @internal ZOrderCurve — the algebra behind Z-order sort keys (#171).
  *
- * A declared `ZOrder.Dimension` is bound per entity and field (its storage
- * resolved from the field's schema) into a {@link BoundDimension}; the bound
+ * A declared `sk.zorder` entry, resolved against its field (its kind and
+ * storage from the field's schema, `internal/ZOrderDimension.ts`), is bound
+ * per entity and field into a {@link BoundDimension}; the bound
  * dimensions of one sort key form a {@link Layout}. This module owns:
  *
  * - quantization: a key-form value → its level (`BoundDimension.quantize`);

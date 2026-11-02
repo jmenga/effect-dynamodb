@@ -5,11 +5,26 @@
 "@effect-dynamodb/language-service": minor
 ---
 
-Z-order indexes (`sk.zorder`, `sk.prefix`, `ZOrder.*`) with binary sort keys and `.within()`
-queries (`naive` / `jump` / `precise`), skip-scan for bounds on non-leading sort-key composites,
+Z-order indexes (`sk.zorder`, `sk.prefix`) with binary sort keys and `.within()` queries
+(`naive` / `jump` / `precise`), skip-scan for bounds on non-leading sort-key composites,
 `.explain()` / `.onRequest()`, and cursor v2. Key text now sorts the way values do, and
 `db.tables.<Table>.rekey()` moves the rows 1.36 wrote to their new keys ("Upgrading from 1.36"
 below).
+
+A Z-order dimension is a plain entry in `sk.zorder`, typed from the model: a bare field name, or
+`{ field, ...options }` whose options follow the field's type (`{ min, max, step? }` for a
+`number` or `bigint`, `{ from, unit, bits }` for a date, the bare name or `{ values?, bits? }` for
+a literal union or `boolean`, `{ bytes }` for a `string`, `{ values, bits? }` for a plain `string`
+or `number`). The editor completes the field names and options. `ZOrder` exports the entry types
+only. `Entity.make` checks entries at runtime too, and refuses an unknown option (`EDD-9087`).
+
+Every definition config that names a model attribute is now typed from the model: `Entity.make`
+key and index composites, `sk.prefix`, `refs` keys, `unique`, `timeSeries.orderBy` /
+`appendInput`, `generatedId.field` and vector index fields; `DynamoModel.configure` keys;
+`Aggregate.make` composites, `context`, `edges` keys and `many` edges' `sk.composite`;
+`Collections.member` / `Collections.make`; and `GeoIndex.make`'s `index` and `fields`. The editor
+completes the names. Physical attribute names (key `field`s, `configure` renames, timestamp,
+version and TTL names) stay strings.
 
 **Behaviour change: adaptive request sizing is now the default** for queries with `.limit()`, a
 filter, `filterBy` predicate or history rows, and no `.pageSize()` or `.maxPages()`. Each
@@ -196,6 +211,23 @@ overwrite different history now ends "The write was not made." (was "Nothing was
 **Behaviour change:** an attribute declared both as a key attribute and as a vector filter
 attribute of another type now throws `EDD-9091` at `Table.make` / `Table.definition`, instead of
 silently keeping the first type.
+
+**Behaviour change:** `Entity.make` now refuses a `unique` constraint field the model doesn't have
+(`EDD-9002`) and a `timeSeries.appendInput` field the model doesn't have (`EDD-9013`); both were
+accepted and the field silently ignored.
+
+**Type changes: misspelled attribute names no longer compile.** Each position listed above
+accepts only the model's field names (an index composite also takes a ref's `${ref}Id` once
+`refs` declares it), so code that named an attribute the model lacks, which ran only if the name
+was never used at runtime, is now a compile error on that name. A config declared outside the
+call (a shared `primaryKey`, an index or a `zorder` list in a variable) needs `as const`, or a
+generic helper, to keep its names literal: widened to `string[]`, they no longer fit the model's
+names. `DynamoModel.configure` refuses a key the model doesn't have even beside valid ones.
+`Collections.make`'s `composite` accepts only fields every member's model has. `GeoIndex.make`'s
+`index` accepts only the entity's index names. `Entity.make`'s `TRefs` type parameter now follows
+`TEntityType` and has no default (left out, refs still resolve to `undefined`), and
+`Aggregate.make` lists its top-level overload first, so `Parameters<typeof Aggregate.make>` reads
+the sub-aggregate form.
 
 **Type changes:** `KeyComposer.composeIndexKeys` / `tryComposeIndexKeys` / `composeAllKeys` and
 `GsiUpdateResult.sets` values widen to `string | Uint8Array` (bytes only for Z-order halves).

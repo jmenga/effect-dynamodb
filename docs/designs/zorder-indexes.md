@@ -164,72 +164,76 @@ Pure TypeScript over `bigint` and `Uint8Array`. No `@aws-sdk`, no `node:*`, no `
 AWS-free and Node-free guards cover it automatically). Exported from the schema barrel as a
 namespace and re-exported from `effect-dynamodb` (`src/index.ts`, pattern at `:73-86`).
 
-The **public** surface is the dimension constructors and their types only. A declared `Dimension`
-is a spec: it knows nothing about the entity or field it will be bound to.
+The **public** surface is types only *(A13, owner 2026-11-01)*. A dimension is declared as a plain
+entry in `sk.zorder`: a bare field name, or `{ field, ...options }`. The field's type is already in
+the model, so the entry never restates it; its options say only how to quantize the values, and
+which options it takes follows from the field's type (`DimensionFor`). An entry is a spec: it
+knows nothing about the entity it will be bound to.
 
 ```ts
-export const DimensionTypeId: unique symbol = Symbol.for("@effect-dynamodb/ZOrder/Dimension")
-export type DimensionTypeId = typeof DimensionTypeId
-
 export type DimensionKind = "int" | "float" | "dateTime" | "literals" | "string"
 export type DateTimeUnit = "milliseconds" | "seconds" | "minutes" | "hours" | "days" | "weeks"
+export type LiteralValue = string | number | boolean
 
-/** One interleaved facet as declared: a model field name, a kind and its options. */
-export interface Dimension<
-  F extends string = string,
-  K extends DimensionKind = DimensionKind,
-  L = never, // literal members, for `literals` only
-> extends Pipeable, Inspectable {
-  readonly [DimensionTypeId]: DimensionTypeId
+export interface NumericDimension<F extends string = string> {       // number | bigint field
   readonly field: F
-  readonly kind: K
-  /** Declared or derived bit width (§4.1). */
-  readonly bits: number
-  /** @internal The declaration, as plain data, for fingerprints and `explain`. */
-  readonly spec: DimensionSpec
+  readonly min: number
+  readonly max: number
+  readonly step?: number | undefined                                  // default 1
 }
+export interface DateTimeDimension<F extends string = string> {      // date field
+  readonly field: F
+  readonly from: string | Date | DateTime.DateTime
+  readonly unit: DateTimeUnit
+  readonly bits: number
+}
+export interface LiteralsDimension<F extends string = string, L = LiteralValue> { // literal union, boolean
+  readonly field: F
+  readonly values?: ReadonlyArray<L> | undefined                      // reorders; lists every member
+  readonly bits?: number | undefined                                  // reserve room for members added later
+}
+export interface ListedLiteralsDimension<F extends string = string, L = LiteralValue>
+  extends LiteralsDimension<F, L> {                                   // plain string | number field
+  readonly values: ReadonlyArray<L>
+}
+export interface StringDimension<F extends string = string> {        // string field
+  readonly field: F
+  readonly bytes: number
+}
+export type AnyDimension = string | NumericDimension | DateTimeDimension | LiteralsDimension | StringDimension
 
-export const int: <const F extends string>(
-  field: F,
-  options: { readonly min: number; readonly max: number; readonly step?: number | undefined },
-) => Dimension<F, "int">
-
-export const float: <const F extends string>(
-  field: F,
-  options: { readonly min: number; readonly max: number; readonly step: number },
-) => Dimension<F, "float">
-
-export const dateTime: <const F extends string>(
-  field: F,
-  options: {
-    readonly from: string | Date | DateTime.DateTime
-    readonly unit: DateTimeUnit
-    readonly bits: number
-  },
-) => Dimension<F, "dateTime">
-
-export const literals: <const F extends string, const L extends ReadonlyArray<string | number | boolean>>(
-  field: F,
-  values: L,
-  options?: { readonly bits?: number | undefined }, // reserve room for values appended later
-) => Dimension<F, "literals", L[number]>
-
-export const string: <const F extends string>(
-  field: F,
-  options: { readonly bytes: number },
-) => Dimension<F, "string">
+/** The entries a field `F` of model type `V` takes (any entry when `V` is unknown). */
+export type DimensionFor<F extends string, V> = /* number → Numeric | ListedLiterals<number>;
+  bigint → Numeric; date → DateTime; string literal union → F | Literals | String;
+  number literal union → F | Literals | Numeric; boolean / mixed literal union → F | Literals;
+  string → String | ListedLiterals<string>; anything else → never */
+/** The entries of a model with fields `TFields` (name → model type), field by field. */
+export type Dimension<TFields = Record<string, unknown>> = {
+  readonly [F in keyof TFields & string]-?: DimensionFor<F, TFields[F]>
+}[keyof TFields & string]
 
 /** A sort-key prefix composite: exact-match, in front of the address. */
-export type PrefixPart = string | { readonly field: string; readonly hash: number }
-
-export const isDimension: (u: unknown) => u is Dimension
+export type PrefixPart<F extends string = string> = F | { readonly field: F; readonly hash: number }
 ```
 
-`Dimension` carries a `TypeId` and implements `Pipeable` + `Inspectable`, per the coding
-conventions. Constructors validate their options eagerly and throw `[EDD-9087]` (§13).
+`Entity.make` types `sk.zorder` as `ReadonlyArray<Dimension<ModelFields<TModel>>>` (and `prefix`
+as `PrefixPart<field names>`), so the editor completes the field names and each field's options,
+and a misspelled field, an option of another kind or a bare name on a field without members is a
+compile error on that entry. At runtime `normalizeGsiConfig` checks each entry without the model
+(`declareDimension`: its form, `[EDD-9086]`; its options, an unknown option included,
+`[EDD-9087]`), and `Entity.make` resolves it against its field (`resolveDimension`, `[EDD-9088]`):
+a range is `int` when `min`, `max` and `step` are all integers and `float` otherwise (a `bigint`
+field takes integers only), and a bare literal-union entry takes the schema's members in order.
+
+The first design declared dimensions with constructors (`ZOrder.int(field, options)`,
+`ZOrder.float`, `ZOrder.dateTime`, `ZOrder.literals(field, values, options)`, `ZOrder.string`)
+returning a `Dimension` value with a `TypeId`, `Pipeable` and `Inspectable`. A13 replaced them:
+the constructor named a type the model already declares, and a free function can't complete or
+check the field name against the model it will be used with.
 
 **Binding happens at `Entity.make`.** The schema package's `buildEntityDefinition` turns each
-declared `Dimension` into an internal `BoundDimension` for that entity and field:
+declared entry (checked by `declareDimension`, resolved by `resolveDimension`) into an internal
+`BoundDimension` for that entity and field:
 
 ```ts
 // packages/schema/src/internal/ZOrderCurve.ts (internal; not exported from the barrel)
@@ -262,8 +266,8 @@ The curve algebra lives in the same internal module: `layout`, `interleave`, `de
 segment encoding, FNV-1a. Tests import it directly from `src/internal/ZOrderCurve.ts`. None of it
 is public API, so the planner's signatures and the stored layout aren't frozen by semver; it is
 promoted when the geo follow-up (B4) needs it. Because the binding is per entity and field, one
-declared `Dimension` value can be reused across entities, and each entity sharing a GSI may bind
-it to a different storage (§14). The resolved storage is part of the layout spec the cursor
+entry (declared `as const`, to keep its field name a literal) can be reused across entities, and
+each entity sharing a GSI may bind it to a different storage (§14). The resolved storage is part of the layout spec the cursor
 fingerprint hashes (§10.3).
 
 ### 3.2 Index declaration
@@ -282,13 +286,10 @@ export interface KeyPart {
   readonly prefix?: never
 }
 
-export interface ZOrderKeyPart<
-  Dims extends ReadonlyArray<ZOrder.Dimension> = ReadonlyArray<ZOrder.Dimension>,
-  Prefix extends ReadonlyArray<ZOrder.PrefixPart> = ReadonlyArray<ZOrder.PrefixPart>,
-> {
-  readonly field: string       // stored as B
-  readonly prefix?: Prefix     // exact-match composites, in front of the address
-  readonly zorder: Dims        // declaration order = interleave priority
+export interface ZOrderKeyPart<TFields = Record<string, unknown>> {   // TFields: the model's fields
+  readonly field: string                                                // stored as B
+  readonly prefix?: ReadonlyArray<ZOrder.PrefixPart<keyof TFields & string>> // exact-match, in front of the address
+  readonly zorder: ReadonlyArray<ZOrder.Dimension<TFields>>             // declaration order = interleave priority
   readonly composite?: never
 }
 
@@ -348,9 +349,9 @@ const Listings = Entity.make({
         field: "gsi2sk",
         prefix: ["agencyId"],
         zorder: [
-          ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),                 // 13 bits
-          ZOrder.int("bedrooms", { min: 0, max: 15 }),                                  //  4 bits
-          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), // 16 bits
+          { field: "price", min: 0, max: 5_000_000, step: 1_000 },                 // 13 bits
+          { field: "bedrooms", min: 0, max: 15 },                                  //  4 bits
+          { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },      // 16 bits
         ],
       },
     },
@@ -362,7 +363,7 @@ const Listings = Entity.make({
 `effect-dynamodb/src/Entity.ts:1826-1837`) forward the half's shape:
 
 ```ts
-sk: T[K]["sk"] extends { readonly zorder: infer Z extends ReadonlyArray<ZOrder.Dimension> }
+sk: T[K]["sk"] extends { readonly zorder: infer Z extends ReadonlyArray<unknown> }
   ? { composite: readonly [...PrefixFieldNames<T[K]["sk"]>, ...DimensionFieldNames<Z>]; zorderHalf: ZOrderHalf; zorder: Z; prefix: PrefixOf<T[K]["sk"]> }
   : { composite: T[K]["sk"]["composite"] }
 ```
@@ -424,9 +425,11 @@ export type RangeBound<V> =
   | UpperBound<V>
   | (LowerBound<V> & UpperBound<V>)
 
-export type DimensionBound<D, V> = D extends ZOrder.Dimension<any, "literals", infer L>
-  ? RangeBound<L> | { readonly in: ReadonlyArray<L> }
-  : RangeBound<V>
+// D: the entry as declared. A literals entry (a bare name, or one with values / bits) bounds by its
+// members (its `values`, else the field's members); any other entry by the field's type.
+export type DimensionBound<D, V> = [LiteralsEntryMembers<D, V>] extends [never]
+  ? RangeBound<V>
+  : RangeBound<LiteralsEntryMembers<D, V>> | Only<{ readonly in: ReadonlyArray<LiteralsEntryMembers<D, V>> }>
 ```
 
 **Per index kind** (`DynamoClient.ts` `EntityIndexAccessors`, `:901-914`, both `TypedClient`
@@ -1736,7 +1739,7 @@ alone. `EDD-9085` is the highest code in use; no other branch claims 9086+ (re-v
 | Code | Raised in | Condition |
 |---|---|---|
 | `EDD-9086` | `KeyComposer.ts` (`normalizeGsiConfig`), `Entity.ts` (schema) | Malformed Z-order sort key: `zorder` on the primary key; `zorder` empty or holding a non-`Dimension`; `composite` together with `zorder` / `prefix`; `prefix` without `zorder`; `type: "clustered"`; a field listed twice (two dimensions, two prefix composites, or both) |
-| `EDD-9087` | `ZOrder.ts` (constructors), `KeyComposer.ts` (`prefix` `hash`) | Dimension or prefix options invalid (§4.1 table, `hash` outside 1..8) |
+| `EDD-9087` | `internal/ZOrderDimension.ts` (`declareDimension` via `normalizeGsiConfig`; `resolveDimension` at `Entity.make`), `KeyComposer.ts` (`prefix` `hash`) | Entry or prefix options invalid (§4.1 table): options of two kinds, an option no entry of its kind takes, fractional options over a `bigint` field, `hash` outside 1..8 |
 | `EDD-9088` | `Entity.ts` (schema) | A dimension's codec doesn't fit its field, or the field's storage can't be resolved (§4.1 storage table): `int` / `float` on a non-numeric key form, `float` on a `bigint`, `dateTime` on an un-annotated number or a plain string (unknown format, so unknown order), `literals` missing a member of the field's literal union, `string` on a non-string key form |
 | `EDD-9089` | `Entity.ts` (schema) | Bit budget: a dimension over its kind's limit, or `Σ bits > 512` (64 address bytes) |
 | `EDD-9090` | `Entity.ts` (schema), `_injectIndex` | A Z-order index declares `collection`, or a collection injects one |
@@ -1751,8 +1754,8 @@ Existing checks that cover Z-order halves through the derived `composite`, uncha
 (sparse map). Their registry rows gain "(incl. Z-order prefix composites and dimensions)".
 
 Placement: the schema package's `buildEntityDefinition` (`schema/src/Entity.ts:396+`, beside the
-EDD-9001/9002 checks at `:438-462`); `ZOrder` constructors for 9087; `normalizeGsiConfig` for the
-structural 9086 cases it can see.
+EDD-9001/9002 checks at `:438-462`); `declareDimension` (through `normalizeGsiConfig`) for 9087
+and the entry-form 9086 cases; `normalizeGsiConfig` for the other structural 9086 cases it can see.
 
 Three codes past the band come with the key-text commits (§18 5a, 5d, 5e), each registered in
 `DESIGN.md` with its own band row by the commit that raises it; "Next free code" ends at
@@ -1866,9 +1869,10 @@ instead of string-composing), and `npx tsx examples/guide-zorder.ts` plus
 
 | File | Change |
 |---|---|
-| `src/ZOrder.ts` (new) | Public: dimension constructors, `Dimension`, `DimensionKind`, `DateTimeUnit`, `PrefixPart`, `isDimension` |
+| `src/ZOrder.ts` (new) | Public, types only (A13): the entry types (`NumericDimension`, `DateTimeDimension`, `LiteralsDimension`, `ListedLiteralsDimension`, `StringDimension`, `AnyDimension`), `DimensionFor`, `Dimension<TFields>`, `DimensionKind`, `DateTimeUnit`, `LiteralValue`, `PrefixPart` |
+| `src/internal/ZOrderDimension.ts` (new) | Internal: `declareDimension` (an entry's form and options, model-free) and `resolveDimension` (an entry against its field: kind, members, storage) |
 | `src/internal/ZOrderCurve.ts` (new) | Internal: `BoundDimension`, storage resolution, `Layout`, interleave, `inBox`, `bigmin` / `litmax` / descent, planner, prefix segments, FNV-1a, bytes helpers |
-| `src/index.ts` | `export * as ZOrder` |
+| `src/index.ts` | `export type * as ZOrder` |
 | `src/KeyComposer.ts` | `KeyPart` gains `zorder?: never` / `prefix?: never`; `ZOrderKeyPart`, `ZOrderSkPart`, `ZOrderHalf`, `isZOrderHalf`, `KeyValue`; `IndexDefinition.sk` union; `normalizeGsiConfig` (EDD-9086, derived `composite`); `composeZOrderSk`, `composeSkValue`; widened returns; `classifyZOrderHalf` in the policy composer; asserts in string-only helpers |
 | `src/Entity.ts` | `NormalizedIndexes`; dimension binding and storage resolution (§3.1, §4.1); validation EDD-9086 / 9088 / 9089 / 9090 |
 | `src/internal/EntityTypes.ts` | `IndexSkComposites` → `never` for Z-order halves; exported `DimensionFieldNames`, `PrefixFieldNames` helpers |
@@ -1989,7 +1993,8 @@ whose tests need it fixed; how it is fixed is G3–G5. The choices the implement
 F1–F4 that no owner decision covered are listed one per row in §19.1 (G1–G32): the owner
 confirmed them on 2026-10-28 as recommended, except G5 and G31, which the owner changed (G31's
 change brought the projection fix, F3). G33–G37 are choices made doing those changes,
-confirmed by the owner on 2026-11-01 as proposed.
+confirmed by the owner on 2026-11-01 as proposed. *(owner 2026-11-01)* = decided by the owner on
+2026-11-01, while reviewing the declaration API (A13, A14).
 
 | # | Item | Decision | Reason |
 |---|---|---|---|
@@ -2004,7 +2009,9 @@ confirmed by the owner on 2026-11-01 as proposed.
 | A9 | One release, five commits *(owner)* | **in** | §18, plus the commits for the pre-existing key bugs and the owner's key-text decisions of 2026-10-28 (5a–5e; E6–E9, F1–F4) and the version commit. |
 | A10 | `.onRequest()` as a second public hook beside `.explain()` *(confirmed 2026-10-27)* | **in** | The issue's Scope names "a plan/explain debug hook"; open question 3 asks for "addresses visited vs items returned", which a no-I/O `explain()` can't report. Alternative: drop `onRequest` and let tests read `ScannedCount` through a wrapped `DynamoClient` layer; users then have no per-request view. |
 | A11 | `auto` strategy = `precise` when the exact plan fits `maxRanges`, else `jump` *(confirmed 2026-10-27)* | **in** | The issue's proposed default (§5.6). An earlier draft added `naive` when address fill ≥ 0.5 (`NAIVE_FILL`); dropped because address fill isn't data density. |
-| A12 | Public `ZOrder` surface = dimension constructors and types only *(confirmed 2026-10-27)* | **in** | The curve algebra (`interleave`, `bigmin`, `plan`, …) stays internal (`internal/ZOrderCurve.ts`) so its signatures and the stored layout aren't semver-bound before the geo follow-up needs them (§3.1). |
+| A12 | ~~Public `ZOrder` surface = dimension constructors and types only~~ *(confirmed 2026-10-27; superseded by A13)* | **replaced** | The curve algebra (`interleave`, `bigmin`, `plan`, …) stays internal (`internal/ZOrderCurve.ts`) so its signatures and the stored layout aren't semver-bound before the geo follow-up needs them (§3.1). That part stands; the constructors are gone (A13). |
+| A13 | Dimensions declared as plain entries in `sk.zorder`, typed from the model; public `ZOrder` = types only *(owner 2026-11-01)* | **in** | A constructor (`ZOrder.int("price", …)`) restated a type the model already declares, and a free function can't complete or check its field name against the model. An entry is a bare field name or `{ field, ...options }`; its options follow the field's model type (`DimensionFor`, §3.1): a range for `number` / `bigint` (int or float by whether the options are integers), a time window for a date, the bare name or `{ values?, bits? }` for a literal union or `boolean`, `{ bytes }` for a `string`, `{ values, bits? }` for a plain `string` / `number`. `[EDD-9087]` moves from the constructors to `Entity.make` (`normalizeGsiConfig`), and also refuses an unknown option (types catch a misspelled field, not a misspelled option beside valid ones). `.within()` bounds are typed from the entry and the field as before. Type change: an entry or key config declared outside `Entity.make` needs `as const`. |
+| A14 | Every definition position that names a model attribute is typed from the model *(owner 2026-11-01)* | **in** | The owner's rule: "The field declarations for all fields MUST validate attribute names." The editor completes the names; a misspelled one is a compile error on that entry; the runtime checks stay for untyped callers. Covered: `Entity.make` key and index composites, `sk.prefix` / `sk.zorder`, `refs` keys, `unique`, `timeSeries.orderBy` / `appendInput`, `generatedId.field`, vector index fields; `DynamoModel.configure` keys; `Aggregate.make` `pk` / `collection` / `list` composites, `context`, `edges` keys, `many` edges' `sk.composite`; `Collections.member` / `Collections.make`; `GeoIndex.make` `index` / `fields`. Physical names stay strings (key `field`s, `configure` renames, timestamp / version / TTL names), as do labels that name no attribute (`one` / `many`'s first argument, discriminator keys). Pre-existing gaps closed with it: a `unique` field or an `appendInput` field the model lacks was accepted at runtime and is now refused (`[EDD-9002]`, `[EDD-9013]`). DESIGN.md §5 lists the positions. |
 | B1 | General binary keys for composite halves *(owner)* | **out** | Per the issue. |
 | B2 | Z-order on the table primary key *(owner)* | **out** | Per the issue; EDD-9086. Follow-up candidate: append-only event items. |
 | B3 | Z-order as a collection member *(owner)* | **out** | EDD-9090. |

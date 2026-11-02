@@ -315,20 +315,20 @@ import { Entity } from "effect-dynamodb"
 const UserEntity = Entity.make({
   model: User,
   entityType: "User",
+  primaryKey: {
+    pk: { field: "pk", composite: ["userId"] },
+    sk: { field: "sk", composite: [] },
+  },
   indexes: {
-    primary: {
-      pk: { field: "pk", composite: ["userId"] },
-      sk: { field: "sk", composite: [] },
-    },
     byTenant: {
-      index: "gsi1",
+      name: "gsi1",
       collection: "TenantItems",
       type: "clustered",
       pk: { field: "gsi1pk", composite: ["tenantId"] },
       sk: { field: "gsi1sk", composite: ["createdAt"] },
     },
     byEmail: {
-      index: "gsi2",
+      name: "gsi2",
       pk: { field: "gsi2pk", composite: ["email"] },
       sk: { field: "gsi2sk", composite: [] },
     },
@@ -339,6 +339,20 @@ const UserEntity = Entity.make({
   softDelete: true,
 })
 ```
+
+#### Attribute names are typed from the model
+
+Every definition position that names a model attribute is typed from the model *(owner 2026-11-01)*: the editor completes the names, and a misspelled one is a compile error on that entry. The runtime checks stay, for untyped callers.
+
+| API | Positions |
+|---|---|
+| `Entity.make` | `primaryKey` and index `pk` / `sk` composites (a ref's `${ref}Id` once `refs` declares the ref); `sk.prefix` parts and `sk.zorder` entries (each entry's options typed by its field's type, §7 "Z-order Sort Keys"); `refs` keys; `unique` fields (both forms); `timeSeries.orderBy` and `appendInput`; `generatedId.field`; vector index `source.fields`, partition and filter fields |
+| `DynamoModel.configure` | attribute keys |
+| `Aggregate.make` | `pk.composite`, `collection.sk.composite`, `list.pk` / `list.sk` composites, `context`, `edges` keys (both forms), and each `many` edge's `sk.composite`, checked at `Aggregate.make` against the element's scalar fields and one dotted level into an object field (`"official.officialId"`) |
+| `Collections.member` / `Collections.make` | a member's SK composites; the collection's composites, which every member's model must have |
+| `GeoIndex.make` | `index` (an index of the entity) and `fields` |
+
+Physical attribute names stay plain strings: key `field`s, `configure` `field` renames, timestamp / version / TTL attribute names. So do labels that name no model attribute: the first argument of `Aggregate.one` / `many` (the `edges` key names the field) and discriminator keys, which are written into the sort key as text. A config declared outside the call (a shared `primaryKey` or `zorder` list) needs `as const`, or a generic helper, to keep its names literal: widened to `string`, they no longer fit the model's names.
 
 ### Table — Declares Members
 
@@ -1275,13 +1289,14 @@ gsiNsk (B) = seg(prefix_1) ‖ … ‖ seg(prefix_k) ‖ toBytes(interleave(q(di
 ```
 
 - **No schema prefix, no entity type, no version byte.** Entity isolation comes from the partition key, which already carries the entity type. A Z-order index can't declare or join a collection (`EDD-9090`).
-- **Quantization `q`** maps a dimension's key-form value to a level: `int` / `float` (`min`..`max` in `step`s, out-of-range values clamped to the edge levels), `dateTime` (`2^bits` levels of one `unit` from `from`), `literals` (declared order), `string` (the first `bytes` UTF-8 bytes). Storage is resolved per entity and field at `Entity.make` (`EDD-9088`); `bits` per dimension at most 53 (128 for `string`), `Σ bits ≤ 512` (`EDD-9089`).
+- **Entries.** Each `zorder` entry is a bare field name or `{ field, ...options }`, and its options follow the field's model type (`ZOrder.DimensionFor`): a range `{ min, max, step? }` for a `number` / `bigint` field, a time window `{ from, unit, bits }` for a date field, the bare name or `{ values?, bits? }` for a literal union or `boolean` (a string union also takes a byte width, a number union a range), a byte width `{ bytes }` for a `string` field, and `{ values, bits? }` for a plain `string` / `number` field. The entry never restates the type. `Entity.make` types each entry from the model, so a misspelled field, an option of another kind or a bare name on a field without members is a compile error *(owner 2026-11-01; replaces the `ZOrder.int` / `float` / `dateTime` / `literals` / `string` constructors)*. At runtime, `normalizeGsiConfig` checks each entry's form (`EDD-9086`) and options (`EDD-9087`, an unknown option included), and `Entity.make` resolves it against the field (`EDD-9088`): a range is `int` when `min`, `max` and `step` are all integers and `float` otherwise (a `bigint` field takes integers only), and a bare literal-union entry takes the schema's members in order.
+- **Quantization `q`** maps a dimension's key-form value to a level: `int` / `float` (`min`..`max` in `step`s, out-of-range values clamped to the edge levels), `dateTime` (`2^bits` levels of one `unit` from `from`), `literals` (the schema's member order, or `values`), `string` (the first `bytes` UTF-8 bytes). Storage is resolved per entity and field at `Entity.make` (`EDD-9088`); `bits` per dimension at most 53 (128 for `string`), `Σ bits ≤ 512` (`EDD-9089`).
 - **Interleave** is MSB-aligned over unequal widths: round `r` takes bit `bits_i - 1 - r` of every dimension still that wide, in declaration order (declaration order = priority). `B = Σ bits`, `W = ceil(B / 8)`; `toBytes` is big-endian and right-aligned (the top `8W - B` bits are zero).
 - **Prefix segments** are exact-match: a bare name is `u16be(len) ‖ utf8(cased value)` (the index's effective casing; length in bytes after casing), `{ field, hash: n }` is the first `n` (1..8) bytes of FNV-1a-64 over the same bytes. Prefix-free, so skip-scan can compute successors; the order users see is the encoded order (length, then bytes), not text order.
 - **Size** counts against DynamoDB's 1,024-byte sort-key limit; no client pre-check — DynamoDB's rejection is diagnosed (`WriteDiagnosis` renders `B` as `0x…` hex).
 - `composeSk` stays string-only (a defect on a Z-order half); `composeZOrderSk` returns a plain `Uint8Array`, `composeSkValue` dispatches, and `composeIndexKeys` / `composeAllKeys` / `composeGsiKeysForUpdatePolicyAware` return `KeyValue = string | Uint8Array`. A value a dimension can't place (`NaN`, an unparseable date, a value outside a `literals` list) is `EDD-9092`, a `ValidationError` on the write.
 - **`Table.make` / `Table.definition`** declare the attribute `B`; one attribute declared `B` by one member and `S` by another throws `EDD-9091`.
-- **Changing a declaration** (dimension order, `bits`, `min` / `max` / `step`, `from`, the prefix list) changes what stored bytes mean: it needs a new index or a backfill, and the cursor fingerprint rejects old cursors. Appending `literals` values is safe while they fit the declared `bits`.
+- **Changing a declaration** (dimension order, `bits`, `min` / `max` / `step`, `from`, `bytes`, a literals dimension's values or their order, the prefix list) changes what stored bytes mean: it needs a new index or a backfill, and the cursor fingerprint rejects old cursors. For a bare literal-union entry the order is the schema's, so reordering the union's members is such a change. Appending a member is safe while the values fit the declared `bits`.
 
 **Write path.** The half's derived `composite` (prefix composites, then dimension fields) feeds the unchanged per-half skip-predicate. An evaluated Z-order half is all-or-nothing — there is no truncation, since a partial address is meaningless:
 
@@ -5182,7 +5197,7 @@ for unrelated errors and the collision was caught only at review.
 | Code | Raised in | Condition |
 |------|-----------|-----------|
 | `EDD-9001` | `Entity.ts` | Primary key declares no composite attribute in either `pk` or `sk` |
-| `EDD-9002` | `Entity.ts`, `DynamoClient.ts` | An index composite names an attribute the model doesn't have (incl. Z-order prefix composites and dimensions), or a required partition-key composite is missing for an index (accessor) |
+| `EDD-9002` | `Entity.ts`, `DynamoClient.ts` | An index composite names an attribute the model doesn't have (incl. Z-order prefix composites and dimensions), a `unique` constraint names one, or a required partition-key composite is missing for an index (accessor) |
 | `EDD-9003` | `KeyComposer.ts` | Malformed `GsiConfig` — missing `name`/`pk`/`sk`, or the pre-v3 `index` property |
 | `EDD-9004` | `DynamoClient.ts` | Sort-key composite supplied without its prior composites (prefix ordering) |
 | `EDD-9005` | `Entity.ts` | TTL string is not a valid duration, or resolves to a non-finite duration |
@@ -5192,7 +5207,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9010` | `Entity.ts` | `.history()` called on an entity with no `timeSeries` config |
 | `EDD-9011` | `Entity.ts` | `timeSeries.orderBy` also appears as a primary-key composite |
 | `EDD-9012` | `Entity.ts` | `timeSeries` and `versioned` are mutually exclusive |
-| `EDD-9013` | `Entity.ts` | `timeSeries.appendInput` omits `orderBy` |
+| `EDD-9013` | `Entity.ts` | `timeSeries.appendInput` omits `orderBy` or a primary-key composite, or names a field the model doesn't have (`.append()` writes each `appendInput` field to the current item) |
 | `EDD-9014` | `Entity.ts` | `timeSeries.orderBy` names a ref field |
 | `EDD-9015` | `Entity.ts` | `timeSeries` and `softDelete` are mutually exclusive |
 | `EDD-9016` | `Entity.ts` | `timeSeries.appendInput` is required and was not supplied |
@@ -5260,9 +5275,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9083` | `change-feed/ChangeFeed.ts` | `changeFeed` options it cannot honour: `lease.renewEvery` of half the lease `duration` or more, a `batchSize` outside 1–1000, or a `maxConcurrentReads` that is not a positive integer |
 | `EDD-9084` | `change-feed/CheckpointStore.ts` | `CheckpointStore.layerDynamoDB` / `makeDynamoDB` given a `finishedTtl` under 28 hours (`CheckpointStore.minFinishedTtl`) |
 | `EDD-9085` | `EventStore.ts` | A head proof that cannot work (#164): `headProof: "snapshot"` on a stream whose snapshot config is not `mode: "inline"` without `every` (a defect from `append`, thrown by `commandHandler` at handler construction); and, at handler construction, a malformed handler `headProof`, a `loadState` that is not a function, `loadState` with `verifySnapshot: false`, or `loadState` with `headProof: "snapshot"` |
-| `EDD-9086` | `KeyComposer.ts` (`normalizeGsiConfig`), `Entity.ts` (schema) | Malformed Z-order sort key: `zorder` on the primary key; `zorder` / `prefix` on a partition key half; `zorder` empty or holding a non-`Dimension`; `composite` together with `zorder` / `prefix`; `prefix` without `zorder`, or not an array of fields; `type: "clustered"`; a field listed twice (two dimensions, two prefix composites, or both) |
-| `EDD-9087` | `ZOrder.ts` (constructors), `KeyComposer.ts` (`prefix` `hash`) | Dimension or prefix options invalid: a bound, step, `bits`, `from` or values list a dimension constructor can't use, or a prefix `hash` outside 1..8 |
-| `EDD-9088` | `Entity.ts` (schema) | A dimension's codec doesn't fit its field, or the field's storage can't be resolved: `int` / `float` on a non-numeric key form, `float` on a `bigint`, `dateTime` on an un-annotated number or a plain string (unknown format, so unknown order), `literals` missing a member of the field's literal union, `string` on a non-string key form |
+| `EDD-9086` | `KeyComposer.ts` (`normalizeGsiConfig`), `Entity.ts` (schema) | Malformed Z-order sort key: `zorder` on the primary key; `zorder` / `prefix` on a partition key half; `zorder` empty, or holding an entry that is neither a field name nor an object naming its `field`; `composite` together with `zorder` / `prefix`; `prefix` without `zorder`, or not an array of fields; `type: "clustered"`; a field listed twice (two dimensions, two prefix composites, or both) |
+| `EDD-9087` | `internal/ZOrderDimension.ts` (`declareDimension` through `normalizeGsiConfig`; `resolveDimension` at `Entity.make`), `KeyComposer.ts` (`prefix` `hash`) | Entry or prefix options invalid: a bound, `step`, `bits`, `from`, `bytes` or `values` list an entry can't use, options of two kinds, an option no entry of its kind takes (a misspelled option is refused, not ignored), fractional options over a `bigint` field, a float range over 2^53 levels, or a prefix `hash` outside 1..8 |
+| `EDD-9088` | `Entity.ts` (schema) | An entry doesn't fit its field, or the field's storage can't be resolved: a range on a non-numeric key form, a time window on an un-annotated number or a plain string (unknown format, so unknown order), a bare name on a field without literal members, `values` of another type than the field's key form or missing a member of its literal union, a byte width on a non-string key form |
 | `EDD-9089` | `Entity.ts` (schema) | Bit budget: a dimension over its kind's limit (53 bits for `int` / `float` / `dateTime` / `literals`, 128 for `string`), or `Σ bits > 512` (64 address bytes) |
 | `EDD-9090` | `Entity.ts` (schema, runtime `_injectIndex`) | A Z-order index declares `collection`, or a collection injects one |
 | `EDD-9091` | `Table.ts` (`Table.make`, `Table.definition`) | One physical attribute is declared with two types across table members: a Z-order (`B`) half and a string (`S`) key half, or a key attribute and a vector filter attribute |

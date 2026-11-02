@@ -992,31 +992,34 @@ const proj = Projection.projection(["name", "email", "status"])
 
 ## ZOrder
 
-Dimension constructors for a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each dimension quantizes one model field into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. Also exported from `@effect-dynamodb/schema`.
+Types for the dimensions of a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each `zorder` entry names a model field (a bare name, or `{ field, ...options }`) and quantizes it into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. The entry's options follow the field's type in the model, and `Entity.make` types each entry from the model: a misspelled field or an option of another kind is a compile error. The module exports types only. Also exported from `@effect-dynamodb/schema`.
 
 ```typescript
-import { ZOrder } from "effect-dynamodb"
+import type { ZOrder } from "effect-dynamodb"
 ```
 
-| Export | Signature | Description |
-|--------|-----------|-------------|
-| `int` | `(field, { min, max, step? }) => Dimension<F, "int">` | Integer levels `min`..`max` in steps of `step` (default 1); bits derived from the level count. Out-of-range values share the edge levels. A `bigint` field quantizes in `bigint` arithmetic |
-| `float` | `(field, { min, max, step }) => Dimension<F, "float">` | Floating-point levels `min`..`max` in steps of `step` (at most 2^53 levels) |
-| `dateTime` | `(field, { from, unit, bits }) => Dimension<F, "dateTime">` | `2^bits` levels of one `unit` (`"milliseconds"` … `"weeks"`) from `from`. The field needs a known storage format (a `DynamoModel` date schema or an Effect date schema) |
-| `literals` | `(field, values, { bits? }) => Dimension<F, "literals", L>` | One level per listed value, in declared order; `bits` reserves room for values appended later. Bounds may use `{ in: [...] }` |
-| `string` | `(field, { bytes }) => Dimension<F, "string">` | The first `bytes` (1..16) UTF-8 bytes, in byte order |
-| `isDimension` | `(u) => u is Dimension` | Type guard |
+| Field type | Entry | Levels |
+|------------|-------|--------|
+| `number`, `bigint` | `{ field, min, max, step? }` (`NumericDimension`) | `min`..`max` in steps of `step` (default 1); bits derived from the level count. Integer arithmetic when all three are integers, float otherwise (at most 2^53 levels); a `bigint` field takes integers only. Out-of-range values share the edge levels |
+| a date with a known storage format (a `DynamoModel` date schema or an Effect date schema) | `{ field, from, unit, bits }` (`DateTimeDimension`) | `2^bits` levels of one `unit` (`"milliseconds"` … `"weeks"`) from `from` (an ISO string, `Date` or `DateTime`) |
+| a literal union, `boolean` | the bare name, or `{ field, values?, bits? }` (`LiteralsDimension`) | One level per member, in the schema's order; `values` reorders them and lists every member; `bits` reserves room for members appended later. Bounds may use `{ in: [...] }`. A string union also takes a byte width, a number union a range |
+| `string` | `{ field, bytes }` (`StringDimension`) | The first `bytes` (1..16) UTF-8 bytes, in byte order |
+| a plain `string` or `number` | `{ field, values, bits? }` (`ListedLiteralsDimension`) | One level per listed value; writing another value fails |
 
-Invalid options throw `EDD-9087`; a dimension that doesn't fit its field's schema throws `EDD-9088`; more than 53 bits for one dimension (128 for `string`) or 512 in all throws `EDD-9089`.
+`Entity.make` checks entries at runtime too. Options an entry can't use, options of two kinds or an unknown option throw `EDD-9087`; an entry that doesn't fit its field's schema throws `EDD-9088`; more than 53 bits for one dimension (128 for a byte width) or 512 in all throws `EDD-9089`.
 
 ### Types
 
 | Type | Description |
 |------|-------------|
-| `Dimension<F, K, L>` | A declared dimension: `field`, `kind`, `bits` |
-| `DimensionKind` | `"int" \| "float" \| "dateTime" \| "literals" \| "string"` |
+| `Dimension<TFields>` | The entries a model with fields `TFields` (name → model type) takes, field by field |
+| `DimensionFor<F, V>` | The entries a field `F` of model type `V` takes (the table above); any entry when `V` is unknown |
+| `NumericDimension<F>`, `DateTimeDimension<F>`, `LiteralsDimension<F, L>`, `ListedLiteralsDimension<F, L>`, `StringDimension<F>` | The entry shapes |
+| `AnyDimension` | Any entry, as `Entity.make` reads it at runtime |
+| `DimensionKind` | `"int" \| "float" \| "dateTime" \| "literals" \| "string"`: how a resolved dimension maps values onto levels |
 | `DateTimeUnit` | `"milliseconds" \| "seconds" \| "minutes" \| "hours" \| "days" \| "weeks"` |
-| `PrefixPart` | `string \| { field: string, hash: number }` — a prefix composite: stored length-prefixed, or as the first `hash` (1..8) bytes of its FNV-1a-64 hash |
+| `LiteralValue` | `string \| number \| boolean`: a member of a literals dimension |
+| `PrefixPart<F>` | `F \| { field: F, hash: number }` — a prefix composite: stored length-prefixed, or as the first `hash` (1..8) bytes of its FNV-1a-64 hash |
 
 ---
 
