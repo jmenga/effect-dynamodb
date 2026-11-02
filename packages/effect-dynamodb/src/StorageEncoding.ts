@@ -41,7 +41,7 @@ import {
   empty as emptyRegistry,
   make as makeRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
-import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { ExternalPackedConfig, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isBase64PackedText, packValueSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Effect, Schema } from "effect"
@@ -129,22 +129,25 @@ export const limits: {
  * domain value through its schema first, or use {@link valueBytes}.
  */
 export const encode = (
-  storedAs: PackedConfig,
+  storedAs: PackedConfig | ExternalPackedConfig,
   wire: unknown,
 ): Effect.Effect<AttributeValue | undefined, ValidationError> =>
   withRegistry((registry) => encodeStep(storedAs, wire, registry))
 
 const ENCODE = { entityType: ENTITY_TYPE, operation: "StorageEncoding.encode" }
 
-const encodeStep = (storedAs: PackedConfig, wire: unknown, registry: CompressionRegistry) =>
-  packAttributeValueSync(storedAs, wire, registry, ENCODE, "value")
+const encodeStep = (
+  storedAs: PackedConfig | ExternalPackedConfig,
+  wire: unknown,
+  registry: CompressionRegistry,
+) => packAttributeValueSync(storedAs, wire, registry, ENCODE, "value")
 
 /**
  * {@link encode}, synchronously, with explicit compressors (see
  * {@link SyncOptions}). Throws the `ValidationError` `encode` fails with.
  */
 export const encodeSync = (
-  storedAs: PackedConfig,
+  storedAs: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   options?: SyncOptions,
 ): AttributeValue | undefined => orThrow(encodeStep(storedAs, wire, registryFrom(options)))
@@ -267,7 +270,7 @@ export const decodeUnmarshalledSync = (stored: unknown, options?: SyncOptions): 
 export const valueBytes = <S extends Schema.Top>(options: {
   readonly schema: S
   readonly value: Schema.Schema.Type<S>
-  readonly storedAs?: PackedConfig | undefined
+  readonly storedAs?: PackedConfig | ExternalPackedConfig | undefined
 }): Effect.Effect<number, ValidationError> =>
   Effect.gen(function* () {
     const codec = options.schema as unknown as Schema.Codec<unknown, unknown>
@@ -302,7 +305,7 @@ const nativeBytes = (wire: unknown): number | ValidationError => {
 
 /** The size of a wire value packed under `storedAs`, or the failure. */
 const packedBytes = (
-  storedAs: PackedConfig,
+  storedAs: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
 ): number | ValidationError => {
@@ -336,7 +339,7 @@ export const valueBytesSync = <S extends Schema.Top>(
   options: {
     readonly schema: S
     readonly value: Schema.Schema.Type<S>
-    readonly storedAs?: PackedConfig | undefined
+    readonly storedAs?: PackedConfig | ExternalPackedConfig | undefined
   } & SyncOptions,
 ): number => {
   const codec = options.schema as unknown as Schema.Codec<unknown, unknown>

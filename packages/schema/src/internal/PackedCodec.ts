@@ -42,7 +42,7 @@
 
 import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
-import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
+import type { CompressionCodec, ExternalPackedConfig, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
 import { type Lost, lostAs, lostRefusal } from "./LostValues.js"
 import { classOf } from "./OwnNames.js"
@@ -414,7 +414,7 @@ export type PackedStored = string | Uint8Array | null | undefined
  * operation by the caller.
  */
 export const packValueSync = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: OperationContext,
@@ -480,7 +480,7 @@ export const packValueSync = (
  * `"compress"`).
  */
 export const packValue = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
@@ -764,3 +764,49 @@ export const isPackedShape = (schema: Schema.Top | SchemaAST.AST): boolean =>
  */
 export const isDispatchEligible = (schema: Schema.Top | SchemaAST.AST): boolean =>
   packedShape(schema)._tag === "Structured"
+
+// ---------------------------------------------------------------------------
+// Binary shape — the encoded side an `External` field must have (#179)
+// ---------------------------------------------------------------------------
+
+const UINT8ARRAY_REPRESENTATION = "effect/schema/Uint8Array"
+
+const binaryRefusalOf = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): string | undefined => {
+  const encoded = SchemaAST.toEncoded(ast)
+  switch (encoded._tag) {
+    case "Declaration": {
+      const id = representationId(encoded)
+      if (id === UINT8ARRAY_REPRESENTATION) return undefined
+      const name = id?.replace(/^effect\/schema\//, "")
+      return name ? `its encoded side is ${name}` : "its encoded side is a declared type"
+    }
+    case "Suspend": {
+      if (seen.has(encoded)) return "its encoded side is an unresolvable recursive type"
+      seen.add(encoded)
+      return binaryRefusalOf(encoded.thunk(), seen)
+    }
+    case "Union": {
+      let members = 0
+      for (const member of encoded.types) {
+        const tag = SchemaAST.toEncoded(member)._tag
+        if (tag === "Null" || tag === "Undefined" || tag === "Void") continue
+        members++
+        const reason = binaryRefusalOf(member, seen)
+        if (reason !== undefined) return `a member of its union is not binary: ${reason}`
+      }
+      return members === 0 ? "its encoded side is only null / undefined" : undefined
+    }
+    default:
+      return `its encoded side is ${scalarReason[encoded._tag] ?? encoded._tag}`
+  }
+}
+
+/**
+ * Why a schema cannot hold an `External` binary field, or `undefined` when its
+ * encoded side is a `Uint8Array` — `Schema.Uint8Array`, optionally under
+ * `optional` / `optionalKey` / `NullOr` (a union whose other members are only
+ * `null` / `undefined`). `Uint8ArrayFromBase64` encodes to a string, so it is
+ * refused: it stores text, not bytes.
+ */
+export const binaryShapeRefusal = (schema: Schema.Top | SchemaAST.AST): string | undefined =>
+  binaryRefusalOf(Schema.isSchema(schema) ? schema.ast : schema, new Set())

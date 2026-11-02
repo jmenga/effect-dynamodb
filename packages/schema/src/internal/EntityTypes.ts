@@ -5,8 +5,8 @@
  */
 
 import type { DateTime, Schema } from "effect"
-import type { StoredAs } from "../DynamoModel.js"
-import type { EmbeddingError, RefNotFound } from "../Errors.js"
+import type { OffloadFields, StoredAs } from "../DynamoModel.js"
+import type { BlobStoreError, EmbeddingError, RefNotFound } from "../Errors.js"
 
 // ---------------------------------------------------------------------------
 // Type-level computations for Entity operation types
@@ -605,6 +605,64 @@ export type RefErrors<TRefs> = [TRefs] extends [undefined] ? never : RefNotFound
 export type VectorErrors<TVectorIndexes> = [TVectorIndexes] extends [undefined]
   ? never
   : EmbeddingError
+
+/**
+ * How a read returns an offloaded value (#179): `"eager"` resolves it from the
+ * blob store; `"lazy"` returns a handle that reads it on demand.
+ */
+export type OffloadMode = "eager" | "lazy"
+
+/** A read's effective {@link OffloadMode} per kind of offloaded field. */
+export interface ResolvedOffloadModes {
+  readonly overflow: OffloadMode
+  readonly binary: OffloadMode
+}
+
+/** The default read modes: overflow fields eager, binary fields lazy. */
+export type DefaultOffloadModes = { readonly overflow: "eager"; readonly binary: "lazy" }
+
+/**
+ * Error type contribution of a read in modes `M` from the blob store —
+ * {@link BlobStoreError} for each kind the member offloads that `M` reads
+ * eagerly, `never` otherwise (so an entity with only binary fields keeps its
+ * read error types under the default modes). A mode that is not a single
+ * literal counts as eager. `never` for `any`.
+ *
+ * Mirrors {@link RefErrors} / {@link VectorErrors}: members without offloaded
+ * fields keep exactly today's error channels.
+ */
+export type ReadBlobErrors<T extends OffloadFields, M extends ResolvedOffloadModes> = 0 extends 1 &
+  T
+  ? never
+  :
+      | ([T["overflow"]] extends [never]
+          ? never
+          : "eager" extends M["overflow"]
+            ? BlobStoreError
+            : never)
+      | ([T["binary"]] extends [never]
+          ? never
+          : "eager" extends M["binary"]
+            ? BlobStoreError
+            : never)
+
+/**
+ * Error type contribution of a write from the blob store —
+ * {@link BlobStoreError} when the member offloads any field, `never` when it
+ * offloads none (or for `any`).
+ */
+export type WriteBlobErrors<T extends OffloadFields> = 0 extends 1 & T
+  ? never
+  : [T["overflow"] | T["binary"]] extends [never]
+    ? never
+    : BlobStoreError
+
+/**
+ * The blob errors of an operation's own error type — what a multi-op entry
+ * point (`Batch.write`, `Transaction.transactWrite`, `EventStream.append`'s
+ * additional items) adds per op. An op typed `any` contributes nothing.
+ */
+export type OpBlobErrors<E> = 0 extends 1 & E ? never : Extract<E, BlobStoreError>
 
 /** Extract pk composite names for a specific index */
 export type IndexPkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] extends {

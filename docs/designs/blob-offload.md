@@ -257,25 +257,45 @@ export interface ExternalPackedOptions extends Omit<PackedOptions, "external"> {
   readonly external: ExternalOptions
 }
 
+/** Always inline. */
 export interface PackedConfig {
   readonly [PackedTag]: true
   readonly format: PackedFormat
   readonly compression: { readonly codec: CompressionCodec; readonly threshold: number } | undefined
-  readonly external: { readonly threshold: number } | undefined
+  readonly external: undefined
 }
 
-/** A `PackedConfig` whose values may be offloaded — what the type level keys on. */
-export interface ExternalPackedConfig extends PackedConfig {
+/** Values may be offloaded — what the type level keys on. Disjoint from `PackedConfig`. */
+export interface ExternalPackedConfig {
+  readonly [PackedTag]: true
+  readonly format: PackedFormat
+  readonly compression: { readonly codec: CompressionCodec; readonly threshold: number } | undefined
   readonly external: { readonly threshold: number }
 }
 
 export function Packed(options: ExternalPackedOptions): ExternalPackedConfig
 export function Packed(options: PackedOptions): PackedConfig
+export const isPackedConfig: (value: unknown) => value is PackedConfig | ExternalPackedConfig
+export const isExternalPackedConfig: (value: unknown) => value is ExternalPackedConfig
 ```
 
 - The plain overload types `external` as `never`, so options held in a variable typed
   `PackedOptions` cannot carry `external` and return a plain `PackedConfig` the type level
   would not see as offloaded. `makeStream`'s `storedAs` takes the same two option types.
+- **The two configs are disjoint** (deviation, from the review of commit 4): an
+  `ExternalPackedConfig` is not assignable to `PackedConfig`, so the config side cannot be
+  widened either — `const c: PackedConfig = Packed({ format: "json", external: {} })` is a
+  compile error. Were it a subtype (as first drafted), that line would compile, offload at
+  runtime, and read as inline at the type level, so `WriteBlobErrors` / `ReadBlobErrors` would
+  drop `BlobStoreError` for the member (and `makeStream`'s storedAs inference, item 13, would
+  miss it likewise). Every API that takes or reports a packed config takes or reports either,
+  `PackedConfig | ExternalPackedConfig`: `configure`'s `storedAs`, `getPackedFields`,
+  `isPackedConfig`, `StorageEncoding`'s `storedAs` arguments, and `makeStream`'s
+  `StreamStorageConfig`, `snapshot.storedAs` and `stream.storedAs`. A config typed
+  `PackedConfig` — a plain one, as existing helpers type it — stays provably inline, so nothing
+  over-reports either. (The alternative, counting every `PackedConfig` not provably inline as
+  overflow, would add `BlobStoreError` to members that offload nothing whenever their config is
+  annotated `PackedConfig`.)
 
 - The threshold compares **stored** bytes — what the item pays for and what the item budget
   (§6.3) measures — so compression runs first and a value that compresses under the threshold
@@ -312,7 +332,9 @@ export const getExternalFields: (model: Schema.Top) => Record<string, ExternalCo
   bytes.
 - Invalid options are `[EDD-9141]` (an unknown key; a `contentType` that is not a non-empty
   US-ASCII string of at most 255 bytes).
-- `field` (rename) and `immutable` combine with `External`; nothing else does (§15).
+- `field` (rename) and `immutable` combine with `External`; nothing else does (§15). An
+  `External` field is not the entity's `identifier` either (`[EDD-9142]`): refs and their
+  cascade indexes compose the identifier into keys.
 - `ConfiguredModel.attributes[field]` gains `external?: ExternalConfig` beside `packed` and
   `sparse`. A field has one `storedAs`, so it is never both.
 
@@ -1455,14 +1477,21 @@ export type NoOffload = { readonly overflow: never; readonly binary: never }
 
 export type ExtractOffloadFields<Model> = Model extends ConfiguredModel<any, infer A>
   ? {
-      readonly overflow: { [K in keyof A & string]: A[K] extends { readonly storedAs: ExternalPackedConfig } ? K : never }[keyof A & string]
+      // Overflow when `storedAs` MAY be an overflow config (a union-typed one included).
+      readonly overflow: { [K in keyof A & string]: A[K] extends { readonly storedAs: infer S }
+        ? [Extract<S, ExternalPackedConfig>] extends [never] ? never : K
+        : never }[keyof A & string]
       readonly binary:   { [K in keyof A & string]: A[K] extends { readonly storedAs: ExternalConfig } ? K : never }[keyof A & string]
     }
   : NoOffload
 ```
 
 `Packed` is overloaded (§3.1) precisely so `ExternalPackedConfig` is visible here: today
-`PackedConfig` is not generic and an `external` option would be invisible to the types.
+`PackedConfig` is not generic and an `external` option would be invisible to the types. The
+two configs are disjoint (§3.1), so a `PackedConfig`-typed value is provably inline; a value
+typed `PackedConfig | ExternalPackedConfig` (legal: it may offload) counts as overflow, so the
+blob-store errors are never under-reported. `ExtractPackedFields` keys on the union, so an
+overflow field stays a packed field.
 
 - `Entity` (14th) and the schema package's `EntityDefinition` gain a trailing
   `TOffload extends OffloadFields = NoOffload`; `BoundEntity` its 11th.
@@ -1532,9 +1561,9 @@ export type NoOffloadState = { readonly fields: NoOffload; readonly modes: Defau
 
 ```ts
 /** Errors a read in modes `M` can raise from the store. */
-export type ReadBlobErrors<T extends OffloadFields, M> =
-  | ([T["overflow"]] extends [never] ? never : M["overflow"] extends "eager" ? BlobStoreError : never)
-  | ([T["binary"]]   extends [never] ? never : M["binary"]   extends "eager" ? BlobStoreError : never)
+export type ReadBlobErrors<T extends OffloadFields, M extends ResolvedOffloadModes> =
+  | ([T["overflow"]] extends [never] ? never : "eager" extends M["overflow"] ? BlobStoreError : never)
+  | ([T["binary"]]   extends [never] ? never : "eager" extends M["binary"]   ? BlobStoreError : never)
 /** Errors a write can raise from the store. */
 export type WriteBlobErrors<T extends OffloadFields> =
   [T["overflow"] | T["binary"]] extends [never] ? never : BlobStoreError
@@ -1543,7 +1572,14 @@ type OpBlobErrors<E> = 0 extends 1 & E ? never : Extract<E, BlobStoreError>
 ```
 
 Mirrors `RefErrors` / `VectorErrors` (`schema/src/internal/EntityTypes.ts:362-374`), in the same
-module. The rules:
+module. `M` is bounded by `ResolvedOffloadModes` (`{ overflow: OffloadMode; binary: OffloadMode }`,
+`OffloadMode = "eager" | "lazy"`, default `DefaultOffloadModes`), and the mode test reads
+`"eager" extends M[k]` rather than `M[k] extends "eager"`: a mode that is not one literal (the
+widened `OffloadMode`, from untyped or generic code) counts as eager, so the error union never
+under-reports. For a literal mode the two agree. `ReadBlobErrors<any, M>` and
+`WriteBlobErrors<any>` are `never`, like `OpBlobErrors<any>`. (Implementation note, commit 4.)
+
+The rules:
 
 - **Write ops** (put / create / upsert / update / patch / delete / restore / purge / append) add
   `WriteBlobErrors<TOffload>`. A delete without return values reaches no store but `purge` does,
@@ -2392,8 +2428,8 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
 | `EDD-9120` | `Entity.ts`, `internal/TransactableOps.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle or source for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; a `Stream` or source for an aggregate edge; or a `Stream` given to a second target (another field, item or op) or to a later operation after its first use — a `Stream` is single-use (§3.8) |
 | `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty US-ASCII string ≤ 255 bytes |
-| `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts`, `DynamoClient.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, collection-injected index, `timeSeries.orderBy`), a unique-constraint field, a ref field, a vector index source or filter field, or an aggregate discriminator / `many` sort-key / list / collection composite |
-| `EDD-9143` | `Entity.ts` (schema), `Aggregate.ts` | A ref (entity ref or aggregate ref edge) whose schema includes a field the referenced entity offloads — the denormalised copy would inline it (400 KB risk), need to marshal a lazy handle, or copy a pointer across item families (§11.2). Reference a subset model without the field |
+| `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, a GSI's `shards.by` source, `timeSeries.orderBy`), a unique-constraint field, a ref field, the entity's identifier, a vector index source, partition or filter field, or an aggregate discriminator / `many` sort-key composite. (An aggregate's list and collection composites are root fields, and a root model takes no `configure`, so none can be `External`: there is nothing to check there.) |
+| `EDD-9143` | `Entity.ts` (schema), `Aggregate.ts` | A ref (entity ref, aggregate ref edge, or the ref a `many` edge's element wraps — `PlayerSheet { player }`, which hydration fills by name — at any depth) whose schema includes a field the referenced entity offloads — the denormalised copy would inline it (400 KB risk), need to marshal a lazy handle, or copy a pointer across item families (§11.2). Reference a subset model without the field |
 | `EDD-9146` | `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts`, `GeoIndex.ts` (geo), `internal/OffloadWrite.ts` (`route`), `internal/Rekey.ts` | A member with an offloaded field on a table whose schema doesn't set `escapeKeys: true`: bound (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, the streams given to `rekey`) — a defect naming every such member and field; or written unbound — a `ValidationError` from the routing, nothing uploaded or sent. Also `rekey` about to move a row that holds a blob pointer — a `ValidationError` naming the row's key, nothing written (only after `escapeKeys` was turned off over rows offloading wrote, §11.10) |
 
 **Extended, not new:** `EDD-9076` (expressions / projections) and `EDD-9077` (update ops) now
@@ -2409,7 +2445,7 @@ The registry's "next free" line is updated in this commit to skip the codes abov
 
 | Rule | Overflow field | Binary field |
 |---|---|---|
-| Not a key / index composite, `orderBy`, unique field, ref field | `EDD-9072` / `9074` / `9075` (it is Packed) | `EDD-9142` |
+| Not a key / index composite, `shards.by` source, `orderBy`, unique field, ref field | `EDD-9072` / `9074` / `9075` (it is Packed; `shards.by` names only composites) | `EDD-9142` (nor the entity's identifier) |
 | Not a vector index filter field | `EDD-9072` | `EDD-9142` (nor a vector *source*: the embedder reads text) |
 | May be a vector source field | yes (an untouched source costs a GET when re-embedding, §6.5) | no |
 | Conditions / filters: only `attribute_exists` / `attribute_not_exists`, whole field | `EDD-9076` | `EDD-9076` (extended); `PackedPath` at the type level |
@@ -2418,7 +2454,7 @@ The registry's "next free" line is updated in this commit to skip the codes abov
 | `immutable` | yes: checksum and size as the fast path, a structural comparison before refusing; a restated value that passes is dropped from the write (§5, §6.5) | yes, likewise (byte comparison) |
 | `field` rename | yes | yes |
 | `timeSeries.appendInput` | yes (one object, two items, §6.8) | yes |
-| Ref copies | a ref schema must not include the field (`EDD-9143`), so no pointer crosses an item family (§11.2) | likewise |
+| Ref copies | a ref schema — entity ref, aggregate ref edge, or the ref a `many` element wraps — must not include the field (`EDD-9143`), so no pointer crosses an item family (§11.2) | likewise |
 | Sparse | impossible (one `storedAs`) | impossible |
 
 **Why whole items are never offloaded** (decision 1, kept): DynamoDB evaluates conditions and
@@ -2523,8 +2559,9 @@ well (and any earlier prefix whose objects GC still has to delete).
     the pointer's bytes).
 - `test/Packed.test.ts` / `test/External.test.ts`: `EDD-9141` cases; `threshold` default 65,536;
   `ExternalPackedConfig` / `ExternalConfig` brands; the plain `Packed` overload refuses
-  `external` at the type level; `configure` with renames and `immutable`;
-  `getExternalFields`; `ExtractOffloadFields` (type tests).
+  `external` at the type level; `PackedConfig` / `ExternalPackedConfig` disjoint (widening is a
+  compile error; a union-typed config counts as overflow); `configure` with renames and
+  `immutable`; `getExternalFields`; `ExtractOffloadFields` (type tests).
 - Entity definition guards: `EDD-9111` (missing field, `Uint8ArrayFromBase64`, string, mixed
   union), `EDD-9142` (each role), `EDD-9143` (a ref schema with and without the offloaded
   field), `EDD-9114` (each option, including `prefix`).
@@ -2663,7 +2700,10 @@ in-doubt outcomes are **kept and reported**:
   - routing and upload happen after `buildDynamoItems`, on the stored attribute names;
   - per-group settlement;
   - eager assembly;
-  - `EDD-9142` for edge composites.
+  - `EDD-9142` for edge composites;
+  - `EDD-9143` for a `many` element wrapping a ref that copies an offloaded field (binary,
+    overflow, unannotated, in a sub-aggregate) and its subset-model acceptance (commit 4,
+    `test/Offload.config.test.ts`).
 - **EventStore** (`test/EventStore.offload.test.ts`):
   - append, inline snapshot, `writeSnapshot` (lost race → ALL_OLD without the pointer →
     deleted);
@@ -2862,6 +2902,42 @@ a write path, deletes the gate.
    one), `External`, `configure`, `ExtractOffloadFields`, `offload` on `Entity.make` /
    `makeStream`, guards `EDD-9141`, `EDD-9111`, `EDD-9142`, `EDD-9143`, `EDD-9114`, `BlobStoreError` (12 reasons),
    `ReadBlobErrors` / `WriteBlobErrors`; the "not yet supported" refusal and the test gate.
+   *Implementation notes (commit 4):* the gate lives in the schema package
+   (`packages/schema/src/internal/OffloadGate.ts`, reachable only through the `internal/*`
+   subpath), because the pure and the runtime `Entity.make` share one derivation
+   (`buildEntityDefinition`) and `makeStream` imports it from there. `Entity.make` and
+   `makeStream` are synchronous, so the refusal reads the `Context.Reference` from the current
+   fiber (`Fiber.getCurrent()?.getRef(OffloadGate)`, `false` outside one); tests define
+   members inside `Effect.runSync(Effect.sync(define).pipe(Effect.provideService(OffloadGate,
+   true)))` (`test/helpers/OffloadGate.ts` in both packages). Every guard (`EDD-9072`–`9075`,
+   `EDD-9141`, `EDD-9111`, `EDD-9142`, `EDD-9143`, `EDD-9114`, `EDD-9079`) runs before the refusal, so guard tests need no gate. The
+   refusal is a plain `Error` with no EDD code: it is never released, and commit 13 deletes it.
+   `entity.offload` is `undefined` for an entity that offloads nothing. A stream validates
+   `offload` here but does not expose it until the commit that wires its writes (13); its
+   `storedAs` already reports `external`. The aggregate guards cover the edge item schemas
+   (`EDD-9111` for a `many` element that redeclares an `External` field, `EDD-9142` for a
+   discriminator or `many` sort-key composite) and, at any depth, `Aggregate.ref` edges and the
+   ref a `many` element wraps (`PlayerSheet { player }`, `EDD-9143`); hydrating a `one` /
+   `many` edge's offloaded fields is commit 11's. The wrapped ref is found by name — the
+   element field `deriveEntityFieldName(entity)` names, as hydration and
+   `deriveElementInputSchema` find it — whether or not it is `DynamoModel.ref`-annotated: its
+   hydrated copy is a nested map in the edge item, which no routing reaches. An element that
+   *is* the entity is the edge item's own attributes, covered by `EDD-9111` / `EDD-9142` and
+   the entity's own routing.
+   *Review fixes (commit 4):* `PackedConfig` and `ExternalPackedConfig` are disjoint (§3.1, a
+   deviation), so widening an overflow config to `PackedConfig` is a compile error and
+   `ExtractOffloadFields` counts a union-typed config as overflow (§9.1). The `_injectIndex`
+   hook had no caller in the library (collections moved to entity indexes), so
+   `Collections.buildMemberIndexDef` and its tests are deleted (adjacent #147 debt).
+   *Rebase onto 1.37 (#171):* the hook itself stays — #171 gave it the `EDD-9090` refusal of a
+   Z-order index and tests that call it — and it runs the `EDD-9142` `externalIndexRefusal`
+   beside the packed `EDD-9072` one, in both packages, so the registry rows keep naming
+   collection-injected indexes. The two
+   refusals (and the definition-time guards beside them) match composites, sparse fields and
+   discriminators by own key (`Object.hasOwn`): `in` also matched names `Object.prototype`
+   defines (`valueOf`, `constructor`, …). Until item 7, `_packedFields` leaves `External`
+   fields out, so `EDD-9076` / `EDD-9077` do not yet cover them — harmless while the gate
+   refuses every offloading member.
 5. **BlobStore contract + in-memory store + `Offload` types** — `BlobStore.ts`, `Offload.ts`,
    key derivation (`internal/BlobKeys.ts`, vendored SHA-256), metadata builder,
    `maxUploadAge`, capabilities (`list`, `head`, `marks`), `EDD-9116`.
@@ -2879,7 +2955,14 @@ a write path, deletes the gate.
    passing value dropped from the write); time-series append (event-keyed); lifecycle copies;
    write results; `TOffload` through `Entity` / `BoundEntity` / `TypedClient` (and the
    doc-comment debt); bind checks `EDD-9115` incl. `Entity.bind` / `Aggregate.bind` (and their
-   missing `EDD-9078` check).
+   missing `EDD-9078` check). **The `EDD-9076` / `EDD-9077` extension to `External` fields**
+   (§14.3, §15, decision 47): `externalFields` feed the walker that reads only packed fields
+   today — the entity's `_packedFields` / `_packedGuards` (conditions, filters and projections:
+   `packedExprRefusal` / `packedProjectionRefusal` in `Query.ts`, the CRUD builders and
+   `Transaction.ts`) and the update-op refusals in `Entity.ts` — with messages that say
+   "packed or External"; and `TPackedFields` gains the binary fields (§9.1), so their paths are
+   `PackedPath`s. Only the guards: the packed codec and stored-form dispatch stay packed-only.
+   Item 8's read paths inherit the walker.
 8. **Entity reads** — all decoders, the trailing `O` state on every builder, `.offloaded()` on
    `BoundGet`, `BoundQuery` and CRUD builders, `Entity.offloaded` / `Query.offloaded` duals,
    `Query<A, E, O>` / `BoundQuery<…, O>`, page prefetch in `examinePage`, raw-row hook, scans,
@@ -2912,8 +2995,10 @@ a write path, deletes the gate.
     `sweepStore`, purge integration, `EDD-9118` / `9119`.
 17. **End-to-end connected** — `connected.blob-offload.test.ts`.
 18. **Docs** — the §20 table: the new guide and its sidebar entry, the example, the guide and
-    tutorial updates, `api-reference.mdx`, `DESIGN.md` §12 EventStore paragraph and
-    per-operation declared-errors rows, `CLAUDE.md`, `README.md`.
+    tutorial updates, `api-reference.mdx` (including the `PackedConfig | ExternalPackedConfig`
+    signatures of `Packed`, `isPackedConfig`, `getPackedFields` and `stream.storedAs`, §3.1),
+    `DESIGN.md` §12 EventStore paragraph and per-operation declared-errors rows, `CLAUDE.md`,
+    `README.md`.
 19. **Release** — changeset (`minor`, lockstep), then `pnpm changeset version` (CHANGELOGs,
     versions).
 

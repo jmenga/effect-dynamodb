@@ -216,6 +216,32 @@ describe("Entity.make — packed fields", () => {
       })
       expect(def.indexes.ok).toBeDefined()
     })
+
+    it("matches packed and sparse fields by own key only", () => {
+      // `"valueOf" in {}` is true, so an `in` lookup named a field inherited
+      // from Object.prototype as the packed composite, and treated an
+      // object-shaped field so named as sparse (no stored-form dispatch).
+      const Odd = Schema.Struct({
+        orderId: Schema.String,
+        valueOf: Schema.String,
+        toString: Schema.Struct({ note: Schema.String }),
+        lines: Schema.Array(Line),
+      })
+      const odd = (sk: ReadonlyArray<string>) =>
+        Entity.make({
+          // `as never`: configure()'s attribute keys see Object.prototype members.
+          model: DynamoModel.configure(Odd, { lines: { storedAs: json } } as never),
+          entityType: "Odd",
+          primaryKey: {
+            pk: { field: "pk", composite: ["orderId"] },
+            sk: { field: "sk", composite: sk },
+          },
+        } as never) as unknown as Entity.EntityDefinition
+      expect(() => odd(["valueOf", "lines"])).toThrow(
+        /\[EDD-9072\] Entity "Odd": packed field "lines" cannot be a composite of the primary key/,
+      )
+      expect([...odd(["valueOf"])._data.dispatchAttributes].sort()).toEqual(["lines", "toString"])
+    })
   })
 
   it("EDD-9074 — refuses a unique-constraint field", () => {

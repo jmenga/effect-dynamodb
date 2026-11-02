@@ -54,7 +54,12 @@ import type {
   PutItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
-import { isPackedConfig, type PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import {
+  type ExternalPackedConfig,
+  isExternalConfig,
+  isPackedConfig,
+  type PackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
@@ -72,12 +77,15 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import { resolveOffloadOptions } from "@effect-dynamodb/schema/internal/EntityOffload.js"
 import {
   readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { refuseUnsupportedOffload } from "@effect-dynamodb/schema/internal/OffloadGate.js"
 import { classOf, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isDispatchEligible,
@@ -273,7 +281,10 @@ export type StreamMetadata<TMetadata> = [TMetadata] extends [undefined]
 /** The codecs a stream's packed `data` / `state` name (`[EDD-9078]` when unregistered). */
 const streamCodecRequirements = (
   streamName: string,
-  storedAs: { readonly data?: PackedConfig | undefined; readonly state?: PackedConfig | undefined },
+  storedAs: {
+    readonly data?: PackedConfig | ExternalPackedConfig | undefined
+    readonly state?: PackedConfig | ExternalPackedConfig | undefined
+  },
 ): Array<CodecRequirement> =>
   codecRequirements(`stream "${streamName}"`, [
     ["data", storedAs.data],
@@ -393,29 +404,31 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
    * (`[EDD-9073]`). Reads go by the stored form, so changing this setting
    * needs no rewrite: a snapshot written before still decodes.
    */
-  readonly storedAs?: PackedConfig | undefined
+  readonly storedAs?: PackedConfig | ExternalPackedConfig | undefined
 }
 
 /**
  * How a stream stores event `data` (`makeStream({ storedAs })`). `data` is a
  * native map by default; `DynamoModel.Packed({ format: "json", compression? })`
  * stores it as one JSON string (`S`), compressed to binary (`B`) at or over the
- * threshold when that is smaller. Metadata always stays a map.
+ * threshold when that is smaller; `DynamoModel.Packed({ external })` (an
+ * `ExternalPackedConfig`, #179) also offloads it to the blob store at or over
+ * `external.threshold`. Metadata always stays a map.
  *
  * Reads go by each item's stored form, never by this setting, so a stream may
  * hold a mix — events appended before packing was turned on still decode, and
  * so do packed events after it is turned off.
  */
 export interface StreamStorageConfig {
-  readonly data?: PackedConfig | undefined
+  readonly data?: PackedConfig | ExternalPackedConfig | undefined
 }
 
 /** The resolved storage settings exposed on a stream (`stream.storedAs`). */
 export interface StreamStorageSettings {
   /** Event `data` (`makeStream({ storedAs: { data } })`); `undefined` = native map. */
-  readonly data: PackedConfig | undefined
+  readonly data: PackedConfig | ExternalPackedConfig | undefined
   /** Snapshot `state` (`snapshot.storedAs`); `undefined` = native map. */
-  readonly state: PackedConfig | undefined
+  readonly state: PackedConfig | ExternalPackedConfig | undefined
 }
 
 /**
@@ -1822,10 +1835,13 @@ const resolveStreamStorage = (
   const describe = (value: unknown): string =>
     value === null
       ? "null"
-      : typeof value === "object"
-        ? "an object that is not a DynamoModel.Packed(...) config"
-        : `${typeof value} ${JSON.stringify(value)}`
-  let data: PackedConfig | undefined
+      : isExternalConfig(value)
+        ? "a DynamoModel.External(...) config, which stores a binary entity field — offload " +
+          "event data or snapshot state with DynamoModel.Packed({ external })"
+        : typeof value === "object"
+          ? "an object that is not a DynamoModel.Packed(...) config"
+          : `${typeof value} ${JSON.stringify(value)}`
+  let data: PackedConfig | ExternalPackedConfig | undefined
   if (storedAs !== undefined) {
     if (typeof storedAs !== "object" || storedAs === null || Array.isArray(storedAs)) {
       fail(
@@ -1849,10 +1865,10 @@ const resolveStreamStorage = (
           `storedAs.data must be a DynamoModel.Packed(...) config; received ${describe(value)}.`,
         )
       }
-      data = value as PackedConfig | undefined
+      data = value as PackedConfig | ExternalPackedConfig | undefined
     }
   }
-  let state: PackedConfig | undefined
+  let state: PackedConfig | ExternalPackedConfig | undefined
   const snapshotStoredAs: unknown = snapshot?.storedAs
   if (snapshot !== undefined && snapshotStoredAs !== undefined) {
     if (!isPackedConfig(snapshotStoredAs)) {
@@ -1870,7 +1886,7 @@ const resolveStreamStorage = (
           `${shape.reason}. Packed storage holds object- or array-shaped JSON.`,
       )
     }
-    state = snapshotStoredAs as PackedConfig
+    state = snapshotStoredAs as PackedConfig | ExternalPackedConfig
   }
   return { data, state }
 }
@@ -2730,6 +2746,11 @@ interface AppendParts {
  *   value is not a `DynamoModel.Packed(...)` config.
  * @throws `[EDD-9073]` when `snapshot.storedAs` is set and the state schema's
  *   encoded side is not object- or array-shaped.
+ * @throws `[EDD-9114]` for invalid `offload` options: an unknown key, an
+ *   `itemBudget` that is not a safe integer in 1 … 409,600, a `prefix` that is
+ *   not a non-empty string of RFC 3986 unreserved characters and `/` of at
+ *   most 256 bytes (not starting with `/`), or `offload` on a stream whose
+ *   `data` and snapshot `state` are not `DynamoModel.Packed({ external })`.
  *
  * `storedAs: { data: DynamoModel.Packed(...) }` stores event `data` packed, and
  * `snapshot.storedAs` the snapshot `state` — see {@link StreamStorageConfig}.
@@ -2769,6 +2790,13 @@ export const makeStream = <
     >
   /** How event `data` is stored — see {@link StreamStorageConfig}. */
   readonly storedAs?: StreamStorageConfig | undefined
+  /**
+   * Item-level offload settings (#179) for a stream whose event `data` or
+   * snapshot `state` is `DynamoModel.Packed({ external })`: `itemBudget`
+   * (applied per event item and per snapshot item) and `prefix` (replaces the
+   * blob store's prefix for this stream's objects).
+   */
+  readonly offload?: OffloadConfig | undefined
 }): EventStream<
   Schema.Schema.Type<TEvents[number]>,
   TStreamId["composite"],
@@ -2871,6 +2899,20 @@ export const makeStream = <
 
   // Packed storage (EDD-9079, EDD-9073) — validated at definition time.
   const storage = resolveStreamStorage(config.streamName, config.storedAs, snapshot)
+  // Offloaded storage (#179): `offload` options (EDD-9114). Until the
+  // EventStore offload paths are wired, a stream that offloads `data` or
+  // `state` is refused here as not yet supported.
+  {
+    const offloaded = [
+      ...(storage.data?.external === undefined ? [] : ['"data" (overflow)']),
+      ...(storage.state?.external === undefined ? [] : ['"state" (overflow)']),
+    ]
+    resolveOffloadOptions(`EventStream "${config.streamName}"`, config.offload, {
+      overflow: offloaded.length > 0,
+      offloaded: offloaded.length > 0,
+    })
+    refuseUnsupportedOffload(`EventStream "${config.streamName}"`, offloaded)
+  }
   /** Event `data` packing, or `undefined` for the native map. */
   const dataStoredAs = storage.data
   /** Snapshot `state` packing, or `undefined` for the native map. */

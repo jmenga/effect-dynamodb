@@ -20,6 +20,8 @@ import { Duration, Option, type Schema, SchemaAST } from "effect"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
+  type ExternalConfig,
+  type ExternalPackedConfig,
   type ExtractIdentifier,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
@@ -43,6 +45,8 @@ import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
+  OffloadConfig,
+  ResolvedOffload,
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampsConfig,
@@ -50,6 +54,7 @@ import type {
   UniqueConstraintDef,
   VersionedConfig,
 } from "./internal/EntityConfig.js"
+import { externalIndexRefusal, resolveOffloadPlan } from "./internal/EntityOffload.js"
 import { packedIndexRefusal, resolvePackedPlan } from "./internal/EntityPacked.js"
 import {
   allCompositeAttributes,
@@ -126,6 +131,7 @@ import type { DimensionFor } from "./ZOrder.js"
 // ---------------------------------------------------------------------------
 
 export type { IndexDefinition, KeyPart, ZOrderKeyPart }
+export type { OffloadConfig, ResolvedOffload }
 
 /** Whether the model field `name` stores something on every write (`isRequiredStored`). */
 const storesUnder = (fields: Readonly<Record<string, Schema.Top>>, name: string): boolean => {
@@ -580,15 +586,23 @@ export interface EntityDefinitionData {
   readonly sparseFields: globalThis.Record<string, SparseConfig>
   readonly hasSparseFields: boolean
   /** Domain field name → packed storage config (`storedAs: DynamoModel.Packed`). */
-  readonly packedFields: Readonly<globalThis.Record<string, PackedConfig>>
+  readonly packedFields: Readonly<globalThis.Record<string, PackedConfig | ExternalPackedConfig>>
   /** Stored attribute name (after `field` renames) → packed storage config. */
-  readonly packedAttributes: Readonly<globalThis.Record<string, PackedConfig>>
+  readonly packedAttributes: Readonly<
+    globalThis.Record<string, PackedConfig | ExternalPackedConfig>
+  >
   /**
    * Stored attribute names read by their stored form (packed ones plus every
    * object/array-shaped field — see `internal/EntityPacked.ts`).
    */
   readonly dispatchAttributes: ReadonlyArray<string>
   readonly hasPackedFields: boolean
+  /** Domain field name → config, for every `External` (binary) field (#179). */
+  readonly externalFields: Readonly<globalThis.Record<string, ExternalConfig>>
+  /** Domain field name → config, for every overflow field (`Packed({ external })`, #179). */
+  readonly overflowFields: Readonly<globalThis.Record<string, ExternalPackedConfig>>
+  /** The resolved offload settings; `undefined` when the entity offloads nothing. */
+  readonly offload: ResolvedOffload | undefined
   readonly fieldRenames: globalThis.Record<string, string>
   readonly hasRenames: boolean
   readonly renameToDynamo: (item: globalThis.Record<string, unknown>) => void
@@ -622,12 +636,13 @@ export interface EntityDefinitionConfig {
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
   readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
+  readonly offload?: OffloadConfig | undefined
 }
 
 /**
  * The pure definition produced by {@link make}. Carries the model binding,
  * index definitions, system-field configuration, derived schemas, and the
- * `_configure` / `_injectIndex` hooks used by the runtime binding layer. Does
+ * `_configure` hook used by the runtime binding layer. Does
  * NOT carry AWS-coupled CRUD/query operations — those live on the runtime
  * `effect-dynamodb` `Entity` type, which extends this.
  */
@@ -663,6 +678,13 @@ export interface EntityDefinition<
   readonly generatedId: TGeneratedId
   /** Vector index declarations as authored (see `DESIGN.md §14`). */
   readonly vectorIndexes: TVectorIndexes
+  /**
+   * The resolved offload settings (#179): `itemBudget` and `prefix` from
+   * `Entity.make({ offload })`, and the domain names of the `overflow`
+   * (`Packed({ external })`) and `binary` (`External()`) fields. `undefined`
+   * when the entity offloads nothing.
+   */
+  readonly offload: ResolvedOffload | undefined
 
   /**
    * @internal Normalized vector index definitions keyed by logical name. The
@@ -837,6 +859,7 @@ export const buildEntityDefinition = (config: {
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
   readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
+  readonly offload?: OffloadConfig | undefined
 }): EntityDefinitionData => {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
@@ -997,6 +1020,30 @@ export const buildEntityDefinition = (config: {
     resolveDbName: (name) =>
       ownValue(configuredAttributes as globalThis.Record<string, { readonly field?: string }>, name)
         ?.field ?? name,
+  })
+
+  // ---------------------------------------------------------------------------
+  // Offloaded fields (Packed({ external }) / External) and `offload` options —
+  // EDD-9111..9114 (#179). Overflow fields are packed, so the Packed guards
+  // above already ran on them. Until offload writes are wired, an entity that
+  // offloads anything is refused here as not yet supported.
+  // ---------------------------------------------------------------------------
+
+  const offloadPlan = resolveOffloadPlan({
+    entityType: config.entityType,
+    model: config.model as Schema.Top,
+    modelFields,
+    indexes: config.indexes,
+    unique: config.unique,
+    timeSeries: config.timeSeries,
+    vectorIndexes: config.vectorIndexes,
+    refs: config.refs as
+      | globalThis.Record<
+          string,
+          { readonly entity: { readonly entityType: string; readonly model: Schema.Top } }
+        >
+      | undefined,
+    offload: config.offload,
   })
 
   // ---------------------------------------------------------------------------
@@ -1743,6 +1790,9 @@ export const buildEntityDefinition = (config: {
     packedAttributes: packedPlan.packedAttributes,
     dispatchAttributes: packedPlan.dispatchAttributes,
     hasPackedFields: packedPlan.hasPackedFields,
+    externalFields: offloadPlan.externalFields,
+    overflowFields: offloadPlan.overflowFields,
+    offload: offloadPlan.offload,
     fieldRenames,
     hasRenames,
     renameToDynamo,
@@ -1953,6 +2003,11 @@ export const make = <
   readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
+  /**
+   * Item-level offload settings (#179) — `itemBudget` and `prefix`, for an
+   * entity with offloaded fields. See {@link OffloadConfig}.
+   */
+  readonly offload?: OffloadConfig | undefined
 }): EntityDefinition<
   TModel,
   TEntityType,
@@ -1997,6 +2052,7 @@ const makeDefinitionImpl = (config: {
   readonly timeSeries?: TimeSeriesConfig<any> | undefined
   readonly generatedId?: GeneratedIdConfig | undefined
   readonly vectorIndexes?: globalThis.Record<string, VectorIndexConfig> | undefined
+  readonly offload?: OffloadConfig | undefined
 }): EntityDefinition => {
   const data = buildEntityDefinition(config)
 
@@ -2020,6 +2076,7 @@ const makeDefinitionImpl = (config: {
     timeSeries: config.timeSeries,
     generatedId: config.generatedId,
     vectorIndexes: config.vectorIndexes,
+    offload: data.offload,
     _vectorIndexes: data.vectorIndexes,
     _resolveDbName: data.resolveDbName,
     _packedFields: Object.keys(data.packedFields),
@@ -2038,6 +2095,8 @@ const makeDefinitionImpl = (config: {
       if (isZOrderHalf(def.sk)) throw zorderInCollection(data.entityType, name)
       const refused = packedIndexRefusal(data.entityType, data.packedFields, name, def)
       if (refused !== undefined) throw new Error(refused)
+      const external = externalIndexRefusal(data.entityType, data.externalFields, name, def)
+      if (external !== undefined) throw new Error(external)
       allIndexes = { ...allIndexes, [name]: def }
     },
     get _schema() {

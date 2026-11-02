@@ -12,12 +12,18 @@ export type {
 export * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 export type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 export { Embedder } from "@effect-dynamodb/schema/Embedder.js"
+export type {
+  BlobStoreAction,
+  BlobStoreErrorFields,
+  BlobStoreReason,
+} from "@effect-dynamodb/schema/Errors.js"
 export {
   AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
   AppendTooLarge,
+  BlobStoreError,
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
@@ -56,6 +62,7 @@ export {
 export type {
   AppendInputType,
   AppendSuccess,
+  DefaultOffloadModes,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
@@ -66,10 +73,14 @@ export type {
   IndexPkInput,
   IndexSkComposites,
   ModelType,
+  OffloadMode,
   PrimaryKeyComposites,
+  ReadBlobErrors,
   RefErrors,
+  ResolvedOffloadModes,
   SystemFieldsType,
   VectorErrors,
+  WriteBlobErrors,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 export type {
   GsiConfig,

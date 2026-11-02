@@ -10,7 +10,9 @@
  * - `SparseMap()` — opt a `Schema.Record` field into flattened storage (one
  *                   top-level attribute per entry)
  * - `Packed()` — store an object/array-shaped field (or EventStore data/state)
- *                as one JSON string, optionally compressed over a threshold
+ *                as one JSON string, optionally compressed over a threshold,
+ *                and (`external`) offloaded to the blob store over another
+ * - `External()` — store a binary field's content in the blob store
  *
  * See docs/design-dynamo-model.md for the three-layer model (wire → domain → storage).
  */
@@ -591,6 +593,24 @@ export const compressionCodecs: ReadonlyArray<CompressionCodec> = ["gzip", "brot
  */
 export const DEFAULT_COMPRESSION_THRESHOLD = 1024
 
+/**
+ * Default `external.threshold`: 65,536 stored bytes. Below roughly 8 KB an
+ * object-store `PUT` costs more than the DynamoDB write units it saves, and
+ * every offloaded read adds a round trip, so only genuinely large values go
+ * out by default. Tune it per workload.
+ */
+export const DEFAULT_EXTERNAL_THRESHOLD = 65_536
+
+/** The `external` option of {@link Packed}: offload large values to the blob store. */
+export interface ExternalOptions {
+  /**
+   * Stored bytes of the packed value (the `S` UTF-8 length, or the `B` length
+   * after compression) at or above which it is written to the blob store
+   * instead. A non-negative safe integer; `0` always offloads. Default 65,536.
+   */
+  readonly threshold?: number | undefined
+}
+
 /** Options accepted by {@link Packed}. */
 export interface PackedOptions {
   readonly format: PackedFormat
@@ -604,24 +624,96 @@ export interface PackedOptions {
         readonly threshold?: number | undefined
       }
     | undefined
+  /**
+   * Not accepted here: offloading is only reachable through the
+   * {@link ExternalPackedOptions} overload of {@link Packed}, so options typed
+   * `PackedOptions` never return a config the type level would not see as
+   * offloaded.
+   */
+  readonly external?: never | undefined
+}
+
+/**
+ * Options of an overflow field (`Packed({ external })`): packed inline below
+ * `external.threshold`, offloaded to the blob store at or above it.
+ */
+export interface ExternalPackedOptions extends Omit<PackedOptions, "external"> {
+  readonly external: ExternalOptions
 }
 
 /** Brand symbol identifying a {@link PackedConfig} produced by {@link Packed}. */
 const PackedTag: unique symbol = Symbol.for("effect-dynamodb/Packed")
 
 /**
- * The validated, frozen storage config returned by {@link Packed} — the value
- * of an entity field's `storedAs`, an EventStore stream's `storedAs.data`, or a
- * snapshot's `storedAs`.
+ * The validated, frozen storage config returned by {@link Packed} without
+ * `external` — the value of an entity field's `storedAs`, an EventStore
+ * stream's `storedAs.data`, or a snapshot's `storedAs`, always stored inline.
+ *
+ * Disjoint from {@link ExternalPackedConfig} (#179): an overflow config is not
+ * assignable to this type, so it cannot be widened into one the type level
+ * would read as inline (and so drop its blob-store errors). Every API that
+ * takes a packed config takes either: `PackedConfig | ExternalPackedConfig`.
  */
 export interface PackedConfig {
   readonly [PackedTag]: true
   readonly format: PackedFormat
   readonly compression: { readonly codec: CompressionCodec; readonly threshold: number } | undefined
+  /** Always `undefined`: a plain packed value is never offloaded. */
+  readonly external: undefined
+}
+
+/**
+ * The config `Packed({ external })` returns — an overflow value, packed
+ * inline below `external.threshold` and offloaded to the blob store at or
+ * above it. What the type level keys on ({@link ExtractOffloadFields}); not
+ * assignable to {@link PackedConfig}.
+ */
+export interface ExternalPackedConfig {
+  readonly [PackedTag]: true
+  readonly format: PackedFormat
+  readonly compression: { readonly codec: CompressionCodec; readonly threshold: number } | undefined
+  /** Offload settings, resolved: stored bytes at or above `threshold` are offloaded. */
+  readonly external: { readonly threshold: number }
 }
 
 const packedError = (message: string): Error =>
   new Error(`[EDD-9071] DynamoModel.Packed: ${message}`)
+
+const externalError = (api: "Packed" | "External", message: string): Error =>
+  new Error(`[EDD-9141] DynamoModel.${api}: ${message}`)
+
+/** The resolved `external` option of {@link Packed}, or `undefined` when absent (EDD-9141). */
+const resolveExternalOption = (external: unknown): { readonly threshold: number } | undefined => {
+  if (external === undefined) return undefined
+  if (typeof external !== "object" || external === null || Array.isArray(external)) {
+    throw externalError(
+      "Packed",
+      `external must be an object, e.g. { threshold: ${DEFAULT_EXTERNAL_THRESHOLD} }; received ` +
+        `${external === null ? "null" : Array.isArray(external) ? "an array" : typeof external}`,
+    )
+  }
+  for (const key of Object.keys(external)) {
+    if (key !== "threshold") {
+      throw externalError(
+        "Packed",
+        `unknown external option "${key}" (expected optional "threshold")`,
+      )
+    }
+  }
+  const threshold = (external as { readonly threshold?: unknown }).threshold
+  if (
+    threshold !== undefined &&
+    (typeof threshold !== "number" || !Number.isSafeInteger(threshold) || threshold < 0)
+  ) {
+    throw externalError(
+      "Packed",
+      `external.threshold must be a non-negative safe integer (stored bytes), got ${String(threshold)}`,
+    )
+  }
+  return Object.freeze({
+    threshold: (threshold as number | undefined) ?? DEFAULT_EXTERNAL_THRESHOLD,
+  })
+}
 
 /**
  * Store a value packed into one attribute: its wire form as a JSON string
@@ -647,17 +739,45 @@ const packedError = (message: string): Error =>
  * })
  * ```
  *
+ * **Overflow fields** (`external`, #179): a value whose stored bytes (after
+ * compression) reach `external.threshold` (default 65,536) is written to the
+ * blob store and the attribute holds a pointer to the object version; smaller
+ * values stay inline, byte-identical to a plain `Packed` field. This overload
+ * returns an {@link ExternalPackedConfig}, which is what marks the field as
+ * offloaded at the type level. See `DESIGN.md §7 "Offloaded Storage"`.
+ *
+ * @example
+ * ```ts
+ * DynamoModel.configure(Document, {
+ *   body: {
+ *     storedAs: DynamoModel.Packed({
+ *       format: "json",
+ *       compression: { codec: "zstd" },
+ *       external: { threshold: 65_536 },
+ *     }),
+ *   },
+ * })
+ * ```
+ *
  * @throws `[EDD-9071]` on invalid options: a `format` other than `"json"`, an
  *   unknown `compression.codec`, a `threshold` that is not a non-negative safe
  *   integer, or an unknown option key.
+ * @throws `[EDD-9141]` on an invalid `external` option: not an object, an
+ *   unknown key, or a `threshold` that is not a non-negative safe integer.
  */
-export const Packed = (options: PackedOptions): PackedConfig => {
+export function Packed(options: ExternalPackedOptions): ExternalPackedConfig
+export function Packed(options: PackedOptions): PackedConfig
+export function Packed(
+  options: PackedOptions | ExternalPackedOptions,
+): PackedConfig | ExternalPackedConfig {
   if (typeof options !== "object" || options === null) {
     throw packedError('options must be an object, e.g. { format: "json" }')
   }
   for (const key of Object.keys(options)) {
-    if (key !== "format" && key !== "compression") {
-      throw packedError(`unknown option "${key}" (expected "format" and optional "compression")`)
+    if (key !== "format" && key !== "compression" && key !== "external") {
+      throw packedError(
+        `unknown option "${key}" (expected "format", optional "compression" and optional "external")`,
+      )
     }
   }
   const format = (options as { readonly format?: unknown }).format
@@ -671,8 +791,9 @@ export const Packed = (options: PackedOptions): PackedConfig => {
     throw packedError(`unknown format ${JSON.stringify(format)} — the supported format is "json"`)
   }
   const compression = (options as { readonly compression?: unknown }).compression
+  const external = resolveExternalOption((options as { readonly external?: unknown }).external)
   if (compression === undefined) {
-    return Object.freeze({ [PackedTag]: true as const, format, compression: undefined })
+    return Object.freeze({ [PackedTag]: true as const, format, compression: undefined, external })
   }
   if (typeof compression !== "object" || compression === null) {
     throw packedError('compression must be an object, e.g. { codec: "zstd" }')
@@ -710,28 +831,164 @@ export const Packed = (options: PackedOptions): PackedConfig => {
       codec: codec as CompressionCodec,
       threshold: (threshold as number | undefined) ?? DEFAULT_COMPRESSION_THRESHOLD,
     }),
+    external,
   })
 }
 
-/** Type guard — returns true iff `value` is a {@link PackedConfig}. */
-export const isPackedConfig = (value: unknown): value is PackedConfig =>
+/**
+ * Type guard — returns true iff `value` is a config {@link Packed} returned:
+ * a {@link PackedConfig} or an {@link ExternalPackedConfig}.
+ */
+export const isPackedConfig = (value: unknown): value is PackedConfig | ExternalPackedConfig =>
   typeof value === "object" &&
   value !== null &&
   (value as globalThis.Record<symbol, unknown>)[PackedTag] === true
 
 /**
+ * Type guard — returns true iff `value` is an {@link ExternalPackedConfig}
+ * (an overflow field's config, `Packed({ external })`).
+ */
+export const isExternalPackedConfig = (value: unknown): value is ExternalPackedConfig =>
+  isPackedConfig(value) && value.external !== undefined
+
+// ---------------------------------------------------------------------------
+// Binary fields offloaded to the blob store — DESIGN.md §7 "Offloaded Storage"
+// ---------------------------------------------------------------------------
+
+/** Default `contentType` of an {@link External} field's objects. */
+export const DEFAULT_EXTERNAL_CONTENT_TYPE = "application/octet-stream"
+
+/** Bytes of the longest content type an object may be stored with (a blob pointer's limit). */
+const MAX_CONTENT_TYPE_BYTES = 255
+
+/** Options accepted by {@link External}. */
+export interface ExternalBinaryOptions {
+  /**
+   * Content-Type of the stored object when a write does not name one. A
+   * non-empty US-ASCII string of at most 255 bytes. Default
+   * `"application/octet-stream"`.
+   */
+  readonly contentType?: string | undefined
+}
+
+/** Brand symbol identifying an {@link ExternalConfig} produced by {@link External}. */
+const ExternalTag: unique symbol = Symbol.for("effect-dynamodb/External")
+
+/**
+ * The validated, frozen storage config returned by {@link External} — the
+ * `storedAs` of a binary field whose content always lives in the blob store.
+ */
+export interface ExternalConfig {
+  readonly [ExternalTag]: true
+  readonly contentType: string
+}
+
+const isUsAscii = (text: string): boolean => {
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false
+  return true
+}
+
+/**
+ * Store a binary field (encoded side `Uint8Array`) in the blob store: every
+ * write uploads the bytes as a new object version, and the attribute holds a
+ * pointer to it (an `S` value, so readers that predate offloading fail loudly
+ * instead of returning the pointer's bytes). Reads return a lazy `BlobHandle`
+ * by default. A value stored natively before `External` was configured still
+ * reads. See `DESIGN.md §7 "Offloaded Storage"`.
+ *
+ * Admitted by {@link configure} only on fields whose domain type is a
+ * `Uint8Array` (optionally `undefined` / `null`); `Entity.make` checks the
+ * encoded side (`[EDD-9111]`). `field` renames and `immutable` combine with it.
+ *
+ * @example
+ * ```ts
+ * DynamoModel.configure(Document, {
+ *   scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+ * })
+ * ```
+ *
+ * @throws `[EDD-9141]` on invalid options: not an object, an unknown key, or a
+ *   `contentType` that is not a non-empty US-ASCII string of at most 255 bytes.
+ */
+export const External = (options?: ExternalBinaryOptions): ExternalConfig => {
+  if (options === undefined) {
+    return Object.freeze({
+      [ExternalTag]: true as const,
+      contentType: DEFAULT_EXTERNAL_CONTENT_TYPE,
+    })
+  }
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw externalError(
+      "External",
+      'options must be an object, e.g. { contentType: "application/pdf" }; received ' +
+        `${options === null ? "null" : Array.isArray(options) ? "an array" : typeof options}`,
+    )
+  }
+  for (const key of Object.keys(options)) {
+    if (key !== "contentType") {
+      throw externalError("External", `unknown option "${key}" (expected optional "contentType")`)
+    }
+  }
+  const contentType = (options as { readonly contentType?: unknown }).contentType
+  if (contentType === undefined) {
+    return Object.freeze({
+      [ExternalTag]: true as const,
+      contentType: DEFAULT_EXTERNAL_CONTENT_TYPE,
+    })
+  }
+  if (
+    typeof contentType !== "string" ||
+    contentType.length === 0 ||
+    contentType.length > MAX_CONTENT_TYPE_BYTES ||
+    !isUsAscii(contentType)
+  ) {
+    throw externalError(
+      "External",
+      `contentType must be a non-empty US-ASCII string of at most ${MAX_CONTENT_TYPE_BYTES} ` +
+        `bytes, got ${typeof contentType === "string" ? JSON.stringify(contentType) : String(contentType)}`,
+    )
+  }
+  return Object.freeze({ [ExternalTag]: true as const, contentType })
+}
+
+/** Type guard — returns true iff `value` is an {@link ExternalConfig}. */
+export const isExternalConfig = (value: unknown): value is ExternalConfig =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as globalThis.Record<symbol, unknown>)[ExternalTag] === true
+
+/**
+ * Resolve the binary offload config for every field on a model configured
+ * `storedAs: DynamoModel.External(...)` via {@link configure}.
+ *
+ * Returns `Record<domainFieldName, ExternalConfig>` — empty when the model is
+ * not a `ConfiguredModel` or configures no `External` field.
+ */
+export const getExternalFields = (
+  model: Schema.Top | ConfiguredModel<any, any>,
+): globalThis.Record<string, ExternalConfig> => {
+  if (!isConfiguredModel(model)) return {}
+  const out: globalThis.Record<string, ExternalConfig> = {}
+  for (const [name, attr] of Object.entries(model.attributes)) {
+    if (attr.external) out[name] = attr.external
+  }
+  return out
+}
+
+/**
  * Resolve the packed storage config for every field on a model configured
  * `storedAs: DynamoModel.Packed(...)` via {@link configure}.
  *
- * Returns `Record<domainFieldName, PackedConfig>` — empty when the model is not
- * a `ConfiguredModel` or configures no packed field. Like sparse maps, packing
- * is a storage concern: it is read from `ConfiguredModel.attributes` only.
+ * Returns `Record<domainFieldName, PackedConfig | ExternalPackedConfig>` —
+ * overflow fields included — empty when the model is not a `ConfiguredModel`
+ * or configures no packed field. Like sparse maps, packing is a storage
+ * concern: it is read from `ConfiguredModel.attributes` only.
  */
 export const getPackedFields = (
   model: Schema.Top | ConfiguredModel<any, any>,
-): globalThis.Record<string, PackedConfig> => {
+): globalThis.Record<string, PackedConfig | ExternalPackedConfig> => {
   // Null-prototype: a field is looked up by name, and a model field may be named `constructor`.
-  const out: globalThis.Record<string, PackedConfig> = Object.create(null)
+  const out: globalThis.Record<string, PackedConfig | ExternalPackedConfig> = Object.create(null)
   if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
     if (attr.packed) setOwn(out, name, attr.packed)
@@ -739,11 +996,18 @@ export const getPackedFields = (
   return out
 }
 
-/** The domain field names a `ConfiguredModel` stores packed (`never` when none). */
+/**
+ * The domain field names a `ConfiguredModel` stores packed (`never` when none),
+ * overflow fields included.
+ */
 export type ExtractPackedFields<Model> =
   Model extends ConfiguredModel<any, infer A>
     ? {
-        [K in keyof A & string]: A[K] extends { readonly storedAs: PackedConfig } ? K : never
+        [K in keyof A & string]: A[K] extends {
+          readonly storedAs: PackedConfig | ExternalPackedConfig
+        }
+          ? K
+          : never
       }[keyof A & string]
     : never
 
@@ -765,6 +1029,43 @@ export type ExtractUnremovableFields<Model> =
     : never
 
 /**
+ * The domain field names a member offloads to the blob store, by kind:
+ * `overflow` (`Packed({ external })`) and `binary` (`External()`).
+ */
+export interface OffloadFields {
+  readonly overflow: string
+  readonly binary: string
+}
+
+/** A member that offloads nothing. */
+export type NoOffload = { readonly overflow: never; readonly binary: never }
+
+/**
+ * The {@link OffloadFields} of a `ConfiguredModel` — {@link NoOffload} for a
+ * model that configures neither kind (or is not configured at all).
+ *
+ * A field is overflow when its `storedAs` may be an {@link ExternalPackedConfig}
+ * — a union-typed config (`PackedConfig | ExternalPackedConfig`) included — so
+ * the blob-store errors are never under-reported. {@link PackedConfig} is
+ * disjoint from it, so an overflow config cannot be widened to look inline.
+ */
+export type ExtractOffloadFields<Model> =
+  Model extends ConfiguredModel<any, infer A>
+    ? {
+        readonly overflow: {
+          [K in keyof A & string]: A[K] extends { readonly storedAs: infer S }
+            ? [Extract<S, ExternalPackedConfig>] extends [never]
+              ? never
+              : K
+            : never
+        }[keyof A & string]
+        readonly binary: {
+          [K in keyof A & string]: A[K] extends { readonly storedAs: ExternalConfig } ? K : never
+        }[keyof A & string]
+      }
+    : NoOffload
+
+/**
  * A model wrapped with DynamoDB-specific attribute overrides.
  *
  * Carries the original model plus per-field configuration:
@@ -774,7 +1075,9 @@ export type ExtractUnremovableFields<Model> =
  *               flatten a `Schema.Record` field into per-entry top-level
  *               attributes (see {@link SparseConfig})
  *               OR a {@link PackedConfig} (via {@link Packed}) to store the
- *               field as one JSON string / compressed binary value.
+ *               field as one JSON string / compressed binary value
+ *               OR an {@link ExternalConfig} (via {@link External}) to store a
+ *               binary field's content in the blob store.
  * - `immutable` — mark field as read-only after creation (excluded from Entity.Update)
  * - `identifier` — mark field as the identity field for ref resolution
  * - `ref` — mark field as a denormalized reference to another entity
@@ -786,18 +1089,19 @@ export interface ConfiguredModel<
   readonly [ConfiguredModelTag]: true
   readonly model: M
   readonly _attributes: A
-  readonly attributes: globalThis.Record<
-    string,
-    {
-      readonly field?: string
-      readonly encoding?: DynamoEncoding
-      readonly immutable?: boolean
-      readonly identifier?: boolean
-      readonly ref?: boolean
-      readonly sparse?: SparseConfig
-      readonly packed?: PackedConfig
-    }
-  >
+  readonly attributes: globalThis.Record<string, ResolvedAttributeConfig>
+}
+
+/** The resolved per-field overrides a {@link ConfiguredModel} carries. */
+interface ResolvedAttributeConfig {
+  readonly field?: string
+  readonly encoding?: DynamoEncoding
+  readonly immutable?: boolean
+  readonly identifier?: boolean
+  readonly ref?: boolean
+  readonly sparse?: SparseConfig
+  readonly packed?: PackedConfig | ExternalPackedConfig
+  readonly external?: ExternalConfig
 }
 
 /** Extract the identifier field name from a ConfiguredModel's attributes type. */
@@ -874,7 +1178,9 @@ export const isRecordAst = (valueAst: unknown): boolean =>
  * - `ref` — Mark as a denormalized reference field.
  *
  *   Or {@link Packed}(...) to store an object/array-shaped field as one JSON
- *   string or compressed binary value.
+ *   string or compressed binary value (with `external`, offloaded to the blob
+ *   store at or over a threshold), or {@link External}(...) to store a
+ *   `Uint8Array` field's content in the blob store.
  *
  * Note: the `prefix` option moved into the {@link SparseMap} config in 1.6 —
  * pass `storedAs: DynamoModel.SparseMap({ prefix })` instead of declaring
@@ -883,23 +1189,42 @@ export const isRecordAst = (valueAst: unknown): boolean =>
  */
 type AttributeConfig<A> = {
   readonly field?: string
-  readonly storedAs?: Schema.Schema<A> | SparseMapConfig | PackableStorage<A>
+  readonly storedAs?:
+    | Schema.Schema<A>
+    | SparseMapConfig
+    | PackableStorage<A>
+    | ExternalBinaryStorage<A>
   readonly immutable?: boolean
   readonly identifier?: boolean
   readonly ref?: boolean
 }
 
 /**
- * `PackedConfig` is admitted only on fields whose domain type is object- or
- * array-shaped (or `unknown`); a scalar field is a compile error. The runtime
- * shape rule at `Entity.make()` (EDD-9073), which inspects the encoded side,
- * stays authoritative.
+ * A packed config (`PackedConfig` or, overflow, `ExternalPackedConfig`) is
+ * admitted only on fields whose domain type is object- or array-shaped (or
+ * `unknown`); a scalar field is a compile error. The runtime shape rule at
+ * `Entity.make()` (EDD-9073), which inspects the encoded side, stays
+ * authoritative.
  */
 type PackableStorage<A> = unknown extends A
-  ? PackedConfig
+  ? PackedConfig | ExternalPackedConfig
   : [NonNullable<A>] extends [object]
-    ? PackedConfig
+    ? PackedConfig | ExternalPackedConfig
     : never
+
+/**
+ * `ExternalConfig` is admitted only on fields whose domain type is a
+ * `Uint8Array` (optionally `undefined` / `null`). The runtime rule at
+ * `Entity.make()` (EDD-9111), which requires the encoded side to be a
+ * `Uint8Array`, stays authoritative.
+ */
+type ExternalBinaryStorage<A> = unknown extends A
+  ? never
+  : [NonNullable<A>] extends [never]
+    ? never
+    : [NonNullable<A>] extends [Uint8Array]
+      ? ExternalConfig
+      : never
 
 /**
  * Type-safe attribute overrides map: keys constrained to model fields,
@@ -963,30 +1288,11 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
     ValidateFieldRenames<keyof Schema.Schema.Type<M> & string, A> &
     OnlyModelFields<M, A>,
 ): ConfiguredModel<M, A> => {
-  const resolved: globalThis.Record<
-    string,
-    {
-      readonly field?: string
-      readonly encoding?: DynamoEncoding
-      readonly immutable?: boolean
-      readonly identifier?: boolean
-      readonly ref?: boolean
-      readonly sparse?: SparseConfig
-      readonly packed?: PackedConfig
-    }
-  > = {}
+  const resolved: globalThis.Record<string, ResolvedAttributeConfig> = {}
   for (const [key, config] of Object.entries(
     attributes as globalThis.Record<string, AttributeConfig<unknown>>,
   )) {
-    const entry: {
-      field?: string
-      encoding?: DynamoEncoding
-      immutable?: boolean
-      identifier?: boolean
-      ref?: boolean
-      sparse?: SparseConfig
-      packed?: PackedConfig
-    } = {}
+    const entry: { -readonly [K in keyof ResolvedAttributeConfig]: ResolvedAttributeConfig[K] } = {}
     if (config.field) entry.field = config.field
     if (config.immutable) entry.immutable = true
     if (config.identifier) entry.identifier = true
@@ -1015,6 +1321,11 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       // Entity.make() time (EDD-9072–9075), where the model and its indexes
       // are known.
       entry.packed = config.storedAs
+    } else if (isExternalConfig(config.storedAs)) {
+      // Binary field offloaded to the blob store. The encoded-side rule
+      // (EDD-9111) and the key / index / unique / ref guards (EDD-9142) run at
+      // Entity.make() time, where the model and its indexes are known.
+      entry.external = config.storedAs
     } else if (config.storedAs !== undefined) {
       const encoding = getEncoding(config.storedAs as Schema.Top)
       if (!encoding) {

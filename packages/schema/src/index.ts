@@ -32,12 +32,18 @@ export type {
   EntityDefinition as EntityType,
 } from "./Entity.js"
 export * as Entity from "./Entity.js"
+export type {
+  BlobStoreAction,
+  BlobStoreErrorFields,
+  BlobStoreReason,
+} from "./Errors.js"
 export {
   AdditionalItemConditionFailed,
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
   AppendTooLarge,
+  BlobStoreError,
   CascadePartialFailure,
   CompositeKeyHoleError,
   CompositeNullableError,
@@ -76,6 +82,7 @@ export {
 export type {
   AppendInputType,
   AppendSuccess,
+  DefaultOffloadModes,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
@@ -86,10 +93,14 @@ export type {
   IndexPkInput,
   IndexSkComposites,
   ModelType,
+  OffloadMode,
   PrimaryKeyComposites,
+  ReadBlobErrors,
   RefErrors,
+  ResolvedOffloadModes,
   SystemFieldsType,
   VectorErrors,
+  WriteBlobErrors,
 } from "./internal/EntityTypes.js"
 export type {
   GsiConfig,

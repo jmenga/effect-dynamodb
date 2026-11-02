@@ -1,5 +1,6 @@
 import { Data, type Option } from "effect"
 import type { CompressionCodec } from "./DynamoModel.js"
+import type { BlobRef } from "./internal/BlobPointer.js"
 
 /**
  * A tagged error's `toJSON` without one field. Effect prints an error through `toJSON`
@@ -455,6 +456,96 @@ export class EmbeddingError extends Data.TaggedError("EmbeddingError")<{
   readonly reason: string
   readonly cause?: unknown
 }> {}
+
+/**
+ * Why a {@link BlobStoreError} was raised:
+ *
+ * - `NotProvided` — no `BlobStore` in context;
+ * - `Unversioned` — a `PutObject` / `CopyObject` / `CompleteMultipartUpload`
+ *   response carried no real `VersionId` (missing or `"null"`);
+ * - `NotFound` — the object version does not exist (`NoSuchVersion` /
+ *   `NoSuchKey`, or `AccessDenied` without `s3:ListBucket`);
+ * - `AccessDenied`, `Throttled`;
+ * - `ChecksumMismatch` — upload validation, or read verification;
+ * - `TooLarge`;
+ * - `SourceFailed` — the input `Stream` failed;
+ * - `Expired` — the upload finished after the store's `maxUploadAge`; nothing
+ *   was written to DynamoDB;
+ * - `Unsupported` — a capability the store lacks (`presign`, `list`, `head`,
+ *   `marks`), or a presigned URL for an inline handle;
+ * - `Unavailable` — a 5xx or transport failure after retries;
+ * - `Rejected` — any other store refusal.
+ */
+export type BlobStoreReason =
+  | "NotProvided"
+  | "Unversioned"
+  | "NotFound"
+  | "AccessDenied"
+  | "Throttled"
+  | "ChecksumMismatch"
+  | "TooLarge"
+  | "SourceFailed"
+  | "Expired"
+  | "Unsupported"
+  | "Unavailable"
+  | "Rejected"
+
+/** The store action a {@link BlobStoreError} failed in. */
+export type BlobStoreAction =
+  | "put"
+  | "get"
+  | "delete"
+  | "copy"
+  | "list"
+  | "head"
+  | "mark"
+  | "presign"
+
+/** The fields of a {@link BlobStoreError}. */
+export type BlobStoreErrorFields = {
+  /** The entity type, or `"<stream>.event"` / `"<stream>.snapshot"` for an EventStore stream. */
+  readonly entityType: string
+  /** The stored attribute name. */
+  readonly attribute: string
+  /** The operation, e.g. `"put"`, `"get.offload"`, `"EventStore.append"`. */
+  readonly operation: string
+  readonly action: BlobStoreAction
+  readonly reason: BlobStoreReason
+  /** The object version involved, when there is one. */
+  readonly ref?: BlobRef | undefined
+  /**
+   * The DynamoDB write committed; only reading its result back failed. Do not
+   * retry a non-idempotent write.
+   */
+  readonly committed: boolean
+  /** The store's failure (its own cause: the SDK error). */
+  readonly cause: unknown
+}
+
+/**
+ * The blob store failed for an offloaded field (#179): an upload, a read of a
+ * pointer, a delete, copy, list, head, mark or presign.
+ *
+ * Carried only in the error channels of members that declare an offloaded
+ * field (`DynamoModel.Packed({ external })` or `DynamoModel.External()`), and
+ * on reads only where the effective read mode reaches the store. See
+ * `DESIGN.md §7 "Offloaded Storage"`.
+ */
+export class BlobStoreError extends Data.TaggedError("BlobStoreError")<BlobStoreErrorFields> {
+  constructor(fields: BlobStoreErrorFields) {
+    super(fields)
+    this.message =
+      `${fields.entityType}: the blob store failed to ${fields.action} attribute ` +
+      `"${fields.attribute}" (${fields.operation}): ${fields.reason}` +
+      (fields.ref === undefined
+        ? ""
+        : ` — object "${fields.ref.key}"` +
+          (fields.ref.version === "" ? "" : ` version "${fields.ref.version}"`)) +
+      (fields.committed
+        ? ". The DynamoDB write committed; only reading its result back failed — do not retry it."
+        : "")
+  }
+}
 
 /** The fields of a {@link CompressorNotRegistered}. */
 export type CompressorNotRegisteredFields = {

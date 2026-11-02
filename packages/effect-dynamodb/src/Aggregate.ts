@@ -49,6 +49,7 @@ import {
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import { refOffloadRefusal } from "@effect-dynamodb/schema/internal/EntityOffload.js"
 import {
   buildDateTransform,
   containedKindOf,
@@ -81,7 +82,10 @@ import {
   ownValue,
   setOwn,
 } from "@effect-dynamodb/schema/internal/OwnNames.js"
-import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import {
+  binaryShapeRefusal,
+  isDispatchEligible,
+} from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
   extractArrayElement,
   extractKeyedValue,
@@ -239,6 +243,7 @@ import {
   holdsRefId,
   isEntityElement,
   isFieldOptional,
+  isSchemaMatchingEntity,
   manyEdgePaths,
   manyElementFields,
   manyElementSchema,
@@ -306,7 +311,9 @@ interface ResolvedNode {
    * node's items (a `one` edge's flattened entity, a `many` edge element that
    * IS the entity). Packed on write, read by stored form on read.
    */
-  readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
+  readonly packed?:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined
   /**
    * The attributes of this node's items read by their stored form (#147): every
    * packed one, plus every object- or array-shaped field of the edge entity's
@@ -577,7 +584,10 @@ export interface Aggregate<
    * name → config). `DynamoClient.make()` checks the codecs they name against
    * the registry it binds with (`[EDD-9078]`).
    */
-  readonly _packedByType?: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>
+  readonly _packedByType?: ReadonlyMap<
+    string,
+    Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+  >
 
   /** @internal Whether the aggregate declares `ownsRows`. */
   readonly _ownsRows?: boolean
@@ -2240,6 +2250,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   validateNestedDiscriminators(aggregateName, config.edges)
+  validateRefEdgeOffload(aggregateName, schemaFields, config.edges)
 
   // Ref fields whose target the schema walker must be told about (see
   // `collectRefTargets`). Keyed by the field SCHEMA, not its name: the resolver
@@ -6164,7 +6175,9 @@ interface ResolveNodeArgs {
   readonly movedKeyText?: true | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
-  readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
+  readonly packed?:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined
   readonly dispatch?: ReadonlyArray<string> | undefined
   /** The schema's `escapeKeys`: an `entity:` edge's sort key composition follows it. */
   readonly escapeKeys?: boolean | undefined
@@ -6182,10 +6195,12 @@ const edgePackedFields = (
   itemFields: Record<string, Schema.Top> | undefined,
   discriminator: Record<string, unknown> | undefined,
   skComposite: ReadonlyArray<string> | undefined,
-): Readonly<Record<string, DynamoModel.PackedConfig>> | undefined => {
+):
+  | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+  | undefined => {
   if (entity === undefined) return undefined
   const configured = DynamoModel.getPackedFields(entity.model)
-  const packed: Record<string, DynamoModel.PackedConfig> = {}
+  const packed: Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig> = {}
   for (const [field, storedAs] of Object.entries(configured)) {
     if (itemFields !== undefined && !Object.hasOwn(itemFields, field)) continue
     if (discriminator !== undefined && Object.hasOwn(discriminator, field)) {
@@ -6206,6 +6221,106 @@ const edgePackedFields = (
 }
 
 /**
+ * Validate the edge entity's `External` (binary) fields that are top-level
+ * attributes of the node's items (`itemFields`), as {@link edgePackedFields}
+ * does for packed ones (#179): such a field's item schema must be binary
+ * (`[EDD-9111]` — a `many` element may redeclare it), and it cannot be a
+ * discriminator or a declared sort-key composite (`[EDD-9142]`).
+ */
+const validateEdgeExternalFields = (
+  edgeName: string,
+  entity: { readonly model: Schema.Top; readonly entityType: string } | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+  discriminator: Record<string, unknown> | undefined,
+  skComposite: ReadonlyArray<string> | undefined,
+): void => {
+  if (entity === undefined) return
+  for (const field of Object.keys(DynamoModel.getExternalFields(entity.model))) {
+    if (itemFields !== undefined && !Object.hasOwn(itemFields, field)) continue
+    const itemSchema = itemFields?.[field]
+    const notBinary = itemSchema === undefined ? undefined : binaryShapeRefusal(itemSchema)
+    if (notBinary !== undefined) {
+      throw new Error(
+        `[EDD-9111] Aggregate edge "${edgeName}": "${field}" is an External field of entity ` +
+          `"${entity.entityType}", but the edge's item schema declares it as non-binary: ` +
+          `${notBinary}. Declare it as the entity does (Schema.Uint8Array).`,
+      )
+    }
+    if (discriminator !== undefined && Object.hasOwn(discriminator, field)) {
+      throw new Error(
+        `[EDD-9142] Aggregate edge "${edgeName}": discriminator "${field}" is an External field ` +
+          `of entity "${entity.entityType}". A discriminator is matched as a scalar stored value.`,
+      )
+    }
+    if ((skComposite ?? []).some((path) => path.split(".")[0] === field)) {
+      throw new Error(
+        `[EDD-9142] Aggregate edge "${edgeName}": sort-key composite "${field}" is an External ` +
+          `field of entity "${entity.entityType}". Key composites must be scalar model values.`,
+      )
+    }
+  }
+}
+
+/**
+ * Refuse a denormalised copy of an entity, at any depth, whose schema includes
+ * a field that entity offloads (`[EDD-9143]`, #179). Two edges copy an entity
+ * into a map inside another item, where no offload routing reaches:
+ *
+ * - a ref edge (`Aggregate.ref`) — its field, kept inline in its parent's item;
+ * - a `many` edge whose element WRAPS the ref (`PlayerSheet { player }`) — the
+ *   element field named after the entity (`deriveEntityFieldName`), which
+ *   hydration fills from `${name}Id` (as `deriveElementInputSchema` derives
+ *   it, by name, whether or not the field is `DynamoModel.ref`-annotated) and
+ *   the edge item stores as a nested map. An element that IS the entity is
+ *   stored as the edge item's own attributes, which `validateEdgeExternalFields`
+ *   checks and the edge entity's offload settings route.
+ */
+const validateRefEdgeOffload = (
+  aggregateName: string,
+  fields: Record<string, Schema.Top> | undefined,
+  edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+): void => {
+  const owner = `Aggregate "${aggregateName}"`
+  for (const [edgeName, edge] of Object.entries(edges)) {
+    if (!("_tag" in edge)) continue
+    if (edge._tag === "RefEdge") {
+      const fieldSchema = fields?.[edgeName]
+      if (fieldSchema === undefined) continue
+      const refused = refOffloadRefusal(
+        owner,
+        edgeName,
+        fieldSchema,
+        edge.entity as { readonly entityType: string; readonly model: Schema.Top },
+      )
+      if (refused !== undefined) throw new Error(refused)
+    } else if (edge._tag === "ManyEdge") {
+      const entity: RefEntity | undefined = edge.entity
+      const arrayField = fields?.[edgeName]
+      const element = arrayField === undefined ? undefined : extractArrayElement(arrayField)
+      if (entity === undefined || element === undefined) continue
+      if (isSchemaMatchingEntity(element, entity)) continue
+      const entityFieldName = deriveEntityFieldName(entity)
+      const elementFields = getSchemaFields(element)
+      const refField =
+        elementFields !== undefined && Object.hasOwn(elementFields, entityFieldName)
+          ? elementFields[entityFieldName]
+          : undefined
+      if (refField === undefined) continue
+      const refused = refOffloadRefusal(
+        owner,
+        `${edgeName}.${entityFieldName}`,
+        refField,
+        entity as { readonly entityType: string; readonly model: Schema.Top },
+      )
+      if (refused !== undefined) throw new Error(refused)
+    } else if (edge._tag === "BoundSubAggregate") {
+      const bound = edge as BoundSubAggregate<any>
+      validateRefEdgeOffload(aggregateName, fieldsOf(bound.aggregate.schema), bound.aggregate.edges)
+    }
+  }
+}
+
+/**
  * The attributes of an edge entity's items a reader dispatches on by stored
  * form: its packed ones, plus every non-sparse field of the item whose encoded
  * side is object- or array-shaped (a native value of it is never `S` or `B`) —
@@ -6214,7 +6329,9 @@ const edgePackedFields = (
 const edgeDispatchFields = (
   entity: { readonly model: Schema.Top } | undefined,
   itemFields: Record<string, Schema.Top> | undefined,
-  packed: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined,
+  packed:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined,
 ): ReadonlyArray<string> | undefined => {
   if (entity === undefined) return undefined
   const sparse = DynamoModel.getSparseFields(entity.model)
@@ -6228,7 +6345,9 @@ const edgeDispatchFields = (
 
 /** A node's packed and stored-form-dispatch attributes, as `resolveNode` args. */
 const edgeStorage = (
-  packed: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined,
+  packed:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined,
   entity: { readonly model: Schema.Top } | undefined,
   itemFields: Record<string, Schema.Top> | undefined,
 ): Pick<ResolveNodeArgs, "packed" | "dispatch"> => ({
@@ -6271,6 +6390,13 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           (parentField === undefined
             ? undefined
             : getSchemaFields(unwrapOptionalField(parentField)))
+        validateEdgeExternalFields(
+          field,
+          edge.entity as { readonly model: Schema.Top; readonly entityType: string } | undefined,
+          valueFields,
+          edge.discriminator,
+          undefined,
+        )
         children.push(
           resolveNode({
             fieldName: field,
@@ -6332,6 +6458,13 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         const recomposed =
           entityEdgeEncodedComposites(edge.entity?.model, edge.sk?.composite).length > 0
         const escaped = args.escapeKeys === true
+        validateEdgeExternalFields(
+          field,
+          edge.entity as { readonly model: Schema.Top; readonly entityType: string } | undefined,
+          elementFields,
+          discriminator,
+          edge.sk?.composite,
+        )
         children.push(
           resolveNode({
             fieldName: field,
@@ -6482,8 +6615,14 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
 /** Every node's packed attributes, by the entity type of its items. */
 const collectPackedByType = (
   root: ResolvedNode,
-): ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>> => {
-  const out = new Map<string, Record<string, DynamoModel.PackedConfig>>()
+): ReadonlyMap<
+  string,
+  Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+> => {
+  const out = new Map<
+    string,
+    Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>
+  >()
   const walk = (node: ResolvedNode): void => {
     if (node.packed !== undefined) {
       out.set(node.entityType, { ...(out.get(node.entityType) ?? {}), ...node.packed })
@@ -6512,7 +6651,10 @@ const collectDispatchByType = (root: ResolvedNode): ReadonlyMap<string, Readonly
 /** The decomposed groups with each item's packed attributes in their stored form. */
 const packAggregateGroups = (
   groups: ReadonlyArray<TransactionGroup>,
-  packedByType: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>,
+  packedByType: ReadonlyMap<
+    string,
+    Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+  >,
   aggregateName: string,
   operation: string,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, ValidationError> =>

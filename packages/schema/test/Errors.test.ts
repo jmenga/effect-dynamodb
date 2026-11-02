@@ -1,8 +1,10 @@
 import { inspect } from "node:util"
 import { Cause, Effect, Equal, Hash, Logger, Option } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, expectTypeOf, it } from "vitest"
 import {
   AggregateTransactionOverflow,
+  BlobStoreError,
+  type BlobStoreReason,
   ConcurrentModification,
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
@@ -132,6 +134,94 @@ describe("a field holding values is read, never printed", () => {
 })
 
 describe("Errors", () => {
+  describe("BlobStoreError (#179)", () => {
+    const base = {
+      entityType: "Document",
+      attribute: "scan",
+      operation: "put",
+      action: "put",
+      reason: "Throttled",
+      committed: false,
+      cause: new Error("SlowDown"),
+    } as const
+
+    it("is a tagged error carrying its fields", () => {
+      const err = new BlobStoreError(base)
+      expect(err._tag).toBe("BlobStoreError")
+      expect(err).toBeInstanceOf(Error)
+      expect(err).toMatchObject({
+        entityType: "Document",
+        attribute: "scan",
+        operation: "put",
+        action: "put",
+        reason: "Throttled",
+        committed: false,
+      })
+      expect(err.ref).toBeUndefined()
+      expect(err.cause).toBe(base.cause)
+      expect(err.message).toBe(
+        'Document: the blob store failed to put attribute "scan" (put): Throttled',
+      )
+    })
+
+    it("names the object version when there is one", () => {
+      const err = new BlobStoreError({
+        ...base,
+        operation: "get.offload",
+        action: "get",
+        reason: "NotFound",
+        ref: { key: "docs/Document/abc", version: "v-3" },
+      })
+      expect(err.ref).toEqual({ key: "docs/Document/abc", version: "v-3" })
+      expect(err.message).toBe(
+        'Document: the blob store failed to get attribute "scan" (get.offload): NotFound' +
+          ' — object "docs/Document/abc" version "v-3"',
+      )
+      const unversioned = new BlobStoreError({
+        ...base,
+        reason: "Unversioned",
+        ref: { key: "docs/Document/abc", version: "" },
+      })
+      expect(unversioned.message).toMatch(/ — object "docs\/Document\/abc"$/)
+    })
+
+    it("says not to retry when the DynamoDB write committed", () => {
+      const err = new BlobStoreError({
+        ...base,
+        action: "get",
+        reason: "Unavailable",
+        committed: true,
+      })
+      expect(err.committed).toBe(true)
+      expect(err.message).toBe(
+        'Document: the blob store failed to get attribute "scan" (put): Unavailable. The ' +
+          "DynamoDB write committed; only reading its result back failed — do not retry it.",
+      )
+    })
+
+    it("has twelve reasons", () => {
+      expectTypeOf<BlobStoreReason>().toEqualTypeOf<
+        | "NotProvided"
+        | "Unversioned"
+        | "NotFound"
+        | "AccessDenied"
+        | "Throttled"
+        | "ChecksumMismatch"
+        | "TooLarge"
+        | "SourceFailed"
+        | "Expired"
+        | "Unsupported"
+        | "Unavailable"
+        | "Rejected"
+      >()
+    })
+
+    it("is exported from the package entry point", async () => {
+      const entry = await import("../src/index.js")
+      expect(entry.BlobStoreError).toBe(BlobStoreError)
+    })
+  })
+
   describe("AggregateTransactionOverflow has a readable message (#144)", () => {
     const base = { aggregate: "Match", subgraph: "team2", itemCount: 107, limit: 100 }
 

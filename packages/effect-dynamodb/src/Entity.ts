@@ -67,6 +67,7 @@ import {
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import { externalIndexRefusal } from "@effect-dynamodb/schema/internal/EntityOffload.js"
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { keyReadings } from "@effect-dynamodb/schema/internal/KeyReadings.js"
@@ -270,7 +271,9 @@ import {
 export type {
   CascadeIndexConfig,
   GeneratedIdConfig,
+  OffloadConfig,
   RefValue,
+  ResolvedOffload,
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampFieldConfig,
@@ -367,6 +370,8 @@ export {
 
 import type {
   GeneratedIdConfig,
+  OffloadConfig,
+  ResolvedOffload,
   SoftDeleteConfig,
   TimeSeriesConfig,
   TimestampsConfig,
@@ -889,6 +894,13 @@ export interface Entity<
   readonly generatedId: TGeneratedId
   /** Vector index declarations as authored (see `DESIGN.md §14`). */
   readonly vectorIndexes: TVectorIndexes
+  /**
+   * The resolved offload settings (#179): `itemBudget` and `prefix` from
+   * `Entity.make({ offload })`, and the domain names of the `overflow`
+   * (`Packed({ external })`) and `binary` (`External()`) fields. `undefined`
+   * when the entity offloads nothing.
+   */
+  readonly offload: ResolvedOffload | undefined
 
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
@@ -2607,6 +2619,13 @@ export const make = <
   readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
+  /**
+   * Item-level offload settings (#179) — `itemBudget` (stored item bytes the
+   * library keeps the item under by offloading overflow fields, largest
+   * first) and `prefix` (replaces the blob store's prefix for this entity's
+   * objects). Only for an entity with offloaded fields (`[EDD-9114]`).
+   */
+  readonly offload?: OffloadConfig | undefined
 }): Entity<
   TModel,
   TEntityType,
@@ -2847,6 +2866,7 @@ const makeImpl = <
     readonly timeSeries?: TTimeSeries
     readonly generatedId?: TGeneratedId
     readonly vectorIndexes?: TVectorIndexes
+    readonly offload?: OffloadConfig | undefined
   },
   precomputedData?: EntityDefinitionData,
 ): Entity<
@@ -20328,6 +20348,7 @@ const makeImpl = <
     timeSeries: config.timeSeries as TTimeSeries,
     generatedId: config.generatedId as TGeneratedId,
     vectorIndexes: config.vectorIndexes as TVectorIndexes,
+    offload: data.offload,
     _vectorIndexes: vectorIndexes,
     _reembedGuard: reembedGuard,
     _refuseTableAttributes: refuseTableAttributes,
@@ -20451,6 +20472,8 @@ const makeImpl = <
       if (KeyComposer.isZOrderHalf(def.sk)) throw zorderInCollection(entityType, name)
       const refused = packedIndexRefusal(entityType, packedFields, name, def)
       if (refused !== undefined) throw new Error(refused)
+      const external = externalIndexRefusal(entityType, data.externalFields, name, def)
+      if (external !== undefined) throw new Error(external)
       allIndexes = { ...allIndexes, [name]: def }
     },
     get _schema() {

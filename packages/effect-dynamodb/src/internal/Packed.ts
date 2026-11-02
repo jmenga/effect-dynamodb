@@ -36,7 +36,11 @@ import {
   type CompressionRegistry,
   empty as emptyRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
-import type { CompressionCodec, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import type {
+  CompressionCodec,
+  ExternalPackedConfig,
+  PackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isBlobPointer } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
@@ -107,7 +111,9 @@ export interface CodecRequirement {
 /** The codecs `configs` (stored attribute → packed config) name. */
 export const codecRequirements = (
   owner: string,
-  configs: Iterable<readonly [attribute: string, config: PackedConfig | undefined]>,
+  configs: Iterable<
+    readonly [attribute: string, config: PackedConfig | ExternalPackedConfig | undefined]
+  >,
 ): Array<CodecRequirement> => {
   const out: Array<CodecRequirement> = []
   for (const [attribute, config] of configs) {
@@ -183,7 +189,7 @@ export const runtimeCodecCheck = (
  */
 export const packItemSync = (
   item: Record<string, unknown>,
-  packed: Readonly<Record<string, PackedConfig>>,
+  packed: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
 ): ValidationError | undefined => {
@@ -200,7 +206,7 @@ export const packItemSync = (
 /** {@link packItemSync} as an Effect. */
 export const packItem = (
   item: Record<string, unknown>,
-  packed: Readonly<Record<string, PackedConfig>>,
+  packed: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
 ): Effect.Effect<void, ValidationError> => {
@@ -221,7 +227,7 @@ export const storedToAttributeValue = (stored: PackedStored): AttributeValue | u
  * `SET #f = :v`, where the value never passes through `toAttributeMap`.
  */
 export const packAttributeValue = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
@@ -230,7 +236,7 @@ export const packAttributeValue = (
 
 /** {@link packAttributeValue} without an Effect: the value, or the failure (returned). */
 export const packAttributeValueSync = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: ItemContext,
@@ -658,7 +664,7 @@ export interface PackedAttributeGuard {
   /** Who stores it, for the message — e.g. `EventStream "Ledger"`. */
   readonly owner: string
   /** Its storage config (the message names the format). */
-  readonly storedAs: PackedConfig
+  readonly storedAs: PackedConfig | ExternalPackedConfig
   /** What to do instead, given the refused path as written (`data.amount`). */
   readonly alternative: (path: string) => string
 }
