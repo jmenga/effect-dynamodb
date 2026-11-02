@@ -12925,7 +12925,7 @@ describeConnected("EventStore stream index projection (#144)", () => {
           .pipe(Query.where({ beginsWith: "E#3-" }), Query.limit(2))
         const first = yield* Query.execute(query)
         expect(versionsOf(first.items), name).toEqual([7, 8])
-        expect(first.cursor, name).not.toBeNull()
+        expect(Option.isSome(first.cursor), name).toBe(true)
         const second = yield* Query.execute(
           query.pipe(Query.startFrom(Option.getOrThrow(first.cursor))),
         )
@@ -16284,7 +16284,7 @@ describeConnected("client-side predicates (closes #122)", () => {
       // Every match, exactly once, in order — the property that breaks when a
       // caller filters `page.items` itself.
       expect(collected).toEqual(["v-1", "v-3", "v-5", "v-7", "v-9"])
-      expect(cursor).toBeNull()
+      expect(cursor).toEqual(Option.none())
     }).pipe(provideCp),
   )
 
