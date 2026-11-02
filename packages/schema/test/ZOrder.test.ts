@@ -274,12 +274,34 @@ describe("ZOrder — dimension entries", () => {
             encoding: undefined,
           }),
       ],
+      [
+        "a misspelled option beside valid ones",
+        () => int("x", { min: 0, max: 10, stpe: 2 } as never),
+      ],
+      [
+        "an option of another kind (bits on a range)",
+        () => int("x", { min: 0, max: 10, bits: 4 } as never),
+      ],
+      [
+        "a misspelled option on a literals entry",
+        () =>
+          resolve({ field: "x", values: ["a", "b"], bitz: 2 } as never, {
+            schema: literalField(["a", "b"]),
+            encoding: undefined,
+          }),
+      ],
     ]
     for (const [name, make] of cases) {
       it(name, () => {
         expect(make).toThrow(/\[EDD-9087\]/)
       })
     }
+
+    it("names the unknown option and the options the entry takes", () => {
+      expect(() => int("price", { min: 0, max: 10, stpe: 2 } as never)).toThrow(
+        '[EDD-9087] Index "gsi1" dimension "price": "stpe" is not an option of this entry, which takes { field, min, max, step? }.',
+      )
+    })
   })
 
   describe("[EDD-9088] an entry that doesn't fit its field", () => {

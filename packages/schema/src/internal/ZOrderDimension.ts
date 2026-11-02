@@ -116,8 +116,9 @@ const invalid = (index: string, field: unknown, why: string): never => {
 
 /**
  * Check one `sk.zorder` entry without the model: its field name, which kind
- * of entry its options make, and the options themselves (`[EDD-9087]`). A
- * value that is neither a name nor an object naming a field is `[EDD-9086]`.
+ * of entry its options make, that it carries only that kind's options, and the
+ * options themselves (`[EDD-9087]`). A value that is neither a name nor an
+ * object naming a field is `[EDD-9086]`.
  */
 export const declareDimension = (
   index: string,
@@ -140,6 +141,20 @@ export const declareDimension = (
     throw malformed('each zorder entry object names its model field: { field: "price", … }.')
   }
   const shape = shapeOf(index, field, options)
+  // The types refuse a misspelled field, not a misspelled option beside valid
+  // ones (`{ field, min, max, stpe }` still fits the range entry), so the
+  // options are checked here: an unknown one would otherwise be silently
+  // ignored, and the dimension sized without it.
+  const unknown = Object.keys(options).filter(
+    (key) => key !== "field" && !SHAPE_OPTIONS[shape].includes(key),
+  )
+  if (unknown.length > 0) {
+    return invalid(
+      index,
+      field,
+      `${unknown.map((key) => JSON.stringify(key)).join(", ")} ${unknown.length === 1 ? "is not an option" : "are not options"} of this entry, which takes ${describeOptions(shape)}.`,
+    )
+  }
   switch (shape) {
     case "range": {
       const { min, max } = options as { readonly min?: unknown; readonly max?: unknown }
