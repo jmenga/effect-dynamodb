@@ -20,7 +20,7 @@ import type {
   UniqueConstraintViolation,
   ValidationError,
 } from "effect-dynamodb"
-import { ConsumedCapacity } from "effect-dynamodb"
+import { ConsumedCapacity, Entity } from "effect-dynamodb"
 import * as _GeoSearch from "./GeoSearch.js"
 import * as H3 from "./H3.js"
 import type { LatLng } from "./Spherical.js"
@@ -276,7 +276,13 @@ export const bind = <A, P>(
       put: (input: A) =>
         provide(
           ConsumedCapacity.withOperation(
-            (geoIndex.put(input) as any).asEffect() as Effect.Effect<A, any, any>,
+            // The result is typed `A`, the domain model: an offloaded field
+            // reads eagerly, never as a lazy handle (#179, design §8.4).
+            Entity.offloaded(geoIndex.put(input) as any, "eager").asEffect() as Effect.Effect<
+              A,
+              any,
+              any
+            >,
             "GeoIndex.put",
             (geoIndex as { readonly _target?: ConsumedCapacity.OperationOptions })._target,
           ),

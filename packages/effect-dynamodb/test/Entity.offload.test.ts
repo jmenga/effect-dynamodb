@@ -7,8 +7,8 @@
  *
  * Requests are captured from an in-memory DynamoDB; objects land in the
  * in-memory blob store, whose call counts say what was uploaded, fetched and
- * deleted. Reads of offloaded fields are commit 8's: rows are inspected as
- * stored.
+ * deleted. Rows are inspected as stored; the read paths are
+ * `Entity.offload.read.test.ts`'s.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -169,31 +169,44 @@ class Reading extends Schema.Class<Reading>("Reading")({
   detail: Schema.optional(Text),
 }) {}
 
+const readingConfig = {
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      sensorId: Schema.String,
+      at: Schema.Number,
+      value: Schema.Number,
+      raw: Schema.optional(Schema.Uint8Array),
+      label: Schema.optional(Schema.String),
+    }),
+  },
+} as const
+
 /** A budget too: an append is never retried for size (no read-merge form). */
 const Readings = withOffloadGate(() =>
   Entity.make({
+    ...readingConfig,
     model: DynamoModel.configure(Reading, {
       raw: { storedAs: DynamoModel.External() },
       detail: { storedAs: overflow(100_000) },
     }),
-    entityType: "Reading",
-    primaryKey: {
-      pk: { field: "pk", composite: ["sensorId"] },
-      sk: { field: "sk", composite: [] },
-    },
     offload: { itemBudget: 2_000 },
-    timeSeries: {
-      orderBy: "at",
-      appendInput: Schema.Struct({
-        sensorId: Schema.String,
-        at: Schema.Number,
-        value: Schema.Number,
-        raw: Schema.optional(Schema.Uint8Array),
-        label: Schema.optional(Schema.String),
-      }),
-    },
   }),
 )
+
+/** The same items, appended by a member that no longer offloads (§4.7). */
+const LegacyReadings = Entity.make({
+  ...readingConfig,
+  model: DynamoModel.configure(Reading, {
+    detail: { storedAs: DynamoModel.Packed({ format: "json" }) },
+  }),
+})
+const LegacyTable = Table.make({ schema: AppSchema, entities: { LegacyReadings } })
 
 class Wide extends Schema.Class<Wide>("Wide")({
   id: Schema.String,
@@ -542,8 +555,14 @@ describe("Entity offload — put / create routing", () => {
         expect(pointer.contentSize).toBe(1)
         expect(pointer.checksum.value).toEqual(crc64nvme(scan))
         expect(versions()[0]!.contentType).toBe("application/pdf")
-        // The result is the input, read from what the write uploaded: no GET.
-        expect(result.scan).toEqual(scan)
+        // Binary is lazy by default: the result holds a handle on the object.
+        expect(Offload.isBlobHandle(result.scan)).toBe(true)
+        expect(result.scan?.contentType).toBe("application/pdf")
+        // Eager, it is the input, read from what the write uploaded: no GET.
+        const eager = yield* db.entities.Docs.create({ docId: "d-2", title: "t", scan }).offloaded(
+          "eager",
+        )
+        expect(eager.scan).toEqual(scan)
         expect(calls().get).toBe(0)
       }),
     ),
@@ -1183,8 +1202,9 @@ describe("Entity offload — immutables", () => {
         )
         expect(error).toBeInstanceOf(ValidationError)
         expect(String((error as ValidationError).cause)).toMatch(/"image" is immutable/)
-        // The first update's result read the kept image; the refusal fetched nothing.
-        expect(calls().get).toBe(1)
+        // The first update's result holds a lazy handle on the kept image
+        // (binary is lazy by default); the refusal fetched nothing.
+        expect(calls().get).toBe(0)
         expect(calls().put).toBe(1)
       }),
     ),
@@ -1206,7 +1226,7 @@ describe("Entity offload — time-series append", () => {
           at: 1,
           value: 10,
           raw,
-        })
+        }).offloaded("eager")
         expect(current.raw).toEqual(raw)
         expect(calls().put).toBe(1)
         expect(calls().get).toBe(0)
@@ -1295,11 +1315,14 @@ describe("Entity offload — lifecycle copies", () => {
         const restored = yield* db.entities.Kept.restore({ docId: "k-1" })
         expect(live("Kept", "k-1").body).toEqual(original.body)
         expect(restored.body).toEqual(text(100))
-        expect(restored.scan).toEqual(pdfBytes(5))
+        // Binary is lazy by default: a handle on the copied object.
+        expect(Offload.isBlobHandle(restored.scan)).toBe(true)
         // One upload per field, ever. The update's and the restore's results
-        // fetched both (neither uploaded them).
+        // fetched the overflow body (neither uploaded it), not the scan.
         expect(calls().put).toBe(2)
-        expect(calls().get).toBe(4)
+        expect(calls().get).toBe(2)
+        expect(yield* restored.scan!.read()).toEqual(pdfBytes(5))
+        expect(calls().get).toBe(3)
       }),
     ),
   )
@@ -1652,7 +1675,7 @@ describe("Entity offload — failure paths", () => {
     )
   })
 
-  it.effect("a stale append's current is none only when the item holds a pointer", () =>
+  it.effect("a stale append's current decodes without store I/O, a pointer as a lazy handle", () =>
     withStore(
       Effect.gen(function* () {
         const db = yield* client
@@ -1676,17 +1699,73 @@ describe("Entity offload — failure paths", () => {
         const head = live("Reading", "s-1", "sensorId")
         rows.set(keyOf("main", head), { ...head, value: { S: "not a number" } })
         expect(yield* stale()).toBeInstanceOf(ValidationError)
-        // A pointer: none until lazy decoding (design §21 item 7 deviation).
+        // A pointer: a lazy handle, fetched only when read (§6.13) — even
+        // when the append asked for eager results.
         yield* db.entities.Readings.append({ sensorId: "s-2", at: 5, value: 1, raw: pdfBytes(4) })
+        const gets = calls().get
         const pointed = yield* Effect.flip(
-          db.entities.Readings.append({ sensorId: "s-2", at: 2, value: 2 }).asEffect(),
+          db.entities.Readings.append({ sensorId: "s-2", at: 2, value: 2 })
+            .offloaded("eager")
+            .asEffect(),
         )
         expect(pointed._tag).toBe("StaleAppend")
-        expect(
-          Option.isNone((pointed as { readonly current: Option.Option<unknown> }).current),
-        ).toBe(true)
+        const current = Option.getOrThrow(
+          (pointed as { readonly current: Option.Option<{ readonly raw: unknown }> }).current,
+        )
+        expect(Offload.isBlobHandle(current.raw)).toBe(true)
+        expect(calls().get).toBe(gets)
+        expect(yield* (current.raw as Offload.BlobHandle).read()).toEqual(pdfBytes(4))
+        expect(calls().get).toBe(gets + 1)
       }),
     ),
+  )
+
+  it.effect(
+    "a refused condition's current decodes without store I/O, a pointer as a lazy handle",
+    () =>
+      withStore(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* db.entities.Readings.append({ sensorId: "s-1", at: 5, value: 1, raw: pdfBytes(4) })
+          const gets = calls().get
+          // Not stale (6 > 5): the caller's condition refused it.
+          const refused = yield* Effect.flip(
+            db.entities.Readings.append({ sensorId: "s-1", at: 6, value: 2 })
+              .condition({ eq: { value: 99 } })
+              .offloaded("eager")
+              .asEffect(),
+          )
+          expect(refused._tag).toBe("ConditionalCheckFailed")
+          const current = Option.getOrThrow(
+            (refused as { readonly current: Option.Option<{ readonly raw: unknown }> }).current,
+          )
+          expect(Offload.isBlobHandle(current.raw)).toBe(true)
+          expect(calls().get).toBe(gets)
+          expect(yield* (current.raw as Offload.BlobHandle).read()).toEqual(pdfBytes(4))
+        }),
+      ),
+  )
+
+  it.effect(
+    "a stale append whose current holds a pointer the member no longer offloads fails",
+    () =>
+      withStore(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* db.entities.Readings.append({ sensorId: "s-1", at: 5, value: 1, raw: pdfBytes(4) })
+          const gets = calls().get
+          const failed = yield* Effect.flip(
+            LegacyReadings.append({ sensorId: "s-1", at: 2, value: 2 }).pipe(
+              Effect.provide(LegacyTable.layer({ name: "main" })),
+            ),
+          )
+          // Resolving it needs a fetch, which an error payload never makes.
+          expect(failed).toBeInstanceOf(ValidationError)
+          expect(String((failed as ValidationError).cause)).toContain('Attribute "raw"')
+          expect(String((failed as ValidationError).cause)).toContain("without store I/O")
+          expect(calls().get).toBe(gets)
+        }),
+      ),
   )
 })
 
@@ -1934,7 +2013,12 @@ describe("Entity offload — insert()", () => {
         const db = yield* client
         const body = text(100)
         const scan = pdfBytes(20)
-        const doc = yield* db.entities.Docs.insert({ docId: "d-1", title: "t", body, scan })
+        const doc = yield* db.entities.Docs.insert({
+          docId: "d-1",
+          title: "t",
+          body,
+          scan,
+        }).offloaded("eager")
         expect(doc.body).toEqual(body)
         expect(doc.scan).toEqual(scan)
         expect(calls().put).toBe(2)
@@ -1945,6 +2029,21 @@ describe("Entity offload — insert()", () => {
         overflowPointer(row.body)
         binaryPointer(row.scan)
         expect(versions()).toHaveLength(2)
+      }),
+    ),
+  )
+
+  it.effect("reads its result in the default modes: overflow eager, binary a lazy handle", () =>
+    withStore(
+      Effect.gen(function* () {
+        const db = yield* client
+        const body = text(100)
+        const scan = pdfBytes(20)
+        const doc = yield* db.entities.Docs.insert({ docId: "d-1", title: "t", body, scan })
+        expect(doc.body).toEqual(body)
+        expect(Offload.isBlobHandle(doc.scan)).toBe(true)
+        // Nothing fetched: the overflow value comes from the ledger's read cache.
+        expect(calls().get).toBe(0)
       }),
     ),
   )

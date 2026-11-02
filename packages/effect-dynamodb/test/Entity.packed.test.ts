@@ -37,7 +37,7 @@ import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 import {
   bytesPointerText,
-  expectUnresolvedPointer,
+  expectPointerStoreFailure,
   jsonPointerBytes,
 } from "./helpers/BlobPointers.js"
 import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
@@ -1328,10 +1328,13 @@ describe("Entity.decodeMarshalledItem — stream images", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Blob pointers (#179): refused on every read path until reads resolve them
+// Blob pointers (#179) on a member that does not offload the attribute
+// (design §4.7, switching offload off): every read path resolves them eagerly
+// through the ambient store — here there is none, so each fails with a
+// ValidationError caused by BlobStoreError NotProvided.
 // ---------------------------------------------------------------------------
 
-describe("Entity packed fields — blob pointers (Packed layout 010) are refused", () => {
+describe("Entity packed fields — blob pointers (Packed layout 010) on a non-offloading member", () => {
   const base64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64")
 
   /** The order `put` writes, with `attribute` rewritten to an offloaded value's pointer. */
@@ -1353,12 +1356,12 @@ describe("Entity packed fields — blob pointers (Packed layout 010) are refused
         for (const attribute of ["d", "lines", "notes"] as const) {
           yield* writeWithPointer(attribute)
           const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: ORDER_KEY })))
-          expectUnresolvedPointer(error, attribute, ORDER)
+          expectPointerStoreFailure(error, attribute, ORDER)
         }
         // Without a compressor in scope too: the pointer's codec names the object, never read here.
         yield* writeWithPointer("d")
         const unbound = failure(yield* Effect.exit(Orders.get({ orderId: ORDER_KEY }).asEffect()))
-        expectUnresolvedPointer(unbound, "d", ORDER)
+        expectPointerStoreFailure(unbound, "d", ORDER)
       }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -1369,8 +1372,8 @@ describe("Entity packed fields — blob pointers (Packed layout 010) are refused
       const queried = failure(
         yield* Effect.exit(db.entities.Orders.byCustomer({ customerId: "c-1" }).collect()),
       )
-      expectUnresolvedPointer(queried, "d", ORDER)
-      expectUnresolvedPointer(
+      expectPointerStoreFailure(queried, "d", ORDER)
+      expectPointerStoreFailure(
         failure(yield* Effect.exit(db.entities.Orders.scan().collect())),
         "d",
         ORDER,
@@ -1382,7 +1385,7 @@ describe("Entity packed fields — blob pointers (Packed layout 010) are refused
             .collect(),
         ),
       )
-      expectUnresolvedPointer(projected, "d", ORDER)
+      expectPointerStoreFailure(projected, "d", ORDER)
     }).pipe(Effect.provide(TestLayer)),
   )
 
@@ -1390,12 +1393,12 @@ describe("Entity packed fields — blob pointers (Packed layout 010) are refused
     Effect.gen(function* () {
       const db = yield* client
       yield* writeWithPointer("lines")
-      expectUnresolvedPointer(
+      expectPointerStoreFailure(
         failure(yield* Effect.exit(Batch.get([db.entities.Orders.get({ orderId: ORDER_KEY })]))),
         "lines",
         ORDER,
       )
-      expectUnresolvedPointer(
+      expectPointerStoreFailure(
         failure(
           yield* Effect.exit(
             Transaction.transactGet([db.entities.Orders.get({ orderId: ORDER_KEY })]),
@@ -1429,7 +1432,7 @@ describe("Entity packed fields — blob pointers (Packed layout 010) are refused
         ]
         for (const candidate of images) {
           const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, candidate)))
-          expectUnresolvedPointer(error, "d", { ...ORDER, operation: "decodeMarshalledItem" })
+          expectPointerStoreFailure(error, "d", { ...ORDER, operation: "decodeMarshalledItem" })
         }
       }).pipe(Effect.provide(TestLayer)),
   )

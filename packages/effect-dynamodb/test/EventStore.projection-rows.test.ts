@@ -1,15 +1,18 @@
 /**
  * Projection rows beyond 1.28.0: `revision` (#153), tombstones (`removal`,
- * #154) and the outbox (#155), on single-source projections — against the
- * in-memory tables in `helpers/InMemoryTables.ts`.
+ * #154) and the outbox (#155), on single-source projections, and the rows of
+ * an offloading read model (#179) — against the in-memory tables in
+ * `helpers/InMemoryTables.ts`.
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ConcurrentModification, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Fiber, Layer, Option, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach } from "vitest"
+import { BlobStore } from "../src/BlobStore.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
@@ -25,6 +28,7 @@ import {
   store,
   tableIndexes,
 } from "./helpers/InMemoryTables.js"
+import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 const AppSchema = DynamoSchema.make({ name: "rows", version: 1 })
 
@@ -646,5 +650,69 @@ describe("projection outbox", () => {
       expect(seen.sort()).toEqual(["o1", "o2"])
       expect(items("outbox")).toEqual([])
     }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+describe("projection rows of an offloading read model (#179)", () => {
+  const Receipt = Schema.Struct({
+    orderId: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+    scan: Schema.optional(Schema.Uint8Array),
+  })
+  const Receipts = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Receipt, { scan: { storedAs: DynamoModel.External() } }),
+      entityType: "Receipt",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    }),
+  )
+  // Offloading requires escaped keys (#179).
+  const ReceiptTable = Table.make({
+    schema: DynamoSchema.make({ name: "rows", version: 1, escapeKeys: true }),
+    entities: { Receipts },
+  })
+  const SCAN = new Uint8Array(16).fill(3)
+  const Receipted = EventStore.projection({
+    stream: Orders,
+    readModel: Receipts,
+    key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+    initial: (id: { readonly orderId: string }) => ({
+      orderId: id.orderId,
+      total: 0,
+      version: 0,
+      scan: SCAN,
+    }),
+    evolve: (state: typeof Receipt.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+      Effect.succeed({
+        ...state,
+        total: state.total + (event.data._tag === "Cancelled" ? 0 : event.data.amount),
+      }),
+    checkpoint: "version" as const,
+  })
+
+  it.effect("each written row is its outcome's state, offloaded fields read eagerly", () =>
+    Effect.gen(function* () {
+      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+      // The first event creates the row; the second replaces it under its guard.
+      for (const event of events) {
+        const result = yield* Receipted.applyBatch([event])
+        const outcome = result.outcomes[0]!
+        if (outcome._tag !== "Applied") throw new Error("not applied")
+        const state = Option.getOrThrow(outcome.state)
+        expect(state.scan).toEqual(SCAN)
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          TestLayer,
+          ReceiptTable.layer({ name: "read" }),
+          BlobStore.layer(BlobStore.memory()),
+        ),
+      ),
+    ),
   )
 })

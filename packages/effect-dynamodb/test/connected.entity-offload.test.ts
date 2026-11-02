@@ -1,11 +1,13 @@
 /**
- * Entity writes of offloaded fields against DynamoDB Local (#179, design §6):
- * the stored pointers, settlement by DynamoDB's real answers (`ALL_OLD` on a
- * refused create, `ALL_NEW` after an upsert's `if_not_exists`, a cancelled
- * time-series append), the item-size retry on DynamoDB's own 400 KB
- * rejection, and lifecycle copies. Objects go to the in-memory blob store
- * (the S3 store and MinIO are later commits'); reads of offloaded fields are
- * commit 8's, so rows are inspected as stored.
+ * Entity writes and reads of offloaded fields against DynamoDB Local (#179,
+ * design §6, §8): the stored pointers, settlement by DynamoDB's real answers
+ * (`ALL_OLD` on a refused create, `ALL_NEW` after an upsert's
+ * `if_not_exists`, a cancelled time-series append), the item-size retry on
+ * DynamoDB's own 400 KB rejection, lifecycle copies, and every read path per
+ * mode — gets, index queries with projections and `limit`, scans, batch and
+ * transactional gets, lifecycle reads and stream-image decoding. Objects go
+ * to the in-memory blob store, whose call counts say what each read fetched
+ * (the S3 store and MinIO are later commits').
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -15,12 +17,15 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { Config, Effect, Layer, Schema } from "effect"
 import { afterAll, beforeAll, beforeEach, describe, expect } from "vitest"
+import * as Batch from "../src/Batch.js"
 import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { MemoryBlobStore } from "../src/internal/MemoryBlobStore.js"
 import { toAttributeMap } from "../src/Marshaller.js"
+import * as Offload from "../src/Offload.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
@@ -101,6 +106,22 @@ const Kept = withOffloadGate(() =>
   }),
 )
 
+/** An index to query offloading rows through. */
+const Shelved = withOffloadGate(() =>
+  Entity.make({
+    model: docModel(1_024),
+    entityType: "Shelved",
+    primaryKey: docKey,
+    indexes: {
+      byTitle: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["title"] },
+        sk: { field: "gsi1sk", composite: ["docId"] },
+      },
+    },
+  }),
+)
+
 class Reading extends Schema.Class<Reading>("Reading")({
   sensorId: Schema.String,
   at: Schema.Number,
@@ -126,7 +147,10 @@ const Readings = withOffloadGate(() =>
   }),
 )
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Docs, Budgeted, Kept, Readings } })
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Docs, Budgeted, Kept, Shelved, Readings },
+})
 
 const credentials = { accessKeyId: "local", secretAccessKey: "local" }
 const ClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })
@@ -146,7 +170,7 @@ const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   )
 
 const client = DynamoClient.make({
-  entities: { Docs, Budgeted, Kept, Readings },
+  entities: { Docs, Budgeted, Kept, Shelved, Readings },
   tables: { MainTable },
 })
 
@@ -194,7 +218,7 @@ const bytes = (n: number, fill = 7) => new Uint8Array(n).fill(fill)
 // Tests
 // ---------------------------------------------------------------------------
 
-describeConnected("Entity offloaded writes (#179)", () => {
+describeConnected("Entity offloaded fields (#179)", () => {
   beforeAll(async () => {
     await Effect.runPromise(
       provide(
@@ -228,9 +252,12 @@ describeConnected("Entity offloaded writes (#179)", () => {
         expect(row.notes).toBeDefined()
         expect(isOverflowPointer(row.notes)).toBe(false)
         expect(isBinaryPointer(row.scan)).toBe(true)
+        // The result reads the operation's own uploads from its read cache;
+        // the binary field is a lazy handle by default.
         expect(result.body).toEqual(doc.body)
-        expect(result.scan).toEqual(doc.scan)
+        expect(Offload.isBlobHandle(result.scan)).toBe(true)
         expect(blobs.inspect().calls).toMatchObject({ put: 2, get: 0 })
+        expect(yield* result.scan!.read()).toEqual(doc.scan)
       }),
     ),
   )
@@ -244,9 +271,11 @@ describeConnected("Entity offloaded writes (#179)", () => {
         const row = yield* liveDoc("doc", "i-1")
         expect(isOverflowPointer(row.body)).toBe(true)
         expect(isBinaryPointer(row.scan)).toBe(true)
+        // As `put`'s: the binary field is a lazy handle by default, read from the read cache.
         expect(result.body).toEqual(doc.body)
-        expect(result.scan).toEqual(doc.scan)
+        expect(Offload.isBlobHandle(result.scan)).toBe(true)
         expect(blobs.inspect().calls).toMatchObject({ put: 2, get: 0, delete: 0 })
+        expect(yield* result.scan!.read()).toEqual(doc.scan)
         // DynamoDB refuses the INSERT of an existing item, sent once: its uploads roll back.
         const error = yield* Effect.flip(
           db.entities.Docs.insert({ ...doc, body: text(3_000), scan: bytes(4, 1) }).asEffect(),
@@ -338,7 +367,7 @@ describeConnected("Entity offloaded writes (#179)", () => {
           at: 5,
           raw: bytes(64),
         })
-        expect(current.raw).toEqual(bytes(64))
+        expect(yield* current.raw!.read()).toEqual(bytes(64))
         const items = yield* partition("$offload-ent#v1#reading#sensorid_s-1")
         const head = items.find((item) => !item.sk!.S!.includes("#e#"))!
         const event = items.find((item) => item.sk!.S!.includes("#e#"))!
@@ -378,6 +407,165 @@ describeConnected("Entity offloaded writes (#179)", () => {
         expect(restored.body).toEqual(text(2_000))
         expect((yield* liveDoc("kept", "k-1")).body).toEqual(original.body)
         expect(blobs.inspect().calls.put).toBe(2)
+      }),
+    ),
+  )
+
+  // -------------------------------------------------------------------------
+  // Reads
+  // -------------------------------------------------------------------------
+
+  const gets = () => blobs.inspect().calls.get
+  const BODY = text(2_000)
+  const SCAN = bytes(300)
+  const shelve = (docId: string, title = "shelf") =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Shelved.put({ docId, title, body: BODY, notes: text(10), scan: SCAN })
+    })
+
+  it.effect("get reads overflow eagerly and binary lazily; .offloaded() picks the modes", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* shelve("r-1", "get")
+        const key = { docId: "r-1" }
+        let before = gets()
+        const doc = yield* db.entities.Shelved.get(key)
+        expect(doc.body).toEqual(BODY)
+        expect(doc.notes).toEqual(text(10))
+        expect(gets()).toBe(before + 1)
+        expect(Offload.isBlobHandle(doc.scan)).toBe(true)
+        expect(yield* doc.scan!.read()).toEqual(SCAN)
+        expect(gets()).toBe(before + 2)
+
+        before = gets()
+        const lazy = yield* db.entities.Shelved.get(key).offloaded("lazy")
+        expect(gets()).toBe(before)
+        expect(Offload.isOffloadedValue(lazy.body)).toBe(true)
+        expect(lazy.body!.location).toBe("external")
+        expect(lazy.notes?.location).toBe("inline")
+        expect(yield* lazy.body!.read()).toEqual(BODY)
+        expect(yield* lazy.notes!.read()).toEqual(text(10))
+        expect(gets()).toBe(before + 1)
+
+        before = gets()
+        const eager = yield* db.entities.Shelved.get(key).offloaded("eager")
+        expect(eager.scan).toEqual(SCAN)
+        expect(gets()).toBe(before + 2)
+
+        // asNative: the stored pointers, untouched.
+        const native = (yield* Entity.asNative(Shelved.get(key))) as unknown as Record<
+          string,
+          AttributeValue
+        >
+        expect(isOverflowPointer(native.body)).toBe(true)
+        expect(isBinaryPointer(native.scan)).toBe(true)
+      }),
+    ),
+  )
+
+  it.effect("index queries: projections, limit and filterBy bound what is fetched", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* client
+        for (const id of ["q-1", "q-2", "q-3"]) yield* shelve(id, "query")
+        const query = () => db.entities.Shelved.byTitle({ title: "query" })
+
+        let before = gets()
+        const all = yield* query().collect()
+        expect(all.map((doc) => doc.docId)).toEqual(["q-1", "q-2", "q-3"])
+        for (const doc of all) expect(doc.body).toEqual(BODY)
+        expect(gets()).toBe(before + 3)
+
+        before = gets()
+        const ids = yield* query().select(["docId", "title"]).collect()
+        expect(ids).toHaveLength(3)
+        expect(gets()).toBe(before)
+
+        before = gets()
+        const two = yield* query().limit(2).collect()
+        expect(two).toHaveLength(2)
+        expect(gets()).toBe(before + 2)
+
+        before = gets()
+        const lazy = yield* query()
+          .offloaded("lazy")
+          .filterBy((doc) => doc.docId !== "q-2")
+          .collect()
+        expect(lazy).toHaveLength(2)
+        expect(gets()).toBe(before)
+        expect(yield* lazy[0]!.body!.read()).toEqual(BODY)
+
+        before = gets()
+        const named = yield* query().select(["docId", "body"]).collect()
+        for (const row of named) expect(row.body).toEqual(BODY)
+        expect(gets()).toBe(before + 3)
+
+        before = gets()
+        const scanned = yield* db.entities.Shelved.scan()
+          .filter({ title: "query" })
+          .offloaded({ binary: "eager" })
+          .collect()
+        expect(scanned).toHaveLength(3)
+        for (const doc of scanned) expect(doc.scan).toEqual(SCAN)
+        expect(gets()).toBe(before + 6)
+      }),
+    ),
+  )
+
+  it.effect("Batch.get and transactGet read each get in its own modes", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* shelve("g-1", "batch")
+        yield* shelve("g-2", "batch")
+        let before = gets()
+        const [first, second] = yield* Batch.get([
+          db.entities.Shelved.get({ docId: "g-1" }),
+          db.entities.Shelved.get({ docId: "g-2" }).offloaded("lazy"),
+        ])
+        expect(first!.body).toEqual(BODY)
+        expect(Offload.isOffloadedValue(second!.body)).toBe(true)
+        expect(gets()).toBe(before + 1)
+
+        before = gets()
+        const [eager] = yield* Transaction.transactGet([
+          db.entities.Shelved.get({ docId: "g-1" }).offloaded("eager"),
+        ])
+        expect(eager!.scan).toEqual(SCAN)
+        expect(gets()).toBe(before + 2)
+      }),
+    ),
+  )
+
+  it.effect("versions, tombstones and stream images resolve their pointers per mode", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* client
+        const key = { docId: "k-2" }
+        yield* db.entities.Kept.put({ ...key, title: "v1", body: BODY, scan: SCAN })
+        yield* db.entities.Kept.update(key).set({ title: "v2" })
+        const versions = yield* db.entities.Kept.versions(key).collect()
+        expect(versions.map((v) => v.title)).toContain("v1")
+        for (const v of versions) expect(v.body).toEqual(BODY)
+        const lazyVersions = yield* db.entities.Kept.versions(key).offloaded("lazy").collect()
+        for (const v of lazyVersions) expect(Offload.isOffloadedValue(v.body)).toBe(true)
+
+        const image = yield* liveDoc("kept", "k-2")
+        yield* db.entities.Kept.delete(key)
+        const tombstone = yield* db.entities.Kept.deleted.get(key)
+        expect(tombstone.body).toEqual(BODY)
+        expect(yield* tombstone.scan!.read()).toEqual(SCAN)
+
+        // A stream image decodes lazily by default, eagerly on request.
+        const before = gets()
+        const lazy = yield* Entity.decodeMarshalledItem(Kept, image)
+        expect(gets()).toBe(before)
+        expect(yield* lazy.body!.read()).toEqual(BODY)
+        const eager = yield* Entity.decodeMarshalledItem(Kept, image, { offloaded: "eager" })
+        expect(eager.scan).toEqual(SCAN)
+        expect(eager.title).toBe("v2")
       }),
     ),
   )

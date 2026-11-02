@@ -11,6 +11,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import {
+  type BlobStoreError,
   DynamoError,
   isAwsTransactionCancelled,
   ValidationError,
@@ -20,7 +21,7 @@ import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
-import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
+import type { AnyGet, BoundWriteOp, GetBlobErrors, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
@@ -35,6 +36,7 @@ import {
   composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
+  loadGetRows,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -98,16 +100,21 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
   config?: BatchRetryConfig,
 ): Effect.Effect<
   BatchGetResult<T>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | GetBlobErrors<T[number]>,
   DynamoClient | TableConfig
-> => Capacity.operation("Batch.get", undefined, getCore(items, config))
+> =>
+  Capacity.operation("Batch.get", undefined, getCore(items, config)) as Effect.Effect<
+    BatchGetResult<T>,
+    DynamoClientError | ValidationError | GetBlobErrors<T[number]>,
+    DynamoClient | TableConfig
+  >
 
 const getCore = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
   config?: BatchRetryConfig,
 ): Effect.Effect<
   BatchGetResult<T>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | BlobStoreError,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -156,12 +163,21 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
       },
     })
 
-    const results: Array<unknown> = new Array(items.length).fill(undefined)
-    for (let i = 0; i < fetched.length; i++) {
-      const item = fetched[i]
+    const rows: Array<Record<string, unknown> | undefined> = fetched.map((item, i) =>
       // A projection tombstone (#154) is no row.
-      if (item === undefined || isProjectionTombstone(item, infos[i]!.entity.entityType)) continue
-      results[i] = yield* infos[i]!.entity._decodeRecord(fromAttributeMap(item))
+      item === undefined || isProjectionTombstone(item, infos[i]!.entity.entityType)
+        ? undefined
+        : (fromAttributeMap(item) as Record<string, unknown>),
+    )
+    // Offloaded fields (#179): every get's rows resolve together, per entity
+    // and per the get's own modes, before any decode.
+    yield* loadGetRows(infos, rows, "Batch.get")
+    const results: Array<unknown> = new Array(items.length).fill(undefined)
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row === undefined) continue
+      const info = infos[i]!
+      results[i] = yield* info.entity._decodeRecord(row, info.offloadModes, "Batch.get.decode")
     }
 
     // Cast rationale: results is built as Array<A | undefined> by matching DynamoDB
@@ -182,7 +198,9 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
  * authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make`
  * (#100).
  */
-type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | BoundWriteOp
+type BatchWriteOp =
+  // The trailing `any`: an op's offload state (#179) — an offloading member's ops too.
+  EntityPut<any, any, any, any, any> | EntityDelete<any, any, void, unknown, any> | BoundWriteOp
 
 /** A versioned put, sent as a create-only `TransactWriteItems` Put (#133). */
 type VersionedPut = {

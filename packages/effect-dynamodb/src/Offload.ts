@@ -117,21 +117,24 @@ type ByMode<V, H, Mode> = [Mode] extends ["eager"]
  * modes `M` — an eager field its value, a lazy overflow field
  * `OffloadedValue<value>`, a lazy binary field `BlobHandle`. Optional and
  * nullable fields keep their `undefined` / `null`. For a member that
- * offloads nothing, exactly `A`.
+ * offloads nothing — and for `T = any` (type-erased code, as `ReadBlobErrors`
+ * reads it) — exactly `A`.
  */
 export type View<
   A,
   T extends OffloadFields,
   M extends ResolvedOffloadModes = DefaultOffloadModes,
-> = [T["overflow"] | T["binary"]] extends [never]
+> = 0 extends 1 & T
   ? A
-  : {
-      readonly [K in keyof A]: K extends T["overflow"]
-        ? ByMode<A[K], OffloadedValue<NonNullable<A[K]>>, M["overflow"]>
-        : K extends T["binary"]
-          ? ByMode<A[K], BlobHandle, M["binary"]>
-          : A[K]
-    }
+  : [T["overflow"] | T["binary"]] extends [never]
+    ? A
+    : {
+        readonly [K in keyof A]: K extends T["overflow"]
+          ? ByMode<A[K], OffloadedValue<NonNullable<A[K]>>, M["overflow"]>
+          : K extends T["binary"]
+            ? ByMode<A[K], BlobHandle, M["binary"]>
+            : A[K]
+      }
 
 /**
  * What a builder needs to re-type its result under other modes: the

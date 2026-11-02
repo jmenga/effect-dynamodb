@@ -1,7 +1,9 @@
 /**
  * `GeoIndex.put` as an upload-ledger root (#179, design §6.2): the bound and
  * unbound puts of a geo entity that offloads a field run the entity's put —
- * a ledger root — and a geo entity that offloads nothing opens none.
+ * a ledger root — and a geo entity that offloads nothing opens none. The
+ * bound put's result is typed as the domain model, so it reads its
+ * offloaded fields eagerly (§8.4).
  *
  * This package sees effect-dynamodb through its public entry point, so the
  * test reads the library's two internal references by their keys: the
@@ -11,7 +13,15 @@
  */
 
 import { Context, Effect, Layer, Schema } from "effect"
-import { DynamoClient, DynamoModel, DynamoSchema, Entity, Table } from "effect-dynamodb"
+import {
+  BlobStore,
+  DynamoClient,
+  DynamoModel,
+  DynamoSchema,
+  Entity,
+  Offload,
+  Table,
+} from "effect-dynamodb"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
 
@@ -138,6 +148,23 @@ describe("GeoIndex.put — upload-ledger root", () => {
       layer,
     )
     expect(ledgers).toEqual([true, true])
+  })
+
+  it("the bound put returns its offloaded fields eagerly, as its type says", async () => {
+    const { layer } = makeClient()
+    const photo = new Uint8Array(32).fill(7)
+    const [bound, unbound] = await run(
+      Effect.gen(function* () {
+        const geo = yield* GeoIndex.bind(OffloadingGeo)
+        const written = yield* geo.put({ ...courier, photo })
+        // The unbound put is the entity's own builder: binary lazy by default.
+        const own = yield* OffloadingGeo.put({ ...courier, photo })
+        return [written, own] as const
+      }).pipe(Effect.provide(BlobStore.layer(BlobStore.memory()))),
+      layer,
+    )
+    expect(bound.photo).toEqual(photo)
+    expect(Offload.isBlobHandle(unbound.photo)).toBe(true)
   })
 
   it("a geo entity that offloads nothing opens no ledger", async () => {

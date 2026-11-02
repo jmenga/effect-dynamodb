@@ -71,6 +71,7 @@ import {
   holdStorage,
   optionalField,
   type ResolvedSystemFields,
+  registerOffloadedFields,
   resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
@@ -1056,6 +1057,11 @@ export const buildEntityDefinition = (config: {
       | undefined,
     offload: config.offload,
   })
+  // A ref to this entity holds none of the fields it offloads (`refHeldTarget`).
+  registerOffloadedFields(rawModel, [
+    ...Object.keys(offloadPlan.overflowFields),
+    ...Object.keys(offloadPlan.externalFields),
+  ])
 
   // ---------------------------------------------------------------------------
   // EDD-9025: composite attribute schemas must not include `null`.

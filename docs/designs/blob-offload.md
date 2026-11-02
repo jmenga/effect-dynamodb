@@ -3278,6 +3278,142 @@ a write path, deletes the gate.
    `Query<A, E, O>` / `BoundQuery<…, O>`, page prefetch in `examinePage`, raw-row hook, scans,
    collections, `Batch.get` / `transactGet` typing, `decodeMarshalledItem`'s typed overload and
    the pure-definition fallback (normalise + unpack + pointer dispatch), `EDD-9117`.
+   *Implementation notes (commit 8):* the read side is `internal/OffloadRead.ts` (no AWS SDK
+   import) and the type helpers `internal/OffloadTypes.ts`. Each member builds a `ReadPlan` once
+   (its dispatch-eligible and bytes attributes, offloaded attribute → kind, content types and a
+   per-field decoder for lazy overflow reads); `loadRows` unpacks a batch of rows in one pass —
+   packed values to their JSON wire form, pointers to `PendingBlob`s, inline values of lazily
+   read fields to inline handles — then resolves every placeholder of the batch together
+   through `resolveAll` in the operation's modes. Rows a page prefetch already loaded are
+   marked (a `WeakSet`), so the per-row decoder only schema-decodes them. Schema decode runs
+   over `lazyReadSchema(base, lazyFields)`: the read schema with each lazily read field
+   accepting its `OffloadedValue` / `BlobHandle` (`Schema.declare`), cached per base and field
+   set. The modes reach a decoder explicitly (the query decoder's second argument, the
+   prefetch's options, `_decodeRecord(raw, modes, operation)`) or, for entity operations,
+   through the `CurrentReadModes` `Context.Reference` that `withReadModes` sets around every
+   operation of an offloading entity (`_offloadModes` on the unbound ops, `offloadModes` on
+   `UpdateState`). Parsing — `parseModes` for builders and duals (throws `[EDD-9117]` for an
+   unknown mode or key, and for `.offloaded()` after `.filterBy()`), `parseModesOption` for
+   option-taking calls (`decodeMarshalledItem`: a `ValidationError` whose cause names
+   `EDD-9117`) — resolves an argument over the builder's current modes, so a string sets both
+   kinds and an object the kinds it names, in any order with `select`, `returnValues`,
+   `limit` and `filter`. `examinePage` loads each window (the rows `limit` can still take, the
+   whole response under `filterBy`) before decoding it; `count()` loads nothing without
+   `filterBy`. A raw projection runs the raw-row hook over the window in raw mode (wire forms;
+   a lazy overflow value's `read()` returns its wire form), and a projection naming no
+   offloaded, packed or bytes attribute installs no hook and prefetches nothing.
+   `Batch.get` and `Transaction.transactGet` group their rows by member and by the value of
+   their modes and load each group once (`TransactableOps.loadGetRows`), one group after
+   another, so the reads in flight stay within the store's `readConcurrency`; each get
+   carries its own modes. Error
+   payloads (`current` of `ConcurrentModification`, `ConditionalCheckFailed`, `StaleAppend`)
+   load with `noFetch` — lazy whatever the operation's modes, and a pointer on an attribute the
+   member no longer offloads fails the load, which needs a fetch (a `ValidationError` naming
+   the attribute; `current: Option.none()` on a `ConcurrentModification`, whose payload is
+   optional). Write results load in the operation's modes with `committed: true`, the binary
+   default lazy (the read cache serves this operation's uploads) — except where the result is
+   typed as the domain model: the bound `GeoIndex.put` (`A`, §8.4) and a projection's row
+   write (the outcome's `state`) read eagerly. A pointer on an attribute the member does not offload (§4.7)
+   resolves eagerly through the ambient store; a failure is a `ValidationError` whose cause is
+   the `BlobStoreError` (`NotProvided` with no store). `hydrateRefs` reads a target that
+   offloads lazily and drops its offloaded fields before the ref copy, so they are never
+   fetched; the projection engine reads eagerly. `decodeMarshalledItem` is lazy by default and
+   decodes a pure definition through the runtime decoder of a `makeImpl` built once per
+   definition (a `WeakMap`), fixing the #147 gap (row 71). `Entity.Read<E, M>` names the view.
+   The types: `Query<A, E = never, O = NoOffloadState>` (`E` the items' read blob errors, which
+   every terminal adds), `BoundQuery<Model, SkRemaining, A, O>`, `BoundGet<A, E, O>` and the
+   CRUD and append builders carry `O`; `OffloadedView` / `OffloadedErrors` re-type a read,
+   `WithItem` a `select` / `returnValues`, and an unbound op's state also records the record
+   type `asRecord` views, whether it is a read or a write (a write's errors carry
+   `BlobStoreError` whatever its result's modes) and the model it was made over. The unbound
+   `Entity.query.*` / `Entity.scan`, the bound `paginate` / `collect` / `fetch` / `scanFetch`
+   helpers and `Entity.filter` / `Entity.select` take queries of any `E` and `O`, and the
+   structural op unions (`Batch.write`'s, `TransactWriteOp`, `TransactWriteUpdateOp`,
+   `ProjectionReadModel`) ops of any state; `ProjectionState` is the read model's domain type
+   (the engine reads and writes rows eagerly). An explicit `Collection.make` collection is
+   typed per member: a member selector is that member's query (`StateOf` its fields and
+   record), and the grouped `query`'s items are `{ _entityKey, _entityType, _decoded }`, its
+   state a per-member map (`MembersOffloadState`), so `Query.offloaded` re-types each
+   member's record. Unit tests
+   are `test/Entity.offload.read.test.ts`; type tests are in `test/Entity.offload.types.test.ts`
+   ("the read types"); `test/connected.entity-offload.test.ts` gains reads against DynamoDB
+   Local (gets per mode, index queries with projections, `limit` and `filterBy`, scans,
+   `Batch.get`, `transactGet`, versions, tombstones and stream images).
+   *Deviations (commit 8):*
+   - Auto-discovered collections (`db.collections.*`) are typed with the offloaded fields of
+     **all** the client's entities together, not a per-member map of states: the accessor is
+     an index signature over every collection name, so it cannot be typed per member. Its
+     result stays `any`, as before; only its blob errors and `.offloaded()` track the modes,
+     never under-reporting. (An explicit `Collection.make` collection is typed per member.)
+   - `getVersion`, `deleted.get` and `restore` on `BoundEntity` stay plain `Effect`s typed as
+     views under the default modes, without `.offloaded()`: making them `BoundGet`s would let
+     `Batch.get` and `transactGet` accept them, which read only live items. Their unbound
+     forms are `EntityGet`s and take `Entity.offloaded`.
+   - `decodeMarshalledItem` keeps one signature, conditional on the entity: its result is
+     `unknown` and its error union unchanged for an entity that offloads nothing, and
+     `Entity.Read<E, M>` for one that does — the overload of §10.1, without a second
+     signature that a widened entity type could fall through to.
+   - Vector search hits and `reembed` decode eagerly until commit 9 (vector), and both report
+     a `BlobStoreError` as a `ValidationError`'s cause (operation
+     `vectorSearch.<index>.decode` / `reembed.decode`), as `VectorSearchError` and `reembed`'s
+     union have no `BlobStoreError` yet; aggregate (11), geo (12, but for `GeoIndex.put`'s
+     eager result) and EventStore (13) reads are unchanged.
+   - Type-erased offloaded fields (`any`, from `TypedClient`'s and the type helpers' own
+     `infer … any` patterns) read as none in `View` and the builder states, as
+     `ReadBlobErrors<any, M>` already did, so generic code over erased entities keeps today's
+     types.
+   - `.skipFollowUp()` on an append returns nothing, so its state is `NoOffloadState`.
+   *Debt fixed (commit 8):* `queryNamespace` spread `packedQueryOptions` twice; commit 7's
+   write-result read-back resolved pointers before unpacking (now one pass, and its
+   `OffloadWrite.resolveStored` / `pendingPointers` are gone); the pure-definition fallback
+   of `decodeMarshalledItem` (row 71). `Collection.make`'s grouped query was typed as one
+   `{ [member]: records[] }` object per item, though its terminals return each item tagged
+   with its member, and its member records were `any` (read off `recordSchema`, typed
+   `Codec<any>`): they are the members' `Entity.Record` views now; two doc comments there
+   sat on the wrong declarations. `DynamoClient`'s `EntityLike._decodeRecord` was typed
+   `Effect<any, any>`, which hid the vector decode's untyped `BlobStoreError`.
+   *Rebase onto 1.37 (#171, commit 8):* `Query<A, E, O>` keeps its offload parameters
+   through #171's combinators (`pageSize("natural")`, `onRequest`, the internal planning
+   helpers, `explain`), and `BoundQuery` takes the offload state **fifth**, after
+   #171's `W` (`BoundQuery<Model, SkRemaining, A, W, O>`), so 1.37's public
+   `BoundQuery<Model, SkRemaining, A, W>` keeps its meaning; `makeBoundQuery` keeps its
+   four parameters and returns `W = never`. Collection pages keep 1.37's
+   `cursor: Option<string>` with the blob errors added. *Prefetch on the planned loop (risk
+   c):* every `examinePage` caller — the key loop, the planned window
+   (`executePlanned` / the planned `pageStream`) and `collectRanges` — passes the budget
+   still open, and a window member read alongside others but discarded (§3.6 of
+   `zorder-indexes.md`), or a page read ahead and never emitted, is never examined, so
+   nothing is prefetched for it. One gap closed here: rows a query drops by their raw form
+   (`liveRows` history rows, #171's per-row bound check `rowCheck`, `keepRow`) used to open
+   the whole response as a client predicate does, so an eager read prefetched every
+   surviving row past `limit`. They are judged before hydration and load, so they now never
+   take a place in the window; only a client predicate (`filterBy`) still examines — and
+   eagerly fetches — the whole response. `Entity.offload.read.test.ts` pins it (a scan over
+   live rows and their snapshots, `limit(1)`, fetches one value).
+   *Port onto 1.42.2 (commit 8):* the 1.39–1.42 query paths keep the offload parameters
+   too — the sharded fan-out (`fanOut`, `concurrency`, `whereUnderPins`, `refuse` /
+   `refused` / `orRefusal`) and `selectWhole`. A fan-out round examines only the rows
+   `ShardMerge.select` took for the round's budget, so a row another partition's page
+   outranks, or one past `limit`, is never prefetched; `Entity.offload.plans.test.ts` pins
+   it with the planned paths. `selectWhole` (a sparse map in a select, #238) reads whole
+   rows, so it installs no page prefetch: its raw-row hook loads the selected subset of
+   each row, and an offloaded field the select doesn't name is never fetched. The bound
+   update takes the offload state after main's `RN` / `KR`
+   (`BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>`), `BoundAppend` after `RN`, and
+   `insert` (1.41) reads its result per the operation's modes like `put`, with
+   `.offloaded()` on `BoundInsert`. Ref hydration and the cascade from a referenced entity
+   both store a ref through `refDataOf`, which leaves out every field the referenced entity
+   offloads (its value is read lazily, so nothing is fetched; the cascade decodes its
+   source row lazily too): a ref never holds a blob pointer, and never a copy of a value
+   whose object another row owns (row 55). A read of the ref holds the same: the
+   referencing entity's ref field is what a read of the target returns (`refHeldTarget`,
+   #241), which leaves the fields the target offloads out as it leaves a required hidden
+   field out (`registerOffloadedFields`, recorded by the target's definition). Without it
+   the subset model `EDD-9143` asks for was replaced by the target's whole model, and every
+   read of the referencing row failed (`Missing key at ["owner"]["avatar"]`).
+   `Entity.offload.refs.test.ts` pins it, plain and retained (the two cascade paths). Two
+   entities of one model that offload different fields leave the union out of a ref to
+   either (a named limit).
 9. **Batch / Transaction / projections / vector** — `validateAndBuildPutItem`, bound builders'
    captured store and compressor registry in `extractTransactable` (the compressor fix),
    `Batch.write` settlement, transaction planning and re-planning, `const`-generic op typing,
@@ -3419,7 +3555,7 @@ its row names the alternative that was considered and rejected.
 | 52 | Switching offload on / off without rewrite | **On: in** (legacy values read inline). **Off: reads only** — pointers resolve via the `ValidationError`-cause path and GC stops covering the field; the same for removing `external` from an overflow field *Rejected: a "retired" declaration that keeps GC coverage.* | design — **confirmed** 2026-11-01 |
 | 53 | `BlobHandle` as a write input | **In** as content to copy (server-side `copy` or streamed), always — even when it names the version the field holds | design |
 | 54 | Carry-on-equal (writing a read pointer back when the checksum matches) | **Out** (the previous draft had it in): named attributes always upload; only pinned copies and unchanged attributes keep a pointer (§6.4); projection rows reuse one only when the folded value deep-equals the fetched one, under `#f = :P` (§6.11) *Rejected: carry-on-equal (previous draft).* | design — **confirmed** 2026-11-01 (cost: restated content re-uploads) |
-| 55 | Refs to entities with offloaded fields | **Refused** when the ref schema includes the field (`EDD-9143`); ref hydration reads lazily *Rejected: stripping such fields from ref hydration automatically.* | design — **confirmed** 2026-11-01 |
+| 55 | Refs to entities with offloaded fields | **Refused** when the ref schema includes the field (`EDD-9143`); ref hydration reads lazily, and hydration and the cascade from the referenced entity (`refDataOf`) leave the offloaded fields out, so no ref ever holds a pointer *Rejected: stripping such fields from ref hydration automatically.* | design — **confirmed** 2026-11-01 |
 | 56 | `StorageEncoding` helpers | `pointer()` added (both stored forms); `decode` resolves via the ambient store; `*Sync` refuse pointers; `valueBytes` unchanged (inline size) | design |
 | 57 | `measureAppend` / `measureSnapshot` | never upload; pointers at the upper bound; `offloaded` field added | design |
 | 58 | Geo | **In**: `GeoSearch.nearby` resolves both kinds eagerly through the entity's two-phase decoder; `GeoIndex.put` takes `Uint8Array` for binary fields; error unions and bind check (§8.4, §9.3, §13) *Rejected: refusing `GeoIndex` on entities that offload.* | design — **confirmed** 2026-11-01 |

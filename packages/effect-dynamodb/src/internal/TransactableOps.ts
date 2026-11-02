@@ -7,6 +7,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { type DynamoEncoding, isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -24,6 +25,7 @@ import { resolveTtlAttributeName, type TableConfig, tableKeyAttributes } from ".
 import { isRefusedValue } from "./Capacity.js"
 import type { PutKind, ReturnValuesMode, UpdateState } from "./EntityOps.js"
 import { encodeInput } from "./InputForm.js"
+import { DEFAULT_MODES, type Modes } from "./OffloadRead.js"
 
 /**
  * @internal Hidden per-incarnation token of a versioned entity (#133): set
@@ -972,6 +974,54 @@ export const rejectUnsupportedOp = (
     )
   }
   return Effect.void
+}
+
+/**
+ * @internal Load, in place, the rows a multi-get (`Batch.get`,
+ * `Transaction.transactGet`) fetched (#179): grouped by entity and by the
+ * value of each get's read modes, every group's offloaded values resolve
+ * together (one batched resolution per group) before any row is decoded —
+ * the decoder then finds each row prepared. Groups load one after another,
+ * so the reads in flight never exceed the store's `readConcurrency`.
+ * `rows[i]` is the unmarshalled item of `infos[i]`, `undefined` for none.
+ */
+export const loadGetRows = (
+  infos: ReadonlyArray<{ readonly entity: Entity; readonly offloadModes?: Modes | undefined }>,
+  rows: ReadonlyArray<Record<string, unknown> | undefined>,
+  operation: string,
+): Effect.Effect<void, ValidationError | BlobStoreError> => {
+  const groups = new Map<
+    Entity,
+    Map<string, { readonly modes: Modes; readonly rows: Array<Record<string, unknown>> }>
+  >()
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    const info = infos[i]
+    if (row === undefined || info === undefined || !info.entity._offloads) continue
+    let byModes = groups.get(info.entity)
+    if (byModes === undefined) {
+      byModes = new Map()
+      groups.set(info.entity, byModes)
+    }
+    const modes = info.offloadModes ?? DEFAULT_MODES
+    // By value: an object-form mode is a fresh `Modes` per builder.
+    const id = `${modes.overflow}/${modes.binary}`
+    let group = byModes.get(id)
+    if (group === undefined) {
+      group = { modes, rows: [] }
+      byModes.set(id, group)
+    }
+    group.rows.push(row)
+  }
+  if (groups.size === 0) return Effect.void
+  const loads = [...groups].flatMap(([entity, byModes]) =>
+    [...byModes.values()].map((group) => ({ entity, group })),
+  )
+  return Effect.forEach(
+    loads,
+    ({ entity, group }) => entity._loadRows(group.rows, { operation, modes: group.modes }),
+    { discard: true },
+  )
 }
 
 /**

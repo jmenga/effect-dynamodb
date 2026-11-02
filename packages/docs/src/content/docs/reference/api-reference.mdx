@@ -713,7 +713,7 @@ import { Collection } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(name, entities) => Collection` | Create a collection from entities sharing an index |
+| `make` | `(name, entities) => Collection` | Create a collection from entities sharing an index. `.query(pk)` returns every member's items, each tagged with its member (`{ _entityKey, _entityType, _decoded }`); each member's selector (`collection.Tasks(pk)` for a member named `Tasks`) returns that member's records |
 
 See [Indexes & Collections](/effect-dynamodb/guides/indexes/) for details.
 

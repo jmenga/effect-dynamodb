@@ -2,10 +2,10 @@
  * Sample blob pointers (#179, Packed layout `010`) for the read-path tests:
  * an overflow field's pointer as stored (`B` bytes) and a binary field's as
  * stored (`~edbp:` base64url `S` text), plus the assertion that a read path
- * refused one with the codec's "cannot resolve" `ValidationError`.
+ * could not resolve one on an attribute its member does not offload.
  */
 
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { Option } from "effect"
 import { expect } from "vitest"
@@ -45,9 +45,38 @@ export const jsonPointerBytes = (): Uint8Array => BlobPointer.encode(jsonPointer
 export const bytesPointerText: string = BlobPointer.encodeText(bytesPointer)
 
 /**
- * `error` is the `ValidationError` a read path raises on a pointer it cannot
- * resolve: it names the attribute and the object version, and never carries
- * the pointer as a value.
+ * `error` is the `ValidationError` a read path raises on a pointer stored on
+ * an attribute its member does not offload (design §4.7, switching offload
+ * off) when the pointer cannot be resolved — here because no blob store is in
+ * context: its `cause` is the `BlobStoreError` naming the attribute and the
+ * object version, and it never carries the pointer as a value.
+ */
+export const expectPointerStoreFailure = (
+  error: unknown,
+  attribute: string,
+  expected: {
+    readonly entityType?: string
+    readonly operation?: string
+    readonly pointer?: BlobPointer.BlobPointer
+  } = {},
+): void => {
+  expect(error).toBeInstanceOf(ValidationError)
+  const validation = error as ValidationError
+  if (expected.entityType !== undefined) expect(validation.entityType).toBe(expected.entityType)
+  if (expected.operation !== undefined) expect(validation.operation).toBe(expected.operation)
+  const ref = (expected.pointer ?? jsonPointer).ref
+  expect(validation.cause).toBeInstanceOf(BlobStoreError)
+  const cause = validation.cause as BlobStoreError
+  expect(cause).toMatchObject({ attribute, reason: "NotProvided", ref })
+  expect(cause.message).toContain(ref.key)
+  expect(cause.message).toContain(ref.version)
+}
+
+/**
+ * `error` is the `ValidationError` a read path that does not resolve
+ * pointers yet raises on one (the codec's "cannot resolve" refusal): it names
+ * the attribute and the object version, and never carries the pointer as a
+ * value.
  */
 export const expectUnresolvedPointer = (
   error: unknown,

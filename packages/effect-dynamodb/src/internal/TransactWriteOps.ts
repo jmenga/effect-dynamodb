@@ -93,7 +93,8 @@ export { type TransactItemTarget, transactItemTarget }
 /**
  * Union of operations accepted by `transactWrite` and by `append`'s
  * `additionalItems`. The `any` positions are deliberate: op intermediates are
- * heterogeneous by design, and each element is narrowed at the call site.
+ * heterogeneous by design, and each element is narrowed at the call site (the
+ * trailing one is an op's offload state, #179).
  *
  * Bound-CRUD builders (`db.entities.X.put(...)` / `.create(...)` /
  * `.delete(...)`) are accepted alongside the unbound intermediates. They are the
@@ -101,8 +102,8 @@ export { type TransactItemTarget, transactItemTarget }
  * AWS-free `@effect-dynamodb/schema` `Entity.make` (#100).
  */
 export type TransactWriteOp =
-  | EntityPut<any, any, any, any>
-  | EntityDelete<any, any>
+  | EntityPut<any, any, any, any, any>
+  | EntityDelete<any, any, void, unknown, any>
   | BoundWriteOp
   | ConditionCheckOp
 
@@ -183,7 +184,7 @@ export type AppendWriteOp = TransactWriteOp | StreamAppendOp
  * `EventStore.append({ additionalItems })` does not, and `Batch.write` cannot
  * express an update at all, so neither accepts one at the type level.
  */
-export type TransactWriteUpdateOp = EntityUpdate<any, any, any, any, any> | BoundUpdateOp
+export type TransactWriteUpdateOp = EntityUpdate<any, any, any, any, any, any> | BoundUpdateOp
 
 /**
  * Compile an op-attached condition (`Entity.create()`'s `attribute_not_exists`,

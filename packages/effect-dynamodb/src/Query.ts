@@ -13,7 +13,9 @@ import type {
   QueryCommandOutput,
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
+import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
@@ -31,6 +33,18 @@ import {
   type StoredFormAt,
 } from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
+import {
+  DEFAULT_MODES,
+  type Modes,
+  offloadedAfterFilterBy,
+  parseModes,
+} from "./internal/OffloadRead.js"
+import type {
+  OffloadedErrors,
+  OffloadedView,
+  WithItem,
+  WithModes,
+} from "./internal/OffloadTypes.js"
 import {
   type PackedAttributeGuard,
   packedExprRefusal,
@@ -60,6 +74,7 @@ import {
 import * as ShardMerge from "./internal/ShardMerge.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
+import type { NoOffloadState, OffloadModes, OffloadState } from "./Offload.js"
 
 // ---------------------------------------------------------------------------
 // Sort key condition types
@@ -260,7 +275,20 @@ interface QueryState {
    * any select (EDD-9054).
    */
   readonly selectsWholeRows?: boolean | undefined
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
+  /**
+   * Decode one row under the query's read modes (#179). A row the page
+   * prefetch ({@link prefetch}) loaded is only schema-decoded.
+   */
+  readonly decoder: QueryDecoder
+  /**
+   * @internal Load a window of rows before they are decoded (#179, design
+   * §8.2): unpack every stored-form attribute and resolve the rows' blob
+   * pointers together, per the query's modes. `undefined` for a query whose
+   * items offload nothing and store nothing packed.
+   */
+  readonly prefetch: QueryPrefetch | undefined
+  /** @internal The modes `.offloaded()` set; the defaults when `undefined`. */
+  readonly offloadModes: Modes | undefined
   /**
    * How a raw row ({@link select} / {@link selectPaths}) is handed back: the
    * identity, unless the query's items store attributes packed — then each
@@ -364,7 +392,10 @@ interface PreparedPlan {
  * header + payload, native → unchanged), never schema-decoded.
  */
 export type QueryRawRow = {
-  (raw: Record<string, unknown>): Effect.Effect<Record<string, unknown>, ValidationError>
+  (
+    raw: Record<string, unknown>,
+    modes: Modes,
+  ): Effect.Effect<Record<string, unknown>, ValidationError | BlobStoreError>
   /**
    * Attributes the hook reads to decide how to read a row — a collection's
    * `__edd_e__`, which names the member whose packed attributes to read. They
@@ -379,6 +410,24 @@ export type QueryRawRow = {
    */
   readonly attributes?: ReadonlyArray<string> | undefined
 }
+
+/** @internal Decode one row under the query's read modes. */
+export type QueryDecoder = (
+  raw: Record<string, unknown>,
+  /** The query's read modes (#179); the defaults when omitted. */
+  modes?: Modes,
+) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+
+/**
+ * @internal The page prefetch of a query whose items offload (see
+ * {@link QueryState.prefetch}). `raw`: the rows are projections, handed back
+ * as their JSON wire form (the raw-row hook's reading). Rows of other entity
+ * types are left as they are.
+ */
+export type QueryPrefetch = (
+  rows: ReadonlyArray<Record<string, unknown>>,
+  options: { readonly modes: Modes; readonly raw: boolean; readonly operation: string },
+) => Effect.Effect<void, ValidationError | BlobStoreError>
 
 /**
  * @internal The raw-row hook a projection of `paths` runs: the query's
@@ -462,7 +511,7 @@ const normalizeKeyFields = (
 }
 
 // ---------------------------------------------------------------------------
-// Query<A> interface
+// Query<A, E, O> interface
 // ---------------------------------------------------------------------------
 
 const QueryTypeId: unique symbol = Symbol.for("effect-dynamodb/Query")
@@ -476,22 +525,35 @@ export type QueryTypeId = typeof QueryTypeId
  * return a new Query — the original is unchanged.
  *
  * @typeParam A - Decoded item type returned by the query
+ * @typeParam E - Errors the query's items add to its terminals: the
+ *   `BlobStoreError` of an eager read of offloaded fields (#179). `never` for
+ *   a query whose items offload nothing.
+ * @typeParam O - The offload state {@link offloaded} re-types `A` from (the
+ *   items' offloaded fields, the read modes, the pre-view item);
+ *   `NoOffloadState` for items that offload nothing.
  */
-export interface Query<A> extends Pipeable.Pipeable {
+export interface Query<A, E = never, O extends OffloadState = NoOffloadState>
+  extends Pipeable.Pipeable {
   readonly [QueryTypeId]: QueryTypeId
   /** @internal */
   readonly _state: QueryState
   /** @internal */
   readonly _A: (_: never) => A
+  /** @internal */
+  readonly _E: (_: never) => E
+  /** @internal */
+  readonly _O: (_: never) => O
 }
 
 // ---------------------------------------------------------------------------
 // Internal: Query implementation
 // ---------------------------------------------------------------------------
 
-class QueryImpl<A> implements Query<A> {
+class QueryImpl<A, E = never, O extends OffloadState = NoOffloadState> implements Query<A, E, O> {
   readonly [QueryTypeId]: QueryTypeId = QueryTypeId
   declare readonly _A: (_: never) => A
+  declare readonly _E: (_: never) => E
+  declare readonly _O: (_: never) => O
 
   constructor(readonly _state: QueryState) {}
 
@@ -505,14 +567,19 @@ class QueryImpl<A> implements Query<A> {
 // Constructor (internal — used by Entity and Collection)
 // ---------------------------------------------------------------------------
 
-export const make = <A>(config: {
+export const make = <A, E = never, O extends OffloadState = NoOffloadState>(config: {
   readonly tableName: string
   readonly indexName: string | undefined
   readonly pkField: string
   readonly pkValue: string
   readonly skField: string | undefined
   readonly entityTypes: ReadonlyArray<string>
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  readonly decoder: (
+    raw: Record<string, unknown>,
+    modes: Modes,
+  ) => Effect.Effect<A, ValidationError | BlobStoreError>
+  /** See {@link QueryState.prefetch}. */
+  readonly prefetch?: QueryPrefetch | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -532,8 +599,10 @@ export const make = <A>(config: {
   readonly storedAt?: StoredFormAt | undefined
   /** See {@link QueryState.operationTarget}. */
   readonly operationTarget?: string | undefined
-}): Query<A> =>
-  new QueryImpl<A>({
+}): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({
+    prefetch: config.prefetch,
+    offloadModes: undefined,
     rawRow: config.rawRow,
     packed: config.packed ?? [],
     storedAt: config.storedAt,
@@ -572,9 +641,7 @@ export const make = <A>(config: {
     isScan: false,
     projection: undefined,
     projectionPaths: undefined,
-    decoder: config.decoder as (
-      raw: Record<string, unknown>,
-    ) => Effect.Effect<unknown, ValidationError>,
+    decoder: config.decoder as QueryDecoder,
     resolveTableName: config.resolveTableName,
     keyFields: normalizeKeyFields(config.keyFields),
   })
@@ -584,11 +651,16 @@ export const make = <A>(config: {
  * but uses DynamoDB Scan instead of Query at execution time.
  * No key condition — only filter expressions and entity type filter.
  */
-export const makeScan = <A>(config: {
+export const makeScan = <A, E = never, O extends OffloadState = NoOffloadState>(config: {
   readonly tableName: string
   readonly indexName: string | undefined
   readonly entityTypes: ReadonlyArray<string>
-  readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>
+  readonly decoder: (
+    raw: Record<string, unknown>,
+    modes: Modes,
+  ) => Effect.Effect<A, ValidationError | BlobStoreError>
+  /** See {@link QueryState.prefetch}. */
+  readonly prefetch?: QueryPrefetch | undefined
   readonly resolveTableName?: Effect.Effect<string, never, any> | undefined
   /** Index key + table key attribute names (used to rebuild cursors). */
   readonly keyFields?: ReadonlyArray<string | undefined> | undefined
@@ -602,8 +674,10 @@ export const makeScan = <A>(config: {
   readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
   /** See {@link QueryState.storedAt}. */
   readonly storedAt?: StoredFormAt | undefined
-}): Query<A> =>
-  new QueryImpl<A>({
+}): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({
+    prefetch: config.prefetch,
+    offloadModes: undefined,
     rawRow: config.rawRow,
     packed: config.packed ?? [],
     storedAt: config.storedAt,
@@ -642,9 +716,7 @@ export const makeScan = <A>(config: {
     isScan: true,
     projection: undefined,
     projectionPaths: undefined,
-    decoder: config.decoder as (
-      raw: Record<string, unknown>,
-    ) => Effect.Effect<unknown, ValidationError>,
+    decoder: config.decoder as QueryDecoder,
     resolveTableName: config.resolveTableName,
     keyFields: normalizeKeyFields(config.keyFields),
   })
@@ -660,8 +732,11 @@ const encodeCursor = (key: Record<string, AttributeValue>): string => Cursor.enc
 // ---------------------------------------------------------------------------
 
 /** @internal Install `condition` as the query's one sort key condition. */
-const withSortKeyCondition = <A>(state: QueryState, condition: SortKeyCondition): Query<A> =>
-  new QueryImpl<A>({
+const withSortKeyCondition = <A, E = never, O extends OffloadState = NoOffloadState>(
+  state: QueryState,
+  condition: SortKeyCondition,
+): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({
     ...state,
     skConditions: state.skField === undefined ? [] : [{ field: state.skField, condition }],
     keepRow: undefined,
@@ -690,20 +765,34 @@ const withoutPruning = (state: QueryState): QueryState => {
  * be in any of them.
  */
 export const where: {
-  (condition: SortKeyCondition): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, condition: SortKeyCondition): Query<A>
-} = Function.dual(2, <A>(self: Query<A>, condition: SortKeyCondition): Query<A> => {
-  const state = self._state
-  if (!state.skField) return self
-  return withSortKeyCondition(withoutPruning(state), condition)
-})
+  (
+    condition: SortKeyCondition,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    condition: SortKeyCondition,
+  ): Query<A, E, O>
+} = Function.dual(
+  2,
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    condition: SortKeyCondition,
+  ): Query<A, E, O> => {
+    const state = self._state
+    if (!state.skField) return self
+    return withSortKeyCondition(withoutPruning(state), condition)
+  },
+)
 
 /**
  * @internal {@link where} for a condition composed from the query's own pins, or
  * bounded under them (an accessor's, `.where()` on a bound query): it selects only
  * rows those pins select, so the shard chosen for them (#183) still holds them all.
  */
-export const whereUnderPins = <A>(self: Query<A>, condition: SortKeyCondition): Query<A> => {
+export const whereUnderPins = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+  condition: SortKeyCondition,
+): Query<A, E, O> => {
   const state = self._state
   if (!state.skField) return self
   return withSortKeyCondition(state, condition)
@@ -714,10 +803,13 @@ export const whereUnderPins = <A>(self: Query<A>, condition: SortKeyCondition): 
  * {@link KeyComposer.composeReadPartitions} returned for the query's pins. An
  * unsharded index's query is unchanged.
  */
-export const fanOut = <A>(self: Query<A>, read: ReadPartitions): Query<A> =>
+export const fanOut = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+  read: ReadPartitions,
+): Query<A, E, O> =>
   read.fanOut === undefined
     ? self
-    : new QueryImpl<A>({
+    : new QueryImpl<A, E, O>({
         ...self._state,
         pkValue: read.partitions[0]!,
         fanOut: { ...read.fanOut, partitions: read.partitions },
@@ -728,16 +820,22 @@ export const fanOut = <A>(self: Query<A>, read: ReadPartitions): Query<A> =>
  * channel to fail into, and a value a key can't hold is the caller's error, not a
  * defect. Nothing is sent.
  */
-export const refuse = <A>(self: Query<A>, refusal: ValidationError): Query<A> =>
-  new QueryImpl<A>({ ...self._state, refusal })
+export const refuse = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+  refusal: ValidationError,
+): Query<A, E, O> => new QueryImpl<A, E, O>({ ...self._state, refusal })
 
 /** @internal Has {@link refuse} refused this query? Its builders have nothing left to do. */
-export const isRefused = (self: Query<unknown>): boolean => self._state.refusal !== undefined
+export const isRefused = (self: Query<unknown, unknown, any>): boolean =>
+  self._state.refusal !== undefined
 
 /** @internal A query that could not even be built: a composite it was given has no key. */
-export const refused = <A>(indexName: string | undefined, refusal: ValidationError): Query<A> =>
+export const refused = <A, E = never, O extends OffloadState = NoOffloadState>(
+  indexName: string | undefined,
+  refusal: ValidationError,
+): Query<A, E, O> =>
   refuse(
-    make<A>({
+    make<A, E, O>({
       tableName: "",
       indexName,
       pkField: "",
@@ -770,7 +868,8 @@ export const orRefusal = <T>(
 }
 
 /** @internal Does this query read a sharded index's partitions (#183)? */
-export const isFanOut = (self: Query<unknown>): boolean => self._state.fanOut !== undefined
+export const isFanOut = (self: Query<unknown, unknown, any>): boolean =>
+  self._state.fanOut !== undefined
 
 /**
  * How many requests a query of a sharded index sends at once, per round of its
@@ -783,17 +882,28 @@ export const isFanOut = (self: Query<unknown>): boolean => self._state.fanOut !=
  * ```
  */
 export const concurrency: {
-  (n: number): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, n: number): Query<A>
-} = Function.dual(2, <A>(self: Query<A>, n: number): Query<A> => {
-  if (!Number.isInteger(n) || n < 1) {
-    throw new Error(
-      `[EDD-9105] concurrency(${JSON.stringify(n)}) is not a number of requests: pass a ` +
-        `positive integer.`,
-    )
-  }
-  return new QueryImpl<A>({ ...self._state, concurrencyValue: n })
-})
+  (
+    n: number,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O>
+} = Function.dual(
+  2,
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O> => {
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(
+        `[EDD-9105] concurrency(${JSON.stringify(n)}) is not a number of requests: pass a ` +
+          `positive integer.`,
+      )
+    }
+    return new QueryImpl<A, E, O>({ ...self._state, concurrencyValue: n })
+  },
+)
 
 /**
  * Return **at most `n` items** — a contract on results, not on round trips.
@@ -814,12 +924,20 @@ export const concurrency: {
  * ```
  */
 export const limit: {
-  (n: number): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, n: number): Query<A>
+  (
+    n: number,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, n: number): Query<A> =>
-    new QueryImpl<A>({
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O> =>
+    new QueryImpl<A, E, O>({
       ...self._state,
       limitValue: n,
     }),
@@ -838,21 +956,32 @@ export const limit: {
  * outstanding `limit` otherwise. Any other string throws `[EDD-9095]`.
  */
 export const pageSize: {
-  (size: number | "natural"): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, size: number | "natural"): Query<A>
-} = Function.dual(2, <A>(self: Query<A>, size: number | "natural"): Query<A> => {
-  if (typeof size === "string" && size !== "natural") {
-    throw new Error(
-      `[EDD-9095] pageSize(${JSON.stringify(size)}) is not a page size: pass the number of ` +
-        `rows each request examines (DynamoDB's Limit), or "natural" to size requests as ` +
-        `1.36 did.`,
-    )
-  }
-  return new QueryImpl<A>({
-    ...self._state,
-    pageSizeValue: size,
-  })
-})
+  (
+    size: number | "natural",
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    size: number | "natural",
+  ): Query<A, E, O>
+} = Function.dual(
+  2,
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    size: number | "natural",
+  ): Query<A, E, O> => {
+    if (typeof size === "string" && size !== "natural") {
+      throw new Error(
+        `[EDD-9095] pageSize(${JSON.stringify(size)}) is not a page size: pass the number of ` +
+          `rows each request examines (DynamoDB's Limit), or "natural" to size requests as ` +
+          `1.36 did.`,
+      )
+    }
+    return new QueryImpl<A, E, O>({
+      ...self._state,
+      pageSizeValue: size,
+    })
+  },
+)
 
 /**
  * What a terminal reports after each request it sends (see {@link onRequest}).
@@ -911,12 +1040,20 @@ export interface QueryRequestEvent {
  * ```
  */
 export const onRequest: {
-  (observer: (event: QueryRequestEvent) => Effect.Effect<void>): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, observer: (event: QueryRequestEvent) => Effect.Effect<void>): Query<A>
+  (
+    observer: (event: QueryRequestEvent) => Effect.Effect<void>,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    observer: (event: QueryRequestEvent) => Effect.Effect<void>,
+  ): Query<A, E, O>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, observer: (event: QueryRequestEvent) => Effect.Effect<void>): Query<A> =>
-    new QueryImpl<A>({
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    observer: (event: QueryRequestEvent) => Effect.Effect<void>,
+  ): Query<A, E, O> =>
+    new QueryImpl<A, E, O>({
       ...self._state,
       observers: [...self._state.observers, observer],
     }),
@@ -925,8 +1062,10 @@ export const onRequest: {
 /**
  * Reverse the sort order (sets ScanIndexForward = false).
  */
-export const reverse = <A>(self: Query<A>): Query<A> =>
-  new QueryImpl<A>({
+export const reverse = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({
     ...self._state,
     scanForward: false,
   })
@@ -938,12 +1077,14 @@ export const reverse = <A>(self: Query<A>): Query<A> =>
  * (`operation: "query.consistentRead"`) naming the index (#144).
  */
 export const consistentRead: {
-  (): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>): Query<A>
+  (): <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+  ) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>): Query<A, E, O>
 } = Function.dual(
   (args) => isQuery(args[0]),
-  <A>(self: Query<A>): Query<A> =>
-    new QueryImpl<A>({
+  <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>): Query<A, E, O> =>
+    new QueryImpl<A, E, O>({
       ...self._state,
       consistentRead: true,
     }),
@@ -954,12 +1095,20 @@ export const consistentRead: {
  * Pagination stops after this many pages even if `LastEvaluatedKey` is present.
  */
 export const maxPages: {
-  (n: number): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, n: number): Query<A>
+  (
+    n: number,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, n: number): Query<A> =>
-    new QueryImpl<A>({
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    n: number,
+  ): Query<A, E, O> =>
+    new QueryImpl<A, E, O>({
       ...self._state,
       maxPagesValue: n,
     }),
@@ -970,8 +1119,10 @@ export const maxPages: {
  * Useful for cross-entity queries or when you know the partition only contains
  * items of the expected type.
  */
-export const ignoreOwnership = <A>(self: Query<A>): Query<A> =>
-  new QueryImpl<A>({
+export const ignoreOwnership = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({
     ...self._state,
     ignoreOwnershipFlag: true,
   })
@@ -991,14 +1142,22 @@ export const ignoreOwnership = <A>(self: Query<A>): Query<A> =>
  * (`DynamoValidationError`) or the query resumes from it.
  */
 export const startFrom: {
-  (cursor: string): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, cursor: string): Query<A>
+  (
+    cursor: string,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    cursor: string,
+  ): Query<A, E, O>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, cursor: string): Query<A> =>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    cursor: string,
+  ): Query<A, E, O> =>
     cursor === ""
       ? self
-      : new QueryImpl<A>({
+      : new QueryImpl<A, E, O>({
           ...self._state,
           cursorText: cursor,
         }),
@@ -1012,14 +1171,14 @@ export const startFrom: {
  * combinators that follow (`reverse`, `startFrom`, …) still apply. Not a
  * combinator: Z-order and skip-scan are reached through `BoundQuery`.
  */
-export const plan = <A>(
-  self: Query<A>,
+export const plan = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
   install:
     | { readonly planner: PlannerFactory; readonly maxSkips: number | undefined }
     | { readonly zorder: ZOrderOptions },
-): Query<A> => {
+): Query<A, E, O> => {
   if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
-  return new QueryImpl<A>(
+  return new QueryImpl<A, E, O>(
     "zorder" in install
       ? { ...self._state, zorderOptions: { ...self._state.zorderOptions, ...install.zorder } }
       : { ...self._state, planner: install.planner, maxSkips: install.maxSkips },
@@ -1038,7 +1197,7 @@ const shardedPlanRefusal = (state: QueryState): Error =>
   )
 
 /** @internal {@link shardedPlanRefusal}, for an accessor to raise before it plans. */
-export const refuseShardedPlan = (self: Query<unknown>): void => {
+export const refuseShardedPlan = (self: Query<unknown, unknown, any>): void => {
   if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
 }
 
@@ -1048,9 +1207,11 @@ export const refuseShardedPlan = (self: Query<unknown>): void => {
  * `.within()` whose bounds admit no value is: nothing is sent, the terminals
  * return no items, and `explain()` reports the `empty` plan.
  */
-export const planEmpty = <A>(self: Query<A>): Query<A> =>
+export const planEmpty = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Query<A, E, O> =>
   // Nothing is read, so no partition is: a fan-out has nothing left to merge.
-  plan(new QueryImpl<A>({ ...self._state, fanOut: undefined }), {
+  plan(new QueryImpl<A, E, O>({ ...self._state, fanOut: undefined }), {
     planner: compositePlanner({
       entityType: self._state.entityTypes.join(", ") || "unknown",
       index: self._state.indexName ?? "primary",
@@ -1074,10 +1235,10 @@ export const planEmpty = <A>(self: Query<A>): Query<A> =>
   })
 
 /** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
-const rawRowDecoder = (
-  hook: QueryRawRow | undefined,
-): ((raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>) =>
-  hook ?? ((raw) => Effect.succeed(raw))
+const rawRowDecoder = (hook: QueryRawRow | undefined): QueryDecoder =>
+  hook === undefined
+    ? (raw) => Effect.succeed(raw)
+    : (raw, modes) => hook(raw, modes ?? DEFAULT_MODES)
 
 /** @internal Throw `[EDD-9076]` for a projection inside a packed attribute. */
 const refusePackedProjection = (
@@ -1100,17 +1261,27 @@ const refusePackedProjection = (
  * selected whole: a path inside it throws `[EDD-9076]`.
  */
 export const select: {
-  (attributes: ReadonlyArray<string>): <A>(self: Query<A>) => Query<Record<string, unknown>>
-  <A>(self: Query<A>, attributes: ReadonlyArray<string>): Query<Record<string, unknown>>
+  (
+    attributes: ReadonlyArray<string>,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+  ) => Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    attributes: ReadonlyArray<string>,
+  ): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, attributes: ReadonlyArray<string>): Query<Record<string, unknown>> => {
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    attributes: ReadonlyArray<string>,
+  ): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>> => {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
     const paths = attributes.map((attribute) => [attribute])
     refusePackedProjection(self._state, paths)
-    return new QueryImpl<Record<string, unknown>>({
+    return new QueryImpl<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>({
       ...self._state,
       projection: attributes,
       decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
@@ -1124,23 +1295,23 @@ export const select: {
  * (#133). Always numbered placeholders (`#proj0`), whatever characters the
  * stored names hold.
  */
-export const selectProjected = <A>(
-  self: Query<A>,
+export const selectProjected = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
   storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
   decode: (raw: Record<string, unknown>) => unknown,
-): Query<Record<string, unknown>> => {
+): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>> => {
   if (self._state.predicates.length > 0) {
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
   refusePackedProjection(self._state, storedPaths)
   const rawRow = rawRowDecoder(projectedRawRow(self._state.rawRow, storedPaths))
-  return new QueryImpl<Record<string, unknown>>({
+  return new QueryImpl<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>({
     ...self._state,
     projection: undefined,
     projectionPaths: storedPaths,
-    decoder: (raw) =>
+    decoder: (raw, modes) =>
       Effect.map(
-        rawRow(raw),
+        rawRow(raw, modes),
         (row) => decode(row as Record<string, unknown>) as Record<string, unknown>,
       ),
   })
@@ -1156,23 +1327,26 @@ export const selectProjected = <A>(
  * `storedPaths` would run it. Nothing the select doesn't name is unpacked, decompressed or
  * checked. `decode` gets that, and the whole row, from which it takes the sparse maps selected.
  */
-export const selectWhole = <A>(
-  self: Query<A>,
+export const selectWhole = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
   storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
   decode: (projected: Record<string, unknown>, raw: Record<string, unknown>) => unknown,
-): Query<Record<string, unknown>> => {
+): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>> => {
   if (self._state.predicates.length > 0) {
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
   refusePackedProjection(self._state, storedPaths)
   const hook = projectedRawRow(self._state.rawRow, storedPaths)
   const reads = hook?.reads ?? []
-  return new QueryImpl<Record<string, unknown>>({
+  return new QueryImpl<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>({
     ...self._state,
     projection: undefined,
     projectionPaths: undefined,
     selectsWholeRows: true,
-    decoder: (raw) => {
+    // The selected subset of each row is loaded by the raw-row hook (#179): a page prefetch of
+    // the whole row would fetch offloaded values the select does not name.
+    prefetch: undefined,
+    decoder: (raw, modes) => {
       const projected = projectRow(raw, storedPaths)
       if (hook === undefined)
         return Effect.succeed(decode(projected, raw) as Record<string, unknown>)
@@ -1180,7 +1354,7 @@ export const selectWhole = <A>(
         (attribute) => !Object.hasOwn(projected, attribute) && Object.hasOwn(raw, attribute),
       )
       for (const attribute of borrowed) projected[attribute] = raw[attribute]
-      return Effect.map(hook(projected), (row) => {
+      return Effect.map(hook(projected, modes ?? DEFAULT_MODES), (row) => {
         const hooked = row as Record<string, unknown>
         for (const attribute of borrowed) delete hooked[attribute]
         return decode(hooked, raw) as Record<string, unknown>
@@ -1372,12 +1546,12 @@ export const respellings = (
  * stored attributes, and each item is handed back keyed by the domain names
  * asked for (#133).
  */
-export const selectRenamed = <A>(
-  self: Query<A>,
+export const selectRenamed = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   resolveDbName: (domainName: string) => string,
   below?: StoredBelow,
-): Query<Record<string, unknown>> => {
+): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>> => {
   const heads = [...new Set(paths.map((path) => String(path[0])))]
   const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, resolveDbName, below)
   const plans = respellings(paths, storedOf)
@@ -1402,11 +1576,19 @@ export const selectRenamed = <A>(
  * value. Use {@link filterBy}, which runs on the decoded item.
  */
 export const filterExpr: {
-  (expr: Expr): <A>(self: Query<A>) => Query<A>
-  <A>(self: Query<A>, expr: Expr): Query<A>
+  (
+    expr: Expr,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    expr: Expr,
+  ): Query<A, E, O>
 } = Function.dual(
   2,
-  <A>(self: Query<A>, expr: Expr): Query<A> =>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    expr: Expr,
+  ): Query<A, E, O> =>
     filterExprStored(
       self,
       self._state.storedAt === undefined ? expr : operandsAsStored(expr, self._state.storedAt),
@@ -1418,7 +1600,10 @@ export const filterExpr: {
  * attributes hold (`operandsAsStored`, #242), with its paths' stored names: added as it is. A bound
  * query's and `Entity.filter`'s, which put them so with the names their own owner resolves.
  */
-export const filterExprStored = <A>(self: Query<A>, expr: Expr): Query<A> => {
+export const filterExprStored = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+  expr: Expr,
+): Query<A, E, O> => {
   // A filter that asserts nothing (`.filter({})`, `and()`) is no filter: it is
   // dropped here, never sent as `FilterExpression: ""`, which DynamoDB
   // rejects (#133). An empty part anywhere else — under `or` or `not`, or an
@@ -1427,7 +1612,7 @@ export const filterExprStored = <A>(self: Query<A>, expr: Expr): Query<A> => {
   if (isEmptyExpr(expr)) return self
   const refused = packedExprRefusal(expr, self._state.packed, "filter")
   if (refused !== undefined) throw new Error(refused)
-  return new QueryImpl<A>({
+  return new QueryImpl<A, E, O>({
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
   })
@@ -1471,21 +1656,32 @@ export const filterExprStored = <A>(self: Query<A>, expr: Expr): Query<A> => {
  * item missing the attributes it reads — see EDD-9054.
  */
 export const filterBy: {
-  <A>(predicate: (item: A) => boolean): (self: Query<A>) => Query<A>
-  <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A>
-} = Function.dual(2, <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A> => {
-  if (
-    self._state.projection !== undefined ||
-    self._state.projectionPaths !== undefined ||
-    self._state.selectsWholeRows === true
-  ) {
-    throw new Error(rejectPredicateWithProjection("filterBy() after select()"))
-  }
-  return new QueryImpl<A>({
-    ...self._state,
-    predicates: [...self._state.predicates, predicate as (item: never) => boolean],
-  })
-})
+  <A>(
+    predicate: (item: A) => boolean,
+  ): <E, O extends OffloadState>(self: Query<A, E, O>) => Query<A, E, O>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    predicate: (item: A) => boolean,
+  ): Query<A, E, O>
+} = Function.dual(
+  2,
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+    predicate: (item: A) => boolean,
+  ): Query<A, E, O> => {
+    if (
+      self._state.projection !== undefined ||
+      self._state.projectionPaths !== undefined ||
+      self._state.selectsWholeRows === true
+    ) {
+      throw new Error(rejectPredicateWithProjection("filterBy() after select()"))
+    }
+    return new QueryImpl<A, E, O>({
+      ...self._state,
+      predicates: [...self._state.predicates, predicate as (item: never) => boolean],
+    })
+  },
+)
 
 /**
  * @internal A projection and a client-side predicate cannot both be active.
@@ -1511,28 +1707,78 @@ const rejectPredicateWithProjection = (what: string): string =>
 export const selectPaths: {
   (
     paths: ReadonlyArray<ReadonlyArray<string | number>>,
-  ): <A>(self: Query<A>) => Query<Record<string, unknown>>
-  <A>(
-    self: Query<A>,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+  ) => Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
     paths: ReadonlyArray<ReadonlyArray<string | number>>,
-  ): Query<Record<string, unknown>>
+  ): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>
 } = Function.dual(
   2,
-  <A>(
-    self: Query<A>,
+  <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
     paths: ReadonlyArray<ReadonlyArray<string | number>>,
-  ): Query<Record<string, unknown>> => {
+  ): Query<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>> => {
     if (self._state.predicates.length > 0) {
       throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
     }
     refusePackedProjection(self._state, paths)
-    return new QueryImpl<Record<string, unknown>>({
+    return new QueryImpl<Record<string, unknown>, E, WithItem<O, Record<string, unknown>>>({
       ...self._state,
       projectionPaths: paths,
       decoder: rawRowDecoder(projectedRawRow(self._state.rawRow, paths)),
     })
   },
 )
+
+/**
+ * Read the query's offloaded fields (#179) in `mode` — `"eager"` or `"lazy"`
+ * for both kinds, or `{ overflow?, binary? }` to set the kinds it names over
+ * the query's current modes. Defaults: overflow eager, binary lazy.
+ *
+ * - **eager** — the value, fetched in a page-level prefetch inside the
+ *   `limit` window (rows past `limit` are never fetched) at the store's
+ *   `readConcurrency`, verified by size and checksum; the terminals carry
+ *   `BlobStoreError`;
+ * - **lazy** — an `OffloadedValue<A>` (overflow) or `BlobHandle` (binary):
+ *   no store I/O until `read()` / `stream()` / `presignedUrl()`.
+ *
+ * Re-types the items: call it before {@link filterBy}, whose predicate is
+ * typed on the item — after `filterBy` it throws `[EDD-9117]`, as it does for
+ * an unknown mode (from untyped code). Under `filterBy` an eager query
+ * fetches every row it examines; `.offloaded("lazy")` keeps it from
+ * downloading. A query whose items offload nothing is unchanged.
+ */
+export const offloaded: {
+  <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ): <A, E = never, O extends OffloadState = NoOffloadState>(
+    self: Query<A, E, O>,
+  ) => Query<OffloadedView<A, O, M>, OffloadedErrors<E, O, M>, WithModes<O, M>>
+  <A, E, O extends OffloadState, const M extends OffloadMode | OffloadModes>(
+    self: Query<A, E, O>,
+    mode: M,
+  ): Query<OffloadedView<A, O, M>, OffloadedErrors<E, O, M>, WithModes<O, M>>
+} = Function.dual(
+  2,
+  <A, E, O extends OffloadState, M extends OffloadMode | OffloadModes>(
+    self: Query<A, E, O>,
+    mode: M,
+  ): Query<OffloadedView<A, O, M>, OffloadedErrors<E, O, M>, WithModes<O, M>> => {
+    if (self._state.predicates.length > 0) {
+      throw offloadedAfterFilterBy("Query.offloaded")
+    }
+    return new QueryImpl<OffloadedView<A, O, M>, OffloadedErrors<E, O, M>, WithModes<O, M>>({
+      ...self._state,
+      offloadModes: parseModes(mode, self._state.offloadModes ?? DEFAULT_MODES, "Query.offloaded"),
+    })
+  },
+)
+
+/** @internal The read modes a query's decoders run under. */
+export const readModes = (self: Query<unknown, unknown, any>): Modes =>
+  self._state.offloadModes ?? DEFAULT_MODES
 
 // ---------------------------------------------------------------------------
 // Internal: shared filter clause builder (entity type + user filters)
@@ -2472,17 +2718,19 @@ const selectedInside = (state: QueryState): ReadonlySet<string> => {
 
 /**
  * @internal Examine one response's rows in order, as `execute` and `paginate`
- * both do: drop excluded rows, hydrate (see {@link QueryHydration}), decode,
- * apply the client predicates, and stop once `budget` items are accepted.
+ * both do: drop excluded rows, hydrate (see {@link QueryHydration}), load
+ * (the page prefetch, #179), decode, apply the client predicates, and stop
+ * once `budget` items are accepted.
  *
  * Without a client predicate every row is accepted, so only the rows the
- * budget can still take are hydrated and decoded; a row dropped after
- * hydration (its item gone) widens the window by one. With a predicate,
- * acceptance is only known after decode, so the whole response is examined
- * (#122). `stoppedAt` is the index of the row that filled the budget, or -1.
- * `accepted` counts the rows that became items: an excluded row, a hydration
- * miss and a predicate's rejection are not, and neither is a row past the
- * budget, left unexamined.
+ * budget can still take are hydrated, loaded and decoded — rows past `limit`
+ * never fetch an offloaded value; a row dropped after hydration (its item
+ * gone) widens the window by one. With a predicate, acceptance is only known
+ * after decode, so the whole response is examined (#122) — and, in eager
+ * mode, its offloaded values fetched. `stoppedAt` is the index of the row
+ * that filled the budget, or -1. `accepted` counts the rows that became
+ * items: an excluded row, a hydration miss and a predicate's rejection are
+ * not, and neither is a row past the budget, left unexamined.
  */
 const examinePage = <A>(
   client: DynamoClientService,
@@ -2499,14 +2747,15 @@ const examinePage = <A>(
     /** Each item's row in `returned`. */
     readonly rows: ReadonlyArray<number>
   },
-  DynamoClientError | ValidationError
+  DynamoClientError | ValidationError | BlobStoreError
 > =>
   Effect.gen(function* () {
     // Nothing left to accept. Without this the loop below never advances
     // (`end` stays at `next`) — or, under a predicate, accepts one row past
     // the budget. No terminal asks; a guard all the same (#171).
     if (budget === 0) return { items: [], stoppedAt: -1, accepted: 0, rows: [] }
-    const hasPredicate = state.predicates.length > 0 || dropsRows(state)
+    const predicated = state.predicates.length > 0
+    const modes = state.offloadModes ?? DEFAULT_MODES
     // Borrowed attributes the raw-row hook reads are stripped after it ran:
     // borrowed into the request's projection, or — on a `BatchGet`-hydrated
     // query — into the hydrating fetch's (see `hydrateRows`).
@@ -2514,26 +2763,39 @@ const examinePage = <A>(
     const strippedAfterHook = new Set(borrowedFields.filter((field) => hookReads.has(field)))
     // Borrowed whole, but selected inside: handed back whole.
     const kept = selectedInside(state)
+    const projected = state.projection !== undefined || state.projectionPaths !== undefined
     if (state.hydration?._tag === "BatchGet") {
-      const projected = new Set<string>([
+      const names = new Set<string>([
         ...(state.projection ?? []),
         ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
       ])
-      if (projected.size > 0) {
-        for (const field of hookReads) if (!projected.has(field)) strippedAfterHook.add(field)
+      if (names.size > 0) {
+        for (const field of hookReads) if (!names.has(field)) strippedAfterHook.add(field)
       }
     }
+    // A projection that names no attribute the hook rewrites (no offloaded,
+    // packed or bytes attribute) installs no hook, and prefetches nothing.
+    const prefetch =
+      state.prefetch === undefined || (projected && activeRawRow(state) === undefined)
+        ? undefined
+        : state.prefetch
+    const operation = state.isScan ? "scan" : "query"
     const items: Array<A> = []
     const rows: Array<number> = []
     let next = 0
     while (next < returned.length) {
-      const end =
-        budget === undefined || hasPredicate
-          ? returned.length
-          : Math.min(returned.length, next + (budget - items.length))
+      // The window: the rows the budget can still take. A row the query
+      // drops by its raw form (history rows, a per-row key bound — #133,
+      // #171) is judged before it is hydrated or loaded, so it never takes a
+      // place in the window: only a rejection known after decode (a client
+      // predicate) opens the whole response. A row past the window is never
+      // hydrated, loaded — no offloaded value fetched (#179) — or decoded.
+      const room = budget === undefined || predicated ? Infinity : budget - items.length
       const positions: Array<number> = []
-      for (let i = next; i < end; i++) {
-        if (!isExcludedRow(state, returned[i]!)) positions.push(i)
+      let end = next
+      while (end < returned.length && positions.length < room) {
+        if (!isExcludedRow(state, returned[end]!)) positions.push(end)
+        end++
       }
       const sources = yield* hydrateRows(
         client,
@@ -2541,6 +2803,7 @@ const examinePage = <A>(
         state,
         positions.map((i) => returned[i]!),
       )
+      const raws: Array<readonly [position: number, raw: Record<string, unknown>]> = []
       for (let k = 0; k < positions.length; k++) {
         const source = sources[k]
         if (source === undefined) continue
@@ -2548,13 +2811,23 @@ const examinePage = <A>(
         for (const field of borrowedFields) {
           if (!hookReads.has(field) && !kept.has(field)) delete raw[field]
         }
-        const item = yield* state.decoder(raw) as Effect.Effect<A, ValidationError>
+        raws.push([positions[k]!, raw])
+      }
+      // The window's offloaded values resolve together (design §8.2).
+      if (prefetch !== undefined && raws.length > 0) {
+        yield* prefetch(
+          raws.map(([, raw]) => raw),
+          { modes, raw: projected, operation },
+        )
+      }
+      for (const [position, raw] of raws) {
+        const item = (yield* state.decoder(raw, modes)) as A
         for (const field of strippedAfterHook) delete raw[field]
-        if (hasPredicate && !accepts(state, item)) continue
+        if (predicated && !accepts(state, item)) continue
         items.push(item)
-        rows.push(positions[k]!)
+        rows.push(position)
         if (budget !== undefined && items.length >= budget) {
-          return { items, stoppedAt: positions[k]!, accepted: items.length, rows }
+          return { items, stoppedAt: position, accepted: items.length, rows }
         }
       }
       next = end
@@ -2567,7 +2840,9 @@ const examinePage = <A>(
  * explicit operation target (an event stream's name) or else its entity
  * types, and its physical index, read from the descriptor.
  */
-export const operationOptions = (self: Query<unknown>): Capacity.OperationOptions => ({
+export const operationOptions = (
+  self: Query<unknown, unknown, any>,
+): Capacity.OperationOptions => ({
   target:
     self._state.operationTarget ??
     (self._state.entityTypes.length > 0 ? self._state.entityTypes.join(",") : undefined),
@@ -2599,26 +2874,31 @@ export interface Page<A> {
  * Stops at {@link limit} items when one is set, otherwise reads to the end of
  * the key range (or {@link maxPages} requests).
  */
-export const collect = <A>(
-  self: Query<A>,
-): Effect.Effect<Array<A>, DynamoClientError | ValidationError, DynamoClient> =>
-  Capacity.delegate(
-    "Query.collect",
-    operationOptions(self),
-    Effect.gen(function* () {
-      const client = yield* Capacity.client
-      const tableName = self._state.resolveTableName
-        ? yield* self._state.resolveTableName
-        : self._state.tableName
-      const state = yield* prepared(self._state, tableName).pipe(
-        Effect.provideService(DynamoClient, client),
-      )
-      const ranges = drainedRanges(state)
-      if (ranges !== undefined) return yield* collectRanges<A>(client, tableName, state, ranges)
-      const pages = yield* Stream.runCollect(pageStream<A>(client, tableName, state))
-      return pages.flat()
-    }),
-  )
+export const collect = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<Array<A>, DynamoClientError | ValidationError | E, DynamoClient> =>
+  Capacity.delegate("Query.collect", operationOptions(self), collectCore(self)) as Effect.Effect<
+    Array<A>,
+    DynamoClientError | ValidationError | E,
+    DynamoClient
+  >
+
+const collectCore = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<Array<A>, DynamoClientError | ValidationError | BlobStoreError, DynamoClient> =>
+  Effect.gen(function* () {
+    const client = yield* Capacity.client
+    const tableName = self._state.resolveTableName
+      ? yield* self._state.resolveTableName
+      : self._state.tableName
+    const state = yield* prepared(self._state, tableName).pipe(
+      Effect.provideService(DynamoClient, client),
+    )
+    const ranges = drainedRanges(state)
+    if (ranges !== undefined) return yield* collectRanges<A>(client, tableName, state, ranges)
+    const pages = yield* Stream.runCollect(pageStream<A>(client, tableName, state))
+    return pages.flat()
+  })
 
 /**
  * @internal The ranges a `collect` drains independently (design §9.3): a
@@ -2648,7 +2928,7 @@ const collectRanges = <A>(
   tableName: string,
   state: QueryState,
   ranges: ReadonlyArray<ReadStep>,
-): Effect.Effect<Array<A>, DynamoClientError | ValidationError> => {
+): Effect.Effect<Array<A>, DynamoClientError | ValidationError | BlobStoreError> => {
   let requests = 0
   const drain = (first: ReadStep) =>
     Effect.gen(function* () {
@@ -2723,14 +3003,18 @@ const collectRanges = <A>(
  * )
  * ```
  */
-export const execute = <A>(
-  self: Query<A>,
-): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
-  Capacity.delegate("Query.execute", operationOptions(self), executeCore(self))
+export const execute = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError | E, DynamoClient> =>
+  Capacity.delegate("Query.execute", operationOptions(self), executeCore(self)) as Effect.Effect<
+    Page<A>,
+    DynamoClientError | ValidationError | E,
+    DynamoClient
+  >
 
-const executeCore = <A>(
-  self: Query<A>,
-): Effect.Effect<Page<A>, DynamoClientError | ValidationError, DynamoClient> =>
+const executeCore = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError | BlobStoreError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* Capacity.client
     const tableName = self._state.resolveTableName
@@ -2916,7 +3200,7 @@ const executePlanned = <A>(
   tableName: string,
   state: QueryState,
   plan: PreparedPlan,
-): Effect.Effect<Page<A>, DynamoClientError | ValidationError> =>
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError | BlobStoreError> =>
   Effect.gen(function* () {
     const { planner } = plan
     const limitValue = state.limitValue
@@ -3061,21 +3345,25 @@ const executePlanned = <A>(
  * items have been emitted in total, the key range is exhausted, or
  * {@link maxPages} requests have been made.
  */
-export const paginate = <A>(
-  self: Query<A>,
+export const paginate = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
 ): Effect.Effect<
-  Stream.Stream<Array<A>, DynamoClientError | ValidationError>,
+  Stream.Stream<Array<A>, DynamoClientError | ValidationError | E>,
   never,
   DynamoClient
 > =>
   Effect.flatMap(paginateInternal(self), (stream) =>
     Capacity.operationStream("Query.paginate", operationOptions(self), stream, "delegate"),
-  )
+  ) as Effect.Effect<
+    Stream.Stream<Array<A>, DynamoClientError | ValidationError | E>,
+    never,
+    DynamoClient
+  >
 
-const paginateInternal = <A>(
-  self: Query<A>,
+const paginateInternal = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
 ): Effect.Effect<
-  Stream.Stream<Array<A>, DynamoClientError | ValidationError>,
+  Stream.Stream<Array<A>, DynamoClientError | ValidationError | BlobStoreError>,
   never,
   DynamoClient
 > =>
@@ -3097,10 +3385,13 @@ const pageStream = <A>(
   client: DynamoClientService,
   tableName: string,
   state: QueryState,
-): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError | BlobStoreError> => {
   const limitValue = state.limitValue
   if (limitValue !== undefined && limitValue <= 0) {
-    return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
+    return Stream.empty as Stream.Stream<
+      Array<A>,
+      DynamoClientError | ValidationError | BlobStoreError
+    >
   }
   if (state.fanOutStart !== undefined) {
     return fanOutPageStream<A>(client, tableName, state, state.fanOutStart)
@@ -3205,7 +3496,7 @@ const plannedPageStream = <A>(
   tableName: string,
   state: QueryState,
   plan: PreparedPlan,
-): Stream.Stream<Array<A>, DynamoClientError | ValidationError> => {
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError | BlobStoreError> => {
   const { planner } = plan
   const limitValue = state.limitValue
   const maxPages = state.maxPagesValue
@@ -3380,14 +3671,18 @@ const plannedPageStream = <A>(
  * from the pass rate the earlier ones showed, as {@link limit} describes.
  * {@link pageSize} sets the rows examined per request instead.
  */
-export const count = <A>(
-  self: Query<A>,
-): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
-  Capacity.delegate("Query.count", operationOptions(self), countCore(self))
+export const count = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<number, DynamoClientError | ValidationError | E, DynamoClient> =>
+  Capacity.delegate("Query.count", operationOptions(self), countCore(self)) as Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | E,
+    DynamoClient
+  >
 
-const countCore = <A>(
-  self: Query<A>,
-): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient> =>
+const countCore = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<number, DynamoClientError | ValidationError | BlobStoreError, DynamoClient> =>
   Effect.gen(function* () {
     const client = yield* Capacity.client
     const tableName = self._state.resolveTableName
@@ -3408,7 +3703,7 @@ const countCore = <A>(
     // predicate the database cannot evaluate, and the alternative is a wrong
     // number (#122).
     if (state.predicates.length > 0) {
-      const items = yield* collect(self)
+      const items = yield* collectCore(self)
       return items.length
     }
 
@@ -3608,7 +3903,9 @@ const countPlanned = (
  * sized — without sending anything (#171). Cursors are not read: the plan is
  * described from its start.
  */
-export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, never> =>
+export const explain = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+): Effect.Effect<QueryExplain, never, never> =>
   Effect.sync(() => {
     const state = self._state
     if (state.refusal !== undefined) {
@@ -3658,8 +3955,8 @@ const explainedSizing = (state: QueryState): QueryExplain["sizing"] => {
  * Fails with a `ValidationError` for a filter the query would refuse to send
  * (an empty part under `or` / `not`, an `or()` with no parts).
  */
-export const asParams = <A>(
-  self: Query<A>,
+export const asParams = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
 ): Effect.Effect<Record<string, unknown>, ValidationError, any> =>
   Effect.gen(function* () {
     const state = self._state
@@ -3915,7 +4212,7 @@ const fanOutRound = <A>(
   run: FanOutRun,
 ): Effect.Effect<
   { readonly run: FanOutRun; readonly items: Array<A> },
-  DynamoClientError | ValidationError
+  DynamoClientError | ValidationError | BlobStoreError
 > =>
   Effect.gen(function* () {
     const limitValue = state.limitValue
@@ -4059,7 +4356,7 @@ const executeFanOut = <A>(
   tableName: string,
   state: QueryState,
   start: FanOutStart,
-): Effect.Effect<Page<A>, DynamoClientError | ValidationError> =>
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError | BlobStoreError> =>
   Effect.gen(function* () {
     const limitValue = state.limitValue
     const items: Array<A> = []
@@ -4090,7 +4387,7 @@ const fanOutPageStream = <A>(
   tableName: string,
   state: QueryState,
   start: FanOutStart,
-): Stream.Stream<Array<A>, DynamoClientError | ValidationError> =>
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError | BlobStoreError> =>
   Stream.paginate(startFanOut(start), (run: FanOutRun) =>
     Effect.gen(function* () {
       if (ShardMerge.isFinished(run.merge)) return [[], Option.none<FanOutRun>()] as const
@@ -4205,5 +4502,5 @@ const explainFanOut = (state: QueryState, spec: FanOutSpec): QueryExplain => {
 // Type guard
 // ---------------------------------------------------------------------------
 
-export const isQuery = (u: unknown): u is Query<unknown> =>
+export const isQuery = (u: unknown): u is Query<unknown, unknown, any> =>
   typeof u === "object" && u !== null && QueryTypeId in u

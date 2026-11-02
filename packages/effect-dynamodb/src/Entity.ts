@@ -90,7 +90,11 @@ import {
   setOwn,
   type UnreadableName,
 } from "@effect-dynamodb/schema/internal/OwnNames.js"
-import { stringifyStrict, unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import {
+  binaryShapeRefusal,
+  stringifyStrict,
+  unpackStoredSync,
+} from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { restoredObjectReading } from "@effect-dynamodb/schema/internal/RestoredKeyText.js"
 import {
   type AbsentReading,
@@ -192,12 +196,15 @@ import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
+import * as OffloadRead from "./internal/OffloadRead.js"
+import type { DeleteOpStateOf, OpStateOf, StateOf } from "./internal/OffloadTypes.js"
 import * as OffloadWrite from "./internal/OffloadWrite.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
   codecRequirements,
-  decodeImage,
   imageEntityType,
+  imageForm,
+  normalizeImage,
   ownRowsRawRow,
   type PackedAttributeGuard,
   packAttributeValueSync,
@@ -271,6 +278,7 @@ import {
   UnstorableValue,
   unstorableIn,
 } from "./Marshaller.js"
+import type { NoOffloadState, OffloadModes, OffloadState, ResolveModes, View } from "./Offload.js"
 import * as Query from "./Query.js"
 import { filterExprStored, selectPaths } from "./Query.js"
 import {
@@ -349,6 +357,7 @@ import {
   type ReturnValuesMode,
   type UpdateState,
   withGuard,
+  withReadModes,
 } from "./internal/EntityOps.js"
 
 export {
@@ -365,6 +374,7 @@ export {
   deleteFromSet,
   expectedVersion,
   keepRefs,
+  offloaded,
   pathAdd,
   pathAppend,
   pathDelete,
@@ -401,6 +411,7 @@ import {
   heldStorageOf,
   inferDefaultEncoding,
   makePathValueEncoder,
+  optionalField,
   type PathSetValue,
   primaryKeyComposites,
   type ResolvedSystemFields,
@@ -412,6 +423,7 @@ import type {
   AppendInputType,
   AppendRemovableFields,
   AppendSuccess as AppendSuccessType,
+  DefaultOffloadModes,
   EntityInputType,
   EntityKeyType,
   EntityRecordType,
@@ -421,9 +433,12 @@ import type {
   EntityUpdateType,
   IndexPkInput,
   ModelType,
+  OffloadMode,
   PrimaryKeyComposites,
+  ReadBlobErrors,
   RefErrors,
   RemovableFields,
+  ResolvedOffloadModes,
   VectorErrors,
   WithGeneratedId,
   WriteBlobErrors,
@@ -433,6 +448,7 @@ import {
   type ConditionPipeable,
   condition as conditionCombinator,
   expectedVersion,
+  offloaded as offloadedCombinator,
   type Removable,
   set,
 } from "./internal/EntityCombinators.js"
@@ -1024,7 +1040,33 @@ export interface Entity<
    * or base64, or an unmarshalled item) into an item record — the
    * implementation of {@link decodeMarshalledItem}.
    */
-  readonly _decodeImage: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
+  readonly _decodeImage: (
+    image: StreamImage,
+    modes?: OffloadRead.Modes,
+  ) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+
+  /**
+   * @internal Load, in place, a batch of stored-name rows (#179): unpack every
+   * stored-form attribute and resolve blob pointers per `options.modes` — see
+   * `OffloadRead.loadRows`. A query's page prefetch runs it over a window.
+   */
+  readonly _loadRows: (
+    rows: ReadonlyArray<globalThis.Record<string, unknown>>,
+    options: {
+      readonly operation: string
+      readonly modes: OffloadRead.Modes
+      readonly raw?: boolean | undefined
+    },
+  ) => Effect.Effect<void, ValidationError | BlobStoreError>
+
+  /** @internal The stored attributes {@link _loadRows} may rewrite. */
+  readonly _readAttributes: ReadonlyArray<string>
+
+  /** @internal True iff the entity offloads a field (#179). */
+  readonly _offloads: boolean
+
+  /** @internal The domain fields the entity offloads (#179), both kinds. */
+  readonly _offloadedFields: ReadonlyArray<string>
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -1037,10 +1079,16 @@ export interface Entity<
     readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
   }>
 
-  /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
+  /**
+   * @internal Full decode pipeline: load (unpack + resolve per `modes`, eager
+   * when omitted) + sparse + rename + schema decode. Used by queries,
+   * collections, Batch and transactions.
+   */
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
-  ) => Effect.Effect<any, ValidationError>
+    modes?: OffloadRead.Modes,
+    operation?: string,
+  ) => Effect.Effect<any, ValidationError | BlobStoreError>
 
   /** @internal Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName: (domainName: string) => string
@@ -1432,10 +1480,19 @@ export interface Entity<
   readonly get: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityGet<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError,
-    DynamoClient | TableConfig
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
+    | ItemNotFound
+    | DynamoClientError
+    | ValidationError
+    | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "read"
+    >
   >
 
   /**
@@ -1455,8 +1512,8 @@ export interface Entity<
       TGeneratedId
     >,
   ) => EntityPut<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -1466,7 +1523,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1476,8 +1539,8 @@ export interface Entity<
   readonly update: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityUpdate<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned> &
       Removable<RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>>,
     | DynamoClientError
@@ -1491,7 +1554,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1511,7 +1580,8 @@ export interface Entity<
     | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig,
     void,
-    ModelType<TModel>
+    ModelType<TModel>,
+    DeleteOpStateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -1526,8 +1596,8 @@ export interface Entity<
       TGeneratedId
     >,
   ) => EntityPut<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -1538,7 +1608,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1555,8 +1631,8 @@ export interface Entity<
       TGeneratedId
     >,
   ) => EntityInsert<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -1565,7 +1641,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1575,8 +1657,8 @@ export interface Entity<
   readonly patch: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityUpdate<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned> &
       Removable<RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>>,
     | DynamoClientError
@@ -1591,7 +1673,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1612,7 +1700,8 @@ export interface Entity<
     | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig,
     void,
-    ModelType<TModel>
+    ModelType<TModel>,
+    DeleteOpStateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -1636,8 +1725,8 @@ export interface Entity<
       TGeneratedId
     >,
   ) => EntityPut<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -1649,7 +1738,13 @@ export interface Entity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   // --- Lifecycle Operations ---
@@ -1659,23 +1754,36 @@ export interface Entity<
     key: EntityKeyType<TModel, TIndexes, TRefs>,
     version: number,
   ) => EntityGet<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
-    ItemNotFound | DynamoClientError | ValidationError,
-    DynamoClient | TableConfig
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
+    | ItemNotFound
+    | DynamoClientError
+    | ValidationError
+    | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "read"
+    >
   >
 
   /** Query version history for an item. Returns a Query for piping with limit, reverse, collect. */
   readonly versions: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
-  ) => Query.Query<EntityRecordType<TModel, TTimestamps, TVersioned>>
+  ) => Query.Query<
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
+    ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    StateOf<TOffload, EntityRecordType<TModel, TTimestamps, TVersioned>>
+  >
 
   /** Restore a soft-deleted item. Recomposes index keys and re-establishes unique sentinels. */
   readonly restore: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityGet<
-    ModelType<TModel>,
-    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    View<ModelType<TModel>, TOffload>,
+    View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
     | ItemNotFound
     | ItemNotDeleted
     | DynamoClientError
@@ -1684,7 +1792,13 @@ export interface Entity<
     | UniqueConstraintViolation
     | ConcurrentModification
     | WriteBlobErrors<TOffload>,
-    DynamoClient | TableConfig
+    DynamoClient | TableConfig,
+    OpStateOf<
+      TOffload,
+      ModelType<TModel>,
+      EntityRecordType<TModel, TTimestamps, TVersioned>,
+      "write"
+    >
   >
 
   /**
@@ -1706,15 +1820,28 @@ export interface Entity<
     readonly get: (
       key: EntityKeyType<TModel, TIndexes, TRefs>,
     ) => EntityGet<
-      ModelType<TModel>,
-      EntityRecordType<TModel, TTimestamps, TVersioned>,
-      ItemNotFound | DynamoClientError | ValidationError,
-      DynamoClient | TableConfig
+      View<ModelType<TModel>, TOffload>,
+      View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
+      | ItemNotFound
+      | DynamoClientError
+      | ValidationError
+      | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+      DynamoClient | TableConfig,
+      OpStateOf<
+        TOffload,
+        ModelType<TModel>,
+        EntityRecordType<TModel, TTimestamps, TVersioned>,
+        "read"
+      >
     >
     /** List soft-deleted items within a partition. */
     readonly list: (
       key: EntityKeyType<TModel, TIndexes, TRefs>,
-    ) => Query.Query<EntityRecordType<TModel, TTimestamps, TVersioned>>
+    ) => Query.Query<
+      View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
+      ReadBlobErrors<TOffload, DefaultOffloadModes>,
+      StateOf<TOffload, EntityRecordType<TModel, TTimestamps, TVersioned>>
+    >
   }
 
   // --- Time-series Operations (only when `timeSeries` is configured) ---
@@ -1756,7 +1883,7 @@ export interface Entity<
             >
           >,
         ): Effect.Effect<
-          { readonly current: ModelType<TModel> },
+          { readonly current: View<ModelType<TModel>, TOffload> },
           | DynamoClientError
           | ValidationError
           | StaleAppend
@@ -1799,7 +1926,13 @@ export interface Entity<
    * Only available when the entity was built with `timeSeries: { ... }`.
    */
   readonly history: [TTimeSeries] extends [TimeSeriesConfig<any>]
-    ? (key: EntityKeyType<TModel, TIndexes, TRefs>) => Query.Query<ModelType<TModel>>
+    ? (
+        key: EntityKeyType<TModel, TIndexes, TRefs>,
+      ) => Query.Query<
+        View<ModelType<TModel>, TOffload>,
+        ReadBlobErrors<TOffload, DefaultOffloadModes>,
+        StateOf<TOffload, ModelType<TModel>>
+      >
     : never
 
   // --- Update Combinators (entity-scoped, type-safe in both paths) ---
@@ -1847,15 +1980,31 @@ export interface Entity<
     ): EntityUpdate<A, Rec, U, E, R>
   }
 
-  /** Index query accessors. Each non-primary index becomes a method that accepts PK composites and returns a {@link Query.Query}. */
+  /**
+   * Index query accessors. Each non-primary index becomes a method that
+   * accepts PK composites and returns a {@link Query.Query}. Offloaded fields
+   * read in the default modes (overflow eager, binary lazy) until
+   * `Query.offloaded` sets others (#179).
+   */
   readonly query: {
     readonly [K in Exclude<keyof TIndexes, "primary">]: (
       pk: IndexPkInput<TModel, TIndexes, K, TRefs>,
-    ) => Query.Query<ModelType<TModel>>
+    ) => Query.Query<
+      View<ModelType<TModel>, TOffload>,
+      ReadBlobErrors<TOffload, DefaultOffloadModes>,
+      StateOf<TOffload, ModelType<TModel>>
+    >
   }
 
-  /** Scan all items of this entity type. Returns a {@link Query.Query} that uses DynamoDB Scan. */
-  readonly scan: () => Query.Query<ModelType<TModel>>
+  /**
+   * Scan all items of this entity type. Returns a {@link Query.Query} that
+   * uses DynamoDB Scan; offloaded fields read as {@link query}'s do.
+   */
+  readonly scan: () => Query.Query<
+    View<ModelType<TModel>, TOffload>,
+    ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    StateOf<TOffload, ModelType<TModel>>
+  >
 
   // --- Expression Combinators (callback + shorthand) ---
 
@@ -1907,8 +2056,14 @@ export interface Entity<
         >,
         ops: import("./internal/Expr.js").ConditionOps<PathModel<ModelType<TModel>, TPackedFields>>,
       ) => import("./internal/Expr.js").Expr,
-    ): <A>(self: Query.Query<A>) => Query.Query<A>
-    (shorthand: globalThis.Record<string, unknown>): <A>(self: Query.Query<A>) => Query.Query<A>
+    ): <A, E = never, O extends OffloadState = NoOffloadState>(
+      self: Query.Query<A, E, O>,
+    ) => Query.Query<A, E, O>
+    (
+      shorthand: globalThis.Record<string, unknown>,
+    ): <A, E = never, O extends OffloadState = NoOffloadState>(
+      self: Query.Query<A, E, O>,
+    ) => Query.Query<A, E, O>
   }
 
   /**
@@ -1936,8 +2091,10 @@ export interface Entity<
             any
           >
       >,
-    ): (self: Query.Query<any>) => Query.Query<any>
-    (attributes: ReadonlyArray<string>): (self: Query.Query<any>) => Query.Query<any>
+    ): (self: Query.Query<any, any, any>) => Query.Query<any, any, any>
+    (
+      attributes: ReadonlyArray<string>,
+    ): (self: Query.Query<any, any, any>) => Query.Query<any, any, any>
   }
 }
 
@@ -2042,8 +2199,12 @@ export interface BoundEntity<
   readonly get: (
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundGet<
-    ModelType<TModel>,
-    ItemNotFound | DynamoClientError | ValidationError
+    View<ModelType<TModel>, TOffload>,
+    | ItemNotFound
+    | DynamoClientError
+    | ValidationError
+    | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2062,7 +2223,7 @@ export interface BoundEntity<
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -2073,7 +2234,8 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
-    TPackedFields
+    TPackedFields,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2087,7 +2249,7 @@ export interface BoundEntity<
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -2099,7 +2261,8 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
-    TPackedFields
+    TPackedFields,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2116,7 +2279,7 @@ export interface BoundEntity<
       TGeneratedId
     >,
   ) => import("./internal/BoundCrud.js").BoundInsert<
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -2125,7 +2288,8 @@ export interface BoundEntity<
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
-    VectorIndexNames<TVectorIndexes>
+    VectorIndexNames<TVectorIndexes>,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2141,7 +2305,7 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | TransactionOverflow
@@ -2157,7 +2321,8 @@ export interface BoundEntity<
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
     RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
-    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>
+    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2182,7 +2347,8 @@ export interface BoundEntity<
     | DeleteAppliedButUnreadable
     | WriteBlobErrors<TOffload>,
     void,
-    TPackedFields
+    TPackedFields,
+    StateOf<TOffload, undefined>
   >
 
   /**
@@ -2199,7 +2365,7 @@ export interface BoundEntity<
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     | DynamoClientError
     | TransactionOverflow
     | ValidationError
@@ -2212,7 +2378,8 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>
     | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
-    TPackedFields
+    TPackedFields,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /**
@@ -2227,7 +2394,7 @@ export interface BoundEntity<
     key: TKey,
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
     | DynamoClientError
     | TransactionOverflow
@@ -2244,7 +2411,8 @@ export interface BoundEntity<
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
     RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
-    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>
+    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /** Delete an existing item, fails if not found. Returns a fluent {@link BoundDelete}. */
@@ -2262,7 +2430,8 @@ export interface BoundEntity<
     | ConditionalCheckFailed
     | WriteBlobErrors<TOffload>,
     void,
-    TPackedFields
+    TPackedFields,
+    StateOf<TOffload, undefined>
   >
 
   // --- Lifecycle Operations ---
@@ -2271,7 +2440,14 @@ export interface BoundEntity<
   readonly getVersion: (
     key: TKey,
     version: number,
-  ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
+  ) => Effect.Effect<
+    View<ModelType<TModel>, TOffload>,
+    | ItemNotFound
+    | DynamoClientError
+    | ValidationError
+    | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    never
+  >
 
   /**
    * List all version snapshots for an item as a fluent BoundQuery.
@@ -2291,14 +2467,16 @@ export interface BoundEntity<
   ) => import("./internal/BoundQuery.js").BoundQuery<
     PathModel<ModelType<TModel>, TPackedFields>,
     never,
-    ModelType<TModel>
+    View<ModelType<TModel>, TOffload>,
+    never,
+    StateOf<TOffload, ModelType<TModel>>
   >
 
   /** Restore a soft-deleted item. */
   readonly restore: (
     key: TKey,
   ) => Effect.Effect<
-    ModelType<TModel>,
+    View<ModelType<TModel>, TOffload>,
     | ItemNotFound
     | ItemNotDeleted
     | DynamoClientError
@@ -2325,7 +2503,14 @@ export interface BoundEntity<
     /** Get a specific soft-deleted item. */
     readonly get: (
       key: TKey,
-    ) => Effect.Effect<ModelType<TModel>, ItemNotFound | DynamoClientError | ValidationError, never>
+    ) => Effect.Effect<
+      View<ModelType<TModel>, TOffload>,
+      | ItemNotFound
+      | DynamoClientError
+      | ValidationError
+      | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+      never
+    >
     /**
      * List all soft-deleted items in this partition as a fluent BoundQuery.
      * Requires `softDelete` on the entity definition.
@@ -2341,7 +2526,9 @@ export interface BoundEntity<
     ) => import("./internal/BoundQuery.js").BoundQuery<
       PathModel<ModelType<TModel>, TPackedFields>,
       never,
-      ModelType<TModel>
+      View<ModelType<TModel>, TOffload>,
+      never,
+      StateOf<TOffload, ModelType<TModel>>
     >
   }
 
@@ -2374,7 +2561,7 @@ export interface BoundEntity<
         input: AppendInputType<TAI>,
       ) => import("./internal/BoundCrud.js").BoundAppend<
         ModelType<TModel>,
-        { readonly current: ModelType<TModel> },
+        { readonly current: View<ModelType<TModel>, TOffload> },
         | DynamoClientError
         | ValidationError
         | StaleAppend
@@ -2395,7 +2582,8 @@ export interface BoundEntity<
           TTimestamps,
           TVersioned,
           TUnremovable
-        >
+        >,
+        StateOf<TOffload, ModelType<TModel>>
       >
     : never
 
@@ -2417,7 +2605,9 @@ export interface BoundEntity<
             K
           >
         },
-        ModelType<TModel>
+        View<ModelType<TModel>, TOffload>,
+        never,
+        StateOf<TOffload, ModelType<TModel>>
       >
     : never
 
@@ -2431,10 +2621,10 @@ export interface BoundEntity<
    * const stream = teams.paginate(Teams.query.byRole({ role: "admin" }), Query.limit(10))
    * ```
    */
-  readonly paginate: <A>(
-    query: Query.Query<A>,
-    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Stream.Stream<A, DynamoClientError | ValidationError, never>
+  readonly paginate: <A, E = never, O extends OffloadState = NoOffloadState>(
+    query: Query.Query<A, E, O>,
+    ...combinators: ReadonlyArray<(q: Query.Query<A, E, O>) => Query.Query<A, E, O>>
+  ) => Stream.Stream<A, DynamoClientError | ValidationError | E, never>
 
   /**
    * Execute a query and collect all pages into a single array.
@@ -2444,10 +2634,10 @@ export interface BoundEntity<
    * const items = yield* teams.collect(Teams.query.byRole({ role: "admin" }), Query.limit(10))
    * ```
    */
-  readonly collect: <A>(
-    query: Query.Query<A>,
-    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
+  readonly collect: <A, E = never, O extends OffloadState = NoOffloadState>(
+    query: Query.Query<A, E, O>,
+    ...combinators: ReadonlyArray<(q: Query.Query<A, E, O>) => Query.Query<A, E, O>>
+  ) => Effect.Effect<Array<A>, DynamoClientError | ValidationError | E, never>
 
   /**
    * Execute a single DynamoDB page and return a {@link Query.Page} with an opaque cursor.
@@ -2464,10 +2654,10 @@ export interface BoundEntity<
    * )
    * ```
    */
-  readonly fetch: <A>(
-    query: Query.Query<A>,
-    ...combinators: ReadonlyArray<(q: Query.Query<A>) => Query.Query<A>>
-  ) => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
+  readonly fetch: <A, E = never, O extends OffloadState = NoOffloadState>(
+    query: Query.Query<A, E, O>,
+    ...combinators: ReadonlyArray<(q: Query.Query<A, E, O>) => Query.Query<A, E, O>>
+  ) => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError | E, never>
 
   /**
    * Execute a single DynamoDB scan page and return a {@link Query.Page} with an opaque cursor.
@@ -2483,9 +2673,23 @@ export interface BoundEntity<
    */
   readonly scanFetch: (
     ...combinators: ReadonlyArray<
-      (q: Query.Query<ModelType<TModel>>) => Query.Query<ModelType<TModel>>
+      (
+        q: Query.Query<
+          View<ModelType<TModel>, TOffload>,
+          ReadBlobErrors<TOffload, DefaultOffloadModes>,
+          StateOf<TOffload, ModelType<TModel>>
+        >,
+      ) => Query.Query<
+        View<ModelType<TModel>, TOffload>,
+        ReadBlobErrors<TOffload, DefaultOffloadModes>,
+        StateOf<TOffload, ModelType<TModel>>
+      >
     >
-  ) => Effect.Effect<Query.Page<ModelType<TModel>>, DynamoClientError | ValidationError, never>
+  ) => Effect.Effect<
+    Query.Page<View<ModelType<TModel>, TOffload>>,
+    DynamoClientError | ValidationError | ReadBlobErrors<TOffload, DefaultOffloadModes>,
+    never
+  >
 }
 
 /**
@@ -2797,10 +3001,31 @@ const refDataOf = (
   model: unknown,
   entityType: string,
   operation: string,
-): Effect.Effect<unknown, ValidationError> =>
-  Schema.encodeUnknownEffect(refEntity.schemas.modelSchema as Schema.Codec<any>)(model).pipe(
+): Effect.Effect<unknown, ValidationError> => {
+  // The fields the referenced entity offloads (#179) are never stored in a ref: their values
+  // live in the referenced entity's own blobs, named from its own row's key, and a pointer
+  // copied into this row would outlive them (a ref schema may not include one, `EDD-9143`).
+  const dropped = offloadedFieldsOf(refEntity)
+  let schema = refEntity.schemas.modelSchema as Schema.Codec<any>
+  let value = model
+  if (dropped.length > 0 && typeof model === "object" && model !== null) {
+    const copy: globalThis.Record<string, unknown> = { ...(model as object) }
+    for (const field of dropped) delete copy[field]
+    value = copy
+    const fields = getSchemaFields(schema) ?? {}
+    schema = Schema.Struct(
+      Object.fromEntries(Object.entries(fields).filter(([field]) => !dropped.includes(field))),
+    ) as unknown as Schema.Codec<any>
+  }
+  return Schema.encodeUnknownEffect(schema)(value).pipe(
     Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
   )
+}
+
+/** @internal The fields an entity offloads (#179); none for a definition that offloads nothing. */
+const offloadedFieldsOf = (entity: unknown): ReadonlyArray<string> =>
+  (entity as { readonly _offloadedFields?: ReadonlyArray<string> | undefined })._offloadedFields ??
+  []
 
 /** @internal Copy the schema + table tag a definition received via `_configure`
  * (Table.make injects them at table-definition time) onto a promoted entity. */
@@ -5330,7 +5555,11 @@ const makeImpl = <
         return false
       }
       if (OffloadWrite.matchesPointer(pointer, text)) return true
-      yield* resolveOffloaded(raw, "update.immutable", false)
+      yield* loadRow(raw, {
+        operation: "update.immutable",
+        modes: OffloadRead.EAGER_MODES,
+        raw: true,
+      })
       return attributeValueEquals(
         toAttributeValue(raw[asserted.attr]),
         toAttributeValue(asserted.wire),
@@ -5366,7 +5595,11 @@ const makeImpl = <
           continue
         }
         const raw = fromAttributeMap({ [attr]: storedValue }) as globalThis.Record<string, unknown>
-        yield* unpackFields(raw, "update.decode")
+        yield* loadRow(raw, {
+          operation: "update.decode",
+          modes: OffloadRead.EAGER_MODES,
+          raw: true,
+        })
         if (!attributeValueEquals(toAttributeValue(raw[attr]), toAttributeValue(wire))) {
           return immutableChangedMessage(field)
         }
@@ -5601,19 +5834,98 @@ const makeImpl = <
           (routed) => routed.uploaded,
         )
 
-  /**
-   * Resolve, in place, the pointers an unmarshalled stored-name row holds,
-   * eagerly (overflow to JSON wire, binary to bytes). `committed`: the row is
-   * a committed write's result (a store failure then says so, §6.13).
-   */
-  const resolveOffloaded = (
-    raw: globalThis.Record<string, unknown>,
+  // ---------------------------------------------------------------------------
+  // Reads (#179, design §8): the two-phase decode. `loadRows` unpacks every
+  // stored-form attribute (a pointer becoming a placeholder) and resolves the
+  // batch's placeholders per the read's modes; the read schemas then accept a
+  // lazily read field's handle (`OffloadRead.lazyReadSchema`).
+  // ---------------------------------------------------------------------------
+
+  /** The domain fields this entity offloads, by kind. */
+  const offloadedByKind = {
+    overflow: Object.keys(data.overflowFields),
+    binary: Object.keys(data.externalFields),
+  } as const
+
+  const fieldDecoders = new Map<string, (wire: unknown) => Effect.Effect<unknown, unknown>>()
+  const decodeOffloadedField = (
+    field: string,
+    wire: unknown,
     operation: string,
-    committed: boolean,
-  ): Effect.Effect<void, BlobStoreError | ValidationError> =>
+  ): Effect.Effect<unknown, ValidationError> => {
+    let decode = fieldDecoders.get(field)
+    if (decode === undefined) {
+      const schema = readFieldSchemas[field]
+      const inner = schema === undefined ? undefined : (optionalField(schema)?.inner ?? schema)
+      decode =
+        inner === undefined
+          ? (value) => Effect.succeed(value)
+          : (Schema.decodeUnknownEffect(inner as Schema.Codec<any>) as (
+              value: unknown,
+            ) => Effect.Effect<unknown, unknown>)
+      fieldDecoders.set(field, decode)
+    }
+    return decode(wire).pipe(
+      Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+    )
+  }
+
+  const readPlan: OffloadRead.ReadPlan = {
+    entityType,
+    dispatch: dispatchAttributes,
+    // Every attribute whose encoded side is bytes, `External` or not (§4.7).
+    binary: Object.entries(data.modelFields as globalThis.Record<string, Schema.Top>)
+      .filter(
+        ([field, schema]) =>
+          !Object.hasOwn(sparseFields, field) && binaryShapeRefusal(schema) === undefined,
+      )
+      .map(([field]) => resolveDbName(field)),
+    offloaded: Object.fromEntries([
+      ...offloadedByKind.overflow.map((field) => [resolveDbName(field), "overflow"] as const),
+      ...offloadedByKind.binary.map((field) => [resolveDbName(field), "binary"] as const),
+    ]),
+    fieldOf: Object.fromEntries(
+      Object.keys(data.modelFields).map((field) => [resolveDbName(field), field]),
+    ),
+    contentTypeOf: Object.fromEntries(
+      Object.entries(binaryFields).map(([field, storedAs]) => [
+        resolveDbName(field),
+        storedAs.contentType,
+      ]),
+    ),
+    decodeField: decodeOffloadedField,
+  }
+
+  /** The attributes a raw read rewrites: a projection naming none runs no hook. */
+  const readAttributeNames: ReadonlyArray<string> = OffloadRead.readAttributes(readPlan)
+
+  /** Unpack and resolve, in place, a batch of stored-name rows (see `OffloadRead.loadRows`). */
+  const loadRows = (
+    rows: ReadonlyArray<globalThis.Record<string, unknown>>,
+    options: OffloadRead.LoadOptions,
+  ): Effect.Effect<void, ValidationError | BlobStoreError> =>
+    OffloadRead.loadRows(readPlan, rows, options)
+
+  /** {@link loadRows} of one row. */
+  const loadRow = (
+    raw: globalThis.Record<string, unknown>,
+    options: OffloadRead.LoadOptions,
+  ): Effect.Effect<void, ValidationError | BlobStoreError> => loadRows([raw], options)
+
+  /**
+   * The read schema `base` under `modes`: each lazily read offloaded field
+   * accepts its handle. `base` itself when no field is lazy.
+   */
+  const readSchema = (base: Schema.Codec<any>, modes: OffloadRead.Modes): Schema.Codec<any> =>
     offloadInfo === undefined
-      ? Effect.void
-      : OffloadWrite.resolveStored(offloadInfo, raw, { operation, committed })
+      ? base
+      : OffloadRead.lazyReadSchema(base, OffloadRead.lazyFields(offloadedByKind, modes))
+
+  /** True iff a read under `modes` holds a handle on some field. */
+  const readsLazily = (modes: OffloadRead.Modes): boolean =>
+    offloadInfo !== undefined &&
+    ((modes.overflow === "lazy" && offloadedByKind.overflow.length > 0) ||
+      (modes.binary === "lazy" && offloadedByKind.binary.length > 0))
 
   /**
    * A domain-named copy of `record` with its packed (or once-packed) attributes
@@ -5628,16 +5940,15 @@ const makeImpl = <
     record: globalThis.Record<string, unknown>,
     operation: string,
   ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError | BlobStoreError> => {
-    if (dispatchAttributes.length === 0 && offloadedAttributeNames.length === 0) {
-      return Effect.succeed(record)
-    }
+    if (OffloadRead.isEmptyPlan(readPlan)) return Effect.succeed(record)
     const stored = { ...record }
     renameToDynamo(stored)
-    return Effect.flatMap(resolveOffloaded(stored, operation, false), () =>
-      Effect.map(unpackFields(stored, operation), () => {
+    return Effect.map(
+      loadRow(stored, { operation, modes: OffloadRead.EAGER_MODES, raw: true }),
+      () => {
         renameFromDynamo(stored)
         return stored
-      }),
+      },
     )
   }
 
@@ -5670,17 +5981,30 @@ const makeImpl = <
   }
 
   /**
-   * The `Query.make` options of this entity's queries: the packed guards, and
-   * the raw-row hook that reads packed attributes of a projected row of THIS
-   * entity type by their stored form (parsed JSON, not schema-decoded) — rows
-   * of other types (`ignoreOwnership()`) are left untouched.
+   * The `Query.make` options of this entity's queries: the packed guards, the
+   * raw-row hook that reads packed attributes of a projected row of THIS
+   * entity type by their stored form (parsed JSON, not schema-decoded) and
+   * resolves its blob pointers per the query's modes — rows of other types
+   * (`ignoreOwnership()`) are left untouched — and the page prefetch that
+   * loads a window of rows together (#179, design §8.2).
    */
   const packedQueryOptions: {
     readonly packed: ReadonlyArray<PackedAttributeGuard>
     readonly rawRow: Query.QueryRawRow | undefined
+    readonly prefetch: Query.QueryPrefetch | undefined
   } = {
     packed: packedGuards,
-    rawRow: ownRowsRawRow(entityType, dispatchAttributes, (raw) => unpackFields(raw)),
+    rawRow: ownRowsRawRow(entityType, readAttributeNames, (raw, modes) =>
+      loadRow(raw, { operation: "query.select", modes, raw: true }),
+    ),
+    prefetch: OffloadRead.isEmptyPlan(readPlan)
+      ? undefined
+      : (rows, { modes, raw, operation }) =>
+          loadRows(raw ? rows.filter((row) => row.__edd_e__ === entityType) : rows, {
+            operation,
+            modes,
+            raw,
+          }),
   }
 
   /**
@@ -6748,15 +7072,25 @@ const makeImpl = <
       (cause) => new ValidationError({ entityType, operation, cause }),
     )
 
+  /**
+   * Decode a stored-name row as a record (`Entity.Record`, under `modes`):
+   * the full read pipeline — load (unpack + resolve, unless a query's page
+   * prefetch already did), sparse rebuild, renames, schema decode. Queries,
+   * collections, `Batch.get` and `transactGet` pass their modes; a caller
+   * that passes none reads eagerly (internal callers whose results are typed
+   * as the domain model).
+   */
   const decodeRecord = (
     raw: globalThis.Record<string, unknown>,
-  ): Effect.Effect<any, ValidationError> => {
+    modes: OffloadRead.Modes = OffloadRead.EAGER_MODES,
+    operation = "decode",
+  ): Effect.Effect<any, ValidationError | BlobStoreError> => {
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
-    return Effect.flatMap(unpackFields(raw), () => {
+    return Effect.flatMap(loadRow(raw, { operation, modes }), () => {
       deserializeSparseFields(raw)
       renameFromDynamo(raw)
-      return Schema.decodeUnknownEffect(schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
+      return Schema.decodeUnknownEffect(readSchema(schemas.recordSchema, modes))(raw).pipe(
         Effect.map(attachPrototype),
         Effect.mapError(
           (cause) =>
@@ -6771,26 +7105,40 @@ const makeImpl = <
     })
   }
 
-  /** Decode a raw item using the schema selected by mode */
+  /**
+   * Decode a raw item using the schema selected by mode, under the running
+   * operation's read modes — or `load`'s: an error payload decodes with
+   * `noFetch` (lazy handles, no store I/O, §6.13).
+   */
   const decodeAs = (
     raw: globalThis.Record<string, unknown>,
     marshalled: globalThis.Record<string, AttributeValue>,
     mode: DecodeMode,
-  ) => {
+    load?: { readonly noFetch: true },
+  ): Effect.Effect<any, ValidationError | BlobStoreError> => {
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
-    // Native: the item as stored — packed values stay their `S` / `B`.
+    // Native: the item as stored — packed values stay their `S` / `B`, and an
+    // offloaded one its pointer.
     if (mode === "native") return Effect.succeed(marshalled)
-    return decodeStored(raw, mode)
+    if (load?.noFetch === true) {
+      return decodeStored(raw, mode, {
+        operation: "decode",
+        modes: OffloadRead.LAZY_MODES,
+        noFetch: true,
+      })
+    }
+    return Effect.flatMap(OffloadRead.currentModes, (modes) =>
+      decodeStored(raw, mode, { operation: "decode", modes }),
+    )
   }
 
   /**
-   * {@link decodeAs} of a write's result (#179, design §6.13): the item's
-   * offloaded pointers are resolved first, eagerly — what `operation`
-   * uploaded from the ledger's read cache (no GET), anything else fetched —
-   * and a store failure is `BlobStoreError { committed: true }`. Exactly
-   * `decodeAs` for an entity that offloads nothing. Reads and error payloads
-   * use `decodeAs`, which refuses a pointer as before (commit 8 reads them).
+   * {@link decodeAs} of a write's result (#179, design §6.13): its pointers
+   * resolve per the operation's modes — what `operation` uploaded from the
+   * ledger's read cache (no GET), anything else fetched — and a store failure
+   * is `BlobStoreError { committed: true }`. Exactly `decodeAs` for an entity
+   * that offloads nothing.
    */
   const decodeWritten = (
     raw: globalThis.Record<string, unknown>,
@@ -6801,17 +7149,19 @@ const makeImpl = <
     if (offloadInfo === undefined || mode === "native") return decodeAs(raw, marshalled, mode)
     const corruption = versionCorruption(raw, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
-    return Effect.flatMap(resolveOffloaded(raw, `${operation}.decode`, true), () =>
-      decodeStored(raw, mode),
+    return Effect.flatMap(OffloadRead.currentModes, (modes) =>
+      decodeStored(raw, mode, { operation: `${operation}.decode`, modes, committed: true }),
     )
   }
 
-  /** {@link decodeAs} once the item's pointers (if any) are resolved. */
+  /** {@link decodeAs} of a stored-name row: load it per `load`, then decode it. */
   const decodeStored = (
     raw: globalThis.Record<string, unknown>,
     mode: Exclude<DecodeMode, "native">,
-  ): Effect.Effect<any, ValidationError> => {
-    return Effect.flatMap(unpackFields(raw), () => {
+    load: OffloadRead.LoadOptions,
+  ): Effect.Effect<any, ValidationError | BlobStoreError> => {
+    const modes = load.noFetch === true ? OffloadRead.LAZY_MODES : load.modes
+    return Effect.flatMap(loadRow(raw, load), () => {
       // Collect flattened sparse-map attributes back into the domain Record.
       // Must happen before rename so the rebuilt Record sits at the domain field
       // name (sparse field renaming is not supported).
@@ -6825,9 +7175,17 @@ const makeImpl = <
           : mode === "record"
             ? schemas.recordSchema
             : schemas.itemSchema
-      return Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
+      // A model holding handles is not the class's value: its constructor
+      // would validate the handle against the domain field.
+      const construct =
+        mode === "model" &&
+        isSchemaClass &&
+        !hasHiddenFields &&
+        !refsHoldLess &&
+        !readsLazily(modes)
+      return Schema.decodeUnknownEffect(readSchema(targetSchema, modes))(raw).pipe(
         Effect.map((decoded) =>
-          mode === "model" && isSchemaClass && !hasHiddenFields && !refsHoldLess
+          construct
             ? new (rawModel as any)(decoded)
             : mode !== "item"
               ? attachPrototype(decoded)
@@ -6849,26 +7207,36 @@ const makeImpl = <
   /**
    * Decode a DynamoDB Streams image into an item record (`Entity.Item`): the
    * image normalised (DynamoDB JSON or unmarshalled; `B` as bytes or base64),
-   * its dispatch-eligible attributes read by stored form, then sparse rebuild,
+   * loaded — its stored-form attributes unpacked and its pointers resolved
+   * per `modes` (lazy by default, design §10.1) — then sparse rebuild,
    * renames and the item-schema decode — exactly what a table read applies.
    */
-  const decodeImageItem = (image: StreamImage): Effect.Effect<unknown, ValidationError> =>
+  const decodeImageItem = (
+    image: StreamImage,
+    modes: OffloadRead.Modes = OffloadRead.LAZY_MODES,
+  ): Effect.Effect<unknown, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
+      const ctx = { entityType, operation: "decodeMarshalledItem" }
+      const options = { probe: config.indexes.primary.pk.field }
       // An image of another entity type is decoded as 1.25.0 decoded it: its
       // attributes are never read as packed values (a plain string of that
       // type is not this entity's JSON). The type is read off the raw image.
       const owner = imageEntityType(image)
-      const raw = yield* decodeImage(
-        image,
-        owner === undefined || owner === entityType ? dispatchAttributes : [],
-        { entityType, operation: "decodeMarshalledItem" },
-        { probe: config.indexes.primary.pk.field },
-      )
+      const form = imageForm(image, options)
+      const raw = yield* normalizeImage(image, ctx, { ...options, form })
+      if (owner === undefined || owner === entityType) {
+        // Unmarshalled, a `B` value may still be base64 text.
+        yield* loadRow(raw, {
+          operation: "decodeMarshalledItem",
+          modes,
+          image: form === "unmarshalled",
+        })
+      }
       const corruption = versionCorruption(raw, "decodeMarshalledItem")
       if (corruption !== undefined) return yield* corruption
       deserializeSparseFields(raw)
       renameFromDynamo(raw)
-      const decoded = yield* Schema.decodeUnknownEffect(schemas.itemSchema as Schema.Codec<any>)(
+      const decoded = yield* Schema.decodeUnknownEffect(readSchema(schemas.itemSchema, modes))(
         raw,
       ).pipe(
         Effect.mapError(
@@ -7452,8 +7820,11 @@ const makeImpl = <
           // Packed fields are read by their stored form: the source text is
           // derived from the value, not its JSON string or compressed bytes —
           // and an offloaded one is fetched (one GET per pointer, #179).
-          yield* resolveOffloaded(currentDomain, "update.vector", false)
-          yield* unpackFields(currentDomain, "update.vector")
+          yield* loadRow(currentDomain, {
+            operation: "update.vector",
+            modes: OffloadRead.EAGER_MODES,
+            raw: true,
+          })
           deserializeSparseFields(currentDomain)
           renameFromDynamo(currentDomain)
           merged = { ...currentDomain, ...merged }
@@ -7967,6 +8338,8 @@ const makeImpl = <
                       fromAttributeMap(item) as globalThis.Record<string, unknown>,
                       item,
                       "model",
+                      // An error payload: offloaded fields as lazy handles (§6.13).
+                      { noFetch: true },
                     ),
                   )
             return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
@@ -8074,30 +8447,38 @@ const makeImpl = <
     }
     if (mode === "native") return Effect.succeed(projected)
     const raw = fromAttributeMap(projected) as globalThis.Record<string, unknown>
-    const resolved =
-      written === undefined ? Effect.void : resolveOffloaded(raw, `${written}.decode`, true)
-    return Effect.flatMap(
-      Effect.flatMap(resolved, () => unpackFields(raw)),
-      () => {
-        deserializeSparseFields(raw)
-        renameFromDynamo(raw)
-        const target =
-          mode === "model"
-            ? schemas.modelSchema
-            : mode === "record"
-              ? schemas.recordSchema
-              : schemas.itemSchema
-        const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
-        const present = Object.fromEntries(
-          Object.entries(fields).filter(([name]) => hasOwnName(raw, name)),
-        )
-        const presentSchema = Schema.Struct(present)
-        return Schema.decodeUnknownEffect(presentSchema as unknown as Schema.Codec<any>)(raw).pipe(
-          Effect.mapError(
-            (cause) => new ValidationError({ entityType, operation: "decode", cause }),
-          ),
-        )
-      },
+    return Effect.flatMap(OffloadRead.currentModes, (modes) =>
+      Effect.flatMap(
+        loadRow(raw, {
+          operation: written === undefined ? "decode" : `${written}.decode`,
+          modes,
+          committed: written !== undefined,
+        }),
+        () => {
+          deserializeSparseFields(raw)
+          renameFromDynamo(raw)
+          const target =
+            mode === "model"
+              ? schemas.modelSchema
+              : mode === "record"
+                ? schemas.recordSchema
+                : schemas.itemSchema
+          const fields = (
+            readSchema(target, modes) as unknown as { readonly fields: Schema.Struct.Fields }
+          ).fields
+          const present = Object.fromEntries(
+            Object.entries(fields).filter(([name]) => hasOwnName(raw, name)),
+          )
+          const presentSchema = Schema.Struct(present)
+          return Schema.decodeUnknownEffect(presentSchema as unknown as Schema.Codec<any>)(
+            raw,
+          ).pipe(
+            Effect.mapError(
+              (cause) => new ValidationError({ entityType, operation: "decode", cause }),
+            ),
+          )
+        },
+      ),
     )
   }
   /**
@@ -9257,9 +9638,16 @@ const makeImpl = <
           const keyInput = {
             [ref.keyField]: Option.getOrElse(keyValueOf(ref.keySchema, id), () => id),
           }
+          // A target that offloads fields is read lazily (#179, design §8.4):
+          // the ref schema never includes an offloaded field (`EDD-9143`), and
+          // `refDataOf` leaves them out, so nothing is fetched.
+          const dropped = offloadedFieldsOf(ref.refEntity)
+          const get = ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>
           // Use asModel to convert EntityGet to Effect<ModelType>
-          const getEffect = asModel(ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>)
-          const model = yield* getEffect.pipe(
+          const getEffect = asModel(
+            dropped.length === 0 ? get : (offloadedCombinator(get, "lazy") as typeof get),
+          )
+          const fetched = yield* getEffect.pipe(
             Effect.catchTag("ItemNotFound", () =>
               Effect.fail(
                 new RefNotFound({
@@ -9273,8 +9661,9 @@ const makeImpl = <
           )
           // `asModel` returns the DECODED domain value (transform fields lifted to
           // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`): stored
-          // as `refDataOf` encodes it, as a cascade stores it (issue #72, #241).
-          const wire = yield* refDataOf(ref.refEntity, model, entityType, "hydrateRefs.encode")
+          // as `refDataOf` encodes it, as a cascade stores it (issue #72, #241). Fields the
+          // target offloads are left out (#179): no blob pointer is ever copied into this row.
+          const wire = yield* refDataOf(ref.refEntity, fetched, entityType, "hydrateRefs.encode")
           return { fieldName: ref.fieldName, idFieldName: ref.idFieldName, data: wire }
         })
       })
@@ -10150,10 +10539,15 @@ const makeImpl = <
           }
 
           // Raw mode: return unmarshalled record without schema decode — a
-          // packed attribute as its parsed JSON (#147).
+          // packed attribute as its parsed JSON (#147), an offloaded one per
+          // the read's modes (#179).
           if (mode === "raw") {
             const row = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
-            yield* unpackFields(row)
+            yield* loadRow(row, {
+              operation: "get",
+              modes: yield* OffloadRead.currentModes,
+              raw: true,
+            })
             return row
           }
 
@@ -11488,6 +11882,8 @@ const makeImpl = <
                             fromAttributeMap(rejectedItem) as globalThis.Record<string, unknown>,
                             rejectedItem,
                             "model",
+                            // An error payload: offloaded fields as lazy handles (§6.13).
+                            { noFetch: true },
                           ),
                         )
                   return yield* keepReleaseRace(e, new ConcurrentModification({ ...e, current }))
@@ -11673,13 +12069,17 @@ const makeImpl = <
 
         // Execute cascade if configured (retain path) — from the new item.
         if (uState.cascade) {
+          // Lazily: a ref stores none of the offloaded fields (`refDataOf`), so nothing is fetched.
           const domainData = {
             ...((yield* appliedUpdate(
-              decodeWritten(
-                fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
-                newImage,
-                "model",
-                "update",
+              OffloadRead.withModes(
+                decodeWritten(
+                  fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
+                  newImage,
+                  "model",
+                  "update",
+                ),
+                OffloadRead.LAZY_MODES,
               ),
               "stored",
             )) as object),
@@ -12629,12 +13029,16 @@ const makeImpl = <
               ? ownValue(encodedKey as globalThis.Record<string, unknown>, sourceIdentifierField)
               : undefined
           if (sourceId == null) return
+          // Lazily: a ref stores none of the offloaded fields (`refDataOf`), so nothing is fetched.
           const domainData = yield* appliedUpdate(
-            decodeWritten(
-              fromAttributeMap(image) as globalThis.Record<string, unknown>,
-              image,
-              "model",
-              "update",
+            OffloadRead.withModes(
+              decodeWritten(
+                fromAttributeMap(image) as globalThis.Record<string, unknown>,
+                image,
+                "model",
+                "update",
+              ),
+              OffloadRead.LAZY_MODES,
             ),
             "stored",
           )
@@ -15283,21 +15687,17 @@ const makeImpl = <
         ) as Effect.Effect<ModelType<TModel>, ValidationError>
 
       /**
-       * The current item for an error's `current`: an offloading entity's
-       * error payload never does store I/O (#179), so an item holding a
-       * pointer is `Option.none()` until lazy decoding (commit 8); any other
-       * decode failure (a corrupt item) fails as it does without offload.
+       * The current item for an error's `current`: an error payload never does
+       * store I/O (#179, §6.13) — an offloading entity's offloaded fields are
+       * lazy handles.
        */
-      const errorCurrent = (item: globalThis.Record<string, AttributeValue>) => {
-        if (offloadInfo !== undefined) {
-          const raw = fromAttributeMap(item) as globalThis.Record<string, unknown>
-          const holdsPointer = offloadedAttributeNames.some(
-            (attr) => OffloadWrite.pointerOf(offloadInfo, attr, raw[attr]) !== undefined,
-          )
-          if (holdsPointer) return Effect.succeed(Option.none<ModelType<TModel>>())
-        }
-        return Effect.map(decodeCurrent(item), (decoded) => Option.some(decoded))
-      }
+      const errorCurrent = (item: globalThis.Record<string, AttributeValue>) =>
+        Effect.map(
+          decodeAs(fromAttributeMap(item) as globalThis.Record<string, unknown>, item, "model", {
+            noFetch: true,
+          }) as Effect.Effect<ModelType<TModel>, ValidationError>,
+          (decoded) => Option.some(decoded),
+        )
 
       const staleAppend = (current: Option.Option<unknown>) =>
         new StaleAppend({ entityType, orderByField, attemptedOrderBy: newObValue, current })
@@ -15530,17 +15930,11 @@ const makeImpl = <
       const rawCurrent = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
       if (offloadInfo !== undefined) {
         // An offloading entity (#179): a stale append's error payload never
-        // does I/O, so a current item holding a pointer is
-        // `current: Option.none()` until lazy decoding (commit 8).
+        // does I/O — its offloaded fields are lazy handles.
         const storedOrderBy = fromAttributeMap(followUp.Item)[resolveDbName(orderByField)]
-        // Only a pointer makes `current` none: any other decode failure (a
-        // corrupt item) fails as it does for an entity that offloads nothing.
-        const holdsPointer = offloadedAttributeNames.some(
-          (attr) => OffloadWrite.pointerOf(offloadInfo, attr, rawCurrent[attr]) !== undefined,
+        const current = Option.some(
+          yield* decodeAs(rawCurrent, followUp.Item, "model", { noFetch: true }),
         )
-        const current = holdsPointer
-          ? Option.none()
-          : Option.some(yield* decodeAs(rawCurrent, followUp.Item, "model"))
         if (!isCasFailure(storedOrderBy, newObValue) && userCondition !== undefined) {
           return yield* new ConditionalCheckFailed({
             entityType,
@@ -15555,7 +15949,8 @@ const makeImpl = <
           current,
         })
       }
-      const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model")
+      // A stale append's `current` is an error payload: no store I/O (§6.13).
+      const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model", { noFetch: true })
       // Compare in the WIRE form (what DynamoDB evaluated): `newObValue` is
       // the encoded value passed to the CAS, and `rawCurrent` carries the
       // encoded values read back. `decodeAs` mutated `rawCurrent` to rename
@@ -15586,13 +15981,19 @@ const makeImpl = <
     givenCondition?: Expr | ConditionInput,
     skipFollowUp = false,
     removeAttrs?: ReadonlyArray<string>,
+    // Internal: the bound builder's `.offloaded()` modes for `current` (#179).
+    offloadModes?: OffloadRead.Modes,
   ) =>
     Capacity.operation(
       "Entity.append",
       { target: entityType },
-      BlobLedger.rootIf(
-        data.offload !== undefined,
-        appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+      withReadModes(
+        self,
+        offloadModes,
+        BlobLedger.rootIf(
+          data.offload !== undefined,
+          appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+        ),
       ),
     )
 
@@ -15614,17 +16015,17 @@ const makeImpl = <
     )
     const prefix = KeyComposer.composeEventSkPrefix(currentSk, schema.casing)
 
-    const decodeHistory = (raw: globalThis.Record<string, unknown>) => {
+    const decodeHistory = (raw: globalThis.Record<string, unknown>, modes: OffloadRead.Modes) => {
       // Sparse fields are aggregate state, not event state — event items DO
       // NOT carry `<prefix>#*` attributes. `deserializeSparseFields` populates
       // empty `{}` Records under the domain field names so the historyRecord
       // schema (which still includes the sparse Record fields) decodes.
-      return Effect.flatMap(unpackFields(raw, "history.decode"), () => {
+      return Effect.flatMap(loadRow(raw, { operation: "history.decode", modes }), () => {
         deserializeSparseFields(raw)
         renameFromDynamo(raw)
-        return Schema.decodeUnknownEffect(schemas.historyRecordSchema as Schema.Codec<any>)(
-          raw,
-        ).pipe(
+        return Schema.decodeUnknownEffect(
+          readSchema(schemas.historyRecordSchema as Schema.Codec<any>, modes),
+        )(raw).pipe(
           Effect.map(attachPrototype),
           Effect.mapError(
             (cause) =>
@@ -15648,7 +16049,7 @@ const makeImpl = <
       pkValue,
       skField: primary.sk.field,
       entityTypes: [entityType],
-      decoder: (raw) => decodeHistory(raw),
+      decoder: (raw, modes) => decodeHistory(raw, modes),
       ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
@@ -15670,7 +16071,7 @@ const makeImpl = <
 
   const queryNamespace: globalThis.Record<
     string,
-    (pk: globalThis.Record<string, unknown>) => Query.Query<any>
+    (pk: globalThis.Record<string, unknown>) => Query.Query<any, any, any>
   > = {}
   for (const indexName of Object.keys(config.indexes)) {
     if (indexName === "primary") continue
@@ -15712,7 +16113,7 @@ const makeImpl = <
         pkValue,
         skField: indexDef.sk.field,
         entityTypes: [entityType],
-        decoder: (raw) => decodeRecord(raw),
+        decoder: (raw, modes) => decodeRecord(raw, modes, "query.decode"),
         ...packedQueryOptions,
         resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
         keyFields: [
@@ -15762,7 +16163,7 @@ const makeImpl = <
       storedAt: storedFormAt,
       indexName: undefined,
       entityTypes: [entityType],
-      decoder: (raw) => decodeRecord(raw),
+      decoder: (raw, modes) => decodeRecord(raw, modes, "scan.decode"),
       ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [config.indexes.primary.pk.field, config.indexes.primary.sk.field],
@@ -15906,7 +16307,7 @@ const makeImpl = <
       pkValue,
       skField: primary.sk.field,
       entityTypes: [entityType],
-      decoder: (raw) => decodeRecord(raw),
+      decoder: (raw, modes) => decodeRecord(raw, modes, "versions.decode"),
       ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
@@ -15943,8 +16344,9 @@ const makeImpl = <
           // (itemSchema would fail because it expects GSI key fields that aren't present)
           if (mode === "native") return tombstone
           // Packed fields: read by their stored form (copied as-is onto the
-          // tombstone, #147).
-          yield* unpackFields(raw, "deleted.get.decode")
+          // tombstone, #147); offloaded ones per the read's modes (#179).
+          const modes = yield* OffloadRead.currentModes
+          yield* loadRow(raw, { operation: "deleted.get.decode", modes })
           // Sparse Map fields: rebuild domain Records from flattened attrs so
           // soft-deleted items decode correctly. Sparse data is preserved
           // verbatim across soft-delete (GSI keys are stripped, sparse data is
@@ -15955,8 +16357,8 @@ const makeImpl = <
           // (#127). Without it a `field:`-renamed attribute decodes as a missing
           // key and every soft-deleted row of such an entity is unreadable.
           renameFromDynamo(raw)
-          const targetSchema = schemas.deletedRecordSchema
-          return yield* Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
+          const targetSchema = readSchema(schemas.deletedRecordSchema, modes)
+          return yield* Schema.decodeUnknownEffect(targetSchema)(raw).pipe(
             Effect.map(attachPrototype),
             Effect.mapError(
               (cause) =>
@@ -15981,18 +16383,16 @@ const makeImpl = <
     // composites (#133): no item segment.
     const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
 
-    const decodeDeleted = (raw: globalThis.Record<string, unknown>) => {
+    const decodeDeleted = (raw: globalThis.Record<string, unknown>, modes: OffloadRead.Modes) => {
       const corruption = versionCorruption(raw, "deleted.list.decode")
       if (corruption !== undefined) return Effect.fail(corruption)
-      return Effect.flatMap(unpackFields(raw, "deleted.list.decode"), () => {
+      return Effect.flatMap(loadRow(raw, { operation: "deleted.list.decode", modes }), () => {
         // Sparse fields are domain data and are preserved across soft-delete.
         // Rebuild Records from flattened attrs before schema decode.
         deserializeSparseFields(raw)
         // Then attribute → domain names, same order as `decodeRecord` (#127).
         renameFromDynamo(raw)
-        return Schema.decodeUnknownEffect(schemas.deletedRecordSchema as Schema.Codec<any>)(
-          raw,
-        ).pipe(
+        return Schema.decodeUnknownEffect(readSchema(schemas.deletedRecordSchema, modes))(raw).pipe(
           Effect.map(attachPrototype),
           Effect.mapError(
             (cause) =>
@@ -16016,7 +16416,7 @@ const makeImpl = <
       pkValue,
       skField: primary.sk.field,
       entityTypes: [],
-      decoder: (raw) => decodeDeleted(raw),
+      decoder: (raw, modes) => decodeDeleted(raw, modes),
       ...packedQueryOptions,
       resolveTableName: tableTag.useSync((tc: TableConfig) => tc.name),
       keyFields: [primary.pk.field, primary.sk.field],
@@ -20885,10 +21285,7 @@ const makeImpl = <
         ? cbOrShorthand(entityPathBuilder, entityConditionOps)
         : parseSimpleShorthand(cbOrShorthand)
     refusePackedExpr(expr, "filter")
-    // Each operand that is one of Effect's instances or a `Date` in the form this entity's
-    // attribute holds it (#242), whichever query it's added to, and its paths named as the entity
-    // stores them (#238).
-    return <A>(q: Query.Query<A>): Query.Query<A> => {
+    return <A, E, O extends OffloadState>(q: Query.Query<A, E, O>): Query.Query<A, E, O> => {
       const { renameExpr } = ownNaming()
       return filterExprStored(q, renameExpr === undefined ? expr : renameExpr(expr))
     }
@@ -20910,13 +21307,13 @@ const makeImpl = <
       const paths = cbOrAttrs(entityPathBuilder)
       const segments = paths.map((p: { segments: ReadonlyArray<string | number> }) => p.segments)
       refuse(segments)
-      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+      return <A, E, O extends OffloadState>(q: Query.Query<A, E, O>) => {
         const { selectAs } = ownNaming()
         return selectAs === undefined ? selectPaths(q, segments) : selectAs(q, segments, "paths")
       }
     }
     refuse(cbOrAttrs.map((attribute) => [attribute]))
-    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+    return <A, E, O extends OffloadState>(q: Query.Query<A, E, O>) => {
       const { selectAs } = ownNaming()
       return selectAs === undefined
         ? Query.select(q, cbOrAttrs)
@@ -20932,7 +21329,7 @@ const makeImpl = <
   // Flattened query accessors (same as query namespace, but on entity directly)
   // ---------------------------------------------------------------------------
 
-  const flattenedAccessors: globalThis.Record<string, (pk: any) => Query.Query<any>> = {}
+  const flattenedAccessors: globalThis.Record<string, (pk: any) => Query.Query<any, any, any>> = {}
   for (const indexName of Object.keys(config.indexes)) {
     if (indexName === "primary") continue
     flattenedAccessors[indexName] = queryNamespace[indexName]!
@@ -20969,8 +21366,19 @@ const makeImpl = <
       return lacksAny(copy, names) ? lackedByName(record, copy, names, undefined, "getter") : copy
     },
     _decodeImage: decodeImageItem,
+    _loadRows: (
+      rows: ReadonlyArray<globalThis.Record<string, unknown>>,
+      options: {
+        readonly operation: string
+        readonly modes: OffloadRead.Modes
+        readonly raw?: boolean | undefined
+      },
+    ) => loadRows(rows, options),
+    _readAttributes: readAttributeNames,
+    _offloads: offloadInfo !== undefined,
+    _offloadedFields: [...offloadedByKind.overflow, ...offloadedByKind.binary],
     _resolvedRefs: resolvedRefs,
-    /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
+    /** @internal Full decode pipeline: load + sparse + rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
     /** @internal Domain field name → stored attribute name (`storedAs` renames). */
     _resolveDbName: resolveDbName,
@@ -21286,17 +21694,20 @@ export const bind = <
     }
 
     // Helper: apply query combinators then execute
-    const applyQuery = <A>(q: Query.Query<A>, combinators: ReadonlyArray<(q: any) => any>) => {
+    const applyQuery = <A, E, O extends OffloadState>(
+      q: Query.Query<A, E, O>,
+      combinators: ReadonlyArray<(q: any) => any>,
+    ) => {
       let result: any = q
       for (const fn of combinators) result = fn(result)
-      return result as Query.Query<A>
+      return result as Query.Query<A, E, O>
     }
 
     // Helper: wrap a raw entity-level Query<A> in a BoundQuery with this binding's
     // pre-resolved provide. Used by `versions` and `deleted.list` accessors so consumers
     // get the same fluent .collect() / .fetch() / .paginate() / .reverse() / .limit() /
     // .filter() ergonomics they get from index accessors and `.scan()`.
-    const wrapAsBoundQuery = <A>(q: Query.Query<A>, operation: string) => {
+    const wrapAsBoundQuery = <A>(q: Query.Query<A, any, any>, operation: string) => {
       const bqConfig: BoundQueryConfig<unknown> = {
         pathBuilder: boundPathBuilder(),
         conditionOps: createConditionOps(),
@@ -21312,7 +21723,7 @@ export const bind = <
       return new BoundQueryImpl(
         q,
         bqConfig,
-      ) as unknown as import("./internal/BoundQuery.js").BoundQuery<A, never, A>
+      ) as unknown as import("./internal/BoundQuery.js").BoundQuery<A, never, A, never, any>
     }
 
     /**
@@ -21355,10 +21766,21 @@ export const bind = <
               Effect.gen(function* () {
                 const raw = fromAttributeMap(marshalled) as globalThis.Record<string, unknown>
                 const storedSk = raw[primary.sk.field]
-                const decoded = (yield* entity._decodeRecord(raw)) as globalThis.Record<
-                  string,
-                  unknown
-                >
+                // Eager (the source text needs the values); a store failure is a
+                // `ValidationError`'s cause until vector reads are typed (#179).
+                const decoded = (yield* entity
+                  ._decodeRecord(raw, OffloadRead.EAGER_MODES, "reembed.decode")
+                  .pipe(
+                    Effect.catchTag("BlobStoreError", (cause) =>
+                      Effect.fail(
+                        new ValidationError({
+                          entityType: entity.entityType,
+                          operation: "reembed.decode",
+                          cause,
+                        }),
+                      ),
+                    ),
+                  )) as globalThis.Record<string, unknown>
                 // Snapshots / tombstones live in the same partition under a
                 // rewritten SK — their SK cannot be recomposed from the record.
                 // `decoded` holds domain values: the keys `put` wrote for them
@@ -21547,14 +21969,15 @@ export const bind = <
                   c: Expr | ConditionInput | undefined,
                   s: boolean,
                   r: ReadonlyArray<string> | undefined,
+                  m: OffloadRead.Modes,
                 ) => Effect.Effect<any, any, any>
-              )(opts.input, opts.condition, opts.skipFollowUp, opts.removeAttrs),
+              )(opts.input, opts.condition, opts.skipFollowUp, opts.removeAttrs, opts.offloadModes),
             ),
         }
         return makeBoundAppend(input, appendCfg)
       },
       history: (key: Key) => {
-        const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
+        const q = (entity.history as any as (k: Key) => Query.Query<any, any, any>)(key)
         const pathBuilder = boundPathBuilder()
         const conditionOps = createConditionOps()
         const ts = (entity as unknown as { readonly timeSeries?: TimeSeriesConfig<any> }).timeSeries
@@ -21692,7 +22115,10 @@ export const bind = <
       },
       // Query execution
       // Each helper is a named operation, inside `provide` (consumed capacity, #174).
-      paginate: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+      paginate: <A>(
+        q: Query.Query<A, any, any>,
+        ...combinators: ReadonlyArray<(q: any) => any>
+      ) => {
         const final = applyQuery(q, combinators)
         const options = {
           ...Query.operationOptions(final as Query.Query<unknown>),
@@ -21706,7 +22132,7 @@ export const bind = <
           ),
         ).pipe(Stream.flatMap((page) => Stream.fromIterable(page)))
       },
-      collect: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+      collect: <A>(q: Query.Query<A, any, any>, ...combinators: ReadonlyArray<(q: any) => any>) => {
         const final = applyQuery(q, combinators)
         const options = {
           ...Query.operationOptions(final as Query.Query<unknown>),
@@ -21714,7 +22140,7 @@ export const bind = <
         }
         return provide(Capacity.operation("Entity.collect", options, Query.collect(final)))
       },
-      fetch: <A>(q: Query.Query<A>, ...combinators: ReadonlyArray<(q: any) => any>) => {
+      fetch: <A>(q: Query.Query<A, any, any>, ...combinators: ReadonlyArray<(q: any) => any>) => {
         const final = applyQuery(q, combinators)
         const options = {
           ...Query.operationOptions(final as Query.Query<unknown>),
@@ -21848,6 +22274,12 @@ export interface TransactableInfo {
         readonly returnValues: ReturnValuesMode | undefined
       }
     | undefined
+  /**
+   * For `opType: "get"` — the read modes `.offloaded()` set on it (#179), the
+   * defaults when unset: `Batch.get` and `transactGet` decode each get's item
+   * in its own modes.
+   */
+  readonly offloadModes?: OffloadRead.Modes | undefined
 }
 
 /** @internal */
@@ -21860,6 +22292,7 @@ interface InternalEntityOp {
   readonly _condition?: Expr | ConditionInput | undefined
   readonly _updateState?: UpdateState
   readonly _putKind?: PutKind | undefined
+  readonly _offloadModes?: OffloadRead.Modes | undefined
 }
 
 /** @internal */
@@ -21918,7 +22351,12 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
   // Check for EntityOp intermediates (get, put, update)
   if (isEntityOp(target)) {
     if (target._opType === "get") {
-      return { opType: "get", entity: target._entity, key: target._key }
+      return {
+        opType: "get",
+        entity: target._entity,
+        key: target._key,
+        offloadModes: target._offloadModes ?? OffloadRead.DEFAULT_MODES,
+      }
     }
     // `create`'s own not-exists guard is ANDed with the caller's condition:
     // no `.condition()` replaces it (#133).
@@ -22012,6 +22450,26 @@ export type Record<
     readonly timeSeries?: any
   },
 > = EntityRecordType<E["model"], E["timestamps"], E["versioned"], E["timeSeries"]>
+
+/**
+ * The record type a read of `E` returns (#179, design §9.2): `Record<E>` with
+ * each offloaded field typed by the read's modes `M` (default: overflow
+ * eager, binary lazy) — an eager field its value, a lazy overflow field
+ * `OffloadedValue<value>`, a lazy binary field `BlobHandle`. Exactly
+ * `Record<E>` for an entity that offloads nothing.
+ *
+ * `Entity.Record<E>` / `Entity.Model<E>` keep the domain types the schema
+ * describes; this names the view.
+ */
+export type Read<
+  E extends {
+    readonly model: Schema.Top
+    readonly timestamps: any
+    readonly versioned: any
+    readonly timeSeries?: any
+  },
+  M extends ResolvedOffloadModes = DefaultOffloadModes,
+> = View<Record<E>, OffloadFieldsOf<E>, M>
 
 /**
  * Extract the input type from an Entity. Ref-aware: when refs are present,
@@ -22215,6 +22673,19 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
  *   binary (`B`). Lambda and EventBridge Pipes deliver `B` / `BS` members as
  *   base64 text; they are decoded at any depth.
  * - Sparse-map fields are rebuilt and `field:` renames reversed.
+ * - **Offloaded fields** (#179) are lazy by default: an overflow field is an
+ *   `OffloadedValue` and a binary field a `BlobHandle`, each fetching from the
+ *   ambient `BlobStore` only when read, so the decode itself does no store
+ *   I/O. `{ offloaded: "eager" }` (or per kind, `{ overflow, binary }`)
+ *   resolves them as the decode runs; a store failure is then a
+ *   `BlobStoreError`. A value stored inline is wrapped too when lazy (its
+ *   `location` is `"inline"`; reading it does no I/O), and is the value
+ *   itself when eager.
+ *
+ * The result is typed {@link DecodedImage}: `unknown` for an entity that
+ * offloads nothing, as before; for one that offloads, its record with each
+ * offloaded field typed by the decode's modes. The error channel carries
+ * `BlobStoreError` only when a mode is eager.
  *
  * Accepts DynamoDB JSON (`{ pk: { S: "…" }, … }`, `B` as bytes or base64) or
  * an already-unmarshalled item. Fails with `ValidationError` if the item does
@@ -22225,14 +22696,28 @@ export const itemSchema = (entity: EntityWithSchemas): Schema.Codec<any> =>
  * Note: {@link itemSchema} is a pure schema over unmarshalled items and does
  * not unpack — use this for entities with packed fields.
  */
-export const decodeMarshalledItem = (
-  entity: EntityWithSchemas & {
-    readonly entityType: string
-    readonly _decodeImage?: (image: StreamImage) => Effect.Effect<unknown, ValidationError>
-  },
+export const decodeMarshalledItem: <
+  E extends DecodableEntity,
+  const M extends OffloadMode | OffloadModes = "lazy",
+>(
+  entity: E,
   marshalledItem: StreamImage,
-): Effect.Effect<unknown, ValidationError> => {
-  if (entity._decodeImage !== undefined) return entity._decodeImage(marshalledItem)
+  options?: DecodeMarshalledItemOptions<M>,
+) => Effect.Effect<DecodedImage<E, M>, ValidationError | ImageBlobErrors<E, M>> = (
+  entity: DecodableEntity,
+  marshalledItem: StreamImage,
+  options?: DecodeMarshalledItemOptions<OffloadMode | OffloadModes>,
+): Effect.Effect<any, any> => {
+  const decodeImage = entity._decodeImage ?? definitionImageDecoder(entity)
+  if (decodeImage !== undefined) {
+    // Lazy by default (#179, design §10.1): a pointer costs a GET only when read.
+    const modes = OffloadRead.parseModesOption(options?.offloaded, OffloadRead.LAZY_MODES, {
+      entityType: entity.entityType,
+      operation: "decodeMarshalledItem",
+    })
+    if (modes instanceof ValidationError) return Effect.fail(modes)
+    return decodeImage(marshalledItem, modes)
+  }
   const corruption = entity._versionCorruption?.(
     marshalledItem as Readonly<globalThis.Record<string, unknown>>,
     "decodeMarshalledItem",
@@ -22252,3 +22737,82 @@ export const decodeMarshalledItem = (
     ),
   )
 }
+
+/** What {@link decodeMarshalledItem} accepts: an entity, or a pure definition. */
+type DecodableEntity = EntityWithSchemas & {
+  readonly entityType: string
+  readonly _decodeImage?:
+    | ((
+        image: StreamImage,
+        modes?: OffloadRead.Modes,
+      ) => Effect.Effect<unknown, ValidationError | BlobStoreError>)
+    | undefined
+}
+
+/** {@link decodeMarshalledItem}'s options. */
+export interface DecodeMarshalledItemOptions<M extends OffloadMode | OffloadModes> {
+  /**
+   * The read modes of the item's offloaded fields (#179): lazy by default —
+   * a pointer becomes a handle that fetches when read, an inline value one
+   * that reads with no I/O. `"eager"` resolves them (a store failure is a
+   * `BlobStoreError`). An entity that offloads nothing ignores it.
+   */
+  readonly offloaded?: M | undefined
+}
+
+/** The fields an entity type offloads, by kind — {@link NoOffload} when none. */
+type OffloadFieldsOf<E> = E extends { readonly _offloadFields?: infer T }
+  ? Exclude<T, undefined> extends infer F extends OffloadFields
+    ? F
+    : NoOffload
+  : NoOffload
+
+/** Both kinds lazy: what a stream image decodes in by default. */
+type LazyOffloadModes = { readonly overflow: "lazy"; readonly binary: "lazy" }
+
+/**
+ * What {@link decodeMarshalledItem} returns: `unknown` for an entity that
+ * offloads nothing (as before #179); for one that does, its record with each
+ * offloaded field typed by the decode's modes ({@link Read}).
+ */
+export type DecodedImage<E, M extends OffloadMode | OffloadModes> = [
+  OffloadFieldsOf<E>["overflow"] | OffloadFieldsOf<E>["binary"],
+] extends [never]
+  ? unknown
+  : E extends {
+        readonly model: Schema.Top
+        readonly timestamps: any
+        readonly versioned: any
+        readonly timeSeries?: any
+      }
+    ? Read<E, ResolveModes<M, LazyOffloadModes>>
+    : unknown
+
+/** The blob errors decoding an image of `E` in modes `M` raises. */
+type ImageBlobErrors<E, M extends OffloadMode | OffloadModes> = ReadBlobErrors<
+  OffloadFieldsOf<E>,
+  ResolveModes<M, LazyOffloadModes>
+>
+
+/**
+ * A pure definition's image decoder (#179, design §10.1): the runtime
+ * entity's own — normalise, unpack, pointer dispatch, renames, sparse
+ * rebuild — built once per definition. Before, a definition's image was
+ * decoded by `itemSchema` alone, so its packed fields came back as their
+ * stored form (#147's gap).
+ */
+const definitionImageDecoder = (entity: object): DecodableEntity["_decodeImage"] | undefined => {
+  const def = entity as Partial<Pick<EntityDefinition, "_config" | "_data">>
+  if (def._config === undefined || def._data === undefined) return undefined
+  let runtime = definitionRuntimes.get(entity)
+  if (runtime === undefined) {
+    runtime = makeImpl(
+      def._config as unknown as Parameters<typeof makeImpl>[0],
+      def._data,
+    ) as unknown as Entity
+    definitionRuntimes.set(entity, runtime)
+  }
+  return runtime._decodeImage
+}
+
+const definitionRuntimes = new WeakMap<object, Entity>()

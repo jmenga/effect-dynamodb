@@ -15,9 +15,11 @@
  * that type.
  */
 
-import type { ConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
+import type { BlobStoreError, ConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import type { Effect } from "effect"
 import { Effectable, Pipeable, Utils } from "effect"
+import type { NoOffloadState, OffloadModes, OffloadState, ViewOf } from "../Offload.js"
 import {
   add as addCombinator,
   append as appendCombinator,
@@ -27,6 +29,7 @@ import {
   deleteFromSet as deleteFromSetCombinator,
   expectedVersion as expectedVersionCombinator,
   keepRefs as keepRefsCombinator,
+  offloaded as offloadedCombinator,
   pathAdd as pathAddCombinator,
   pathAppend as pathAppendCombinator,
   pathDelete as pathDeleteCombinator,
@@ -62,6 +65,16 @@ import type {
 } from "./EntityOps.js"
 import type { ConditionOps, Expr } from "./Expr.js"
 import { parseSimpleShorthand } from "./Expr.js"
+import type { Modes } from "./OffloadRead.js"
+import { DEFAULT_MODES, parseModes } from "./OffloadRead.js"
+import type {
+  OffloadedErrors,
+  OffloadedView,
+  Offloads,
+  ViewWith,
+  WithItem,
+  WithModes,
+} from "./OffloadTypes.js"
 import type { PathBuilder, PathModel } from "./PathBuilder.js"
 
 // ---------------------------------------------------------------------------
@@ -159,8 +172,14 @@ const buildCondition = <Model>(cfg: BoundCrudConfig<Model>, arg: ConditionArg<Mo
  * yield* db.entities.Users.create(input).condition((t, { eq }) => eq(t.status, "active"))
  * ```
  */
-export interface BoundPut<Model, A, E, VN extends string = string, P extends PropertyKey = never>
-  extends Pipeable.Pipeable {
+export interface BoundPut<
+  Model,
+  A,
+  E,
+  VN extends string = string,
+  P extends PropertyKey = never,
+  O extends OffloadState = NoOffloadState,
+> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "put"
   /**
@@ -172,13 +191,23 @@ export interface BoundPut<Model, A, E, VN extends string = string, P extends Pro
    */
   readonly condition: (
     cond: ConditionArg<Model, P>,
-  ) => BoundPut<Model, A, E | ConditionalCheckFailed, VN, P>
+  ) => BoundPut<Model, A, E | ConditionalCheckFailed, VN, P, O>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
    * name declared on `Entity.make({ vectorIndexes })`.
    */
-  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundPut<Model, A, E, VN, P>
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundPut<Model, A, E, VN, P, O>
+  /**
+   * Read the result's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). Re-types the result; an
+   * unknown mode (untyped code) throws `[EDD-9117]`. A member that offloads
+   * nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundPut<Model, OffloadedView<A, O, M>, E, VN, P, WithModes<O, M>>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -187,7 +216,7 @@ export interface BoundPut<Model, A, E, VN extends string = string, P extends Pro
 
 /** @internal */
 export class BoundPutImpl<Model, A, E, VN extends string = string>
-  implements BoundPut<Model, A, E, VN>
+  implements Omit<BoundPut<Model, A, E, VN>, "offloaded">
 {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "put" as const
@@ -204,6 +233,10 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
 
   withVector(name: VN, vector: ReadonlyArray<number>): BoundPutImpl<Model, A, E, VN> {
     return new BoundPutImpl(withVectorCombinator(this._op, name, vector), this._config)
+  }
+
+  offloaded(mode: OffloadMode | OffloadModes): BoundPutImpl<Model, any, E, VN> {
+    return new BoundPutImpl(offloadedCombinator(this._op, mode) as any, this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -235,7 +268,12 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
  * There is no `.condition()`, because a PartiQL `INSERT` has no conditions. Its
  * `_boundOpType` keeps it out of `Batch.write` and `Transaction.transactWrite`.
  */
-export interface BoundInsert<A, E, VN extends string = string> extends Pipeable.Pipeable {
+export interface BoundInsert<
+  A,
+  E,
+  VN extends string = string,
+  O extends OffloadState = NoOffloadState,
+> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "insert"
   /**
@@ -243,7 +281,17 @@ export interface BoundInsert<A, E, VN extends string = string> extends Pipeable.
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
    * name declared on `Entity.make({ vectorIndexes })`.
    */
-  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundInsert<A, E, VN>
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundInsert<A, E, VN, O>
+  /**
+   * Read the result's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). Re-types the result; an
+   * unknown mode (untyped code) throws `[EDD-9117]`. A member that offloads
+   * nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundInsert<OffloadedView<A, O, M>, E, VN, WithModes<O, M>>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -252,7 +300,7 @@ export interface BoundInsert<A, E, VN extends string = string> extends Pipeable.
 
 /** @internal */
 export class BoundInsertImpl<Model, A, E, VN extends string = string>
-  implements BoundInsert<A, E, VN>
+  implements Omit<BoundInsert<A, E, VN>, "offloaded">
 {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "insert" as const
@@ -263,6 +311,10 @@ export class BoundInsertImpl<Model, A, E, VN extends string = string>
 
   withVector(name: VN, vector: ReadonlyArray<number>): BoundInsertImpl<Model, A, E, VN> {
     return new BoundInsertImpl(withVectorCombinator(this._op, name, vector), this._config)
+  }
+
+  offloaded(mode: OffloadMode | OffloadModes): BoundInsertImpl<Model, any, E, VN> {
+    return new BoundInsertImpl(offloadedCombinator(this._op, mode) as any, this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -291,8 +343,13 @@ export class BoundInsertImpl<Model, A, E, VN extends string = string>
  * yield* db.entities.Tasks.delete({ taskId }).returnValues("allOld")
  * ```
  */
-export interface BoundDelete<Model, E, A = void, P extends PropertyKey = never>
-  extends Pipeable.Pipeable {
+export interface BoundDelete<
+  Model,
+  E,
+  A = void,
+  P extends PropertyKey = never,
+  O extends OffloadState = NoOffloadState,
+> extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "delete"
   /**
@@ -304,7 +361,7 @@ export interface BoundDelete<Model, E, A = void, P extends PropertyKey = never>
    */
   readonly condition: (
     cond: ConditionArg<Model, P>,
-  ) => BoundDelete<Model, E | ConditionalCheckFailed, A, P>
+  ) => BoundDelete<Model, E | ConditionalCheckFailed, A, P, O>
   /**
    * Set ReturnValues mode: `"allOld"` returns the item the delete removed
    * (`undefined` when there was none); `"none"` returns nothing. DynamoDB has no
@@ -313,7 +370,23 @@ export interface BoundDelete<Model, E, A = void, P extends PropertyKey = never>
    */
   readonly returnValues: <M extends ReturnValuesMode>(
     mode: M,
-  ) => BoundDelete<Model, E, M extends "allOld" ? Model | undefined : void, P>
+  ) => BoundDelete<
+    Model,
+    E,
+    M extends "allOld" ? ViewWith<O, Model> | undefined : void,
+    P,
+    WithItem<O, M extends "allOld" ? Model | undefined : void>
+  >
+  /**
+   * Read the result's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). Re-types the result; an
+   * unknown mode (untyped code) throws `[EDD-9117]`. A member that offloads
+   * nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundDelete<Model, E, OffloadedView<A, O, M>, P, WithModes<O, M>>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -321,7 +394,9 @@ export interface BoundDelete<Model, E, A = void, P extends PropertyKey = never>
 }
 
 /** @internal */
-export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E, A> {
+export class BoundDeleteImpl<Model, E, A = void>
+  implements Omit<BoundDelete<Model, E, A>, "offloaded" | "returnValues">
+{
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "delete" as const
   constructor(
@@ -340,6 +415,10 @@ export class BoundDeleteImpl<Model, E, A = void> implements BoundDelete<Model, E
   ): BoundDeleteImpl<Model, E, M extends "allOld" ? Model | undefined : void> {
     const next = returnValuesCombinator(this._op, mode)
     return new BoundDeleteImpl(next as any, this._config)
+  }
+
+  offloaded(mode: OffloadMode | OffloadModes): BoundDeleteImpl<Model, E, any> {
+    return new BoundDeleteImpl(offloadedCombinator(this._op, mode) as any, this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -382,11 +461,12 @@ export interface BoundUpdate<
   P extends PropertyKey = never,
   RN extends string = string,
   KR = never,
+  O extends OffloadState = NoOffloadState,
 > extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "update"
   /** Set the fields to update (record-based SET). */
-  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /**
    * Clear model fields a row can lack (REMOVE clause); `.set({ field: undefined })`
    * is the same operation. Takes field names, not stored attribute names. A
@@ -394,25 +474,25 @@ export interface BoundUpdate<
    * refused at run time, before anything is sent. To clean up an attribute the
    * model no longer declares, use `.pathRemove(["attribute"])`.
    */
-  remove(fields: ReadonlyArray<RN>): BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  remove(fields: ReadonlyArray<RN>): BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Atomic ADD: a number adds, a set unions. */
   readonly add: (
     values: globalThis.Record<string, AddOperand>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Numeric SET subtraction (synthesized as `SET #f = #f - :v`). */
   readonly subtract: (
     values: globalThis.Record<string, number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** List append (synthesized as `SET #f = list_append(#f, :v)`). */
   readonly append: (
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Delete elements from a set attribute. */
   readonly deleteFromSet: (
     values: globalThis.Record<string, unknown>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Optimistic concurrency — expected version. */
-  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /**
    * Add a condition expression. Callback or shorthand.
    *
@@ -427,7 +507,7 @@ export interface BoundUpdate<
    */
   readonly condition: (
     cond: ConditionArg<Model, P>,
-  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN, P, string, KR>
+  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN, P, string, KR, O>
   /**
    * Supply a pre-computed embedding for a named vector index, skipping the
    * `Embedder` for that index on this write. `name` is the LOGICAL vector index
@@ -436,7 +516,7 @@ export interface BoundUpdate<
   readonly withVector: (
     name: VN,
     vector: ReadonlyArray<number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /**
    * Name refs the update keeps, by their ids (`{ playerId }`), as the row holds them. Each id keys
    * the indexes it is a composite of, as `.set({ playerId })` would, but the referenced item is not
@@ -448,7 +528,7 @@ export interface BoundUpdate<
    */
   readonly keepRefs: (
     ids: KR,
-  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E | ConditionalCheckFailed, VN, P, RN, KR, O>
   /**
    * What the update returns. `"allNew"` (the default) / `"allOld"`: the whole
    * item after / before it. `"updatedNew"` / `"updatedOld"`: only the
@@ -457,31 +537,41 @@ export interface BoundUpdate<
    */
   readonly returnValues: <M extends ReturnValuesMode>(
     mode: M,
-  ) => BoundUpdate<Model, UpdateReturn<Model, M>, U, E, VN, P, string, KR>
+  ) => BoundUpdate<
+    Model,
+    ViewWith<O, UpdateReturn<Model, M>>,
+    U,
+    E,
+    VN,
+    P,
+    string,
+    KR,
+    WithItem<O, UpdateReturn<Model, M>>
+  >
   /** Configure cascade updates to denormalized target entities. */
   readonly cascade: (config: {
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  }) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based SET. */
-  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based REMOVE. */
   readonly pathRemove: (
     segments: ReadonlyArray<string | number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based ADD. */
-  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based SUBTRACT. */
-  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based APPEND. */
-  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based PREPEND. */
-  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based if_not_exists. */
-  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /** Path-based DELETE (set removal). */
-  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /**
    * Remove specific entries from a sparse-map field. Compiles to
    * `REMOVE <prefix>#k1, <prefix>#k2, ...`. Removing an entry that doesn't
@@ -490,14 +580,24 @@ export interface BoundUpdate<
   readonly removeEntries: (
     field: string,
     keys: ReadonlyArray<string>,
-  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
   /**
    * Clear all entries of a sparse-map field. Two-op helper: reads the current
    * item, then folds REMOVE clauses for the discovered `<prefix>#*` attrs into
    * the same final UpdateItem. Atomic via the version CAS for `versioned`
    * entities; best-effort for non-versioned.
    */
-  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN, P, RN, KR>
+  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN, P, RN, KR, O>
+  /**
+   * Read the result's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). Re-types the result; an
+   * unknown mode (untyped code) throws `[EDD-9117]`. A member that offloads
+   * nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundUpdate<Model, OffloadedView<A, O, M>, U, E, VN, P, RN, KR, WithModes<O, M>>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -506,7 +606,7 @@ export interface BoundUpdate<
 
 /** @internal */
 export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
-  implements BoundUpdate<Model, A, U, E, VN, never, string>
+  implements Omit<BoundUpdate<Model, A, U, E, VN, never, string>, "offloaded" | "returnValues">
 {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "update" as const
@@ -643,6 +743,10 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
     return this._with(clearMapCombinator(this._op, field))
   }
 
+  offloaded(mode: OffloadMode | OffloadModes): BoundUpdateImpl<Model, any, U, E, VN> {
+    return new BoundUpdateImpl(offloadedCombinator(this._op, mode) as any, this._config)
+  }
+
   asEffect(): Effect.Effect<A, E, never> {
     return this._config.provide(
       (this._op as unknown as { _exec: (m: string) => Effect.Effect<A, E, any> })._exec("record"),
@@ -720,9 +824,20 @@ const BoundGetBase = BoundGetCtor as unknown as new <A, E>() => Effect.Effect<A,
  * ])
  * ```
  */
-export interface BoundGet<A, E> extends Effect.Effect<A, E, never> {
+export interface BoundGet<A, E, O extends OffloadState = NoOffloadState>
+  extends Effect.Effect<A, E, never> {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "get"
+  /**
+   * Read the result's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). Re-types the result and its blob errors; an
+   * unknown mode (untyped code) throws `[EDD-9117]`. A member that offloads
+   * nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundGet<OffloadedView<A, O, M>, OffloadedErrors<E, O, M>, WithModes<O, M>>
   /**
    * The Effect this value already is. Present so `.asEffect()` reads the same
    * on every bound op.
@@ -731,7 +846,10 @@ export interface BoundGet<A, E> extends Effect.Effect<A, E, never> {
 }
 
 /** @internal */
-export class BoundGetImpl<A, E> extends BoundGetBase<A, E> implements BoundGet<A, E> {
+export class BoundGetImpl<A, E>
+  extends BoundGetBase<A, E>
+  implements Omit<BoundGet<A, E>, "offloaded">
+{
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "get" as const
   constructor(
@@ -739,6 +857,10 @@ export class BoundGetImpl<A, E> extends BoundGetBase<A, E> implements BoundGet<A
     readonly _config: BoundCrudConfig<any>,
   ) {
     super()
+  }
+
+  offloaded(mode: OffloadMode | OffloadModes): BoundGetImpl<any, any> {
+    return new BoundGetImpl(offloadedCombinator(this._op, mode) as any, this._config)
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -754,46 +876,95 @@ export class BoundGetImpl<A, E> extends BoundGetBase<A, E> implements BoundGet<A
  * and `Transaction.check`: the unbound `EntityGet` intermediate, or the
  * {@link BoundGet} returned by `db.entities.X.get(...)`.
  */
-export type AnyGet = EntityGet<any, any, any, any> | BoundGet<any, any>
+export type AnyGet = EntityGet<any, any, any, any, any> | BoundGet<any, any, any>
 
 /** Success type carried by an {@link AnyGet}, whichever half it is. */
 export type GetSuccess<T> =
-  T extends EntityGet<infer A, any, any, any> ? A : T extends BoundGet<infer A, any> ? A : never
+  T extends EntityGet<infer A, any, any, any, any>
+    ? A
+    : T extends BoundGet<infer A, any, any>
+      ? A
+      : never
+
+/**
+ * The blob errors an {@link AnyGet} raises in its own modes (#179) — `never`
+ * for a get over a member that offloads nothing (and for `any`).
+ */
+export type GetBlobErrors<T> =
+  T extends EntityGet<any, any, infer E, any, any>
+    ? OpBlobErrorsOf<E>
+    : T extends BoundGet<any, infer E, any>
+      ? OpBlobErrorsOf<E>
+      : never
+
+type OpBlobErrorsOf<E> = 0 extends 1 & E ? never : Extract<E, BlobStoreError>
 
 // ---------------------------------------------------------------------------
 // Factory helpers
 // ---------------------------------------------------------------------------
 
 /** @internal */
-export const makeBoundGet = <A, E>(
-  op: EntityGet<A, any, E, any>,
+export const makeBoundGet = <A, E, O extends OffloadState = NoOffloadState>(
+  op: EntityGet<A, any, E, any, any>,
   config: BoundCrudConfig<any>,
-): BoundGet<A, E> => new BoundGetImpl<A, E>(op, config)
+): BoundGet<A, E, O> => new BoundGetImpl<A, E>(op, config) as unknown as BoundGet<A, E, O>
 
 /** @internal */
-export const makeBoundPut = <Model, A, E, VN extends string = string>(
-  op: EntityPut<A, any, E, any>,
+export const makeBoundPut = <
+  Model,
+  A,
+  E,
+  VN extends string = string,
+  O extends OffloadState = NoOffloadState,
+>(
+  op: EntityPut<A, any, E, any, any>,
   config: BoundCrudConfig<Model>,
-): BoundPut<Model, A, E, VN> => new BoundPutImpl<Model, A, E, VN>(op, config)
+): BoundPut<Model, A, E, VN, never, O> =>
+  new BoundPutImpl<Model, A, E, VN>(op, config) as unknown as BoundPut<Model, A, E, VN, never, O>
 
 /** @internal */
-export const makeBoundInsert = <Model, A, E, VN extends string = string>(
-  op: EntityInsert<A, any, E, any>,
+export const makeBoundInsert = <
+  Model,
+  A,
+  E,
+  VN extends string = string,
+  O extends OffloadState = NoOffloadState,
+>(
+  op: EntityInsert<A, any, E, any, any>,
   config: BoundCrudConfig<Model>,
-): BoundInsert<A, E, VN> => new BoundInsertImpl<Model, A, E, VN>(op, config)
+): BoundInsert<A, E, VN, O> =>
+  new BoundInsertImpl<Model, A, E, VN>(op, config) as unknown as BoundInsert<A, E, VN, O>
 
 /** @internal */
-export const makeBoundDelete = <Model, E>(
-  op: EntityDelete<E, any, any, any>,
+export const makeBoundDelete = <Model, E, O extends OffloadState = NoOffloadState>(
+  op: EntityDelete<E, any, any, any, any>,
   config: BoundCrudConfig<Model>,
-): BoundDelete<Model, E> => new BoundDeleteImpl(op, config)
+): BoundDelete<Model, E, void, never, O> =>
+  new BoundDeleteImpl(op, config) as unknown as BoundDelete<Model, E, void, never, O>
 
 /** @internal */
-export const makeBoundUpdate = <Model, A, U, E, VN extends string = string>(
-  op: EntityUpdate<A, any, U, E, any>,
+export const makeBoundUpdate = <
+  Model,
+  A,
+  U,
+  E,
+  VN extends string = string,
+  O extends OffloadState = NoOffloadState,
+>(
+  op: EntityUpdate<A, any, U, E, any, any>,
   config: BoundCrudConfig<Model>,
-): BoundUpdate<Model, A, U, E, VN> =>
-  new BoundUpdateImpl<Model, A, U, E, VN>(op, config) as unknown as BoundUpdate<Model, A, U, E, VN>
+): BoundUpdate<Model, A, U, E, VN, never, string, never, O> =>
+  new BoundUpdateImpl<Model, A, U, E, VN>(op, config) as unknown as BoundUpdate<
+    Model,
+    A,
+    U,
+    E,
+    VN,
+    never,
+    string,
+    never,
+    O
+  >
 
 // ---------------------------------------------------------------------------
 // BoundAppend — time-series append() builder
@@ -830,9 +1001,10 @@ export interface BoundAppend<
   ESkip,
   P extends PropertyKey = never,
   RN extends string = string,
+  O extends OffloadState = NoOffloadState,
 > extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model, P>) => BoundAppend<Model, A, E, ESkip, P, RN>
+  readonly condition: (cond: ConditionArg<Model, P>) => BoundAppend<Model, A, E, ESkip, P, RN, O>
   /**
    * Emit REMOVE clauses for `appendInput` attributes the caller wants cleared
    * on the current item. Cleared attributes also cascade-drop any GSI half
@@ -853,14 +1025,31 @@ export interface BoundAppend<
    *
    * Chained `.remove()` calls accumulate.
    */
-  remove(attrs: ReadonlyArray<RN>): BoundAppend<Model, A, E, ESkip, P, RN>
+  remove(attrs: ReadonlyArray<RN>): BoundAppend<Model, A, E, ESkip, P, RN, O>
   /** Skip the follow-up GetItem; success becomes `void`. */
-  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P, RN>
+  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P, RN, NoOffloadState>
+  /**
+   * Read `current`'s offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). An unknown mode (untyped
+   * code) throws `[EDD-9117]`. A member that offloads nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundAppend<Model, AppendView<A, O, M>, E, ESkip, P, RN, WithModes<O, M>>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
   readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
 }
+
+/** An append's `{ current }` result after `.offloaded(m)`. */
+export type AppendView<A, O extends OffloadState, M extends OffloadMode | OffloadModes> =
+  Offloads<O> extends true
+    ? A extends { readonly current: unknown }
+      ? Omit<A, "current"> & { readonly current: ViewOf<WithModes<O, M>> }
+      : A
+    : A
 
 /** @internal Execution wiring for the time-series append() path. */
 export interface BoundAppendConfig<Model> extends BoundCrudConfig<Model> {
@@ -870,32 +1059,68 @@ export interface BoundAppendConfig<Model> extends BoundCrudConfig<Model> {
     readonly condition: Expr | undefined
     readonly skipFollowUp: boolean
     readonly removeAttrs: ReadonlyArray<string> | undefined
+    readonly offloadModes: Modes
   }) => Effect.Effect<unknown, unknown, never>
 }
 
 /** @internal */
-export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A, E, ESkip> {
+export class BoundAppendImpl<Model, A, E, ESkip>
+  implements Omit<BoundAppend<Model, A, E, ESkip>, "offloaded">
+{
   constructor(
     readonly _input: unknown,
     readonly _config: BoundAppendConfig<Model>,
     readonly _condition: Expr | undefined = undefined,
     readonly _skip: boolean = false,
     readonly _removeAttrs: ReadonlyArray<string> | undefined = undefined,
+    readonly _modes: Modes = DEFAULT_MODES,
   ) {}
 
   condition(cond: ConditionArg<Model>): BoundAppendImpl<Model, A, E, ESkip> {
     const compiled = buildCondition(this._config, cond)
-    return new BoundAppendImpl(this._input, this._config, compiled, this._skip, this._removeAttrs)
+    return new BoundAppendImpl(
+      this._input,
+      this._config,
+      compiled,
+      this._skip,
+      this._removeAttrs,
+      this._modes,
+    )
   }
 
   remove(attrs: ReadonlyArray<string>): BoundAppendImpl<Model, A, E, ESkip> {
     // Chained `.remove()` calls accumulate.
     const merged = this._removeAttrs === undefined ? attrs : [...this._removeAttrs, ...attrs]
-    return new BoundAppendImpl(this._input, this._config, this._condition, this._skip, merged)
+    return new BoundAppendImpl(
+      this._input,
+      this._config,
+      this._condition,
+      this._skip,
+      merged,
+      this._modes,
+    )
   }
 
   skipFollowUp(): BoundAppendImpl<Model, void, ESkip, ESkip> {
-    return new BoundAppendImpl(this._input, this._config, this._condition, true, this._removeAttrs)
+    return new BoundAppendImpl(
+      this._input,
+      this._config,
+      this._condition,
+      true,
+      this._removeAttrs,
+      this._modes,
+    )
+  }
+
+  offloaded(mode: OffloadMode | OffloadModes): BoundAppendImpl<Model, any, E, ESkip> {
+    return new BoundAppendImpl(
+      this._input,
+      this._config,
+      this._condition,
+      this._skip,
+      this._removeAttrs,
+      parseModes(mode, this._modes, "BoundAppend.offloaded"),
+    )
   }
 
   asEffect(): Effect.Effect<A, E, never> {
@@ -904,6 +1129,7 @@ export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A
       condition: this._condition,
       skipFollowUp: this._skip,
       removeAttrs: this._removeAttrs,
+      offloadModes: this._modes,
     }) as Effect.Effect<A, E, never>
   }
 
@@ -917,7 +1143,16 @@ export class BoundAppendImpl<Model, A, E, ESkip> implements BoundAppend<Model, A
 }
 
 /** @internal */
-export const makeBoundAppend = <Model, A, E, ESkip>(
+export const makeBoundAppend = <Model, A, E, ESkip, O extends OffloadState = NoOffloadState>(
   input: unknown,
   config: BoundAppendConfig<Model>,
-): BoundAppend<Model, A, E, ESkip> => new BoundAppendImpl<Model, A, E, ESkip>(input, config)
+): BoundAppend<Model, A, E, ESkip, never, string, O> =>
+  new BoundAppendImpl<Model, A, E, ESkip>(input, config) as unknown as BoundAppend<
+    Model,
+    A,
+    E,
+    ESkip,
+    never,
+    string,
+    O
+  >

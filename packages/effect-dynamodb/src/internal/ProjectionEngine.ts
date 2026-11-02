@@ -69,8 +69,9 @@ import { type RekeyAmbiguity, resolveTtlAttributeName, type TableConfig } from "
 import { attributeValueEquals } from "./AttributeValueEquals.js"
 import * as BlobLedger from "./BlobLedger.js"
 import * as Capacity from "./Capacity.js"
-import { condition as entityCondition } from "./EntityCombinators.js"
-import type { EntityPutImpl } from "./EntityOps.js"
+import { condition as entityCondition, offloaded as entityOffloaded } from "./EntityCombinators.js"
+import { type EntityPutImpl, withReadModes } from "./EntityOps.js"
+import { EAGER_MODES } from "./OffloadRead.js"
 import { handlerOf, type RekeyMember, type RekeyTally } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
@@ -214,7 +215,7 @@ export interface EngineSource {
     parseStreamId(id: string): Effect.Effect<any, ValidationError>
     readFrom(id: any, after: number, options?: any): Effect.Effect<ReadonlyArray<any>, any, any>
     read(id: any, options?: any): Effect.Effect<ReadonlyArray<any>, any, any>
-    readonly query: { events(id: any): Query.Query<any> }
+    readonly query: { events(id: any): Query.Query<any, any, any> }
     decodeStreamImage(image: any): Effect.Effect<Option.Option<any>, ValidationError, any>
   }
   /** `K`, or `Option<K>` (none: the event addresses no row). */
@@ -1246,10 +1247,10 @@ export const makeEngine = (config: EngineConfig) => {
         }
         return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
       }
-      const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
-        string,
-        unknown
-      >
+      // Eager (#179, design §8.4): the engine folds over the row's values.
+      const decoded = (yield* decodeMarshalledItem(readModel as any, item, {
+        offloaded: "eager",
+      })) as Record<string, unknown>
       let values: Record<string, unknown> = decoded
       if (fields !== undefined) {
         values = {}
@@ -1839,9 +1840,11 @@ export const makeEngine = (config: EngineConfig) => {
         // The row alone, through the entity: `put` conditioned on the guard
         // (keeping the row's `createdAt`), or `create` for a new row.
         const value = target.pipe(Option.getOrThrow)
+        // The written row is the result's `state`, typed as the read model's
+        // domain values: its offloaded fields read eagerly (#179, design §8.4).
         const op =
           condition.input === undefined
-            ? readModel.create(value)
+            ? entityOffloaded(readModel.create(value), "eager")
             : (entityCondition(
                 readModel.put(value),
                 condition.input as never,
@@ -1851,20 +1854,24 @@ export const makeEngine = (config: EngineConfig) => {
         const run =
           condition.input === undefined && token === undefined && overRead === undefined && !absent
             ? (op.asEffect() as Effect.Effect<unknown, any, any>)
-            : (op as EntityPutImpl<any, any, any, any>)._builder("model", {
-                condition: (op as EntityPutImpl<any, any, any, any>)._condition,
-                withVectors: (op as EntityPutImpl<any, any, any, any>)._withVectors,
-                putKind: (op as EntityPutImpl<any, any, any, any>)._putKind,
-                createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
-                ...((token !== undefined || overRead !== undefined || absent) && {
-                  projectionWrite: {
-                    attributes: token === undefined ? {} : { [ROW_TOKEN]: token },
-                    condition: Option.isSome(row) ? term : undefined,
-                    expectAbsent: Option.isNone(row),
-                    returnOld: returnOld && Option.isSome(row),
-                  },
+            : withReadModes(
+                readModel as any,
+                EAGER_MODES,
+                (op as EntityPutImpl<any, any, any, any>)._builder("model", {
+                  condition: (op as EntityPutImpl<any, any, any, any>)._condition,
+                  withVectors: (op as EntityPutImpl<any, any, any, any>)._withVectors,
+                  putKind: (op as EntityPutImpl<any, any, any, any>)._putKind,
+                  createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
+                  ...((token !== undefined || overRead !== undefined || absent) && {
+                    projectionWrite: {
+                      attributes: token === undefined ? {} : { [ROW_TOKEN]: token },
+                      condition: Option.isSome(row) ? term : undefined,
+                      expectAbsent: Option.isNone(row),
+                      returnOld: returnOld && Option.isSome(row),
+                    },
+                  }),
                 }),
-              })
+              )
         const written = yield* (run as Effect.Effect<unknown, any, any>).pipe(
           Effect.catchTag("ConditionalCheckFailed", (error: { readonly current?: unknown }) =>
             Effect.fail(

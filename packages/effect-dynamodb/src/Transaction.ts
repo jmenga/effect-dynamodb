@@ -11,6 +11,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import {
+  type BlobStoreError,
   type ConcurrentModification,
   type ConditionalCheckFailed,
   DynamoError,
@@ -29,7 +30,7 @@ import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
-import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
+import type { AnyGet, GetBlobErrors, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
   comparedOperandsOf,
@@ -43,6 +44,7 @@ import {
   composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
+  loadGetRows,
   resolveTableNames,
 } from "./internal/TransactableOps.js"
 import {
@@ -218,15 +220,20 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
 ): Effect.Effect<
   TransactGetResult<T>,
-  DynamoClientError | ValidationError | TransactionCancelled,
+  DynamoClientError | ValidationError | TransactionCancelled | GetBlobErrors<T[number]>,
   DynamoClient | TableConfig
-> => Capacity.operation("Transaction.transactGet", undefined, transactGetCore(items))
+> =>
+  Capacity.operation("Transaction.transactGet", undefined, transactGetCore(items)) as Effect.Effect<
+    TransactGetResult<T>,
+    DynamoClientError | ValidationError | TransactionCancelled | GetBlobErrors<T[number]>,
+    DynamoClient | TableConfig
+  >
 
 const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
 ): Effect.Effect<
   TransactGetResult<T>,
-  DynamoClientError | ValidationError | TransactionCancelled,
+  DynamoClientError | ValidationError | TransactionCancelled | BlobStoreError,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -317,24 +324,27 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
     )
 
     const responses = result.Responses ?? []
-    const decoded: Array<unknown> = []
-
-    for (let i = 0; i < infos.length; i++) {
+    const rows = infos.map((info, i) => {
       const response = responses[i]
-      const entity = infos[i]!.entity
       // A projection tombstone (#154) is no row.
-      const raw =
-        response?.Item && !isProjectionTombstone(response.Item, entity.entityType)
-          ? fromAttributeMap(response.Item)
-          : undefined
-
+      return response?.Item && !isProjectionTombstone(response.Item, info.entity.entityType)
+        ? (fromAttributeMap(response.Item) as Record<string, unknown>)
+        : undefined
+    })
+    // Offloaded fields (#179): every get's rows resolve together, per entity
+    // and per the get's own modes, before any decode.
+    yield* loadGetRows(infos, rows, "Transaction.transactGet")
+    const decoded: Array<unknown> = []
+    for (let i = 0; i < infos.length; i++) {
+      const raw = rows[i]
       if (raw === undefined) {
         decoded.push(undefined)
         continue
       }
-
-      const item = yield* entity._decodeRecord(raw)
-      decoded.push(item)
+      const info = infos[i]!
+      decoded.push(
+        yield* info.entity._decodeRecord(raw, info.offloadModes, "Transaction.transactGet.decode"),
+      )
     }
 
     // Cast rationale: decoded is built as Array<A | undefined> by iterating

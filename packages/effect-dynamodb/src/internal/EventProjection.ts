@@ -35,10 +35,12 @@ import {
 } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
+import type { OffloadState } from "../Offload.js"
 import * as Query from "../Query.js"
 import type { Table, TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import type { EntityGet, EntityPut } from "./EntityOps.js"
+import type { Offloads } from "./OffloadTypes.js"
 import { imageEntityType, type StreamImage } from "./Packed.js"
 import {
   addressed,
@@ -73,18 +75,24 @@ export interface ProjectionReadModel {
   readonly versioned: unknown
   readonly softDelete: unknown
   readonly timeSeries: unknown
-  readonly get: (key: any) => EntityGet<any, any, any, any>
-  readonly put: (input: any) => EntityPut<any, any, any, any>
-  readonly create: (input: any) => EntityPut<any, any, any, any>
+  readonly get: (key: any) => EntityGet<any, any, any, any, any>
+  readonly put: (input: any) => EntityPut<any, any, any, any, any>
+  readonly create: (input: any) => EntityPut<any, any, any, any, any>
   readonly systemFields: { readonly createdAt: string | null }
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
 }
 
-/** The state a projection folds: the read model's model type. */
+/**
+ * The state a projection folds: the read model's model type — its domain
+ * type, offloaded fields included (#179): the engine reads and writes the row
+ * eagerly, whatever its `get`'s default read modes.
+ */
 export type ProjectionState<RM> = RM extends {
-  readonly get: (key: any) => EntityGet<infer A, any, any, any>
+  readonly get: (key: any) => EntityGet<infer A, any, any, any, infer O extends OffloadState>
 }
-  ? A
+  ? Offloads<O> extends true
+    ? O["item"]
+    : A
   : never
 
 /** The read model's primary key, as its `get` takes it. */
@@ -96,10 +104,10 @@ export type ProjectionKey<RM> = RM extends { readonly get: (key: infer K) => any
  * `ConditionalCheckFailed` is the projection's own race signal, never surfaced.
  */
 export type ProjectionReadModelError<RM> =
-  | (RM extends { readonly put: (input: any) => EntityPut<any, any, infer E, any> }
+  | (RM extends { readonly put: (input: any) => EntityPut<any, any, infer E, any, any> }
       ? Exclude<E, ConditionalCheckFailed>
       : never)
-  | (RM extends { readonly get: (key: any) => EntityGet<any, any, infer E, any> }
+  | (RM extends { readonly get: (key: any) => EntityGet<any, any, infer E, any, any> }
       ? Exclude<E, ItemNotFound>
       : never)
 

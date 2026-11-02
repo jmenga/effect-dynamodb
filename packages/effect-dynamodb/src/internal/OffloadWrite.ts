@@ -2,9 +2,9 @@
  * @internal The write side of offloaded fields (#179, design §6.1–§6.5,
  * §6.8, §6.13): which values of a row go to the blob store (per-field
  * thresholds, then the item budget), their uploads through the operation's
- * ledger, the pointers that replace them in the request, and the read-back of
- * what a write stored (its own uploads from the ledger's read cache, other
- * pointers fetched).
+ * ledger, and the pointers that replace them in the request. (A write's
+ * result reads what it stored through `OffloadRead`, its own uploads from the
+ * ledger's read cache.)
  *
  * Everything here works on **stored** attribute names, after renames, sparse
  * flattening and packing: an overflow value arrives as its inline stored form
@@ -43,7 +43,6 @@ import { blobError } from "./BlobCalls.js"
 import { type KeyAttributeValue, objectKey } from "./BlobKeys.js"
 import * as BlobLedger from "./BlobLedger.js"
 import * as BlobMetadata from "./BlobMetadata.js"
-import { EAGER_MODES, makePendingBlob, type PendingBlob, resolveRows } from "./BlobResolver.js"
 import type { BlobStoreService } from "./BlobStoreContract.js"
 import { attributeBytes, itemBytes, utf8Bytes } from "./ItemSize.js"
 import { currentRegistry } from "./Packed.js"
@@ -585,7 +584,7 @@ export const setValues = (
 }
 
 // ---------------------------------------------------------------------------
-// Read back
+// Stored pointers
 // ---------------------------------------------------------------------------
 
 /** The pointer an offloaded attribute's stored value is, if it is a well-formed one. */
@@ -610,49 +609,6 @@ export const pointerOf = (
   }
   return undefined
 }
-
-/**
- * Replace, in place, every well-formed pointer an unmarshalled stored-name row
- * holds on an offloaded attribute with a {@link PendingBlob}. A malformed one
- * is left for the decode to refuse. Returns how many it replaced.
- */
-export const pendingPointers = (info: OffloadInfo, raw: Record<string, unknown>): number => {
-  let found = 0
-  for (const attribute of offloadedAttributes(info)) {
-    const pointer = pointerOf(info, attribute, raw[attribute])
-    if (pointer === undefined) continue
-    const pending: PendingBlob = makePendingBlob({
-      pointer,
-      attribute,
-      field: info.fieldOf[attribute] ?? attribute,
-      kind: Object.hasOwn(info.binary, attribute) ? "binary" : "overflow",
-    })
-    raw[attribute] = pending
-    found++
-  }
-  return found
-}
-
-/**
- * Resolve, in place and eagerly, every pointer an unmarshalled stored-name row
- * holds: an overflow value to its JSON wire form, a binary one to its bytes —
- * what the operation uploaded from the ledger's read cache (no GET), anything
- * else fetched and verified. `committed`: the row is the result of a write
- * that DynamoDB applied, so a store failure says so (design §6.13).
- */
-export const resolveStored = (
-  info: OffloadInfo,
-  raw: Record<string, unknown>,
-  options: { readonly operation: string; readonly committed: boolean },
-): Effect.Effect<void, BlobStoreError | ValidationError> =>
-  pendingPointers(info, raw) === 0
-    ? Effect.void
-    : resolveRows([raw], {
-        entityType: info.entityType,
-        operation: options.operation,
-        modes: EAGER_MODES,
-        committed: options.committed,
-      })
 
 // ---------------------------------------------------------------------------
 // Immutables

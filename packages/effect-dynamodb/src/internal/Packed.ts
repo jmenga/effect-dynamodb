@@ -42,6 +42,7 @@ import type {
   ExternalPackedConfig,
   PackedConfig,
 } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isBlobPointer } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
@@ -57,7 +58,8 @@ import {
 import { Context, Effect, Result } from "effect"
 import { Base64 } from "effect/encoding"
 import { fromAttributeMap } from "../Marshaller.js"
-import type { QueryRawRow } from "../Query.js"
+import type { QueryPrefetch, QueryRawRow } from "../Query.js"
+import type { Modes } from "./BlobResolver.js"
 import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
@@ -409,7 +411,7 @@ const imageError = (ctx: ItemContext, message: string, cause?: unknown): Validat
   })
 
 /** Decode base64 text (or pass bytes through), or the failure naming the attribute. */
-const toBytesSync = (
+export const toBytesSync = (
   value: unknown,
   ctx: ItemContext,
   attribute: string,
@@ -845,14 +847,51 @@ export interface PackedEntityLike {
     | undefined
   /** The stored attributes `_unpackFields` reads by stored form (packed ∪ dispatch-eligible). */
   readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
+  /**
+   * Load a batch of the entity's stored-name rows (#179): unpack by stored
+   * form and resolve blob pointers per the read's modes (see
+   * `OffloadRead.loadRows`). Supersedes `_unpackFields` where present.
+   */
+  readonly _loadRows?:
+    | ((
+        rows: ReadonlyArray<Record<string, unknown>>,
+        options: {
+          readonly operation: string
+          readonly modes: Modes
+          readonly raw?: boolean | undefined
+        },
+      ) => Effect.Effect<void, ValidationError | BlobStoreError>)
+    | undefined
+  /** The stored attributes `_loadRows` may rewrite (a projection naming none runs no hook). */
+  readonly _readAttributes?: ReadonlyArray<string> | undefined
 }
+
+type RowLoader = (
+  raw: Record<string, unknown>,
+  modes: Modes,
+) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+
+/** How a raw row of `entity` is read: `_loadRows` in raw form, or `_unpackFields`. */
+const rawLoaderOf = (entity: PackedEntityLike): RowLoader | undefined => {
+  const load = entity._loadRows
+  if (load !== undefined) {
+    return (raw, modes) => load([raw], { operation: "query.select", modes, raw: true })
+  }
+  const unpack = entity._unpackFields
+  return unpack === undefined ? undefined : (raw) => unpack(raw)
+}
+
+/** The attributes `rawLoaderOf(entity)` may rewrite. */
+const rawAttributesOf = (entity: PackedEntityLike): ReadonlyArray<string> | undefined =>
+  entity._loadRows !== undefined ? entity._readAttributes : entity._dispatchAttributes
 
 /**
  * The raw-row hook of one entity type's projections (`Query.select` /
  * `selectPaths`): reads `attributes` of the type's **own** rows by their stored
- * form, and hands every other row back untouched. `ignoreOwnership()` lets
- * rows of other types through, and their plain strings must never be parsed
- * as packed JSON. The type is read from `__edd_e__`, borrowed into the
+ * form — and resolves their blob pointers per the query's modes (#179) —
+ * and hands every other row back untouched. `ignoreOwnership()` lets rows of
+ * other types through, and their plain strings must never be parsed as
+ * packed JSON. The type is read from `__edd_e__`, borrowed into the
  * projection (and stripped again) when the caller did not select it; a row
  * without it is not attributable, so it is left as is. No hook when there is
  * nothing to read, and none on a projection that names none of `attributes`.
@@ -860,63 +899,110 @@ export interface PackedEntityLike {
 export const ownRowsRawRow = (
   entityType: string,
   attributes: ReadonlyArray<string> | undefined,
-  unpack: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>,
+  unpack: RowLoader,
 ): QueryRawRow | undefined =>
   attributes !== undefined && attributes.length === 0
     ? undefined
     : Object.assign(
-        (raw: Record<string, unknown>) =>
-          raw.__edd_e__ === entityType ? Effect.as(unpack(raw), raw) : Effect.succeed(raw),
+        (raw: Record<string, unknown>, modes: Modes) =>
+          raw.__edd_e__ === entityType ? Effect.as(unpack(raw, modes), raw) : Effect.succeed(raw),
         { reads: ["__edd_e__"], attributes },
       )
 
-/** `Query.make` options for the queries of one entity: guards + raw-row unpack. */
+/**
+ * The page prefetch of an entity's queries (#179, design §8.2): its rows of a
+ * window loaded together — every row (a decoder reads them as the entity's),
+ * or, for a projection, only the entity's own rows (see {@link ownRowsRawRow}).
+ */
+const entityPrefetch = (entity: PackedEntityLike): QueryPrefetch | undefined => {
+  const load = entity._loadRows
+  if (load === undefined || entity._readAttributes?.length === 0) return undefined
+  return (rows, { modes, raw, operation }) =>
+    load(raw ? rows.filter((row) => row.__edd_e__ === entity.entityType) : rows, {
+      operation,
+      modes,
+      raw,
+    })
+}
+
+/** `Query.make` options for the queries of one entity: guards, raw-row hook, page prefetch. */
 export const entityPackedQueryOptions = (
   entity: PackedEntityLike,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow: QueryRawRow | undefined
+  readonly prefetch: QueryPrefetch | undefined
 } => {
-  const unpack = entity._unpackFields
+  const loader = rawLoaderOf(entity)
   return {
     packed: entity._packedGuards ?? [],
     rawRow:
-      unpack === undefined
+      loader === undefined
         ? undefined
-        : ownRowsRawRow(entity.entityType, entity._dispatchAttributes, (raw) => unpack(raw)),
+        : ownRowsRawRow(entity.entityType, rawAttributesOf(entity), loader),
+    prefetch: entityPrefetch(entity),
   }
 }
 
 /**
  * `Query.make` options for a query over several entities (a collection): every
- * member's guards (a path packed in any member is refused, naming it), and a
- * raw-row unpack by the member the row's `__edd_e__` names.
+ * member's guards (a path packed in any member is refused, naming it), a
+ * raw-row read by the member the row's `__edd_e__` names, and a page prefetch
+ * that loads each row by its member (rows of other types are left as they are).
  */
 export const collectionPackedQueryOptions = (
   members: ReadonlyArray<PackedEntityLike>,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow: QueryRawRow | undefined
+  readonly prefetch: QueryPrefetch | undefined
 } => {
   const byType = new Map(members.map((m) => [m.entityType, m]))
   const packed = members.flatMap((m) => m._packedGuards ?? [])
-  const unpacking = members.filter(
-    (m) => m._unpackFields !== undefined && m._dispatchAttributes?.length !== 0,
-  )
-  if (unpacking.length === 0) return { packed, rawRow: undefined }
+  const reading = members.filter((m) => {
+    const attributes = rawAttributesOf(m)
+    return rawLoaderOf(m) !== undefined && attributes?.length !== 0
+  })
+  const loaders = new Map(reading.map((m) => [m.entityType, rawLoaderOf(m)!]))
+  const prefetching = members.filter((m) => entityPrefetch(m) !== undefined)
+  const prefetch: QueryPrefetch | undefined =
+    prefetching.length === 0
+      ? undefined
+      : (rows, { modes, raw, operation }) => {
+          const byMember = new Map<PackedEntityLike, Array<Record<string, unknown>>>()
+          for (const row of rows) {
+            const member = byType.get(row.__edd_e__ as string)
+            if (member?._loadRows === undefined) continue
+            let group = byMember.get(member)
+            if (group === undefined) {
+              group = []
+              byMember.set(member, group)
+            }
+            group.push(row)
+          }
+          return Effect.forEach(
+            byMember,
+            ([member, group]) => member._loadRows!(group, { operation, modes, raw }),
+            { discard: true },
+          )
+        }
+  if (reading.length === 0) return { packed, rawRow: undefined, prefetch }
   // A row of a type that is not a member is never read (`ignoreOwnership()`).
-  const rawRow = (raw: Record<string, unknown>) => {
-    const member = byType.get(raw.__edd_e__ as string)
-    const unpack = member?._unpackFields
-    return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
+  const rawRow = (raw: Record<string, unknown>, modes: Modes) => {
+    const load = loaders.get(raw.__edd_e__ as string)
+    return load === undefined ? Effect.succeed(raw) : Effect.as(load(raw, modes), raw)
   }
   // The member is named by `__edd_e__`, so a projection that does not select
   // it still reads it (borrowed, then stripped — see `Query.QueryRawRow`); a
   // projection naming none of the members' read attributes runs no hook.
-  const attributes = unpacking.every((m) => m._dispatchAttributes !== undefined)
-    ? [...new Set(unpacking.flatMap((m) => m._dispatchAttributes ?? []))]
+  const attributes = reading.every((m) => rawAttributesOf(m) !== undefined)
+    ? [...new Set(reading.flatMap((m) => rawAttributesOf(m) ?? []))]
     : undefined
-  return { packed, rawRow: Object.assign(rawRow, { reads: ["__edd_e__"], attributes }) }
+  return {
+    packed,
+    rawRow: Object.assign(rawRow, { reads: ["__edd_e__"], attributes }),
+    prefetch,
+  }
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
