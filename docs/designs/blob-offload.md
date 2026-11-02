@@ -2758,14 +2758,24 @@ existence tests, nothing DynamoDB evaluates depends on their contents.
 | `s3:AbortMultipartUpload` | aborting on failure / interruption |
 | `s3:GetObjectVersion` | reads by `VersionId`; `HeadObject` by `VersionId` (store-wide sweep); `CopyObject` source |
 | `s3:ListBucket` | so a missing version is `404 NotFound`, not `403 AccessDenied` (F12) |
-| `s3:DeleteObject` | the store's cleanup of an object written to an unversioned bucket (§12.2) |
+| `s3:DeleteObject` | optional: only the fallback of the store's cleanup of an object written to an unversioned bucket, a plain `DeleteObject` after the delete by `VersionId: "null"` is refused (§12.2) |
 | `s3:DeleteObjectVersion` | rollback, reaper, sweep, purge; the cleanup of a `null` version in a suspended bucket (§12.2) |
 | `s3:GetObjectVersionTagging`, `s3:PutObjectVersionTagging` | the sweep's unreferenced-since marks (§11.4) |
 | `s3:ListBucketVersions` | sweeps (per-item and store-wide); purge on S3 (lists the family) |
 | `kms:GenerateDataKey`, `kms:Decrypt` | SSE-KMS uploads (multipart needs both) and reads |
 
-The guide gives a policy scoped to `arn:aws:s3:::<bucket>/<prefix>*` for object actions and the
-bucket ARN with an `s3:prefix` condition for the list actions. An entity's `offload.prefix`
+The guide gives a policy scoped to `arn:aws:s3:::<bucket>/<prefix>*` for object actions, the
+bucket ARN with an `s3:prefix` condition for `s3:ListBucketVersions`, and the bucket ARN with no
+condition for `s3:ListBucket`. S3 consults `s3:ListBucket` when a read finds no such version
+(F12), and AWS documents no `s3:prefix` key for that check (not verified on AWS; MinIO does not
+enforce IAM), so a prefix-conditioned grant cannot be relied on to turn that `403` into a
+`404`; `StringLikeIfExists` is no tighter, since a listing naming no prefix passes it. The
+unconditioned grant lets the principal list every key in the bucket, so the guide recommends a
+bucket used only for offloaded storage, one per environment: object keys are hashed, so a
+listing reveals no item keys or contents, only object counts, sizes and times. The policy
+leaves out the optional `s3:DeleteObject` (a plain delete can place a delete marker anywhere
+under the prefix), and the guide lists per-role subsets (reader, writer, collector). An
+entity's `offload.prefix`
 replaces the store prefix for that entity (§3.3), so the policy must cover every such prefix as
 well (and any earlier prefix whose objects GC still has to delete).
 
@@ -4326,7 +4336,7 @@ a write path, deletes the gate.
       commands from an in-memory bucket (enabled / suspended / never-versioned, CRC-64/NVME
       validation of uploads and parts, full-object checksums, ranges, tags, delete markers,
       paginated listings) with a `faults` hook (fail before, lose the answer after, respond,
-      or pause). `test/blob-s3.test.ts` (45): the `[EDD-9116]` checks, every command's shape,
+      or pause). `test/blob-s3.test.ts` (55 tests): the `[EDD-9116]` checks, every command's shape,
       single PUT vs multipart checksums, part-size adaptation and part 10,001, interruption and
       part failures aborting, the `completeLost` rule per answer, unversioned and suspended
       cleanup (and its fallbacks), copies (encoding, directives, tags, the source's size from
@@ -4335,7 +4345,7 @@ a write path, deletes the gate.
       aborted, the `completeLost` rule by attempt count, reads (chunks, ranges,
       `notFoundRetry`), deletes, listings, marks, presign with a stub and with the real
       presigner (locally), the classification table, the layers (owned and caller clients)
-      and `layerConfig` (47). `test/Offload.stream.test.ts` gains the §19.2 stubbed-`S3Client`
+      and `layerConfig`. `test/Offload.stream.test.ts` gains the §19.2 stubbed-`S3Client`
       half (14): the same checksum single vs multipart, adaptation and `TooLarge`,
       interruption, a refused part and a source failure aborting, a lost `Complete` reported,
       an interruption while a `Complete` (of a put and of a multipart copy) or a `PutObject` is
@@ -4670,6 +4680,81 @@ a write path, deletes the gate.
     signatures of `Packed`, `isPackedConfig`, `getPackedFields` and `stream.storedAs`, §3.1),
     `DESIGN.md` §12 EventStore paragraph and per-operation declared-errors rows, `CLAUDE.md`,
     `README.md`.
+    *Implementation notes (commit 18):*
+    - `examples/guide-blob-offload.ts` (new) with regions `model`, `entity`, `layers`,
+      `memory-layer`, `put`, `stored-form`, `put-stream`, `lazy-handles`, `modes`,
+      `update-one-field`, `decode-stream-record`, `gc`, `gc-reap`, `not-found`, `gc-sweep`,
+      `gc-sweep-store` and `purge`, backing `guides/blob-offload.mdx` (new; sidebar entry after
+      "Packed Storage"). The guide covers every §20 topic plus an S3 options table, the IAM
+      policy as JSON, the error table and the offload codes (EDD-9111, EDD-9114–9120, EDD-9141–9143 and EDD-9146).
+    - `guide-streams.ts` gains regions `offloaded-entity`, `decode-lazy`,
+      `decode-stream-record` and `compare-stored` (a separate contracts table outside the
+      regions); `guide-aggregates.ts` gains `offloaded-edge-entity`, `offloaded-edges` and
+      `offloaded-edges-usage` (a binary-field edge entity on the existing table);
+      `guide-geospatial.ts` gains `offloaded-geo` and `offloaded-geo-usage` (a separate
+      landmarks table). Each example provides `BlobStore.layerMemory()`.
+    - Guide updates: packed-storage, streams, change-feed, projections, lifecycle, timeseries,
+      aggregates (and its error table), geospatial, modeling, testing; tutorial updates:
+      event-sourcing ("Large event payloads"), projections (one row). `api-reference.mdx` gains
+      `BlobStore`, `Offload`, `BlobGc` and `effect-dynamodb/blob/s3` sections and the new
+      `DynamoModel`, `Entity`, `Query`, `DynamoClient`, `EventStore`, `StorageEncoding` and
+      error rows, with the `PackedConfig | ExternalPackedConfig` signatures (§3.1).
+    - `DESIGN.md` gains the EventStore "Offloaded Storage (#179)" subsection and the
+      declared-errors rows for offloading writes and reads, purge, `BlobGc`, `BlobHandle` and
+      `OffloadedValue.read`; `CLAUDE.md` the module tree, dependency lines, gate 4's MinIO note
+      and the test counts; `README.md` the feature bullet and the example row.
+    *Deviations (commit 18):*
+    - **`s3:ListBucket` has no prefix condition** in the guide's policy (§17 said the list
+      actions were prefix-conditioned): AWS documents no `s3:prefix` key for the
+      missing-version check that makes S3 answer `404`. §17 now says so, with what the grant
+      exposes (every key of the bucket, hence a dedicated bucket per environment);
+      `s3:ListBucketVersions` keeps the condition, and the optional `s3:DeleteObject` is left
+      out of the policy.
+    - **`tutorials/projections.mdx` is the attribute-projection tutorial** (`.select()`), not
+      the event-projection one, so §20's handler notes went to `guides/projections.mdx` only;
+      the tutorial gains a row on how a projection returns offloaded fields (overflow parsed
+      eagerly, binary as a `BlobHandle`).
+    - **The example runs every section on both stores**: without `S3_ENDPOINT` it uses
+      `BlobStore.layerMemory()` instead of skipping the S3 sections (§19.5), so the doctest
+      runtime suite exercises it on DynamoDB Local alone. Its GC regions move the clock by
+      providing a shifted `Clock` (an example cannot use `TestClock`) and build the stream
+      records they reap from the table's raw items.
+    - **`tsconfig.examples.json` maps `effect-dynamodb` to core's source.** The examples
+      import `@effect-dynamodb/geo` from source, which resolved `effect-dynamodb` to its build
+      while the examples' entities come from core's source, so two `BlobHandle` declarations
+      defeated `GeoItem`'s narrowing. With one copy of the types, `guide-geospatial.ts`
+      annotates the photo as `Uint8Array | undefined` instead of checking it at run time. Type
+      checking only: `tsx` runs the examples as before.
+    *Debt fixed (commit 18):*
+    - `guides/packed-storage.mdx` said a packed value's base64 text starts with `I`–`P`; with
+      pointers it is `I`–`X`, and its tables now list layout `010`.
+    - `guides/geospatial.mdx` typed `nearby`'s items as `Entity.Record` (they are the entity's
+      decoded rows, typed as the GeoIndex's item type) and said nothing of `put`'s errors and
+      result.
+    - The geo package's README described a bounding-box search and latitude/longitude inputs
+      it does not have; it now describes geo-enriched writes and proximity search.
+    - `CLAUDE.md` named `Option.fromNullable` (not in Effect v4; `fromNullishOr` /
+      `fromNullOr`) and carried stale test counts; `README.md` said "17+" runnable examples.
+    *Port onto 1.42.2 (docs):*
+    - Every offloading member in the examples and snippets sits on a schema with
+      `escapeKeys: true` (`[EDD-9146]`): `guide-blob-offload.ts`'s `AppSchema` (region
+      `schema`), and an escaped schema and table of their own for the offloading members of
+      `guide-aggregates.ts` (`ReportSchema` / `ReportTable` in region `offloaded-edges`, its
+      table created and deleted by the program), `guide-geospatial.ts` and
+      `guide-streams.ts` (outside the regions).
+    - The guide gains a "Key text" section (why, the refusing bind sites, how a 1.x table turns
+      `escapeKeys` on and runs `rekey` before offloading, and the `rekey` refusal of a pointer
+      row), an `insert()` region and paragraph, `[EDD-9146]` in its error table, "Escape the
+      key text" as the first rollout step, and the 1.43.0 version; `upgrading.mdx` gains
+      "Offloaded storage needs `escapeKeys` (1.43)". The 1.36-key stream paragraph is gone with
+      the 1.36 fallback, and the example's S3 credentials are plain `Config.String`s, as main's
+      `layerConfig` reads them (commit 15's port).
+    - Connected timeouts seen only under a full unbounded run on a shared machine
+      (`connected.zorder`, `connected.aggregate-entity-edge-keys`,
+      `connected.update-operand-paths`, and in another run `connected.alias-keys`,
+      `connected.rekey-concurrent-runs`, `connected.sort-key-escaping`) are not this feature's:
+      the failing set changes between runs, and each file alone takes what it takes on main
+      (within 2%). The full suite passes with `--maxWorkers=4`, as gate 4 advises.
 19. **Release** — changeset (`minor`, lockstep), then `pnpm changeset version` (CHANGELOGs,
     versions).
 

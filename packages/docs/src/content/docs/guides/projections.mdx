@@ -294,6 +294,39 @@ const filterCriteria = {
 
 The decoded value's `stream` is the name you gave the stream in the record, so a `switch` on it narrows `event`. Two streams that store events under the same marker throw `[EDD-9082]`.
 
+## Offloaded event data
+
+On a stream whose event `data` is [offloaded to a blob store](/effect-dynamodb/guides/blob-offload/#eventstore-streams) (`storedAs: { data: DynamoModel.Packed({ ..., external }) }`), handlers receive **`LazyStreamEvent`s** by default: `event.data` is an `OffloadedValue`, so a handler dispatches on `event.eventType` and fetches the payload only when it needs it. `{ offloaded: "eager" }` on the projection fetches every event's `data` before the handlers run:
+
+```typescript
+// Lazy (the default): dispatch on eventType, fetch the payload only where it matters
+const DocumentStats = EventStore.projection({
+  stream: DocumentEvents,
+  readModel: DocumentStatsRows,
+  key: (streamId) => ({ documentId: streamId.documentId }),
+  initial: (streamId) => ({ documentId: streamId.documentId, pages: 0, edits: 0, version: 0 }),
+  evolve: (state, event) =>
+    event.eventType === "Uploaded"
+      ? event.data.read().pipe(
+          Effect.map((data) => (data._tag === "Uploaded" ? { ...state, pages: data.pages } : state)),
+        )
+      : Effect.succeed({ ...state, edits: state.edits + 1 }),
+  checkpoint: "version",
+})
+
+// Eager: handlers see the decoded data, as on a stream that does not offload
+const DocumentIndex = EventStore.projection({
+  stream: DocumentEvents,
+  offloaded: "eager",
+  // ...
+})
+```
+
+- **One mode per projection.** The change feed, gap reads, `catchUp` and `rebuild` all decode in it. `EventStore.processBatch` decodes each record once per mode its projections take, and the events of `streams` lazily. An unknown mode is `[EDD-9117]`, thrown when the projection is defined. A `read()` in a handler adds `BlobStoreError` to its errors.
+- **Store failures are never poison.** A record whose decode fails reading the store (an eager projection's fetch, or a pointer left on a stream that no longer offloads `data`) is transient: it is reported in the partial batch response whatever `onDecodeFailure` says, listed in the result's `storeFailures` (not `decodeFailures`) and logged at `Warning`, so the source delivers it again.
+- **A store** must be resolvable where the projection is bound (`EventStore.bindProjection`) or, for unbound calls, where `processBatch` / `runChangeFeed` first runs; otherwise `[EDD-9115]`.
+- **Read models can offload too.** The engine reads the row eagerly and writes it whole. A folded field whose encoded content equals what the row's pointer named when it was read keeps that pointer (under a condition that it is still there), so an unchanged offloaded field isn't uploaded again on every event.
+
 ## Catch-up and rebuild
 
 ```typescript region="catch-up" example="guide-projections.ts"

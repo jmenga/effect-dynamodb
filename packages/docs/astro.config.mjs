@@ -38,6 +38,7 @@ export default defineConfig({
             { label: "Modeling", slug: "guides/modeling" },
             { label: "Sparse Maps", slug: "guides/sparse-maps" },
             { label: "Packed Storage", slug: "guides/packed-storage" },
+            { label: "Offloaded Storage", slug: "guides/blob-offload" },
             { label: "Indexes & Collections", slug: "guides/indexes" },
             { label: "Z-order Indexes", slug: "guides/zorder" },
             { label: "Write Sharding", slug: "guides/sharding" },

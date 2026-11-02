@@ -8,6 +8,7 @@
  *   - Writing items with automatic geo field enrichment
  *   - Proximity search (nearby) with time windows
  *   - Enriching items for use in transactions/batch writes
+ *   - A geo entity with an offloaded (binary) field
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -20,7 +21,9 @@ import { Config, Console, Effect, Layer, Schema } from "effect"
 // Import from geo package source (use "@effect-dynamodb/geo" when published)
 import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 // Import from source (use "effect-dynamodb" when published)
+import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
@@ -91,6 +94,53 @@ const VehicleGeo = GeoIndex.make({
   },
 })
 // #endregion
+
+// A second geo entity, whose photo is kept in the blob store
+// #region offloaded-geo
+class Landmark extends Schema.Class<Landmark>("Landmark")({
+  landmarkId: Schema.String,
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  timestamp: Schema.Number,
+  photo: Schema.Uint8Array,
+  cell: Schema.optional(Schema.String),
+  parentCell: Schema.optional(Schema.String),
+  timePartition: Schema.optional(Schema.String),
+}) {}
+
+const Landmarks = Entity.make({
+  model: DynamoModel.configure(Landmark, {
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
+  }),
+  entityType: "Landmark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["landmarkId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    landmarksByCell: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
+    },
+  },
+})
+
+const LandmarkGeo = GeoIndex.make({
+  entity: Landmarks,
+  index: "landmarksByCell",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+  },
+})
+// #endregion
+
+// Offloading requires escaped key text (objects are named after their row's key)
+const LandmarksSchema = DynamoSchema.make({ name: "fleet", version: 1, escapeKeys: true })
+const LandmarksTable = Table.make({ schema: LandmarksSchema, entities: { Landmarks } })
 
 // ---------------------------------------------------------------------------
 // 4. Main program
@@ -196,6 +246,43 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  parentCell=${enriched.parentCell?.slice(0, 12)}...`)
   yield* Console.log(`  timePartition=${enriched.timePartition}\n`)
 
+  // --- Offloaded fields ---
+  yield* Console.log("=== Offloaded Fields ===\n")
+  const landmarks = yield* DynamoClient.make({ entities: { Landmarks } })
+  yield* landmarks.tables["fleet-landmarks"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* landmarks.tables["fleet-landmarks"]!.create()
+  const jpeg = new Uint8Array(80_000).fill(7)
+
+  // #region offloaded-geo-usage
+  // GeoIndex.bind needs a BlobStore in context for an entity that offloads
+  const landmarkGeo = yield* GeoIndex.bind(LandmarkGeo)
+
+  // A binary field takes a Uint8Array: one type is put's input and nearby's result
+  yield* landmarkGeo.put({
+    landmarkId: "l-1",
+    latitude: 37.8199,
+    longitude: -122.4783,
+    timestamp: now,
+    photo: jpeg,
+  })
+
+  // nearby reads offloaded fields eagerly, for every row its cell queries return
+  const found = yield* landmarkGeo.nearby({
+    center: { latitude: 37.82, longitude: -122.478 },
+    radius: 500,
+    unit: "m",
+  })
+  const photo: Uint8Array | undefined = found[0]?.item.photo // never a handle
+  // #endregion
+
+  if (photo?.length !== 80_000) {
+    throw new Error("expected the landmark's photo")
+  }
+  yield* Console.log(`Landmark ${found[0]!.item.landmarkId}: ${photo.length}-byte photo\n`)
+  yield* landmarks.tables["fleet-landmarks"]!.delete()
+
   // --- Cleanup ---
   yield* db.tables["fleet-table"]!.delete()
   yield* Console.log("Table deleted.")
@@ -213,6 +300,9 @@ const AppLayer = Layer.mergeAll(
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "fleet-table" }),
+  LandmarksTable.layer({ name: "fleet-landmarks" }),
+  // Where Landmarks' photos live (S3 in production: effect-dynamodb/blob/s3)
+  BlobStore.layerMemory(),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

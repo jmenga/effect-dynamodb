@@ -125,6 +125,10 @@ A key can hold composites earlier releases each composed their own way: 1.39.0 o
 
 The unique-constraint sentinel that `restore` wrote under `[object object]` names the key the item left, so `rekey` leaves it and counts it as `skipped.unrecognizedKey`, on every run. The value stays reserved: 1.39.0's soft delete didn't release the sentinel `put` wrote, which names the item's key as `put` wrote it. With `escapeKeys` off that's where the item moves, and with it turned on, that sentinel moves with the item. No write composes `[object object]` for such a value since 1.41.0 (`EDD-9162`), so the leftover sentinel holds nothing back.
 
+## Offloaded storage needs `escapeKeys` (1.43)
+
+[Offloaded storage](/effect-dynamodb/guides/blob-offload/) is new in 1.43.0 and needs `escapeKeys: true`. A member with an offloaded field on any other setting is refused where it is bound (`EDD-9146`). A table that isn't escaped yet turns the setting on as the next section describes, and declares its offloaded fields after `rekey` has finished.
+
 ## Turning `escapeKeys` on over existing data
 
 1. **Set `escapeKeys: true`** in a build, and deploy it everywhere without serving traffic from it yet.
@@ -278,6 +282,8 @@ const backAgain = yield* before.tables.MainTable.rekey({ streams: [Default.Calib
 ```
 
 Going back gives up what the setting gave you, and a set of rows that were told apart by escaping may no longer be: `a#b` + `c` and `a` + `b#c` compose one key with it off. The second to arrive is reported `taken`, and nothing is overwritten.
+
+A table with [offloaded fields](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true) can't go back while its rows hold blob pointers: each object is named after its row's key text, so `rekey` never moves a row that holds one. The run stops at the first such row it meets with a `ValidationError` (`EDD-9146`) naming it, and leaves it where it is; rows reached before it may already have moved. A dry run fails the same way. Store live items' values inline again first, and remove the history rows that copied pointers (retain snapshots, soft-delete tombstones, time-series events). EventStore events can't be rewritten, so a table whose members kept offloaded history or event data keeps `escapeKeys: true` ([details](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true)).
 
 ## What moves, and how
 

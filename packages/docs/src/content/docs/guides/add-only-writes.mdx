@@ -143,6 +143,7 @@ The role's policy must list the sentinel prefix as well, `$my-app#v1#account._un
 | `timeSeries` | Writes the current row and no event, as `create` does |
 | `refs` | Reads each referenced item first, so the role also needs `dynamodb:GetItem` on those items |
 | `versioned: { retain: true }` | Refused |
+| [Offloaded fields](/effect-dynamodb/guides/blob-offload/) (1.43.0) | Uploads them first, as `put` does, then one `INSERT` (or the unique transaction) holding the pointers. A duplicate item's uploads are deleted; the role also needs the store's write permissions |
 
 A retained entity is refused because its version number comes from a query of the retained versions, which the role can't run, and writing a first snapshot would collide with any history already there:
 

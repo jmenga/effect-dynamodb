@@ -183,6 +183,7 @@ const empty = Projection.projection([])
 | Full entity CRUD (get, put, update) | Use `Entity.get()` -- full schema decode |
 | List views with a few columns | Use projection -- reduce network transfer |
 | Items with large string/binary fields | Use projection to exclude them |
+| Fields [offloaded to a blob store](/effect-dynamodb/guides/blob-offload/) | The item holds only a pointer of around 150 bytes, so a raw projection returns the pointer, not the value. A typed `.select()` that omits the field fetches nothing from the store. One that names an overflow field fetches and parses it; one that names a binary field returns a `BlobHandle`, which fetches on `read()` |
 | Need typed model instances | Use `Entity.get()` or `Entity.query` -- schema-decoded |
 
 Projections trade type safety for efficiency. Use them at the edges (API responses, UI data) where you control the shape, and use full Entity operations in domain logic where type safety matters.

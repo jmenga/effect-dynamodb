@@ -57,14 +57,18 @@ All date schemas carry a `DynamoEncoding` annotation that controls how the field
 
 ### Storage Layouts
 
-Values for a field's `storedAs` in `configure` that change how a structured field is laid out on the item.
+Values for a field's `storedAs` in `configure` that change how a field is laid out on the item, or where its value lives.
 
 | Export | Type | Description |
 |--------|------|-------------|
 | `SparseMap` | `(options?: { prefix? }) => SparseMapConfig` | Store a `Schema.Record` as one top-level attribute per entry — see [Sparse Maps](/effect-dynamodb/guides/sparse-maps/) |
-| `Packed` | `(options: { format: "json", compression?: { codec: "gzip" \| "brotli" \| "zstd", threshold? } }) => PackedConfig` | Store an object- or array-shaped field (or EventStore `data` / snapshot `state`) as one JSON string, compressed to binary at or above `threshold` (default 1024 bytes) when smaller. Keep the default: compressing small values (`threshold: 0`) saves read units but makes reads slower. Throws `[EDD-9071]` on invalid options. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) |
-| `isPackedConfig` | `(value) => value is PackedConfig` | Check if a value is a `Packed` config |
-| `getPackedFields` | `(model) => Record<string, PackedConfig>` | Domain field name → config, for every field configured `storedAs: Packed(...)` |
+| `Packed` | `(options: PackedOptions) => PackedConfig` and `(options: ExternalPackedOptions) => ExternalPackedConfig` | Store an object- or array-shaped field (or EventStore `data` / snapshot `state`) as one JSON string, compressed to binary at or above `compression.threshold` (default 1024 bytes) when smaller. Keep the default: compressing small values (`threshold: 0`) saves read units but makes reads slower. `PackedOptions` is `{ format: "json", compression?: { codec: "gzip" \| "brotli" \| "zstd", threshold? }, external?: never }`; `ExternalPackedOptions` adds `external: { threshold? }`, an **overflow** field: inline below `external.threshold` stored bytes (default 65,536; `0` always offloads), in the blob store at or above it. Throws `[EDD-9071]` (packing) or `[EDD-9141]` (`external`) on invalid options. An `external` field requires `escapeKeys: true` on its table's schema (`[EDD-9146]` where its member is bound). See [Packed Storage](/effect-dynamodb/guides/packed-storage/) and [Offloaded Storage](/effect-dynamodb/guides/blob-offload/) |
+| `External` | `(options?: { contentType? }) => ExternalConfig` | A **binary** field offloaded to the blob store: the field's encoded side must be `Uint8Array` (`[EDD-9111]`). `contentType` (default `application/octet-stream`; printable US-ASCII, at most 255 bytes) is the object's when a write names none. Throws `[EDD-9141]` on invalid options. Requires `escapeKeys: true` on its table's schema (`[EDD-9146]` where its member is bound). See [Offloaded Storage](/effect-dynamodb/guides/blob-offload/) |
+| `isPackedConfig` | `(value) => value is PackedConfig \| ExternalPackedConfig` | Check if a value is a `Packed` config, overflow configs included |
+| `isExternalPackedConfig` | `(value) => value is ExternalPackedConfig` | Check if a value is an overflow field's config (`Packed({ external })`) |
+| `isExternalConfig` | `(value) => value is ExternalConfig` | Check if a value is an `External` config |
+| `getPackedFields` | `(model) => Record<string, PackedConfig \| ExternalPackedConfig>` | Domain field name → config, for every field configured `storedAs: Packed(...)`, overflow fields included |
+| `getExternalFields` | `(model) => Record<string, ExternalConfig>` | Domain field name → config, for every field configured `storedAs: External(...)` |
 
 ### Encoding Utilities
 
@@ -80,6 +84,10 @@ Values for a field's `storedAs` in `configure` that change how a structured fiel
 | `DynamoEncoding` | `{ storage: "string" \| "epochMs" \| "epochSeconds", domain: "DateTime.Utc" \| "DateTime.Zoned" \| "Date" }` |
 | `ConfiguredModel<M>` | Wrapper carrying original model + per-field attribute overrides |
 | `RefAnnotation` | `{ _tag: "Ref", refSchemaId?: string }` — annotation metadata for ref fields |
+| `PackedConfig` | `{ format, compression: { codec, threshold } \| undefined, external: undefined }` — what `Packed(...)` returns without `external` |
+| `ExternalPackedConfig` | `{ format, compression, external: { threshold } }` — what `Packed({ external })` returns. Not assignable to `PackedConfig`, so an overflow config can't be typed as an inline one |
+| `ExternalConfig` | `{ contentType }` — what `External(...)` returns |
+| `OffloadFields` / `ExtractOffloadFields<Model>` | `{ overflow, binary }` — the domain field names a configured model offloads, by kind (`NoOffload` when none) |
 
 ### Usage
 
@@ -144,7 +152,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `escapeKeys: true` to escape strings in every key and give numbers numeric key text. It's off by default for all of 1.x, which composes the key text 1.36 did ([Key text](/effect-dynamodb/guides/indexes/#key-text), [its limitations](/effect-dynamodb/guides/indexes/#limitations-with-escapekeys-off), [Upgrading](/effect-dynamodb/guides/upgrading/)) |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `escapeKeys: true` to escape strings in every key and give numbers numeric key text. It's off by default for all of 1.x, which composes the key text 1.36 did. Required by offloaded fields (`[EDD-9146]`, [Offloaded Storage](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true)) ([Key text](/effect-dynamodb/guides/indexes/#key-text), [its limitations](/effect-dynamodb/guides/indexes/#limitations-with-escapekeys-off), [Upgrading](/effect-dynamodb/guides/upgrading/)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -161,7 +169,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Type | Description |
 |------|-------------|
-| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, escapeKeys?: boolean }` |
+| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, escapeKeys?: boolean }`. `escapeKeys: true` is required by offloaded fields (`[EDD-9146]`) |
 | `Casing` | `"lowercase" \| "uppercase" \| "preserve"` |
 
 ### Usage
@@ -221,7 +229,7 @@ The typed client's `db.tables.<Table>` binds the table's operations:
 | `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
 | `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
 | `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
-| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row under key text the schema's `escapeKeys` setting doesn't compose (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does, in either direction: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, nothing is overwritten or merged, and conflicts are reported and left; a row it can't place is counted in `skipped.unrecognizedKey`; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move; `indexKeys` counts index keys that aren't what their row's values compose, and [`repairIndexKeys`](/effect-dynamodb/guides/upgrading/#repairing-index-keys) writes them; with the `reservations` option, `reservations` counts unique sentinels no row holds, and [`releaseOrphanedReservations`](/effect-dynamodb/guides/upgrading/#releasing-orphaned-reservations), with `writesStopped: true`, deletes them, each conditioned on the sentinel and the row it names as read. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`), as it does a row whose own key holds `NaN` under `escapeKeys: true` or one of whose key composites holds a value no form of its schema takes. A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading](/effect-dynamodb/guides/upgrading/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row under key text the schema's `escapeKeys` setting doesn't compose (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does, in either direction: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, nothing is overwritten or merged, and conflicts are reported and left; a row it can't place is counted in `skipped.unrecognizedKey`; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move; `indexKeys` counts index keys that aren't what their row's values compose, and [`repairIndexKeys`](/effect-dynamodb/guides/upgrading/#repairing-index-keys) writes them; with the `reservations` option, `reservations` counts unique sentinels no row holds, and [`releaseOrphanedReservations`](/effect-dynamodb/guides/upgrading/#releasing-orphaned-reservations), with `writesStopped: true`, deletes them, each conditioned on the sentinel and the row it names as read. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`), as it does a row whose own key holds `NaN` under `escapeKeys: true` or one of whose key composites holds a value no form of its schema takes. It refuses to move a row holding a blob pointer: the run stops there with a `ValidationError` (`[EDD-9146]`) naming the row ([Offloaded Storage](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true)). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 
@@ -270,6 +278,7 @@ import { Entity } from "effect-dynamodb"
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
 | `unique` | `Record<string, string[]>` | No | Unique constraint definitions: model fields, or a ref's id (`teamId` for `refs: { team }`); a ref itself is refused (**EDD-9172**) |
 | `refs` | `Record<string, Entity>` | No | Map ref field names to their source entities for ref hydration |
+| `offload` | `{ itemBudget?, prefix? }` | No | For an entity with [offloaded fields](/effect-dynamodb/guides/blob-offload/): `itemBudget` (stored item bytes, 1 … 409,600) offloads still-inline overflow fields, largest first, until the item fits; `prefix` replaces the blob store's prefix for this entity's objects. Invalid options throw `[EDD-9114]`. The resolved settings are on `entity.offload` (`{ itemBudget, prefix, overflow, binary }`, or `undefined` for an entity that offloads nothing) |
 
 ### Operations
 
@@ -377,6 +386,7 @@ These functions transform entity operations via pipe:
 | `deleteFromSet(values)` | `EntityUpdate` | DELETE elements from Set attributes |
 | `returnValues(mode)` | `EntityUpdate`, `EntityDelete` | Control DynamoDB `ReturnValues`. An update takes `"none" \| "allOld" \| "allNew" \| "updatedOld" \| "updatedNew"`; a delete takes `"none" \| "allOld"` (any other mode fails with a `ValidationError` before sending). On an update the result type follows the mode (`UpdateReturn<A, M>`): `"none"` → `undefined`, `"updatedOld"` / `"updatedNew"` → a `Partial` of the top-level attributes the update wrote, `"allOld"` / `"allNew"` → the whole item. Honoured on every update path; with repeated calls the last one wins. On a delete, `"allOld"` returns the deleted item (`undefined` when there was none) on every delete path, and `"none"` nothing; a deleted item that won't decode is `DeleteAppliedButUnreadable` (the delete was applied) |
 | `cascade(config)` | `EntityUpdate` | Propagate source entity changes to target entities that embed it via `DynamoModel.ref`. Config: `{ targets, filter?, mode? }` (dual API) |
+| `offloaded(mode)` | `EntityGet`, `EntityPut`, `EntityUpdate`, `EntityDelete` | Read the op's [offloaded fields](/effect-dynamodb/guides/blob-offload/#read-modes) in `"eager"` or `"lazy"` mode, or `{ overflow?, binary? }` per kind (defaults: overflow eager, binary lazy). Re-types the result (lazy overflow fields `OffloadedValue<A>`, lazy binary fields `BlobHandle`) and its `BlobStoreError`s. An unknown mode (untyped code) throws `[EDD-9117]`. Bound builders have the same `.offloaded()` method (dual API) |
 
 ### Decode Mode Selectors
 
@@ -389,6 +399,8 @@ Control what type an operation returns:
 | `asItem` | `Entity.Item<E>` | Full DynamoDB item (all keys + `__edd_e__`) |
 | `asNative` | `Entity.Marshalled<E>` | Raw DynamoDB `AttributeValue` format |
 
+`asModel`, `asRecord` and `asItem` resolve [offloaded fields](/effect-dynamodb/guides/blob-offload/) in the op's modes; `asNative` returns the stored pointers untouched.
+
 ### Type Extractors
 
 | Type | Description |
@@ -400,6 +412,7 @@ Control what type an operation returns:
 | `Entity.Key<E>` | Primary key attributes only |
 | `Entity.Item<E>` | Full DynamoDB item (model + system + keys + `__edd_e__`) |
 | `Entity.Marshalled<E>` | DynamoDB `AttributeValue` format |
+| `Entity.Read<E, M>` | `Entity.Record<E>` with each offloaded field typed by read modes `M` (default overflow eager, binary lazy): the value, an `OffloadedValue<A>` or a `BlobHandle`. Exactly `Entity.Record<E>` for an entity that offloads nothing |
 
 ### Schema & Attribute Accessors
 
@@ -409,7 +422,8 @@ Control what type an operation returns:
 | `keyFieldNames(entity)` | List physical field names for all keys |
 | `compositeAttributes(entity)` | List all composite attribute names across indexes |
 | `itemSchema(entity)` | Get the item-level decode schema |
-| `decodeMarshalledItem(entity, item)` | Decode a DynamoDB item (DynamoDB JSON with `B` as bytes or base64, or already unmarshalled) as a table read does: packed fields by stored form, sparse maps rebuilt, renames reversed. Fails with `ValidationError` (a missing compressor's `cause` is `CompressorNotRegistered`) |
+| `decodeMarshalledItem(entity, item, options?)` | Decode a DynamoDB item (DynamoDB JSON with `B` as bytes or base64, or already unmarshalled) as a table read does: packed fields by stored form, sparse maps rebuilt, renames reversed. Offloaded fields are **lazy** by default (`options.offloaded`: `"eager"`, `"lazy"` or `{ overflow?, binary? }`), and the result is typed `Entity.Read<E, M>` for an entity that offloads (`unknown` otherwise). Fails with `ValidationError` (a missing compressor's `cause` is `CompressorNotRegistered`), and with `BlobStoreError` when resolving eagerly |
+| `decodeStreamRecord(entity, record, options?)` | `Effect<Option<EntityChange<A, F>>, ValidationError \| …>` — decode both images of a `NEW_AND_OLD_IMAGES` stream record (`StreamRecordLike`: the SDK's, Lambda's, EventBridge Pipes' or Kinesis Data Streams' shape). `Option.none()` for a record of another entity type. `EntityChange` is `{ eventName, oldItem: Option<A>, newItem: Option<A>, offloaded: { [field]?: "unchanged" \| "rewritten" \| "changed" \| "added" \| "removed" } }`, classified from the two pointers with no store I/O (`rewritten`: same checksum and size, probably the same content). Items lazy by default. A record of another view type, or missing an image its event needs, is a `ValidationError` naming `[EDD-9119]`. See [DynamoDB Streams](/effect-dynamodb/guides/streams/#change-detection) |
 
 ### Usage
 
@@ -494,6 +508,7 @@ import { Query } from "effect-dynamodb"
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
 | `filterExpr(expr)` | Dual | Add an `Expr` ADT filter (from callback API) |
 | `selectPaths(paths)` | Dual | Project path segments (from callback API) |
+| `offloaded(mode)` | Dual | Read [offloaded fields](/effect-dynamodb/guides/blob-offload/#read-modes) in `"eager"` / `"lazy"` mode, or `{ overflow?, binary? }`; re-types the item. Call before `filterBy` (after it, or with an unknown mode, it throws `[EDD-9117]`). EventStore queries (`query.events`, `query.index`) take `"lazy"` for `LazyStreamEvent`s |
 
 ### Terminals
 
@@ -592,6 +607,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.onRequest(observer)` | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. See [Inspecting a query](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest). |
 | `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, DynamoDB rejects the query and it fails with a `ValidationError` naming the index. An entity's indexes are GSIs when `db.tables.*.create()` creates them. |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
+| `.offloaded(mode)` | Read [offloaded fields](/effect-dynamodb/guides/blob-offload/#read-modes) eagerly or lazily (`"eager"`, `"lazy"`, or `{ overflow?, binary? }`), re-typing the items. Eager values are fetched in a page-level prefetch within the query's `limit`. Call it before `.filterBy()`, or it throws `[EDD-9117]`. Also on collection queries and vector searches. |
 
 ### Terminals
 
@@ -1128,8 +1144,9 @@ import { DynamoClient } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `DynamoClient` | `Context.Service` | Effect service class |
-| `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials |
-| `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values |
+| `DynamoClient.layer(config)` | `Layer<DynamoClient>` | Create live layer with region + optional endpoint/credentials. `credentials` is `{ accessKeyId, secretAccessKey, sessionToken? }`, all strings (`sessionToken` for temporary credentials) |
+| `DynamoClient.layerConfig(config)` | `Layer<DynamoClient, ConfigError>` | Create live layer from Effect `Config` providers. Accepts `{ region, endpoint?, credentials? }` as `Config.Config<...>` values; the credentials are strings, read with `Config.String` |
+| `blobStore` option | `BlobStoreService` | On `DynamoClient.make({ ..., blobStore })`: bind the [blob store](#blobstore) into every operation of that client (bound builders handed to `Batch`, `Transaction` and `additionalItems` keep it), ahead of an ambient `BlobStore`. A member with an offloaded field and no store resolvable at `make` is the `[EDD-9115]` defect, and one on a schema without `escapeKeys: true` the `[EDD-9146]` defect; an invalid store throws `[EDD-9116]` |
 | `compressors` option | `ReadonlyArray<Compressor>` | On `layer` / `layerConfig`: also provide a `Compression` registry for [packed storage](/effect-dynamodb/guides/packed-storage/) (the layer's output becomes `DynamoClient \| Compression`); it does not survive a wrapper layer that consumes this layer through `Layer.provide`, so prefer `Compression.layer([...])` merged into the application layer. On `DynamoClient.make({ ..., compressors })`: bind the registry into every operation of that client, ahead of any ambient `Compression` |
 
 ### Service Methods
@@ -1402,7 +1419,8 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 | `measureSnapshot(streamId, state, asOfVersion)` | `Effect<number, ValidationError, TableConfig>` — the item size of the snapshot `writeSnapshot` would write |
 | `decodeStreamImage(image, options?)` | `Effect<Option<StreamEvent<TEvent, M>>, ValidationError>` — decode a DynamoDB Streams `NewImage` / `OldImage` (DynamoDB JSON with `B` as bytes or base64, or unmarshalled) into the `StreamEvent` the read paths return; `Option.none()` for an image that is not one of this stream's events |
 | `decodeStreamImage(image, { raw: true })` | `Effect<Option<RawStreamEvent<TEvent, M>>, ValidationError>` — the same, each event also carrying `rawData`: its `data` as stored, in wire form (parsed JSON of a packed value, or the unmarshalled map), unmodelled fields included |
-| `storedAs` | `{ data: PackedConfig \| undefined, state: PackedConfig \| undefined }` — the stream's resolved storage settings |
+| `storedAs` | `{ data: PackedConfig \| ExternalPackedConfig \| undefined, state: PackedConfig \| ExternalPackedConfig \| undefined }` — the stream's resolved storage settings. `makeStream({ storedAs: { data } })` and `snapshot.storedAs` take either config: an `ExternalPackedConfig` (`Packed({ external })`) offloads values at or over its threshold to the [blob store](/effect-dynamodb/guides/blob-offload/#eventstore-streams) |
+| `offload` | `{ itemBudget, prefix, overflow }` (`StreamOffloadSettings`) or `undefined` — the resolved `makeStream({ offload })` settings (`overflow`: `"data"` and / or `"state"`). `offload` takes `{ itemBudget?, prefix? }`, as on entities (`[EDD-9114]`) |
 | `streamIdFields` | The stream id's composite fields, in declaration order |
 | `eventMarker` | The `__edd_e__` value of the stream's event items (`<streamname>.event`, lower-cased) |
 | `parseStreamId(streamId)` | `Effect<StreamIdInput, ValidationError>` — the structured id of a `StreamEvent.streamId` (composites joined with `#`); a multi-field id whose part count differs from its field count (a value containing `#`) is ambiguous and fails |
@@ -1481,7 +1499,11 @@ Read models folded from DynamoDB Streams in version order, gap-filled from the e
 | `NestedAppendOptions<M, State>` | `appendOp`'s options: `AppendOptions` without `additionalItems`, `idempotency` and `headProof` |
 | `StreamAppendOp` / `AppendWriteOp` | `StreamAppendOp` is what `appendOp` returns; `AppendWriteOp` is `TransactWriteOp \| StreamAppendOp`, the element type of `append`'s and the handler's `additionalItems`. Passing a `TransactWriteOp[]` in still compiles; code that reads these option types and forwards the value to `Transaction.transactWrite` must annotate it `ReadonlyArray<TransactWriteOp>` |
 | `EventMetadataInput<State, Event, M, E3, R3>` | `(decision: Decision<State, Event>) => ReadonlyArray<M \| undefined> \| Effect<ReadonlyArray<M \| undefined>, E3, R3>` — a handler's `eventMetadata` |
-| `ReadOptions` | `{ consistentRead?: boolean }` |
+| `ReadOptions` | `{ consistentRead?: boolean, offloaded?: "eager" \| "lazy" }` — `offloaded` (default `"eager"`) on a stream with offloaded `data`: `"lazy"` returns `LazyStreamEvent`s |
+| `CurrentVersionOptions` | `{ consistentRead?: boolean }` — `currentVersion` never reads `data`, so it takes no `offloaded` |
+| `ReadSnapshotOptions` | `{ offloaded?: "eager" \| "lazy" }` — `readSnapshot`'s options; `"lazy"` returns a `LazySnapshot` |
+| `LazyStreamEvent<A, M>` / `LazyRawStreamEvent<A, M>` / `LazySnapshot<S>` | A `StreamEvent` whose `data` is an `OffloadedValue<A>` (`yield* event.data.read()`), its raw twin (`rawData` lazy too), and a `Snapshot` whose `state` is an `OffloadedValue<S>`. What lazy reads, `decodeStreamImage` and projection handlers return for a stream with offloaded `data` / `state` |
+| `AppendMeasurement` | `{ events, sentinel, snapshot, transactionBytes, offloaded }` — `measureAppend`'s result. `offloaded` lists each value the append would offload (`{ item: number \| "snapshot", attribute: "data" \| "state", objectBytes }`); the sizes count each as its pointer at its upper bound, and nothing is uploaded |
 | `ReadLatestOptions` | `ReadOptions & { verifySnapshot?: boolean }` — `readLatest`'s options |
 | `LatestState<State, Event>` | `{ snapshot: Option<Snapshot<State>>, events: ReadonlyArray<StreamEvent<Event>>, version: number, seal?: StreamEvent<Event> }` — `seal` is kept out of `events` when the snapshot already folds it in |
 | `Snapshot<State>` | `{ state, asOfVersion, timestamp }` |
@@ -1495,6 +1517,8 @@ Read models folded from DynamoDB Streams in version order, gap-filled from the e
 | `ProjectionOutcome` | `({ _tag: "Applied", positions } & ProjectionApplied) \| { _tag: "Failed", streamId, key, positions, error }` |
 | `ReadFromOptions` | `ReadOptions & { toVersion?: number }` — `readFrom`'s options |
 | `StreamRecord` | `{ eventID?, eventName?, dynamodb?: { SequenceNumber?, NewImage? } }` — structural; no `aws-lambda` dependency |
+
+**Offloaded event data.** On a stream whose `data` or snapshot `state` is `Packed({ external })`: writes (`append`, `commandHandler`, `appendOp`, `writeSnapshot`) upload before their transaction and add `BlobStoreError`; reads are eager by default, `{ offloaded: "lazy" }` on `read` / `readFrom` / `readLatest` / `readSnapshot` / `readIndex`, and `decodeStreamImage(image, { offloaded })` is lazy by default. `EventStore.projection` and `multiProjection` take `offloaded: "lazy"` (default) or `"eager"` (`[EDD-9117]` for another value); a record whose decode fails reading the store is never poison: it is reported in the batch response and listed in the result's `storeFailures` (`{ record, error: BlobStoreError }`). Writes (`append`, `commandHandler`, `appendOp`) carry `BlobStoreError` when `data` or the snapshot `state` offloads; `writeSnapshot` and an eager `readSnapshot` only when `state` does; eager event reads only when `data` does, and `readLatest`, which reads both, when either does. Binding (`bind`, `bindProjection`) or a first unbound operation without a `BlobStore` is the `[EDD-9115]` defect. See [Offloaded Storage](/effect-dynamodb/guides/blob-offload/#eventstore-streams).
 
 ### Usage
 
@@ -1567,7 +1591,7 @@ import {
 | `ChangeFeedBatch` | `{ streamArn, shardId, records, firstSequenceNumber, lastSequenceNumber, commit(), complete(response) }` — `records` non-empty, in sequence order, shaped like Lambda's (`ChangeFeedRecord`, the SDK's `GetRecords` record). `commit()` checkpoints at `lastSequenceNumber`; `complete({ batchItemFailures })` (identifiers = `SequenceNumber`) checkpoints at the record before the earliest failure and re-reads the shard from it after a growing backoff — any identifier naming no record fails the whole batch. Both `Effect<void, CheckpointStoreError \| ChangeFeedLeaseLost>`: the first acknowledgement whose write succeeds counts (later ones are no-ops), a failed write can be retried and writes again, and once the lease is lost they fail with `ChangeFeedLeaseLost`, writing nothing |
 | `runChangeFeed(feed, { projections, streams?, onBatch?, onDecodeFailure?, image?, concurrency? })` | `Effect<void, E \| CheckpointStoreError \| ChangeFeedLeaseLost \| StreamRecordIdentifierMissing, R \| projections' R>` — each batch through `EventStore.processBatch(batch.records, { source: "lambda", ... })`, `onBatch(batch, result)` (before the acknowledgement; its failure ends the run unacknowledged), then `batch.complete(result.response)`. Batches of different shards run concurrently |
 | `lease` option | `{ duration? (30 s), renewEvery? (duration / 3, must be < duration / 2), onHeld?: "fail" \| "wait", owner? (random UUID) }` or `false`. One lease per consumer and stream in the checkpoint store: taken at start, renewed, released when the stream ends. A renewal the store fails to write is retried until `renewEvery` before the lease lapses, then fails the feed. Held elsewhere: `ChangeFeedLeaseHeld` (or wait); taken over while running: `ChangeFeedLeaseLost`. Once lost, in-flight acknowledgements fail with `ChangeFeedLeaseLost`. Not a fencing token |
-| `DynamoStreamsClient` | `Context.Service` (`@effect-dynamodb/DynamoStreamsClient`): `describeStream`, `getShardIterator`, `getRecords`, `listStreams`, each `Effect<Output, DynamoStreamsClientError>`. `layer({ region, endpoint?, credentials? })`, `layerConfig({ region, endpoint?, credentials? })` (Effect `Config`s), `layerFromSdkClient(client)` |
+| `DynamoStreamsClient` | `Context.Service` (`@effect-dynamodb/DynamoStreamsClient`): `describeStream`, `getShardIterator`, `getRecords`, `listStreams`, each `Effect<Output, DynamoStreamsClientError>`. `layer({ region, endpoint?, credentials? })`, `layerConfig({ region, endpoint?, credentials? })` (Effect `Config`s), `layerFromSdkClient(client)`. `credentials` as `DynamoClient.layer`'s |
 | `CheckpointStore` | `Context.Service` (`@effect-dynamodb/CheckpointStore`): `load(feed)`, `commit(feed, shardId, checkpoint)`, `acquireLease(feed, owner, duration)`, `renewLease(feed, owner, duration)`, `releaseLease(feed, owner)`; `feed` is `{ streamArn, consumer }`, a checkpoint `{ _tag: "Sequence", sequenceNumber }` or `{ _tag: "Finished" }`. `layerMemory` (process-local), `layerDynamoDB({ tableName, finishedTtl? })` (needs `DynamoClient`; `finishedTtl` default 2 days, at least 28 hours — `[EDD-9084]` below, `CheckpointStore.minFinishedTtl`), `makeMemory()` / `makeDynamoDB(options)` as values |
 | `CheckpointStore.tableDefinition(tableName)` | The checkpoint table's `CreateTable` input: `pk` (S, HASH) + `sk` (S, RANGE), on demand. Items: `{ pk: "<consumer>#<streamArn>", sk: "shard#<shardId>", sequenceNumber \| finished, updatedAt, ttl? }` and `{ pk, sk: "lease", owner, expiresAt }`; `ttl` (epoch s) only on finished shards, `finishedTtl` out (default 2 days) |
 
@@ -1586,9 +1610,116 @@ import {
 
 ---
 
+## BlobStore
+
+The service [offloaded values](/effect-dynamodb/guides/blob-offload/) live in. Read with `Effect.serviceOption`, so no operation gains a requirement. Precedence: `DynamoClient.make({ blobStore })`, then a store in context when a member is bound, then at run time.
+
+```typescript
+import { BlobStore } from "effect-dynamodb"
+```
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `BlobStore` | `Context.Service<BlobStore, BlobStoreService>` | The service (`@effect-dynamodb/BlobStore`) |
+| `BlobStore.layer(service)` | `Layer<BlobStore>` | Provide any implementation of the contract. Throws `[EDD-9116]` for an invalid store |
+| `BlobStore.memory(options?)` | `MemoryBlobStore` | An in-memory store for tests: `versioning` (`"versioned"` or `"keyPerWrite"`), `prefix`, `presign`, `maxVersionBytes`, `maxUploadAge`, `readConcurrency`, `writeConcurrency`, `readChunkBytes`, simulated multipart (`partSize`, `maxParts`, `uploadConcurrency`, `partAttempts`), `clock`, and a `failures` hook (`(call: MemoryBlobCall) => MemoryBlobFault \| undefined \| Effect<…>`). `inspect()` returns `{ versions, calls, multipart }`. See [Testing](/effect-dynamodb/guides/testing/#offloaded-storage) |
+| `BlobStore.layerMemory(options?)` | `Layer<BlobStore>` | `BlobStore.layer(BlobStore.memory(options))` |
+| `BlobStore.crc64nvme` | `(bytes) => Uint8Array` (and `.make()`, an incremental hasher) | The CRC-64/NVME the library checksums content with, for store implementers |
+| `BlobStoreFailure` | `Data.TaggedError` | What a store's operations fail with: `{ reason, ref?, completeLost?, cause }` (`completeLost`: a multipart completion whose response was lost). The library wraps it in a `BlobStoreError` naming the entity, attribute and operation |
+
+**The contract (`BlobStoreService`).** `name`, `prefix`, `limits` (`{ maxVersionBytes, maxKeySuffixBytes }`), `maxUploadAge`, `readConcurrency` and `writeConcurrency`, and:
+
+| Operation | Contract |
+|-----------|----------|
+| `put(request)` | Store `request.body` (bytes or a stream, with `contentLength`, `contentType`, `checksum`, `metadata`) under `request.key`; return `{ ref: { key, version }, size }`. The ref must be immutable: the bytes it names never change |
+| `get(ref, { range? })` | `Stream<Uint8Array, BlobStoreFailure>` of the version's bytes, or a `{ offset, length }` range |
+| `delete(refs)` | Idempotent: deleting an absent ref succeeds |
+| `copy?(source, request)` | Server-side copy into a new version (a `BlobHandle` input read through the same store) |
+| `list?(prefix, { startAfter? })` | Every version under a prefix, keys ascending, newest first (the sweeps) |
+| `head?(ref)` | The metadata the library wrote with the version (`gc.sweepStore`) |
+| `marks?` | `{ get, set, clear }` unreferenced-since marks; `get` returns `Option<Date>` (the sweeps) |
+| `presign?(ref, { expiresIn, contentType? })` | A presigned GET URL (`BlobHandle.presignedUrl`) |
+
+The library computes every checksum and verifies sizes and checksums on read, and enforces `maxUploadAge` itself, so a store is never trusted for either. A store without versioning satisfies the contract by returning a new key per write with version `""`.
+
+## Offload
+
+Read modes, lazy values, binary inputs, the unsettled-upload observer and change classification for [offloaded storage](/effect-dynamodb/guides/blob-offload/).
+
+```typescript
+import { Offload } from "effect-dynamodb"
+```
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `source(body, options?)` | `(Uint8Array \| Stream<Uint8Array>, { contentType?, contentLength? }) => BlobSource` | A binary field's write input with the object's content type and length. A source stream longer or shorter than `contentLength` fails the write with `SourceFailed`; invalid options are `[EDD-9120]` |
+| `layerObserver({ onUnsettled })` | `Layer<never>` | Receive every upload the library could not settle, once its operation exits: `UnsettledUpload { reason, table, entityType, attribute, operation, rowKey, key, ref: Option<BlobRef>, store, cause? }`, `reason` one of `inDoubt`, `rollbackFailed`, `completeLost`, `interrupted`, `answerRefused`. `rowKey` is the key of the row the object is keyed by (an event item for a time-series append). A failing observer is logged and never changes the operation's result |
+| `compareStored(old, new, kind)` | `Effect<OffloadChange, ValidationError>` | Classify one offloaded attribute across two stored values (DynamoDB JSON, `B` as bytes or base64; `undefined` when absent; `kind` `"overflow"` or `"binary"`): `unchanged`, `rewritten`, `changed`, `added` or `removed`, with no store I/O. `StoredAttributeValue` is the accepted value type |
+| `isBlobHandle` / `isOffloadedValue` / `isBlobSource` | type guards | |
+
+| Type | Description |
+|------|-------------|
+| `OffloadedValue<A>` | A lazy overflow value: `location` (`"inline"` \| `"external"`), `ref: Option<BlobRef>`, `size`, `checksum`, `read(): Effect<A, BlobStoreError \| ValidationError>`. Captures the reading fiber's store and compressors, so `read()` has `R = never`; an inline value reads with no I/O |
+| `BlobHandle` | A lazy binary value: `location`, `ref`, `size`, `contentType`, `checksum`, `read({ range? })`, `stream({ range? })`, `presignedUrl({ expiresIn? })` (each failing with `BlobStoreError`) (default 15 minutes; `Unsupported` on an inline handle or a store without `presign`). `Equal` by location and ref, or by checksum and size when inline. A full read is verified by size and CRC64NVME; a ranged read is not; `stream()` verifies as its last chunk arrives. As a write input it is copied into a new version, never shared |
+| `BinaryInput` | `Uint8Array \| Stream<Uint8Array> \| BlobHandle \| BlobSource` — what a binary field's write input accepts. A `Stream` is single-use (`[EDD-9120]` on reuse) |
+| `OffloadMode` / `OffloadModes` | `"eager" \| "lazy"`, and `{ overflow?, binary? }` |
+| `BlobRef` | `{ key, version }` — one immutable object version |
+| `OffloadChange` | `"unchanged" \| "rewritten" \| "changed" \| "added" \| "removed"` |
+| `WriteBlobErrors<F>` / `ReadBlobErrors<F, M>` | `BlobStoreError` for a member with offloaded fields `F` (reads: only where `M` is eager for a kind present), `never` otherwise |
+
+## BlobGc
+
+Opt-in garbage collection of superseded offloaded versions: a stream reaper and two-pass sweeps. See [Garbage collection](/effect-dynamodb/guides/blob-offload/#garbage-collection).
+
+```typescript
+import { BlobGc } from "effect-dynamodb"
+```
+
+| Export | Description |
+|--------|-------------|
+| `BlobGc.make({ entities?, aggregates?, streams?, reaper?, sweep? })` | `Effect<Collector, never, DynamoClient \| TableConfig>`. Members are the entities, aggregates and streams that offload, by the name the sweeps take; the `BlobStore` is resolved from context (`[EDD-9115]` without one). A member on a table whose schema doesn't set `escapeKeys: true` is the `[EDD-9146]` defect, checked first. `reaper`: `{ gracePeriod?` (default 15 minutes), `confirm?: "auto" \| "always" }`. `sweep`: `{ gracePeriod? }` (default the larger of 24 hours and the store's `maxUploadAge` + 15 minutes; at least 1 hour and at least `maxUploadAge` + 15 minutes). Invalid options are the `[EDD-9118]` defect |
+| `collector.reap(records, { table? })` | `Effect<ReapReport, GcError>` — free each own version a batch of `NEW_AND_OLD_IMAGES` stream records superseded (Lambda, EventBridge Pipes, Kinesis Data Streams, or a change-feed batch with `{ table: batch.streamArn }`), once the newest candidate record is the grace old. `ReapReport` is `{ records, candidates, freed, retained, foreign, skipped }`. A record lacking the images it needs is the `[EDD-9119]` defect |
+| `collector.sweep(name, key)` | `Effect<SweepReport, GcError>` — sweep one entity item family: mark every version no row holds (and old enough not to be in flight), delete a version marked at least the grace ago. `SweepReport` is `{ referenced, listed, marked, deleted, retainedYoung, foreign, busy }` |
+| `collector.sweepPartition(name, key)` | `Effect<SweepReport, GcError>` — the same over an aggregate's partition or a stream's |
+| `collector.sweepStore({ prefix?, startAfter?, maxFamilies? })` | `Stream<StoreSweepFamily, GcError>` — list the store (by default its prefix and every member's `offload.prefix`) and sweep each item family a member owns. Each family is `Swept { familyPrefix, member, report }`, `Foreign { familyPrefix, table: Option<string> }` or `Unattributable { familyPrefix, versions, bytes }`. Resumable with `startAfter` |
+| `GcError` | `DynamoClientError \| BlobStoreError \| ValidationError` |
+
+GC is table-local: only versions under the keys a member computes from its own table name are ever deleted, so restored tables, imports and copies never delete their source's versions. The sweeps need a store with `list` and `marks` (`sweepStore` also `head`).
+
+## S3 blob store (`effect-dynamodb/blob/s3`)
+
+The `BlobStore` over a versioned S3 bucket. A subpath: it needs `@aws-sdk/client-s3` (an optional peer dependency, `^3.1104.0`), which the main entry never imports.
+
+```typescript
+import * as S3BlobStore from "effect-dynamodb/blob/s3"
+```
+
+| Export | Description |
+|--------|-------------|
+| `layer(options)` | `Layer<BlobStore>` from `S3BlobStoreOptions` |
+| `layerConfig(config)` | `Layer<BlobStore, ConfigError>` from Effect `Config`s (`S3BlobStoreConfig`): `bucket`, `prefix`, `region`, `endpoint`, `forcePathStyle`, `credentials` (`{ accessKeyId, secretAccessKey, sessionToken? }`, as `DynamoClient.layerConfig` reads them), `partSize`, `uploadConcurrency`, `readConcurrency`, `writeConcurrency`, `maxUploadAge`; the other options static |
+| `make(options)` | `Effect<BlobStoreService, never, Scope>` — the store in a scope, for wiring by hand |
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `bucket` | — | A bucket with versioning **enabled**: an upload answered without a real `VersionId` fails with `Unversioned`, and its object is deleted |
+| `prefix` | `""` | At most 256 bytes, not starting with `/` |
+| `client` / `clientConfig` | — | An `S3Client` you own, or the config of one the layer builds and destroys (its `responseChecksumValidation` defaults to `"WHEN_REQUIRED"`). Not both |
+| `partSize` | 8 MiB | Multipart part size, 5 MiB … 5 GiB |
+| `uploadConcurrency` / `readConcurrency` / `writeConcurrency` | 4 / 16 / 8 | Parts per upload; store reads and uploads per operation |
+| `maxUploadAge` | 1 hour | 1 minute … 7 days |
+| `serverSideEncryption` | — | `{ ServerSideEncryption, SSEKMSKeyId?, BucketKeyEnabled? }` on every upload |
+| `storageClass` | — | `StorageClass` of every upload |
+| `notFoundRetry` | — | A `Schedule` retrying reads that find no such version (replica lag) |
+| `presign` | — | `{ getSignedUrl }` from `@aws-sdk/s3-request-presigner`, for `BlobHandle.presignedUrl` |
+
+Invalid options are the `[EDD-9116]` defect. Object Lock and MFA Delete are unsupported (rollback and GC deletes fail). See [the IAM policy](/effect-dynamodb/guides/blob-offload/#iam) and [lifecycle rules](/effect-dynamodb/guides/blob-offload/#lifecycle-rules).
+
+---
+
 ## StorageEncoding
 
-Helpers for [packed storage](/effect-dynamodb/guides/packed-storage/). Compressors come from the `Compression` service in context; none of these adds a requirement. The Effect forms cost one Effect per call and look the registry up only for a compressed value; to decode many values with no Effect per value, resolve the registry once (`yield* Effect.serviceOption(Compression)`) and call a `*Sync` twin in a loop.
+Helpers for [packed storage](/effect-dynamodb/guides/packed-storage/) and [offloaded](/effect-dynamodb/guides/blob-offload/) pointers. Compressors come from the `Compression` service in context; none of these adds a requirement. The Effect forms cost one Effect per call and look the registry up only for a compressed value; to decode many values with no Effect per value, resolve the registry once (`yield* Effect.serviceOption(Compression)`) and call a `*Sync` twin in a loop.
 
 ```typescript
 import { StorageEncoding } from "effect-dynamodb"
@@ -1597,11 +1728,12 @@ import { StorageEncoding } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `encode` | `(storedAs, wire) => Effect<AttributeValue \| undefined, ValidationError>` | The `AttributeValue` a wire (encoded) value is stored as: `S`, `B`, `NULL`, or `undefined` for no attribute |
-| `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON |
-| `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged |
+| `decode` | `(stored: AttributeValue) => Effect<unknown, ValidationError>` | Read a stored `AttributeValue` (DynamoDB JSON) by its form (native, `S`, `B` as bytes or base64) and return its wire form as plain JSON. An overflow pointer is resolved through the `BlobStore` in context; a store failure is the `ValidationError`'s `cause` |
+| `decodeUnmarshalled` | `(stored: unknown) => Effect<unknown, ValidationError>` | The same for an already-unmarshalled value: a JSON string, bytes or base64 text, or a native value returned unchanged. Resolves pointers as `decode` does |
+| `pointer` | `(stored: AttributeValue \| { B: string } \| Uint8Array \| string) => Option<BlobPointer>` | The blob pointer a stored value holds (an overflow field's `B`, or a binary field's `~edbp:` text), pure: `{ kind: "json" \| "bytes", codec, ref, objectSize, contentSize, checksum, contentType: Option<string> }`. `Option.none()` for any other value |
 | `valueBytes` | `({ schema, value, storedAs? }) => Effect<number, ValidationError>` | The DynamoDB size of one attribute value as stored: packed under `storedAs`, or as a native map when it is omitted |
 | `valueBytesSync` | `({ schema, value, storedAs?, compressors? }) => number` | `valueBytes`, synchronously, for pure planning code: the schema encode runs synchronously, compressors are passed in (none by default), and a failure throws the `ValidationError` `valueBytes` fails with |
-| `encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | `(…, options?: { compressors? }) => …` | Synchronous twins of `encode` / `decode` / `decodeUnmarshalled` for pure code: compressors are passed explicitly (a `Compression.make(...)` registry or a list; none by default) and a failure **throws** the `ValidationError` the Effect form fails with |
+| `encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | `(…, options?: { compressors? }) => …` | Synchronous twins of `encode` / `decode` / `decodeUnmarshalled` for pure code: compressors are passed explicitly (a `Compression.make(...)` registry or a list; none by default) and a failure **throws** the `ValidationError` the Effect form fails with. They do no I/O, so a blob pointer is refused (a `ValidationError`) |
 | `limits` | `{ item: 409_600, transaction: 4_194_304, request: 16_777_216 }` | DynamoDB's item and `TransactWriteItems` size limits, and the request body limit (AWS documents 16 MB for `BatchWriteItem`; DynamoDB Local rejects any request body over 16 MiB, HTTP 413), in bytes |
 
 ## Compression
@@ -1646,7 +1778,7 @@ import {
   AggregateDecompositionError, AggregateTransactionOverflow,
   CascadePartialFailure, VersionConflict, AppendTooLarge,
   AdditionalItemConditionFailed, DuplicateCommand, StreamSealed,
-  CompressorNotRegistered,
+  CompressorNotRegistered, BlobStoreError,
 } from "effect-dynamodb"
 ```
 
@@ -1685,6 +1817,7 @@ import {
 | `AdditionalItemConditionFailed` | `"AdditionalItemConditionFailed"` | A condition the caller set on an `EventStore.append({ additionalItems })` op (`.condition()`, `create()`, `Transaction.check`) failed — NOT a version conflict, and never an op the caller set no condition on (`streamName`, `streamId`, `indices`, `reasons`) |
 | `DuplicateCommand` | `"DuplicateCommand"` | A `commandId` was already applied to this stream (`streamName`, `streamId`, `commandId`) |
 | `StreamSealed` | `"StreamSealed"` | An append's stream is sealed (`streamName`, `streamId`, `sealedVersion`: the sealing event's version, the stream's final one): an append, a nested `appendOp`, or a command handler whose load found the seal. Terminal, never retried. Precedence is per stream: within one stream's items it ranks after `DuplicateCommand` and ahead of that stream's `VersionConflict`; across streams the appending stream's own verdict comes first, then nested `appendOp`s in op order (the first failing op wins), then the other additional items |
+| `BlobStoreError` | `"BlobStoreError"` | A blob store operation for an [offloaded field](/effect-dynamodb/guides/blob-offload/#errors) failed (`entityType`, `attribute`, `operation`, `action`, `reason`, `ref?`, `committed`, `cause`). `reason` is `NotProvided`, `Unversioned`, `NotFound`, `AccessDenied`, `Throttled`, `ChecksumMismatch`, `TooLarge`, `SourceFailed`, `Expired`, `Unsupported`, `Unavailable` or `Rejected`. `committed: true` means the DynamoDB write was applied and only reading its result failed: don't retry a non-idempotent write. Only in the error channels of members with offloaded fields |
 | `CompressorNotRegistered` | `"CompressorNotRegistered"` | Never in an error channel — the `cause` of the `ValidationError` a [packed](/effect-dynamodb/guides/packed-storage/) value fails with when it needs a compression codec that is not registered: writing a value over its threshold, or reading a `B` value whose header names the codec (`codec`, `direction: "compress" \| "decompress"`, `entityType`, `attribute`, `operation`) |
 
 ### Credential refusals
@@ -1703,7 +1836,7 @@ Fields that hold an item or your values are read but never printed: `UniqueConst
 
 ### Errors by operation
 
-Each operation declares a fixed error union, whatever the entity's configuration. Every union also includes `DynamoClientError`, plus ref and vector errors where the entity has refs or vector indexes. `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
+Each operation declares a fixed error union, whatever the entity's configuration. Every union also includes `DynamoClientError`, plus ref and vector errors where the entity has refs or vector indexes. `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it. A member with [offloaded fields](/effect-dynamodb/guides/blob-offload/) adds `BlobStoreError` to every write (and to `Batch.write`, `Transaction.transactWrite` and `additionalItems` that include its ops), and to a read only where the read's mode is eager for a kind it has: overflow fields are eager by default, binary fields lazy.
 
 | Operation | Declared errors (besides `DynamoClientError`) |
 |-----------|-----------------------------------------------|
@@ -1715,11 +1848,15 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
-| `purge` | `ValidationError` |
+| `purge` | `ValidationError`, plus `BlobStoreError` for an entity that offloads (it needs the store up front) |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, plus `BlobStoreError` when `data` or the snapshot `state` offloads (an inline snapshot uploads its state) |
+| Aggregate `create` / `update` / `get` / `list` | plus `BlobStoreError` for an aggregate with offloaded edge fields (reads are eager); `delete` never reaches the store |
+| `BlobGc` `reap` / `sweep` / `sweepPartition` / `sweepStore` | `GcError`: `ValidationError`, `BlobStoreError` |
+| `BlobHandle` `read` / `stream` / `presignedUrl` | `BlobStoreError` only (no `DynamoClientError`) |
+| `OffloadedValue.read` | `BlobStoreError`, `ValidationError` (no `DynamoClientError`) |
 
 ### Usage
 

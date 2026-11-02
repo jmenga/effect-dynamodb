@@ -6,6 +6,8 @@
  *   - Entity.itemSchema() for decoding unmarshalled format
  *   - Entity.Marshalled<E> type helper
  *   - Processing multiple entity types via __edd_e__ discriminator
+ *   - Offloaded fields in stream images: lazy decoding, Entity.decodeStreamRecord
+ *     change detection, Offload.compareStored and StorageEncoding.pointer
  *
  * The handlers are written for a Lambda consuming DynamoDB Streams. DynamoDB
  * Local has no stream trigger, so the demo writes items through the typed
@@ -20,14 +22,17 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Config, Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Marshaller from "../src/Marshaller.js"
+import * as Offload from "../src/Offload.js"
+import * as StorageEncoding from "../src/StorageEncoding.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -204,6 +209,84 @@ const handleTaskChange = (task: Entity.Record<typeof TaskEntity>) =>
 // #endregion
 
 // ---------------------------------------------------------------------------
+// 7. Offloaded fields in stream images
+// ---------------------------------------------------------------------------
+
+// #region offloaded-entity
+class Contract extends Schema.Class<Contract>("Contract")({
+  contractId: Schema.String,
+  terms: Schema.Struct({ clauses: Schema.Array(Schema.String) }),
+  signed: Schema.Uint8Array,
+}) {}
+
+const ContractEntity = Entity.make({
+  model: DynamoModel.configure(Contract, {
+    // In the blob store at or over 32 KiB stored, inline below
+    terms: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 32_768 } }) },
+    // Always in the blob store
+    signed: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+  }),
+  entityType: "Contract",
+  primaryKey: {
+    pk: { field: "pk", composite: ["contractId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+// #endregion
+
+// Offloading requires escaped key text (objects are named after their row's key)
+const ContractsSchema = DynamoSchema.make({ name: "myapp", version: 1, escapeKeys: true })
+const ContractsTable = Table.make({ schema: ContractsSchema, entities: { ContractEntity } })
+
+// #region decode-lazy
+const handleContractImage = (image: Record<string, AttributeValue>) =>
+  Effect.gen(function* () {
+    // Typed for an entity that offloads: its offloaded fields come back lazy
+    const contract = yield* Entity.decodeMarshalledItem(ContractEntity, image)
+    const terms = yield* contract.terms.read() // OffloadedValue: one GET, on read()
+    const header = yield* contract.signed.read({ range: { offset: 0, length: 4 } }) // BlobHandle
+
+    // { offloaded: "eager" } resolves both kinds while decoding
+    const eager = yield* Entity.decodeMarshalledItem(ContractEntity, image, {
+      offloaded: "eager",
+    })
+    const pdf: Uint8Array = eager.signed
+    return { clauses: terms.clauses.length, header, bytes: pdf.length }
+  })
+// #endregion
+
+// #region decode-stream-record
+// A record of a NEW_AND_OLD_IMAGES stream: both images, and what the change
+// did to each offloaded field, read from the two pointers alone
+const handleContractRecord = (record: Entity.StreamRecordLike) =>
+  Effect.gen(function* () {
+    const change = yield* Entity.decodeStreamRecord(ContractEntity, record)
+    if (Option.isNone(change)) return "not a contract"
+    const { offloaded, newItem } = change.value
+    // "rewritten" is probably the same content: a consumer that must never
+    // miss a change treats it as "changed"
+    const signed = offloaded.signed
+    if (signed === "unchanged" || Option.isNone(newItem)) return "signature unchanged"
+    const bytes = yield* newItem.value.signed.read() // fetched only here
+    return `signature ${signed}: ${bytes.length} bytes to re-index`
+  })
+// #endregion
+
+// #region compare-stored
+// Without an entity: classify one attribute of the two images, and read a pointer
+const compareSigned = (record: Entity.StreamRecordLike) =>
+  Effect.gen(function* () {
+    const oldImage = record.dynamodb?.OldImage as Record<string, AttributeValue> | undefined
+    const newImage = record.dynamodb?.NewImage as Record<string, AttributeValue> | undefined
+    const change = yield* Offload.compareStored(oldImage?.signed, newImage?.signed, "binary")
+    const pointer =
+      newImage?.signed === undefined ? Option.none() : StorageEncoding.pointer(newImage.signed)
+    // pointer.value → { kind: "bytes", ref: { key, version }, objectSize, contentType, … }
+    return { change, pointer }
+  })
+// #endregion
+
+// ---------------------------------------------------------------------------
 // Demo: feed the handlers a stream event built from real stored images
 // ---------------------------------------------------------------------------
 
@@ -264,6 +347,75 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Unmarshalled decode: ${decoded.displayName}`)
 
   yield* db.tables.MainTable.delete()
+
+  // Offloaded fields: a contract whose terms and signed PDF are in the blob store
+  const contracts = yield* DynamoClient.make({
+    entities: { ContractEntity },
+    tables: { ContractsTable },
+  })
+  const { name: contractsTable } = yield* ContractsTable.Tag
+  yield* contracts.tables.ContractsTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* contracts.tables.ContractsTable.create()
+
+  const pdfOf = (size: number, fill: number) => {
+    const bytes = new Uint8Array(size).fill(fill)
+    bytes.set([0x25, 0x50, 0x44, 0x46]) // %PDF
+    return bytes
+  }
+  const clauses = Array.from({ length: 400 }, (_, i) => `Clause ${i}: ${"x".repeat(90)}`)
+  const storedContract = Effect.gen(function* () {
+    const { Items = [] } = yield* client.scan({ TableName: contractsTable })
+    return Items[0]!
+  })
+
+  yield* contracts.entities.ContractEntity.put({
+    contractId: "c-1",
+    terms: { clauses },
+    signed: pdfOf(2_000, 1),
+  })
+  const before = yield* storedContract
+  assertEq(StorageEncoding.pointer(before.terms!)._tag, "Some", "terms offloaded")
+
+  const fromImage = yield* handleContractImage(before)
+  assertEq(fromImage.clauses, 400, "lazy terms read")
+  assertEq(Array.from(fromImage.header), [0x25, 0x50, 0x44, 0x46], "ranged read")
+  assertEq(fromImage.bytes, 2_000, "eager signed")
+  yield* Console.log(`Contract image: ${fromImage.clauses} clauses, ${fromImage.bytes} PDF bytes`)
+
+  // Re-sign the contract: a MODIFY record carrying both images
+  yield* contracts.entities.ContractEntity.update({ contractId: "c-1" }).set({
+    signed: pdfOf(3_000, 2),
+  })
+  const after = yield* storedContract
+  const record: Entity.StreamRecordLike = {
+    eventName: "MODIFY",
+    dynamodb: {
+      OldImage: before,
+      NewImage: after,
+      StreamViewType: "NEW_AND_OLD_IMAGES",
+    },
+  }
+  const outcome = yield* handleContractRecord(record)
+  assertEq(outcome, "signature changed: 3000 bytes to re-index", "change detection")
+  yield* Console.log(outcome)
+
+  const compared = yield* compareSigned(record)
+  assertEq(compared.change, "changed", "compareStored")
+  assertEq(
+    Option.map(compared.pointer, (pointer) => pointer.kind),
+    Option.some("bytes"),
+    "binary pointer",
+  )
+  // The terms were not rewritten: the same pointer in both images
+  assertEq(
+    yield* Offload.compareStored(before.terms, after.terms, "overflow"),
+    "unchanged",
+    "terms unchanged",
+  )
+
+  yield* contracts.tables.ContractsTable.delete()
 })
 
 const AppLayer = Layer.mergeAll(
@@ -273,6 +425,9 @@ const AppLayer = Layer.mergeAll(
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "streams-demo-table" }),
+  ContractsTable.layer({ name: "streams-demo-contracts" }),
+  // The blob store offloaded values live in: in memory for the demo
+  BlobStore.layerMemory(),
 )
 
 Effect.runPromise(program.pipe(Effect.provide(AppLayer))).then(() => console.log("\nDone."))

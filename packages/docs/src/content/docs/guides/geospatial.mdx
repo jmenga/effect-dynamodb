@@ -105,7 +105,7 @@ const VehicleGeo = GeoIndex.make({
 
 ### Writing with Geo Enrichment
 
-After binding with `GeoIndex.bind()`, use `vehicleGeo.put()` instead of the entity's `put()` — it automatically computes and sets the geo fields:
+After binding with `GeoIndex.bind()`, use `vehicleGeo.put()` instead of the entity's `put()`. It computes and sets the geo fields, then writes through the entity's own `put`, so it fails with that put's errors and returns the written item:
 
 ```typescript region="put" example="guide-geospatial.ts"
 const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
@@ -153,7 +153,7 @@ for (const { item, distance } of results) {
 | `sort` | `"ASC"` \| `"DESC"` | `"ASC"` | Sort by distance |
 | `pkFilter` | `Record<string, unknown>` | — | Values for any GSI partition-key composites besides `parentCell` and `timePartition` (a tenant, for example) |
 
-**Returns:** `Array<{ item: Entity.Record, distance: number }>` — sorted by distance, filtered to the exact radius using great-circle distance.
+**Returns:** `Array<{ item, distance: number }>`, sorted by distance and filtered to the exact radius using great-circle distance. Each `item` is decoded as the entity's own queries decode a row (a model class instance for a `Schema.Class` model), typed as the GeoIndex's item type: the entity's put input, with binary fields as bytes (see [Offloaded fields](#offloaded-fields)).
 
 `timeWindow` filters items, not just partitions. The search queries every hourly partition the window touches, then keeps only the items whose `timePartition.source` timestamp lies within `[start, end]`, so a 30-second window returns only items from those 30 seconds, never the rest of the hour. The filtered-out items are still read from those partitions and consume read capacity, so cost scales with the number of hours the window touches, not with how long the window is.
 
@@ -171,6 +171,79 @@ const enriched = VehicleGeo.enrich({
 // enriched now has cell, parentCell, timePartition set
 // Use in Transaction.write() or Batch.write()
 ```
+
+### Offloaded fields
+
+A geo entity can [offload fields to a blob store](/effect-dynamodb/guides/blob-offload/) (`DynamoModel.Packed({ ..., external })` or `DynamoModel.External()`). `GeoIndex` adds no option:
+
+```typescript region="offloaded-geo" example="guide-geospatial.ts"
+class Landmark extends Schema.Class<Landmark>("Landmark")({
+  landmarkId: Schema.String,
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  timestamp: Schema.Number,
+  photo: Schema.Uint8Array,
+  cell: Schema.optional(Schema.String),
+  parentCell: Schema.optional(Schema.String),
+  timePartition: Schema.optional(Schema.String),
+}) {}
+
+const Landmarks = Entity.make({
+  model: DynamoModel.configure(Landmark, {
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
+  }),
+  entityType: "Landmark",
+  primaryKey: {
+    pk: { field: "pk", composite: ["landmarkId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    landmarksByCell: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "timePartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
+    },
+  },
+})
+
+const LandmarkGeo = GeoIndex.make({
+  entity: Landmarks,
+  index: "landmarksByCell",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+  },
+})
+```
+
+```typescript region="offloaded-geo-usage" example="guide-geospatial.ts"
+// GeoIndex.bind needs a BlobStore in context for an entity that offloads
+const landmarkGeo = yield* GeoIndex.bind(LandmarkGeo)
+
+// A binary field takes a Uint8Array: one type is put's input and nearby's result
+yield* landmarkGeo.put({
+  landmarkId: "l-1",
+  latitude: 37.8199,
+  longitude: -122.4783,
+  timestamp: now,
+  photo: jpeg,
+})
+
+// nearby reads offloaded fields eagerly, for every row its cell queries return
+const found = yield* landmarkGeo.nearby({
+  center: { latitude: 37.82, longitude: -122.478 },
+  radius: 500,
+  unit: "m",
+})
+const photo: Uint8Array | undefined = found[0]?.item.photo // never a handle
+```
+
+- **`GeoIndex.bind`** checks the entity and its context as `Entity.bind` does: an entity that offloads a field needs a table schema that sets `escapeKeys: true` (`[EDD-9146]`, see [key text](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true)), a `BlobStore` (`[EDD-9115]`), and every codec its `Packed` fields name registered (`[EDD-9078]`). All three are defects at bind.
+- **One item type.** A GeoIndex types `put`'s input and `nearby`'s results with one type, so a binary field is a `Uint8Array` on both sides: `put` takes no `Stream`, handle or `Offload.source` for it, and results never hold a lazy handle.
+- **`nearby` reads eagerly, both kinds.** Each cell query's page is resolved together, and the search's parallel queries share one pool of the store's `readConcurrency`. Offloaded values are fetched for **every row a cell query returns**, including rows the time window and the radius then drop: keep large values out of entities whose searches return many rows outside the window.
+- **Errors.** `put` and `nearby` add `BlobStoreError` for an entity that offloads, and only for one.
 
 ## How the Query Works
 

@@ -356,7 +356,96 @@ describe("EmployeeEntity", () => {
 })
 ```
 
+## Offloaded Storage
+
+An entity with [offloaded fields](/effect-dynamodb/guides/blob-offload/) needs a `BlobStore` wherever it is bound. In unit tests, use the in-memory store: create it once per test, provide it with `BlobStore.layer`, and inspect it afterwards:
+
+```typescript title="documents.test.ts"
+import { describe, expect, it } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { BlobStore, DynamoClient } from "effect-dynamodb"
+// Body, Documents and MainTable as in the Offloaded Storage guide's model; TestLayer as above
+
+describe("Documents", () => {
+  it.effect("uploads the scan before the item is written", () => {
+    const store = BlobStore.memory({ presign: true })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Documents }, tables: { MainTable } })
+      yield* db.entities.Documents.put({
+        docId: "d-1",
+        owner: "ada",
+        title: "Report",
+        body: new Body({ text: "Short", words: 1 }),
+        scan: new Uint8Array(1_000),
+      })
+
+      const { versions, calls } = store.inspect()
+      expect(calls.put).toBe(1)
+      expect(versions[0]?.contentType).toBe("application/pdf")
+      expect(versions[0]?.metadata["edd-attr"]).toBe("scan")
+    }).pipe(Effect.provide(Layer.mergeAll(TestLayer, BlobStore.layer(store))))
+  })
+})
+```
+
+`BlobStore.layerMemory(options)` builds a fresh store per layer, when the test never inspects it. `BlobStore.memory(options)` takes:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `versioning` | `"versioned"` | `"versioned"` (stable keys, version ids, as S3) or `"keyPerWrite"` (a new key per write, version `""`, for code that must work on a store without versioning) |
+| `presign` | `false` | implement `presign`, with fake `memory://` URLs |
+| `prefix` | `""` | the store prefix |
+| `maxUploadAge` | 1 hour | as the S3 store's |
+| `partSize`, `maxParts`, `uploadConcurrency`, `partAttempts` | 8 MiB, 10,000, 4, 3 | simulated multipart uploads. Any positive `partSize` works (no 5 MiB floor), so a test can exercise multipart with small bodies |
+| `readConcurrency`, `writeConcurrency`, `readChunkBytes` | 16, 8, 65,536 | per-operation limits, and the chunk size of `get` |
+| `maxVersionBytes` | 32 (0 per key-per-write) | the declared `limits.maxVersionBytes`, which the item budget's pointer bound uses |
+| `clock` | the calling fiber's | where `lastModified` comes from |
+| `failures` | none | a fault-injection hook (below) |
+
+**`inspect()`** returns `{ versions, calls, multipart }`: every stored version (`ref`, `size`, `bytes`, `contentType`, `metadata`, `lastModified`, `isLatest`, and the sweep's `mark` as an `Option<Date>`), a count of calls per action (`put`, `get`, `delete`, `copy`, `list`, `head`, `mark`, `presign`), and multipart counts (`creates`, `parts`, `completes`, `aborts`, `inProgress`).
+
+**Fault injection.** `failures` is asked about every call, with `{ action, n, key?, ref?, refs?, mark?, multipart? }` (`n` counts calls of that action, 1-based), and returns a fault, `undefined` to let the call run, or an `Effect` of either (to pause a call):
+
+```typescript
+const store = BlobStore.memory({
+  failures: (call) =>
+    // The second upload is stored but its response is lost: the write fails, and the
+    // stray version is left for the sweeps (gc.sweep of the item, or gc.sweepStore)
+    call.action === "put" && call.n === 2 ? { _tag: "Fail", reason: "Unavailable", at: "response" } : undefined,
+})
+```
+
+- `{ _tag: "Fail", reason }` fails the call with that `BlobStoreError` reason; `{ _tag: "Interrupt" }` interrupts it.
+- `at: "request"` (the default) fails **without** taking effect, after consuming the body (or `afterChunks` chunks of it). `at: "response"` takes effect first (the version is stored, or deleted), then loses the response.
+- A multipart phase (`create`, `part`, `complete`, `abort`) is asked with `action: "multipart"`; a `complete` fault `at: "response"` stores the version and reports `completeLost` to the observer.
+
+**Time.** `lastModified` comes from the fiber's `Clock`, so `TestClock.adjust` drives the reaper's grace, the sweep's age and grace checks and `maxUploadAge` in `it.effect` tests without waiting. Against MinIO, which dates versions with the wall clock, set the `TestClock` to the wall clock first (`TestClock.setTime(Date.now())`) and move it on between passes.
+
+### Connected tests against MinIO
+
+The S3 store runs unchanged against [MinIO](https://min.io), an S3-compatible server:
+
+```bash
+docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  cgr.dev/chainguard/minio server /data
+```
+
+```typescript
+const BlobLayer = S3BlobStore.layer({
+  bucket: "test-blobs", // created by the test, with PutBucketVersioning Enabled
+  clientConfig: {
+    endpoint: "http://localhost:9000",
+    forcePathStyle: true,
+    region: "us-east-1",
+    credentials: { accessKeyId: "minioadmin", secretAccessKey: "minioadmin" },
+  },
+})
+```
+
+The library never creates or configures a bucket: create it in the test setup and enable versioning, or every upload fails with `Unversioned`. The library's own connected suites read `S3_ENDPOINT` (default `http://localhost:9000`) and skip their blob tests when DynamoDB Local or MinIO isn't reachable.
+
 ## What's Next?
 
 - [Getting Started](/effect-dynamodb/getting-started/) — Quick start guide
 - [DynamoDB Streams](/effect-dynamodb/guides/streams/) — Process change events from DynamoDB Streams
+- [Offloaded Storage](/effect-dynamodb/guides/blob-offload/) — Large and binary values in a blob store

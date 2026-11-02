@@ -245,7 +245,7 @@ const AppSchema = DynamoSchema.make({
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
 | `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
-| `escapeKeys` | `boolean` | `false` | `true` escapes strings and gives numbers numeric key text, in every key, partition and sort (§7 "Key text"): all or nothing. Off stores exactly the 1.36 text, for strings and numbers, with accepted limitations. Off by default for all of 1.x; on by default is planned for the next major. Over existing rows, `rekey` moves them |
+| `escapeKeys` | `boolean` | `false` | `true` escapes strings and gives numbers numeric key text, in every key, partition and sort (§7 "Key text"): all or nothing. Off stores exactly the 1.36 text, for strings and numbers, with accepted limitations. Off by default for all of 1.x; on by default is planned for the next major. Over existing rows, `rekey` moves them. Required by offloaded fields (`EDD-9146`, "Offloaded Storage") |
 
 ### Casing Rules
 
@@ -964,7 +964,10 @@ silently left. Run
 it once every instance runs this release under the setting (another instance writes its own text
 again); dry run first. It returns a `RekeyReport` (`Table.ts`) and fails with `ValidationError`
 (`EDD-9098`) for a bad option or resume token, or with the `DynamoClientError` of a request that
-failed.
+failed. It refuses to move a row that holds a blob pointer (`EDD-9146`, "Offloaded Storage"):
+offloading requires `escapeKeys: true`, so such a row is only met after the setting was turned off
+over rows offloading wrote; the run stops at that row, rows reached before it may already have
+moved, and nothing is written for it.
 
 **Driver** (`internal/Rekey.ts`). A `Scan` of the table — `segments` fibers
 (`Segment` / `TotalSegments` when more than one), `pageSize` as `Limit`, a
@@ -7809,6 +7812,65 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   fails with the operation's existing `ValidationError`, whose `cause` is a
   `CompressorNotRegistered` — no error channel changes.
 
+### Offloaded Storage (#179)
+
+```typescript
+const Ledger = EventStore.makeStream({
+  table, streamName: "Ledger", events: [Recorded, Voided], streamId: { composite: ["ledgerId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json", external: { threshold: 131_072 } }) },
+  snapshot: {
+    schema: LedgerState, mode: "inline",
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" }, external: {} }),
+  },
+  offload: { itemBudget: 350_000 },
+})
+```
+
+Event `data` and snapshot `state` may be overflow values (§7 "Offloaded Storage"): packed
+inline below `external.threshold`, a pointer to a blob-store object at or above it.
+`offload: { itemBudget?, prefix? }` applies per event item and per snapshot item
+(`[EDD-9114]`); `stream.offload` exposes `{ itemBudget, prefix, overflow }` and
+`stream.storedAs` types each slot `PackedConfig | ExternalPackedConfig | undefined`.
+
+- **Write.** `append` uploads every routed `data` (and the inline snapshot's `state`)
+  before its transaction, keyed per event item, and settles the uploads by DynamoDB's
+  answer (§7 "Consistency"); a `commandHandler` retry at the same version with the same
+  content reuses its uploads, and a retry at another version deletes the cancelled
+  attempt's; `appendOp` uploads with the
+  append that carries it; `writeSnapshot` rolls back the upload of a snapshot that loses
+  its monotonic race. Projection rows reuse a read pointer only when the folded value's
+  encoded content equals what the pointer named, under a `#f = :P` condition.
+- **Read.** Eager by default: `read`, `readFrom`, `readLatest`, `readSnapshot` and
+  `readIndex` resolve pointers within the store's `readConcurrency`; `{ offloaded: "lazy" }`
+  (and `Query.offloaded("lazy")` on `query.events` / `query.index`) returns
+  `LazyStreamEvent` / `LazyRawStreamEvent` / `LazySnapshot`, whose `data` / `state` is an
+  `OffloadedValue`. `currentVersion` never reads `data` (`CurrentVersionOptions` has no
+  mode). Raw rows (`select`) return an overflow `data` as its fetched, parsed JSON.
+- **Streams and projections.** Lazy by default (decision 5): `decodeStreamImage`,
+  `EventProjection` / `MultiProjection` handlers, `EventStore.processBatch` and
+  `runChangeFeed` hand `LazyStreamEvent`s for streams with external `data`; a projection
+  declares `offloaded: "eager"` to receive resolved events (`[EDD-9117]` for an unknown
+  mode, at definition). A batch decodes each record once per mode its projections take.
+  A record whose decode fails reading the store is transient, never poison: reported in
+  the partial batch response whatever `onDecodeFailure` says, listed in `storeFailures`,
+  logged at `Warning`.
+- **Planning.** `measureAppend` / `measureSnapshot` upload nothing: each value the append
+  would offload counts as its pointer at its upper bound (exact but for the `VersionId`'s
+  bytes) and is listed in `AppendMeasurement.offloaded` (`{ item, attribute, objectBytes }`);
+  an offloading stream measures against the store's limits, so it needs a store.
+- **Store.** Read with `Effect.serviceOption` (no new `R`). `bind` / `bindProjection`
+  capture it with the rest of the context and refuse a stream that offloads without one
+  (`[EDD-9115]`, a defect); an unbound stream checks on its first operation the same way.
+- **GC.** Event objects are immutable and keyed per event: the reaper never frees them
+  (an event row is never superseded), and only purge removes them. A snapshot's
+  superseded `state` is freed directly. `BlobGc.make({ streams })` members are swept with
+  `sweepPartition(name, streamId)`.
+- **Errors.** Per kind (the stream's trailing type parameter records which): writes
+  (`append`, `commandHandler`, `appendOp`) carry `BlobStoreError` when `data` or the
+  snapshot `state` offloads, since an inline snapshot uploads its state; `writeSnapshot`
+  and an eager `readSnapshot` only when `state` does; eager event reads only when `data`
+  does, and `readLatest`, which reads both, when either does.
+
 ### Change-feed Projections (#151)
 
 DynamoDB Streams orders records per item only, and a transaction's records carry no
@@ -8944,11 +9006,16 @@ pre-#179 unions.
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
-| `purge` | `ValidationError` |
+| `purge` | `ValidationError` (plus `BlobStoreError` for an entity that offloads: it needs the store up front and deletes the purged rows' versions) |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
+| Offloading members (#179): every write above, aggregate `create` / `update`, `EventStore` `append` / `commandHandler` / `appendOp` / `writeSnapshot`, `GeoIndex.put` | the operation's union, plus `BlobStoreError` (an aggregate `delete` adds nothing: it never reaches the store) |
+| Offloading members (#179): `get`, queries, scans, collections, vector search, `Batch.get`, `transactGet`, aggregate `get` / `list`, `GeoIndex.nearby`, EventStore reads | the operation's union, plus `BlobStoreError` where the read's mode is eager for a kind the member has (aggregate and geo reads always are) |
+| `BlobGc` `reap` / `sweep` / `sweepPartition` / `sweepStore` (`BlobGc.make` fails with none: its misconfigurations are `[EDD-9115]` / `[EDD-9118]` defects) | `GcError`: `BlobStoreError`, `ValidationError` |
+| `BlobHandle` `read` / `stream` / `presignedUrl` (no `DynamoClientError`) | `BlobStoreError` |
+| `OffloadedValue.read` (no `DynamoClientError`) | `BlobStoreError`, `ValidationError` |
 | `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
 | `EventStream.parseStreamId` | `ValidationError` |
 | `EventStore` multi-source projection `catchUp` / `rebuild` (`applyBatch` / `processBatch` per row) | the sources' `evolve` errors, the read model's errors, `ValidationError`, `ConcurrentModification`, `ProjectionSourceConflict` |

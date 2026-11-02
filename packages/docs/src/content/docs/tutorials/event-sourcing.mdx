@@ -1583,6 +1583,10 @@ In a downstream benchmark on Lambda, reading ~6,000 small events was about 2× f
 
 `Query.select` raw rows return `data` as parsed JSON whatever its stored form. A filter on a path inside packed `data` is refused with `[EDD-9076]`, so use `Query.filterBy`. `measureAppend` and `measureSnapshot` return the stored sizes for chunk planning, and `decodeStreamImage` decodes DynamoDB Streams records. See [Packed Storage](/effect-dynamodb/guides/packed-storage/) for compressor registration, the stored form, sizing and rollout order.
 
+### Large event payloads
+
+An event or snapshot item is still capped at 400 KB, and an inline snapshot rides in every append's transaction. For payloads that can outgrow that (a document, an export, a large state), add `external` to the packed config: a value at or over its threshold (64 KiB stored by default) goes to a blob store such as S3, and the item keeps a pointer. `storedAs: { data: DynamoModel.Packed({ format: "json", external: {} }) }` offloads large event data; `snapshot.storedAs` takes the same option for state. Offloading needs the stream's table schema to set `escapeKeys: true` (binding fails with `[EDD-9146]` otherwise). Reads stay eager by default (`{ offloaded: "lazy" }` returns `LazyStreamEvent`s), projections receive lazy events unless defined with `{ offloaded: "eager" }`, and event objects are removed only by purge. See [Offloaded Storage](/effect-dynamodb/guides/blob-offload/#eventstore-streams).
+
 ## Step 22: Shared Indexes Across Streams
 
 A GSI stream index is normally scoped to its stream: `append` writes the stream's own partition key into the index's `pk`. Give the index a `partition` function instead, and several streams can write **one partition** of a GSI they all declare. One query of that partition then reads a whole group of streams. Here a series groups its matches, squads and umpire appointments:
