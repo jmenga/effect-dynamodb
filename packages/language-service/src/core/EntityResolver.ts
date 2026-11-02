@@ -18,9 +18,10 @@ export interface ZOrderMarker {
   readonly prefix: ReadonlyArray<string>
   readonly dimensions: ReadonlyArray<string>
   /**
-   * Present when a part couldn't be read statically (a dimension built by a
-   * helper the checker can't name, say): `prefix` and `dimensions` then list
-   * only the parts that could. The index is kept — the half is still binary.
+   * Present when a part couldn't be read statically (an entry computed at run
+   * time, or a shared list declared without `as const`, whose field names the
+   * checker widened to `string`): `prefix` and `dimensions` then list only the
+   * parts that could. The index is kept — the half is still binary.
    */
   readonly unresolved?: true
 }
@@ -639,10 +640,8 @@ export function resolveZOrderFields(
   let prefix: Fields = { fields: [], complete: true }
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
-    if (prop.name.text === "zorder") {
-      dimensions = extractDimensionFields(ts, prop.initializer, lookup)
-    }
-    if (prop.name.text === "prefix") prefix = extractPrefixFields(ts, prop.initializer, lookup)
+    if (prop.name.text === "zorder") dimensions = extractListFields(ts, prop.initializer, lookup)
+    if (prop.name.text === "prefix") prefix = extractListFields(ts, prop.initializer, lookup)
   }
   if (dimensions === undefined || (dimensions.complete && dimensions.fields.length === 0)) {
     return undefined
@@ -660,7 +659,8 @@ interface Fields {
   readonly complete: boolean
 }
 
-function extractDimensionFields(
+/** The fields of a `zorder` or `prefix` list (both take the same two entry forms). */
+function extractListFields(
   ts: typeof import("typescript"),
   expr: ts.Expression,
   lookup: ExpressionLookup | undefined,
@@ -668,18 +668,6 @@ function extractDimensionFields(
   const list = lookup?.resolve(expr) ?? expr
   if (!ts.isArrayLiteralExpression(list)) {
     // Not written as a list: the checker may still know its tuple of entries.
-    return entryTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
-  }
-  return extractEntryFields(ts, list, lookup)
-}
-
-function extractPrefixFields(
-  ts: typeof import("typescript"),
-  expr: ts.Expression,
-  lookup: ExpressionLookup | undefined,
-): Fields {
-  const list = lookup?.resolve(expr) ?? expr
-  if (!ts.isArrayLiteralExpression(list)) {
     return entryTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
   }
   return extractEntryFields(ts, list, lookup)
