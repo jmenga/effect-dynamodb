@@ -12,7 +12,10 @@
  *   (item-size diagnosis, `Batch.write` chunking) therefore sees stored bytes.
  * - **Read:** after `fromAttributeMap`, before sparse rebuild and renames —
  *   {@link unpackItem} dispatches each dispatch-eligible attribute on its
- *   stored form (native → unchanged, `S` → JSON, `B` → header + payload).
+ *   stored form (native → unchanged, `S` → JSON, `B` → header + payload). A
+ *   `B` blob pointer (an offloaded value, #179) is refused with a
+ *   `ValidationError` naming it ({@link unpackStoredValueSync}): no read path
+ *   resolves pointers yet.
  * - **Streams:** {@link normalizeImage} turns a Streams image (DynamoDB JSON,
  *   `B`/`BS` as bytes or base64, or an already-unmarshalled item) into an
  *   unmarshalled item with real bytes, and {@link unpackImageItem} additionally
@@ -35,6 +38,7 @@ import {
 } from "@effect-dynamodb/schema/Compression.js"
 import type { CompressionCodec, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { isBlobPointer } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isBase64PackedText,
@@ -42,8 +46,8 @@ import {
   type PackedContext,
   type PackedStored,
   packValueSync,
-  unpackBytesSync,
   unpackStoredSync,
+  unresolvedPointer,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Context, Effect, Result } from "effect"
 import { Base64 } from "effect/encoding"
@@ -241,6 +245,23 @@ export const packAttributeValueSync = (
 // ---------------------------------------------------------------------------
 
 /**
+ * `unpackStoredSync` for the library's read paths: the JSON wire form, or the
+ * `ValidationError` it fails with (returned, never thrown). A blob pointer (an
+ * offloaded value, #179) is refused with a `ValidationError` naming the
+ * attribute and the object version it pins — no read path resolves pointers
+ * yet, so stored data never reads as the pointer itself.
+ */
+export const unpackStoredValueSync = (
+  stored: string | Uint8Array,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+  attribute: string,
+): unknown => {
+  const wire = unpackStoredSync(stored, registry, ctx, attribute)
+  return isBlobPointer(wire) ? unresolvedPointer(ctx, attribute, wire) : wire
+}
+
+/**
  * True iff any listed attribute of `raw` holds a string or bytes — a value
  * read by its stored form. A native row (maps, lists, absent) is false, and
  * costs one `typeof` per attribute.
@@ -270,7 +291,7 @@ export const unpackItemSync = (
   for (const attribute of attributes) {
     const value = ownValue(raw, attribute)
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
-    const wire = unpackStoredSync(value, registry, ctx, attribute)
+    const wire = unpackStoredValueSync(value, registry, ctx, attribute)
     if (wire instanceof ValidationError) return wire
     setOwn(raw, attribute, wire)
   }
@@ -541,7 +562,7 @@ export const normalizeImage = (
 /**
  * {@link unpackItemSync} for a normalised **unmarshalled** stream image: on a
  * listed attribute, a string that is base64 of a `B` value (it starts with
- * `I`–`P`, which JSON text never does — see `PackedCodec.isBase64PackedText`)
+ * `I`–`X`, which JSON text never does — see `PackedCodec.isBase64PackedText`)
  * is decoded to bytes and read as `B`; any other string is JSON.
  */
 export const unpackImageItemSync = (
@@ -555,13 +576,13 @@ export const unpackImageItemSync = (
     if (typeof value === "string" && isBase64PackedText(value)) {
       const bytes = toBytesSync(value, ctx, attribute)
       if (bytes instanceof ValidationError) return bytes
-      const wire = unpackBytesSync(bytes, registry, ctx, attribute)
+      const wire = unpackStoredValueSync(bytes, registry, ctx, attribute)
       if (wire instanceof ValidationError) return wire
       setOwn(raw, attribute, wire)
       continue
     }
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
-    value = unpackStoredSync(value, registry, ctx, attribute)
+    value = unpackStoredValueSync(value, registry, ctx, attribute)
     if (value instanceof ValidationError) return value
     setOwn(raw, attribute, value)
   }
@@ -611,7 +632,7 @@ export const decodeImageSync = (
  *
  * In DynamoDB JSON the `S` / `B` tag says what each value is; in an
  * unmarshalled image a string on a listed attribute is read as base64 `B`
- * when it starts with `I`–`P` (see {@link unpackImageItemSync}).
+ * when it starts with `I`–`X` (see {@link unpackImageItemSync}).
  */
 export const decodeImage = (
   image: StreamImage,

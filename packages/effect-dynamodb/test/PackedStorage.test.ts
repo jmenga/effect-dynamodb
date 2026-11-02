@@ -9,6 +9,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { Effect, Exit } from "effect"
 import * as ZlibCompression from "../src/compression/zlib.js"
 import {
@@ -22,6 +23,7 @@ import {
   unpackItem,
 } from "../src/internal/Packed.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import { bytesPointer, expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 const registry = Compression.make(ZlibCompression.available())
@@ -274,5 +276,77 @@ describe("stream images", () => {
           attribute: "b",
         })
       }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Blob pointers (#179): no read path resolves them yet
+// ---------------------------------------------------------------------------
+
+describe("blob pointers (Packed layout 010) are refused, never read as values", () => {
+  const pointerText = () => base64(jsonPointerBytes())
+
+  it.effect("unpackItem: a B pointer on a packed or dispatch-eligible attribute", () =>
+    Effect.gen(function* () {
+      const error = failure(
+        yield* Effect.exit(unpackItem({ d: jsonPointerBytes() }, ["d"], registry, readCtx)),
+      )
+      expectUnresolvedPointer(error, "d", { entityType: "Order", operation: "decode" })
+      // A compressed pointer's codec names the object, so no compressor is needed to refuse it.
+      const bare = failure(
+        yield* Effect.exit(
+          unpackItem({ d: jsonPointerBytes() }, ["d"], Compression.empty, readCtx),
+        ),
+      )
+      expectUnresolvedPointer(bare, "d")
+    }),
+  )
+
+  it.effect("a binary field's pointer stored as B is malformed for a packed attribute", () =>
+    Effect.gen(function* () {
+      const error = failure(
+        yield* Effect.exit(
+          unpackItem({ d: BlobPointer.encode(bytesPointer) }, ["d"], registry, readCtx),
+        ),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(((error as ValidationError).cause as Error).message).toContain("kind bytes")
+    }),
+  )
+
+  it.effect("decodeImage: DynamoDB JSON with B as bytes or as base64 (Lambda, Pipes)", () =>
+    Effect.gen(function* () {
+      for (const B of [jsonPointerBytes(), pointerText()]) {
+        const error = failure(
+          yield* Effect.exit(decodeImage({ pk: { S: "x" }, d: { B } }, ["d"], readCtx)),
+        )
+        expectUnresolvedPointer(error, "d", { operation: "decode" })
+      }
+    }),
+  )
+
+  it.effect("unmarshalled image: a pointer as bytes, or as base64 text (it starts with Q)", () =>
+    Effect.gen(function* () {
+      expect(pointerText()[0]).toBe("Q")
+      for (const d of [jsonPointerBytes(), pointerText()]) {
+        const error = failure(
+          yield* Effect.exit(unpackImageItem({ pk: "x", d }, ["d"], registry, readCtx)),
+        )
+        expectUnresolvedPointer(error, "d")
+      }
+    }),
+  )
+
+  it.effect("unmarshalled image: base64 text starting with Q–X that is not a pointer", () =>
+    Effect.gen(function* () {
+      // Read as base64 of a B value now (I–X), so a truncated pointer is a malformed pointer.
+      const error = failure(
+        yield* Effect.exit(
+          unpackImageItem({ d: base64(new Uint8Array([0x40, 1, 2])) }, ["d"], registry, readCtx),
+        ),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(((error as ValidationError).cause as Error).message).toContain('Packed attribute "d"')
+    }),
   )
 })

@@ -83,7 +83,6 @@ import {
   isDispatchEligible,
   packedShape,
   packValue,
-  unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -127,6 +126,7 @@ import {
   type PackedAttributeGuard,
   runtimeCodecCheck,
   type StreamImage,
+  unpackStoredValueSync,
   unregisteredCodecError,
   withRegistry,
 } from "./internal/Packed.js"
@@ -3132,7 +3132,7 @@ export const makeStream = <
   ): Effect.Effect<unknown, ValidationError> =>
     typeof stored === "string" || stored instanceof Uint8Array
       ? withRegistry((registry) =>
-          unpackStoredSync(stored, registry, { entityType, operation }, "data"),
+          unpackStoredValueSync(stored, registry, { entityType, operation }, "data"),
         )
       : Effect.succeed(stored)
 
@@ -4809,7 +4809,7 @@ export const makeStream = <
     // `stateDispatch` — then decoded through the state schema as before.
     (stateDispatch && (typeof raw.state === "string" || raw.state instanceof Uint8Array)
       ? withRegistry((registry) =>
-          unpackStoredSync(
+          unpackStoredValueSync(
             raw.state as string | Uint8Array,
             registry,
             { entityType: snapshotEntityType, operation },

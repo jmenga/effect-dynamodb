@@ -28,6 +28,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as StorageEncoding from "../src/StorageEncoding.js"
 import * as Table from "../src/Table.js"
+import { expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import {
   awsValidationException,
@@ -666,6 +667,71 @@ describe("EventStore packed storage — every read path on a mixed M/S/B stream 
       expect(error).toBeInstanceOf(ValidationError)
       expect((error as ValidationError).operation).toBe("EventStore.decode")
       expect(String((error as ValidationError).cause)).toContain('Packed attribute "data"')
+    }).pipe(Effect.provide(TestLayer)),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Blob pointers (#179): refused until reads resolve them
+// ---------------------------------------------------------------------------
+
+describe("EventStore packed storage — blob pointers (Packed layout 010) are refused", () => {
+  const withPointer = (item: Item, attribute: "data" | "state"): Item => ({
+    ...item,
+    [attribute]: { B: jsonPointerBytes() },
+  })
+
+  it.effect("event data: every read path, through packed and native definitions", () =>
+    Effect.gen(function* () {
+      yield* JsonLedger.append(id, [recorded(1)], 0)
+      const [item] = storedEvents()
+      store.set(keyOf(item!), withPointer(item!, "data"))
+      const event = { entityType: "ledger.event", operation: "EventStore.decode" }
+      for (const ledger of [JsonLedger, ZstdLedger, NativeLedger]) {
+        expectUnresolvedPointer(yield* ledger.read(id).pipe(Effect.flip), "data", event)
+        expectUnresolvedPointer(
+          yield* ledger.query.events(id).pipe(Query.collect, Effect.flip),
+          "data",
+          event,
+        )
+      }
+      // A raw row (`select`) reads `data` by its stored form too.
+      expectUnresolvedPointer(
+        yield* JsonLedger.query
+          .events(id)
+          .pipe(Query.select(["version", "data"]), Query.collect, Effect.flip),
+        "data",
+        { operation: "EventStore.select" },
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("event data in a stream image: DynamoDB JSON and unmarshalled", () =>
+    Effect.gen(function* () {
+      yield* JsonLedger.append(id, [recorded(1)], 0)
+      const image = withPointer(storedEvents()[0]!, "data")
+      const base64 = Buffer.from(jsonPointerBytes()).toString("base64")
+      for (const candidate of [
+        image,
+        { ...image, data: { B: base64 } },
+        { ...fromAttributeMap(image), data: base64 },
+      ]) {
+        const error = yield* ZstdLedger.decodeStreamImage(candidate).pipe(Effect.flip)
+        expectUnresolvedPointer(error, "data")
+      }
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("snapshot state: readSnapshot and readLatest", () =>
+    Effect.gen(function* () {
+      yield* ZstdLedger.append(id, [recorded(1)], 0, { snapshot: { total: 1, notes: [] } })
+      const snapshot = storedSnapshot()!
+      store.set(keyOf(snapshot), withPointer(snapshot, "state"))
+      const state = { entityType: "ledger.snapshot" }
+      for (const ledger of [ZstdLedger, JsonLedger, NativeLedger]) {
+        expectUnresolvedPointer(yield* ledger.readSnapshot(id).pipe(Effect.flip), "state", state)
+      }
+      expectUnresolvedPointer(yield* ZstdLedger.readLatest(id).pipe(Effect.flip), "state", state)
     }).pipe(Effect.provide(TestLayer)),
   )
 })

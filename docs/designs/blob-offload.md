@@ -701,6 +701,12 @@ Notes:
   §6.3).
 - The trailer and the content checksum both use the vendored CRC64NVME (§5), so the schema
   package needs one checksum implementation.
+- **Strict decoding.** A pointer has exactly one encoding in each form. Besides the refusals
+  above, readers refuse non-minimal or unsafe LEB128 integers, bytes left over before the
+  trailer, a key or version that is not valid UTF-8, an object size that differs from the
+  content size when the codec is `000`, and `S` text that is padded or not canonical base64url.
+  A pointer of the other kind than its attribute stores — a bytes pointer as `B` on a packed
+  attribute, a json pointer as `S` text on a binary one — is malformed too.
 
 `PackedCodec.parseHeader` recognises layout `010`; `unpackBytesSync` returns a decoded
 `BlobPointer` value for it instead of fetching (the codec stays synchronous and AWS-free), and a
@@ -2170,6 +2176,10 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
 }> {}
 ```
 
+- **Where `BlobRef` and `BlobChecksum` live.** They are defined in the schema package, in
+  `@effect-dynamodb/schema` `internal/BlobPointer.ts` beside the pointer codec, because the
+  codec and `BlobStoreError` (`ref?: BlobRef`, §14.1) live there and the schema package cannot
+  import from core. Core's `BlobStore.ts` re-exports them and does not declare its own.
 - **Library vs store.** The library computes the checksum and verifies sizes and checksums on
   read; a store never has to be trusted for either. The library also enforces `maxUploadAge`
   (§6.1): a store only declares it.
@@ -2844,7 +2854,10 @@ a write path, deletes the gate.
    both stored forms (`B`, and the `~edbp:` `S` form with `parseBinaryPointerText`),
    `parseHeader` / `unpackBytesSync` / `isBase64PackedText` changes. Every runtime site still
    treats a pointer as an unsupported value (`ValidationError`, a clearer message): no behaviour
-   change for stored data.
+   change for stored data. The one read path this does not reach is `GeoSearch.nearby`, which
+   does not unpack at all (the #147 gap, §8.4); item 12 routes it through the entity's decoder.
+   Offload stays refused outside the test gate until item 13, so no user write can store a
+   pointer meanwhile.
 4. **Config surface** — `Packed({ external })` overloads (and `external?: never` on the plain
    one), `External`, `configure`, `ExtractOffloadFields`, `offload` on `Entity.make` /
    `makeStream`, guards `EDD-9141`, `EDD-9111`, `EDD-9142`, `EDD-9143`, `EDD-9114`, `BlobStoreError` (12 reasons),

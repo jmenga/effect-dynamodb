@@ -54,10 +54,11 @@ describe("node-free guard", () => {
     expect(offendersIn(files)).toEqual([])
   })
 
-  it("the built codec and checksum modules are present (so the dist check covers them)", () => {
+  it("the built codec, pointer and checksum modules are present (so the dist check covers them)", () => {
     for (const file of [
       "Compression.js",
       "internal/PackedCodec.js",
+      "internal/BlobPointer.js",
       "internal/Crc64Nvme.js",
       "internal/Sha256.js",
     ]) {

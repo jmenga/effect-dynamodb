@@ -43,11 +43,7 @@ import {
 } from "@effect-dynamodb/schema/Compression.js"
 import type { PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import {
-  isBase64PackedText,
-  packValueSync,
-  unpackStoredSync,
-} from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import { isBase64PackedText, packValueSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Effect, Schema } from "effect"
 import {
   attributeBytes,
@@ -61,6 +57,7 @@ import {
   type StreamImage,
   storedToAttributeValue,
   unpackImageItemSync,
+  unpackStoredValueSync,
   withRegistry,
 } from "./internal/Packed.js"
 import { toAttributeValue } from "./Marshaller.js"
@@ -157,7 +154,9 @@ export const encodeSync = (
  * (encoded) form as plain JSON — not schema-decoded: `S` is JSON, `B` (bytes, or
  * base64 text as Lambda and EventBridge Pipes deliver it) is a header plus a
  * payload, and any other type (a legacy native `M`, say) is unmarshalled
- * unchanged. `undefined` (no attribute) returns `undefined`.
+ * unchanged. `undefined` (no attribute) returns `undefined`. A `B` blob pointer
+ * (an offloaded value) fails with a `ValidationError` naming the object version
+ * it pins: this version does not resolve pointers.
  *
  * For a value already unmarshalled (`@aws-sdk/util-dynamodb`'s `unmarshall`, or
  * a `DocumentClient` row), use {@link decodeUnmarshalled}: the two forms cannot
@@ -169,7 +168,9 @@ export const decode = (
   if (stored === undefined) return Effect.succeed(undefined)
   // `S` never needs a compressor: no registry lookup.
   const text = (stored as { readonly S?: unknown }).S
-  if (typeof text === "string") return lift(unpackStoredSync(text, emptyRegistry, DECODE, "value"))
+  if (typeof text === "string") {
+    return lift(unpackStoredValueSync(text, emptyRegistry, DECODE, "value"))
+  }
   return withRegistry((registry) => decodeStep(stored, registry))
 }
 
@@ -187,7 +188,7 @@ const decodeStep = (
   if (raw instanceof ValidationError) return raw
   const value = raw.value
   return typeof value === "string" || value instanceof Uint8Array
-    ? unpackStoredSync(value, registry, DECODE, "value")
+    ? unpackStoredValueSync(value, registry, DECODE, "value")
     : value
 }
 
@@ -203,8 +204,9 @@ export const decodeSync = (
 /**
  * Read an already-unmarshalled stored value by its form, returning its wire
  * (encoded) form as plain JSON — not schema-decoded: a string is JSON unless it
- * is base64 of a `B` value (it then starts with `I`–`P`, which JSON text never
+ * is base64 of a `B` value (it then starts with `I`–`X`, which JSON text never
  * does), bytes are `B`, and anything else is a native value returned unchanged.
+ * A blob pointer fails as for {@link decode}.
  *
  * For an `AttributeValue` (DynamoDB JSON), use {@link decode}.
  */
@@ -212,7 +214,7 @@ export const decodeUnmarshalled = (stored: unknown): Effect.Effect<unknown, Vali
   // A native value is returned as is, and JSON text never needs a compressor:
   // only bytes (or base64 of them) look the registry up.
   if (typeof stored === "string" && !isBase64PackedText(stored)) {
-    return lift(unpackStoredSync(stored, emptyRegistry, DECODE_UNMARSHALLED, "value"))
+    return lift(unpackStoredValueSync(stored, emptyRegistry, DECODE_UNMARSHALLED, "value"))
   }
   if (typeof stored !== "string" && !(stored instanceof Uint8Array)) {
     return Effect.succeed(stored)

@@ -19,6 +19,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -169,6 +170,17 @@ describe("Aggregate — packed edge fields", () => {
       expect(venueItems()[0]!.layout?.M).toBeDefined()
       const match = yield* Matches.get({ matchId: "m-2" })
       expect(match.venue.layout).toEqual(layout)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an edge item holding a blob pointer (#179) is refused, never assembled", () =>
+    Effect.gen(function* () {
+      yield* seedVenue
+      yield* Matches.create({ matchId: "m-3", name: "Qualifier", venueId: "v-1" } as never)
+      const [edge] = venueItems()
+      store.set(keyOf(edge!), { ...edge!, layout: { B: jsonPointerBytes() } })
+      const error = yield* Matches.get({ matchId: "m-3" }).pipe(Effect.flip)
+      expectUnresolvedPointer(error, "layout", { operation: "aggregate.decode" })
     }).pipe(Effect.provide(TestLayer)),
   )
 

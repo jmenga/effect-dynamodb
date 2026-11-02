@@ -10,6 +10,7 @@ import * as ZlibCompression from "../src/compression/zlib.js"
 import { attributeBytes } from "../src/internal/ItemSize.js"
 import { toAttributeValue } from "../src/Marshaller.js"
 import * as StorageEncoding from "../src/StorageEncoding.js"
+import { expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 const compression = Compression.layer(ZlibCompression.available())
@@ -186,6 +187,50 @@ describe("StorageEncoding sync twins", () => {
       })
     }),
   )
+})
+
+describe("StorageEncoding decoders — blob pointers (#179)", () => {
+  const base64 = () => Buffer.from(jsonPointerBytes()).toString("base64")
+
+  it.effect("decode / decodeUnmarshalled refuse a pointer with a ValidationError naming it", () =>
+    Effect.gen(function* () {
+      for (const stored of [{ B: jsonPointerBytes() }, { B: base64() }]) {
+        expectUnresolvedPointer(
+          failure(yield* Effect.exit(StorageEncoding.decode(stored))),
+          "value",
+          { entityType: "StorageEncoding", operation: "StorageEncoding.decode" },
+        )
+      }
+      for (const stored of [jsonPointerBytes(), base64()]) {
+        expectUnresolvedPointer(
+          failure(yield* Effect.exit(StorageEncoding.decodeUnmarshalled(stored))),
+          "value",
+          { operation: "StorageEncoding.decodeUnmarshalled" },
+        )
+      }
+    }),
+  )
+
+  it("the sync twins throw the same ValidationError", () => {
+    const thrown = (f: () => unknown): unknown => {
+      try {
+        f()
+      } catch (error) {
+        return error
+      }
+      throw new Error("expected a throw")
+    }
+    expectUnresolvedPointer(
+      thrown(() => StorageEncoding.decodeSync({ B: jsonPointerBytes() })),
+      "value",
+      { operation: "StorageEncoding.decode" },
+    )
+    expectUnresolvedPointer(
+      thrown(() => StorageEncoding.decodeUnmarshalledSync(base64())),
+      "value",
+      { operation: "StorageEncoding.decodeUnmarshalled" },
+    )
+  })
 })
 
 describe("StorageEncoding.valueBytes", () => {

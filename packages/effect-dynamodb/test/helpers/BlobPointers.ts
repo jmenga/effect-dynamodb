@@ -1,0 +1,67 @@
+/**
+ * Sample blob pointers (#179, Packed layout `010`) for the read-path tests:
+ * an overflow field's pointer as stored (`B` bytes) and a binary field's as
+ * stored (`~edbp:` base64url `S` text), plus the assertion that a read path
+ * refused one with the codec's "cannot resolve" `ValidationError`.
+ */
+
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
+import { Option } from "effect"
+import { expect } from "vitest"
+
+const pointer = (fields: BlobPointer.BlobPointerFields): BlobPointer.BlobPointer => {
+  const made = BlobPointer.make(fields)
+  if (typeof made === "string") throw new Error(made)
+  return made
+}
+
+/** An overflow field's pointer (kind json, zstd object). */
+export const jsonPointer: BlobPointer.BlobPointer = pointer({
+  kind: "json",
+  codec: "zstd",
+  ref: { key: "prod/0f1e2d3c4b5a69788796a5b4c3d2e1f0/aa/bb", version: "Vd1pQx7.version" },
+  objectSize: 40_000,
+  contentSize: 512_000,
+  checksum: { algorithm: "crc64nvme", value: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]) },
+  contentType: Option.none(),
+})
+
+/** A binary field's pointer (kind bytes). */
+export const bytesPointer: BlobPointer.BlobPointer = pointer({
+  kind: "bytes",
+  codec: "none",
+  ref: { key: "prod/0f1e2d3c4b5a69788796a5b4c3d2e1f0/cc/dd", version: "Xk2bytes.version" },
+  objectSize: 12_000_000,
+  contentSize: 12_000_000,
+  checksum: { algorithm: "crc64nvme", value: new Uint8Array([8, 7, 6, 5, 4, 3, 2, 1]) },
+  contentType: Option.some("application/pdf"),
+})
+
+/** The `B` value an overflow field holds when offloaded. */
+export const jsonPointerBytes = (): Uint8Array => BlobPointer.encode(jsonPointer)
+
+/** The `S` value a binary field holds when offloaded. */
+export const bytesPointerText: string = BlobPointer.encodeText(bytesPointer)
+
+/**
+ * `error` is the `ValidationError` a read path raises on a pointer it cannot
+ * resolve: it names the attribute and the object version, and never carries
+ * the pointer as a value.
+ */
+export const expectUnresolvedPointer = (
+  error: unknown,
+  attribute: string,
+  expected: { readonly entityType?: string; readonly operation?: string } = {},
+): void => {
+  expect(error).toBeInstanceOf(ValidationError)
+  const validation = error as ValidationError
+  if (expected.entityType !== undefined) expect(validation.entityType).toBe(expected.entityType)
+  if (expected.operation !== undefined) expect(validation.operation).toBe(expected.operation)
+  const message = (validation.cause as Error).message
+  expect(message).toContain(`Packed attribute "${attribute}"`)
+  expect(message).toContain("blob pointer")
+  expect(message).toContain(jsonPointer.ref.key)
+  expect(message).toContain(jsonPointer.ref.version)
+  expect(message).toContain("cannot resolve")
+}
