@@ -210,8 +210,8 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
     team: Aggregate.ref(Teams),
-    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+    coach: Aggregate.one({ entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many({ entityType: "MatchPlayer", entity: Players }),
   },
 })
 // #endregion
@@ -225,7 +225,7 @@ const MatchAggregate = Aggregate.make(Match, {
   consistentRead: true,
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -246,7 +246,7 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
   collection: { name: "officiated" },
   root: { entityType: "OfficiatedMatchItem" },
   edges: {
-    officials: Aggregate.many("officials", {
+    officials: Aggregate.many({
       entityType: "MatchOfficial",
       entity: Umpires,
       sk: { composite: ["role", "umpire.id"] },
@@ -285,7 +285,7 @@ const AuditedMatchAggregate = Aggregate.make(Match, {
   collection: { name: "audited-match" },
   root: { entityType: "AuditedMatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "AuditedMatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "AuditedMatchVenue", entity: Venues }),
   },
   timestamps: {
     created: { field: "created", schema: DynamoModel.DateEpochMs },

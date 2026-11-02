@@ -341,7 +341,7 @@ const Matches = Aggregate.make(Match, {
   collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
   },
 })
 
@@ -353,14 +353,14 @@ const PlainMatches = Aggregate.make(Match, {
   collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: PlainVenues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: PlainVenues }),
   },
 })
 
 const LegAggregate = Aggregate.make(Leg, {
   root: { entityType: "TourLeg" },
   edges: {
-    stops: Aggregate.many("stops", {
+    stops: Aggregate.many({
       entityType: "TourStop",
       entity: Stops,
       sk: { composite: ["stopId"] },

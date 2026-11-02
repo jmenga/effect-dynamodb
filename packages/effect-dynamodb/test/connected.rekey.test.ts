@@ -283,7 +283,7 @@ const Routes = Aggregate.make(Route, {
   collection: { name: "routes" },
   root: { entityType: "RouteItem" },
   edges: {
-    stops: Aggregate.many("stops", { entityType: "RouteStop", sk: { composite: ["label"] } }),
+    stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
   },
   list: {
     index: "gsi1",
@@ -306,7 +306,7 @@ const Trails = Aggregate.make(Trail, {
   collection: { name: "trails" },
   root: { entityType: "TrailItem" },
   edges: {
-    stops: Aggregate.many("stops", { entityType: "TrailStop", sk: { composite: ["label"] } }),
+    stops: Aggregate.many({ entityType: "TrailStop", sk: { composite: ["label"] } }),
   },
 })
 

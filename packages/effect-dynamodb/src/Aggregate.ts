@@ -113,6 +113,7 @@ export {
   type ManyEdgeConfig,
   many,
   type OneEdge,
+  type OneEdgeConfig,
   one,
   type RefEdge,
   type RefEntity,
@@ -3754,7 +3755,7 @@ const decomposeAggregate = (
         const hint =
           prior.member === item.member
             ? ` Give the "${item.member}" edge a declared sort key naming attributes that differ` +
-              ` between its elements: Aggregate.many("${item.member}", { …, sk: { composite: [...] } }).`
+              ` between its elements: ${item.member}: Aggregate.many({ …, sk: { composite: [...] } }).`
             : ""
         return yield* new AggregateDecompositionError({
           aggregate: aggregateName,

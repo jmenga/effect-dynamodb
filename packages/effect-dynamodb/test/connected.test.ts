@@ -349,8 +349,8 @@ const BlogPostAggregate = Aggregate.make(BlogPost, {
   root: { entityType: "BlogPostRoot" },
   edges: {
     author: Aggregate.ref(Authors),
-    meta: Aggregate.one("meta", { entityType: "BlogPostMeta" }),
-    comments: Aggregate.many("comments", { entityType: "BlogPostComment" }),
+    meta: Aggregate.one({ entityType: "BlogPostMeta" }),
+    comments: Aggregate.many({ entityType: "BlogPostComment" }),
   },
 })
 
@@ -367,7 +367,7 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
   },
   root: { entityType: "OfficiatedMatchRoot" },
   edges: {
-    officials: Aggregate.many("officials", {
+    officials: Aggregate.many({
       entityType: "MatchOfficial",
       entity: Officials,
       // "onfield" seats two umpires and one umpire holds two appointments, so
@@ -389,7 +389,7 @@ const CollidingMatchAggregate = Aggregate.make(OfficiatedMatch, {
   },
   root: { entityType: "CollidingMatchRoot" },
   edges: {
-    officials: Aggregate.many("officials", {
+    officials: Aggregate.many({
       entityType: "CollidingMatchOfficial",
       entity: Officials,
     }),
@@ -417,8 +417,8 @@ const TimestampedPostAggregate = Aggregate.make(TimestampedPost, {
   },
   root: { entityType: "TsPostRoot" },
   edges: {
-    meta: Aggregate.one("meta", { entityType: "TsPostMeta" }),
-    comments: Aggregate.many("comments", { entityType: "TsPostComment" }),
+    meta: Aggregate.one({ entityType: "TsPostMeta" }),
+    comments: Aggregate.many({ entityType: "TsPostComment" }),
   },
   timestamps: {
     created: { field: "created", schema: DynamoModel.DateEpochMs },
@@ -4438,8 +4438,8 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
     const SquadAggregate = Aggregate.make(Squad, {
       root: { entityType: "MatchSquad" },
       edges: {
-        coach: Aggregate.one("coach", { entityType: "SquadCoach" }),
-        players: Aggregate.many("players", { entityType: "SquadPlayer" }),
+        coach: Aggregate.one({ entityType: "SquadCoach" }),
+        players: Aggregate.many({ entityType: "SquadPlayer" }),
       },
     })
     // Reuses the existing gsi2 on AggTable (no CreateTable change). Not bound via
@@ -7053,9 +7053,9 @@ const EddMatchAggregate = Aggregate.make(EddMatch, {
   collection: { index: "lsi1", name: "eddmatch", sk: { field: "lsi1sk", composite: ["name"] } },
   root: { entityType: "EddMatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "EddMatchVenue", entity: EddVenues }),
-    coach: Aggregate.one("coach", { entityType: "EddMatchCoach", entity: EddCoaches }),
-    players: Aggregate.many("players", { entityType: "EddMatchPlayer", entity: EddPlayers }),
+    venue: Aggregate.one({ entityType: "EddMatchVenue", entity: EddVenues }),
+    coach: Aggregate.one({ entityType: "EddMatchCoach", entity: EddCoaches }),
+    players: Aggregate.many({ entityType: "EddMatchPlayer", entity: EddPlayers }),
   },
 })
 const eddTableName = "edd-71-72-connected"
@@ -13127,7 +13127,7 @@ const BtOrderAggregate = Aggregate.make(BtOrder, {
   collection: { name: "btorder" },
   root: { entityType: "BtOrderRoot" },
   edges: {
-    lines: Aggregate.many("lines", { entityType: "BtOrderLine" }),
+    lines: Aggregate.many({ entityType: "BtOrderLine" }),
   },
 })
 
@@ -13140,7 +13140,7 @@ const BtConsistentAggregate = Aggregate.make(BtOrder, {
   consistentRead: true,
   root: { entityType: "BtOrderRoot" },
   edges: {
-    lines: Aggregate.many("lines", { entityType: "BtOrderLine" }),
+    lines: Aggregate.many({ entityType: "BtOrderLine" }),
   },
 })
 
@@ -15279,8 +15279,8 @@ const AeMachineAggregate = Aggregate.make(AeMachine, {
   collection: { name: "aemachine" },
   root: { entityType: "AeMachineItem" },
   edges: {
-    supplier: Aggregate.one("supplier", { entityType: "AeMachineSupplier", entity: AeSuppliers }),
-    parts: Aggregate.many("parts", { entityType: "AeMachinePart", entity: AeParts }),
+    supplier: Aggregate.one({ entityType: "AeMachineSupplier", entity: AeSuppliers }),
+    parts: Aggregate.many({ entityType: "AeMachinePart", entity: AeParts }),
   },
 })
 
@@ -15794,7 +15794,7 @@ const AlOrderAggregate = Aggregate.make(AlOrder, {
   },
   root: { entityType: "AlOrderItem" },
   edges: {
-    lines: Aggregate.many("lines", { entityType: "AlOrderLine" }),
+    lines: Aggregate.many({ entityType: "AlOrderLine" }),
   },
 })
 
@@ -15813,7 +15813,7 @@ const AlShardedAggregate = Aggregate.make(AlOrder, {
   },
   root: { entityType: "AlShardedItem" },
   edges: {
-    lines: Aggregate.many("lines", { entityType: "AlShardedLine" }),
+    lines: Aggregate.many({ entityType: "AlShardedLine" }),
   },
 })
 
@@ -17145,8 +17145,8 @@ const makeI133Match = (kind: "plain" | "ref") => {
     root: { entityType: "MatchTeam" },
     edges: {
       team: Aggregate.ref(I133Teams),
-      coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: I133Coaches }),
-      players: Aggregate.many("players", { entityType: "MatchPlayer", entity: I133Players }),
+      coach: Aggregate.one({ entityType: "MatchCoach", entity: I133Coaches }),
+      players: Aggregate.many({ entityType: "MatchPlayer", entity: I133Players }),
     },
   })
   return Aggregate.make(Match, {
@@ -17158,7 +17158,7 @@ const makeI133Match = (kind: "plain" | "ref") => {
     edges: {
       team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
       team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
-      umpires: Aggregate.many("umpires", {
+      umpires: Aggregate.many({
         entityType: "MatchUmpire",
         entity: I133Umpires,
         sk: { composite: ["role", "umpire.id"] },
@@ -17212,7 +17212,7 @@ const I133HolderAggregate = Aggregate.make(I133Holder, {
   collection: { name: "holder" },
   root: { entityType: "HolderItem" },
   edges: {
-    players: Aggregate.many("players", { entityType: "HolderPlayer", entity: I133Players }),
+    players: Aggregate.many({ entityType: "HolderPlayer", entity: I133Players }),
   },
 })
 
@@ -17828,13 +17828,13 @@ const N133Table = Table.make({ schema: N133Schema, entities: { N133Players, N133
 const N133SquadAggregate = Aggregate.make(N133Squad, {
   root: { entityType: "NSquad" },
   edges: {
-    players: Aggregate.many("players", { entityType: "NSquadPlayer", entity: N133Players }),
+    players: Aggregate.many({ entityType: "NSquadPlayer", entity: N133Players }),
   },
 })
 const N133ClubAggregate = Aggregate.make(N133Club, {
   root: { entityType: "NClub" },
   edges: {
-    coach: Aggregate.one("coach", { entityType: "NCoach", entity: N133Coaches }),
+    coach: Aggregate.one({ entityType: "NCoach", entity: N133Coaches }),
     squad: N133SquadAggregate.with({ discriminator: { squadNo: 1 } }),
   },
 })

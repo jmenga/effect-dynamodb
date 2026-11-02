@@ -41,6 +41,7 @@ export {
   type ManyEdgeConfig,
   many,
   type OneEdge,
+  type OneEdgeConfig,
   one,
   type RefEdge,
   type RefEntity,

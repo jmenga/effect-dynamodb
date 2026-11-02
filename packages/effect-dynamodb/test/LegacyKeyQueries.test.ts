@@ -122,7 +122,7 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
     collection: { name: "routes" },
     root: { entityType: "RouteItem" },
     edges: {
-      stops: Aggregate.many("stops", { entityType: "RouteStop", sk: { composite: ["label"] } }),
+      stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
     },
     list: {
       index: "gsi1",
@@ -139,7 +139,7 @@ const world = (schema: DynamoSchema.DynamoSchema) => {
     collection: { name: "lines" },
     root: { entityType: "LineItem" },
     edges: {
-      stops: Aggregate.many("stops", { entityType: "LineStop", sk: { composite: ["label"] } }),
+      stops: Aggregate.many({ entityType: "LineStop", sk: { composite: ["label"] } }),
     },
     list: {
       index: "gsi1",

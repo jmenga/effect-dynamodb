@@ -473,7 +473,7 @@ describe("definition attribute names are typed from the model", () => {
         context: ["venue"],
         root: { entityType: "MatchItem" },
         edges: {
-          officials: Aggregate.many("officials", {
+          officials: Aggregate.many({
             entityType: "MatchOfficial",
             entity: Officials,
             sk: { composite: ["role", "official.officialId"] },
@@ -519,7 +519,7 @@ describe("definition attribute names are typed from the model", () => {
           pk: { field: "pk", composite: ["matchId"] },
           edges: {
             // @ts-expect-error not a schema field
-            oficials: Aggregate.many("officials", {
+            oficials: Aggregate.many({
               entityType: "MatchOfficial",
               entity: Officials,
             }),
@@ -531,7 +531,7 @@ describe("definition attribute names are typed from the model", () => {
           root: { entityType: "AppointmentItem" },
           edges: {
             // @ts-expect-error not a schema field (sub-aggregate form)
-            oficial: Aggregate.one("official", { entityType: "Appointee", entity: Officials }),
+            oficial: Aggregate.one({ entityType: "Appointee", entity: Officials }),
           },
         }),
       )
@@ -541,7 +541,7 @@ describe("definition attribute names are typed from the model", () => {
           pk: { field: "pk", composite: ["matchId"] },
           edges: {
             // @ts-expect-error not a scalar path of the element (the ref object itself)
-            officials: Aggregate.many("officials", {
+            officials: Aggregate.many({
               entityType: "MatchOfficial",
               entity: Officials,
               sk: { composite: ["official"] },

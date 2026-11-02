@@ -212,6 +212,12 @@ overwrite different history now ends "The write was not made." (was "Nothing was
 attribute of another type now throws `EDD-9091` at `Table.make` / `Table.definition`, instead of
 silently keeping the first type.
 
+**Deprecated:** the `(name, config)` forms of `Aggregate.one` and `Aggregate.many`, and `many`'s
+`edgeAttributes`. Neither the name nor `edgeAttributes` is read: the `edges` key names the edge.
+Use `Aggregate.one(config)` / `Aggregate.many(config)` and leave `edgeAttributes` out; the
+deprecated forms keep working and are removed in the next major release. `OneEdge.name` and
+`ManyEdge.name` are now optional (set only by the deprecated form).
+
 **Behaviour change:** `Entity.make` now refuses a `unique` constraint field the model doesn't have
 (`EDD-9002`) and a `timeSeries.appendInput` field the model doesn't have (`EDD-9013`); both were
 accepted and the field silently ignored.

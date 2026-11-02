@@ -1,6 +1,6 @@
 /**
  * Aggregate edges with packed fields (#147). An edge's items carry the edge
- * entity's fields (`Aggregate.one("venue", { entity: Venues })` flattens the
+ * entity's fields (`Aggregate.one({ entity: Venues })` flattens the
  * hydrated venue onto the `MatchVenue` item), so the entity's
  * `storedAs: DynamoModel.Packed` fields are stored packed there too — and read
  * back by stored form, whatever an earlier writer stored.
@@ -70,7 +70,7 @@ const Matches = Aggregate.make(Match, {
   collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
   },
 })
 
@@ -211,7 +211,7 @@ describe("Aggregate — packed edge fields", () => {
         collection: { name: "match" },
         root: { entityType: "MatchItem" },
         edges: {
-          venue: Aggregate.one("venue", {
+          venue: Aggregate.one({
             entityType: "MatchVenue",
             entity: Venues,
             discriminator: { layout: "x" },
@@ -235,7 +235,7 @@ describe("Aggregate — packed edge fields", () => {
         root: { entityType: "TourItem" },
         edges: {
           // @ts-expect-error `layout` is an object, not a scalar path: a type error too
-          venues: Aggregate.many("venues", {
+          venues: Aggregate.many({
             entityType: "TourVenue",
             entity: Venues,
             sk: { composite: ["layout"] },
@@ -267,7 +267,7 @@ describe("Aggregate — packed edge fields after packing is turned off", () => {
     collection: { name: "match" },
     root: { entityType: "MatchItem" },
     edges: {
-      venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: PlainVenues }),
+      venue: Aggregate.one({ entityType: "MatchVenue", entity: PlainVenues }),
     },
   })
   const PlainLayer = Layer.mergeAll(TestLayer, PlainTable.layer({ name: "agg-table" }))
@@ -307,7 +307,7 @@ describe("Aggregate — packed many-edge elements", () => {
   const LegAggregate = Aggregate.make(Leg, {
     root: { entityType: "TourLeg" },
     edges: {
-      stops: Aggregate.many("stops", {
+      stops: Aggregate.many({
         entityType: "TourStop",
         entity: Stops,
         sk: { composite: ["stopId"] },

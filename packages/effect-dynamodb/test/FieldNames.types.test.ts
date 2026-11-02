@@ -154,7 +154,7 @@ describe("definition attribute names are typed from the model (runtime package)"
         context: ["venue"],
         root: { entityType: "MatchItem" },
         edges: {
-          officials: Aggregate.many("officials", {
+          officials: Aggregate.many({
             entityType: "MatchOfficial",
             entity: Officials,
             sk: { composite: ["role", "official.officialId"] },
@@ -201,13 +201,13 @@ describe("definition attribute names are typed from the model (runtime package)"
           collection: { name: "match" },
           root: { entityType: "MatchItem" },
           edges: {
-            officials: Aggregate.many("officials", {
+            officials: Aggregate.many({
               entityType: "MatchOfficial",
               entity: Officials,
               sk: { composite: ["role"] },
             }),
             // @ts-expect-error not a schema field
-            refereee: Aggregate.one("referee", { entityType: "MatchReferee", entity: Officials }),
+            refereee: Aggregate.one({ entityType: "MatchReferee", entity: Officials }),
           },
         }),
       )
@@ -216,7 +216,7 @@ describe("definition attribute names are typed from the model (runtime package)"
           root: { entityType: "AppointmentItem" },
           edges: {
             // @ts-expect-error not a schema field (sub-aggregate form)
-            oficial: Aggregate.one("official", { entityType: "Appointee", entity: Officials }),
+            oficial: Aggregate.one({ entityType: "Appointee", entity: Officials }),
           },
         }),
       )
@@ -229,7 +229,7 @@ describe("definition attribute names are typed from the model (runtime package)"
           root: { entityType: "MatchItem" },
           edges: {
             // @ts-expect-error "official.officialID" is not a path of the element
-            officials: Aggregate.many("officials", {
+            officials: Aggregate.many({
               entityType: "MatchOfficial",
               entity: Officials,
               sk: { composite: ["official.officialID"] },

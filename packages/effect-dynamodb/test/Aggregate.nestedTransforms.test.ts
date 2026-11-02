@@ -256,8 +256,8 @@ const makeMatch = (kind: Kind) => {
     root: { entityType: "MatchTeam" },
     edges: {
       team: Aggregate.ref(Teams),
-      coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
-      players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+      coach: Aggregate.one({ entityType: "MatchCoach", entity: Coaches }),
+      players: Aggregate.many({ entityType: "MatchPlayer", entity: Players }),
     },
   })
 
@@ -270,7 +270,7 @@ const makeMatch = (kind: Kind) => {
     edges: {
       team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
       team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
-      umpires: Aggregate.many("umpires", {
+      umpires: Aggregate.many({
         entityType: "MatchUmpire",
         entity: Umpires,
         sk: { composite: ["role", "umpire.id"] },
@@ -623,23 +623,23 @@ const RosterAggregate = Aggregate.make(Roster, {
   collection: { name: "roster" },
   root: { entityType: "RosterItem" },
   edges: {
-    byDob: Aggregate.many("byDob", {
+    byDob: Aggregate.many({
       entityType: "RosterDob",
       entity: Umpires,
       sk: { composite: ["umpire.dateOfBirth", "umpire.id"] },
     }),
-    byRank: Aggregate.many("byRank", {
+    byRank: Aggregate.many({
       entityType: "RosterRank",
       entity: Umpires,
       sk: { composite: ["umpire.rank"] },
     }),
-    bySeq: Aggregate.many("bySeq", {
+    bySeq: Aggregate.many({
       entityType: "RosterSeq",
       entity: Umpires,
       sk: { composite: ["seq"] },
     }),
     // Element IS the entity: its own `rank` (NumberFromString) is the composite.
-    flat: Aggregate.many("flat", {
+    flat: Aggregate.many({
       entityType: "RosterFlat",
       entity: Umpires,
       sk: { composite: ["rank"] },
@@ -710,7 +710,7 @@ const TrainingAggregate = Aggregate.make(Training, {
   pk: { field: "pk", composite: ["id"] },
   collection: { name: "training" },
   root: { entityType: "TrainingItem" },
-  edges: { coach: Aggregate.one("coach", { entityType: "TrainingCoach", entity: Coaches }) },
+  edges: { coach: Aggregate.one({ entityType: "TrainingCoach", entity: Coaches }) },
 })
 
 describe("#133 nested transforms — ref resolution", () => {
@@ -774,8 +774,8 @@ const JournalAggregate = Aggregate.make(Journal, {
   collection: { name: "journal" },
   root: { entityType: "JournalItem" },
   edges: {
-    notes: Aggregate.many("notes", { entityType: "JournalNote", sk: { composite: ["noteId"] } }),
-    summary: Aggregate.one("summary", { entityType: "JournalSummary" }),
+    notes: Aggregate.many({ entityType: "JournalNote", sk: { composite: ["noteId"] } }),
+    summary: Aggregate.one({ entityType: "JournalSummary" }),
   },
 })
 
@@ -1043,7 +1043,7 @@ const RefRosterAggregate = Aggregate.make(RefRoster, {
   pk: { field: "pk", composite: ["id"] },
   collection: { name: "refroster" },
   root: { entityType: "RefRosterItem" },
-  edges: { players: Aggregate.many("players", { entityType: "RefRosterPlayer", entity: Players }) },
+  edges: { players: Aggregate.many({ entityType: "RefRosterPlayer", entity: Players }) },
 })
 
 describe("#133 nested transforms — many edge of annotated refs", () => {
@@ -1188,7 +1188,7 @@ const KitAggregate = Aggregate.make(Kit, {
   pk: { field: "pk", composite: ["id"] },
   collection: { name: "kit" },
   root: { entityType: "KitItem" },
-  edges: { coach: Aggregate.one("coach", { entityType: "KitCoach", entity: Coaches }) },
+  edges: { coach: Aggregate.one({ entityType: "KitCoach", entity: Coaches }) },
 })
 
 describe("#133 nested transforms — create input values survive ref replacement", () => {
@@ -1306,13 +1306,13 @@ class League extends Schema.Class<League>("League")({
 const SquadAggregate = Aggregate.make(Squad, {
   root: { entityType: "LeagueSquad" },
   edges: {
-    players: Aggregate.many("players", { entityType: "LeagueSquadPlayer", entity: Players }),
+    players: Aggregate.many({ entityType: "LeagueSquadPlayer", entity: Players }),
   },
 })
 const ClubAggregate = Aggregate.make(Club, {
   root: { entityType: "LeagueClub" },
   edges: {
-    coach: Aggregate.one("coach", { entityType: "LeagueCoach", entity: Coaches }),
+    coach: Aggregate.one({ entityType: "LeagueCoach", entity: Coaches }),
     squad: SquadAggregate.with({ discriminator: { squadNo: 1 } }),
   },
 })
@@ -1436,13 +1436,13 @@ describe("#133 nested sub-aggregates", () => {
     const Inner = Aggregate.make(Squad, {
       root: { entityType: "ClashSquad" },
       edges: {
-        players: Aggregate.many("players", { entityType: "ClashPlayer", entity: Players }),
+        players: Aggregate.many({ entityType: "ClashPlayer", entity: Players }),
       },
     })
     const Outer = Aggregate.make(Club, {
       root: { entityType: "ClashClub" },
       edges: {
-        coach: Aggregate.one("coach", { entityType: "ClashCoach", entity: Coaches }),
+        coach: Aggregate.one({ entityType: "ClashCoach", entity: Coaches }),
         squad: Inner.with({ discriminator: { clubNo: 9 } }),
       },
     })

@@ -213,17 +213,17 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
     team: Aggregate.ref(Teams),
-    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+    coach: Aggregate.one({ entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many({ entityType: "MatchPlayer", entity: Players }),
   },
 })
 ```
 
-- `Aggregate.one(name, config)` — One member item per aggregate instance (decomposes to separate DynamoDB item)
-- `Aggregate.many(name, config)` — Multiple member items per aggregate instance (one DynamoDB item per element)
+- `Aggregate.one(config)` — One member item per aggregate instance (decomposes to separate DynamoDB item)
+- `Aggregate.many(config)` — Multiple member items per aggregate instance (one DynamoDB item per element)
 - `Aggregate.ref(entity)` — Inline ref edge (stays in the parent item, no separate DynamoDB item; hydrates on create)
 
-Edge keys (`coach`, `players`) correspond to fields on the schema.
+Edge keys (`coach`, `players`) correspond to fields on the schema, and the editor completes them from it. The `(name, config)` forms of `one` and `many`, and `many`'s `edgeAttributes`, are deprecated: neither the name nor `edgeAttributes` is read, and both are removed in the next major release.
 
 ##### Sort keys for `many` edges
 
@@ -254,7 +254,7 @@ const OfficiatedMatchAggregate = Aggregate.make(OfficiatedMatch, {
   collection: { name: "officiated" },
   root: { entityType: "OfficiatedMatchItem" },
   edges: {
-    officials: Aggregate.many("officials", {
+    officials: Aggregate.many({
       entityType: "MatchOfficial",
       entity: Umpires,
       sk: { composite: ["role", "umpire.id"] },
@@ -306,7 +306,7 @@ const MatchAggregate = Aggregate.make(Match, {
   consistentRead: true,
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -342,7 +342,7 @@ const AuditedMatchAggregate = Aggregate.make(Match, {
   collection: { name: "audited-match" },
   root: { entityType: "AuditedMatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "AuditedMatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "AuditedMatchVenue", entity: Venues }),
   },
   timestamps: {
     created: { field: "created", schema: DynamoModel.DateEpochMs },

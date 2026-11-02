@@ -352,7 +352,7 @@ Every definition position that names a model attribute is typed from the model *
 | `Collections.member` / `Collections.make` | a member's SK composites; the collection's composites, which every member's model must have |
 | `GeoIndex.make` | `index` (an index of the entity) and `fields` |
 
-Physical attribute names stay plain strings: key `field`s, `configure` `field` renames, timestamp / version / TTL attribute names. So do labels that name no model attribute: the first argument of `Aggregate.one` / `many` (the `edges` key names the field) and discriminator keys, which are written into the sort key as text. A config declared outside the call (a shared `primaryKey` or `zorder` list) needs `as const`, or a generic helper, to keep its names literal: widened to `string`, they no longer fit the model's names.
+Physical attribute names stay plain strings: key `field`s, `configure` `field` renames, timestamp / version / TTL attribute names. So do labels that name no model attribute: discriminator keys, which are written into the sort key as text. (The first argument of `Aggregate.one` / `many`, which the runtime never read, is deprecated; the `edges` key names the field.) A config declared outside the call (a shared `primaryKey` or `zorder` list) needs `as const`, or a generic helper, to keep its names literal: widened to `string`, they no longer fit the model's names.
 
 ### Table — Declares Members
 
@@ -3353,25 +3353,29 @@ The consumer defines the aggregate's domain shape as a pure Schema.Class hierarc
 
 ```typescript
 const MatchAggregate = Aggregate.make(Match, {
+  table: MainTable,
   schema: AppSchema,
   pk: { field: "pk", composite: ["matchId"] },
-  collection: { index: "lsi1", name: "match", sk: { field: "lsi1sk", composite: [...] } },
+  collection: { index: "lsi1", name: "match", sk: { field: "lsi1sk", composite: ["name"] } },
   context: ["name", "gender", "matchType", "league", "series", "season", "startDate"],
-  root: MatchEntity,
+  root: { entityType: "MatchItem" },
 
   edges: {
-    venue:   Aggregate.one(MatchVenueEntity, { ref: VenueEntity }),
+    venue:   Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
     team1:   TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2:   TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
-    umpires: Aggregate.many(MatchUmpireEntity, { ref: UmpireEntity }),
+    umpires: Aggregate.many({ entityType: "MatchUmpire", entity: Umpires }),
   },
 })
 ```
 
-**Edge types:**
-- `Aggregate.one(EdgeEntity, { ref? })` — one-to-one edge entity. Optional `ref` specifies the external entity to hydrate/denormalize from.
-- `Aggregate.many(EdgeEntity, { ref? })` — one-to-many edge entities. One DynamoDB item per element.
+**Edge types** (each `edges` key names a schema field, typed from the schema):
+- `Aggregate.one({ entityType, entity?, discriminator? })` — one-to-one edge: one item per aggregate. Optional `entity` is the external entity to hydrate/denormalize from.
+- `Aggregate.many({ entityType, entity?, inputField?, sk?, assemble?, decompose? })` — one-to-many edge: one DynamoDB item per element.
+- `Aggregate.ref(entity)` — inline ref: stays in the parent item, hydrated on write.
 - **BoundSubAggregate** — sub-tree with discriminator for reuse (e.g., `TeamSheetAggregate.with(...)`)
+
+The `(name, config)` forms of `one` / `many` and `many`'s `edgeAttributes` are deprecated *(owner 2026-11-01)*: neither the name nor `edgeAttributes` is read. Both are removed in the next major release.
 
 ### Aggregate Operations via Typed Client
 

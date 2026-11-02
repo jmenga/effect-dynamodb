@@ -301,7 +301,7 @@ const PurchaseOrders = Aggregate.make(PurchaseOrder, {
   collection: { index: "lsi1", name: "purchaseOrder", sk: { field: "lsi1sk", composite: [] } },
   root: { entityType: "PurchaseOrderItem" },
   edges: {
-    lines: Aggregate.many("lines", {
+    lines: Aggregate.many({
       entityType: "PurchaseOrderLine",
       sk: { composite: ["lineId"] },
     }),

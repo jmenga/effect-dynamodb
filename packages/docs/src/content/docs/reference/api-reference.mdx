@@ -1153,8 +1153,8 @@ import { Aggregate } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `make` | Overloaded | Create a sub-aggregate or top-level aggregate (see below) |
-| `one` | `(name, { entityType }) => OneEdge` | Create a one-to-one edge descriptor |
-| `many` | `(name, config) => ManyEdge` | Create a one-to-many edge descriptor |
+| `one` | `({ entityType, entity?, discriminator? }) => OneEdge` | Create a one-to-one edge descriptor. The `edges` key names the schema field. `(name, config)` is deprecated (the name is not read) and removed in the next major release |
+| `many` | `({ entityType, entity?, inputField?, sk?, assemble?, decompose? }) => ManyEdge` | Create a one-to-many edge descriptor. `(name, config)` and `edgeAttributes` are deprecated (neither is read) and removed in the next major release |
 | `ref` | `(entity) => RefEdge` | Create a ref edge (inline hydration, no separate DynamoDB item) |
 
 **Sub-aggregate form** — `Aggregate.make(Schema, { root, edges })`:
@@ -1165,8 +1165,8 @@ Returns a `SubAggregate<TSchema>` with a `.with(config)` method for discriminato
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
-    coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+    coach: Aggregate.one({ entityType: "MatchCoach" }),
+    players: Aggregate.many({ entityType: "MatchPlayer" }),
   },
 })
 ```
@@ -1184,7 +1184,7 @@ const MatchAggregate = Aggregate.make(Match, {
   root: { entityType: "MatchItem" },
   refs: { Team: Teams, Player: Players, Coach: Coaches, Venue: Venues },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue" }),
+    venue: Aggregate.one({ entityType: "MatchVenue" }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -1205,8 +1205,8 @@ const MatchAggregate = Aggregate.make(Match, {
 
 | Type | Description |
 |------|-------------|
-| `OneEdge` | One-to-one edge: `{ _tag: "OneEdge", name, entityType }` |
-| `ManyEdge` | One-to-many edge: `{ _tag: "ManyEdge", name, entityType, edgeAttributes?, sk? }` |
+| `OneEdge` | One-to-one edge: `{ _tag: "OneEdge", entityType, entity?, discriminator? }` (`name?`, deprecated, only from the `(name, config)` form) |
+| `ManyEdge` | One-to-many edge: `{ _tag: "ManyEdge", entityType, entity?, inputField?, sk?, assemble?, decompose? }` (`name?` and `edgeAttributes?` deprecated) |
 | `RefEdge` | Inline ref edge: `{ _tag: "RefEdge", entity }` — no separate DynamoDB item |
 | `AggregateEdge` | Union: `OneEdge \| ManyEdge \| RefEdge` |
 

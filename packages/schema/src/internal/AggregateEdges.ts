@@ -55,7 +55,19 @@ export interface RefEntity<M extends Schema.Top = Schema.Top, TIndexes = unknown
  */
 export interface OneEdge<E extends RefEntity = RefEntity> {
   readonly _tag: "OneEdge"
-  readonly name: string
+  /**
+   * @deprecated The name given to the deprecated `one(name, config)` form. It
+   * is not read: the `edges` key names the edge. Absent from `one(config)`;
+   * removed in the next major release.
+   */
+  readonly name?: string
+  readonly entityType: string
+  readonly entity?: E
+  readonly discriminator?: Record<string, unknown>
+}
+
+/** Configuration for a one edge */
+export interface OneEdgeConfig<E extends RefEntity = RefEntity> {
   readonly entityType: string
   readonly entity?: E
   readonly discriminator?: Record<string, unknown>
@@ -66,6 +78,10 @@ export interface ManyEdgeConfig<E extends RefEntity = RefEntity> {
   readonly entityType: string
   readonly entity?: E
   readonly inputField?: string
+  /**
+   * @deprecated Not read: it changes nothing an edge item stores or returns.
+   * Leave it out; it is removed in the next major release.
+   */
   readonly edgeAttributes?: ReadonlyArray<string>
   readonly sk?: { readonly composite: ReadonlyArray<string> }
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
@@ -80,10 +96,16 @@ export interface ManyEdgeConfig<E extends RefEntity = RefEntity> {
  */
 export interface ManyEdge<E extends RefEntity = RefEntity> {
   readonly _tag: "ManyEdge"
-  readonly name: string
+  /**
+   * @deprecated The name given to the deprecated `many(name, config)` form. It
+   * is not read: the `edges` key names the edge. Absent from `many(config)`;
+   * removed in the next major release.
+   */
+  readonly name?: string
   readonly entityType: string
   readonly entity?: E
   readonly inputField?: string
+  /** @deprecated Not read; see {@link ManyEdgeConfig.edgeAttributes}. */
   readonly edgeAttributes?: ReadonlyArray<string>
   readonly sk?: { readonly composite: ReadonlyArray<string> }
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
@@ -109,28 +131,36 @@ export type AggregateEdge = OneEdge<any> | ManyEdge<any> | RefEdge<any>
 // ---------------------------------------------------------------------------
 
 /**
- * Create a one-to-one edge descriptor.
+ * Create a one-to-one edge descriptor. The `edges` key it is declared under
+ * names the schema field it decomposes.
  *
  * Generic over the referenced entity `E` so the entity's branded primary-key
  * identifier flows into the derived aggregate input/update types. When `entity`
  * is omitted, `E` defaults to `RefEntity` and the edge id falls back to `string`.
  */
-export const one = <const E extends RefEntity = RefEntity>(
+export function one<const E extends RefEntity = RefEntity>(config: OneEdgeConfig<E>): OneEdge<E>
+/**
+ * @deprecated The name is not read: the `edges` key names the edge. Use
+ * `Aggregate.one(config)`; the `(name, config)` form is removed in the next
+ * major release.
+ */
+export function one<const E extends RefEntity = RefEntity>(
   name: string,
-  config: {
-    readonly entityType: string
-    readonly entity?: E
-    readonly discriminator?: Record<string, unknown>
-  },
-): OneEdge<E> => ({
-  _tag: "OneEdge",
-  name,
-  entityType: config.entityType,
-  // Spread rather than assign: under `exactOptionalPropertyTypes` an absent
-  // optional field must stay absent, not be set to an explicit `undefined`.
-  ...(config.entity !== undefined && { entity: config.entity }),
-  ...(config.discriminator !== undefined && { discriminator: config.discriminator }),
-})
+  config: OneEdgeConfig<E>,
+): OneEdge<E>
+export function one(nameOrConfig: string | OneEdgeConfig, legacy?: OneEdgeConfig): OneEdge {
+  const named = typeof nameOrConfig === "string"
+  const config = named ? (legacy as OneEdgeConfig) : nameOrConfig
+  return {
+    _tag: "OneEdge",
+    ...(named && { name: nameOrConfig }),
+    entityType: config.entityType,
+    // Spread rather than assign: under `exactOptionalPropertyTypes` an absent
+    // optional field must stay absent, not be set to an explicit `undefined`.
+    ...(config.entity !== undefined && { entity: config.entity }),
+    ...(config.discriminator !== undefined && { discriminator: config.discriminator }),
+  }
+}
 
 /**
  * The declared `sk.composite` of a many edge, kept on its type so
@@ -140,9 +170,28 @@ export const one = <const E extends RefEntity = RefEntity>(
 export type ManyEdgeSk<SK> = [SK] extends [never] ? {} : { readonly sk: { readonly composite: SK } }
 
 /**
- * Create a one-to-many edge descriptor. `sk.composite` names attributes of the
+ * Create a one-to-many edge descriptor. The `edges` key it is declared under
+ * names the schema field it decomposes. `sk.composite` names attributes of the
  * edge field's element (a dotted path reaches into a hydrated ref:
  * `"umpire.id"`); `Aggregate.make` checks them against its schema.
+ */
+export function many<
+  const E extends RefEntity,
+  const IF extends string,
+  const SK extends ReadonlyArray<string> = never,
+>(
+  config: ManyEdgeConfig<E> & {
+    readonly inputField: IF
+    readonly sk?: { readonly composite: SK }
+  },
+): ManyEdge<E> & { readonly inputField: IF } & ManyEdgeSk<SK>
+export function many<const E extends RefEntity, const SK extends ReadonlyArray<string> = never>(
+  config: ManyEdgeConfig<E> & { readonly sk?: { readonly composite: SK } },
+): ManyEdge<E> & ManyEdgeSk<SK>
+/**
+ * @deprecated The name is not read: the `edges` key names the edge. Use
+ * `Aggregate.many(config)`; the `(name, config)` form is removed in the next
+ * major release.
  */
 export function many<
   const E extends RefEntity,
@@ -155,14 +204,21 @@ export function many<
     readonly sk?: { readonly composite: SK }
   },
 ): ManyEdge<E> & { readonly inputField: IF } & ManyEdgeSk<SK>
+/**
+ * @deprecated The name is not read: the `edges` key names the edge. Use
+ * `Aggregate.many(config)`; the `(name, config)` form is removed in the next
+ * major release.
+ */
 export function many<const E extends RefEntity, const SK extends ReadonlyArray<string> = never>(
   name: string,
   config: ManyEdgeConfig<E> & { readonly sk?: { readonly composite: SK } },
 ): ManyEdge<E> & ManyEdgeSk<SK>
-export function many(name: string, config: ManyEdgeConfig): ManyEdge {
+export function many(nameOrConfig: string | ManyEdgeConfig, legacy?: ManyEdgeConfig): ManyEdge {
+  const named = typeof nameOrConfig === "string"
+  const config = named ? (legacy as ManyEdgeConfig) : nameOrConfig
   return {
     _tag: "ManyEdge",
-    name,
+    ...(named && { name: nameOrConfig }),
     entityType: config.entityType,
     ...(config.entity !== undefined && { entity: config.entity }),
     ...(config.inputField !== undefined && { inputField: config.inputField }),

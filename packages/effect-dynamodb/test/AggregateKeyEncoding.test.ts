@@ -132,7 +132,7 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
     collection: { index: "lsi1", name: "routes", sk: { field: "lsi1sk", composite: ["area"] } },
     root: { entityType: "RouteItem" },
     edges: {
-      stops: Aggregate.many("stops", { entityType: "RouteStop", sk: { composite: ["label"] } }),
+      stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
     },
   })
 

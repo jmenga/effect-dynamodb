@@ -165,26 +165,40 @@ describe("Aggregate", () => {
 
   describe("edge builders", () => {
     it("one() creates a OneEdge", () => {
-      const edge = Aggregate.one("venue", { entityType: "MatchVenue" })
-      expect(edge._tag).toBe("OneEdge")
-      expect(edge.name).toBe("venue")
-      expect(edge.entityType).toBe("MatchVenue")
+      const edge = Aggregate.one({ entityType: "MatchVenue" })
+      expect(edge).toEqual({ _tag: "OneEdge", entityType: "MatchVenue" })
     })
 
     it("many() creates a ManyEdge", () => {
-      const edge = Aggregate.many("players", {
+      const edge = Aggregate.many({ entityType: "MatchPlayer", inputField: "playerIds" })
+      expect(edge).toEqual({ _tag: "ManyEdge", entityType: "MatchPlayer", inputField: "playerIds" })
+    })
+
+    it("the deprecated (name, config) forms build the same edges, keeping the unread name", () => {
+      // The name and edgeAttributes are not read; kept until the next major release.
+      expect(Aggregate.one("venue", { entityType: "MatchVenue" })).toEqual({
+        _tag: "OneEdge",
+        name: "venue",
+        entityType: "MatchVenue",
+      })
+      expect(
+        Aggregate.many("players", {
+          entityType: "MatchPlayer",
+          edgeAttributes: ["battingPosition", "isCaptain"],
+        }),
+      ).toEqual({
+        _tag: "ManyEdge",
+        name: "players",
         entityType: "MatchPlayer",
         edgeAttributes: ["battingPosition", "isCaptain"],
       })
-      expect(edge._tag).toBe("ManyEdge")
-      expect(edge.name).toBe("players")
-      expect(edge.entityType).toBe("MatchPlayer")
-      expect(edge.edgeAttributes).toEqual(["battingPosition", "isCaptain"])
+      const named = Aggregate.many("players", { entityType: "MatchPlayer", inputField: "ids" })
+      expect(named.inputField).toBe("ids")
     })
 
     it("many() with custom assemble function", () => {
       const assemble = (items: ReadonlyArray<unknown>) => ({ custom: items })
-      const edge = Aggregate.many("umpires", {
+      const edge = Aggregate.many({
         entityType: "MatchUmpire",
         assemble,
       })
@@ -192,8 +206,8 @@ describe("Aggregate", () => {
     })
 
     it("isOneEdge / isManyEdge type guards", () => {
-      const oneEdge = Aggregate.one("venue", { entityType: "MatchVenue" })
-      const manyEdge = Aggregate.many("players", { entityType: "MatchPlayer" })
+      const oneEdge = Aggregate.one({ entityType: "MatchVenue" })
+      const manyEdge = Aggregate.many({ entityType: "MatchPlayer" })
 
       expect(Aggregate.isOneEdge(oneEdge)).toBe(true)
       expect(Aggregate.isManyEdge(oneEdge)).toBe(false)
@@ -211,8 +225,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -224,8 +238,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -239,8 +253,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -263,8 +277,8 @@ describe("Aggregate", () => {
         root: { entityType: "MatchTeam" },
         edges: {
           team: Aggregate.ref(TeamEntity),
-          coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+          coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+          players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
         },
       })
 
@@ -279,7 +293,7 @@ describe("Aggregate", () => {
         },
         root: { entityType: "MatchItem" },
         edges: {
-          venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+          venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
           team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
           team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
         },
@@ -316,8 +330,8 @@ describe("Aggregate", () => {
           },
           root: { entityType: "PostItem" },
           edges: {
-            author: Aggregate.one("author", { entityType: "PostAuthor" }),
-            comments: Aggregate.many("comments", { entityType: "PostComment" }),
+            author: Aggregate.one({ entityType: "PostAuthor" }),
+            comments: Aggregate.many({ entityType: "PostComment" }),
           },
         })
 
@@ -386,7 +400,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "SimpleRoot" },
           edges: {
-            items: Aggregate.many("items", { entityType: "SimpleItem" }),
+            items: Aggregate.many({ entityType: "SimpleItem" }),
           },
         })
 
@@ -441,8 +455,8 @@ describe("Aggregate", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -457,7 +471,7 @@ describe("Aggregate", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -616,7 +630,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "MatchRoot" },
           edges: {
-            umpires: Aggregate.many("umpires", {
+            umpires: Aggregate.many({
               entityType: "MatchUmpire",
               assemble: (items) => ({
                 matchReferee: (items as Array<{ umpireName: string; role: string }>).find(
@@ -706,12 +720,12 @@ describe("Aggregate", () => {
     const UmpireSheetAggregate = Aggregate.make(UmpireSheet, {
       root: { entityType: "MatchUmpires" },
       edges: {
-        matchReferee: Aggregate.one("matchReferee", {
+        matchReferee: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "referee" },
         }),
-        tvUmpire: Aggregate.one("tvUmpire", {
+        tvUmpire: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "tvUmpire" },
@@ -922,7 +936,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "WithOneRoot" },
           edges: {
-            detail: Aggregate.one("detail", { entityType: "WithOneDetail" }),
+            detail: Aggregate.one({ entityType: "WithOneDetail" }),
           },
         })
 
@@ -1023,7 +1037,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "WithManyRoot" },
           edges: {
-            items: Aggregate.many("items", { entityType: "WithManyItem" }),
+            items: Aggregate.many({ entityType: "WithManyItem" }),
           },
         })
 
@@ -1439,10 +1453,10 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "PostItem" },
       edges: {
-        author: Aggregate.one("author", { entityType: "PostAuthor" }),
+        author: Aggregate.one({ entityType: "PostAuthor" }),
         // Entity-less many edge: nothing identifies an element, so the sort key
         // has to be declared or every comment lands on one row (#103).
-        comments: Aggregate.many("comments", {
+        comments: Aggregate.many({
           entityType: "PostComment",
           sk: { composite: ["user"] },
         }),
@@ -1485,8 +1499,8 @@ describe("Aggregate write path", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -1501,7 +1515,7 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -2302,7 +2316,7 @@ describe("Aggregate write path", () => {
       pk: { field: "pk", composite: ["postId"] },
       collection: { index: "lsi1", name: "postx", sk: { field: "lsi1sk", composite: [] } },
       root: { entityType: "PostXRoot" },
-      edges: { comments: Aggregate.many("comments", { entityType: "PostXComment" }) },
+      edges: { comments: Aggregate.many({ entityType: "PostXComment" }) },
     })
 
     // Create (capturing the written rows), then arm the partition query with those
@@ -2526,8 +2540,8 @@ describe("Aggregate write path", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -2542,7 +2556,7 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -2686,7 +2700,7 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "FixtureItem" },
         edges: {
-          sponsor: Aggregate.one("sponsor", { entityType: "FixtureSponsor", entity: TeamEntity }),
+          sponsor: Aggregate.one({ entityType: "FixtureSponsor", entity: TeamEntity }),
         },
       })
 
@@ -2799,7 +2813,7 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "OfficiatedMatchItem" },
         edges: {
-          officials: Aggregate.many("officials", {
+          officials: Aggregate.many({
             entityType: "MatchOfficial",
             entity: OfficialEntity,
             ...(sk !== undefined && { sk: sk as never }),
@@ -3063,7 +3077,7 @@ describe("Aggregate write path", () => {
           },
           root: { entityType: "RosterItem" },
           edges: {
-            slots: Aggregate.many("slots", {
+            slots: Aggregate.many({
               entityType: "RosterSlot",
               entity: OfficialEntity,
               sk: { composite: ["seq", "confirmed", "official.officialId"] },
@@ -3110,11 +3124,11 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "PanelItem" },
         edges: {
-          onfield: Aggregate.many("onfield", {
+          onfield: Aggregate.many({
             entityType: "PanelOnfield",
             entity: OfficialEntity,
           }),
-          third: Aggregate.one("third", { entityType: "PanelThird", entity: OfficialEntity }),
+          third: Aggregate.one({ entityType: "PanelThird", entity: OfficialEntity }),
         },
       })
 
@@ -3178,12 +3192,12 @@ describe("Aggregate write path", () => {
     const UmpireSheetAggregate = Aggregate.make(UmpireSheet, {
       root: { entityType: "MatchUmpires" },
       edges: {
-        matchReferee: Aggregate.one("matchReferee", {
+        matchReferee: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "referee" },
         }),
-        matchUmpire: Aggregate.many("matchUmpire", {
+        matchUmpire: Aggregate.many({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           inputField: "matchUmpireIds",
@@ -3316,7 +3330,7 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "SimpleMatchItem" },
         edges: {
-          players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+          players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
         },
       })
 

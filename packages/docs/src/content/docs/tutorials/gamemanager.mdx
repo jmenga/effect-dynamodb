@@ -2264,8 +2264,8 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
     team: Aggregate.ref(Teams),
-    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+    coach: Aggregate.one({ entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many({ entityType: "MatchPlayer", entity: Players }),
   },
 })
 
@@ -2277,7 +2277,7 @@ const MatchAggregate = Aggregate.make(Match, {
   collection: { name: "match" },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -2288,9 +2288,9 @@ Key aggregate concepts:
 
 - **`Aggregate.ref(Teams)`** — Like `DynamoModel.ref` but at the aggregate level. The `team` field in `TeamSheet` references Teams. Input accepts IDs; output contains full Team objects.
 
-- **`Aggregate.one("venue", { entity: Venues, entityType: "MatchVenue" })`** — A one-to-one edge. The venue is decomposed into a separate DynamoDB item with entity type `MatchVenue`, all sharing the match's partition key.
+- **`Aggregate.one({ entity: Venues, entityType: "MatchVenue" })`** — A one-to-one edge. The venue is decomposed into a separate DynamoDB item with entity type `MatchVenue`, all sharing the match's partition key.
 
-- **`Aggregate.many("players", { entity: Players, entityType: "MatchPlayer" })`** — A one-to-many edge. Each player in the team sheet becomes a separate DynamoDB item. The hydrated player is stored in its wire form, so `player.dateOfBirth` is an ISO string on the `MatchPlayer` item and reads back as a `Date` (see [How Values Are Stored](/effect-dynamodb/guides/aggregates/#how-values-are-stored)).
+- **`Aggregate.many({ entity: Players, entityType: "MatchPlayer" })`** — A one-to-many edge. Each player in the team sheet becomes a separate DynamoDB item. The hydrated player is stored in its wire form, so `player.dateOfBirth` is an ISO string on the `MatchPlayer` item and reads back as a `Date` (see [How Values Are Stored](/effect-dynamodb/guides/aggregates/#how-values-are-stored)).
 
 - **`TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } })`** — Binds a sub-aggregate with a discriminator. Since a match has **two** TeamSheets, the discriminator (`teamNumber: 1` vs `teamNumber: 2`) distinguishes them in the sort key.
 
