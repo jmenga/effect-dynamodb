@@ -54,8 +54,13 @@ describe("node-free guard", () => {
     expect(offendersIn(files)).toEqual([])
   })
 
-  it("the built Compression and PackedCodec modules are present (so the dist check covers them)", () => {
-    for (const file of ["Compression.js", "internal/PackedCodec.js"]) {
+  it("the built codec and checksum modules are present (so the dist check covers them)", () => {
+    for (const file of [
+      "Compression.js",
+      "internal/PackedCodec.js",
+      "internal/Crc64Nvme.js",
+      "internal/Sha256.js",
+    ]) {
       expect(existsSync(join(distDir, file)), `${file} missing from dist — rebuild`).toBe(true)
     }
   })
