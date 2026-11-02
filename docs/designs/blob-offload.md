@@ -471,8 +471,9 @@ Defaults: `{ overflow: "eager", binary: "lazy" }`. A string sets both kinds; an 
 overrides the kinds it names. Available:
 
 - on bound builders: `BoundGet`, `BoundQuery` (index accessors, scans, `history()`,
-  `versions()`, `deleted.list()`), collection queries (per member), `BoundPut` /
-  `BoundUpdate` / `BoundDelete` / `upsert` / `append` (their return values);
+  `versions()`, `deleted.list()`), collection queries (per member), vector searches
+  (`BoundVectorQuery`, its hits), `BoundPut` / `BoundUpdate` / `BoundDelete` / `upsert` /
+  `append` (their return values);
 - on unbound descriptors, as `Function.dual` combinators (the dual-API convention):
   `Entity.offloaded(mode)` for `EntityGet` and the write intermediates (`EntityPut`,
   `EntityUpdate`, `EntityDelete`), and `Query.offloaded(mode)` for `Query<A, E>` — including the
@@ -1320,6 +1321,8 @@ reused, under two conditions that make it safe:
 - **Content, not checksum.** The engine keeps the value it fetched for each offloaded field
   of the row it read. A field whose folded value deep-equals that fetched value (structural
   equality of the domain value) keeps the read pointer; any other value uploads.
+  *(Implemented, commit 9, over the encoded content snapshotted at the read — the canonical
+  JSON of an overflow value, the bytes of a binary one — see §21 item 9.)*
 - **Pinned.** The row write's condition gains `#f = :P` for every reused pointer `P`, beside
   the existing revision / checkpoint guard (`ProjectionEngine.ts:514-554`). A concurrent write
   of the row — by the projection or by anything else — fails it as `LostRace`, which the
@@ -1477,7 +1480,7 @@ I/O.
 
 | Read | Default modes | Notes |
 |---|---|---|
-| `get`, queries, scans, collections, `Batch.get`, `transactGet`, `history()`, `versions()` / `getVersion()`, `deleted.get` / `deleted.list`, `ReturnValues` | overflow eager, binary lazy | `.offloaded()` per builder |
+| `get`, queries, scans, collections, vector search hits, `Batch.get`, `transactGet`, `history()`, `versions()` / `getVersion()`, `deleted.get` / `deleted.list`, `ReturnValues` | overflow eager, binary lazy | `.offloaded()` per builder |
 | `asNative` | — | returns the stored pointer (`B`, or a binary field's `S`) unchanged |
 | `asRecord` / `asItem` | the op's modes | resolve like `asModel`, then add system fields (and keys) |
 | raw projections (`select`, `selectPaths`, `Entity.project`, vector `select`) | overflow eager (parsed JSON wire form, as #147's raw rows), binary lazy | via the raw-row hook, which declares the offloaded attributes in `QueryRawRow.attributes`, so a projection that names none of them installs no hook and fetches nothing |
@@ -3418,11 +3421,119 @@ a write path, deletes the gate.
    captured store and compressor registry in `extractTransactable` (the compressor fix),
    `Batch.write` settlement, transaction planning and re-planning, `const`-generic op typing,
    projection pointer reuse (deep-equal + `#f = :P`), vector source and projections.
+   *Implementation notes (commit 9):* `validateAndBuildPutItem` builds the stored-name item
+   and no longer marshals it: its callers route and upload through the member's
+   `_offloadItem(item, table, operation, reuse?)` (the put core's `OffloadWrite.route`, under
+   the full operation name) and marshal after. A bound builder carries the services its
+   `Entity.bind` resolved (`BoundCrudConfig.captured`: the `BlobStore` and `Compression` of the
+   bind context, `TransactableOps.capturedServices`), `extractTransactable` surfaces them as
+   `TransactableInfo.captured`, and `underCaptured` provides them (`Effect.provideContext`, so
+   the client, ledger and operation are untouched) around everything done for that op: the
+   item build (packing), the uploads, a planned update's or delete's plan, and the decode of
+   a `Batch.get` / `transactGet` row (`loadGetRows` also groups rows by captured context).
+   `Batch.write` builds every op first (local work, so a refused op uploads nothing), runs the
+   repeated-key check, then uploads every offloading put through `forEachSettled` before any
+   request; settlement is the ledger's at the choke point (commit 6: per ref by
+   `UnprocessedItems` and `$metadata.attempts`, a versioned chunk by its token), and an
+   `Expired` refusal of a later request is rebuilt to say what the batch had already written
+   (`withCommitted`, the clause the batch's other mid-batch failures use).
+   `buildTransactWriteItems` builds every put's item first (local work, so a refused op reads
+   and uploads nothing), then runs the plan pre-pass it is given (`plans`, the effect
+   `planTransactWriteOps(operations)`), then uploads each put's values after its tombstone read
+   and before a guarded put's read; planned updates upload under the recording client into
+   the transaction's ledger, and a re-plan after a lost race hits the memo. `Batch.write` and `transactWrite` are `const`-generic over their ops and add
+   `WriteOpBlobErrors<T[number]>` (`BlobStoreError` for an op whose own error type has it,
+   nothing for a plain op or one typed `any`); `PlanUpdateError` / `PlanDeleteError` gain
+   `BlobStoreError`. Projections: `readRow` of an offloading read model reads the row through
+   `_loadForReuse`, which loads it eagerly, snapshots each pointer it held
+   (`OffloadWrite.ReadPointers`: the pointer, its stored attribute value, and the content it
+   named — the canonical JSON of the loaded overflow value, sorted keys on null-prototype
+   copies so an own `__proto__` key stays in the text, or a copy of the bytes), and decodes it
+   as an item — Hidden fields included, as the plain read model's `decodeMarshalledItem` does,
+   since the row is written back whole; the row write passes them
+   as `reuse` (`EntityPutOpts.reuse` on the entity-put path, `_offloadItem`'s fourth argument
+   on the outbox path) and `OffloadWrite.reuse` keeps, before routing, every uploadable value
+   whose encoded content equals its snapshot: the item takes the stored pointer value, the
+   write's condition gains `#eddPin<i> = :eddPin<i>` (`withPins`), and the content seeds the
+   ledger's read cache (`BlobLedger.remember`), so the outcome's eager `state` fetches
+   nothing. Upload operation names are the builders' validation names (`batchWrite.put`,
+   `transactWrite.put`, `<projection label>.write`). Vector searches: `BoundVectorQuery`
+   carries the trailing `O`, gains `.offloaded()` and adds `ReadErrors<O>` to `collect`; the
+   hits load in one `loadRows` batch under the builder's modes (operation
+   `vectorSearch.<index>.decode`), a `select` naming a read attribute in raw mode
+   (`vectorSearch.<index>.select`), and decode through `_decodeRecord(raw, modes)`. `reembed`
+   decodes lazily and reads only the source fields' offloaded values, of live rows only (a
+   retained snapshot or tombstone is skipped on its sort key before any read); the standard update's
+   vector path and the retain path's domain copy fetch only the source fields the payload
+   does not supply (`keepOffloaded`). Unit tests: `test/Entity.offload.multi.test.ts`
+   (`Batch.write` settlement per answer, `Expired` on a later chunk, transactions committed,
+   cancelled and re-planned, captured stores and compressors), the projection-reuse tests of
+   `test/EventStore.projection-rows.test.ts` (kept and pinned, changed and uploaded, a
+   concurrent change of the field lost and retried, the outbox transaction; an overflow field
+   unchanged, restated in another key order, changed, differing only under a `__proto__` key,
+   and gzip-compressed; a required and an optional Hidden field on an offloading read model),
+   the transaction tests of a refused put beside a planned update and of a store failure while
+   planning one, and the vector tests of `test/Entity.offload.read.test.ts` (with a retained
+   member: the read-merge update's source reads, and `reembed` over its snapshots); type tests in
+   `test/Entity.offload.types.test.ts`; `test/connected.entity-offload.test.ts` gains
+   `Batch.write` and `transactWrite` (committed and cancelled) against DynamoDB Local.
+   *Deviations (commit 9):*
+   - A projection keeps a read pointer when the folded value's **encoded** content equals the
+     content the pointer named when the row was read (canonical JSON, key order ignored, for
+     an overflow field; the bytes for a binary one), not when the domain values are
+     structurally equal (§6.11). The snapshot is taken at the read, so an `evolve` that
+     mutates its state in place cannot make a changed value compare equal to itself, and the
+     comparison is over exactly what an upload would store; a restatement in another key order
+     keeps the pointer, as the immutable confirm of commit 7 accepts it. The canonical text is
+     built on null-prototype objects: values that differ only under an own `__proto__` key
+     (which `JSON.parse` creates) are different content.
+   - `BoundVectorQuery` gains `.offloaded()` (decision 43: every read builder), which §3.7's
+     list did not name; §3.7 and §8.4 now do.
+   - The typing of `EventStream.append` / `commandHandler`'s `additionalItems` (`const`
+     generics, `BlobStoreError` in `AppendError`) moves to commit 13 (EventStore, item 13's
+     scope) with the rest of the stream's offload types. Their puts already route and upload through the shared
+     builder; nothing reaches them outside the test-only gate until then.
+   - The projection interleaving of the test plan (§19) is in
+     `test/EventStore.projection-rows.test.ts`, the concurrent writer scripted between the
+     row's read and its write by the in-memory tables' `afterGet` hook;
+     `test/Offload.interleaving.test.ts` moves to commit 16 (GC, item 16's scope): its other
+     two scenarios, a unique-constraint entity and an aggregate edge (commit 11), both need
+     the reaper.
+   *Debt fixed (commit 9):* bound builders inside `Batch` / `Transaction` ignored the
+   compressor registry they were bound with, for writes and for `Batch.get` / `transactGet`
+   decodes (row 71's compressor fix); a `BlobStoreError` raised while planning a transaction's
+   update or delete died as a defect (`PlanUpdateError` / `PlanDeleteError` lacked it); a
+   vector `select` naming an offloaded field returned the raw pointer (only packed fields were
+   unpacked); `reembed`, the update vector path and the retain path's domain copy fetched
+   every offloaded field rather than the sources (commit 8's eager decode); commit 8's
+   deviation for vector hits and `reembed` (eager, a `BlobStoreError` reported as a
+   `ValidationError`'s cause) is gone; `extractTransactable`'s doc comment sat on
+   `createGuard`; `transactWrite` planned its updates and multi-item deletes (reading their
+   rows) before building any put, so a put refused by its own validation cost those reads —
+   and, with offloading, a planned update's uploads — and the build now plans once every put
+   is built.
+   *Port onto 1.42.2 (commit 9):* main checks and composes every op of a transaction before
+   anything reads (`prepareTransactWriteOps`, #236) and plans from that (`planTransactWriteOps(
+   prepared)`), so the put items are already built when the plans read: the prepared op carries
+   its `captured` services, the put item is built under them and a plan thunk runs under them,
+   and `buildTransactWriteItems` keeps main's `{ prepared, plans }` options (no plan effect).
+   Main marshals the built item through `marshalOrFail`, which names a field DynamoDB can't
+   store; the port keeps that marshal (so the refusal still comes before any read or upload,
+   and a getter in a value is called as often as main calls it, `LostBehindGetters.test.ts`)
+   and returns it again: an entity that offloads nothing stores it as it is, and one that
+   offloads a field marshals its routed item again through `marshalPutItem` (the same
+   refusal). This supersedes "no longer marshals it" above. `Batch.write` keeps main's request packing (`packRequests`: 25 requests and
+   16 MB of body; versioned chunks by transaction size) around the build / upload / request
+   stages. `OffloadWrite.rowOf` of `_offloadItem` passes the schema's `escapeKeys` like the put
+   core's. The 1.36 key paths are gone (no `aliasOf`, `old`, `held`, `leftBehind`,
+   `Planning`, `ItemNotMoved`), and so are their tests; the multi-item fixtures use
+   `escapeKeys: true`. A projection row write adds the row token (#237) before routing, so the
+   item budget counts it, and pins the reused pointers onto the row-token condition.
 10. **Binary inputs and streaming** — `BinaryInput`, `Offload.source`, single-use streams +
     memo, handle copy (with `VersionId` check), in-memory multipart simulation, `EDD-9120`.
 11. **Aggregates** — diff first, route + upload after `buildDynamoItems` on stored attributes,
     no read-pointer reuse, per-group settlement, eager assembly, `AggregateType` error
-    parameter.
+    parameter. (The aggregate-edge interleaving of §19 is item 16's: it needs the reaper.)
 12. **Geo** — `GeoSearch.nearby` decoding through the entity's two-phase decoder (fixing the
     #147 packed gap), eager resolution, `GeoIndex.put` binary input, `GeoIndex.bind` check,
     error unions.
@@ -3430,7 +3541,9 @@ a write path, deletes the gate.
     `measure*`, reads + `offloaded` option and `Query.offloaded` on `query.events`,
     `decodeStreamImage` / projections / `processBatch` / `runChangeFeed` lazy by default with
     `LazyStreamEvent`, `EventStream` parameter, `EventStore.bind` / `bindProjection` /
-    first-operation checks. **The gate is deleted**: the refusal is lifted for every member.
+    first-operation checks; the typing of `EventStream.append` / `commandHandler`'s
+    `additionalItems` (`const` generics over the ops, `BlobStoreError` in `AppendError`; moved
+    from commit 9). **The gate is deleted**: the refusal is lifted for every member.
 14. **Streams** — `decodeStreamRecord`, `Offload.compareStored`, `StorageEncoding.pointer` and
     pointer-aware `decode`, projection poison-record exclusion, `EDD-9119` (decoder side).
 15. **S3 store + CI** — `src/blob/s3.ts` (put / copy `VersionId` checks and cleanup, list, head,
@@ -3438,7 +3551,9 @@ a write path, deletes the gate.
     MinIO in CI; `connected.blob-s3.test.ts`.
 16. **GC** — `BlobGc`: reaper (table-local candidates, every-record view check, free rules,
     bracketed confirm-read, `confirm` option), per-item two-pass sweep and `sweepPartition`,
-    `sweepStore`, purge integration, `EDD-9118` / `9119`.
+    `sweepStore`, purge integration, `EDD-9118` / `9119`; `test/Offload.interleaving.test.ts`
+    (§19, moved from commit 9): the unique-constraint and aggregate-edge interleavings, which
+    need the reaper.
 17. **End-to-end connected** — `connected.blob-offload.test.ts`.
 18. **Docs** — the §20 table: the new guide and its sidebar entry, the example, the guide and
     tutorial updates, `api-reference.mdx` (including the `PackedConfig | ExternalPackedConfig`

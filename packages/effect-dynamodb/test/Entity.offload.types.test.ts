@@ -120,12 +120,44 @@ const MainTable = Table.make({
   entities: { Docs, Scans, Plain, PureDocs, Readings },
 })
 
+/** Vector search over an offloading member, and over one that offloads nothing. */
+const byTitle = {
+  name: "vec1",
+  dimensions: 2,
+  distance: "cosine",
+  source: { fields: ["title"] },
+} as const
+const Cards = withOffloadGate(() =>
+  Entity.make({ model: offloaded, entityType: "Card", primaryKey, vectorIndexes: { byTitle } }),
+)
+const PlainCards = Entity.make({
+  model: Doc,
+  entityType: "PlainCard",
+  primaryKey,
+  vectorIndexes: { byTitle },
+})
+const VectorTable = Table.make({
+  schema: DynamoSchema.make({ name: "vectors", version: 1, escapeKeys: true }),
+  entities: { Cards, PlainCards },
+})
+
 type ErrorOf<T> = T extends { readonly asEffect: () => Effect.Effect<any, infer E, any> }
   ? E
   : T extends Effect.Effect<any, infer E, any>
     ? E
     : never
 type Blob<T> = Extract<ErrorOf<T>, BlobStoreError>
+/** A vector search's hit item and its terminal's errors. */
+type HitOf<T> = T extends {
+  readonly collect: () => Effect.Effect<Array<{ readonly item: infer A }>, any, any>
+}
+  ? A
+  : never
+type SearchBlob<T> = T extends {
+  readonly collect: () => Effect.Effect<any, infer E, any>
+}
+  ? Extract<E, BlobStoreError>
+  : never
 
 const key = { docId: "d-1" }
 const doc = { docId: "d-1", title: "t", body: { text: "b" } }
@@ -271,20 +303,91 @@ type CollectBlob<T> = T extends {
 
 describe("the read types (#179)", () => {
   it("accepts an offloading member's ops in Batch.write, transactWrite and projections", () => {
+    const plainBatch = Batch.write([Plain.put(doc), Plain.delete(key)])
     typeOnly(() => {
       const written = Batch.write([Docs.put(doc), Docs.delete(key), Plain.put(doc)])
       expectTypeOf<SuccessOf<typeof written>>().toEqualTypeOf<void>()
-      Transaction.transactWrite([
+      // An op over an offloading member adds BlobStoreError; plain ops add nothing.
+      expectTypeOf<Blob<typeof written>>().toEqualTypeOf<BlobStoreError>()
+      expectTypeOf<
+        Blob<ReturnType<typeof Batch.write<[ReturnType<typeof Plain.put>]>>>
+      >().toBeNever()
+      expectTypeOf<Blob<typeof plainBatch>>().toBeNever()
+      // Ops typed `any` add nothing either.
+      expectTypeOf<Blob<ReturnType<typeof Batch.write<Array<any>>>>>().toBeNever()
+
+      const transacted = Transaction.transactWrite([
         Docs.put(doc),
         Docs.delete(key),
         Docs.update(key).pipe(Entity.set({ title: "t2" })),
       ])
+      expectTypeOf<Blob<typeof transacted>>().toEqualTypeOf<BlobStoreError>()
+      const plainTransaction = Transaction.transactWrite([
+        Plain.put(doc),
+        Plain.update(key).pipe(Entity.set({ title: "t2" })),
+      ])
+      expectTypeOf<Blob<typeof plainTransaction>>().toBeNever()
+      expectTypeOf<Blob<ReturnType<typeof Transaction.transactWrite<Array<any>>>>>().toBeNever()
       // A projection folds the read model's domain values: its rows are read eagerly.
       expectTypeOf<EventStore.ProjectionState<typeof Scans>["scan"]>().toEqualTypeOf<
         Uint8Array | undefined
       >()
       expectTypeOf<EventStore.ProjectionState<typeof Plain>>().toEqualTypeOf<Doc>()
     })
+    expect(true).toBe(true)
+  })
+
+  it("adds BlobStoreError for bound ops in Batch.write and transactWrite", () => {
+    typeOnly(() =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Docs, Plain }, tables: { MainTable } })
+        const written = Batch.write([db.entities.Docs.put(doc), db.entities.Plain.put(doc)])
+        expectTypeOf<Blob<typeof written>>().toEqualTypeOf<BlobStoreError>()
+        const plain = Transaction.transactWrite([db.entities.Plain.put(doc)])
+        expectTypeOf<Blob<typeof plain>>().toBeNever()
+      }),
+    )
+    expect(true).toBe(true)
+  })
+
+  it("types vector hits by the search's modes; select and reembed too", () => {
+    typeOnly(() =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Cards, PlainCards },
+          tables: { VectorTable },
+        })
+        const search = db.entities.Cards.byTitle([1, 0])
+        expectTypeOf<HitOf<typeof search>["body"]>().toEqualTypeOf<Body>()
+        expectTypeOf<HitOf<typeof search>["scan"]>().toEqualTypeOf<BlobHandle | undefined>()
+        expectTypeOf<SearchBlob<typeof search>>().toEqualTypeOf<BlobStoreError>()
+
+        const lazy = search.topK(3).offloaded("lazy")
+        expectTypeOf<HitOf<typeof lazy>["body"]>().toEqualTypeOf<OffloadedValue<Body>>()
+        expectTypeOf<SearchBlob<typeof lazy>>().toBeNever()
+
+        const eager = search.offloaded("eager")
+        expectTypeOf<HitOf<typeof eager>["scan"]>().toEqualTypeOf<Uint8Array | undefined>()
+        expectTypeOf<SearchBlob<typeof eager>>().toEqualTypeOf<BlobStoreError>()
+
+        // A raw projection: partial records, read under the same modes.
+        const selected = search.select(["title", "body"])
+        expectTypeOf<HitOf<typeof selected>>().toEqualTypeOf<Record<string, unknown>>()
+        expectTypeOf<SearchBlob<typeof selected>>().toEqualTypeOf<BlobStoreError>()
+        expectTypeOf<SearchBlob<ReturnType<typeof selected.offloaded<"lazy">>>>().toBeNever()
+
+        expectTypeOf<
+          Blob<ReturnType<typeof db.entities.Cards.reembed>>
+        >().toEqualTypeOf<BlobStoreError>()
+
+        // A member that offloads nothing: unchanged.
+        const plain = db.entities.PlainCards.byTitle([1, 0])
+        expectTypeOf<HitOf<typeof plain>>().toEqualTypeOf<Doc>()
+        expectTypeOf<SearchBlob<typeof plain>>().toBeNever()
+        expectTypeOf<HitOf<ReturnType<typeof plain.offloaded<"lazy">>>>().toEqualTypeOf<Doc>()
+        expectTypeOf<Blob<ReturnType<typeof db.entities.PlainCards.reembed>>>().toBeNever()
+      }),
+    )
     expect(true).toBe(true)
   })
 

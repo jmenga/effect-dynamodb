@@ -6,13 +6,17 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ConcurrentModification, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { Effect, Fiber, Layer, Option, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach } from "vitest"
 import { BlobStore } from "../src/BlobStore.js"
+import * as ZlibCompression from "../src/compression/zlib.js"
+import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
@@ -20,6 +24,7 @@ import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import {
   calls,
+  hooks,
   InMemoryClient,
   type Item,
   rejection,
@@ -670,10 +675,92 @@ describe("projection rows of an offloading read model (#179)", () => {
       },
     }),
   )
+  const Announcement = Schema.Struct({
+    orderId: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+    rev: Schema.Number,
+    scan: Schema.optional(Schema.Uint8Array),
+  })
+  const Announcements = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Announcement, { scan: { storedAs: DynamoModel.External() } }),
+      entityType: "Announcement",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    }),
+  )
+  const rowKey = {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  // A Hidden field beside an offloaded one: the row is read whole, Hidden
+  // fields included, and written whole (design §8.4).
+  const Keyed = Schema.Struct({
+    orderId: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+    searchKey: DynamoModel.Hidden(Schema.String),
+    scan: Schema.optional(Schema.Uint8Array),
+  })
+  const KeyedReceipts = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Keyed, { scan: { storedAs: DynamoModel.External() } }),
+      entityType: "KeyedReceipt",
+      primaryKey: rowKey,
+    }),
+  )
+  const Noted = Schema.Struct({
+    orderId: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+    note: Schema.optionalKey(DynamoModel.Hidden(Schema.String)),
+    scan: Schema.optional(Schema.Uint8Array),
+  })
+  const NotedReceipts = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Noted, { scan: { storedAs: DynamoModel.External() } }),
+      entityType: "NotedReceipt",
+      primaryKey: rowKey,
+    }),
+  )
+  // An overflow field, offloaded at 8 stored bytes: plain JSON, and gzip-compressed.
+  const Ledger = Schema.Struct({
+    orderId: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+    body: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  })
+  const Ledgers = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Ledger, {
+        body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 8 } }) },
+      }),
+      entityType: "Ledger",
+      primaryKey: rowKey,
+    }),
+  )
+  const GzLedgers = withOffloadGate(() =>
+    Entity.make({
+      model: DynamoModel.configure(Ledger, {
+        body: {
+          storedAs: DynamoModel.Packed({
+            format: "json",
+            compression: { codec: "gzip", threshold: 0 },
+            external: { threshold: 8 },
+          }),
+        },
+      }),
+      entityType: "GzLedger",
+      primaryKey: rowKey,
+    }),
+  )
   // Offloading requires escaped keys (#179).
   const ReceiptTable = Table.make({
     schema: DynamoSchema.make({ name: "rows", version: 1, escapeKeys: true }),
-    entities: { Receipts },
+    entities: { Receipts, Announcements, KeyedReceipts, NotedReceipts, Ledgers, GzLedgers },
   })
   const SCAN = new Uint8Array(16).fill(3)
   const Receipted = EventStore.projection({
@@ -713,6 +800,438 @@ describe("projection rows of an offloading read model (#179)", () => {
           BlobStore.layer(BlobStore.memory()),
         ),
       ),
+    ),
+  )
+
+  // ---- pointer reuse (design §6.11) ----
+
+  const ROWS: ReadonlySet<string> = new Set([
+    "Receipt",
+    "Announcement",
+    "KeyedReceipt",
+    "NotedReceipt",
+    "Ledger",
+    "GzLedger",
+  ])
+  /** The row writes sent: each `PutItem`, and each `TransactWriteItems`' row Put. */
+  const rowWrites: Array<{
+    readonly command: string
+    readonly condition: string | undefined
+    readonly names: Record<string, string>
+  }> = []
+  const SpyClient = Layer.effect(
+    DynamoClient,
+    Effect.map(
+      Effect.service(DynamoClient),
+      (inner): DynamoClientService => ({
+        ...inner,
+        putItem: (input) =>
+          Effect.suspend(() => {
+            if (ROWS.has(input.Item?.__edd_e__?.S ?? "")) {
+              rowWrites.push({
+                command: "PutItem",
+                condition: input.ConditionExpression,
+                names: input.ExpressionAttributeNames ?? {},
+              })
+            }
+            return inner.putItem(input)
+          }),
+        transactWriteItems: (input) =>
+          Effect.suspend(() => {
+            for (const entry of input.TransactItems ?? []) {
+              const put = entry.Put
+              if (put === undefined || !ROWS.has(put.Item?.__edd_e__?.S ?? "")) continue
+              rowWrites.push({
+                command: "TransactWriteItems",
+                condition: put.ConditionExpression,
+                names: put.ExpressionAttributeNames ?? {},
+              })
+            }
+            return inner.transactWriteItems(input)
+          }),
+      }),
+    ),
+  ).pipe(Layer.provide(InMemoryClient))
+  let blobs = BlobStore.memory()
+  const withBlobs = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      blobs = BlobStore.memory()
+      rowWrites.length = 0
+      return effect.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            SpyClient,
+            EventsTable.layer({ name: "events" }),
+            ReceiptTable.layer({ name: "read" }),
+            BlobStore.layer(blobs),
+            Compression.layer([ZlibCompression.gzip()]),
+          ),
+        ),
+      )
+    })
+  /** Whether a row write is conditioned on the row still holding `attribute`'s pointer. */
+  const pinnedOn = (attribute: string) => (write: (typeof rowWrites)[number]) =>
+    write.names["#eddPin0"] === attribute && (write.condition ?? "").includes("#eddPin0 = :eddPin0")
+  const pinned = pinnedOn("scan")
+  /** A row's stored attribute value, by entity type and order id. */
+  const storedOf = (entityType: string, orderId: string, attribute: string) =>
+    [...store.entries()].find(
+      ([key, item]) =>
+        key.startsWith("read|") && item.__edd_e__?.S === entityType && item.orderId?.S === orderId,
+    )?.[1][attribute]
+  const storedScan = (orderId: string) => storedOf("Receipt", orderId, "scan")
+  const rescanned = (scanOf: (event: EventStore.StreamEvent<OrderEvent>) => Uint8Array) =>
+    EventStore.projection({
+      stream: Orders,
+      readModel: Receipts,
+      key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+      initial: (id: { readonly orderId: string }) => ({
+        orderId: id.orderId,
+        total: 0,
+        version: 0,
+        scan: SCAN,
+      }),
+      evolve: (state: typeof Receipt.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+        Effect.succeed({ ...state, scan: scanOf(event) }),
+      checkpoint: "version" as const,
+    })
+
+  it.effect("an unchanged offloaded field keeps its pointer, pinned: nothing uploads", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Receipted.applyBatch(events.slice(0, 1))
+        const first = storedScan("o1")
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(pinned(rowWrites[0]!)).toBe(false)
+        const result = yield* Receipted.applyBatch(events.slice(1))
+        expect(result.outcomes[0]!._tag).toBe("Applied")
+        // The same pointer, conditioned on the row still holding it.
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(storedScan("o1")).toEqual(first)
+        expect(pinned(rowWrites[1]!)).toBe(true)
+      }),
+    ),
+  )
+
+  it.effect("a changed offloaded field uploads anew, unpinned", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Rescanned = rescanned((event) =>
+          new Uint8Array(16).fill(event.data._tag === "Cancelled" ? 0 : event.data.amount),
+        )
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Rescanned.applyBatch(events.slice(0, 1))
+        yield* Rescanned.applyBatch(events.slice(1))
+        expect(blobs.inspect().calls.put).toBe(2)
+        expect(rowWrites.map((write) => pinned(write))).toEqual([false, false])
+        // No inline freeing: the replaced version is the reaper's.
+        expect(blobs.inspect().versions).toHaveLength(2)
+        const state = yield* Receipts.get({ orderId: "o1" }).pipe(Entity.offloaded("eager"))
+        expect(state.scan).toEqual(new Uint8Array(16).fill(2))
+      }),
+    ),
+  )
+
+  it.effect("the field changed since the read: the pinned write loses and is retried", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Receipted.applyBatch(events.slice(0, 1))
+        // Another writer's pointer, swapped into the row between the read and the write.
+        const OTHER = new Uint8Array(16).fill(9)
+        yield* Receipts.put({ orderId: "o2", total: 0, version: 0, scan: OTHER })
+        const other = storedScan("o2")!
+        const [rowKey, row] = [...store.entries()].find(
+          ([key, item]) => key.startsWith("read|") && item.orderId?.S === "o1",
+        )!
+        hooks.afterGet.push(() => {
+          store.set(rowKey, { ...row, scan: other })
+        })
+        // The retry sleeps (jittered) first: run it on the test clock.
+        const fiber = yield* Effect.forkChild(Receipted.applyBatch(events.slice(1)))
+        yield* TestClock.adjust("1 second")
+        const result = yield* Fiber.join(fiber)
+        expect(result.outcomes[0]!._tag).toBe("Applied")
+        // Pinned to the pointer it read, lost; re-read and pinned to the new one.
+        expect(rowWrites.slice(-2).map((write) => pinned(write))).toEqual([true, true])
+        expect(storedScan("o1")).toEqual(other)
+        expect(blobs.inspect().calls.put).toBe(2)
+      }),
+    ),
+  )
+
+  it.effect("the outbox path pins a kept pointer in its transaction", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Announced = EventStore.projection({
+          stream: Orders,
+          readModel: Announcements,
+          key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+          initial: (id: { readonly orderId: string }) => ({
+            orderId: id.orderId,
+            total: 0,
+            version: 0,
+            rev: 0,
+            scan: SCAN,
+          }),
+          evolve: (state: typeof Announcement.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+            Effect.succeed({
+              ...state,
+              total: state.total + (event.data._tag === "Cancelled" ? 0 : event.data.amount),
+            }),
+          checkpoint: "version" as const,
+          revision: "rev",
+          outbox: {
+            schema: Notice,
+            effects: (event, next) => [
+              { orderId: event.streamId, kind: event.eventType, total: next?.total ?? -1 },
+            ],
+          },
+        })
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Announced.applyBatch(events.slice(0, 1))
+        yield* Announced.applyBatch(events.slice(1))
+        expect(rowWrites.map((write) => write.command)).toEqual([
+          "TransactWriteItems",
+          "TransactWriteItems",
+        ])
+        expect(rowWrites.map((write) => pinned(write))).toEqual([false, true])
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(blobs.inspect().calls.delete).toBe(0)
+      }),
+    ),
+  )
+
+  // ---- Hidden fields: read whole, written whole ----
+
+  const amountOf = (event: EventStore.StreamEvent<OrderEvent>) =>
+    event.data._tag === "Cancelled" ? 0 : event.data.amount
+
+  it.effect("a required Hidden field is read with the row, so every fold applies", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Keying = EventStore.projection({
+          stream: Orders,
+          readModel: KeyedReceipts,
+          key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+          initial: (id: { readonly orderId: string }) => ({
+            orderId: id.orderId,
+            total: 0,
+            version: 0,
+            searchKey: `order#${id.orderId}`,
+            scan: SCAN,
+          }),
+          evolve: (state: typeof Keyed.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+            Effect.succeed({ ...state, total: state.total + amountOf(event) }),
+          checkpoint: "version" as const,
+        })
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        for (const event of events) {
+          const result = yield* Keying.applyBatch([event])
+          expect(result.outcomes[0]!._tag).toBe("Applied")
+        }
+        expect(items("read", "KeyedReceipt")[0]).toMatchObject({
+          total: 3,
+          version: 2,
+          searchKey: "order#o1",
+        })
+        // The kept scan pointer still pins the rewrite.
+        expect(rowWrites.map((write) => pinned(write))).toEqual([false, true])
+      }),
+    ),
+  )
+
+  it.effect("an optional Hidden field survives every rewrite", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Noting = EventStore.projection({
+          stream: Orders,
+          readModel: NotedReceipts,
+          key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+          initial: (id: { readonly orderId: string }) => ({
+            orderId: id.orderId,
+            total: 0,
+            version: 0,
+            note: "kept",
+            scan: SCAN,
+          }),
+          evolve: (state: typeof Noted.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+            Effect.succeed({ ...state, total: state.total + amountOf(event) }),
+          checkpoint: "version" as const,
+        })
+        const events = yield* seed("o1", [
+          new Placed({ amount: 1 }),
+          new Added({ amount: 2 }),
+          new Added({ amount: 3 }),
+        ])
+        for (const event of events) yield* Noting.applyBatch([event])
+        expect(items("read", "NotedReceipt")[0]).toMatchObject({ total: 6, note: "kept" })
+      }),
+    ),
+  )
+
+  // ---- pointer reuse of an overflow field: the encoded content compared ----
+
+  const PAD = "x".repeat(32)
+  const ledgered = (
+    bodyOf: (
+      state: typeof Ledger.Type,
+      event: EventStore.StreamEvent<OrderEvent>,
+    ) => Record<string, unknown>,
+  ) =>
+    EventStore.projection({
+      stream: Orders,
+      readModel: Ledgers,
+      key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+      initial: (id: { readonly orderId: string }) => ({
+        orderId: id.orderId,
+        total: 0,
+        version: 0,
+      }),
+      evolve: (state: typeof Ledger.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+        Effect.succeed({
+          ...state,
+          total: state.total + amountOf(event),
+          body: bodyOf(state, event),
+        }),
+      checkpoint: "version" as const,
+    })
+  const pinnedBody = pinnedOn("body")
+  const bodyRef = (entityType: string, orderId: string) => {
+    const pointer = BlobPointer.decode(storedOf(entityType, orderId, "body")!.B!)
+    if (typeof pointer === "string") throw new Error(pointer)
+    return pointer
+  }
+  const readBody = (orderId: string) =>
+    Effect.gen(function* () {
+      const row = yield* Ledgers.get({ orderId }).pipe(Entity.offloaded("eager"))
+      return row.body as Record<string, unknown>
+    })
+  /** `value` with every object's keys in reverse order: the same JSON value. */
+  const reversed = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map((element) => reversed(element))
+    if (value === null || typeof value !== "object") return value
+    return Object.fromEntries(
+      Object.keys(value)
+        .reverse()
+        .map((key) => [key, reversed((value as Record<string, unknown>)[key])]),
+    )
+  }
+  const SAMPLE = { a: 1, b: { c: [1, { d: 2, e: 3 }], f: "g" }, pad: PAD }
+
+  it.effect("an unchanged overflow value keeps its pointer, pinned: nothing uploads", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Kept = ledgered((state) => state.body ?? SAMPLE)
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Kept.applyBatch(events.slice(0, 1))
+        const first = storedOf("Ledger", "o1", "body")
+        expect(blobs.inspect().calls.put).toBe(1)
+        const result = yield* Kept.applyBatch(events.slice(1))
+        const outcome = result.outcomes[0]!
+        if (outcome._tag !== "Applied") throw new Error("not applied")
+        // The state decodes the kept value from the read cache: no fetch.
+        expect(Option.getOrThrow(outcome.state).body).toEqual(SAMPLE)
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(storedOf("Ledger", "o1", "body")).toEqual(first)
+        expect(rowWrites.map((write) => pinnedBody(write))).toEqual([false, true])
+        expect(yield* readBody("o1")).toEqual(SAMPLE)
+      }),
+    ),
+  )
+
+  it.effect("the same overflow value in another key order keeps its pointer", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        // Each fold restates the value with every object's keys reversed.
+        expect(JSON.stringify(reversed(SAMPLE))).not.toBe(JSON.stringify(SAMPLE))
+        const Restated = ledgered((state) => reversed(state.body ?? SAMPLE) as never)
+        const events = yield* seed("o1", [
+          new Placed({ amount: 1 }),
+          new Added({ amount: 2 }),
+          new Added({ amount: 3 }),
+        ])
+        for (const event of events) yield* Restated.applyBatch([event])
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(rowWrites.map((write) => pinnedBody(write))).toEqual([false, true, true])
+        expect(yield* readBody("o1")).toEqual(SAMPLE)
+      }),
+    ),
+  )
+
+  it.effect("a changed overflow value uploads anew, unpinned", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Changing = ledgered((_, event) => ({ pad: PAD, n: amountOf(event) }))
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Changing.applyBatch(events.slice(0, 1))
+        const first = bodyRef("Ledger", "o1").ref
+        yield* Changing.applyBatch(events.slice(1))
+        expect(blobs.inspect().calls.put).toBe(2)
+        expect(bodyRef("Ledger", "o1").ref).not.toEqual(first)
+        expect(rowWrites.map((write) => pinnedBody(write))).toEqual([false, false])
+        expect(yield* readBody("o1")).toEqual({ pad: PAD, n: 2 })
+      }),
+    ),
+  )
+
+  it.effect("values that differ only under a `__proto__` key are not the same content", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        // A computed key: an own `__proto__` property, not the prototype.
+        const Nested = ledgered((_, event) => ({ pad: PAD, ["__proto__"]: { n: amountOf(event) } }))
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        yield* Nested.applyBatch(events.slice(0, 1))
+        const result = yield* Nested.applyBatch(events.slice(1))
+        expect(result.outcomes[0]!._tag).toBe("Applied")
+        expect(blobs.inspect().calls.put).toBe(2)
+        expect(rowWrites.map((write) => pinnedBody(write))).toEqual([false, false])
+        const body = yield* readBody("o1")
+        expect(Object.getOwnPropertyDescriptor(body, "__proto__")?.value).toEqual({ n: 2 })
+      }),
+    ),
+  )
+
+  it.effect("a compressed overflow value: unchanged keeps its pointer, changed uploads", () =>
+    withBlobs(
+      Effect.gen(function* () {
+        const Compressed = EventStore.projection({
+          stream: Orders,
+          readModel: GzLedgers,
+          key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+          initial: (id: { readonly orderId: string }) => ({
+            orderId: id.orderId,
+            total: 0,
+            version: 0,
+          }),
+          evolve: (state: typeof Ledger.Type, event: EventStore.StreamEvent<OrderEvent>) =>
+            Effect.succeed({
+              ...state,
+              total: state.total + amountOf(event),
+              // The same value through the second event, a new one at the third.
+              body: { ...SAMPLE, stage: amountOf(event) < 3 ? "early" : "late" },
+            }),
+          checkpoint: "version" as const,
+        })
+        const events = yield* seed("o1", [
+          new Placed({ amount: 1 }),
+          new Added({ amount: 2 }),
+          new Added({ amount: 3 }),
+        ])
+        yield* Compressed.applyBatch(events.slice(0, 1))
+        expect(bodyRef("GzLedger", "o1").codec).toBe("gzip")
+        const first = bodyRef("GzLedger", "o1").ref
+        yield* Compressed.applyBatch(events.slice(1, 2))
+        expect(blobs.inspect().calls.put).toBe(1)
+        expect(bodyRef("GzLedger", "o1").ref).toEqual(first)
+        yield* Compressed.applyBatch(events.slice(2))
+        expect(blobs.inspect().calls.put).toBe(2)
+        expect(bodyRef("GzLedger", "o1").ref).not.toEqual(first)
+        expect(rowWrites.map((write) => pinnedBody(write))).toEqual([false, true, false])
+        const row = yield* GzLedgers.get({ orderId: "o1" }).pipe(Entity.offloaded("eager"))
+        expect(row.body).toEqual({ ...SAMPLE, stage: "late" })
+      }),
     ),
   )
 })

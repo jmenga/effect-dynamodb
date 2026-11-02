@@ -16,6 +16,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { makeTestEmbedder } from "@effect-dynamodb/schema/Embedder.js"
 import * as SchemaEntity from "@effect-dynamodb/schema/Entity.js"
 import {
   BlobStoreError,
@@ -225,7 +226,52 @@ const Cards = withOffloadGate(() =>
     },
   }),
 )
-const CardTable = Table.make({ schema: AppSchema, entities: { Cards } })
+class Brief extends Schema.Class<Brief>("Brief")({
+  briefId: Schema.String,
+  title: Schema.String,
+  body: Schema.optional(Text),
+  scan: Schema.optional(Schema.Uint8Array),
+}) {}
+
+const briefModel = DynamoModel.configure(Brief, {
+  body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+  scan: { storedAs: DynamoModel.External() },
+})
+const briefKey = {
+  pk: { field: "pk", composite: ["briefId"] },
+  sk: { field: "sk", composite: [] },
+} as const
+/** The text a brief embeds: its title and its (offloaded) body — model-typed fields (#171). */
+const briefSource = {
+  fields: ["title", "body"] as const,
+  compose: (picked: Record<string, unknown>) =>
+    `${String(picked.title ?? "")} ${(picked.body as { readonly text?: string } | undefined)?.text ?? ""}`,
+}
+
+/** Vector search over an offloading member whose embedding source is offloaded. */
+const Briefs = withOffloadGate(() =>
+  Entity.make({
+    model: briefModel,
+    entityType: "Brief",
+    primaryKey: briefKey,
+    vectorIndexes: {
+      byText: { name: "vec2", dimensions: 2, distance: "cosine", source: briefSource },
+    },
+  }),
+)
+/** `Briefs` with retained versions: an update takes the read-merge (retain) path. */
+const RetainedBriefs = withOffloadGate(() =>
+  Entity.make({
+    model: briefModel,
+    entityType: "RetainedBrief",
+    primaryKey: briefKey,
+    versioned: { retain: true },
+    vectorIndexes: {
+      byText: { name: "vec3", dimensions: 2, distance: "cosine", source: briefSource },
+    },
+  }),
+)
+const CardTable = Table.make({ schema: AppSchema, entities: { Cards, Briefs, RetainedBriefs } })
 
 // ---------------------------------------------------------------------------
 // The client: the in-memory tables, plus the reads they lack
@@ -1269,6 +1315,23 @@ describe("Entity offload reads — error payloads", () => {
 // ---------------------------------------------------------------------------
 
 describe("Entity offload reads — vector search hits", () => {
+  /** The refs the store served a `get` for, by key, and by key and version. */
+  const fetched: Array<string> = []
+  const fetchedRefs: Array<string> = []
+  const refName = (ref: BlobPointer.BlobRef) => `${ref.key}@${ref.version}`
+  const recording = () => {
+    fetched.length = 0
+    fetchedRefs.length = 0
+    blobs = BlobStore.memory({
+      failures: (call) => {
+        if (call.action === "get" && call.ref !== undefined) {
+          fetched.push(call.ref.key)
+          fetchedRefs.push(refName(call.ref))
+        }
+        return undefined
+      },
+    })
+  }
   const withVectors = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.suspend(() =>
       effect.pipe(
@@ -1281,37 +1344,223 @@ describe("Entity offload reads — vector search hits", () => {
         ),
       ),
     )
+  const vectorClient = DynamoClient.make({
+    entities: { Cards, Briefs, RetainedBriefs },
+    tables: { CardTable },
+    embedder: makeTestEmbedder(2),
+  })
+  const rowOf = (entityType: string) =>
+    [...rows.values()].find((item) => item.__edd_e__?.S === entityType)!
+  /** The live row of an entity type: not a retained version snapshot (`…#v#<n>`). */
+  const liveOf = (entityType: string) =>
+    [...rows.values()].find(
+      (item) => item.__edd_e__?.S === entityType && !(item.sk?.S ?? "").includes("#v#"),
+    )!
+  const versionsOf = (entityType: string) =>
+    [...rows.values()].filter(
+      (item) => item.__edd_e__?.S === entityType && (item.sk?.S ?? "").includes("#v#"),
+    )
+  const putCard = (cardId: string) =>
+    Effect.gen(function* () {
+      const db = yield* vectorClient
+      yield* db.entities.Cards.put({ cardId, title: "t", body: BODY, scan: SCAN }).withVector(
+        "byTitle",
+        [1, 0],
+      )
+    })
 
-  it.effect("read eagerly; a store failure is a ValidationError whose cause it is", () =>
+  it.effect("default modes: overflow eager, binary a handle; the hits resolve together", () =>
     withVectors(
       Effect.gen(function* () {
-        const db = yield* DynamoClient.make({ entities: { Cards }, tables: { CardTable } })
-        yield* db.entities.Cards.put({
-          cardId: "c-1",
-          title: "t",
-          body: BODY,
-          scan: SCAN,
-        }).withVector("byTitle", [1, 0])
-        const [hit] = yield* db.entities.Cards.byTitle([1, 0]).collect()
-        expect(hit!.item.body).toEqual(BODY)
-        expect(hit!.item.scan).toEqual(SCAN)
-
-        const row = [...rows.values()].find((item) => item.__edd_e__?.S === "Card")!
-        yield* blobs.delete([pointerOf(row.scan).ref])
-        const failed = yield* Effect.flip(db.entities.Cards.byTitle([1, 0]).collect())
-        expect(failed).toBeInstanceOf(ValidationError)
-        expect(failed).toMatchObject({
-          entityType: "Card",
-          operation: "vectorSearch.byTitle.decode",
-        })
-        expect((failed as ValidationError).cause).toMatchObject({
-          _tag: "BlobStoreError",
-          reason: "NotFound",
-          attribute: "scan",
-        })
+        const db = yield* vectorClient
+        yield* putCard("c-1")
+        yield* putCard("c-2")
+        const before = gets()
+        const hits = yield* db.entities.Cards.byTitle([1, 0]).collect()
+        expect(hits).toHaveLength(2)
+        // Two bodies, fetched once each; no scan.
+        expect(gets()).toBe(before + 2)
+        for (const hit of hits) {
+          expect(hit.item.body).toEqual(BODY)
+          expect(yield* asHandle(hit.item.scan).read()).toEqual(SCAN)
+        }
       }),
     ),
   )
+
+  it.effect(".offloaded(mode) re-reads the hits eagerly or lazily", () =>
+    withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* putCard("c-1")
+        let before = gets()
+        const [eager] = yield* db.entities.Cards.byTitle([1, 0]).offloaded("eager").collect()
+        expect(eager!.item).toMatchObject({ body: BODY, scan: SCAN })
+        expect(gets()).toBe(before + 2)
+
+        before = gets()
+        const [lazy] = yield* db.entities.Cards.byTitle([1, 0]).offloaded("lazy").collect()
+        expect(gets()).toBe(before)
+        expect(yield* asValue(lazy!.item.body).read()).toEqual(BODY)
+        asHandle(lazy!.item.scan)
+
+        const [mixed] = yield* db.entities.Cards.byTitle([1, 0])
+          .offloaded("lazy")
+          .offloaded({ binary: "eager" })
+          .collect()
+        asValue(mixed!.item.body)
+        expect(mixed!.item.scan).toEqual(SCAN)
+      }),
+    ),
+  )
+
+  it.effect("a store failure is a typed BlobStoreError, not a ValidationError", () =>
+    withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* putCard("c-1")
+        yield* blobs.delete([pointerOf(rowOf("Card").body).ref])
+        const failed = yield* Effect.flip(db.entities.Cards.byTitle([1, 0]).collect())
+        expect(failed).toMatchObject({
+          _tag: "BlobStoreError",
+          reason: "NotFound",
+          entityType: "Card",
+          attribute: "body",
+        })
+        // A lazy read of the same hit succeeds; the failure moves to its read.
+        const [lazy] = yield* db.entities.Cards.byTitle([1, 0]).offloaded("lazy").collect()
+        const reread = yield* Effect.flip(asValue(lazy!.item.body).read())
+        expect(reread).toMatchObject({ _tag: "BlobStoreError", reason: "NotFound" })
+      }),
+    ),
+  )
+
+  it.effect("select: an inline field fetches nothing; an offloaded one reads raw", () =>
+    withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* putCard("c-1")
+        let before = gets()
+        const [titled] = yield* db.entities.Cards.byTitle([1, 0]).select(["title"]).collect()
+        expect(titled!.item).toEqual({ title: "t" })
+        expect(gets()).toBe(before)
+
+        before = gets()
+        const [named] = yield* db.entities.Cards.byTitle([1, 0])
+          .select(["title", "body", "scan"])
+          .collect()
+        // The overflow field's JSON wire form, eagerly; the binary one a handle.
+        expect(named!.item.body).toEqual(BODY)
+        expect(yield* asHandle(named!.item.scan).read()).toEqual(SCAN)
+        expect(gets()).toBe(before + 2)
+
+        before = gets()
+        const [lazy] = yield* db.entities.Cards.byTitle([1, 0])
+          .offloaded("lazy")
+          .select(["body"])
+          .collect()
+        expect(gets()).toBe(before)
+        expect(yield* asValue(lazy!.item.body).read()).toEqual(BODY)
+      }),
+    ),
+  )
+
+  it.effect("reembed reads only an offloaded source field", () => {
+    recording()
+    return withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* db.entities.Briefs.put({ briefId: "b-1", title: "alpha", body: BODY, scan: SCAN })
+        const row = rowOf("Brief")
+        fetched.length = 0
+        expect(yield* db.entities.Briefs.reembed()).toBe(1)
+        expect(fetched).toEqual([pointerOf(row.body).ref.key])
+      }),
+    )
+  })
+
+  it.effect("an update re-embedding from the stored source never fetches a binary field", () => {
+    recording()
+    return withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* db.entities.Briefs.put({ briefId: "b-1", title: "alpha", body: BODY, scan: SCAN })
+        const row = rowOf("Brief")
+        const vectorBefore = row.__edd_v_vec2__
+        fetched.length = 0
+        // The title is a source: the stored body is read to re-derive the text.
+        const updated = yield* db.entities.Briefs.update({ briefId: "b-1" })
+          .set({ title: "beta gamma" })
+          .offloaded("lazy")
+        expect(fetched.length).toBeGreaterThan(0)
+        expect(fetched.every((key) => key === pointerOf(row.body).ref.key)).toBe(true)
+        asHandle(updated.scan)
+        expect(rowOf("Brief").__edd_v_vec2__).not.toEqual(vectorBefore)
+      }),
+    )
+  })
+
+  it.effect("a retained update re-embeds from the stored source, never fetching a binary", () => {
+    recording()
+    return withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* db.entities.RetainedBriefs.put({
+          briefId: "b-1",
+          title: "alpha",
+          body: BODY,
+          scan: SCAN,
+        })
+        const row = liveOf("RetainedBrief")
+        const vectorBefore = row.__edd_v_vec3__
+        fetched.length = 0
+        // The title is a source: the read-merge copy reads the stored body,
+        // which the payload does not supply — and not the scan.
+        const updated = yield* db.entities.RetainedBriefs.update({ briefId: "b-1" })
+          .set({ title: "beta gamma" })
+          .offloaded("lazy")
+        expect(fetchedRefs).toEqual([refName(pointerOf(row.body).ref)])
+        asHandle(updated.scan)
+        expect(liveOf("RetainedBrief").__edd_v_vec3__).not.toEqual(vectorBefore)
+        expect(versionsOf("RetainedBrief").length).toBeGreaterThan(0)
+
+        // A payload that supplies the source fetches nothing to embed it.
+        fetchedRefs.length = 0
+        yield* db.entities.RetainedBriefs.update({ briefId: "b-1" })
+          .set({ title: "delta", body: text(150, "y") })
+          .offloaded("lazy")
+        expect(fetchedRefs).toEqual([])
+      }),
+    )
+  })
+
+  it.effect("reembed skips a retained snapshot without reading its source", () => {
+    recording()
+    return withVectors(
+      Effect.gen(function* () {
+        const db = yield* vectorClient
+        yield* db.entities.RetainedBriefs.put({
+          briefId: "b-1",
+          title: "alpha",
+          body: BODY,
+          scan: SCAN,
+        })
+        // A new body: the snapshot of the first version keeps the old pointer.
+        yield* db.entities.RetainedBriefs.update({ briefId: "b-1" })
+          .set({ body: text(150, "y") })
+          .offloaded("lazy")
+        const liveBody = refName(pointerOf(liveOf("RetainedBrief").body).ref)
+        expect(
+          versionsOf("RetainedBrief").some(
+            (snapshot) => refName(pointerOf(snapshot.body).ref) !== liveBody,
+          ),
+        ).toBe(true)
+        fetchedRefs.length = 0
+        expect(yield* db.entities.RetainedBriefs.reembed()).toBe(1)
+        expect(fetchedRefs).toEqual([liveBody])
+      }),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

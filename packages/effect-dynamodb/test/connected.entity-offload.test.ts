@@ -569,4 +569,64 @@ describeConnected("Entity offloaded fields (#179)", () => {
       }),
     ),
   )
+
+  it.effect("Batch.write uploads every put before sending; DynamoDB's answer settles them", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* client
+        yield* db.entities.Docs.put({ docId: "w-3", title: "t", body: text(2_000) })
+        const before = blobs.inspect().calls
+        yield* Batch.write([
+          db.entities.Docs.put({ docId: "w-1", title: "t", body: text(2_000), scan: bytes(3) }),
+          Docs.put({ docId: "w-2", title: "t", notes: text(3_000) }),
+          db.entities.Docs.delete({ docId: "w-3" }),
+        ])
+        expect(isOverflowPointer((yield* liveDoc("doc", "w-1")).body)).toBe(true)
+        expect(isBinaryPointer((yield* liveDoc("doc", "w-1")).scan)).toBe(true)
+        expect(isOverflowPointer((yield* liveDoc("doc", "w-2")).notes)).toBe(true)
+        // Processed: committed, nothing deleted (w-3's version is the reaper's).
+        expect(blobs.inspect().calls.put - before.put).toBe(3)
+        expect(blobs.inspect().calls.delete - before.delete).toBe(0)
+        const [one, two] = yield* Batch.get([
+          db.entities.Docs.get({ docId: "w-1" }).offloaded("eager"),
+          db.entities.Docs.get({ docId: "w-2" }),
+        ])
+        expect(one).toMatchObject({ body: text(2_000), scan: bytes(3) })
+        expect(two!.notes).toEqual(text(3_000))
+      }),
+    ),
+  )
+
+  it.effect(
+    "transactWrite: a committed transaction keeps its uploads; a cancelled one deletes them",
+    () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* db.entities.Docs.put({ docId: "x-1", title: "t" })
+          yield* Transaction.transactWrite([
+            db.entities.Docs.put({ docId: "x-2", title: "t", body: text(2_000) }),
+            db.entities.Docs.update({ docId: "x-1" }).set({ notes: text(2_500) }),
+          ])
+          expect(isOverflowPointer((yield* liveDoc("doc", "x-1")).notes)).toBe(true)
+          expect((yield* db.entities.Docs.get({ docId: "x-2" })).body).toEqual(text(2_000))
+          const kept = blobs.inspect().versions.length
+          const before = blobs.inspect().calls
+
+          const error = yield* Effect.flip(
+            Transaction.transactWrite([
+              db.entities.Docs.put({ docId: "x-3", title: "t", body: text(2_000) }),
+              db.entities.Docs.update({ docId: "x-1" }).set({ notes: text(2_600) }),
+              // x-2 exists: DynamoDB cancels the transaction.
+              db.entities.Docs.create({ docId: "x-2", title: "t", scan: bytes(4) }),
+            ]),
+          )
+          expect(error._tag).toBe("TransactionCancelled")
+          expect(blobs.inspect().calls.put - before.put).toBe(3)
+          expect(blobs.inspect().calls.delete - before.delete).toBe(1)
+          expect(blobs.inspect().versions).toHaveLength(kept)
+          expect((yield* db.entities.Docs.get({ docId: "x-1" })).notes).toEqual(text(2_500))
+        }),
+      ),
+  )
 })

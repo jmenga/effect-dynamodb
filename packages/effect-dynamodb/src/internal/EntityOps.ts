@@ -17,6 +17,7 @@ import * as BlobLedger from "./BlobLedger.js"
 import type { Modes } from "./BlobResolver.js"
 import * as Capacity from "./Capacity.js"
 import { DEFAULT_MODES, withModes } from "./OffloadRead.js"
+import type { ReadPointers } from "./OffloadWrite.js"
 import type { RawCondition } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
@@ -550,6 +551,13 @@ export interface EntityPutOpts {
         readonly returnOld?: boolean | undefined
       }
     | undefined
+  /**
+   * @internal The pointers the row being rewritten held when read (#179,
+   * design §6.11) — an EventStore projection's row rewrite: a value whose
+   * content one of them named keeps it, and the put is conditioned on the
+   * row still holding it.
+   */
+  readonly reuse?: ReadPointers | undefined
 }
 
 /**

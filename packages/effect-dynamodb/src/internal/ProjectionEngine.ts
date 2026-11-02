@@ -23,6 +23,7 @@ import {
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
+  type BlobStoreError,
   ConcurrentModification,
   type ConditionalCheckFailed,
   isAwsConditionalCheckFailed,
@@ -72,6 +73,7 @@ import * as Capacity from "./Capacity.js"
 import { condition as entityCondition, offloaded as entityOffloaded } from "./EntityCombinators.js"
 import { type EntityPutImpl, withReadModes } from "./EntityOps.js"
 import { EAGER_MODES } from "./OffloadRead.js"
+import { type Pin, type ReadPointers, withPins } from "./OffloadWrite.js"
 import { handlerOf, type RekeyMember, type RekeyTally } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
@@ -86,6 +88,7 @@ import {
   KEY_TEXT,
   layoutTag,
   marshalOrFail,
+  marshalPutItem,
   OUTBOX_READ_MODEL,
   outboxMarkInUse,
   type ProjectionLayout,
@@ -203,6 +206,26 @@ export interface EngineEntity {
   readonly schemas: any
   /** The mark a row tombstone or outbox item takes for the key `key` composes — see `Entity`. */
   readonly _keyTextMark: (key: Record<string, unknown>) => 2 | undefined
+  /** True iff the read model offloads a field (#179). */
+  readonly _offloads: boolean
+  /**
+   * Read a row eagerly as an item (Hidden fields included), snapshotting its
+   * pointers (§6.11) — `Entity._loadForReuse`.
+   */
+  readonly _loadForReuse: (
+    raw: Record<string, unknown>,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly item: unknown; readonly pointers: ReadPointers },
+    ValidationError | BlobStoreError
+  >
+  /** Route and upload a built item, reusing read pointers — `Entity._offloadItem`. */
+  readonly _offloadItem: (
+    item: Record<string, unknown>,
+    table: string,
+    operation: string,
+    reuse?: ReadPointers | undefined,
+  ) => Effect.Effect<ReadonlyArray<Pin>, BlobStoreError | ValidationError>
 }
 
 /** @internal One source a row engine reads. */
@@ -396,6 +419,12 @@ interface Row {
    * user's.
    */
   readonly token: AttributeValue | undefined
+  /**
+   * The blob pointers the row held, with the content each named as fetched
+   * (#179, design §6.11): the rewrite keeps a pointer whose content the
+   * folded value still has, conditioned on the row still holding it.
+   */
+  readonly pointers?: ReadPointers | undefined
 }
 
 /**
@@ -1247,10 +1276,25 @@ export const makeEngine = (config: EngineConfig) => {
         }
         return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
       }
-      // Eager (#179, design §8.4): the engine folds over the row's values.
-      const decoded = (yield* decodeMarshalledItem(readModel as any, item, {
-        offloaded: "eager",
-      })) as Record<string, unknown>
+      // Eager (#179, design §8.4): the engine folds over the row's values,
+      // read as an item — Hidden fields included, since the row is written
+      // back whole. A read model that offloads a field keeps the pointers it
+      // read, and what each one named (§6.11): the rewrite reuses those still
+      // current.
+      let pointers: ReadPointers | undefined
+      let decoded: Record<string, unknown>
+      if (readModel._offloads) {
+        const loaded = yield* readModel._loadForReuse(
+          fromAttributeMap(item) as Record<string, unknown>,
+          `${config.label}.read`,
+        )
+        pointers = loaded.pointers
+        decoded = loaded.item as Record<string, unknown>
+      } else {
+        decoded = (yield* decodeMarshalledItem(readModel as any, item, {
+          offloaded: "eager",
+        })) as Record<string, unknown>
+      }
       let values: Record<string, unknown> = decoded
       if (fields !== undefined) {
         values = {}
@@ -1263,6 +1307,7 @@ export const makeEngine = (config: EngineConfig) => {
         createdAt: createdAtField === null ? undefined : ownValue(decoded, createdAtField),
         item,
         token,
+        pointers,
       })
     })
 
@@ -1733,7 +1778,7 @@ export const makeEngine = (config: EngineConfig) => {
       const client = yield* Capacity.client
       const TableName = yield* tableName
       const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
-      const condition = guard(row)
+      let condition = guard(row)
       // On a read model whose rows carry the row token (#237), or on a row that holds one (a
       // program defining only this projection writes it too, so it never replaces another's write
       // landed since its read), a fresh one recording the projections whose bookkeeping the row
@@ -1796,6 +1841,9 @@ export const makeEngine = (config: EngineConfig) => {
       // `rekey` (`KEY_TEXT`): one under the text of `escapeKeys: true`, where that isn't off's, is
       // marked.
       const mark = readModel._keyTextMark(key as Record<string, unknown>)
+      // The read row's pointers (#179, design §6.11): reused where the folded
+      // value's content is still theirs, the write pinned to them.
+      const pointers = Option.isSome(row) ? row.value.pointers : undefined
 
       // The row's item: the entity's own `put` (no outbox), or built for a transaction.
       let rowItem: Record<string, AttributeValue> | undefined
@@ -1833,7 +1881,17 @@ export const makeEngine = (config: EngineConfig) => {
           { createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined },
         )
         if (token !== undefined) built.item[ROW_TOKEN] = token
-        rowItem = toAttributeMap(built.item)
+        // Offloaded fields (#179, design §6.6, §6.11): the read row's
+        // pointers kept where still current — pinned — and the rest uploaded,
+        // settled by the transaction below.
+        const pins = yield* readModel._offloadItem(
+          built.item,
+          TableName,
+          `${config.label}.write`,
+          pointers,
+        )
+        condition = { input: condition.input, raw: withPins(condition.raw, pins) }
+        rowItem = yield* marshalPutItem(readModel as any, built.item, `${config.label}.write`)
       }
 
       if (rowItem === undefined) {
@@ -1870,6 +1928,8 @@ export const makeEngine = (config: EngineConfig) => {
                       returnOld: returnOld && Option.isSome(row),
                     },
                   }),
+                  // Pointers still current kept, the put pinned to them (§6.11).
+                  reuse: pointers,
                 }),
               )
         const written = yield* (run as Effect.Effect<unknown, any, any>).pipe(
@@ -2638,6 +2698,7 @@ export const makeEngine = (config: EngineConfig) => {
         validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
       )
       if (Option.isNone(built)) return false
+      // Its attributes as stored: an offloaded value's pointer takes the value's name (#179).
       const written = built.value.marshalled
       return Object.keys(row.item).every(
         (name) => Object.hasOwn(written, name) || (name === ROW_TOKEN && row.token !== undefined),

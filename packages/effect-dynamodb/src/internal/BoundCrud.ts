@@ -17,7 +17,7 @@
 
 import type { BlobStoreError, ConditionalCheckFailed } from "@effect-dynamodb/schema/Errors.js"
 import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
-import type { Effect } from "effect"
+import type { Context, Effect } from "effect"
 import { Effectable, Pipeable, Utils } from "effect"
 import type { NoOffloadState, OffloadModes, OffloadState, ViewOf } from "../Offload.js"
 import {
@@ -103,6 +103,8 @@ export interface BoundOp {
   readonly [BoundOpTypeId]: BoundOpTypeId
   /** @internal The wrapped unbound intermediate. */
   readonly _op: unknown
+  /** @internal The binding's wiring: its captured blob store and compressors. */
+  readonly _config?: { readonly captured?: Context.Context<never> | undefined } | undefined
 }
 
 /** @internal Narrow an unknown value to a bound-CRUD builder. */
@@ -148,6 +150,15 @@ export interface BoundCrudConfig<Model> {
   readonly pathBuilder: PathBuilder<Model, Model, never>
   readonly conditionOps: ConditionOps<Model>
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
+  /**
+   * The blob store and compressor registry the binding bundled (#179, design
+   * §3.6), whichever of the two it has: `Batch.get` / `Batch.write` /
+   * `Transaction.transactGet` / `Transaction.transactWrite` (and an
+   * `EventStore` append's `additionalItems`) build and read this builder's
+   * item under them rather than the caller's ambient ones. Absent when the
+   * binding has neither.
+   */
+  readonly captured?: Context.Context<never> | undefined
 }
 
 /** Build a compiled condition Expr from a callback or simple shorthand record.
@@ -898,6 +909,21 @@ export type GetBlobErrors<T> =
       : never
 
 type OpBlobErrorsOf<E> = 0 extends 1 & E ? never : Extract<E, BlobStoreError>
+
+/**
+ * The blob errors a write op of `Batch.write` / `Transaction.transactWrite`
+ * raises (#179, design §9.3): its own `BlobStoreError` — present for an op
+ * over a member that offloads a field — and `never` for any other op: one
+ * over a member that offloads nothing, a `Transaction.check`, and an op whose
+ * type was erased (`any`, the documented price of an untyped array). Read off
+ * the op's `asEffect`, which every unbound intermediate and bound builder
+ * has, whatever its other type parameters.
+ */
+export type WriteOpBlobErrors<T> = T extends {
+  readonly asEffect: () => Effect.Effect<any, infer E, any>
+}
+  ? OpBlobErrorsOf<E>
+  : never
 
 // ---------------------------------------------------------------------------
 // Factory helpers

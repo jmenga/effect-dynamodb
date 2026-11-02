@@ -239,6 +239,21 @@ export const current: Effect.Effect<Ledger | undefined> = Effect.withFiber((fibe
 export const cached = (ledger: Ledger | undefined, ref: BlobRef): LedgerContent | undefined =>
   ledger === undefined ? undefined : ledger.cache.get(refKey(ref))
 
+/**
+ * Keep `content` in the ledger's read cache as what `ref` names, though the
+ * ledger did not upload it: a read pointer a projection's row rewrite reuses
+ * (design §6.11), whose content the write just compared — decoding the
+ * write's result then fetches nothing. No entry: nothing settles or rolls it
+ * back.
+ */
+export const remember = (
+  ledger: Ledger | undefined,
+  ref: BlobRef,
+  content: LedgerContent,
+): void => {
+  if (ledger !== undefined && !ledger.closed) ledger.cache.set(refKey(ref), content)
+}
+
 // ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------

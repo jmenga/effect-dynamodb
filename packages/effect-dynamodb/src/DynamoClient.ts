@@ -223,7 +223,7 @@ import {
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag, type StoredFormAt } from "./internal/Expr.js"
-import { EAGER_MODES, type Modes } from "./internal/OffloadRead.js"
+import type { Modes } from "./internal/OffloadRead.js"
 import type { StateOf } from "./internal/OffloadTypes.js"
 import {
   aggregateStoreRequirements,
@@ -2155,7 +2155,7 @@ export type TypedClient<
               StateOf<O, Schema.Schema.Type<M>>
             >
           } & EntityIndexAccessors<M, I, R, P, O> &
-            EntityVectorAccessors<M, VI>
+            EntityVectorAccessors<M, VI, O>
         >
       : TEntities[K] extends EntityDefinition<
             infer M,
@@ -2185,7 +2185,7 @@ export type TypedClient<
                 StateOf<O, Schema.Schema.Type<M>>
               >
             } & EntityIndexAccessors<M, I, R, P, O> &
-              EntityVectorAccessors<M, VI>
+              EntityVectorAccessors<M, VI, O>
           >
         : never
   }
@@ -2374,7 +2374,7 @@ type VectorFilterNames<C> = C extends { readonly filters: ReadonlyArray<infer K 
  * `reembed` maintenance operation. Empty when the entity declares none — so a
  * consumer never sees vector API surface on an entity that has no vectors.
  */
-type EntityVectorAccessors<M extends Schema.Top, VI> =
+type EntityVectorAccessors<M extends Schema.Top, VI, O extends OffloadFields = NoOffload> =
   VI extends Record<string, VectorIndexConfig>
     ? {
         readonly [K in keyof VI & string]: (
@@ -2383,7 +2383,8 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           Schema.Schema.Type<M>,
           VectorPartitionInput<M, VI[K]>,
           VectorFilterNames<VI[K]>,
-          Schema.Schema.Type<M>
+          View<Schema.Schema.Type<M>, O>,
+          StateOf<O, Schema.Schema.Type<M>>
         >
       } & {
         /**
@@ -2393,7 +2394,9 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
          * embedding model or the declared `source.fields` change. Returns the
          * number of items whose vector was rewritten. An item a write changed
          * between the scan and the rewrite (a source field or a partition
-         * composite) is skipped: that write wrote its own vector.
+         * composite) is skipped: that write wrote its own vector. An offloaded
+         * source field stored externally is fetched to derive the text (#179);
+         * no other offloaded field is.
          */
         readonly reembed: (options?: {
           readonly concurrency?: number | undefined
@@ -2401,7 +2404,8 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           number,
           | DynamoClientError
           | import("@effect-dynamodb/schema/Errors.js").ValidationError
-          | import("@effect-dynamodb/schema/Errors.js").EmbeddingError,
+          | import("@effect-dynamodb/schema/Errors.js").EmbeddingError
+          | ReadBlobErrors<O, DefaultOffloadModes>,
           never
         >
       }
@@ -2578,6 +2582,19 @@ interface EntityLike {
     | undefined
   /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
   readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
+  /** Load a batch of stored-name rows per read modes (#179): unpack, resolve pointers. */
+  readonly _loadRows?:
+    | ((
+        rows: ReadonlyArray<Record<string, unknown>>,
+        options: {
+          readonly operation: string
+          readonly modes: Modes
+          readonly raw?: boolean | undefined
+        },
+      ) => Effect.Effect<void, ValidationError | BlobStoreError>)
+    | undefined
+  /** The stored attributes `_loadRows` may rewrite (a projection naming none loads nothing). */
+  readonly _readAttributes?: ReadonlyArray<string> | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
@@ -3253,24 +3270,12 @@ const makeFromConfig = (config: {
           definition,
           schema: entityLike._schema,
           tableTag: entityLike._tableTag,
-          // Hits read eagerly (both kinds) until vector search is typed by
-          // its modes (#179, commit 9); `VectorSearchError` names no
-          // `BlobStoreError`, so a store failure is a `ValidationError`'s
-          // cause, as in `reembed`.
-          decode: (raw) =>
-            entityLike._decodeRecord(raw, EAGER_MODES, `vectorSearch.${logicalName}.decode`).pipe(
-              Effect.catchTag("BlobStoreError", (cause) =>
-                Effect.fail(
-                  new ValidationError({
-                    entityType: entityLike.entityType,
-                    operation: `vectorSearch.${logicalName}.decode`,
-                    cause,
-                  }),
-                ),
-              ),
-            ),
-          unpackRaw: entityLike._unpackFields,
-          unpackAttributes: entityLike._dispatchAttributes,
+          // Hits read in the builder's modes (#179, design §8.4), loaded
+          // together first (`loadRows`): the decoder then finds each prepared.
+          decode: (raw, modes) =>
+            entityLike._decodeRecord(raw, modes, `vectorSearch.${logicalName}.decode`),
+          loadRows: entityLike._loadRows ?? (() => Effect.void),
+          readAttributes: entityLike._readAttributes ?? [],
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
           storedAt: entityLike._storedFormAt,

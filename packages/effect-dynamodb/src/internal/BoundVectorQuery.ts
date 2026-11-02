@@ -12,6 +12,13 @@
  * `.partition({...})` has been called — mirroring the "PK composites required"
  * rule on index query accessors.
  *
+ * Offloaded fields (#179, design §8.2, §8.4): the hits load together — one
+ * batched resolution of their blob pointers — under the builder's read modes
+ * (`.offloaded(mode)`, default overflow eager, binary lazy), which re-type the
+ * hits and the terminal's blob errors, as on every other read builder. A
+ * `select` projection is a raw projection: it resolves only when it names an
+ * offloaded (or packed) attribute.
+ *
  * See `DESIGN.md §14 Vector Search`.
  */
 
@@ -19,12 +26,13 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
-import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   EmbeddingError,
   ValidationError as ValidationErrorClass,
   VectorIndexBackfilling,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
@@ -36,9 +44,12 @@ import { DEFAULT_TOP_K, toSimilarity } from "@effect-dynamodb/schema/VectorIndex
 import { Effect, Option } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import { fromAttributeMap, toAttributeValue } from "../Marshaller.js"
+import type { NoOffloadState, OffloadModes, OffloadState } from "../Offload.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { operandAsStored, type StoredFormAt } from "./Expr.js"
+import { DEFAULT_MODES, type Modes, parseModes } from "./OffloadRead.js"
+import type { OffloadedView, ReadErrors, WithItem, WithModes } from "./OffloadTypes.js"
 import { marshalOrFail } from "./TransactableOps.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./WriteDiagnosis.js"
 
@@ -70,8 +81,18 @@ export type VectorSearchError =
 // Builder types
 // ---------------------------------------------------------------------------
 
-/** Combinators available at every stage of the builder. */
-export interface BoundVectorQueryCombinators<Model, Partition, Filters extends string, A> {
+/**
+ * Combinators available at every stage of the builder. `O` is the builder's
+ * offload state (#179, design §9.2): `NoOffloadState` for an entity that
+ * offloads nothing, whose types are exactly what they were before.
+ */
+export interface BoundVectorQueryCombinators<
+  Model,
+  Partition,
+  Filters extends string,
+  A,
+  O extends OffloadState = NoOffloadState,
+> {
   /**
    * Equality-only filter over the index's declared `INLINE_FILTER` attributes.
    *
@@ -87,23 +108,45 @@ export interface BoundVectorQueryCombinators<Model, Partition, Filters extends s
    */
   readonly filter: (
     filters: VectorFilterInput<Filters>,
-  ) => BoundVectorQuery<Model, Partition, Filters, A>
+  ) => BoundVectorQuery<Model, Partition, Filters, A, O>
 
   /**
    * Number of nearest neighbours to return; default 10. Sent as given, never
    * clamped: DynamoDB accepts an integer in 1..100, and when it rejects the
    * value `collect()` fails with a `ValidationError` naming it.
    */
-  readonly topK: (k: number) => BoundVectorQuery<Model, Partition, Filters, A>
+  readonly topK: (k: number) => BoundVectorQuery<Model, Partition, Filters, A, O>
 
-  /** Project a subset of attributes. Returns partial records. */
+  /**
+   * Project a subset of attributes. Returns partial records — a raw
+   * projection: a projected packed or overflow field holds its parsed JSON
+   * wire form (eager by default), a binary one its handle (lazy by default).
+   */
   readonly select: (
     attributes: ReadonlyArray<Extract<keyof Model, string>>,
-  ) => BoundVectorQuery<Model, Partition, Filters, Record<string, unknown>>
+  ) => BoundVectorQuery<
+    Model,
+    Partition,
+    Filters,
+    Record<string, unknown>,
+    WithItem<O, Record<string, unknown>>
+  >
+
+  /**
+   * Read the hits' offloaded fields (#179) in `mode` — `"eager"` / `"lazy"`
+   * for both kinds, or `{ overflow?, binary? }` over the current modes
+   * (defaults: overflow eager, binary lazy). Re-types the hits and the
+   * terminal's blob errors; a lazy read fetches nothing until a handle is
+   * read. An unknown mode (untyped code) throws `[EDD-9117]`. An entity that
+   * offloads nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundVectorQuery<Model, Partition, Filters, OffloadedView<A, O, M>, WithModes<O, M>>
 }
 
 /** Terminals — available only once every required partition composite is bound. */
-export interface BoundVectorQueryTerminals<A> {
+export interface BoundVectorQueryTerminals<A, O extends OffloadState = NoOffloadState> {
   /**
    * Execute the search and collect the hits, most similar first.
    *
@@ -111,17 +154,27 @@ export interface BoundVectorQueryTerminals<A> {
    * shot with no cursor, so there is nothing for `.fetch()` or `.paginate()` to
    * mean.
    */
-  readonly collect: () => Effect.Effect<Array<VectorHit<A>>, VectorSearchError, never>
+  readonly collect: () => Effect.Effect<
+    Array<VectorHit<A>>,
+    VectorSearchError | ReadErrors<O>,
+    never
+  >
 }
 
 /** Partition binding — present iff the index declares partition composites. */
-export interface BoundVectorQueryWithPartition<Model, Partition, Filters extends string, A> {
+export interface BoundVectorQueryWithPartition<
+  Model,
+  Partition,
+  Filters extends string,
+  A,
+  O extends OffloadState = NoOffloadState,
+> {
   /**
    * Bind the index's declared partition composites. Required by the types when
    * `partition: [...]` is declared on the vector index — the composed HASH value
    * is mandatory in every `SearchVectors` call once an index has a HASH element.
    */
-  readonly partition: (composites: Partition) => BoundVectorQuery<Model, never, Filters, A>
+  readonly partition: (composites: Partition) => BoundVectorQuery<Model, never, Filters, A, O>
 }
 
 /**
@@ -129,12 +182,16 @@ export interface BoundVectorQueryWithPartition<Model, Partition, Filters extends
  * so an index with declared partition composites cannot be searched without
  * supplying them.
  */
-export type BoundVectorQuery<Model, Partition, Filters extends string, A> = [Partition] extends [
-  never,
-]
-  ? BoundVectorQueryCombinators<Model, Partition, Filters, A> & BoundVectorQueryTerminals<A>
-  : BoundVectorQueryCombinators<Model, Partition, Filters, A> &
-      BoundVectorQueryWithPartition<Model, Partition, Filters, A>
+export type BoundVectorQuery<
+  Model,
+  Partition,
+  Filters extends string,
+  A,
+  O extends OffloadState = NoOffloadState,
+> = [Partition] extends [never]
+  ? BoundVectorQueryCombinators<Model, Partition, Filters, A, O> & BoundVectorQueryTerminals<A, O>
+  : BoundVectorQueryCombinators<Model, Partition, Filters, A, O> &
+      BoundVectorQueryWithPartition<Model, Partition, Filters, A, O>
 
 // ---------------------------------------------------------------------------
 // Config + state
@@ -148,22 +205,27 @@ export interface BoundVectorQueryConfig {
   readonly definition: VectorIndexDefinition
   readonly schema: DynamoSchema.DynamoSchema
   readonly tableTag: import("effect").Context.Service<TableConfig, TableConfig>
-  readonly decode: (raw: Record<string, unknown>) => Effect.Effect<any, ValidationError>
+  /** Decode a hit's (already loaded) stored-name row under `modes`. */
+  readonly decode: (
+    raw: Record<string, unknown>,
+    modes: Modes,
+  ) => Effect.Effect<any, ValidationError | BlobStoreError>
   readonly provide: <X, E>(eff: Effect.Effect<X, E, any>) => Effect.Effect<X, E, never>
   /**
-   * Read, in place, the packed attributes of a stored-name row by their stored
-   * form (parsed JSON, not schema-decoded) — what a `.select()` projection
-   * returns for a packed field, as every other projection path does. Absent
-   * for an entity with no packed (or once-packed) fields.
+   * Load, in place, a batch of stored-name rows (#179): unpack their packed
+   * attributes and resolve their blob pointers per `modes` — one batched
+   * resolution for all the hits. `raw`: a projection's rows, whose values
+   * stay their JSON wire form, as every other projection path returns them.
    */
-  readonly unpackRaw?:
-    | ((raw: Record<string, unknown>) => Effect.Effect<void, ValidationError>)
-    | undefined
+  readonly loadRows: (
+    rows: ReadonlyArray<Record<string, unknown>>,
+    options: { readonly operation: string; readonly modes: Modes; readonly raw?: boolean },
+  ) => Effect.Effect<void, ValidationError | BlobStoreError>
   /**
-   * The stored attributes {@link unpackRaw} reads. A projection naming none of
-   * them skips it. Absent: every projection runs it.
+   * The stored attributes {@link loadRows} may rewrite. A projection naming
+   * none of them loads nothing.
    */
-  readonly unpackAttributes?: ReadonlyArray<string> | undefined
+  readonly readAttributes: ReadonlyArray<string>
   /**
    * Domain field name → stored DynamoDB attribute name. Filter attributes,
    * projections and the emitted `SearchSchema` must all use STORED names —
@@ -195,6 +257,8 @@ interface VectorQueryState {
   readonly filters: Record<string, unknown>
   readonly topK: number
   readonly projection: ReadonlyArray<string> | undefined
+  /** The read modes of the hits' offloaded fields (#179). */
+  readonly modes: Modes
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +304,15 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
     )
   }
 
-  collect(): Effect.Effect<Array<VectorHit<A>>, VectorSearchError, never> {
+  offloaded(
+    mode: OffloadMode | OffloadModes,
+  ): BoundVectorQueryImpl<Model, Partition, Filters, any> {
+    return this._with({
+      modes: parseModes(mode, this._state.modes, "vectorSearch.offloaded"),
+    }) as BoundVectorQueryImpl<Model, Partition, Filters, any>
+  }
+
+  collect(): Effect.Effect<Array<VectorHit<A>>, VectorSearchError | BlobStoreError, never> {
     // A named operation inside `provide` (consumed capacity, #174).
     return this._config.provide(
       Capacity.operation(
@@ -254,7 +326,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
   /** @internal The unprovided search program. */
   private _execute(): Effect.Effect<
     Array<VectorHit<A>>,
-    VectorSearchError,
+    VectorSearchError | BlobStoreError,
     DynamoClient | TableConfig
   > {
     const {
@@ -264,8 +336,8 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       schema,
       tableTag,
       decode,
-      unpackRaw,
-      unpackAttributes,
+      loadRows,
+      readAttributes,
       resolveDbName,
       keyForm,
       storedAt,
@@ -402,36 +474,47 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         }),
       )
 
-      // 4. Decode each hit through the entity schema and normalize the score.
-      //    A projection reads its packed attributes by stored form — only when
-      //    it names one of them.
-      const unpackProjection =
-        state.projection !== undefined &&
-        unpackRaw !== undefined &&
-        (unpackAttributes === undefined ||
-          state.projection.some((attribute) => unpackAttributes.includes(resolveDbName(attribute))))
-      const hits: Array<VectorHit<A>> = []
+      // 4. Load the hits together — their packed attributes unpacked and
+      //    their blob pointers resolved per the builder's modes, one batched
+      //    resolution (#179, design §8.2) — then decode each through the
+      //    entity schema and normalize the score. A projection is a raw read
+      //    of the attributes it names: it loads only when it names one the
+      //    load may rewrite.
+      const found: Array<{ readonly raw: Record<string, unknown>; readonly rawScore: number }> = []
       for (const result of output.SearchResults ?? []) {
         if (!result.Item) continue
         // A result with no Score cannot be ranked or normalized. Coercing it to
         // 0 would be a lie under DOT_PRODUCT, where 0 is a real (orthogonal)
         // score — drop it instead.
         if (result.Score === undefined || result.Score === null) continue
-        const raw = fromAttributeMap(result.Item) as Record<string, unknown>
+        found.push({
+          raw: fromAttributeMap(result.Item) as Record<string, unknown>,
+          rawScore: result.Score,
+        })
+      }
+      if (state.projection === undefined) {
+        yield* loadRows(
+          found.map((hit) => hit.raw),
+          { operation: `vectorSearch.${logicalName}.decode`, modes: state.modes },
+        )
+      } else if (
+        state.projection.some((attribute) => readAttributes.includes(resolveDbName(attribute)))
+      ) {
         // The vector partition value bakes in the entity type, so every hit is
         // this entity's own row; one that says otherwise is left untouched.
-        if (
-          unpackProjection &&
-          (raw.__edd_e__ === undefined || raw.__edd_e__ === entityType) &&
-          unpackRaw !== undefined
-        ) {
-          yield* unpackRaw(raw)
-        }
+        yield* loadRows(
+          found
+            .map((hit) => hit.raw)
+            .filter((raw) => raw.__edd_e__ === undefined || raw.__edd_e__ === entityType),
+          { operation: `vectorSearch.${logicalName}.select`, modes: state.modes, raw: true },
+        )
+      }
+      const hits: Array<VectorHit<A>> = []
+      for (const { raw, rawScore } of found) {
         const decoded =
           state.projection === undefined
-            ? yield* decode(raw)
+            ? yield* decode(raw, state.modes)
             : (projectDomainNames(raw, state.projection, resolveDbName) as A)
-        const rawScore = result.Score
         hits.push({
           item: decoded as A,
           similarity: toSimilarity(rawScore, definition.distance),
@@ -550,14 +633,21 @@ const projectDomainNames = (
 // ---------------------------------------------------------------------------
 
 /** @internal Create a vector search builder for a single accessor invocation. */
-export const makeBoundVectorQuery = <Model, Partition, Filters extends string, A>(
+export const makeBoundVectorQuery = <
+  Model,
+  Partition,
+  Filters extends string,
+  A,
+  O extends OffloadState = NoOffloadState,
+>(
   config: BoundVectorQueryConfig,
   query: string | ReadonlyArray<number>,
-): BoundVectorQuery<Model, Partition, Filters, A> =>
+): BoundVectorQuery<Model, Partition, Filters, A, O> =>
   new BoundVectorQueryImpl<Model, Partition, Filters, A>(config, {
     query,
     partition: undefined,
     filters: {},
     topK: DEFAULT_TOP_K,
     projection: undefined,
-  }) as unknown as BoundVectorQuery<Model, Partition, Filters, A>
+    modes: DEFAULT_MODES,
+  }) as unknown as BoundVectorQuery<Model, Partition, Filters, A, O>

@@ -65,6 +65,7 @@ import { normalizeTtlSeconds } from "@effect-dynamodb/schema/Entity.js"
 import {
   AdditionalItemConditionFailed,
   AppendTooLarge,
+  type BlobStoreError,
   type ConcurrentModification,
   DuplicateCommand,
   isAwsConditionalCheckFailed,
@@ -4296,7 +4297,7 @@ export const makeStream = <
     proofOp: number | undefined,
   ): Effect.Effect<
     AppendTransaction,
-    ValidationError | DynamoClientError,
+    ValidationError | DynamoClientError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {

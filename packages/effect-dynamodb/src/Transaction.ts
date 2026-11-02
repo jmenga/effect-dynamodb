@@ -30,7 +30,7 @@ import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
-import type { AnyGet, GetBlobErrors, GetSuccess } from "./internal/BoundCrud.js"
+import type { AnyGet, GetBlobErrors, GetSuccess, WriteOpBlobErrors } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
   comparedOperandsOf,
@@ -46,6 +46,7 @@ import {
   isProjectionTombstone,
   loadGetRows,
   resolveTableNames,
+  underCaptured,
 } from "./internal/TransactableOps.js"
 import {
   buildTransactWriteItems,
@@ -342,8 +343,12 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
         continue
       }
       const info = infos[i]!
+      // Under a bound get's captured services (§3.6), as its row was loaded.
       decoded.push(
-        yield* info.entity._decodeRecord(raw, info.offloadModes, "Transaction.transactGet.decode"),
+        yield* underCaptured(
+          info.captured,
+          info.entity._decodeRecord(raw, info.offloadModes, "Transaction.transactGet.decode"),
+        ),
       )
     }
 
@@ -393,6 +398,14 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
  * that returns an item (EDD-9060), and an update of a vector-indexed entity
  * (EDD-9061).
  *
+ * **Offloaded fields** (#179). A put routes and uploads its entity's offloaded
+ * values, and an update plans its own as the standalone update does; the
+ * uploads settle by the transaction — a cancelled attempt's are deleted, and
+ * an attempt planned again with the same content uploads nothing new. A bound
+ * builder's values go to the blob store (and pack with the compressors) its
+ * `DynamoClient.make` bundled. An op over a member that offloads a field adds
+ * `BlobStoreError` to the error type; an op typed `any` adds nothing.
+ *
  * ```typescript
  * yield* Transaction.transactWrite([
  *   Users.put({ userId: "u-1", ... }),
@@ -402,32 +415,30 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
  * ])
  * ```
  */
-export const transactWrite = (
-  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
+export const transactWrite = <
+  const T extends ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
+>(
+  operations: T,
 ): Effect.Effect<
   void,
-  | DynamoClientError
-  | ValidationError
-  | TransactionCancelled
-  | UniqueConstraintViolation
-  | OptimisticLockError
-  | ConcurrentModification
-  | ConditionalCheckFailed
-  | ItemNotFound
-  | TransactionOverflow
-  | RefNotFound,
+  TransactWriteError | WriteOpBlobErrors<T[number]>,
   DynamoClient | TableConfig
 > =>
   Capacity.operation(
     "Transaction.transactWrite",
     undefined,
     BlobLedger.root(transactWriteCore(operations)),
-  )
+  ) as Effect.Effect<
+    void,
+    TransactWriteError | WriteOpBlobErrors<T[number]>,
+    DynamoClient | TableConfig
+  >
 
-const transactWriteCore = (
-  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
-): Effect.Effect<
-  void,
+/**
+ * What `transactWrite` fails with whatever its ops — beside the
+ * `BlobStoreError` of an op over a member that offloads a field (#179).
+ */
+type TransactWriteError =
   | DynamoClientError
   | ValidationError
   | TransactionCancelled
@@ -437,9 +448,11 @@ const transactWriteCore = (
   | ConditionalCheckFailed
   | ItemNotFound
   | TransactionOverflow
-  | RefNotFound,
-  DynamoClient | TableConfig
-> =>
+  | RefNotFound
+
+const transactWriteCore = (
+  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
+): Effect.Effect<void, TransactWriteError | BlobStoreError, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     if (operations.length === 0) return
 
@@ -496,6 +509,9 @@ const transactWriteCore = (
             OptimisticLockError | ConcurrentModification,
             DynamoClientError | ValidationError | UniqueConstraintViolation | TransactionCancelled
           > => {
+            // Not a cancellation — a `BlobStoreError` (`Expired`, an upload
+            // over the store's `maxUploadAge` refused before the request was
+            // sent, design §6.1) among them — passes through as it is.
             if (!isAwsTransactionCancelled(error.cause)) return Effect.fail(error)
             const rawReasons = error.cause.CancellationReasons ?? []
             const judged = judgeCancellation(built, rawReasons)

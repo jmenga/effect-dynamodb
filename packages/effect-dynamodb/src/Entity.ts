@@ -198,6 +198,7 @@ import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
 import * as OffloadRead from "./internal/OffloadRead.js"
 import type { DeleteOpStateOf, OpStateOf, StateOf } from "./internal/OffloadTypes.js"
+import { isOffloadedValue } from "./internal/OffloadValues.js"
 import * as OffloadWrite from "./internal/OffloadWrite.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
@@ -236,6 +237,7 @@ import {
 } from "./internal/RoundTrip.js"
 import {
   andRaw,
+  capturedServices,
   composeKeysOrFail,
   freshIncarnationToken,
   generateTimestampPrimitive,
@@ -1067,6 +1069,41 @@ export interface Entity<
 
   /** @internal The domain fields the entity offloads (#179), both kinds. */
   readonly _offloadedFields: ReadonlyArray<string>
+
+  /**
+   * @internal Route and upload, in place, the offloaded attributes of a
+   * packed, stored-name item built outside the entity's own `put`
+   * (`TransactableOps.validateAndBuildPutItem`, #179, design §6.6): the
+   * `Batch.write`, transaction, `additionalItems` and projection puts.
+   * `operation` is the name the uploads record. With `reuse` (a projection's
+   * row rewrite, §6.11), an attribute whose new content is what the read
+   * row's pointer named keeps that pointer instead of uploading; the write
+   * must then be conditioned on the returned pins (`OffloadWrite.withPins`).
+   * Nothing when the entity offloads nothing.
+   */
+  readonly _offloadItem: (
+    item: globalThis.Record<string, unknown>,
+    table: string,
+    operation: string,
+    reuse?: OffloadWrite.ReadPointers | undefined,
+  ) => Effect.Effect<ReadonlyArray<OffloadWrite.Pin>, BlobStoreError | ValidationError>
+
+  /**
+   * @internal Read a stored-name row that is about to be folded and rewritten
+   * (an EventStore projection's read model, design §6.11): loaded eagerly
+   * (both kinds) and decoded as an item — `Entity.Item`, Hidden fields
+   * included, as {@link decodeMarshalledItem} decodes one, since the row is
+   * written back whole — with the pointers it held and the content each named
+   * as fetched, which {@link _offloadItem}'s `reuse` compares. `raw` is
+   * consumed.
+   */
+  readonly _loadForReuse: (
+    raw: globalThis.Record<string, unknown>,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly item: unknown; readonly pointers: OffloadWrite.ReadPointers },
+    ValidationError | BlobStoreError
+  >
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -5834,6 +5871,43 @@ const makeImpl = <
           (routed) => routed.uploaded,
         )
 
+  /** `_offloadItem`: {@link offloadItem} of an item another entry point built, under its own name. */
+  const offloadBuiltItem = (
+    item: globalThis.Record<string, unknown>,
+    table: string,
+    operation: string,
+    reuse?: OffloadWrite.ReadPointers,
+  ): Effect.Effect<ReadonlyArray<OffloadWrite.Pin>, BlobStoreError | ValidationError> => {
+    if (offloadInfo === undefined) return Effect.succeed(OffloadWrite.NO_PINS)
+    const info = offloadInfo
+    const row = OffloadWrite.rowOf(item, {
+      table,
+      pkAttribute: config.indexes.primary.pk.field,
+      skAttribute: config.indexes.primary.sk.field,
+      operation,
+      escapeKeys: schema.escapeKeys === true,
+    })
+    return Effect.flatMap(
+      reuse === undefined
+        ? Effect.succeed(OffloadWrite.NO_PINS)
+        : OffloadWrite.reuse(info, item, reuse, operation),
+      (pins) => Effect.as(OffloadWrite.route(info, item, row), pins),
+    )
+  }
+
+  /**
+   * The pins of a put that reuses its read row's pointers (`opts.reuse`,
+   * §6.11), the reused values now holding them — none for any other put.
+   */
+  const reusePointers = (
+    item: globalThis.Record<string, unknown>,
+    reuse: OffloadWrite.ReadPointers | undefined,
+    operation: string,
+  ): Effect.Effect<ReadonlyArray<OffloadWrite.Pin>, ValidationError> =>
+    offloadInfo === undefined || reuse === undefined
+      ? Effect.succeed(OffloadWrite.NO_PINS)
+      : OffloadWrite.reuse(offloadInfo, item, reuse, `Entity.${operation}`)
+
   // ---------------------------------------------------------------------------
   // Reads (#179, design §8): the two-phase decode. `loadRows` unpacks every
   // stored-form attribute (a pointer becoming a placeholder) and resolves the
@@ -5928,21 +6002,40 @@ const makeImpl = <
       (modes.binary === "lazy" && offloadedByKind.binary.length > 0))
 
   /**
+   * Drop, from a stored-name copy of a row, every offloaded attribute whose
+   * field is not in `keep` (#179): the vector paths read source fields only,
+   * so loading the copy fetches no other offloaded value — a large binary
+   * beside the text is never downloaded to re-embed it.
+   */
+  const keepOffloaded = (
+    stored: globalThis.Record<string, unknown>,
+    keep: ReadonlySet<string>,
+  ): void => {
+    if (offloadInfo === undefined) return
+    for (const attribute of offloadedAttributeNames) {
+      if (!keep.has(offloadInfo.fieldOf[attribute] ?? attribute)) delete stored[attribute]
+    }
+  }
+
+  /**
    * A domain-named copy of `record` with its packed (or once-packed) attributes
    * read by their stored form. The update paths derive vector source text from
    * it: an untouched packed field still holds its stored value there (a JSON
    * string or compressed bytes), not the value the source `compose` expects —
    * and an untouched offloaded one its pointer, resolved here eagerly (one GET
-   * per pointer, design §6.5). `record` itself is left as is, so the write
-   * still carries the stored bytes.
+   * per pointer, design §6.5) when it is one of `sources`; any other offloaded
+   * field is left out of the copy. `record` itself is left as is, so the
+   * write still carries the stored bytes.
    */
   const unpackedDomainCopy = (
     record: globalThis.Record<string, unknown>,
     operation: string,
+    sources: ReadonlySet<string>,
   ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError | BlobStoreError> => {
     if (OffloadRead.isEmptyPlan(readPlan)) return Effect.succeed(record)
     const stored = { ...record }
     renameToDynamo(stored)
+    keepOffloaded(stored, sources)
     return Effect.map(
       loadRow(stored, { operation, modes: OffloadRead.EAGER_MODES, raw: true }),
       () => {
@@ -7247,6 +7340,34 @@ const makeImpl = <
       return attachPrototype(decoded)
     })
 
+  /**
+   * `_loadForReuse`: an eager load that snapshots the pointers the row held
+   * (§6.11), then the item decode — the item schema keeps Hidden fields, which
+   * the record schema strips and the whole-row rewrite must carry.
+   */
+  const loadForReuse = (
+    raw: globalThis.Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<
+    { readonly item: unknown; readonly pointers: OffloadWrite.ReadPointers },
+    ValidationError | BlobStoreError
+  > => {
+    const corruption = versionCorruption(raw, operation)
+    if (corruption !== undefined) return Effect.fail(corruption)
+    // Read before the load, which replaces each pointer with its value.
+    const held = offloadInfo === undefined ? [] : OffloadWrite.pointersIn(offloadInfo, raw)
+    const load = { operation, modes: OffloadRead.EAGER_MODES }
+    return Effect.flatMap(loadRow(raw, load), () => {
+      // Snapshotted by stored name, before the decode renames the attributes;
+      // the decode's own load is then a no-op.
+      const pointers: OffloadWrite.ReadPointers =
+        offloadInfo === undefined
+          ? new Map<string, OffloadWrite.ReadPointer>()
+          : OffloadWrite.snapshotPointers(offloadInfo, held, raw)
+      return Effect.map(decodeStored(raw, "item", load), (item) => ({ item, pointers }))
+    })
+  }
+
   const nowIso = (now: DateTime.Utc) => DateTime.formatIso(now)
 
   /**
@@ -7711,6 +7832,20 @@ const makeImpl = <
     })
 
   /**
+   * The source fields of `indexes` an embedding is derived from: those of the
+   * indexes without an explicit vector (`withVector`), which need no text.
+   */
+  const embeddedSources = (
+    indexes: ReadonlyArray<readonly [string, VectorIndexDefinition]>,
+    withVectors: globalThis.Record<string, ReadonlyArray<number>> | undefined,
+  ): ReadonlySet<string> =>
+    new Set(
+      indexes.flatMap(([logicalName, definition]) =>
+        withVectors?.[logicalName] === undefined ? definition.sourceFields : [],
+      ),
+    )
+
+  /**
    * Which vector indexes does this update require work for?
    *
    * Re-embedding fires when the write touches a `source.fields` member by ANY
@@ -7819,7 +7954,14 @@ const makeImpl = <
           const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
           // Packed fields are read by their stored form: the source text is
           // derived from the value, not its JSON string or compressed bytes —
-          // and an offloaded one is fetched (one GET per pointer, #179).
+          // and an offloaded one is fetched (one GET per pointer, #179) when
+          // it is a source the payload does not supply. No other offloaded
+          // value is.
+          const supplied = merged
+          keepOffloaded(
+            currentDomain,
+            new Set([...embeddedSources(needing, withVectors)].filter((f) => !(f in supplied))),
+          )
           yield* loadRow(currentDomain, {
             operation: "update.vector",
             modes: OffloadRead.EAGER_MODES,
@@ -10354,6 +10496,12 @@ const makeImpl = <
             }
           }
 
+          // A projection's row rewrite (#179, design §6.11): a value whose
+          // content the read row's pointer named keeps that pointer, and the
+          // write holds only while the row still does (`#f = :P`).
+          const pins = yield* reusePointers(item, opts.reuse, operation)
+          if (pins.length > 0) userCondition = OffloadWrite.withPins(userCondition, pins)
+
           // Offloaded fields (#179, design §6.5): every one the item holds is
           // routed (thresholds, then the item budget) and uploaded — after the
           // local guards and the tombstone read, so a refused write uploads
@@ -11507,7 +11655,14 @@ const makeImpl = <
           // (kept byte-identical for the write diff), so the source text is
           // derived from an unpacked copy.
           const vectorWrite = yield* computeVectorAttributes(
-            yield* unpackedDomainCopy(newItem, "update.vector"),
+            yield* unpackedDomainCopy(
+              newItem,
+              "update.vector",
+              embeddedSources(
+                vectorIndexEntries.filter(([logicalName]) => embedFor.has(logicalName)),
+                uState.withVectors,
+              ),
+            ),
             uState.withVectors,
             embedFor,
             ownUpdate,
@@ -21377,6 +21532,8 @@ const makeImpl = <
     _readAttributes: readAttributeNames,
     _offloads: offloadInfo !== undefined,
     _offloadedFields: [...offloadedByKind.overflow, ...offloadedByKind.binary],
+    _offloadItem: offloadBuiltItem,
+    _loadForReuse: loadForReuse,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: load + sparse + rename + schema decode. Used by Batch/Aggregate. */
     _decodeRecord: decodeRecord,
@@ -21691,6 +21848,7 @@ export const bind = <
       pathBuilder: boundPathBuilder(),
       conditionOps: createConditionOps(),
       provide,
+      captured: capturedServices(baseCtx),
     }
 
     // Helper: apply query combinators then execute
@@ -21744,8 +21902,17 @@ export const bind = <
      */
     const reembed = (options?: {
       readonly concurrency?: number | undefined
-    }): Effect.Effect<number, DynamoClientError | ValidationError | EmbeddingError, never> => {
+    }): Effect.Effect<
+      number,
+      DynamoClientError | ValidationError | EmbeddingError | BlobStoreError,
+      never
+    > => {
       const vectorDefs = Object.entries(entity._vectorIndexes)
+      // The fields any index derives its text from: the only offloaded
+      // values a re-embed reads (#179).
+      const sourceFields = [
+        ...new Set(vectorDefs.flatMap(([, definition]) => definition.sourceFields)),
+      ]
       const boundSchema = entity._schema
       const primary = entity.indexes.primary as IndexDefinition
       const boundEntityVersion = entity._entityVersion
@@ -21766,25 +21933,19 @@ export const bind = <
               Effect.gen(function* () {
                 const raw = fromAttributeMap(marshalled) as globalThis.Record<string, unknown>
                 const storedSk = raw[primary.sk.field]
-                // Eager (the source text needs the values); a store failure is a
-                // `ValidationError`'s cause until vector reads are typed (#179).
-                const decoded = (yield* entity
-                  ._decodeRecord(raw, OffloadRead.EAGER_MODES, "reembed.decode")
-                  .pipe(
-                    Effect.catchTag("BlobStoreError", (cause) =>
-                      Effect.fail(
-                        new ValidationError({
-                          entityType: entity.entityType,
-                          operation: "reembed.decode",
-                          cause,
-                        }),
-                      ),
-                    ),
-                  )) as globalThis.Record<string, unknown>
+                // Lazy (#179, design §6.5): no offloaded value is fetched by
+                // the decode.
+                const decoded = (yield* entity._decodeRecord(
+                  raw,
+                  OffloadRead.LAZY_MODES,
+                  "reembed.decode",
+                )) as globalThis.Record<string, unknown>
                 // Snapshots / tombstones live in the same partition under a
                 // rewritten SK — their SK cannot be recomposed from the record.
                 // `decoded` holds domain values: the keys `put` wrote for them
-                // are the key form of the values it stores.
+                // are the key form of the values it stores. Key and vector
+                // partition composites are never packed or External (EDD-9072,
+                // EDD-9142), so the key form needs no read.
                 const decodedKeyForm = entity._domainKeyForm(decoded)
                 const liveSk = KeyComposer.composeSk(
                   boundSchema,
@@ -21794,6 +21955,13 @@ export const bind = <
                   decodedKeyForm,
                 )
                 if (storedSk !== liveSk) return false
+                // A live row: only its source fields' values are read — an
+                // offloaded one stored externally costs one GET, an inline one
+                // none — and no other offloaded field is fetched.
+                for (const field of sourceFields) {
+                  const value = decoded[field]
+                  if (isOffloadedValue(value)) decoded[field] = yield* value.read()
+                }
 
                 const attributes: globalThis.Record<string, unknown> = {}
                 const embedded: Array<VectorIndexDefinition> = []
@@ -22180,8 +22348,9 @@ export const bind = <
  * What planning an update for a transaction can fail with: everything the
  * update raises before it writes — its reads (`DynamoClientError`, `ItemNotFound`,
  * `RefNotFound`), a stale `expectedVersion`, `patch` of a missing row
- * (`ConditionalCheckFailed`), an op too large for one transaction, and a refused op
- * (`ValidationError`).
+ * (`ConditionalCheckFailed`), an op too large for one transaction, a refused op
+ * (`ValidationError`), and the blob store's failures of its uploads and reads
+ * (`BlobStoreError`, #179).
  */
 /**
  * @internal What `Entity._prepareUpdate` decided of an update, opaque outside the entity that
@@ -22200,6 +22369,7 @@ export type PlanUpdateError =
   | OptimisticLockError
   | RefNotFound
   | UniqueConstraintViolation
+  | BlobStoreError
 
 /** What planning a delete for a transaction can fail with — see {@link PlanUpdateError}. */
 export type PlanDeleteError =
@@ -22208,6 +22378,7 @@ export type PlanDeleteError =
   | ConditionalCheckFailed
   | ItemNotFound
   | TransactionOverflow
+  | BlobStoreError
 
 const tagged =
   <A>(tags: ReadonlySet<string>) =>
@@ -22227,6 +22398,7 @@ const planDeleteErrorTags = [
   "ConditionalCheckFailed",
   "ItemNotFound",
   "TransactionOverflow",
+  "BlobStoreError",
 ]
 const isPlanDeleteError = tagged<PlanDeleteError>(new Set(planDeleteErrorTags))
 const isPlanUpdateError = tagged<PlanUpdateError>(
@@ -22280,6 +22452,13 @@ export interface TransactableInfo {
    * in its own modes.
    */
   readonly offloadModes?: OffloadRead.Modes | undefined
+  /**
+   * A bound builder's captured blob store and compressor registry (#179,
+   * design §3.6): the multi-item entry points build, upload and read this
+   * op's item under them (`TransactableOps.underCaptured`). `undefined` for
+   * an unbound op, and for a binding that captured neither.
+   */
+  readonly captured?: Context.Context<never> | undefined
 }
 
 /** @internal */
@@ -22310,20 +22489,6 @@ const isEntityOp = (op: object): op is InternalEntityOp => EntityOpTypeId in op
 const isEntityDelete = (op: object): op is InternalEntityDelete => EntityDeleteTypeId in op
 
 /**
- * Extract transactable metadata from an Entity operation intermediate.
- * Returns undefined if the value is not a recognized entity operation.
- *
- * Bound ops (`db.entities.X.put(...)`, `.create(...)`, `.delete(...)`,
- * `.get(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
- * That unwrapping is what lets entities authored with the pure, AWS-free
- * `@effect-dynamodb/schema` `Entity.make` take part in `Batch.write`,
- * `Transaction.transactWrite`, `EventStore.append({ additionalItems })` (#100)
- * and — through the same one protocol, not a second one — `Batch.get`,
- * `Transaction.transactGet` and `Transaction.check` (#108). A pure definition
- * carries no operations, so the bound op is the only descriptor its author can
- * ever hold.
- */
-/**
  * @internal `create`'s guard: the item must not exist. (Over a projection
  * tombstone, `create` reads it and guards on it instead — `overTombstone`.)
  */
@@ -22339,14 +22504,33 @@ export const createGuard = (entity: {
   return { attributeNotExists: [primary.pk.field, primary.sk.field] }
 }
 
+/**
+ * Extract transactable metadata from an Entity operation intermediate.
+ * Returns undefined if the value is not a recognized entity operation.
+ *
+ * Bound ops (`db.entities.X.put(...)`, `.create(...)`, `.delete(...)`,
+ * `.get(...)`, …) are unwrapped to the `EntityOp` / `EntityDelete` they wrap.
+ * That unwrapping is what lets entities authored with the pure, AWS-free
+ * `@effect-dynamodb/schema` `Entity.make` take part in `Batch.write`,
+ * `Transaction.transactWrite`, `EventStore.append({ additionalItems })` (#100)
+ * and — through the same one protocol, not a second one — `Batch.get`,
+ * `Transaction.transactGet` and `Transaction.check` (#108). A pure definition
+ * carries no operations, so the bound op is the only descriptor its author can
+ * ever hold.
+ *
+ * A bound op also carries its binding's captured blob store and compressor
+ * registry (`captured`, #179): the entry points build its item under them.
+ */
 export const extractTransactable = (op: unknown): TransactableInfo | undefined => {
   if (op == null || typeof op !== "object") return undefined
 
   // Unwrap a bound-CRUD builder to the intermediate it wraps. Combinators on the
   // builder (`.condition()`, `.set()`, …) are applied to that inner op, so the
   // unwrapped value carries the full request.
-  const target = isBoundOp(op) ? (op._op as unknown) : op
+  const bound = isBoundOp(op)
+  const target = bound ? (op._op as unknown) : op
   if (target == null || typeof target !== "object") return undefined
+  const captured = bound ? op._config?.captured : undefined
 
   // Check for EntityOp intermediates (get, put, update)
   if (isEntityOp(target)) {
@@ -22356,6 +22540,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         entity: target._entity,
         key: target._key,
         offloadModes: target._offloadModes ?? OffloadRead.DEFAULT_MODES,
+        captured,
       }
     }
     // `create`'s own not-exists guard is ANDed with the caller's condition:
@@ -22372,6 +22557,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         ),
         putKind,
         callerCondition: target._condition,
+        captured,
       }
     }
     if (target._opType === "update") {
@@ -22384,6 +22570,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         key: target._key,
         condition: target._updateState?.condition,
         updateState: target._updateState,
+        captured,
       }
     }
   }
@@ -22406,6 +22593,7 @@ export const extractTransactable = (op: unknown): TransactableInfo | undefined =
         mustExist: target._mustExist === true,
         returnValues: target._returnValues,
       },
+      captured,
     }
   }
 

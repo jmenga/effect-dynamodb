@@ -611,6 +611,185 @@ export const pointerOf = (
 }
 
 // ---------------------------------------------------------------------------
+// Read-pointer reuse (projection row rewrites, design §6.11)
+// ---------------------------------------------------------------------------
+
+/** A pointer a row held when read, and the content it named as fetched. */
+export interface ReadPointer {
+  readonly pointer: BlobPointer
+  /** Its stored form, as the row holds it (`B` bytes, or `~edbp:` text). */
+  readonly stored: string | Uint8Array
+  /**
+   * The content fetched, snapshotted when the row was read: the value's
+   * canonical JSON (overflow, {@link canonicalJson}), or a copy of its bytes
+   * (binary). A snapshot, so a fold that mutates the state it was given in
+   * place cannot make a changed value compare equal.
+   */
+  readonly content: string | Uint8Array
+}
+
+/** The pointers a read row held, by stored attribute name. */
+export type ReadPointers = ReadonlyMap<string, ReadPointer>
+
+/** A reused pointer the write must be conditioned on (`#f = :P`). */
+export interface Pin {
+  readonly attribute: string
+  readonly stored: string | Uint8Array
+}
+
+/** No reuse, no pins. */
+export const NO_PINS: ReadonlyArray<Pin> = []
+
+/** Sort an object's keys, recursively — key order does not change a JSON value. */
+const sortKeys = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map((element) => sortKeys(element))
+  if (value === null || typeof value !== "object") return value
+  // A null-prototype copy: on a plain object, assigning an own `__proto__`
+  // key (which `JSON.parse` creates) would set the prototype instead, and the
+  // key and its value would drop out of the text.
+  const out: Record<string, unknown> = Object.create(null)
+  for (const key of Object.keys(value).sort()) {
+    out[key] = sortKeys((value as Record<string, unknown>)[key])
+  }
+  return out
+}
+
+/** A JSON value's text with every object's keys sorted: equal iff the values are. */
+export const canonicalJson = (value: unknown): string => JSON.stringify(sortKeys(value)) ?? "null"
+
+/**
+ * The pointers a stored-name row holds on the member's offloaded attributes,
+ * before it is loaded (the load replaces them with their values).
+ */
+export const pointersIn = (
+  info: OffloadInfo,
+  row: Readonly<Record<string, unknown>>,
+): ReadonlyArray<{
+  readonly attribute: string
+  readonly pointer: BlobPointer
+  readonly stored: string | Uint8Array
+}> =>
+  offloadedAttributes(info).flatMap((attribute) => {
+    const stored = row[attribute]
+    const pointer = pointerOf(info, attribute, stored)
+    return pointer === undefined
+      ? []
+      : [{ attribute, pointer, stored: stored as string | Uint8Array }]
+  })
+
+/**
+ * The {@link ReadPointers} of a row whose `pointers` ({@link pointersIn}) were
+ * just loaded eagerly: each attribute holds its fetched value — the JSON wire
+ * form (overflow) or the bytes (binary) — which is snapshotted.
+ */
+export const snapshotPointers = (
+  info: OffloadInfo,
+  pointers: ReturnType<typeof pointersIn>,
+  loaded: Readonly<Record<string, unknown>>,
+): ReadPointers => {
+  const out = new Map<string, ReadPointer>()
+  for (const { attribute, pointer, stored } of pointers) {
+    const value = loaded[attribute]
+    if (Object.hasOwn(info.binary, attribute)) {
+      if (value instanceof Uint8Array) {
+        out.set(attribute, { pointer, stored, content: new Uint8Array(value) })
+      }
+    } else if (value !== undefined) {
+      out.set(attribute, { pointer, stored, content: canonicalJson(value) })
+    }
+  }
+  return out
+}
+
+/**
+ * Keep, in place, the read pointer of every offloaded attribute of a packed,
+ * stored-name item whose new value has the content that pointer named when
+ * the row was read (design §6.11) — content, not checksum: a CRC is no proof
+ * of equality. The attribute then holds the pointer, which {@link route}
+ * leaves as is, and the returned {@link Pin}s must condition the write on the
+ * row still holding each one ({@link withPins}), so a concurrent write of the
+ * row fails it. Each reused value goes into the ledger's read cache, so the
+ * write's result decodes it without a fetch. A value that differs, or an
+ * attribute the item no longer holds, is left to {@link route}.
+ */
+export const reuse = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  read: ReadPointers,
+  operation: string,
+): Effect.Effect<ReadonlyArray<Pin>, ValidationError> =>
+  read.size === 0
+    ? Effect.succeed(NO_PINS)
+    : Effect.gen(function* () {
+        const registry = yield* currentRegistry
+        const ledger = yield* BlobLedger.current
+        const pins: Array<Pin> = []
+        for (const [attribute, previous] of read) {
+          const value = ownValue(item, attribute)
+          if (!uploadable(info, attribute, value)) continue
+          let content: BlobLedger.LedgerContent
+          if (Object.hasOwn(info.binary, attribute)) {
+            if (
+              !(previous.content instanceof Uint8Array) ||
+              !sameBytes(value as Uint8Array, previous.content)
+            ) {
+              continue
+            }
+            content = { kind: "bytes", bytes: previous.content }
+          } else {
+            const upload = overflowUpload(info, attribute, value, registry, operation)
+            if (upload instanceof ValidationError) return yield* upload
+            const text = (upload.content as { readonly text: string }).text
+            let parsed: unknown
+            try {
+              parsed = JSON.parse(text)
+            } catch {
+              continue
+            }
+            if (previous.content !== canonicalJson(parsed)) continue
+            content = { kind: "json", text }
+          }
+          setOwn(item, attribute, previous.stored)
+          pins.push({ attribute, stored: previous.stored })
+          BlobLedger.remember(ledger, previous.pointer.ref, content)
+        }
+        return pins
+      })
+
+/** A compiled condition: expression, names and values. */
+export interface RawCondition {
+  readonly expression: string
+  readonly names: Record<string, string>
+  readonly values: Record<string, AttributeValue>
+}
+
+/**
+ * `condition` ANDed with `#f = :P` for every pin (design §6.11): the write
+ * succeeds only while the row still holds each reused pointer. `condition`
+ * itself when there are none.
+ */
+export const withPins = <C extends RawCondition | undefined>(
+  condition: C,
+  pins: ReadonlyArray<Pin>,
+): C | RawCondition => {
+  if (pins.length === 0) return condition
+  const names: Record<string, string> = { ...condition?.names }
+  const values: Record<string, AttributeValue> = { ...condition?.values }
+  const parts: Array<string> = []
+  pins.forEach((pin, i) => {
+    names[`#eddPin${i}`] = pin.attribute
+    values[`:eddPin${i}`] = toAttributeValue(pin.stored)
+    parts.push(`#eddPin${i} = :eddPin${i}`)
+  })
+  const pinned = parts.join(" AND ")
+  return {
+    expression: condition === undefined ? pinned : `(${condition.expression}) AND ${pinned}`,
+    names,
+    values,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Immutables
 // ---------------------------------------------------------------------------
 
