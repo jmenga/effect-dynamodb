@@ -206,7 +206,14 @@ export function make<
   const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
 >(
   schema: TSchema,
-  config: SubAggregateConfig<TEdges> & { readonly table?: undefined },
+  // The top-level form's keys, refused here, so an error in a top-level config
+  // is reported against the top-level overload (it fails this one on each key).
+  config: SubAggregateConfig<TEdges> & {
+    readonly table?: undefined
+    readonly schema?: undefined
+    readonly pk?: undefined
+    readonly collection?: undefined
+  },
 ): SubAggregate<TSchema, TEdges>
 export function make<
   TSchema extends Schema.Top,
