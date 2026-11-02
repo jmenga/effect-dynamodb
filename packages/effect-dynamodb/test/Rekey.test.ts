@@ -32,7 +32,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -384,7 +384,7 @@ describe("rekey — every row kind", () => {
       expect(report.indexKeysRewritten).toBe(1)
       expect(report.sentinelsMoved).toBe(2)
       expect(report.conflicts).toEqual([])
-      expect(report.resume).toBeUndefined()
+      expect(report.resume).toEqual(Option.none())
       expect(report.scanned).toBe(before.size)
       expect(table.requests.every((r) => ["Scan", "GetItem", "Query"].includes(r.command))).toBe(
         true,
@@ -637,11 +637,16 @@ describe("rekey — the scan", () => {
       const rows = table.items.size
       const first = yield* rekey(On, table, { dryRun: true, pageSize: 3, maxPages: 2 })
       expect(first.scanned).toBe(6)
-      expect(first.resume).toMatch(/^rk1\./)
+      expect(Option.getOrThrow(first.resume)).toMatch(/^rk1\./)
       let scanned = first.scanned
       let resume = first.resume
-      while (resume !== undefined) {
-        const next = yield* rekey(On, table, { dryRun: true, pageSize: 3, maxPages: 2, resume })
+      while (Option.isSome(resume)) {
+        const next = yield* rekey(On, table, {
+          dryRun: true,
+          pageSize: 3,
+          maxPages: 2,
+          resume: resume.value,
+        })
         scanned += next.scanned
         resume = next.resume
       }
@@ -653,7 +658,7 @@ describe("rekey — the scan", () => {
     Effect.gen(function* () {
       const table = makeRecordingTable()
       const { meter: m } = yield* seed(On, table)
-      const tokens: Array<string | undefined> = []
+      const tokens: Array<Option.Option<string>> = []
       const interrupted = yield* rekey(On, table, {
         pageSize: 2,
         onProgress: (progress) =>
@@ -663,8 +668,11 @@ describe("rekey — the scan", () => {
           }),
       }).pipe(Effect.exit)
       expect(interrupted._tag).toBe("Failure")
-      const resumed = yield* rekey(On, table, { pageSize: 2, resume: tokens[1]! })
-      expect(resumed.resume).toBeUndefined()
+      const resumed = yield* rekey(On, table, {
+        pageSize: 2,
+        resume: Option.getOrThrow(tokens[1]!),
+      })
+      expect(resumed.resume).toEqual(Option.none())
       expect(table.items.has(at(m.old))).toBe(false)
       for (const pk of [docPk(On, -5).old, gaugePk(On, -6).old, ledgerPk(On, -4).old]) {
         expect([...table.items.keys()].filter((key) => key.startsWith(`${pk}|`))).toEqual([])
@@ -678,7 +686,9 @@ describe("rekey — the scan", () => {
     Effect.gen(function* () {
       const table = makeRecordingTable()
       yield* seed(On, table)
-      const token = (yield* rekey(On, table, { dryRun: true, pageSize: 1, maxPages: 1 })).resume!
+      const token = Option.getOrThrow(
+        (yield* rekey(On, table, { dryRun: true, pageSize: 1, maxPages: 1 })).resume,
+      )
       table.take()
       const failures = yield* Effect.all([
         rekey(On, table, { segments: 0 }).pipe(Effect.flip),

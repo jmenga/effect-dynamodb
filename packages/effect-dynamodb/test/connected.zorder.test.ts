@@ -19,7 +19,7 @@
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, DateTime, Effect, Layer, Schema } from "effect"
+import { Config, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -110,7 +110,8 @@ const observed = () => {
   }
 }
 
-const decodeCursor = (cursor: string | null) => (cursor === null ? null : JSON.parse(atob(cursor)))
+const decodeCursor = (cursor: Option.Option<string>): Option.Option<unknown> =>
+  Option.map(cursor, (text) => JSON.parse(atob(text)))
 
 describeConnected("#171 adaptive request sizing — connected", () => {
   beforeAll(async () => {
@@ -174,21 +175,24 @@ describeConnected("#171 adaptive request sizing — connected", () => {
         const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
         const chain = (natural: boolean) =>
           Effect.gen(function* () {
-            const pages: Array<{ readonly ids: Array<string>; readonly cursor: unknown }> = []
-            let cursor: string | null = null
+            const pages: Array<{
+              readonly ids: Array<string>
+              readonly cursor: Option.Option<unknown>
+            }> = []
+            let cursor = Option.none<string>()
             do {
               let query = db.entities.Products.primary({ storeId: STORE })
                 .filter({ status: "discontinued" })
                 .limit(5)
               if (natural) query = query.pageSize("natural")
-              if (cursor !== null) query = query.startFrom(cursor)
+              if (Option.isSome(cursor)) query = query.startFrom(cursor.value)
               const page: Query.Page<Product> = yield* query.fetch()
               pages.push({
                 ids: page.items.map((p) => p.productId),
                 cursor: decodeCursor(page.cursor),
               })
               cursor = page.cursor
-            } while (cursor !== null && pages.length < 20)
+            } while (Option.isSome(cursor) && pages.length < 20)
             return pages
           })
 
@@ -196,7 +200,7 @@ describeConnected("#171 adaptive request sizing — connected", () => {
         const natural = yield* chain(true)
 
         // The second page fills the limit on product 937, the last match. The
-        // natural page read on to the end of the partition and returned null;
+        // natural page read on to the end of the partition and returned None;
         // the sized request stopped well short of the tail, at its `Limit`, and
         // returned DynamoDB's LastEvaluatedKey — so the adaptive chain has one
         // more page, empty (design §8.4, §19 C9).
@@ -204,10 +208,10 @@ describeConnected("#171 adaptive request sizing — connected", () => {
           discontinuedIds.slice(0, 5),
           discontinuedIds.slice(5),
         ])
-        expect(natural.at(-1)!.cursor).toBeNull()
+        expect(natural.at(-1)!.cursor).toEqual(Option.none())
         expect(adaptive.map((page) => page.ids)).toEqual([...natural.map((page) => page.ids), []])
-        expect(adaptive.at(-2)!.cursor).not.toBeNull()
-        expect(adaptive.at(-1)!.cursor).toBeNull()
+        expect(Option.isSome(adaptive.at(-2)!.cursor)).toBe(true)
+        expect(adaptive.at(-1)!.cursor).toEqual(Option.none())
         // Each cursor resumes at the same place. A natural page fills the limit
         // mid-page, so its cursor is rebuilt from the last item kept (#122); a
         // sized request may fill it on its last returned row and keep DynamoDB's
@@ -218,10 +222,11 @@ describeConnected("#171 adaptive request sizing — connected", () => {
             .split("_")
             .at(-1)!
         adaptive.forEach((page, i) => {
-          if (page.cursor === null) return
-          const at = productIdAt(page.cursor)
+          if (Option.isNone(page.cursor)) return
+          const at = productIdAt(page.cursor.value)
           const naturalCursor = natural[i]!.cursor
-          if (naturalCursor !== null) expect(at >= productIdAt(naturalCursor)).toBe(true)
+          if (Option.isSome(naturalCursor))
+            expect(at >= productIdAt(naturalCursor.value)).toBe(true)
           expect(at >= page.ids.at(-1)!).toBe(true)
           const next = adaptive[i + 1]!.ids[0]
           if (next !== undefined) expect(at < next).toBe(true)
@@ -331,12 +336,15 @@ interface Fetchable<A> {
 const fetchChain = <A>(query: Fetchable<A>) =>
   Effect.gen(function* () {
     const pages: Array<Query.Page<A>> = []
-    let cursor: string | null | undefined
-    while (cursor !== null && pages.length < 500) {
-      const page = yield* (cursor === undefined ? query : query.startFrom(cursor)).fetch()
+    let cursor = Option.none<string>()
+    do {
+      const page = yield* Option.match(cursor, {
+        onNone: () => query,
+        onSome: (resume) => query.startFrom(resume),
+      }).fetch()
       pages.push(page)
       cursor = page.cursor
-    }
+    } while (Option.isSome(cursor) && pages.length < 500)
     return pages
   })
 
@@ -430,14 +438,14 @@ describeConnected("#171 skip-scan — connected", () => {
         const pages = yield* fetchChain(filtered.limit(firstTuple))
         expect(listingIds(pages.flatMap((page) => page.items))).toEqual(collected)
         expect(pages[0]!.items).toHaveLength(firstTuple)
-        const cursor = Cursor.decode(pages[0]!.cursor!)!
+        const cursor = Cursor.decode(Option.getOrThrow(pages[0]!.cursor))!
         expect(cursor.s).toBe("skip-scan")
         expect(cursor.d).toBe(1)
         // …which is the resumed call's first request.
         const resumed = observed()
         yield* filtered
           .limit(firstTuple)
-          .startFrom(pages[0]!.cursor!)
+          .startFrom(Option.getOrThrow(pages[0]!.cursor))
           .onRequest(resumed.observer)
           .fetch()
         expect(resumed.events[0]!.kind).toBe("probe")
@@ -803,7 +811,7 @@ describeConnected("#171 Z-order indexes — connected", () => {
             const page = yield* query.limit(first).fetch()
             expect(page.items.length).toBe(first)
             // Through the end of a range, not inside one.
-            const cursor = Cursor.decode(page.cursor!)!
+            const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
             expect(cursor.k).toBeUndefined()
           }
         }

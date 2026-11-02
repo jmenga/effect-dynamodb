@@ -255,7 +255,7 @@ export const PaginatedResponse = <A>(item: Schema.Schema<A>) =>
   Schema.Struct({
     data: Schema.Array(item),
     count: Schema.Number,
-    cursor: Schema.NullOr(Schema.String),
+    cursor: Schema.OptionFromNullOr(Schema.String),
   })
 
 // ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ Three things to notice:
 
 1. **`PaginationOptions`** — A `Schema.Struct` that doubles as both schema and type. Spread `PaginationOptions.fields` into endpoint `query` definitions. The HTTP framework decodes query strings (e.g., `?count=20&reverse=true`) into typed values automatically.
 
-2. **`PaginatedResponse(item)`** — A schema factory for runtime use (e.g., in service implementations). **Do not use in `HttpApiEndpoint` definitions** — the generic function indirection exceeds TypeScript's conditional type inference depth inside `HttpApiBuilder.group`, causing the layer's `R` parameter to resolve to `unknown` instead of `never`. Use inline `Schema.Struct({ data: Schema.Array(Entity), count: Schema.Number, cursor: Schema.NullOr(Schema.String) })` in endpoint `success` fields instead.
+2. **`PaginatedResponse(item)`** — A schema factory for runtime use (e.g., in service implementations). **Do not use in `HttpApiEndpoint` definitions** — the generic function indirection exceeds TypeScript's conditional type inference depth inside `HttpApiBuilder.group`, causing the layer's `R` parameter to resolve to `unknown` instead of `never`. Use inline `Schema.Struct({ data: Schema.Array(Entity), count: Schema.Number, cursor: Schema.OptionFromNullOr(Schema.String) })` in endpoint `success` fields instead. The `cursor` field takes a page's `Option<string>` cursor as is and sends it as a string, or `null` on the last page.
 
 3. **`applyPagination`** — Works directly with decoded `PaginationOptions`. No manual parsing — the Schema layer already decoded `count` from string to number via `Schema.NumberFromString`.
 
@@ -415,7 +415,7 @@ export const TeamsApi = HttpApiGroup.make("teams").add(
     success: Schema.Struct({
       data: Schema.Array(Team),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/teams/:id", {
@@ -909,7 +909,7 @@ export const PlayersApi = HttpApiGroup.make("players").add(
     success: Schema.Struct({
       data: Schema.Array(Player),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/players/:id", {
@@ -1064,7 +1064,7 @@ export const CoachesApi = HttpApiGroup.make("coaches").add(
     success: Schema.Struct({
       data: Schema.Array(Coach),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/coaches/:id", {
@@ -1222,7 +1222,7 @@ export const UmpiresApi = HttpApiGroup.make("umpires").add(
     success: Schema.Struct({
       data: Schema.Array(Umpire),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/umpires/:id", {
@@ -1379,7 +1379,7 @@ export const VenuesApi = HttpApiGroup.make("venues").add(
     success: Schema.Struct({
       data: Schema.Array(Venue),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/venues/:id", {
@@ -1975,7 +1975,7 @@ export const SquadSelectionsApi = HttpApiGroup.make("squads").add(
     success: Schema.Struct({
       data: Schema.Array(SquadSelection),
       count: Schema.Number,
-      cursor: Schema.NullOr(Schema.String),
+      cursor: Schema.OptionFromNullOr(Schema.String),
     }),
   }),
   HttpApiEndpoint.get("get", "/squads/:id", {

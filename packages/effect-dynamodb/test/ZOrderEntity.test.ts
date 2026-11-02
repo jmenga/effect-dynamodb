@@ -27,7 +27,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -423,7 +423,7 @@ describe("Z-order sort keys — the accessor (#171)", () => {
           Effect.gen(function* () {
             const first = yield* db.entities.Listings.byFacets({ region: "North" }).limit(1).fetch()
             yield* db.entities.Listings.byFacets({ region: "North" })
-              .startFrom(first.cursor!)
+              .startFrom(Option.getOrThrow(first.cursor))
               .limit(1)
               .fetch()
             return first.cursor
@@ -432,8 +432,10 @@ describe("Z-order sort keys — the accessor (#171)", () => {
         page(capture, lastEvaluatedKey),
       )
       // `B` has no legacy form: the cursor is v2, its bytes as base64.
-      expect(cursor).toMatch(/^v2\./)
-      expect(Cursor.decode(cursor!)?.k?.gsi1sk).toEqual({ B: Cursor.toBase64(FACETS_BYTES) })
+      expect(Option.getOrThrow(cursor)).toMatch(/^v2\./)
+      expect(Cursor.decode(Option.getOrThrow(cursor))?.k?.gsi1sk).toEqual({
+        B: Cursor.toBase64(FACETS_BYTES),
+      })
       const resumed = capture.queries[1]!.ExclusiveStartKey!
       expect(resumed.gsi1sk).toEqual({ B: FACETS_BYTES })
       expect(resumed.gsi1sk!.B).toBeInstanceOf(Uint8Array)

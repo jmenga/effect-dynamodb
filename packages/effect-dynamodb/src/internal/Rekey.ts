@@ -21,7 +21,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
   RekeyConflict,
@@ -226,7 +226,7 @@ class Totals {
       skipped: { ...this.skipped },
       byMember,
       capacity,
-      resume,
+      resume: Option.fromUndefinedOr(resume),
     }
   }
 }

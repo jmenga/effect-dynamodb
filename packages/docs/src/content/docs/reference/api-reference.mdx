@@ -198,7 +198,7 @@ Both `make` and `definition` check the members against each other. Every member 
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
 | `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
-| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume }` |
+| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
 | `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed", key, target, message }` — a row `rekey` left as it is |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
@@ -490,7 +490,7 @@ import { Query } from "effect-dynamodb"
 
 | Export | Returns | Description |
 |--------|---------|-------------|
-| `execute` | `Effect<Page<A>>` | Execute and return a page: `{ items: Array<A>, cursor: string \| null }` |
+| `execute` | `Effect<Page<A>>` | Execute and return a page: `{ items: Array<A>, cursor: Option<string> }` |
 | `collect` | `Effect<Array<A>>` | Execute, fetch all pages, and flatten into a single array |
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
@@ -525,7 +525,7 @@ Used in entity-level `filter()`:
 
 | Type | Description |
 |------|-------------|
-| `Page<A>` | `{ items: Array<A>, cursor: string \| null }` — `cursor` is `null` on the last page |
+| `Page<A>` | `{ items: Array<A>, cursor: Option<string> }` — `cursor` is `None` on the last page; `startFrom` takes the string inside a `Some` |
 | `PlanMode` | `"key" \| "skip-scan" \| "filter" \| "naive" \| "jump" \| "precise" \| "empty"` |
 | `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, maxSkips? }` |
 | `QueryRequestEvent` | `{ kind: "read" \| "probe" \| "count", request, lower, upper, limit, scannedCount, count, accepted, discarded }` |
@@ -588,7 +588,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Returns |
 |--------|---------|
 | `.collect()` | `Effect<Array<A>, DynamoClientError \| ValidationError, never>` — drain all pages into a single array. |
-| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: string \| null }`; `cursor` is `null` on the last page. |
+| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: Option<string> }`; `cursor` is `None` on the last page. |
 | `.paginate()` | `Stream<A, DynamoClientError \| ValidationError, never>` — lazy stream that paginates automatically. |
 | `.count()` | `Effect<number, DynamoClientError \| ValidationError, never>` — count-only query (`Select: COUNT`); items are not returned. |
 | `.explain()` | `Effect<QueryExplain, never, never>` — the plan the terminals would run, and why, without sending anything. |
@@ -687,7 +687,7 @@ A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.
 | Terminal | Returns |
 |----------|---------|
 | `.collect()` | The grouped result, `{ Employees: Employee[], Tasks: Task[] }` |
-| `.fetch()` | One page, grouped the same way, with its `cursor` |
+| `.fetch()` | One page, grouped the same way, with its `cursor` (`Option<string>`, `None` on the last page) |
 | `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
 | `.count()` | The number of items, every member's together |
 
@@ -1199,7 +1199,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
-| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is an `Option<string>`, `None` only when exhausted, and always `None` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 

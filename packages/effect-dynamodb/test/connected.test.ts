@@ -1494,7 +1494,7 @@ describeConnected("Connected integration tests", () => {
         expect(page.items).toHaveLength(1)
         // Reversed SK sort: u-carol sorts last ascending, so it comes first reversed.
         expect(page.items[0]!.userId).toBe("u-carol")
-        expect(page.cursor).not.toBeNull()
+        expect(Option.isSome(page.cursor)).toBe(true)
       }).pipe(provide),
     )
 
@@ -1690,15 +1690,15 @@ describeConnected("Connected integration tests", () => {
           }
           const first = yield* todo().fetch()
           expect(first.items.map((t) => t.taskId)).toEqual(["t-lim-01", "t-lim-02"])
-          expect(first.cursor).not.toBeNull()
+          expect(Option.isSome(first.cursor)).toBe(true)
 
-          const second = yield* todo().startFrom(first.cursor!).fetch()
+          const second = yield* todo().startFrom(Option.getOrThrow(first.cursor)).fetch()
           expect(second.items.map((t) => t.taskId)).toEqual(["t-lim-03", "t-lim-04"])
 
-          const third = yield* todo().startFrom(second.cursor!).fetch()
+          const third = yield* todo().startFrom(Option.getOrThrow(second.cursor)).fetch()
           expect(third.items.map((t) => t.taskId)).toEqual(["t-lim-05", "t-lim-06"])
           // Nothing left after the 6th item.
-          expect(third.cursor).toBeNull()
+          expect(third.cursor).toEqual(Option.none())
         }
       }).pipe(provide),
     )
@@ -11080,8 +11080,10 @@ describeConnected("EventStore stream indexes (#140)", () => {
         .pipe(Query.where({ beginsWith: "ENTRY#3-" }), Query.consistentRead(), Query.limit(2))
       const first = yield* Query.execute(query)
       expect(first.items.map((event) => event.version)).toEqual([7, 8])
-      expect(first.cursor).not.toBeNull()
-      const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+      expect(Option.isSome(first.cursor)).toBe(true)
+      const second = yield* Query.execute(
+        query.pipe(Query.startFrom(Option.getOrThrow(first.cursor))),
+      )
       expect(second.items.map((event) => event.version)).toEqual([9])
 
       const pages = yield* Query.paginate(
@@ -12924,7 +12926,9 @@ describeConnected("EventStore stream index projection (#144)", () => {
         const first = yield* Query.execute(query)
         expect(versionsOf(first.items), name).toEqual([7, 8])
         expect(first.cursor, name).not.toBeNull()
-        const second = yield* Query.execute(query.pipe(Query.startFrom(first.cursor!)))
+        const second = yield* Query.execute(
+          query.pipe(Query.startFrom(Option.getOrThrow(first.cursor))),
+        )
         expect(versionsOf(second.items), name).toEqual([9])
 
         const pages = yield* Query.paginate(
@@ -15928,7 +15932,7 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
       // examined and rejected server-side, and never assembled.
       expect(alCounts().assemblies).toBe(3)
       // A fourth match (o-12) is still out there, so the page is not the end.
-      expect(page.cursor).not.toBeNull()
+      expect(Option.isSome(page.cursor)).toBe(true)
     }).pipe(provideAl),
   )
 
@@ -15948,13 +15952,18 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
 
       const second = yield* db.aggregates.AlOrderAggregate.list(
         { customerId: "c1" },
-        { cursor: first.cursor!, filter: { status: "shipped" }, limit: 3, pageSize: 1 },
+        {
+          cursor: Option.getOrThrow(first.cursor),
+          filter: { status: "shipped" },
+          limit: 3,
+          pageSize: 1,
+        },
       )
 
       // Resumes after o-09 — no repeats, nothing skipped.
       expect(ids(second)).toEqual(["o-12"])
       // Short only because the range genuinely ended, and the cursor says so.
-      expect(second.cursor).toBeNull()
+      expect(second.cursor).toEqual(Option.none())
     }).pipe(provideAl),
   )
 
@@ -15971,25 +15980,29 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
       // ended), so a passed-through cursor would have claimed exhaustion and
       // lost o-09 and o-12 outright.
       const collected: Array<string> = []
-      let cursor: string | null = null
+      let cursor = Option.none<string>()
       let pages = 0
       do {
         // Annotated: without it `page` infers through the `cursor` it assigns,
         // which makes the initialiser self-referential (TS7022).
-        const page: { data: ReadonlyArray<AlOrder>; cursor: string | null } =
-          yield* db.aggregates.AlOrderAggregate.list(
-            { customerId: "c1" },
-            cursor === null
-              ? { filter: { status: "shipped" }, limit: 2 }
-              : { cursor, filter: { status: "shipped" }, limit: 2 },
-          )
+        const page: Aggregate.ListResult<AlOrder> = yield* db.aggregates.AlOrderAggregate.list(
+          { customerId: "c1" },
+          Option.match(cursor, {
+            onNone: () => ({ filter: { status: "shipped" as const }, limit: 2 }),
+            onSome: (resume) => ({
+              cursor: resume,
+              filter: { status: "shipped" as const },
+              limit: 2,
+            }),
+          }),
+        )
         collected.push(...ids(page))
         cursor = page.cursor
         pages++
-      } while (cursor !== null && pages < 10)
+      } while (Option.isSome(cursor) && pages < 10)
 
       expect(collected).toEqual(["o-03", "o-06", "o-09", "o-12"])
-      expect(cursor).toBeNull()
+      expect(cursor).toEqual(Option.none())
     }).pipe(provideAl),
   )
 
@@ -16073,7 +16086,7 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
 
       const all = yield* db.aggregates.AlShardedAggregate.list({ customerId: "c2" })
       expect(all.data).toHaveLength(12)
-      expect(all.cursor).toBeNull()
+      expect(all.cursor).toEqual(Option.none())
 
       alQueryLog.length = 0
 
@@ -16087,7 +16100,7 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
       expect(alCounts().root).toBe(3)
       expect(alCounts().assemblies).toBe(4)
       // No resumable position across shards — never a cursor that lies.
-      expect(bounded.cursor).toBeNull()
+      expect(bounded.cursor).toEqual(Option.none())
     }).pipe(provideAl),
   )
 
@@ -16120,13 +16133,13 @@ describeConnected("Aggregate.list — filtered pagination, reverse, sharding (#1
       // A cursor minted by the unsharded aggregate — structurally valid, and
       // meaningless here. The old code accepted it and restarted from the top.
       const source = yield* db.aggregates.AlOrderAggregate.list({ customerId: "c1" }, { limit: 2 })
-      expect(source.cursor).not.toBeNull()
+      expect(Option.isSome(source.cursor)).toBe(true)
 
       alQueryLog.length = 0
 
       const error = yield* db.aggregates.AlShardedAggregate.list(
         { customerId: "c2" },
-        { cursor: source.cursor!, limit: 2 },
+        { cursor: Option.getOrThrow(source.cursor), limit: 2 },
       ).pipe(Effect.flip)
 
       expect(error._tag).toBe("ValidationError")
@@ -16246,7 +16259,7 @@ describeConnected("client-side predicates (closes #122)", () => {
         .fetch()
 
       expect(page.items.map((v) => v.venueId)).toEqual(["v-1", "v-3", "v-5"])
-      expect(page.cursor).not.toBeNull()
+      expect(Option.isSome(page.cursor)).toBe(true)
     }).pipe(provideCp),
   )
 
@@ -16255,17 +16268,18 @@ describeConnected("client-side predicates (closes #122)", () => {
       const db = yield* DynamoClient.make({ entities: { CpVenues }, tables: { CpTable } })
 
       const collected: Array<string> = []
-      let cursor: string | null = null
+      let cursor = Option.none<string>()
       let pages = 0
       do {
         const query = db.entities.CpVenues.primary({ city: "vic" }).filterBy(isMelbourne).limit(2)
-        const page: { items: Array<CpVenue>; cursor: string | null } = yield* (
-          cursor === null ? query : query.startFrom(cursor)
-        ).fetch()
+        const page: Query.Page<CpVenue> = yield* Option.match(cursor, {
+          onNone: () => query,
+          onSome: (resume) => query.startFrom(resume),
+        }).fetch()
         collected.push(...page.items.map((v) => v.venueId))
         cursor = page.cursor
         pages++
-      } while (cursor !== null && pages < 10)
+      } while (Option.isSome(cursor) && pages < 10)
 
       // Every match, exactly once, in order — the property that breaks when a
       // caller filters `page.items` itself.

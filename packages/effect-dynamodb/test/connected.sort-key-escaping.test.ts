@@ -26,11 +26,12 @@
 
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, Effect, Layer, Schema } from "effect"
+import { Config, Effect, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { compareUtf8 } from "../src/internal/RangePlanner.js"
+import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -653,16 +654,17 @@ describeConnected("#171 sort key escaping and E7 — connected", () => {
       ])
       expect(yield* query.count()).toBe(all.length)
       const paged: Array<string> = []
-      let cursor: string | null = null
+      let cursor = Option.none<string>()
       do {
-        const page: { items: ReadonlyArray<Place>; cursor: string | null } = yield* (
-          cursor === null ? query : query.startFrom(cursor)
-        )
+        const page: Query.Page<Place> = yield* Option.match(cursor, {
+          onNone: () => query,
+          onSome: (resume) => query.startFrom(resume),
+        })
           .limit(1)
           .fetch()
         paged.push(...page.items.map((place) => place.id))
         cursor = page.cursor
-      } while (cursor !== null)
+      } while (Option.isSome(cursor))
       expect(paged).toEqual(all.map((place) => place.id))
     }).pipe(provide),
   )

@@ -19,7 +19,7 @@
  *   npx tsx examples/guide-upgrade.ts
  */
 
-import { Config, Console, Effect, Layer, Ref, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Ref, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -196,7 +196,7 @@ const program = Effect.gen(function* () {
   // #region run
   // Move them: four scan segments in parallel, a resume token kept after
   // every page so an interrupted run can go on from there.
-  const checkpoint = yield* Ref.make<string | undefined>(undefined)
+  const checkpoint = yield* Ref.make(Option.none<string>())
   const report = yield* db.tables.MainTable.rekey({
     streams: [Calibrations],
     segments: 4,
@@ -204,13 +204,15 @@ const program = Effect.gen(function* () {
   })
   // report.moved     → the same counts as the dry run
   // report.capacity  → { capacityUnits, readCapacityUnits, writeCapacityUnits, requests, ... }
-  // report.resume    → undefined: the whole table was scanned
+  // report.resume    → None: the whole table was scanned
   // #endregion
   assertEq(report.moved, plan.moved, "the run moved what the dry run counted")
-  assertEq(report.resume, undefined, "the run covered the table")
+  assertEq(Option.isNone(report.resume), true, "the run covered the table")
   yield* Console.log(`Moved: ${JSON.stringify(report.moved)}`)
   yield* Console.log(`Consumed: ${report.capacity.capacityUnits} units`)
-  yield* Console.log(`Last checkpoint: ${(yield* Ref.get(checkpoint)) ?? "(done)"}`)
+  yield* Console.log(
+    `Last checkpoint: ${Option.getOrElse(yield* Ref.get(checkpoint), () => "(done)")}`,
+  )
 
   // --- A bounded run, resumed ---
   yield* Console.log("\n=== A bounded run, resumed ===\n")
@@ -218,18 +220,18 @@ const program = Effect.gen(function* () {
   // #region resume
   // At most one page per run — a time slot — each run resuming where the
   // last stopped, until a run reports no resume token.
-  let resume: string | undefined
+  let resume = Option.none<string>()
   let slices = 0
   do {
     const slice = yield* db.tables.MainTable.rekey({
       streams: [Calibrations],
       pageSize: 2,
       maxPages: 1,
-      resume,
+      resume: Option.getOrUndefined(resume),
     })
     resume = slice.resume
     slices++
-  } while (resume !== undefined)
+  } while (Option.isSome(resume))
   // #endregion
   yield* Console.log(`A rerun in ${slices} slices of one page each.`)
 

@@ -376,7 +376,7 @@ Any other string throws `EDD-9095`.
 Sizing is now adaptive by default for a `.limit()` under a filter. The items `collect()` and `count()` return, and the items a `fetch()` chain returns end to end, are unchanged; request counts and read units change. A selective filter with `limit(5)` no longer reads a 1 MB page to return 5 items, but a low or uneven pass rate can take more round trips than one natural page (a logarithmic number more in the worst case). Three things you can observe change with it:
 
 - **A `fetch()` cursor's value** can differ. It resumes at the same place.
-- **A `fetch()` cursor can be non-null where it was null**: when the limit fills on the last row a sized request returned, DynamoDB reports more to read. The chain then ends with one empty page.
+- **A `fetch()` cursor can be `Some` where it was `None`**: when the limit fills on the last row a sized request returned, DynamoDB reports more to read. The chain then ends with one empty page.
 - **`Query.paginate`'s page boundaries** follow the sized requests, since it emits one array per request; the items it streams are unchanged. A bound query's `.paginate()` streams items and is unaffected.
 
 `.pageSize("natural")` restores the 1.36 behaviour for one query.
@@ -390,28 +390,34 @@ Sizing is now adaptive by default for a `.limit()` under a filter. The items `co
 // Single page with limit — returns page with items and cursor
 const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
 // page.items: Task[] (up to 3 items)
-// page.cursor: string | null — resumes after the 3rd item, or null when done
+// page.cursor: Option<string> — Some resumes after the 3rd item, None when done
 ```
 
-The cursor always resumes **after the last item you were handed**, even when the underlying request read past it and the surplus was discarded. `cursor: null` means the key range is genuinely exhausted.
+The cursor always resumes **after the last item you were handed**, even when the underlying request read past it and the surplus was discarded. A `None` cursor means the key range is genuinely exhausted.
+
+:::caution[Changed in 1.37]
+`cursor` is an `Option<string>`; it was `string | null`. Where something needs a nullable, such as a JSON response, use `Option.getOrNull(page.cursor)` (or a `Schema.OptionFromNullOr` field). `.startFrom()` still takes a string.
+:::
 
 ### Cursor-Based Pagination
 
 Use `.startFrom()` to resume from a previous page's cursor:
 
 ```typescript region="cursor-pagination" example="guide-queries.ts"
-// Cursor-based pagination
-const page1 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-  .limit(3)
-  .fetch()
-
-if (page1.cursor) {
-  const page2 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-    .limit(3)
-    .startFrom(page1.cursor)
-    .fetch()
-}
+// Cursor-based pagination: the next page, if there is one
+const alpha = db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3)
+const page1 = yield* alpha.fetch()
+const page2 = yield* Option.match(page1.cursor, {
+  onNone: () => Effect.succeed([]),
+  onSome: (cursor) =>
+    alpha
+      .startFrom(cursor)
+      .fetch()
+      .pipe(Effect.map((next) => next.items)),
+})
 ```
+
+To read every page by cursor, `Stream.paginate` takes the cursor as its stop signal: see [Z-order cursors](/effect-dynamodb/guides/zorder/#cursors). To stream every item in one process, use `.paginate()`.
 
 A cursor is opaque and belongs to the query that produced it: resume with the same accessor, bounds, `.within()` and direction. It is read when the terminal runs, not by `.startFrom()`, so the order of `.startFrom()` and `.within()` in the chain doesn't matter.
 

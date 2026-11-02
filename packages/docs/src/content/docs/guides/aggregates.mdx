@@ -685,15 +685,17 @@ const completed = yield* TournamentMatchAggregate.list(
 
 `filter` is worth reaching for beyond ergonomics. `list` assembles each surviving root item with **its own partition read**, so filtering the result afterwards pays a full assembly for every aggregate it then discards. Pushing the predicate into the query means those rows are never assembled.
 
-Because a `FilterExpression` runs _after_ DynamoDB's `Limit`, a request can come back empty. `limit` still means "this many matching aggregates": the query keeps asking until the page fills or the key range ends. `cursor` is `null` only when genuinely exhausted.
+Because a `FilterExpression` runs _after_ DynamoDB's `Limit`, a request can come back empty. `limit` still means "this many matching aggregates": the query keeps asking until the page fills or the key range ends. `cursor` is an `Option<string>`: `Some` while there is more, `None` only when genuinely exhausted. `list({ cursor })` takes the string inside.
 
 ```typescript region="list-cursor" example="guide-aggregates.ts"
-if (completed.cursor !== null) {
-  const nextPage = yield* TournamentMatchAggregate.list(
-    { tournament: "bgt-2025" },
-    { cursor: completed.cursor, filter: { status: "completed" }, limit: 2 },
-  )
-}
+const nextPage = yield* Option.match(completed.cursor, {
+  onNone: () => Effect.succeed([]),
+  onSome: (cursor) =>
+    TournamentMatchAggregate.list(
+      { tournament: "bgt-2025" },
+      { cursor, filter: { status: "completed" }, limit: 2 },
+    ).pipe(Effect.map((next) => next.data)),
+})
 ```
 
 ```typescript region="list-reverse" example="guide-aggregates.ts"
@@ -704,7 +706,7 @@ const latest = yield* TournamentMatchAggregate.list(
 ```
 
 :::caution[Sharded lists cannot be resumed]
-With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `null`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.
+With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `None`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.
 :::
 
 ### Type Extractors

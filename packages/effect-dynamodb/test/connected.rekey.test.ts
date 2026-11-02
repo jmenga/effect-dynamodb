@@ -32,7 +32,7 @@ import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Config, Effect, Layer, Schema } from "effect"
+import { Config, Effect, Layer, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -791,7 +791,7 @@ describeConnected("#171 rekey — connected", () => {
           expect(report.conflicts.find((c) => c.member === "Meter")?.key).toEqual(
             primaryOf(seeded.m11.old),
           )
-          expect(report.resume).toBeUndefined()
+          expect(report.resume).toEqual(Option.none())
           expect(yield* leftUnder136).toEqual([])
           // The conflicts are left as they were: both rows, until the owner
           // resolves them — here, by deleting the stale 1.36 copies.
@@ -885,14 +885,14 @@ describeConnected("#171 rekey — connected", () => {
             pageSize: 4,
             onProgress: (progress) =>
               Effect.suspend(() => {
-                if (progress.resume !== undefined) tokens.push(progress.resume)
+                if (Option.isSome(progress.resume)) tokens.push(progress.resume.value)
                 return tokens.length === 3 ? Effect.die("interrupted") : Effect.void
               }),
           }).pipe(Effect.exit)
           expect(interrupted._tag).toBe("Failure")
           expect(yield* leftUnder136).not.toEqual([])
           const resumed = yield* run({ pageSize: 4, resume: tokens[2]! })
-          expect(resumed.resume).toBeUndefined()
+          expect(resumed.resume).toEqual(Option.none())
           expect(yield* leftUnder136).toEqual([])
           const again = yield* run()
           expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)

@@ -1879,9 +1879,12 @@ export interface BoundEntity<
    *
    * ```ts
    * const page = yield* teams.fetch(Teams.query.byRole({ role: "admin" }), Query.limit(25))
-   * if (page.cursor) {
-   *   const next = yield* teams.fetch(Teams.query.byRole({ role: "admin" }), Query.limit(25), Query.startFrom(page.cursor))
-   * }
+   * // page.cursor: Option<string> — None on the last page
+   * const next = yield* Effect.transposeOption(
+   *   Option.map(page.cursor, (cursor) =>
+   *     teams.fetch(Teams.query.byRole({ role: "admin" }), Query.limit(25), Query.startFrom(cursor)),
+   *   ),
+   * )
    * ```
    */
   readonly fetch: <A>(
@@ -1896,9 +1899,9 @@ export interface BoundEntity<
    *
    * ```ts
    * const page = yield* teams.scanFetch(Query.limit(25))
-   * if (page.cursor) {
-   *   const next = yield* teams.scanFetch(Query.limit(25), Query.startFrom(page.cursor))
-   * }
+   * const next = yield* Effect.transposeOption(
+   *   Option.map(page.cursor, (cursor) => teams.scanFetch(Query.limit(25), Query.startFrom(cursor))),
+   * )
    * ```
    */
   readonly scanFetch: (

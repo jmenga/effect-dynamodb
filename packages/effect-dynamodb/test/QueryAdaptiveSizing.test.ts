@@ -21,7 +21,7 @@
 
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Cause, Effect, Exit, Layer, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { createConditionOps } from "../src/internal/Expr.js"
@@ -87,7 +87,7 @@ const ids = (items: ReadonlyArray<Product>) => items.map((item) => numberOf(item
 /** 100-byte rows on a page cap of `rows` rows. */
 const cappedAt = (rows: number) => ({ rowBytes: () => 100, pageBytes: rows * 100 })
 
-const decodeCursor = (cursor: string | null) => JSON.parse(atob(cursor!))
+const decodeCursor = (cursor: Option.Option<string>) => JSON.parse(atob(Option.getOrThrow(cursor)))
 
 /**
  * Follow `query`'s `fetch` cursors to the end: each page's items, the sort key
@@ -100,19 +100,22 @@ const fetchChain = (partition: Partition, query: Query.Query<Product>) =>
       readonly after: string | null
       readonly limits: Array<number | undefined>
     }> = []
-    let cursor: string | null = null
+    let cursor = Option.none<string>()
     do {
       partition.clear()
       const page: Query.Page<Product> = yield* Query.execute(
-        cursor === null ? query : query.pipe(Query.startFrom(cursor)),
+        Option.match(cursor, {
+          onNone: () => query,
+          onSome: (resume) => query.pipe(Query.startFrom(resume)),
+        }),
       )
       pages.push({
         ids: ids(page.items),
-        after: page.cursor === null ? null : decodeCursor(page.cursor).sk.S,
+        after: Option.isNone(page.cursor) ? null : decodeCursor(page.cursor).sk.S,
         limits: partition.limits(),
       })
       cursor = page.cursor
-    } while (cursor !== null && pages.length < 20)
+    } while (Option.isSome(cursor) && pages.length < 20)
     return pages
   })
 
@@ -429,12 +432,12 @@ describe("adaptive request sizing (#171)", () => {
 
         const chained: Array<number> = [...ids(first.items)]
         let cursor = first.cursor
-        for (let pages = 0; cursor !== null && pages < 20; pages++) {
-          const page = yield* Query.execute(query.pipe(Query.startFrom(cursor)))
+        for (let pages = 0; Option.isSome(cursor) && pages < 20; pages++) {
+          const page = yield* Query.execute(query.pipe(Query.startFrom(cursor.value)))
           chained.push(...ids(page.items))
           cursor = page.cursor
         }
-        expect(cursor).toBeNull()
+        expect(cursor).toEqual(Option.none())
         expect(chained).toEqual(ids(yield* Query.collect(products().pipe(activeOnly))))
       }).pipe(Effect.provide(partition.layer))
     })

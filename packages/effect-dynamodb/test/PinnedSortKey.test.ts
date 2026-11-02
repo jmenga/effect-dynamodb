@@ -20,7 +20,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { compareUtf8, keyJustBelow } from "../src/internal/RangePlanner.js"
@@ -833,7 +833,7 @@ describe(".history().where() on a string orderBy (#171 sort key escaping)", () =
       expect((yield* query.explain()).plan).toBe("empty")
       expect(yield* query.collect()).toEqual([])
       expect(yield* query.count()).toBe(0)
-      expect(yield* query.reverse().fetch()).toEqual({ items: [], cursor: null })
+      expect(yield* query.reverse().fetch()).toEqual({ items: [], cursor: Option.none() })
       expect(partition.inputs).toEqual([])
     }).pipe(Effect.provide(layer)),
   )

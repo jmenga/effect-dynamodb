@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Stream } from "effect"
+import { Effect, Option, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import { createConditionOps } from "../src/internal/Expr.js"
@@ -983,7 +983,7 @@ describe("Query", () => {
         expect(mockQuery.mock.calls.length).toBeLessThanOrEqual(10)
         mockQuery.mockClear()
         const rest = yield* Query.execute(
-          historyQuery().pipe(Query.limit(2), Query.startFrom(page.cursor!)),
+          historyQuery().pipe(Query.limit(2), Query.startFrom(Option.getOrThrow(page.cursor))),
         )
         expect(rest.items.map((i) => i.id)).toEqual(["c"])
       }).pipe(Effect.provide(TestDynamoClient)),
@@ -1673,8 +1673,8 @@ describe("filterBy (#122)", () => {
         )
 
         expect(page.items.map((i) => i.id)).toEqual(["0", "2"])
-        expect(page.cursor).not.toBeNull()
-        const resume = JSON.parse(atob(page.cursor!))
+        expect(Option.isSome(page.cursor)).toBe(true)
+        const resume = JSON.parse(atob(Option.getOrThrow(page.cursor)))
         expect(resume.sk.S).toBe("s-2")
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
 
@@ -1698,7 +1698,7 @@ describe("filterBy (#122)", () => {
         const second = yield* makeTestQuery().pipe(
           Query.filterBy(isEven),
           Query.limit(2),
-          Query.startFrom(first.cursor!),
+          Query.startFrom(Option.getOrThrow(first.cursor)),
           Query.execute,
         )
 
@@ -1721,7 +1721,7 @@ describe("filterBy (#122)", () => {
         )
 
         expect(page.items.map((i) => i.id)).toEqual(["0", "2"])
-        const resume = JSON.parse(atob(page.cursor!))
+        const resume = JSON.parse(atob(Option.getOrThrow(page.cursor)))
         expect(resume.sk.S).toBe("s-2")
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
   })
@@ -1844,7 +1844,7 @@ describe("filterBy (#122)", () => {
         const page = yield* makeTestQuery().pipe(Query.limit(2), Query.execute)
 
         expect(page.items.map((i) => i.id)).toEqual(["0", "1"])
-        expect(JSON.parse(atob(page.cursor!)).sk.S).toBe("s-1")
+        expect(JSON.parse(atob(Option.getOrThrow(page.cursor))).sk.S).toBe("s-1")
       }).pipe(Effect.provide(TestDynamoClient), Effect.runPromise))
   })
 })

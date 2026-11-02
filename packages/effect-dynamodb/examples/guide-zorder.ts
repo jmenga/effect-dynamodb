@@ -255,10 +255,7 @@ const program = Effect.gen(function* () {
   const paged = yield* Stream.paginate(box, (query) =>
     query.fetch().pipe(
       Effect.map((page) =>
-        [
-          page.items,
-          Option.map(Option.fromNullOr(page.cursor), (cursor) => box.startFrom(cursor)),
-        ] as const,
+        [page.items, Option.map(page.cursor, (cursor) => box.startFrom(cursor))] as const,
       ),
     ),
   ).pipe(Stream.runCollect)

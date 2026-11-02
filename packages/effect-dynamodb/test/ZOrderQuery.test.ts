@@ -18,7 +18,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError, ThrottlingError } from "@effect-dynamodb/schema/Errors.js"
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
-import { DateTime, Effect, Layer, Schema, Stream } from "effect"
+import { DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { RangeBound } from "../src/internal/BoundQuery.js"
@@ -228,13 +228,16 @@ const fetchAll = <A, E>(query: {
 }) =>
   Effect.gen(function* () {
     const pages: Array<Query.Page<A>> = []
-    let cursor: string | null | undefined
-    while (cursor !== null) {
-      const page = yield* (cursor === undefined ? query : query.startFrom(cursor)).fetch()
+    let cursor = Option.none<string>()
+    do {
+      const page = yield* Option.match(cursor, {
+        onNone: () => query,
+        onSome: (resume) => query.startFrom(resume),
+      }).fetch()
       pages.push(page)
       cursor = page.cursor
       if (pages.length > 2_000) return yield* Effect.die(new Error("the fetch chain did not end"))
-    }
+    } while (Option.isSome(cursor))
     return pages
   })
 
@@ -378,7 +381,7 @@ describe("Z-order strategies (#171 §5.5)", () => {
           const query = L.byFacets({ region: "north" }).within({ price: { gte: 500, lte: 100 } })
           expect(yield* query.collect()).toEqual([])
           expect(yield* query.count()).toBe(0)
-          expect(yield* query.fetch()).toEqual({ items: [], cursor: null })
+          expect(yield* query.fetch()).toEqual({ items: [], cursor: Option.none() })
           expect(yield* Stream.runCollect(query.paginate())).toEqual([])
           expect((yield* query.explain()).plan).toBe("empty")
           expect(partition.inputs).toEqual([])
@@ -456,9 +459,11 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
         const first = yield* query.limit(2).fetch()
         expect(cellIds(first.items)).toEqual(["a-3-2", "a-3-3"])
         // Through the end of [14, 15]: nothing of the next range was read.
-        expect(Cursor.decode(first.cursor!)?.a).toEqual(Cursor.keyValueToWire(Uint8Array.of(15)))
+        expect(Cursor.decode(Option.getOrThrow(first.cursor))?.a).toEqual(
+          Cursor.keyValueToWire(Uint8Array.of(15)),
+        )
         partition.clear()
-        const rest = yield* fetchAll(query.limit(2).startFrom(first.cursor!))
+        const rest = yield* fetchAll(query.limit(2).startFrom(Option.getOrThrow(first.cursor)))
         expect(skOperands(queries(partition)[0]!)).toEqual(["0x24", "0x25"])
         expect(cellIds(rest.flatMap((page) => page.items))).toEqual(["a-4-2", "a-4-3"])
       }),
@@ -478,7 +483,7 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
         expect(cellIds(first.items)).toEqual(["a-3-2", "a-3-3"])
         expect(partition.responses[0]).toEqual({ scannedCount: 3, count: 2 })
         partition.clear()
-        const rest = yield* fetchAll(query.limit(2).startFrom(first.cursor!))
+        const rest = yield* fetchAll(query.limit(2).startFrom(Option.getOrThrow(first.cursor)))
         // From the next in-box address after 16: 36.
         expect(skOperands(queries(partition)[0]!)).toEqual(["0x24", "0x25"])
         expect(queries(partition)[0]!.ExclusiveStartKey).toBeUndefined()
@@ -498,7 +503,7 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
         const first = yield* query.limit(4).fetch()
         expect(cellIds(first.items)).toEqual(all.slice(0, 4))
         partition.clear()
-        const rest = yield* fetchAll(query.limit(4).startFrom(first.cursor!))
+        const rest = yield* fetchAll(query.limit(4).startFrom(Option.getOrThrow(first.cursor)))
         // The next request is a probe past the first tuple, never a read of it.
         expect(queries(partition)[0]!.ProjectionExpression).toBe("#sk")
         expect(cellIds(rest.flatMap((page) => page.items))).toEqual(all.slice(4))
@@ -539,12 +544,12 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
           partition.responses.reduce((sum, response) => sum + response.scannedCount, 0),
         )
         partition.clear()
-        const rest = yield* query.limit(6).startFrom(first.cursor!).fetch()
+        const rest = yield* query.limit(6).startFrom(Option.getOrThrow(first.cursor)).fetch()
         expect(queries(partition).map(skOperands)).toEqual([["0x24", "0x25"]])
         expect(cellIds([...first.items, ...rest.items])).toEqual(
           cellIds(cellsIn(CELLS, [1, 4], [2, 3])),
         )
-        expect(rest.cursor).toBeNull()
+        expect(rest.cursor).toEqual(Option.none())
       }),
     )
   })
@@ -564,7 +569,10 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
           [{ maxRanges: 1 }, ["0x24", "0x25"]],
         ] as const) {
           partition.clear()
-          const rest = yield* query.zorder(options).startFrom(first.cursor!).collect()
+          const rest = yield* query
+            .zorder(options)
+            .startFrom(Option.getOrThrow(first.cursor))
+            .collect()
           expect(skOperands(queries(partition)[0]!)).toEqual(operands)
           expect(cellIds(rest)).toEqual(["a-4-2", "a-4-3"])
         }
@@ -596,10 +604,9 @@ describe("Z-order limit, maxPages and fetch chains (#171 §9.2, §10.3)", () => 
           )
           const limit = 1 + Math.floor(next() * Math.max(1, want.length))
           const first = yield* query.zorder(plan()).limit(limit).fetch()
-          const rest =
-            first.cursor === null
-              ? []
-              : yield* query.zorder(plan()).startFrom(first.cursor).collect()
+          const rest = Option.isNone(first.cursor)
+            ? []
+            : yield* query.zorder(plan()).startFrom(first.cursor.value).collect()
           expect([...first.items, ...rest].map((l) => l.listingId)).toEqual(want)
         }
       }),
@@ -745,7 +752,7 @@ describe("Z-order windows, streams and throttling (#171 §9.2–§9.5)", () => {
         expect(cellIds(first.items)).toEqual(all.slice(0, 6))
         throttled = false
         const rest = yield* withCells(layer, (cells) =>
-          query(cells).limit(100).startFrom(first.cursor!).fetch(),
+          query(cells).limit(100).startFrom(Option.getOrThrow(first.cursor)).fetch(),
         )
         expect(cellIds([...first.items, ...rest.items])).toEqual(all)
         throttled = true

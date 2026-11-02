@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Stream } from "effect"
+import { Effect, Option, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import {
@@ -746,7 +746,7 @@ describe("BoundQuery", () => {
         const page = yield* bq.fetch()
 
         expect(page.items).toHaveLength(1)
-        expect(page.cursor).toBeNull()
+        expect(page.cursor).toEqual(Option.none())
         expect(mockQuery).toHaveBeenCalledOnce()
       }),
     )

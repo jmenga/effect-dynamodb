@@ -22,7 +22,7 @@
  *   npx tsx examples/guide-aggregates.ts
  */
 
-import { Config, Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -638,16 +638,18 @@ const program = Effect.gen(function* () {
     `Completed matches: ${completed.data.map((m) => m.matchId).join(", ")}`,
   )
 
-  // A non-null cursor means there is more; `null` means genuinely exhausted.
+  // `cursor` is `Some` while there is more, `None` once the list is exhausted.
   // #region list-cursor
-  if (completed.cursor !== null) {
-    const nextPage = yield* TournamentMatchAggregate.list(
-      { tournament: "bgt-2025" },
-      { cursor: completed.cursor, filter: { status: "completed" }, limit: 2 },
-    )
-    yield* Console.log(`Next page: ${nextPage.data.map((m) => m.matchId).join(", ")}`)
-  }
+  const nextPage = yield* Option.match(completed.cursor, {
+    onNone: () => Effect.succeed([]),
+    onSome: (cursor) =>
+      TournamentMatchAggregate.list(
+        { tournament: "bgt-2025" },
+        { cursor, filter: { status: "completed" }, limit: 2 },
+      ).pipe(Effect.map((next) => next.data)),
+  })
   // #endregion
+  yield* Console.log(`Next page: ${nextPage.map((m) => m.matchId).join(", ")}`)
 
   // The callback form of `filter`, and newest-first ordering.
   // #region list-reverse

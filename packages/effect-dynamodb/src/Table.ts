@@ -13,7 +13,7 @@ import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
-import { type Config, Context, Effect, Layer } from "effect"
+import { type Config, Context, Effect, Layer, type Option } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 import type { BoundEventStream, EventStream } from "./EventStore.js"
 import type { CapacityTotals } from "./internal/Capacity.js"
@@ -985,9 +985,9 @@ export interface RekeyReport {
   /**
    * Where the scan stopped, when it stopped before the end of the table
    * (`maxPages`): pass it as {@link RekeyOptions.resume} to go on.
-   * `undefined` when the run covered the whole table.
+   * `None` when the run covered the whole table.
    */
-  readonly resume: string | undefined
+  readonly resume: Option.Option<string>
 }
 
 /** Options for `db.tables.<Table>.rekey()`. */

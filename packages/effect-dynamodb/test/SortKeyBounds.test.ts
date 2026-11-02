@@ -22,12 +22,13 @@ import type { QueryCommandInput } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Arbitrary, Effect, Layer, Schema } from "effect"
+import { Arbitrary, Effect, Layer, Option, Schema } from "effect"
 import { composeRangeUnder, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { RawSortKeyCondition } from "../src/internal/BoundQuery.js"
 import { keyJustBelow } from "../src/internal/RangePlanner.js"
 import { toAttributeMap } from "../src/Marshaller.js"
+import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 import { compareBytes, makePartition, type Row } from "./helpers/PartitionMock.js"
@@ -716,16 +717,17 @@ describe("sort key bounds on values holding escaped characters (#171)", () => {
       expect(requests.map((input) => input.Select)).toEqual(["COUNT"])
       // Pages of 2 resume where the last one stopped.
       const paged: Array<string> = []
-      let cursor: string | null = null
+      let cursor = Option.none<string>()
       do {
-        const page: { items: ReadonlyArray<Place>; cursor: string | null } = yield* (
-          cursor === null ? query : query.startFrom(cursor)
-        )
+        const page: Query.Page<Place> = yield* Option.match(cursor, {
+          onNone: () => query,
+          onSome: (resume) => query.startFrom(resume),
+        })
           .limit(2)
           .fetch()
         paged.push(...page.items.map((place) => place.id))
         cursor = page.cursor
-      } while (cursor !== null)
+      } while (Option.isSome(cursor))
       expect(paged).toEqual(all.map((place) => place.id))
     }).pipe(Effect.provide(layer)) as Effect.Effect<void, unknown>
   })
@@ -762,7 +764,10 @@ describe("sort key bounds on values holding escaped characters (#171)", () => {
           expect((yield* query.explain()).plan, context).toBe("empty")
           expect(yield* query.collect(), context).toEqual([])
           expect(yield* query.count(), context).toBe(0)
-          expect(yield* query.reverse().fetch(), context).toEqual({ items: [], cursor: null })
+          expect(yield* query.reverse().fetch(), context).toEqual({
+            items: [],
+            cursor: Option.none(),
+          })
           expect(requests, context).toEqual([])
         }
       }

@@ -62,7 +62,7 @@ The report counts:
 | `skipped` | Rows no member owns: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs), `unrecognizedKey` (a member's row stored under neither its current key nor its 1.36 key) |
 | `byMember` | The same counts per entity type, aggregate and stream name |
 | `capacity` | What the run consumed: capacity units (read and write), requests |
-| `resume` | A token to go on from, when the run stopped before the end of the table |
+| `resume` | `Some(token)` to go on from, when the run stopped before the end of the table; `None` when it covered the whole table |
 
 A row is counted once, by the run that moves it. A row the scan reaches after something else moved it (a write through the fallback, or a stream copied ahead of its scan position) is `unchanged`, so `scanned` is not the sum of the other counts.
 
@@ -73,7 +73,7 @@ Without `dryRun` the same scan moves each row as it goes. `segments` scans the t
 ```typescript region="run" example="guide-upgrade.ts"
 // Move them: four scan segments in parallel, a resume token kept after
 // every page so an interrupted run can go on from there.
-const checkpoint = yield* Ref.make<string | undefined>(undefined)
+const checkpoint = yield* Ref.make(Option.none<string>())
 const report = yield* db.tables.MainTable.rekey({
   streams: [Calibrations],
   segments: 4,
@@ -81,7 +81,7 @@ const report = yield* db.tables.MainTable.rekey({
 })
 // report.moved     → the same counts as the dry run
 // report.capacity  → { capacityUnits, readCapacityUnits, writeCapacityUnits, requests, ... }
-// report.resume    → undefined: the whole table was scanned
+// report.resume    → None: the whole table was scanned
 ```
 
 | Option | Default | Description |
@@ -91,7 +91,7 @@ const report = yield* db.tables.MainTable.rekey({
 | `concurrency` | `4` | Rows of one scan page handled at once, per segment |
 | `pageSize` | DynamoDB's (1 MB pages) | The scan's `Limit` |
 | `maxPages` | none | Stop after this many scan pages, all segments together, and return a `resume` token |
-| `resume` | none | A `resume` token from an earlier run, or the last one `onProgress` received |
+| `resume` | none | A `resume` token (the string) from an earlier run, or the last one `onProgress` received |
 | `streams` | `[]` | The event streams on the table, bound or not |
 | `onProgress` | none | Called after each scan page, once every row of it is handled |
 
@@ -104,18 +104,18 @@ A request that fails fails the run with its `DynamoClientError` (a throttled req
 ```typescript region="resume" example="guide-upgrade.ts"
 // At most one page per run — a time slot — each run resuming where the
 // last stopped, until a run reports no resume token.
-let resume: string | undefined
+let resume = Option.none<string>()
 let slices = 0
 do {
   const slice = yield* db.tables.MainTable.rekey({
     streams: [Calibrations],
     pageSize: 2,
     maxPages: 1,
-    resume,
+    resume: Option.getOrUndefined(resume),
   })
   resume = slice.resume
   slices++
-} while (resume !== undefined)
+} while (Option.isSome(resume))
 ```
 
 A token holds the table name and each segment's position. Its segment count wins over the default: a token from a run with `segments: 4` resumes four segments, and passing a different `segments` with it fails. A token of another table, a malformed token, or a `segments`, `concurrency`, `pageSize` or `maxPages` that isn't a positive integer fails with a `ValidationError` (`EDD-9098`) before anything is read.

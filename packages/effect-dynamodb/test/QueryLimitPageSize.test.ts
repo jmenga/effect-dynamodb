@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Stream } from "effect"
+import { Effect, Option, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
 import { createConditionOps } from "../src/internal/Expr.js"
 import { createPathBuilder } from "../src/internal/PathBuilder.js"
@@ -84,7 +84,7 @@ const items = (from: number, count: number) =>
 
 const lastKey = toAttributeMap({ pk: PK, sk: "cursor" })
 
-const decodeCursor = (cursor: string | null) => JSON.parse(atob(cursor!))
+const decodeCursor = (cursor: Option.Option<string>) => JSON.parse(atob(Option.getOrThrow(cursor)))
 
 const ids = (xs: ReadonlyArray<{ id: string }>) => xs.map((x) => x.id)
 
@@ -360,14 +360,14 @@ describe("Query — limit vs pageSize", () => {
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
-    it.effect("cursor is null only when genuinely exhausted", () =>
+    it.effect("cursor is None only when genuinely exhausted", () =>
       Effect.gen(function* () {
         mockQuery.mockResolvedValueOnce({ Items: items(1, 2), LastEvaluatedKey: undefined })
 
         const page = yield* keyedQuery().pipe(Query.limit(5), Query.execute)
 
         expect(page.items).toHaveLength(2)
-        expect(page.cursor).toBeNull()
+        expect(page.cursor).toEqual(Option.none())
       }).pipe(Effect.provide(TestDynamoClient)),
     )
 
@@ -381,7 +381,7 @@ describe("Query — limit vs pageSize", () => {
         const second = yield* keyedQuery().pipe(
           activeFilter,
           Query.limit(3),
-          Query.startFrom(first.cursor!),
+          Query.startFrom(Option.getOrThrow(first.cursor)),
           Query.execute,
         )
 

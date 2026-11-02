@@ -6,8 +6,9 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import * as Cursor from "../src/internal/Cursor.js"
+import type * as Query from "../src/Query.js"
 import { type ListingItem, makeListings, STORE } from "./helpers/ListingsFixture.js"
 import { compareBytes, type Partition } from "./helpers/PartitionMock.js"
 import * as ZListings from "./helpers/ZOrderListings.js"
@@ -58,7 +59,7 @@ const midTupleCursor = (byStore: (pins: object) => any) =>
       .limit(1)
       .fetch(),
     (page: any) => {
-      const cursor = Cursor.decode(page.cursor!)!
+      const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
       expect(cursor.s).toBe("skip-scan")
       expect(cursor.k).toBeDefined()
       return cursor
@@ -69,12 +70,12 @@ describe("cursor v2 (#171)", () => {
   it.effect("plain queries emit legacy cursor bytes", () =>
     run((byStore) =>
       Effect.gen(function* () {
-        const page = yield* byStore({ storeId: STORE }).limit(2).fetch()
-        expect(page.cursor!.startsWith("v2.")).toBe(false)
+        const page: Query.Page<ListingItem> = yield* byStore({ storeId: STORE }).limit(2).fetch()
+        expect(Option.getOrThrow(page.cursor).startsWith("v2.")).toBe(false)
         // `btoa(JSON.stringify(key))`, exactly as 1.36 wrote it.
-        const key = JSON.parse(atob(page.cursor!))
+        const key = JSON.parse(atob(Option.getOrThrow(page.cursor)))
         expect(key).toEqual(keyOf(fixture.ordered(items)[1]!))
-        expect(page.cursor).toBe(btoa(JSON.stringify(key)))
+        expect(page.cursor).toEqual(Option.some(btoa(JSON.stringify(key))))
       }),
     ),
   )
@@ -86,20 +87,20 @@ describe("cursor v2 (#171)", () => {
       (byStore) =>
         Effect.gen(function* () {
           const plain = byStore({ storeId: STORE })
-          const page = yield* plain.limit(2).fetch()
-          expect(page.cursor!.startsWith("v2.")).toBe(true)
-          const cursor = Cursor.decode(page.cursor!)!
+          const page: Query.Page<ListingItem> = yield* plain.limit(2).fetch()
+          expect(Option.getOrThrow(page.cursor).startsWith("v2.")).toBe(true)
+          const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
           expect(cursor).toEqual({ v: 2, k: Cursor.keyToWire(keyOf(fixture.ordered(rows)[1]!)) })
-          const rest = yield* plain.startFrom(page.cursor!).collect()
+          const rest = yield* plain.startFrom(Option.getOrThrow(page.cursor)).collect()
           expect(ids([...page.items, ...rest])).toEqual(ids(fixture.ordered(rows)))
 
           // A planned query's cursor carries the key text the same way.
           const planned = byStore({ storeId: STORE }).within({ price: PRICE })
           const first = yield* planned.limit(1).fetch()
-          expect(Cursor.decode(first.cursor!)!.k!.gsi1sk).toEqual({
+          expect(Cursor.decode(Option.getOrThrow(first.cursor))!.k!.gsi1sk).toEqual({
             S: fixture.skOf(fixture.ordered(rows).find((row) => row.price === 40)!),
           })
-          const others = yield* planned.startFrom(first.cursor!).collect()
+          const others = yield* planned.startFrom(Option.getOrThrow(first.cursor)).collect()
           expect(ids([...first.items, ...others])).toEqual(
             ids(fixture.ordered(rows).filter((row) => row.price === 40)),
           )
@@ -176,11 +177,11 @@ describe("cursor v2 (#171)", () => {
         Effect.gen(function* () {
           const plain = client.byFacets({ region: ZListings.REGION })
           const page = yield* plain.limit(5).fetch()
-          const cursor = Cursor.decode(page.cursor!)!
+          const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
           expect(Object.keys(cursor)).toEqual(["v", "k"])
           const sk = Cursor.wireToKeyValue(cursor.k!.gsi1sk!)
           expect(sk).toEqual(bytesOf.get(page.items[4]!.listingId)!.gsi1sk!.B)
-          const rest = yield* plain.startFrom(page.cursor!).collect()
+          const rest = yield* plain.startFrom(Option.getOrThrow(page.cursor)).collect()
           expect(ZListings.ids([...page.items, ...rest])).toEqual(ZListings.ids(listings))
           expect([...page.items, ...rest].map((l) => l.listingId)).toEqual(
             order("gsi1sk", listings),
@@ -200,16 +201,19 @@ describe("cursor v2 (#171)", () => {
           )
           const seen = new Set<string>()
           for (let limit = 1; limit <= want.length; limit++) {
-            let cursor: string | null | undefined
+            let cursor = Option.none<string>()
             const got: Array<string> = []
-            while (cursor !== null) {
-              const page = yield* (cursor === undefined ? query : query.startFrom(cursor))
+            do {
+              const page = yield* Option.match(cursor, {
+                onNone: () => query,
+                onSome: (resume) => query.startFrom(resume),
+              })
                 .limit(limit)
                 .fetch()
               got.push(...page.items.map((l) => l.listingId))
               cursor = page.cursor
-              if (cursor !== null) {
-                const decoded = Cursor.decode(cursor)!
+              if (Option.isSome(cursor)) {
+                const decoded = Cursor.decode(cursor.value)!
                 expect(decoded.s).toBe("precise")
                 if (decoded.k !== undefined) {
                   expect("B" in decoded.k.gsi1sk!).toBe(true)
@@ -220,7 +224,7 @@ describe("cursor v2 (#171)", () => {
                   seen.add("a")
                 }
               }
-            }
+            } while (Option.isSome(cursor))
             expect(got).toEqual(want)
           }
           expect([...seen].sort()).toEqual(["a", "k"])
@@ -233,13 +237,13 @@ describe("cursor v2 (#171)", () => {
             .byAgency({ region: ZListings.REGION })
             .within({ price: { gte: 200 } })
           const first = yield* query.limit(2).fetch()
-          const cursor = Cursor.decode(first.cursor!)!
+          const cursor = Cursor.decode(Option.getOrThrow(first.cursor))!
           expect(cursor.s).toBe("skip-scan")
           const tuple = Cursor.wireToKeyValue(cursor.t!)
           expect(tuple).toBeInstanceOf(Uint8Array)
           const stored = bytesOf.get(first.items[0]!.listingId)!.gsi2sk!.B!
           expect(stored.subarray(0, (tuple as Uint8Array).length)).toEqual(tuple)
-          const rest = yield* query.startFrom(first.cursor!).collect()
+          const rest = yield* query.startFrom(Option.getOrThrow(first.cursor)).collect()
           expect([...first.items, ...rest].map((l) => l.listingId)).toEqual(
             order(
               "gsi2sk",
@@ -350,7 +354,10 @@ describe("cursor v2 (#171)", () => {
       Effect.gen(function* () {
         const page = yield* byStore({ storeId: STORE }).limit(2).fetch()
         const why = yield* refusal(
-          byStore({ storeId: STORE }).within({ price: PRICE }).startFrom(page.cursor!).collect(),
+          byStore({ storeId: STORE })
+            .within({ price: PRICE })
+            .startFrom(Option.getOrThrow(page.cursor))
+            .collect(),
         )
         expect(why).toContain("without .within()")
       }),

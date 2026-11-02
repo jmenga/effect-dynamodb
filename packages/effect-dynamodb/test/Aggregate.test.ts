@@ -9,7 +9,7 @@ import {
   type RefNotFound,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Fiber, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Option, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
@@ -3469,7 +3469,7 @@ describe("Aggregate write path", () => {
         expect(results.data).toHaveLength(2)
         expect(results.data[0]!.articleId).toBe("a-1")
         expect(results.data[1]!.articleId).toBe("a-2")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // 1 GSI query + 2 assembly queries
         expect(mockListQuery).toHaveBeenCalledTimes(3)
@@ -3560,7 +3560,7 @@ describe("Aggregate write path", () => {
         const results = yield* ListAggregate.list({ author: "Nobody" })
 
         expect(results.data).toHaveLength(0)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
         expect(mockListQuery).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -3625,7 +3625,7 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-1")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // 3 shard queries + 1 assembly query
         expect(mockListQuery).toHaveBeenCalledTimes(4)
@@ -3692,14 +3692,14 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-1")
-        expect(results.cursor).not.toBeNull()
+        expect(Option.isSome(results.cursor)).toBe(true)
 
         // Verify Limit was passed to DynamoDB query
         const gsiInput = mockListQuery.mock.calls[0]![0]
         expect(gsiInput.Limit).toBe(1)
 
         // Decode cursor and verify it matches the LastEvaluatedKey
-        const decodedCursor = JSON.parse(atob(results.cursor!))
+        const decodedCursor = JSON.parse(atob(Option.getOrThrow(results.cursor)))
         expect(decodedCursor).toEqual(lastEvaluatedKey)
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -3750,7 +3750,7 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-2")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // Verify ExclusiveStartKey was passed
         const gsiInput = mockListQuery.mock.calls[0]![0]
@@ -3830,7 +3830,7 @@ describe("Aggregate write path", () => {
         const results = yield* ListAggregate.list()
 
         expect(results.data).toHaveLength(2)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // Without limit, no Limit param is sent
         const gsiInput = mockListQuery.mock.calls[0]![0]
@@ -3966,8 +3966,8 @@ describe("Aggregate write path", () => {
         // Resumes after a-1 — the last aggregate KEPT. Resuming from
         // LastEvaluatedKey (a-3) would skip a-3 itself, which the predicate
         // accepts and the next page still owes the caller.
-        expect(results.cursor).not.toBeNull()
-        const resume = JSON.parse(atob(results.cursor!))
+        expect(Option.isSome(results.cursor)).toBe(true)
+        const resume = JSON.parse(atob(Option.getOrThrow(results.cursor)))
         expect(resume.pk.S).toBe("$myapp#v1#article#a-1")
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -4124,8 +4124,8 @@ describe("Aggregate write path", () => {
           expect(call[0].Limit).toBe(5)
         }
         // More to come, so the cursor is not null.
-        expect(results.cursor).not.toBeNull()
-        expect(JSON.parse(atob(results.cursor!))).toEqual(lek("a-3"))
+        expect(Option.isSome(results.cursor)).toBe(true)
+        expect(JSON.parse(atob(Option.getOrThrow(results.cursor)))).toEqual(lek("a-3"))
       }).pipe(Effect.provide(ListLayer)),
     )
 
@@ -4151,9 +4151,9 @@ describe("Aggregate write path", () => {
 
         expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-2"])
         // Not null — a-3 was read and dropped, so the range is NOT exhausted.
-        expect(results.cursor).not.toBeNull()
+        expect(Option.isSome(results.cursor)).toBe(true)
         // Rebuilt from a-2 (the last item handed back), not from a-3.
-        expect(JSON.parse(atob(results.cursor!))).toEqual({
+        expect(JSON.parse(atob(Option.getOrThrow(results.cursor)))).toEqual({
           pk: { S: "$myapp#v1#article#a-2" },
           sk: { S: "$myapp#v1#articleitem" },
           gsi1pk: { S: "$myapp#v1#articlelist" },
@@ -4174,7 +4174,7 @@ describe("Aggregate write path", () => {
         })
 
         expect(results.data).toHaveLength(1)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
       }).pipe(Effect.provide(ListLayer)),
     )
 
@@ -4243,7 +4243,7 @@ describe("Aggregate write path", () => {
             expect(call[0].Limit).toBe(2)
           }
           // No resumable position across shards.
-          expect(results.cursor).toBeNull()
+          expect(results.cursor).toEqual(Option.none())
         }).pipe(Effect.provide(ListLayer)),
       )
 

@@ -310,8 +310,11 @@ export interface ListOptions<Model = Record<string, unknown>> {
 export interface ListResult<T> {
   /** The assembled aggregates for this page */
   readonly data: Array<T>
-  /** Opaque cursor for the next page, or null if no more results */
-  readonly cursor: string | null
+  /**
+   * Opaque cursor for the next page — pass it as `list({ cursor })` — or
+   * `None` when there are no more results.
+   */
+  readonly cursor: Option.Option<string>
 }
 
 // ---------------------------------------------------------------------------
@@ -443,12 +446,12 @@ export interface Aggregate<
    *
    * `options.filter` adds a server-side `FilterExpression` to the root-item
    * query; `limit` still means "this many aggregates", the loop accumulating
-   * across requests until the page fills or the key range ends. A `null` cursor
+   * across requests until the page fills or the key range ends. A `None` cursor
    * means genuinely exhausted.
    *
    * On a **sharded** list (`list.cardinality`) `limit` bounds the merged result
    * but there is no resumable position across shards, so `cursor` is always
-   * `null` and passing one fails with `EDD-9051`.
+   * `None` and passing one fails with `EDD-9051`.
    */
   readonly list: (
     filter?: Record<string, unknown>,
@@ -2474,7 +2477,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   `(list.cardinality = ${listConfig.cardinality}), and a sharded fan-out has no ` +
                   "resumable cursor: a DynamoDB cursor names a position in one partition, while " +
                   "this query spans all of them with no defined order across shards. `list` on a " +
-                  "sharded aggregate always returns `cursor: null`; use `limit` to bound the " +
+                  "sharded aggregate always returns `cursor: None`; use `limit` to bound the " +
                   "result, or drop `list.cardinality` if the partition needs paging more than it " +
                   "needs spreading.",
               })
@@ -2604,7 +2607,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             if (assembled !== undefined) aggregates.push(assembled)
           }
 
-          const cursor = nextKey ? btoa(JSON.stringify(nextKey)) : null
+          const cursor = nextKey ? Option.some(btoa(JSON.stringify(nextKey))) : Option.none()
 
           return { data: aggregates, cursor }
         }),

@@ -19,7 +19,7 @@
  *   npx tsx examples/guide-queries.ts
  */
 
-import { Config, Console, Effect, Layer, Schema, Stream } from "effect"
+import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -387,28 +387,28 @@ const program = Effect.gen(function* () {
   // Single page with limit — returns page with items and cursor
   const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
   // page.items: Task[] (up to 3 items)
-  // page.cursor: string | null — resumes after the 3rd item, or null when done
+  // page.cursor: Option<string> — Some resumes after the 3rd item, None when done
   // #endregion
   yield* Console.log(
-    `Single page (limit 3): ${page.items.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
+    `Single page (limit 3): ${page.items.length} items, cursor: ${Option.isSome(page.cursor) ? "some" : "none"}`,
   )
 
   // #region cursor-pagination
-  // Cursor-based pagination
-  const page1 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-    .limit(3)
-    .fetch()
-
-  if (page1.cursor) {
-    const page2 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-      .limit(3)
-      .startFrom(page1.cursor)
-      .fetch()
-    yield* Console.log(
-      `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
-    )
-  }
+  // Cursor-based pagination: the next page, if there is one
+  const alpha = db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3)
+  const page1 = yield* alpha.fetch()
+  const page2 = yield* Option.match(page1.cursor, {
+    onNone: () => Effect.succeed([]),
+    onSome: (cursor) =>
+      alpha
+        .startFrom(cursor)
+        .fetch()
+        .pipe(Effect.map((next) => next.items)),
+  })
   // #endregion
+  yield* Console.log(
+    `Cursor pagination: page1=${page1.items.length} items, page2=${page2.length} items`,
+  )
 
   // #region streaming
   // Streaming — automatic pagination via Stream

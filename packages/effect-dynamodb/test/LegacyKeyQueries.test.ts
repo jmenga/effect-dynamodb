@@ -23,7 +23,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -271,7 +271,10 @@ const script = (w: World) =>
     const page = yield* db.entities.Readings.byZone({ zone: 3 }).limit(1).fetch()
     out.push(page)
     out.push(
-      yield* db.entities.Readings.byZone({ zone: 3 }).limit(1).startFrom(page.cursor!).fetch(),
+      yield* db.entities.Readings.byZone({ zone: 3 })
+        .limit(1)
+        .startFrom(Option.getOrThrow(page.cursor))
+        .fetch(),
     )
     out.push(yield* Query.collect(w.Readings.query.byZone({ zone: 3 })))
     yield* db.entities.Docs.put({ docId: 5, title: "v1" }).asEffect()
@@ -382,20 +385,26 @@ describe("legacy key queries — an accessor over pins whose text changed", () =
       const table = freshTable()
       const { db } = yield* seeded(table)
       const seen: Array<number> = []
-      let cursor: string | null = null
+      let cursor = Option.none<string>()
       for (let page = 0; page < 10; page++) {
         const query = db.entities.Readings.byZone({ zone: -3 }).limit(1)
-        const result: { readonly items: ReadonlyArray<Reading>; readonly cursor: string | null } =
-          yield* inTable(On, table, (cursor === null ? query : query.startFrom(cursor)).fetch())
+        const result: Query.Page<Reading> = yield* inTable(
+          On,
+          table,
+          Option.match(cursor, {
+            onNone: () => query,
+            onSome: (resume) => query.startFrom(resume),
+          }).fetch(),
+        )
         seen.push(...result.items.map((r) => r.seq))
-        if (result.cursor !== null && page === 0) {
+        if (Option.isSome(result.cursor) && page === 0) {
           const decoded = JSON.parse(
-            Buffer.from(result.cursor.slice(3), "base64url").toString("utf8"),
+            Buffer.from(result.cursor.value.slice(3), "base64url").toString("utf8"),
           )
           expect(decoded.p).toBe(1)
         }
         cursor = result.cursor
-        if (cursor === null) break
+        if (Option.isNone(cursor)) break
       }
       expect(seen).toEqual([1, 2, 3, 4])
       const count = yield* inTable(On, table, db.entities.Readings.byZone({ zone: -3 }).count())

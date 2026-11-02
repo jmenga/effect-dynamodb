@@ -19,13 +19,14 @@ import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Config, Effect, Layer, Schema } from "effect"
+import { Config, Effect, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
+import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 
 // ---------------------------------------------------------------------------
@@ -356,17 +357,17 @@ describeConnected("#171 queries over rows still under their 1.36 keys — connec
         const db = yield* seed(-4)
         for (const reverse of [false, true]) {
           const seen: Array<number> = []
-          let cursor: string | null = null
+          let cursor = Option.none<string>()
           for (let page = 0; page < 10; page++) {
             const base = db.entities.Readings.byZone({ zone: -4 }).limit(1)
             const query = reverse ? base.reverse() : base
-            const result: {
-              readonly items: ReadonlyArray<Reading>
-              readonly cursor: string | null
-            } = yield* (cursor === null ? query : query.startFrom(cursor)).fetch()
+            const result: Query.Page<Reading> = yield* Option.match(cursor, {
+              onNone: () => query,
+              onSome: (resume) => query.startFrom(resume),
+            }).fetch()
             seen.push(...result.items.map((r) => r.seq))
             cursor = result.cursor
-            if (cursor === null) break
+            if (Option.isNone(cursor)) break
           }
           expect(seen).toEqual(reverse ? [4, 3, 2, 1] : [1, 2, 3, 4])
         }

@@ -7073,7 +7073,7 @@ describe("EventStore stream index projection", () => {
           .pipe(Query.limit(2), Query.execute)
         expect(page.items.map((e) => e.version)).toEqual([1, 2])
         expect(batchKeys(0)).toEqual([1, 2].map((v) => ({ pk, sk: sk(v) })))
-        expect(JSON.parse(atob(page.cursor!))).toEqual(
+        expect(JSON.parse(atob(Option.getOrThrow(page.cursor)))).toEqual(
           toAttributeMap({ gsi2pk: pk, gsi2sk: "V#0002", pk, sk: sk(2) }),
         )
 
@@ -7094,7 +7094,9 @@ describe("EventStore stream index projection", () => {
           .index("keysGsi", { matchId: "m-1" })
           .pipe(Query.limit(2), Query.execute)
         expect(page.items.map((e) => e.version)).toEqual([1, 3])
-        expect(JSON.parse(atob(page.cursor!))).toMatchObject(toAttributeMap({ sk: sk(3) }))
+        expect(JSON.parse(atob(Option.getOrThrow(page.cursor)))).toMatchObject(
+          toAttributeMap({ sk: sk(3) }),
+        )
         expect(mockQuery).toHaveBeenCalledOnce()
 
         const streamed = yield* ProjMatch.query

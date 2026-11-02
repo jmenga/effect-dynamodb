@@ -13,7 +13,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema, Stream } from "effect"
+import { Effect, Layer, Option, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Cursor from "../src/internal/Cursor.js"
@@ -69,14 +69,17 @@ const tupleText = (sk: string) => sk.slice(0, sk.search(/#price_/i) + 1)
 /** Every page of a `fetch` chain, from the start. */
 const fetchAll = (query: any) =>
   Effect.gen(function* () {
-    const pages: Array<{ readonly items: Array<any>; readonly cursor: string | null }> = []
-    let cursor: string | null | undefined
-    while (cursor !== null) {
-      const page = yield* (cursor === undefined ? query : query.startFrom(cursor)).fetch()
+    const pages: Array<Query.Page<any>> = []
+    let cursor = Option.none<string>()
+    do {
+      const page: Query.Page<any> = yield* Option.match(cursor, {
+        onNone: () => query,
+        onSome: (resume) => query.startFrom(resume),
+      }).fetch()
       pages.push(page)
       cursor = page.cursor
       if (pages.length > 500) return yield* Effect.die(new Error("the fetch chain did not end"))
-    }
+    } while (Option.isSome(cursor))
     return pages
   })
 
@@ -385,7 +388,7 @@ describe("skip-scan (#171)", () => {
         )
         expect(ids(skipping.flatMap((page) => page.items))).toEqual(want)
         const skipCursors = skipping.flatMap((page) =>
-          page.cursor === null ? [] : [Cursor.decode(page.cursor)!],
+          Option.toArray(page.cursor).map((cursor) => Cursor.decode(cursor)!),
         )
         expect(skipCursors.map((cursor) => cursor.s)).toEqual(skipCursors.map(() => "skip-scan"))
         expect(skipCursors.some((cursor) => cursor.k !== undefined && cursor.t !== undefined)).toBe(
@@ -400,7 +403,7 @@ describe("skip-scan (#171)", () => {
         )
         expect(ids(falling.flatMap((page) => page.items))).toEqual(want)
         const modes = falling.flatMap((page) =>
-          page.cursor === null ? [] : [Cursor.decode(page.cursor)!.s],
+          Option.toArray(page.cursor).map((cursor) => Cursor.decode(cursor)!.s),
         )
         expect(modes[0]).toBe("filter")
         expect(new Set(modes)).toEqual(new Set(["filter"]))
@@ -440,12 +443,12 @@ describe("skip-scan (#171)", () => {
           expect(page.items).toEqual([])
           expect(partition.inputs).toHaveLength(1)
           expect(isProbe(partition.inputs[0])).toBe(true)
-          const cursor = Cursor.decode(page.cursor!)!
+          const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
           const T1 = tupleText(fixture.skOf(fixture.ordered(items)[0]!))
           expect(cursor).toEqual({ v: 2, f: cursor.f, s: "skip-scan", t: { S: T1 } })
           // Resuming reads tuple T1 first: no probe for it again.
           partition.clear()
-          expect(ids(yield* query.startFrom(page.cursor!).collect())).toEqual(
+          expect(ids(yield* query.startFrom(Option.getOrThrow(page.cursor)).collect())).toEqual(
             expected(fixture, items, PRICE),
           )
           expect(isProbe(partition.inputs[0])).toBe(false)
@@ -474,11 +477,11 @@ describe("skip-scan (#171)", () => {
         expect(page.items).toHaveLength(2)
         expect(partition.inputs.map(isProbe)).toEqual([true, false])
         const T1 = tupleText(fixture.skOf(items[0]!))
-        const cursor = Cursor.decode(page.cursor!)!
+        const cursor = Cursor.decode(Option.getOrThrow(page.cursor))!
         expect(cursor).toEqual({ v: 2, f: cursor.f, s: "skip-scan", t: { S: T1 }, d: 1 })
         // The pending probe is the resumed call's first request.
         partition.clear()
-        const rest = yield* query.startFrom(page.cursor!).collect()
+        const rest = yield* query.startFrom(Option.getOrThrow(page.cursor)).collect()
         expect(ids([...page.items, ...rest])).toEqual(expected(fixture, items, PRICE))
         expect(isProbe(partition.inputs[0])).toBe(true)
         expect(betweenOf(partition.inputs[0])![0]).toBe(`${T1.slice(0, -1)}$`)
@@ -557,7 +560,7 @@ describe("skip-scan (#171)", () => {
             expect((yield* query.explain()).plan, context).toBe("empty")
             expect(yield* query.collect(), context).toEqual([])
             expect(yield* query.count(), context).toBe(0)
-            expect(yield* query.fetch(), context).toEqual({ items: [], cursor: null })
+            expect(yield* query.fetch(), context).toEqual({ items: [], cursor: Option.none() })
           }
         }
         expect(partition.inputs).toEqual([])

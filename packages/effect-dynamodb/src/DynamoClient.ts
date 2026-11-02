@@ -1850,9 +1850,12 @@ export type CollectionSelected<TResult> = {
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
   readonly collect: () => Effect.Effect<TResult, DynamoClientError | ValidationError, never>
-  /** Execute a single page, grouped like `collect()`. */
+  /**
+   * Execute a single page, grouped like `collect()`, with the cursor of the
+   * next page (`None` when there are no more results).
+   */
   readonly fetch: () => Effect.Effect<
-    { items: TResult; cursor: string | null },
+    { readonly items: TResult; readonly cursor: Option.Option<string> },
     DynamoClientError | ValidationError,
     never
   >

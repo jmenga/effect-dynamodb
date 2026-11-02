@@ -1894,10 +1894,10 @@ const probeCommand = (state: QueryState, step: ProbeStep, tableName: string) => 
   }
 }
 
-/** @internal The cursor of a planned query at `step`: v2, or `null` once done. */
-const plannedCursor = (planner: RangePlanner, step: Step): string | null => {
+/** @internal The cursor of a planned query at `step`: v2, or `None` once done. */
+const plannedCursor = (planner: RangePlanner, step: Step): Option.Option<string> => {
   const cursor = planner.cursor(step)
-  return cursor === null ? null : Cursor.encodeV2(cursor)
+  return cursor === null ? Option.none() : Option.some(Cursor.encodeV2(cursor))
 }
 
 /**
@@ -2192,8 +2192,11 @@ export const operationOptions = (self: Query<unknown>): Capacity.OperationOption
  */
 export interface Page<A> {
   readonly items: Array<A>
-  /** Opaque cursor for the next page, or `null` if there are no more results. */
-  readonly cursor: string | null
+  /**
+   * Opaque cursor for the next page — pass it to `.startFrom()` — or `None`
+   * when there are no more results.
+   */
+  readonly cursor: Option.Option<string>
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,17 +2316,20 @@ const collectRanges = <A>(
  * accumulates until `n` items are accepted, the key range is exhausted, or
  * {@link maxPages} requests have been made.
  *
- * The cursor resumes after the last item actually returned — a `null` cursor
- * means genuinely exhausted. A non-null one can still lead to an empty page:
+ * The cursor resumes after the last item actually returned — `None` means
+ * genuinely exhausted. A `Some` can still lead to an empty page:
  * a request that stops at its `Limit` cannot tell whether another match
  * follows, which is likelier when {@link limit} sizes requests under a
  * filter. Combine with {@link startFrom} to iterate:
  *
  * ```ts
  * const first = yield* query.pipe(Query.limit(25), Query.execute)
- * if (first.cursor) {
- *   const second = yield* query.pipe(Query.limit(25), Query.startFrom(first.cursor), Query.execute)
- * }
+ * // Some(page) when there is a next page, None when `first` was the last
+ * const second = yield* Effect.transposeOption(
+ *   Option.map(first.cursor, (cursor) =>
+ *     query.pipe(Query.limit(25), Query.startFrom(cursor), Query.execute),
+ *   ),
+ * )
  * ```
  */
 export const execute = <A>(
@@ -2344,7 +2350,7 @@ const executeCore = <A>(
     const limitValue = state.limitValue
 
     if (limitValue !== undefined && limitValue <= 0) {
-      return { items: [], cursor: null } as Page<A>
+      return { items: [], cursor: Option.none() } as Page<A>
     }
     if (state.plan !== undefined)
       return yield* executePlanned<A>(client, tableName, state, state.plan)
@@ -2423,7 +2429,7 @@ const executeCore = <A>(
       startKey = lastEvaluatedKey
     }
 
-    return { items, cursor } as Page<A>
+    return { items, cursor: Option.fromNullOr(cursor) } as Page<A>
   })
 
 /** @internal One planned read's response, with the state it was sent with. */
@@ -2530,7 +2536,7 @@ const executePlanned = <A>(
     let window = 1
 
     while (true) {
-      if (step._tag === "Done") return { items, cursor: null }
+      if (step._tag === "Done") return { items, cursor: Option.none() }
       if (filled() || (maxPages != null && requests >= maxPages)) {
         return { items, cursor: plannedCursor(planner, step) }
       }
