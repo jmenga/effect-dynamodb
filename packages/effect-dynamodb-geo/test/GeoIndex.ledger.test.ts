@@ -7,9 +7,9 @@
  *
  * This package sees effect-dynamodb through its public entry point, so the
  * test reads the library's two internal references by their keys: the
- * test-only offload gate (to define an offloading entity before its write
- * paths are wired) and the current ledger (to observe it from inside the
- * request).
+ * test-only offload gate (`helpers/OffloadGate.ts`, to define an offloading
+ * entity before its write paths are wired) and the current ledger (to
+ * observe it from inside the request).
  */
 
 import { Context, Effect, Layer, Schema } from "effect"
@@ -24,11 +24,7 @@ import {
 } from "effect-dynamodb"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
-
-/** `@effect-dynamodb/schema`'s test-only `internal/OffloadGate.ts`, by its key. */
-const OffloadGate = Context.Reference<boolean>("@effect-dynamodb/internal/OffloadGate", {
-  defaultValue: () => false,
-})
+import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 /** effect-dynamodb's `internal/BlobLedger.ts` `CurrentLedger`, by its key. */
 const CurrentLedger = Context.Reference<{ readonly closed: boolean } | undefined>(
@@ -65,15 +61,13 @@ const courierConfig = {
   },
 } as const
 
-const OffloadingCouriers = Effect.runSync(
-  Effect.sync(() =>
-    Entity.make({
-      ...courierConfig,
-      model: DynamoModel.configure(Courier, {
-        photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
-      }),
+const OffloadingCouriers = withOffloadGate(() =>
+  Entity.make({
+    ...courierConfig,
+    model: DynamoModel.configure(Courier, {
+      photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
     }),
-  ).pipe(Effect.provideService(OffloadGate, true)),
+  }),
 )
 
 const PlainCouriers = Entity.make({ ...courierConfig, entityType: "PlainCourier", model: Courier })
@@ -138,13 +132,14 @@ const courier = { courierId: "c-1", latitude: 51.5, longitude: -0.12, timestamp:
 
 describe("GeoIndex.put — upload-ledger root", () => {
   it("the bound and unbound puts of an offloading geo entity run in a ledger", async () => {
+    // A store at bind: `GeoIndex.bind` refuses an offloading entity without one (EDD-9115).
     const { layer, ledgers } = makeClient()
     await run(
       Effect.gen(function* () {
         const bound = yield* GeoIndex.bind(OffloadingGeo)
         yield* bound.put(courier)
         yield* OffloadingGeo.put(courier)
-      }),
+      }).pipe(Effect.provide(BlobStore.layer(BlobStore.memory()))),
       layer,
     )
     expect(ledgers).toEqual([true, true])

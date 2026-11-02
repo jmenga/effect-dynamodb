@@ -39,7 +39,7 @@ import {
   parseBinaryPointerText,
   unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Context, Effect, Schema } from "effect"
+import { Context, Effect, Schema, type Semaphore } from "effect"
 import { toAttributeValue } from "../Marshaller.js"
 import {
   DEFAULT_MODES,
@@ -211,6 +211,12 @@ export interface LoadOptions {
    * offloads (which would need a fetch) fails the load.
    */
   readonly noFetch?: boolean | undefined
+  /**
+   * Store-read permits shared with the operation's other loads running at the
+   * same time (`BlobResolver.ResolveOptions.permits`): `GeoIndex.nearby`'s
+   * parallel cell queries share one pool of the store's `readConcurrency`.
+   */
+  readonly permits?: Semaphore.Semaphore | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +419,7 @@ export const loadRows = (
               modes,
               committed: options.committed,
               decode,
+              permits: options.permits,
             }),
             (values) => assign(slots, values),
           )
@@ -425,6 +432,7 @@ export const loadRows = (
         operation: options.operation,
         modes: EAGER_MODES,
         committed: options.committed,
+        permits: options.permits,
       }).pipe(
         Effect.catchTag("BlobStoreError", (cause) =>
           Effect.fail(

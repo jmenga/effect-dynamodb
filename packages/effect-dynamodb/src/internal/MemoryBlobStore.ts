@@ -163,9 +163,9 @@ export interface MemoryBlobStoreOptions {
   readonly maxVersionBytes?: number | undefined
   /** Default 1 hour; from 1 minute to 7 days. */
   readonly maxUploadAge?: Duration.Input | undefined
-  /** Default 16. */
+  /** Concurrent reads per operation (eager resolution). Default 16. */
   readonly readConcurrency?: number | undefined
-  /** Default 8. */
+  /** Concurrent uploads per operation. Default 8. */
   readonly writeConcurrency?: number | undefined
   /** Bytes per chunk a `get` emits (default 65,536). */
   readonly readChunkBytes?: number | undefined

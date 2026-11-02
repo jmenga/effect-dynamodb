@@ -162,7 +162,11 @@ export interface BlobStoreService {
    * collecting against one store configures the same value.
    */
   readonly maxUploadAge: Duration.Duration
-  /** Concurrent reads the library runs against the store (eager resolution). */
+  /**
+   * Concurrent reads the library runs against the store per operation (eager
+   * resolution): a page, a batch get's group, an aggregate's partition, and
+   * all of a `GeoIndex.nearby` search's parallel queries together.
+   */
   readonly readConcurrency: number
   /** Concurrent uploads the library runs against the store per operation. */
   readonly writeConcurrency: number

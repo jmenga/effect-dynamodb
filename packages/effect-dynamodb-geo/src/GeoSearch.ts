@@ -7,9 +7,15 @@
  * @internal Used by GeoIndex — consumers should use `GeoIndex.nearby()`.
  */
 
-import { type Context, Effect, Schema } from "effect"
-import type { DynamoClientError, DynamoSchema, Table } from "effect-dynamodb"
-import { type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
+import { type Context, Effect, Option, Semaphore } from "effect"
+import type {
+  BlobStoreError,
+  DynamoClientError,
+  DynamoSchema,
+  Offload,
+  Table,
+} from "effect-dynamodb"
+import { BlobStore, type DynamoClient, KeyComposer, Query, ValidationError } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import type { Coordinates, GeoFields, NearbyOptions, NearbyResult } from "./GeoIndex.js"
 import * as H3 from "./H3.js"
@@ -22,13 +28,30 @@ export interface SearchConfig<A> {
     readonly _tableTag: Context.Service<Table.TableConfig, Table.TableConfig>
     readonly entityType: string
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
-    readonly schemas: { readonly recordSchema: Schema.Codec<any> }
     /**
      * The key form of a DOMAIN record (`Entity._domainKeyForm`). Search composes
      * GSI keys for rows written by `Entity.put`, so it composes the key form of
      * the values `put` stores for its domain values (#111).
      */
     readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
+    /** The entity's row decoder (see `GeoEntity._decodeRecord`). */
+    readonly _decodeRecord: (
+      raw: Record<string, unknown>,
+      modes?: Offload.ResolvedOffloadModes,
+      operation?: string,
+    ) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+    /** The entity's batch row loader (see `GeoEntity._loadRows`). */
+    readonly _loadRows: (
+      rows: ReadonlyArray<Record<string, unknown>>,
+      options: {
+        readonly operation: string
+        readonly modes: Offload.ResolvedOffloadModes
+        readonly raw?: boolean | undefined
+        readonly permits?: Semaphore.Semaphore | undefined
+      },
+    ) => Effect.Effect<void, ValidationError | BlobStoreError>
+    /** The stored attributes `_loadRows` may rewrite. */
+    readonly _readAttributes: ReadonlyArray<string>
   } & GivesValues
   readonly indexDef: KeyComposer.IndexDefinition
   readonly coordinates: (item: A) => Coordinates | undefined
@@ -82,6 +105,9 @@ export const setOwnValue = (
   })
 }
 
+/** The operation a search's decode failures and blob reads name. */
+const DECODE = "GeoSearch.decode"
+
 /**
  * Search for items near a geographic point within a given radius.
  *
@@ -94,15 +120,22 @@ export const setOwnValue = (
  * 6. Generate time partition keys for the time window
  * 7. Build N queries (one per timePartition x chunk combination), each keeping
  *    only items whose `timePartition.source` timestamp lies in the window
- * 8. Execute all queries in parallel
+ * 8. Execute all queries in parallel, each decoding its rows through the
+ *    entity's own decoder: packed fields unpacked, offloaded values of a
+ *    page fetched together, both kinds eagerly (#147, #179, design §8.4) —
+ *    the store reads of all the queries sharing one pool of the store's
+ *    `readConcurrency` permits (§8.2)
  * 9. Post-process: compute great-circle distance, filter by radius, sort
+ *
+ * `EBlob` is `BlobStoreError` when the entity offloads a field, which the
+ * eager reads may fail with.
  */
-export const nearby = <A>(
+export const nearby = <A, EBlob = never>(
   config: SearchConfig<A>,
   options: NearbyOptions,
 ): Effect.Effect<
   Array<NearbyResult<A>>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | EBlob,
   DynamoClient | Table.TableConfig
 > =>
   Effect.gen(function* () {
@@ -149,17 +182,38 @@ export const nearby = <A>(
 
     const resolveTableName = entity._tableTag.useSync((tc: { name: string }) => tc.name)
 
-    const decoder = (raw: Record<string, unknown>) =>
-      Schema.decodeUnknownEffect(entity.schemas.recordSchema as Schema.Codec<any>)(raw).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ValidationError({
-              entityType: entity.entityType,
-              operation: "GeoSearch.decode",
-              cause,
-            }),
+    // Rows decode as the entity's own queries decode them (#147, #179): the
+    // entity's decoder unpacks packed fields, undoes renames and rebuilds
+    // sparse fields, and resolves offloaded values — eagerly here, both kinds
+    // (`Query.offloaded("eager")` below), since a result is typed as the
+    // domain model. A page's values are fetched together by the prefetch.
+    // The decoder names a schema failure `decode`; a search's has always
+    // been `GeoSearch.decode`.
+    const decoder = (raw: Record<string, unknown>, modes: Offload.ResolvedOffloadModes) =>
+      entity._decodeRecord(raw, modes, DECODE).pipe(
+        Effect.mapError((error) =>
+          error._tag === "ValidationError" && error.operation === "decode"
+            ? new ValidationError({
+                entityType: error.entityType,
+                operation: DECODE,
+                cause: error.cause,
+              })
+            : error,
         ),
       )
+    // The queries run in parallel, so a limit per query would multiply: their
+    // store reads share one pool of the store's `readConcurrency` permits for
+    // the whole search, as a batch get's groups stay within it (§8.2).
+    const store =
+      entity._readAttributes.length === 0 ? Option.none() : yield* Effect.serviceOption(BlobStore)
+    const permits = Option.isSome(store)
+      ? yield* Semaphore.make(store.value.readConcurrency)
+      : undefined
+    const prefetch: Query.QueryPrefetch | undefined =
+      entity._readAttributes.length === 0
+        ? undefined
+        : (rows, { modes, raw }) =>
+            entity._loadRows(rows, { operation: DECODE, modes, raw, permits })
 
     // Group search cells by parent cell — when search resolution is low,
     // multiple search cells may map to the same parent cell at parentResolution
@@ -241,14 +295,18 @@ export const nearby = <A>(
     const allItems = yield* Effect.forEach(
       queryConfigs,
       (qc) => {
-        const query = Query.make<A>({
+        const query = Query.make<A, EBlob>({
           tableName: "",
           indexName: dynamoIndexName,
           pkField,
           pkValue: qc.pkValue,
           skField,
           entityTypes: [entity.entityType],
-          decoder: decoder as (raw: Record<string, unknown>) => Effect.Effect<A, ValidationError>,
+          decoder: decoder as (
+            raw: Record<string, unknown>,
+            modes: Offload.ResolvedOffloadModes,
+          ) => Effect.Effect<A, ValidationError | BlobStoreError>,
+          prefetch,
           resolveTableName,
           keyFields: [
             pkField,
@@ -258,6 +316,8 @@ export const nearby = <A>(
           ],
         }).pipe(
           Query.where({ between: [qc.lower, qc.upper] as const }),
+          // Before `filterBy`, whose predicate is typed on the item (`[EDD-9117]`).
+          Query.offloaded("eager"),
           Query.filterBy(inTimeWindow),
         )
 

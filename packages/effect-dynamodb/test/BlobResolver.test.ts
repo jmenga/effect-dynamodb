@@ -3,8 +3,9 @@
  * driven with placeholders over objects in the in-memory store.
  *
  * - Modes: overflow eager / binary lazy by default, both eager, both lazy;
- *   eager fetches at the store's `readConcurrency`; a row without
- *   placeholders costs no I/O.
+ *   eager fetches at the store's `readConcurrency`, within permits shared
+ *   across parallel resolutions when given; a row without placeholders costs
+ *   no I/O.
  * - The upload ledger's read cache: what the operation uploaded is never
  *   fetched; lazy values never pin the ledger.
  * - Verification: the object's size, the content's size and CRC-64/NVME
@@ -21,7 +22,7 @@ import { Compression, type Compressor } from "@effect-dynamodb/schema/Compressio
 import { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
-import { Effect, Exit, Layer, Option, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Semaphore, Stream } from "effect"
 import { BlobStore, type BlobStoreService, type MemoryBlobStore } from "../src/BlobStore.js"
 import * as BlobLedger from "../src/internal/BlobLedger.js"
 import * as BlobResolver from "../src/internal/BlobResolver.js"
@@ -219,6 +220,50 @@ describe("BlobResolver — modes", () => {
         options(),
       ).pipe(withStore(store))
       expect(values).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }, { n: 5 }])
+      expect(most).toBe(2)
+    }),
+  )
+
+  it.effect("resolutions sharing permits stay within them together", () =>
+    Effect.gen(function* () {
+      // Each resolution alone runs at the store's readConcurrency (2); three
+      // in parallel would hold six reads in flight without the shared pool.
+      const memory = BlobStore.memory({ readConcurrency: 2 })
+      let inFlight = 0
+      let most = 0
+      const store: BlobStoreService = {
+        ...memory,
+        get: (ref, opts) =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              inFlight++
+              most = Math.max(most, inFlight)
+              yield* Effect.yieldNow
+              yield* Effect.yieldNow
+              return memory.get(ref, opts).pipe(
+                Stream.ensuring(
+                  Effect.sync(() => {
+                    inFlight--
+                  }),
+                ),
+              )
+            }),
+          ),
+      }
+      const batches = yield* Effect.forEach([0, 1, 2], (b) =>
+        Effect.forEach([0, 1, 2], (n) => json(memory, { b, n }, `p/doc/${b}-${n}`)),
+      )
+      const permits = yield* Semaphore.make(memory.readConcurrency)
+      const values = yield* Effect.forEach(
+        batches,
+        (pointers) =>
+          BlobResolver.resolveAll(
+            pointers.map((pointer) => overflowPending(pointer)),
+            options({ permits }),
+          ),
+        { concurrency: "unbounded" },
+      ).pipe(withStore(store))
+      expect(values).toEqual([0, 1, 2].map((b) => [0, 1, 2].map((n) => ({ b, n }))))
       expect(most).toBe(2)
     }),
   )

@@ -137,6 +137,7 @@ import {
   Schema,
   SchemaAST,
   SchemaIssue,
+  type Semaphore,
   Stream,
 } from "effect"
 import { SecureRandom } from "effect/crypto"
@@ -1058,6 +1059,9 @@ export interface Entity<
    * @internal Load, in place, a batch of stored-name rows (#179): unpack every
    * stored-form attribute and resolve blob pointers per `options.modes` — see
    * `OffloadRead.loadRows`. A query's page prefetch runs it over a window.
+   * `permits`: store-read permits shared with the caller's other loads running
+   * at the same time (`GeoIndex.nearby`'s parallel queries), so their reads in
+   * flight stay within the store's `readConcurrency`.
    */
   readonly _loadRows: (
     rows: ReadonlyArray<globalThis.Record<string, unknown>>,
@@ -1065,6 +1069,7 @@ export interface Entity<
       readonly operation: string
       readonly modes: OffloadRead.Modes
       readonly raw?: boolean | undefined
+      readonly permits?: Semaphore.Semaphore | undefined
     },
   ) => Effect.Effect<void, ValidationError | BlobStoreError>
 
@@ -1073,6 +1078,22 @@ export interface Entity<
 
   /** @internal True iff the entity offloads a field (#179). */
   readonly _offloads: boolean
+
+  /**
+   * @internal The context this entity's operations run in when it is bound in
+   * `context` — by {@link bind}, or by a binding over the entity from another
+   * package (`GeoIndex.bind`). First the configuration checks where its
+   * registries are first resolvable (#147, #179): a codec its `Packed` fields
+   * name must be registered (`[EDD-9078]`), an offloaded field needs a schema
+   * setting `escapeKeys: true` (`[EDD-9146]`) and a blob store (`[EDD-9115]`),
+   * each thrown as the defect naming `where`. Then a default `SecureRandom`
+   * service is bundled when `context` has none, which a `generatedId` put
+   * draws its UUID from.
+   */
+  readonly _bindContext: <R>(
+    where: string,
+    context: Context.Context<R>,
+  ) => Context.Context<R | SecureRandom.SecureRandom>
 
   /** @internal The domain fields the entity offloads (#179), both kinds. */
   readonly _offloadedFields: ReadonlyArray<string>
@@ -21702,10 +21723,15 @@ const makeImpl = <
         readonly operation: string
         readonly modes: OffloadRead.Modes
         readonly raw?: boolean | undefined
+        readonly permits?: Semaphore.Semaphore | undefined
       },
     ) => loadRows(rows, options),
     _readAttributes: readAttributeNames,
     _offloads: offloadInfo !== undefined,
+    _bindContext: <R>(
+      where: string,
+      context: Context.Context<R>,
+    ): Context.Context<R | SecureRandom.SecureRandom> => bindingContext(where, entity, context),
     _offloadedFields: [...offloadedByKind.overflow, ...offloadedByKind.binary],
     _offloadItem: offloadBuiltItem,
     _loadForReuse: loadForReuse,
@@ -21900,6 +21926,60 @@ const makeImpl = <
 // ---------------------------------------------------------------------------
 
 /**
+ * The context `entity`'s operations run in when it is bound in `context`
+ * (`Entity.bind`, `GeoIndex.bind`). First the configuration checks where its
+ * registries are first resolvable (#147, #179): an offloaded field needs a
+ * schema setting `escapeKeys: true` (`[EDD-9146]`, checked first: a store
+ * doesn't make the key text right), a codec its `Packed` fields name must be
+ * registered (`[EDD-9078]`) and an offloaded field needs a blob store
+ * (`[EDD-9115]`), each thrown as the defect naming `where` (`DynamoClient.make`
+ * runs its own, over every member). Then a default `SecureRandom` service is
+ * bundled when `context` has none: a `generatedId` put yields `SecureRandom`,
+ * and the bound operations stay at `R = never`. A platform override
+ * (`DynamoClient.make({ crypto })`) is kept.
+ */
+const bindingContext = <R>(
+  where: string,
+  entity: {
+    readonly entityType: string
+    readonly offload: ResolvedOffload | undefined
+    readonly _schema: unknown
+    readonly _packedFields: ReadonlyArray<string>
+    readonly _packedGuards: ReadonlyArray<PackedAttributeGuard>
+  },
+  context: Context.Context<R>,
+): Context.Context<R | SecureRandom.SecureRandom> => {
+  const owner = `entity "${entity.entityType}"`
+  const requirements = OffloadWrite.entityStoreRequirements(owner, entity)
+  // Offloading requires escaped key text (`[EDD-9146]`), before the store.
+  const keysError = OffloadWrite.unescapedKeysError(where, requirements)
+  if (keysError !== undefined) throw keysError
+  const codecError = unregisteredCodecError(
+    where,
+    codecRequirements(
+      owner,
+      entity._packedFields.flatMap((field) => {
+        const storedAs = entity._packedGuards.find((g) => g.attribute === field)?.storedAs
+        return storedAs !== undefined && isPackedConfig(storedAs)
+          ? [[field, storedAs] as const]
+          : []
+      }),
+    ),
+    Context.getOrUndefined(context, Compression),
+  )
+  if (codecError !== undefined) throw codecError
+  const storeError = OffloadWrite.missingStoreError(
+    where,
+    requirements,
+    Context.getOrUndefined(context, BlobStore),
+  )
+  if (storeError !== undefined) throw storeError
+  return Option.isSome(Context.getOption(context, SecureRandom.SecureRandom))
+    ? (context as Context.Context<R | SecureRandom.SecureRandom>)
+    : Context.add(context, SecureRandom.SecureRandom, makeDefaultCrypto())
+}
+
+/**
  * Bind an Entity to resolved `DynamoClient` and `TableConfig` services.
  * Returns a {@link BoundEntity} where all operations have `R = never`.
  *
@@ -21958,48 +22038,19 @@ export const bind = <
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
-    // Bundle a default `SecureRandom` service into the captured context. This is how
-    // `generatedId` put auto-fills a UUID while keeping bound `put` at
-    // `R = never`: the entity op yields `SecureRandom`, and `provide` supplies
-    // it from this bundled context rather than surfacing it as a requirement.
-    // The `provide` helper is widened to admit `SecureRandom` so the
-    // SecureRandom-requiring entity ops typecheck. A platform override supplied via
-    // `DynamoClient.make({ crypto })` is already in `baseCtx` and is respected
-    // (we only fill the default when absent). See `DESIGN.md`.
+    // The configuration checks where the entity is first resolvable, and a
+    // default `SecureRandom` bundled into the captured context (`bindingContext`;
+    // `DynamoClient.make` binds under the registries and crypto it bundled).
+    // A `generatedId` put yields `SecureRandom`, which `provide` supplies
+    // from this context rather than surfacing it as a requirement — widened
+    // to admit it so the SecureRandom-requiring entity ops typecheck, and bound
+    // `put` stays at `R = never`. See `DESIGN.md`.
     // Detached: no current operation or parent span is pinned for later calls (#174).
-    const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
-    // Configuration checks where the entity is first resolvable (#147, #179):
-    // a packed codec must be registered (`[EDD-9078]`) and an offloaded field
-    // needs a blob store (`[EDD-9115]`) in the context it is bound with —
-    // `DynamoClient.make` binds under the one it bundled.
-    const owner = `entity "${entity.entityType}"`
-    const requirements = OffloadWrite.entityStoreRequirements(owner, entity)
-    // Offloading requires escaped key text (`[EDD-9146]`), before the store.
-    const keysError = OffloadWrite.unescapedKeysError("Entity.bind", requirements)
-    if (keysError !== undefined) throw keysError
-    const codecError = unregisteredCodecError(
+    const ctx = bindingContext(
       "Entity.bind",
-      codecRequirements(
-        owner,
-        entity._packedFields.flatMap((field) => {
-          const storedAs = entity._packedGuards.find((g) => g.attribute === field)?.storedAs
-          return storedAs !== undefined && isPackedConfig(storedAs)
-            ? [[field as string, storedAs] as const]
-            : []
-        }),
-      ),
-      Context.getOrUndefined(baseCtx, Compression),
+      entity,
+      Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>()),
     )
-    if (codecError !== undefined) throw codecError
-    const storeError = OffloadWrite.missingStoreError(
-      "Entity.bind",
-      requirements,
-      Context.getOrUndefined(baseCtx, BlobStore),
-    )
-    if (storeError !== undefined) throw storeError
-    const ctx = Option.isSome(Context.getOption(baseCtx, SecureRandom.SecureRandom))
-      ? (baseCtx as Context.Context<DynamoClient | TableConfig | SecureRandom.SecureRandom>)
-      : Context.add(baseCtx, SecureRandom.SecureRandom, makeDefaultCrypto())
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -22023,7 +22074,7 @@ export const bind = <
       pathBuilder: boundPathBuilder(),
       conditionOps: createConditionOps(),
       provide,
-      captured: capturedServices(baseCtx),
+      captured: capturedServices(ctx),
     }
 
     // Helper: apply query combinators then execute

@@ -2904,7 +2904,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 
 A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, a `Date` or any other class instance — are refused at write; one of Effect's own instances a native attribute stores as a map, a `DateTime`, a look-alike, an `Option` or a `Result`, is written as that map, `storedFormOf`). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
-**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge), `Entity.bind`, `Aggregate.bind` and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
+**Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge), `Entity.bind`, `Aggregate.bind`, `EventStore.bind` and `GeoIndex.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
 **Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
 
@@ -2947,7 +2947,7 @@ The threshold compares stored bytes (after compression; default 65,536, `0` alwa
 
 **Checksum and streaming.** The pointer's checksum is CRC64NVME over the field's content (the bytes; for overflow, the uncompressed JSON), computed by a pure-JS implementation vendored in `@effect-dynamodb/schema` and sent to S3 for upload validation. It is S3's full-object checksum, identical for single `PUT` and multipart (chosen over the full-object CRC-32 / CRC-32C for width), and not tamper evidence: a match never skips a write, `rewritten` means probably identical, and immutable fields are confirmed structurally on a mismatch (a restated immutable that passes is dropped from the write). Binary inputs are `Uint8Array | Stream<Uint8Array> | BlobHandle | Offload.source(body, { contentType, contentLength })` (`Entity.Input` / `Create` / `Update` and every write builder type them so; the source's content type, else the field's `External` one, is the object's and the pointer's); a stream runs once, for one target, re-chunked into parts (default 8 MiB, raised for a known length) and uploaded by multipart written directly against `@aws-sdk/client-s3` at `uploadConcurrency` 4; interruption aborts the upload; a consumed stream is never replayed, and a stream given for a second field, item or operation is refused (`[EDD-9120]`); a source failure, or a stream longer or shorter than its `contentLength`, fails the write with `SourceFailed`; a lost multipart completion is reported to the observer (`completeLost`). A `BlobHandle` input is copied with the store's `copy` when it was read through the same store, else streamed into a `put`; an immutable binary field restated by a handle compares by checksum and size, and by a stream is refused.
 
-**Reads.** Default modes: overflow eager, binary lazy. `.offloaded("eager" | "lazy" | { overflow?, binary? })` on gets, queries, scans, collections, vector searches and CRUD builders — and `Entity.offloaded` / `Query.offloaded` for unbound ones — re-types the result through a trailing offload-state parameter on every builder: lazy overflow fields are `OffloadedValue<A>` (`read()`), lazy binary fields `BlobHandle` (`read` / `stream` with an optional `{ offset, length }`, `presignedUrl`, default expiry 15 minutes). Call it before `filterBy`, whose predicate is typed on the item (after it, or with an unknown mode from untyped code, it throws `[EDD-9117]`). Write results read in their builder's modes (the bound `GeoIndex.put`'s and a projection's row write, typed as the domain model, eagerly); error payloads (`current` items) are always lazy, with no store I/O. Auto-discovered collection accessors are typed with the offloaded fields of all the client's entities, since they are not typed per member. Eager values resolve in a page-level prefetch inside the query's `limit` window at the store's `readConcurrency` (16) and are verified by size and checksum (ranged reads are not). A projection that omits the field never fetches it. Aggregate reads and `GeoSearch.nearby` are eager for both kinds; ref hydration fetches only the target's offloaded fields the copy holds — those of an aggregate edge item (a `one` edge's entity, a `many` element given as an id), none for a ref copy — so an edge whose items hold none needs no store; EventStore reads are eager, `{ offloaded: "lazy" }` returning `LazyStreamEvent`. Stream-image and change-feed decoding is lazy by default (decision 5): `Entity.decodeMarshalledItem` (typed `Entity.Read<E, M>` for offloading entities; a pure definition now unpacks and dispatches pointers too), `stream.decodeStreamImage`, `EventProjection` / `MultiProjection` and `EventStore.processBatch` / `runChangeFeed` (`LazyStreamEvent` for streams with external `data`; `{ offloaded: "eager" }` to resolve). An eager EventStore default was considered and rejected. `Entity.decodeStreamRecord` returns both images and classifies each offloaded field `unchanged` (same ref) / `rewritten` (same checksum algorithm, checksum and size) / `changed` / `added` / `removed` without touching the store, requiring `NEW_AND_OLD_IMAGES` (`[EDD-9119]`, checked from the records).
+**Reads.** Default modes: overflow eager, binary lazy. `.offloaded("eager" | "lazy" | { overflow?, binary? })` on gets, queries, scans, collections, vector searches and CRUD builders — and `Entity.offloaded` / `Query.offloaded` for unbound ones — re-types the result through a trailing offload-state parameter on every builder: lazy overflow fields are `OffloadedValue<A>` (`read()`), lazy binary fields `BlobHandle` (`read` / `stream` with an optional `{ offset, length }`, `presignedUrl`, default expiry 15 minutes). Call it before `filterBy`, whose predicate is typed on the item (after it, or with an unknown mode from untyped code, it throws `[EDD-9117]`). Write results read in their builder's modes (the bound `GeoIndex.put`'s and a projection's row write, typed as the domain model, eagerly); error payloads (`current` items) are always lazy, with no store I/O. Auto-discovered collection accessors are typed with the offloaded fields of all the client's entities, since they are not typed per member. Eager values resolve in a page-level prefetch inside the query's `limit` window at the store's `readConcurrency` (16) — a bound per operation: `GeoSearch.nearby`'s parallel queries share one pool of it — and are verified by size and checksum (ranged reads are not). A projection that omits the field never fetches it. Aggregate reads and `GeoSearch.nearby` are eager for both kinds; ref hydration fetches only the target's offloaded fields the copy holds — those of an aggregate edge item (a `one` edge's entity, a `many` element given as an id), none for a ref copy — so an edge whose items hold none needs no store; EventStore reads are eager, `{ offloaded: "lazy" }` returning `LazyStreamEvent`. Stream-image and change-feed decoding is lazy by default (decision 5): `Entity.decodeMarshalledItem` (typed `Entity.Read<E, M>` for offloading entities; a pure definition now unpacks and dispatches pointers too), `stream.decodeStreamImage`, `EventProjection` / `MultiProjection` and `EventStore.processBatch` / `runChangeFeed` (`LazyStreamEvent` for streams with external `data`; `{ offloaded: "eager" }` to resolve). An eager EventStore default was considered and rejected. `Entity.decodeStreamRecord` returns both images and classifies each offloaded field `unchanged` (same ref) / `rewritten` (same checksum algorithm, checksum and size) / `changed` / `added` / `removed` without touching the store, requiring `NEW_AND_OLD_IMAGES` (`[EDD-9119]`, checked from the records).
 
 **Garbage collection (opt-in, `BlobGc`).** GC is table-local: a version is a member's own only when its key's partition and family hashes are the ones the member computes from its own table, so a restored or copied table never deletes its source's versions. The reaper (`gc.reap(records)`, a batch processor for Lambda, Pipes or the change feed) checks every record's view type, then frees each own pointer in `OldImage` not in `NewImage` after a grace (default 15 minutes, equal to the presign default; Lambda reapers set a shorter one): directly for plain entities, aggregate edges and EventStore snapshots, and for `retain`, `softDelete` and `timeSeries` members (or any entity with `confirm: "always"`) only after a confirm-read of the item family's explicit sort-key ranges, bracketed by strongly consistent reads of the live row so a concurrent restore cannot hide a holder *(confirmed, replacing the issue's free rules)*. The sweep (`gc.sweep(member, key)`) reads the family the same way, lists its own versions and deletes an unreferenced one only after a later pass finds it still unreferenced at least the grace (default 24 hours, ≥ `maxUploadAge` + 15 minutes) after it was marked; marks are object version tags. `gc.sweepStore()` lists the store and sweeps each own item family its metadata names. `purge` deletes the family's versions after its DynamoDB deletes succeed and a bracketed re-read finds them unreferenced. `NoncurrentVersionExpiration` and `Expiration` must never apply to the offload prefix; `AbortIncompleteMultipartUpload` is safe. Under replication, deletes by version are not replicated, so each region runs its own GC.
 
@@ -8474,16 +8474,19 @@ stream.pipe(EventStore.commandHandler(decider, { retry: 3 }))
 
 `GeoIndex` provides geospatial indexing and radius-based proximity search using H3 hexagonal grid. It wraps an entity with automatic geo field enrichment on writes and multi-cell parallel query on reads.
 
-### Client Gateway Pattern
+### Binding
 
-GeoIndex definitions are registered on a table and accessed through the typed client:
+A `GeoIndex` is made over an entity registered on a table, and bound with `GeoIndex.bind`, which resolves `DynamoClient | TableConfig` so every operation has `R = never`:
 
 ```typescript
-// Definition — binds geo config to entity definition
+// Definition — binds geo config to an entity's GSI
 const VehicleGeo = GeoIndex.make({
-  entity: VehiclesEntity,
+  entity: Vehicles,
   index: "byCell",
-  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  coordinates: (item) =>
+    item.latitude !== undefined && item.longitude !== undefined
+      ? { latitude: item.latitude, longitude: item.longitude }
+      : undefined,
   fields: {
     cell: { field: "cell", resolution: 15 },
     parentCell: { field: "parentCell", resolution: 3 },
@@ -8491,18 +8494,13 @@ const VehicleGeo = GeoIndex.make({
   },
 })
 
-// Register on table
-const MainTable = Table.make({
-  schema: AppSchema,
-  entities: { Vehicles: VehiclesEntity },
-  geoIndexes: { VehicleGeo },
-})
+// The entity is registered on its table as usual
+const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
 
-// Access through typed client
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make(MainTable)
-  yield* db.VehicleGeo.put({ vehicleId: "v-1", latitude: 37.77, longitude: -122.42, timestamp: now })
-  const results = yield* db.VehicleGeo.nearby({ center, radius: 2000, unit: "m" })
+  const vehicleGeo = yield* GeoIndex.bind(VehicleGeo)
+  yield* vehicleGeo.put({ vehicleId: "v-1", latitude: 37.77, longitude: -122.42, timestamp: now })
+  const results = yield* vehicleGeo.nearby({ center, radius: 2000, unit: "m" })
 })
 ```
 
@@ -8510,28 +8508,32 @@ As a service:
 
 ```typescript
 class VehicleSearch extends Context.Service<VehicleSearch>()("@fleet/VehicleSearch", {
-  make: Effect.gen(function* () {
-    const { VehicleGeo } = yield* DynamoClient.make(MainTable)
-    return VehicleGeo
-  }),
+  make: GeoIndex.bind(VehicleGeo),
 }) {}
 ```
+
+`GeoIndex.bind` checks its context as `Entity.bind` does — for an entity that offloads a field, a table schema setting `escapeKeys: true` (`[EDD-9146]`) and a `BlobStore` (`[EDD-9115]`); a codec the entity's `Packed` fields name (`[EDD-9078]`) — and bundles the default `SecureRandom` a `generatedId` put draws its id from.
 
 ### Layering
 
 GeoIndex composes Entity operations (for writes) and Query (for reads). It adds geo field enrichment and multi-cell search orchestration on top:
 
 ```
-db.VehicleGeo.put(input)
+geo.put(input)
   → enrich(input)           // compute H3 cell, parent cell, time partition
-  → Entity.put(enriched)    // delegate to entity
+  → Entity.put(enriched)    // delegate to entity (uploads offloaded fields)
 
-db.VehicleGeo.nearby(options)
+geo.nearby(options)
   → compute search cells    // H3 ring + prune
   → build N queries          // one per (timePartition, cell chunk)
   → execute in parallel     // via Query module
+  → decode each row         // the entity's own decoder: packed fields, renames,
+                            //   offloaded values resolved eagerly per page
+  → time window             // items whose source timestamp is in [start, end]
   → post-process            // distance filter + sort
 ```
+
+**Offloaded fields.** One item type serves a GeoIndex's inputs and its results, so `nearby` resolves overflow and binary fields eagerly and a binary field takes a `Uint8Array` on `put`. Its cell and time-partition queries run in parallel, but their store reads share one pool of the store's `readConcurrency` permits for the whole search; the values of every row a query returns are fetched, including rows the time window and the radius then drop. An entity that offloads adds `BlobStoreError` to `nearby` and to the bound `put`, whose errors are the entity put's own.
 
 ---
 
@@ -9100,7 +9102,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9075` | `Entity.ts` (schema) | A packed field is a `DynamoModel.ref` field |
 | `EDD-9076` | `Query.ts`, `Entity.ts`, `internal/BoundCrud.ts`, `Transaction.ts` | A condition, filter or projection addresses a path inside a packed attribute, or applies anything but `attribute_exists` / `attribute_not_exists` to it (thrown when the expression is built; EventStore messages point to `Query.filterBy`) |
 | `EDD-9077` | `Entity.ts` | An update applies anything but a whole-value `.set()` / `.remove()` to a packed field (`add`, `subtract`, `append`, `deleteFromSet`, any `path*` op), or copies one into another attribute (`pathSet` / `pathSubtract` with `isPath` + `valueSegments` naming it, 1.43.0) — a `ValidationError` at execution |
-| `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts` | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`), or in the registry an unbound stream's first operation runs with |
+| `EDD-9078` | `Compression.ts`, `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts`, `GeoIndex.ts` (geo) | A compressor registry is given two compressors for one codec, or a compressor whose `codec` is not `gzip` / `brotli` / `zstd`; or a codec a bound entity / aggregate edge / stream's `Packed` config names is not in the registry it binds with (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `GeoIndex.bind`), or in the registry an unbound stream's first operation runs with |
 | `EDD-9079` | `EventStore.ts` | `makeStream` `storedAs` declares a key other than `data`, or a `storedAs` / `snapshot.storedAs` value that is not a `DynamoModel.Packed(...)` config |
 | `EDD-9080` | `EventStore.ts` | `query.index` without `partition` for an index that derives its partition, or with one for a stream-scoped index (a defect; the first is unreachable from typed code) |
 | `EDD-9081` | `internal/EventProjection.ts`, `internal/MultiProjection.ts` | A projection the library cannot run: a `versioned`, `softDelete` or `timeSeries` read model, a checkpoint field the model lacks, a non-integer checkpoint offset, `removal` / `outbox` on a read model with `unique` constraints, `outbox` without `revision`, `checkpoints` declaring neither `field` nor `sources`, or an `outbox` operation on a projection without one |

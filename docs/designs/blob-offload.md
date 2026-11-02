@@ -1475,7 +1475,11 @@ The same batched step serves scans, collections (per member), `Batch.get`,
 `Transaction.transactGet`, `history()`, `versions()`, `deleted.list()`, vector search hits,
 EventStore event queries (`read`, `readFrom`, `readLatest`'s delta, `readIndex`,
 `query.events` / `query.index`), aggregate assembly (one partition) and `GeoSearch.nearby`
-(per cell query).
+(per cell query). `readConcurrency` bounds the reads one operation has in flight: where an
+operation resolves several batches at once — `GeoSearch.nearby`'s cell and time-partition
+queries run in parallel — they share one pool of `readConcurrency` permits for the whole
+operation (a store read takes one; a ledger cache hit none), as `Batch.get`'s groups stay
+within it by loading one after another.
 
 ### 8.3 Lazy handles
 
@@ -1494,7 +1498,7 @@ I/O.
 | raw projections (`select`, `selectPaths`, `Entity.project`, vector `select`) | overflow eager (parsed JSON wire form, as #147's raw rows), binary lazy | via the raw-row hook, which declares the offloaded attributes in `QueryRawRow.attributes`, so a projection that names none of them installs no hook and fetches nothing |
 | aggregate `get` / list / assembly | **both eager** | the assembled value is the user's aggregate schema and `update` re-validates the whole state through it (`Aggregate.ts` ~`:1606`). A handle there would fail a `Uint8Array` schema, and typing handles through nested sub-aggregates is out of this design (§23) |
 | EventStore reads (`read`, `readFrom`, `readLatest`, `readSnapshot`, `readIndex`, `fold`, `query.*`) | eager (event `data` and snapshot `state` are overflow values, eager by default per decision 5) | `ReadOptions.offloaded: "lazy"` / `Query.offloaded("lazy")` → `LazyStreamEvent` (§10.2) |
-| `GeoSearch.nearby` (geo package) | **both eager** | it decodes through the entity's own two-phase row decoder (unpack + resolve) instead of running `recordSchema` over the raw row (`GeoSearch.ts:107-116`), which also fixes #147's gap: geo reads do not unpack packed fields today. `GeoIndex<A, P>` uses one `A` for its input and its results, so a lazy handle cannot be typed there without splitting it; `GeoIndex.put` takes `Uint8Array` for binary fields, as aggregates do |
+| `GeoSearch.nearby` (geo package) | **both eager** | it decodes through the entity's own two-phase row decoder (unpack + resolve) instead of running `recordSchema` over the raw row (`GeoSearch.ts:107-116`), which also fixes #147's gap: geo reads do not unpack packed fields today. `GeoIndex<A, P>` uses one `A` for its input and its results, so a lazy handle cannot be typed there without splitting it; `GeoIndex.put` takes `Uint8Array` for binary fields, as aggregates do. *As built (commit 12):* each cell query's page resolves together (the entity's `_loadRows` as the query's prefetch), the parallel queries' store reads sharing one pool of the store's `readConcurrency` permits for the search (§8.2); under the time-window `filterBy`, that is every row the query returns, including rows the window and the radius then drop |
 | ref hydration (`hydrateRefs`) | lazy internally | the ref copy takes only the ref schema's fields (§15), so offloaded fields of the target are never fetched |
 | aggregate ref hydration | per copy, internally | an edge item copy (a `one` edge's entity, a `many` element given as an id) fetches only the target's offloaded fields its item holds — eagerly for a kind it holds whole, from lazy values otherwise — which the edge item re-uploads; the rest, and every offloaded field of a ref copy, are dropped unfetched |
 | projection engine `readRow` | eager internally | it folds over the row |
@@ -1694,7 +1698,9 @@ The rules:
   tuple keeps them typed. Callers of non-offloading entities see exactly today's unions.
 - **Geo.** `GeoIndex.put` (today the entity put's union hard-coded, `GeoIndex.ts:205-214`) adds
   the entity's `WriteBlobErrors`; `nearby` adds `BlobStoreError` when the entity offloads any
-  field (geo reads are eager for both kinds, §8.4).
+  field (geo reads are eager for both kinds, §8.4). *As built (commit 12):* the bound put's
+  union is the entity put builder's own error type, which carries its `WriteBlobErrors` (and
+  its refs' and vector indexes' errors, which the hard-coded union lacked).
 - **Collections** union their members' `ReadBlobErrors` under the collection query's modes.
 - **Aggregates**: `Aggregate.make` computes `TBlobErrors` from its edge entities' `TOffload`
   (`AggregateType` gains a trailing parameter), applied to every aggregate operation (reads are
@@ -2499,7 +2505,9 @@ the `[EDD-9078]` pattern:
 - **An unbound `EventStream`**, and **`EventStore.processBatch` / `runChangeFeed`** over
   streams that offload, check on their first operation per context (the `runtimeCodecCheck`
   `WeakSet` pattern, `Packed.ts:152-166`).
-- **`GeoIndex.bind`** checks the geo entity (geo reads resolve eagerly, §8.4).
+- **`GeoIndex.bind`** checks the geo entity (geo reads resolve eagerly, §8.4). *As built
+  (commit 12):* through the entity's own binding checks, so the `[EDD-9078]` codec check runs
+  there too (debt).
 - **`BlobGc.make`** checks its own context.
 - **`Batch` / `Transaction`** need no check of their own: bound builders carry the store they
   were bound with (§3.6 rule 1), and unbound ops follow the next rule.
@@ -3025,7 +3033,7 @@ stream; lazy handles (`read`, ranged `stream`, `presignedUrl` with an injected p
 | `guides/lifecycle.mdx` | retain / softDelete / restore share offloaded versions; turning either off needs `reaper.confirm: "always"` while history rows exist |
 | `guides/timeseries.mdx` | event-keyed objects; events without `ttl` keep their objects forever |
 | `guides/aggregates.mdx` | offloaded edge fields: eager reads, `Uint8Array` inputs, a changed group re-uploads |
-| `guides/geospatial.mdx` | `nearby` resolves offloaded fields eagerly |
+| `guides/geospatial.mdx` | `nearby` resolves offloaded fields eagerly, within the store's `readConcurrency` for the whole search; it fetches the offloaded values of every row its cell queries return, including rows the time window and the radius then drop (the window is a client predicate, §8.2), so a long window or a large radius over an offloading entity costs a GET per such row and value |
 | `guides/modeling.mdx` | `storedAs` options list gains `External` |
 | `guides/testing.mdx` | `BlobStore.memory` (versioning modes, `failures`, `inspect`, `TestClock`), MinIO for connected tests |
 | `reference/api-reference.mdx` | `BlobStore`, `Offload`, `BlobGc`, `effect-dynamodb/blob/s3`, `DynamoModel.External`, `Packed({ external })`, `BlobStoreError` |
@@ -3803,6 +3811,103 @@ a write path, deletes the gate.
 12. **Geo** — `GeoSearch.nearby` decoding through the entity's two-phase decoder (fixing the
     #147 packed gap), eager resolution, `GeoIndex.put` binary input, `GeoIndex.bind` check,
     error unions.
+    *Implementation notes (commit 12):*
+    - `GeoSearch.nearby` decodes each row with the entity's `_decodeRecord` — the full read
+      pipeline of its own queries: load (unpack + resolve), sparse rebuild, renames, schema
+      decode, the model's class — under `Query.offloaded("eager")`, set before the
+      time-window `filterBy` (`[EDD-9117]`). The entity's `_loadRows` is the query's page
+      prefetch (none when `_readAttributes` is empty), so a cell query's page resolves its
+      pointers together, and the store reads of all the search's parallel queries share one
+      pool of the store's `readConcurrency` permits (§8.2). Load and blob failures name
+      the operation `GeoSearch.decode`; the entity's schema-decode failure (operation
+      `decode`) is renamed to `GeoSearch.decode`, which geo decode failures have always named.
+      `GeoEntity` and `SearchConfig` drop `schemas` and require `_decodeRecord`, `_loadRows`,
+      `_readAttributes` and `_bindContext`, plus the type-only `_offloadFields`.
+    - The time window is a client predicate (#169), so acceptance is known only after decode:
+      the eager prefetch fetches the offloaded values of every row a cell query returns,
+      including rows the window and then the radius drop — as any eager `filterBy` query does
+      (§8.2), and geo takes no mode. Item 18's geospatial guide says so.
+    - Types: `GeoIndex<A, P, TBlobErrors = never>`. `make` infers the entity's `TOffload` from
+      its phantom `_offloadFields`; its item type is `GeoItem<A, TOffload>`, the entity's put
+      input with each binary field narrowed from `Offload.BinaryInput` back to its bytes
+      (exactly `A` for an entity without binary fields), used for `put`, `enrich`,
+      `coordinates` and `nearby`'s results; and `TBlobErrors` is
+      `GeoBlobErrors<TOffload>` (= `WriteBlobErrors`: `BlobStoreError` when the entity
+      offloads anything, since geo reads are eager for both kinds), which `nearby` adds.
+      `BoundGeoIndex<A, TBlobErrors = never, TPutError = GeoPutError | TBlobErrors>`, and
+      `bind` sets `TPutError` to `GeoPutErrorOf<P>`: the entity put builder's own error type,
+      which carries its `WriteBlobErrors`. An annotated `BoundGeoIndex<A>` keeps the previous
+      put union (`GeoPutError`) and `nearby` union.
+    - `GeoIndex.bind` binds through the entity's new internal `_bindContext("GeoIndex.bind",
+      context)`: the `[EDD-9146]` escaped-key-text, `[EDD-9078]` codec and `[EDD-9115]` store
+      checks of `Entity.bind`, which moved out of `Entity.bind` into `bindingContext` (both
+      call it), then the default `SecureRandom` when the context has none (port onto 1.42.2:
+      Effect 4.1 has no `Crypto` service). A store or registry in context at bind wins over a
+      run-time one (§3.6 rule 2): the bound operations run under the captured context.
+    - Binary inputs: the GeoIndex `put` types a binary field `Uint8Array` (§8.4). A `Stream`,
+      `BlobHandle` or `Offload.source(...)` from untyped code reaches the entity's put, which
+      prepares and uploads it as on any entity put (commit 10's input path); geo refuses none
+      of them — unlike an aggregate, whose decode and diff run over domain values, nothing in
+      geo reads the input's binary value.
+    - Tests: `packages/effect-dynamodb-geo/test/GeoIndex.offload.test.ts` (13): eager overflow
+      and binary values through bound and unbound `nearby` (with fetch counts), inline values
+      with no fetch, packed, renamed and sparse-map fields (the #147 gap), a page's values
+      fetched concurrently, `NotProvided` and `NotFound`, the `GeoSearch.decode`
+      `ValidationError`, the bound put of a binary field, `[EDD-9146]` (port onto 1.42.2),
+      `[EDD-9115]` and `[EDD-9078]` at bind, the bind-time store's precedence and a `generatedId` entity's bound put.
+      `GeoIndex.types.test.ts` gains the error unions and the item type (§19.3's `GeoIndex.put`
+      / `nearby` row — in the geo package, which owns the types). The geo package's connected
+      config now runs `test/connected*.test.ts`; the new `test/connected.offload.test.ts` (2)
+      stores pointers and reads them eagerly through `nearby` against DynamoDB Local (with the
+      in-memory store; MinIO end to end is item 17's) and covers the #147 gap there. The geo
+      tests' `test/helpers/OffloadGate.ts` reads the gate by its key, shared with
+      `GeoIndex.ledger.test.ts` (whose offloading bind now provides a store, `[EDD-9115]`).
+    *Deviations (commit 12):*
+    - Commit 10's follow-up proposed `WithBinaryInput` on the GeoIndex input types; not taken.
+      §8.4 and §23 row 58 type a binary field `Uint8Array` on `GeoIndex.put`, because one `A`
+      types both the inputs and the eager results. Since commit 10 widened the entity put's
+      input, `make` narrows it back (`GeoItem`); otherwise `nearby`'s results would have typed
+      a binary field as every `BinaryInput`.
+    - The bound put's errors are the entity put builder's (`GeoPutErrorOf<P>`) instead of
+      §9.3's hard-coded union plus `WriteBlobErrors`: the same `BlobStoreError`, and the refs'
+      and vector indexes' errors the hard-coded union lacked (debt below).
+    - `GeoIndex.bind` also runs the `[EDD-9078]` codec check; §13 named only the store check.
+      Recorded in §13 and `DESIGN.md`'s `[EDD-9078]` row and compressors paragraph.
+    - The type tests are in the geo package's `GeoIndex.types.test.ts`, not
+      `test/Offload.types.test.ts` (§19.3): the geo types are not visible from the core
+      package's tests.
+    *Debt fixed (commit 12):*
+    - `nearby` ran the record schema over the raw stored row. Besides packed fields (the #147
+      gap, row 71), a `field` rename and a `SparseMap` field failed every row (`Missing key`:
+      neither was mapped back from its stored attributes), and the version-corruption check
+      never ran; results also came back as plain objects, not the model's class. They now
+      decode as the entity's own queries decode.
+    - The bound put's hard-coded error union omitted the entity's `RefErrors` and
+      `VectorErrors`.
+    - `GeoIndex.bind` did not bundle the default `SecureRandom` (`Crypto` before Effect 4.1)
+      that `Entity.bind` does, so the bound put of a `generatedId` geo entity died with a
+      missing service.
+    - `GeoIndex.bind` skipped the `[EDD-9078]` codec check that `Entity.bind` gained in
+      commit 7.
+    - `DESIGN.md §13` showed a `geoIndexes` table option and a `db.VehicleGeo` accessor from
+      `DynamoClient.make(MainTable)`, neither of which exists; it now shows `GeoIndex.bind`,
+      the decode step and the offloaded-field rules.
+    *Review fixes (commit 12):* `nearby` runs its cell and time-partition queries in parallel
+    (unbounded) and each query's prefetch resolved at the store's `readConcurrency`, so a
+    search held up to queries × `readConcurrency` GETs in flight (12 for 6 partitions at
+    `readConcurrency: 2`). The resolver now takes an optional permit pool
+    (`ResolveOptions.permits`, through `OffloadRead.LoadOptions` and the entity's
+    `_loadRows`): a store read takes a permit, a ledger cache hit none. `nearby` sizes one pool
+    to the store's `readConcurrency` per search and hands it to every query's prefetch, so the
+    queries still run in parallel and the store sees at most `readConcurrency` reads (§8.2);
+    pinned by a six-partition test (exactly `readConcurrency` in flight) and a resolver test
+    (three parallel resolutions sharing a pool). `BlobStoreService.readConcurrency` is
+    documented per operation, as `writeConcurrency` is. `GeoPutErrorOf<any>` was `unknown`
+    (the conditional distributes over `any`), so binding a `GeoIndex<A, any>` — a
+    `GeoEntity<A, any>`, as the package's own mock is — typed the bound put's errors
+    `unknown`; it guards `any` (§9.3: `any` contributes nothing) and gives `GeoPutError`. §22
+    lists the commit's visible geo changes for code that offloads nothing, and §20's
+    geospatial row the eager cost of rows the window and radius drop.
 13. **EventStore** — data / state offload, append / `commandHandler` / `writeSnapshot` /
     `measure*`, reads + `offloaded` option and `Query.offloaded` on `query.events`,
     `decodeStreamImage` / projections / `processBatch` / `runChangeFeed` lazy by default with
@@ -3843,6 +3948,21 @@ a write path, deletes the gate.
 - **`isBase64PackedText`** accepts `Q`–`X` too; JSON text is never affected.
 - **Packed and geo reads.** `Entity.decodeMarshalledItem` on pure definitions and
   `GeoSearch.nearby` now unpack #147 packed fields, which they returned raw before (a bug fix).
+- **Geo** (commit 12), for a geo entity that offloads nothing:
+  - **`nearby` results** are decoded as the entity's own queries decode them: instances of
+    the model's class (plain objects before), with `field` renames and `SparseMap` fields read
+    back (every such row failed before) and the version-corruption check run (bug fixes).
+  - **`GeoIndex.bind`** runs `Entity.bind`'s configuration checks: a compressed `Packed`
+    field whose codec is not registered is the `[EDD-9078]` defect at bind, where before bind
+    succeeded and each read failed with a `ValidationError` (mirroring commit 7's `Entity.bind`
+    change). It also bundles the default `SecureRandom`, so the bound put of a `generatedId`
+    entity no longer dies with a missing service (a bug fix).
+  - **The exported `GeoEntity` interface** drops `schemas` and requires `_decodeRecord`,
+    `_loadRows`, `_readAttributes` and `_bindContext` (plus the type-only `_offloadFields`).
+    An effect-dynamodb `Entity` provides them; a hand-written stand-in (a test mock) must add
+    them. The bound put's errors are now the entity put's own (`GeoPutErrorOf<P>`), which adds
+    its refs' and vector indexes' errors the fixed union lacked; an annotated
+    `BoundGeoIndex<A>` and a type-erased (`any`) put builder keep the fixed union.
 - **Bound builders in `Batch` / `Transaction`** now use the compressor registry they were bound
   with, not the ambient one (a bug fix; identical when only one registry exists).
 

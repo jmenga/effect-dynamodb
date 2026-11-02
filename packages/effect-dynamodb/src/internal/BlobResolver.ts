@@ -7,11 +7,13 @@
  * 2. **Resolve** (here, effectful, batched over a page, a batch response, a
  *    partition or one item) turns every placeholder into its value per the
  *    read's modes ({@link resolveRows}):
- *    - **eager** — fetch at the store's `readConcurrency` (failing a read as
- *      soon as it runs past the pointer's size), verify the object's
- *      size and the CRC-64/NVME of its content (§8.6), decompress, then
- *      `JSON.parse` (overflow) or the bytes (binary). What the operation
- *      itself uploaded comes from the upload ledger's read cache, unfetched;
+ *    - **eager** — fetch at the store's `readConcurrency` (within permits
+ *      shared across an operation's parallel resolutions, when it passes
+ *      them; failing a read as soon as it runs past the pointer's size),
+ *      verify the object's size and the CRC-64/NVME of its content (§8.6),
+ *      decompress, then `JSON.parse` (overflow) or the bytes (binary). What
+ *      the operation itself uploaded comes from the upload ledger's read
+ *      cache, unfetched;
  *    - **lazy** — an `OffloadedValue` (overflow) or `BlobHandle` (binary): no
  *      I/O until `read()` / `stream()`, which fetch, verify and decode each
  *      call with the store and compressor registry of the fiber that resolved
@@ -41,7 +43,7 @@ import type {
 import { crc64nvme, make as makeCrc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
 import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { notRegistered } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Context, Duration, Effect, Option, Stream } from "effect"
+import { Context, Duration, Effect, Option, Semaphore, Stream } from "effect"
 import { BlobStore } from "../BlobStore.js"
 import { type BlobCallContext, blobError, call, callStream } from "./BlobCalls.js"
 import * as BlobLedger from "./BlobLedger.js"
@@ -134,6 +136,14 @@ export interface ResolveOptions {
   readonly decode?:
     | ((field: string, wire: unknown) => Effect.Effect<unknown, ValidationError>)
     | undefined
+  /**
+   * Permits shared with the operation's other resolutions running at the same
+   * time — sized to the store's `readConcurrency` by an operation that
+   * resolves several batches in parallel (`GeoIndex.nearby`'s cell and time
+   * partition queries): each store read takes one, so the reads in flight
+   * across them stay within it. Default: this resolution's own limit.
+   */
+  readonly permits?: Semaphore.Semaphore | undefined
 }
 
 /** What a resolution captured from the fiber that ran it. */
@@ -316,12 +326,14 @@ const isBlobStoreError = (value: unknown): value is BlobStoreError =>
 
 /**
  * The verified content `pointer` names: from the ledger's read cache when the
- * operation uploaded it, else fetched from the store.
+ * operation uploaded it, else fetched from the store — under one of
+ * `permits`, when given (a cache hit takes none).
  */
 const fetchContent = (
   env: Environment,
   pointer: BlobPointer,
   ctx: BlobCallContext,
+  permits?: Semaphore.Semaphore,
 ): Effect.Effect<BlobContent, BlobStoreError | ValidationError> => {
   const cached = BlobLedger.cached(env.ledger, pointer.ref)
   if (cached !== undefined) {
@@ -332,9 +344,10 @@ const fetchContent = (
   }
   const store = env.store
   if (store === undefined) return Effect.fail(notProvided(ctx, "get", pointer.ref))
-  return Effect.flatMap(getObject(store, pointer, ctx), (object) =>
+  const fetched = Effect.flatMap(getObject(store, pointer, ctx), (object) =>
     lift(verify(pointer, object, env.registry, ctx)),
   )
+  return permits === undefined ? fetched : Semaphore.withPermit(permits, fetched)
 }
 
 /** Parse JSON content to its wire form. */
@@ -620,9 +633,9 @@ const contextOf = (options: ResolveOptions, pending: PendingBlob): BlobCallConte
 
 /**
  * Resolve `pendings` per `options.modes`, in order: the eager ones fetched
- * together at the store's `readConcurrency` (the ledger's read cache first),
- * the lazy ones as handles capturing the fiber's store and compressor
- * registry.
+ * together at the store's `readConcurrency` (the ledger's read cache first;
+ * within `options.permits` too, when given), the lazy ones as handles
+ * capturing the fiber's store and compressor registry.
  */
 export const resolveAll = (
   pendings: ReadonlyArray<PendingBlob>,
@@ -652,7 +665,7 @@ export const resolveAll = (
       (i) => {
         const pending = pendings[i]!
         const ctx = contextOf(options, pending)
-        return fetchContent(env, pending.pointer, ctx).pipe(
+        return fetchContent(env, pending.pointer, ctx, options.permits).pipe(
           Effect.flatMap((content) => valueOf(content, ctx)),
           Effect.tap((value) =>
             Effect.sync(() => {
