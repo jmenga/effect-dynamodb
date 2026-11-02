@@ -12,7 +12,6 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Schema } from "effect"
 import { describe, expect, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
-import { ZOrder } from "../src/index.js"
 import {
   batchEntries,
   type Diagnosis,
@@ -772,7 +771,7 @@ describe("WriteDiagnosis (#144)", () => {
           sk: {
             field: "gsi1sk",
             prefix: ["agencyId"],
-            zorder: [ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 })],
+            zorder: [{ field: "price", min: 0, max: 5_000_000, step: 1_000 }],
           },
         },
       },

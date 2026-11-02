@@ -21,7 +21,6 @@ import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import { ZOrder } from "../src/index.js"
 import type { RangeBound } from "../src/internal/BoundQuery.js"
 import * as Cursor from "../src/internal/Cursor.js"
 import * as Query from "../src/Query.js"
@@ -55,8 +54,8 @@ class Cell extends Schema.Class<Cell>("Cell")({
   y: Schema.Number,
 }) {}
 
-const xDim = ZOrder.int("x", { min: 0, max: 7 })
-const yDim = ZOrder.int("y", { min: 0, max: 7 })
+const xDim = { field: "x", min: 0, max: 7 } as const
+const yDim = { field: "y", min: 0, max: 7 } as const
 
 const Cells = Entity.make({
   model: Cell,

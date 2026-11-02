@@ -326,9 +326,9 @@ describe("EntityResolver", () => {
         field: "gsi2sk",
         prefix: ["agencyId", { field: "officeId", hash: 8 }],
         zorder: [
-          ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-          ZOrder.int("bedrooms", { min: 0, max: 15 }),
-          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+          { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+          { field: "bedrooms", min: 0, max: 15 },
+          { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
         ],
       }`)
       expect(search).toBeDefined()
@@ -346,7 +346,7 @@ describe("EntityResolver", () => {
 
     it("resolves a Z-order key without a prefix", () => {
       const search = resolveSearch(
-        `{ field: "gsi2sk", zorder: [ZOrder.int("price", { min: 0, max: 9 })] }`,
+        `{ field: "gsi2sk", zorder: [{ field: "price", min: 0, max: 9 }] }`,
       )
       expect(search!.sk.composite).toEqual(["price"])
       expect(search!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"] })
@@ -356,8 +356,8 @@ describe("EntityResolver", () => {
       const search = resolveSearch(
         `{ field: "gsi2sk", prefix: [agency, { field: office, hash: 2 }], zorder: facets }`,
         `
-        const price = ZOrder.int("price", { min: 0, max: 9 })
-        const facets = [price, ZOrder.int("bedrooms", { min: 0, max: 15 })] as const
+        const price = { field: "price", min: 0, max: 9 }
+        const facets = [price, { field: "bedrooms", min: 0, max: 15 }] as const
         const agency = "agencyId"
         const office = "officeId"
         `,
@@ -379,22 +379,34 @@ describe("EntityResolver", () => {
       })
       expect(isZOrderHalf(built!.sk)).toBe(true)
       const partly = resolveSearch(
-        `{ field: "gsi2sk", prefix: [agency], zorder: [ZOrder.int("price", { min: 0, max: 9 }), beds] }`,
+        `{ field: "gsi2sk", prefix: [agency], zorder: [{ field: "price", min: 0, max: 9 }, beds] }`,
       )
       expect(partly!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"], unresolved: true })
       expect(partly!.sk.composite).toEqual(["price"])
     })
 
-    it("reads a dimension's field from its type across files", () => {
-      // A real checker: the dimensions come from helpers in another module.
+    it("reads a bare name and a dimension in the same list", () => {
+      const search = resolveSearch(
+        `{ field: "gsi2sk", zorder: ["status", { field: "price", min: 0, max: 9 }, status2] }`,
+        `const status2 = "furnished"`,
+      )
+      expect(search!.sk.zorder).toEqual({
+        prefix: [],
+        dimensions: ["status", "price", "furnished"],
+      })
+    })
+
+    it("reads an entry's field from its type across files", () => {
+      // A real checker: the entries come from helpers in another module.
       const files: Record<string, string> = {
         "/virtual/dims.ts": `
-          type Dimension<F extends string> = { readonly field: F; readonly bits: number }
-          const int = <F extends string>(field: F): Dimension<F> => ({ field, bits: 8 })
-          export const makePrice = () => int("price")
+          type Range<F extends string> = { readonly field: F; readonly min: number; readonly max: number }
+          const range = <F extends string>(field: F): Range<F> => ({ field, min: 0, max: 9 })
+          export const makePrice = () => range("price")
           export const price = makePrice()
-          export const facets = [int("bedrooms"), int("listedAt")] as const
-          export const makeFacets = () => [price, int("bedrooms")] as const
+          export const status = "status" as const
+          export const facets = [range("bedrooms"), range("listedAt"), status] as const
+          export const makeFacets = () => [price, range("bedrooms")] as const
         `,
         "/virtual/entity.ts": `
           import { facets, makeFacets, price } from "./dims"
@@ -437,7 +449,7 @@ describe("EntityResolver", () => {
       expect(listings!.indexes.byPrice!.sk.zorder).toEqual({ prefix: [], dimensions: ["price"] })
       expect(listings!.indexes.byFacets!.sk.zorder).toEqual({
         prefix: [],
-        dimensions: ["bedrooms", "listedAt"],
+        dimensions: ["bedrooms", "listedAt", "status"],
       })
       expect(listings!.indexes.byBuilt!.sk.zorder).toEqual({
         prefix: [],

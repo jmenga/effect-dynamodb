@@ -16,7 +16,6 @@
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import type * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import * as Query from "../Query.js"
@@ -390,14 +389,34 @@ export type RangeBound<V> =
   | Only<{ readonly gte: V; readonly lte: V }>
 
 /**
- * A `.within()` bound on one dimension of a Z-order sort key (#171): a
- * {@link RangeBound} in the field's own type — for a `literals` dimension by
- * declaration order — and, for a `literals` dimension only, a set of members.
+ * The members of a literals dimension entry `D` over a field of type `V`: its
+ * declared `values`, else the field's members. `never` for any other entry (a
+ * range, a date-time window, a byte width).
  */
-export type DimensionBound<D, V> =
-  D extends ZOrder.Dimension<any, "literals", infer L>
-    ? RangeBound<L> | Only<{ readonly in: ReadonlyArray<L> }>
-    : RangeBound<V>
+type LiteralsEntryMembers<D, V> = D extends string
+  ? Exclude<V, undefined>
+  : D extends
+        | { readonly min: unknown }
+        | { readonly max: unknown }
+        | { readonly from: unknown }
+        | { readonly unit: unknown }
+        | { readonly bytes: unknown }
+    ? never
+    : D extends { readonly values: ReadonlyArray<infer L> }
+      ? L
+      : Exclude<V, undefined>
+
+/**
+ * A `.within()` bound on one dimension of a Z-order sort key (#171), declared
+ * as entry `D` over a field of type `V`: a {@link RangeBound} in the field's
+ * own type — for a literals dimension by its members' order — and, for a
+ * literals dimension only, a set of members.
+ */
+export type DimensionBound<D, V> = [LiteralsEntryMembers<D, V>] extends [never]
+  ? RangeBound<V>
+  :
+      | RangeBound<LiteralsEntryMembers<D, V>>
+      | Only<{ readonly in: ReadonlyArray<LiteralsEntryMembers<D, V>> }>
 
 export interface WithinOptions {
   /**

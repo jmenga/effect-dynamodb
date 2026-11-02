@@ -92,13 +92,21 @@ export type {
   VectorSourceConfig,
 } from "@effect-dynamodb/schema/VectorIndex.js"
 export * as VectorIndex from "@effect-dynamodb/schema/VectorIndex.js"
+export type * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 export type {
+  AnyDimension,
+  DateTimeDimension,
   DateTimeUnit,
   Dimension,
+  DimensionFor,
   DimensionKind,
+  ListedLiteralsDimension,
+  LiteralsDimension,
+  LiteralValue,
+  NumericDimension,
   PrefixPart,
+  StringDimension,
 } from "@effect-dynamodb/schema/ZOrder.js"
-export * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "./Aggregate.js"
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"

@@ -112,10 +112,18 @@ export type {
   VectorSourceConfig,
 } from "./VectorIndex.js"
 export * as VectorIndex from "./VectorIndex.js"
+export type * as ZOrder from "./ZOrder.js"
 export type {
+  AnyDimension,
+  DateTimeDimension,
   DateTimeUnit,
   Dimension,
+  DimensionFor,
   DimensionKind,
+  ListedLiteralsDimension,
+  LiteralsDimension,
+  LiteralValue,
+  NumericDimension,
   PrefixPart,
+  StringDimension,
 } from "./ZOrder.js"
-export * as ZOrder from "./ZOrder.js"

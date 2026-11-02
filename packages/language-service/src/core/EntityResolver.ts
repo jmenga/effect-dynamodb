@@ -621,14 +621,14 @@ function resolveKeyPart(
 /**
  * Parse a Z-order sort key's `zorder` / `prefix` from its object literal:
  *
- * - `zorder: [ZOrder.int("price", …), ZOrder.dateTime("listedAt", …)]` — each
- *   dimension's field is its constructor's first (string) argument. A
- *   dimension or list held in a variable is followed through `lookup`, and
- *   failing that read from its type (`Dimension<"price">`'s `field`);
- * - `prefix: ["agencyId", { field: "officeId", hash: 8 }]`, followed the same way.
+ * - `zorder: [{ field: "price", min: 0, max: 100 }, "status"]` — each entry is
+ *   a bare field name or an object naming its `field`;
+ * - `prefix: ["agencyId", { field: "officeId", hash: 8 }]`, the same two forms.
  *
- * `undefined` when the half declares no `zorder`. A part that can't be read
- * leaves the marker `unresolved`, never guessed.
+ * An entry or list held in a variable is followed through `lookup`, and
+ * failing that read from its type (a `"status"` literal, or an entry type
+ * whose `field` is one). `undefined` when the half declares no `zorder`. A
+ * part that can't be read leaves the marker `unresolved`, never guessed.
  */
 export function resolveZOrderFields(
   ts: typeof import("typescript"),
@@ -667,53 +667,10 @@ function extractDimensionFields(
 ): Fields {
   const list = lookup?.resolve(expr) ?? expr
   if (!ts.isArrayLiteralExpression(list)) {
-    // Not written as a list: the checker may still know its tuple of dimensions.
-    return dimensionTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
+    // Not written as a list: the checker may still know its tuple of entries.
+    return entryTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
   }
-  const fields: Array<string> = []
-  let complete = true
-  for (const el of list.elements) {
-    const declared = lookup?.resolve(el) ?? el
-    const field =
-      ts.isCallExpression(declared) && declared.arguments.length > 0
-        ? extractStringLiteral(ts, declared.arguments[0]!)
-        : undefined
-    const read = field ?? dimensionFieldOfType(lookup?.checker, el)
-    if (read === undefined) complete = false
-    else fields.push(read)
-  }
-  return { fields, complete }
-}
-
-/** A dimension's field from its type: `Dimension<"price">`'s `field`, when a string literal. */
-function dimensionFieldOfType(
-  checker: ts.TypeChecker | undefined,
-  node: ts.Node,
-): string | undefined {
-  if (checker === undefined) return undefined
-  return literalField(checker, checker.getTypeAtLocation(node), node)
-}
-
-function literalField(checker: ts.TypeChecker, type: ts.Type | undefined, node: ts.Node) {
-  const field = type?.getProperty("field")
-  if (field === undefined) return undefined
-  const fieldType = checker.getTypeOfSymbolAtLocation(field, node)
-  return fieldType.isStringLiteral() ? fieldType.value : undefined
-}
-
-/** The fields of a tuple of dimensions, from the type of `node`. */
-function dimensionTupleFields(
-  checker: ts.TypeChecker | undefined,
-  node: ts.Node,
-): Fields | undefined {
-  if (checker === undefined) return undefined
-  const type = checker.getTypeAtLocation(node)
-  if (type === undefined || !checker.isTupleType(type)) return undefined
-  const read = checker
-    .getTypeArguments(type as ts.TypeReference)
-    .map((element) => literalField(checker, element, node))
-  const fields = read.filter((field): field is string => field !== undefined)
-  return { fields, complete: fields.length === read.length }
+  return extractEntryFields(ts, list, lookup)
 }
 
 function extractPrefixFields(
@@ -722,29 +679,72 @@ function extractPrefixFields(
   lookup: ExpressionLookup | undefined,
 ): Fields {
   const list = lookup?.resolve(expr) ?? expr
-  if (!ts.isArrayLiteralExpression(list)) return { fields: [], complete: false }
+  if (!ts.isArrayLiteralExpression(list)) {
+    return entryTupleFields(lookup?.checker, list) ?? { fields: [], complete: false }
+  }
+  return extractEntryFields(ts, list, lookup)
+}
+
+/** The field of each entry of a `zorder` / `prefix` list: a bare name or `{ field, … }`. */
+function extractEntryFields(
+  ts: typeof import("typescript"),
+  list: ts.ArrayLiteralExpression,
+  lookup: ExpressionLookup | undefined,
+): Fields {
   const fields: Array<string> = []
   let complete = true
   for (const el of list.elements) {
-    const part = lookup?.resolve(el) ?? el
-    const name = extractStringLiteral(ts, part)
-    if (name !== undefined) {
-      fields.push(name)
-      continue
-    }
-    const fieldProp = ts.isObjectLiteralExpression(part)
-      ? part.properties.find(
-          (p): p is ts.PropertyAssignment =>
-            ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === "field",
-        )
-      : undefined
-    const field = fieldProp
-      ? extractStringLiteral(ts, lookup?.resolve(fieldProp.initializer) ?? fieldProp.initializer)
-      : undefined
+    const field = entryField(ts, el, lookup)
     if (field === undefined) complete = false
     else fields.push(field)
   }
   return { fields, complete }
+}
+
+function entryField(
+  ts: typeof import("typescript"),
+  el: ts.Expression,
+  lookup: ExpressionLookup | undefined,
+): string | undefined {
+  const part = lookup?.resolve(el) ?? el
+  const name = extractStringLiteral(ts, part)
+  if (name !== undefined) return name
+  if (ts.isObjectLiteralExpression(part)) {
+    const fieldProp = part.properties.find(
+      (p): p is ts.PropertyAssignment =>
+        ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === "field",
+    )
+    const field = fieldProp
+      ? extractStringLiteral(ts, lookup?.resolve(fieldProp.initializer) ?? fieldProp.initializer)
+      : undefined
+    if (field !== undefined) return field
+  }
+  const checker = lookup?.checker
+  return checker === undefined
+    ? undefined
+    : entryFieldOfType(checker, checker.getTypeAtLocation(el), el)
+}
+
+/** An entry's field from its type: a string literal, or an object whose `field` is one. */
+function entryFieldOfType(checker: ts.TypeChecker, type: ts.Type | undefined, node: ts.Node) {
+  if (type === undefined) return undefined
+  if (type.isStringLiteral()) return type.value
+  const field = type.getProperty("field")
+  if (field === undefined) return undefined
+  const fieldType = checker.getTypeOfSymbolAtLocation(field, node)
+  return fieldType.isStringLiteral() ? fieldType.value : undefined
+}
+
+/** The fields of a tuple of entries, from the type of `node`. */
+function entryTupleFields(checker: ts.TypeChecker | undefined, node: ts.Node): Fields | undefined {
+  if (checker === undefined) return undefined
+  const type = checker.getTypeAtLocation(node)
+  if (type === undefined || !checker.isTupleType(type)) return undefined
+  const read = checker
+    .getTypeArguments(type as ts.TypeReference)
+    .map((element) => entryFieldOfType(checker, element, node))
+  const fields = read.filter((field): field is string => field !== undefined)
+  return { fields, complete: fields.length === read.length }
 }
 
 // --- Extraction helpers ---

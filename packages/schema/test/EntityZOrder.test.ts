@@ -13,7 +13,7 @@ import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import type { DimensionStorage } from "../src/internal/ZOrderCurve.js"
 import * as KeyComposer from "../src/KeyComposer.js"
-import * as ZOrder from "../src/ZOrder.js"
+import type * as ZOrder from "../src/ZOrder.js"
 
 const schema = DynamoSchema.make({ name: "myapp", version: 1 })
 
@@ -27,7 +27,7 @@ const withZOrder = (
   fields: Schema.Struct.Fields,
   sk: {
     readonly prefix?: ReadonlyArray<ZOrder.PrefixPart>
-    readonly zorder: ReadonlyArray<ZOrder.Dimension>
+    readonly zorder: ReadonlyArray<ZOrder.AnyDimension>
   },
   options?: { readonly collection?: string },
 ) =>
@@ -39,7 +39,8 @@ const withZOrder = (
       search: {
         name: "gsi2",
         pk: { field: "gsi2pk", composite: ["region"] },
-        sk: { field: "gsi2sk", ...sk } as KeyComposer.ZOrderKeyPart,
+        // The fields vary per test, so the entries are checked at runtime only.
+        sk: { field: "gsi2sk", ...sk } as never,
         ...(options?.collection !== undefined && { collection: options.collection }),
       },
     },
@@ -76,9 +77,9 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
             field: "gsi2sk",
             prefix: ["agencyId"],
             zorder: [
-              ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-              ZOrder.int("bedrooms", { min: 0, max: 15 }),
-              ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+              { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+              { field: "bedrooms", min: 0, max: 15 },
+              { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
             ],
           },
         },
@@ -111,9 +112,13 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expectTypeOf<Composite[3]>().toEqualTypeOf<"listedAt">()
     })
 
-    it("keeps the declared Dimension values, so one declaration can serve several entities", () => {
+    it("keeps the declared entries, checked, beside the bound layout", () => {
       const half = Listings.indexes.search.sk as KeyComposer.ZOrderSkPart
-      expect(half.zorderHalf.dimensions.every((d) => ZOrder.isDimension(d))).toBe(true)
+      expect(half.zorderHalf.dimensions.map((d) => [d.shape, d.field])).toEqual([
+        ["range", "price"],
+        ["range", "bedrooms"],
+        ["dateTime", "listedAt"],
+      ])
     })
   })
 
@@ -132,10 +137,10 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
         Schema.BigIntFromString,
         { _tag: "NumericString", numeric: "bigint" },
       ],
-    ])("ZOrder.int over %s", (_, field, storage) => {
+    ])("a range over %s", (_, field, storage) => {
       const entity = withZOrder(
         { price: field },
-        { zorder: [ZOrder.int("price", { min: 0, max: 1000 })] },
+        { zorder: [{ field: "price", min: 0, max: 1000 }] },
       )
       expect(storagesOf(entity)).toEqual([storage])
     })
@@ -150,10 +155,10 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       ["DynamoModel.DateString", DynamoModel.DateString, { _tag: "UtcIsoString" }],
       ["Schema.DateTimeUtcFromString", Schema.DateTimeUtcFromString, { _tag: "UtcIsoString" }],
       ["DynamoModel.DateTimeZoned", DynamoModel.DateTimeZoned, { _tag: "ZonedIsoString" }],
-    ])("ZOrder.dateTime over %s", (_, field, storage) => {
+    ])("a date-time window over %s", (_, field, storage) => {
       const entity = withZOrder(
         { listedAt: field },
-        { zorder: [ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "days", bits: 12 })] },
+        { zorder: [{ field: "listedAt", from: "2024-01-01", unit: "days", bits: 12 }] },
       )
       expect(storagesOf(entity)).toEqual([storage])
     })
@@ -167,14 +172,14 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       ],
       ["optional Number", Schema.optional(Schema.Number), { _tag: "Number", numeric: "number" }],
     ])("an optional field (%s) resolves through its wrapper", (_, field, storage) => {
-      const dimension =
+      const dimension: ZOrder.AnyDimension =
         storage._tag === "Number"
-          ? ZOrder.int("value", { min: 0, max: 9 })
-          : ZOrder.dateTime("value", { from: "2024-01-01", unit: "days", bits: 12 })
+          ? { field: "value", min: 0, max: 9 }
+          : { field: "value", from: "2024-01-01", unit: "days", bits: 12 }
       expect(storagesOf(withZOrder({ value: field }, { zorder: [dimension] }))).toEqual([storage])
     })
 
-    it("ZOrder.dateTime over a configured storedAs override reads the override", () => {
+    it("a date-time window over a configured storedAs override reads the override", () => {
       class Listing extends Schema.Class<Listing>("Listing")({
         id: Schema.String,
         region: Schema.String,
@@ -192,7 +197,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
             pk: { field: "gsi2pk", composite: ["region"] },
             sk: {
               field: "gsi2sk",
-              zorder: [ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "days", bits: 12 })],
+              zorder: [{ field: "listedAt", from: "2024-01-01", unit: "days", bits: 12 }],
             },
           },
         },
@@ -200,7 +205,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(storagesOf(entity)).toEqual([{ _tag: "Epoch", unit: "epochSeconds" }])
     })
 
-    it("ZOrder.literals over literal fields, and ZOrder.string over a string", () => {
+    it("literals over literal fields, and a byte width over a string", () => {
       const entity = withZOrder(
         {
           status: Schema.Literals(["draft", "live"]),
@@ -210,10 +215,10 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
         },
         {
           zorder: [
-            ZOrder.literals("status", ["draft", "live", "sold"]),
-            ZOrder.literals("furnished", [false, true]),
-            ZOrder.literals("floors", [1, 2, 3]),
-            ZOrder.string("suburb", { bytes: 2 }),
+            { field: "status", values: ["draft", "live", "sold"] },
+            { field: "furnished", values: [false, true] },
+            { field: "floors", values: [1, 2, 3] },
+            { field: "suburb", bytes: 2 },
           ],
         },
       )
@@ -225,8 +230,13 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       ])
     })
 
-    it("one Dimension bound by two entities to different storages places an instant identically", () => {
-      const listedAt = ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 })
+    it("one entry bound by two entities to different storages places an instant identically", () => {
+      const listedAt: ZOrder.DateTimeDimension = {
+        field: "listedAt",
+        from: "2024-01-01",
+        unit: "hours",
+        bits: 16,
+      }
       const AsIso = withZOrder({ listedAt: DynamoModel.DateString }, { zorder: [listedAt] })
       const AsEpoch = withZOrder({ listedAt: DynamoModel.DateEpochMs }, { zorder: [listedAt] })
       expect(storagesOf(AsIso)).toEqual([{ _tag: "UtcIsoString" }])
@@ -242,76 +252,104 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(iso).toEqual(Uint8Array.of(0x00, 29))
     })
 
-    it.each<[string, Schema.Struct.Fields, ZOrder.Dimension, RegExp]>([
+    it.each<[string, Schema.Struct.Fields, ZOrder.AnyDimension, RegExp]>([
       [
         "int over a string",
         { price: Schema.String },
-        ZOrder.int("price", { min: 0, max: 9 }),
+        { field: "price", min: 0, max: 9 },
         /needs a number or bigint field/,
-      ],
-      [
-        "float over a bigint",
-        { price: Schema.BigInt },
-        ZOrder.float("price", { min: 0, max: 9, step: 0.5 }),
-        /use ZOrder\.int/,
       ],
       [
         "dateTime over a plain string",
         { listedAt: Schema.String },
-        ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "days", bits: 8 }),
+        { field: "listedAt", from: "2024-01-01", unit: "days", bits: 8 },
         /known storage format/,
       ],
       [
         "dateTime over a plain number",
         { listedAt: Schema.Number },
-        ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "days", bits: 8 }),
+        { field: "listedAt", from: "2024-01-01", unit: "days", bits: 8 },
         /known storage format/,
       ],
       [
         "literals with an undeclared member",
         { status: Schema.Literals(["draft", "live", "sold"]) },
-        ZOrder.literals("status", ["draft", "live"]),
+        { field: "status", values: ["draft", "live"] },
         /"sold" are not declared/,
       ],
       [
         "literals of another kind",
         { status: Schema.String },
-        ZOrder.literals("status", [1, 2]),
+        { field: "status", values: [1, 2] },
         /1 is not a string/,
       ],
       [
         "literals over an object",
         { status: Schema.Struct({ code: Schema.String }) },
-        ZOrder.literals("status", ["a"]),
+        { field: "status", values: ["a"] },
         /string, number or boolean field/,
       ],
       [
         "string over a number",
         { suburb: Schema.Number },
-        ZOrder.string("suburb", { bytes: 2 }),
+        { field: "suburb", bytes: 2 },
         /needs a string field/,
+      ],
+      [
+        "a bare name over a plain string",
+        { status: Schema.String },
+        "status",
+        /a bare name has no levels; declare \{ field, bytes \}/,
+      ],
+      [
+        "a bare name over a plain number",
+        { floors: Schema.Number },
+        "floors",
+        /declare \{ field, min, max, step\? \}/,
       ],
     ])("[EDD-9088] %s", (_, fields, dimension, why) => {
       expect(() => withZOrder(fields, { zorder: [dimension] })).toThrow(
-        /\[EDD-9088\] Entity "Listing": index "search"/,
+        /\[EDD-9088\] Entity "Listing": index "search" dimension "\w+" doesn't fit its field/,
       )
       expect(() => withZOrder(fields, { zorder: [dimension] })).toThrow(why)
+    })
+
+    it("[EDD-9087] a fractional range over a bigint field", () => {
+      expect(() =>
+        withZOrder(
+          { price: Schema.BigInt },
+          { zorder: [{ field: "price", min: 0, max: 9, step: 0.5 }] },
+        ),
+      ).toThrow(
+        /\[EDD-9087\] Index "search" dimension "price": a bigint field is quantized in integer steps/,
+      )
+    })
+
+    it("a bare name takes a literal field's members, and a boolean's false, true", () => {
+      const entity = withZOrder(
+        { status: Schema.Literals(["draft", "live", "sold"]), furnished: Schema.Boolean },
+        { zorder: ["status", "furnished"] },
+      )
+      expect(layoutOf(entity).dimensions.map((d) => d.spec)).toEqual([
+        { kind: "literals", field: "status", values: ["draft", "live", "sold"], bits: 2 },
+        { kind: "literals", field: "furnished", values: [false, true], bits: 1 },
+      ])
     })
   })
 
   describe("[EDD-9089] bit budget", () => {
     it("refuses a dimension wider than its kind allows", () => {
-      const huge = ZOrder.int("price", {
+      const huge = {
+        field: "price",
         min: -Number.MAX_SAFE_INTEGER,
         max: Number.MAX_SAFE_INTEGER,
-      })
-      expect(huge.bits).toBe(54)
+      }
       expect(() => withZOrder({ price: Schema.Number }, { zorder: [huge] })).toThrow(
-        /\[EDD-9089\] .*ZOrder\.int\("price"\) needs 54 bits; a int dimension takes at most 53/,
+        /\[EDD-9089\] .*dimension "price" needs 54 bits; a range dimension takes at most 53\. Widen its step/,
       )
-      const wide = ZOrder.literals("status", ["a", "b"], { bits: 60 })
+      const wide = { field: "status", values: ["a", "b"], bits: 60 }
       expect(() => withZOrder({ status: Schema.Literals(["a", "b"]) }, { zorder: [wide] })).toThrow(
-        /\[EDD-9089\]/,
+        /\[EDD-9089\] .*dimension "status" needs 60 bits; a literals dimension takes at most 53\. Lower its bits/,
       )
     })
 
@@ -319,7 +357,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       const fields = Object.fromEntries(
         ["s1", "s2", "s3", "s4", "s5"].map((name) => [name, Schema.String]),
       )
-      const dims = Object.keys(fields).map((name) => ZOrder.string(name, { bytes: 16 }))
+      const dims = Object.keys(fields).map((name) => ({ field: name, bytes: 16 }))
       expect(() => withZOrder(fields, { zorder: dims })).toThrow(
         /\[EDD-9089\] Entity "Listing": index "search" interleaves 640 bits; a Z-order address takes at most 512/,
       )
@@ -337,9 +375,9 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
           sk: { field: "sk", composite: [], ...(half === "sk" ? extra : {}) },
         }) as unknown as typeof byId
       for (const [half, extra] of [
-        ["sk", { zorder: [ZOrder.int("price", { min: 0, max: 9 })] }],
+        ["sk", { zorder: [{ field: "price", min: 0, max: 9 }] }],
         ["sk", { prefix: ["id"] }],
-        ["pk", { zorder: [ZOrder.int("price", { min: 0, max: 9 })] }],
+        ["pk", { zorder: [{ field: "price", min: 0, max: 9 }] }],
       ] as const) {
         expect(() =>
           Entity.make({ model, entityType: "Listing", primaryKey: primary(half, extra) }),
@@ -357,7 +395,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(() =>
         withZOrder(
           { price: Schema.Number },
-          { zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+          { zorder: [{ field: "price", min: 0, max: 9 }] },
           { collection: "listings" },
         ),
       ).toThrow(/\[EDD-9090\] Entity "Listing": index "search" has a Z-order sort key/)
@@ -366,7 +404,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
     it("[EDD-9090] _injectIndex refuses a Z-order half", () => {
       const Bound = withZOrder(
         { price: Schema.Number },
-        { zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+        { zorder: [{ field: "price", min: 0, max: 9 }] },
       )
       const Other = Entity.make({
         model: Schema.Struct({ id: Schema.String, region: Schema.String, price: Schema.Number }),
@@ -389,16 +427,13 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(() =>
         withZOrder(
           { price: Schema.Number },
-          { prefix: ["agencyId"], zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+          { prefix: ["agencyId"], zorder: [{ field: "price", min: 0, max: 9 }] },
         ),
       ).toThrow(
         /\[EDD-9002\] Entity "Listing": index "search" references unknown attribute "agencyId"/,
       )
       expect(() =>
-        withZOrder(
-          { price: Schema.Number },
-          { zorder: [ZOrder.int("bedrooms", { min: 0, max: 9 })] },
-        ),
+        withZOrder({ price: Schema.Number }, { zorder: [{ field: "bedrooms", min: 0, max: 9 }] }),
       ).toThrow(/\[EDD-9002\] .*unknown attribute "bedrooms"/)
     })
 
@@ -406,13 +441,13 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(() =>
         withZOrder(
           { agencyId: Schema.NullOr(Schema.String), price: Schema.Number },
-          { prefix: ["agencyId"], zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+          { prefix: ["agencyId"], zorder: [{ field: "price", min: 0, max: 9 }] },
         ),
       ).toThrow(/EDD-9025/)
       expect(() =>
         withZOrder(
           { price: Schema.NullOr(Schema.Number) },
-          { zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+          { zorder: [{ field: "price", min: 0, max: 9 }] },
         ),
       ).toThrow(/EDD-9025/)
     })
@@ -434,7 +469,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
             search: {
               name: "gsi2",
               pk: { field: "gsi2pk", composite: ["region"] },
-              sk: { field: "gsi2sk", ...sk } as KeyComposer.ZOrderKeyPart,
+              sk: { field: "gsi2sk", ...sk } as never,
             },
           },
         })
@@ -444,7 +479,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
       expect(
         configured(
           { details: { storedAs: DynamoModel.Packed({ format: "json" }) } },
-          { prefix: ["details"], zorder: [ZOrder.int("price", { min: 0, max: 9 })] },
+          { prefix: ["details"], zorder: [{ field: "price", min: 0, max: 9 }] },
         ),
       ).toThrow(
         /\[EDD-9072\] Entity "Listing": packed field "details" cannot be a composite of index "search"/,
@@ -454,9 +489,9 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
     it("[EDD-9022] a sparse prefix composite or dimension", () => {
       const sparse = { tags: { storedAs: DynamoModel.SparseMap() } }
       expect(
-        configured(sparse, { prefix: ["tags"], zorder: [ZOrder.int("price", { min: 0, max: 9 })] }),
+        configured(sparse, { prefix: ["tags"], zorder: [{ field: "price", min: 0, max: 9 }] }),
       ).toThrow(/\[EDD-9022\] Entity "Listing": sparse field "tags"/)
-      expect(configured(sparse, { zorder: [ZOrder.string("tags", { bytes: 2 })] })).toThrow(
+      expect(configured(sparse, { zorder: [{ field: "tags", bytes: 2 }] })).toThrow(
         /\[EDD-9022\] Entity "Listing": sparse field "tags"/,
       )
     })

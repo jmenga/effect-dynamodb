@@ -1619,7 +1619,7 @@ describe("Entity", () => {
         const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
         mockTransactWriteItems.mockRejectedValueOnce(rejection)
         // Build an entity with 100 unique constraints → 101 transact items (1 main + 100 sentinels)
-        const uniqueConstraints: Record<string, ReadonlyArray<string>> = {}
+        const uniqueConstraints: Record<string, ReadonlyArray<"email">> = {}
         for (let i = 0; i < 100; i++) {
           uniqueConstraints[`c${i}`] = ["email"]
         }

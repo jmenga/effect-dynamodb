@@ -31,7 +31,6 @@ import { DateTime, Effect, Layer, Schema } from "effect"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import { ZOrder } from "../src/index.js"
 import * as Cursor from "../src/internal/Cursor.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -58,9 +57,9 @@ class Listing extends Schema.Class<Listing>("Listing")({
 const AppSchema = DynamoSchema.make({ name: "zorder-entity", version: 1 })
 
 const facets = [
-  ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-  ZOrder.int("bedrooms", { min: 0, max: 15 }),
-  ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+  { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+  { field: "bedrooms", min: 0, max: 15 },
+  { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
 ] as const
 
 const Listings = Entity.make({
@@ -86,7 +85,7 @@ const Listings = Entity.make({
       pk: { field: "gsi4pk", composite: ["region"] },
       sk: {
         field: "gsi4sk",
-        zorder: [ZOrder.literals("status", ["draft", "live"]), facets[0]],
+        zorder: [{ field: "status", values: ["draft", "live"] }, facets[0]],
       },
     },
     // A string-composed GSI beside them, for contrast.

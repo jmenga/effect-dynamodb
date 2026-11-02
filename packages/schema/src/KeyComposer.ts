@@ -25,16 +25,20 @@ import {
   prefixSegment,
   toBytes,
 } from "./internal/ZOrderCurve.js"
-import * as ZOrder from "./ZOrder.js"
+import { type DeclaredDimension, declareDimension } from "./internal/ZOrderDimension.js"
+import type * as ZOrder from "./ZOrder.js"
 
 /**
- * Index key part definition (pk or sk of an index). `zorder` / `prefix` belong
- * to a Z-order sort key ({@link ZOrderKeyPart}) and are a type error here — on
- * a partition key half or on the primary key.
+ * Index key part definition (pk or sk of an index). `field` is the physical
+ * key attribute; `composite` names the model attributes composed into it —
+ * `F`, on `Entity.make`, is the model's field names (plus ref-derived ids), so
+ * a misspelled one is a compile error. `zorder` / `prefix` belong to a Z-order
+ * sort key ({@link ZOrderKeyPart}) and are a type error here — on a partition
+ * key half or on the primary key.
  */
-export interface KeyPart {
+export interface KeyPart<F extends string = string> {
   readonly field: string
-  readonly composite: ReadonlyArray<string>
+  readonly composite: ReadonlyArray<F>
   readonly zorder?: never
   readonly prefix?: never
 }
@@ -43,18 +47,17 @@ export interface KeyPart {
  * A Z-order sort key, as declared on a secondary index (#171): the bits of the
  * `zorder` dimensions interleaved into one binary (`B`) value, behind the
  * exact-match `prefix` composites. It has no `composite`: the fields that feed
- * it are the prefix composites and the dimensions' fields.
+ * it are the prefix composites and the dimensions' fields. `TFields` is the
+ * model's fields (name → type) on `Entity.make`, which types each prefix
+ * composite and each dimension entry from the field it names.
  */
-export interface ZOrderKeyPart<
-  Dims extends ReadonlyArray<ZOrder.Dimension> = ReadonlyArray<ZOrder.Dimension>,
-  Prefix extends ReadonlyArray<ZOrder.PrefixPart> = ReadonlyArray<ZOrder.PrefixPart>,
-> {
+export interface ZOrderKeyPart<TFields = globalThis.Record<string, unknown>> {
   /** Physical attribute name, stored as `B`. */
   readonly field: string
   /** Exact-match composites, in front of the address. */
-  readonly prefix?: Prefix
+  readonly prefix?: ReadonlyArray<ZOrder.PrefixPart<keyof TFields & string>>
   /** The interleaved dimensions; declaration order is interleave priority. */
-  readonly zorder: Dims
+  readonly zorder: ReadonlyArray<ZOrder.Dimension<TFields>>
   readonly composite?: never
 }
 
@@ -67,8 +70,8 @@ export interface ZOrderPrefixSegment {
 /** The Z-order specifics of a normalised sort key half. */
 export interface ZOrderHalf {
   readonly prefix: ReadonlyArray<ZOrderPrefixSegment>
-  /** The dimensions as declared, in interleave order. */
-  readonly dimensions: ReadonlyArray<ZOrder.Dimension>
+  /** The dimensions as declared (options checked), in interleave order. */
+  readonly dimensions: ReadonlyArray<DeclaredDimension>
   /**
    * The dimensions bound to the entity's fields (internal). `undefined` on the
    * half `normalizeGsiConfig` returns, until `Entity.make` binds it.
@@ -159,8 +162,10 @@ export interface IndexDefinition {
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
- * Mirrors the primaryKey structure with an added `name` for the physical GSI. */
-export interface GsiConfig {
+ * Mirrors the primaryKey structure with an added `name` for the physical GSI.
+ * `TFields` is the model's fields (name → type) on `Entity.make`: composites,
+ * prefix composites and dimensions are typed from it. */
+export interface GsiConfig<TFields = globalThis.Record<string, unknown>> {
   /** Physical GSI name (e.g., `"gsi1"`). */
   readonly name: string
   /** Optional collection name. String for single, array for sub-collections. */
@@ -168,12 +173,12 @@ export interface GsiConfig {
   /** SK ordering mode. `"isolated"` (default) puts entity type before composites; `"clustered"` puts entity type after composites (required for sub-collections). */
   readonly type?: "isolated" | "clustered"
   /** Partition key: physical field name + composite attributes. */
-  readonly pk: KeyPart
+  readonly pk: KeyPart<keyof TFields & string>
   /**
    * Sort key: physical field name + composite attributes — or a Z-order key
    * (`zorder`, optional `prefix`; see {@link ZOrderKeyPart}).
    */
-  readonly sk: KeyPart | ZOrderKeyPart
+  readonly sk: KeyPart<keyof TFields & string> | ZOrderKeyPart<TFields>
   /**
    * Key casing for this index, overriding the schema's `casing`. Applies to the
    * entity type / collection name and the composite names and values in both
@@ -268,7 +273,8 @@ const zorderMalformed = (index: string, why: string): Error =>
  * dimensions as declared, and the derived `composite`. Unbound — `Entity.make`
  * resolves each dimension's storage from the model and lays the address out.
  * Raises the structural `[EDD-9086]` cases visible without the model, and
- * `[EDD-9087]` for a `hash` outside 1..8.
+ * `[EDD-9087]` for a `hash` outside 1..8 or a dimension's options (checked
+ * without the model; `Entity.make` checks them against the field).
  */
 const normalizeZOrderHalf = (
   config: GsiConfig,
@@ -289,14 +295,10 @@ const normalizeZOrderHalf = (
   if (sk.zorder === undefined) {
     throw zorderMalformed(index, "prefix needs zorder: a prefix is the front of a Z-order key.")
   }
-  if (
-    !Array.isArray(sk.zorder) ||
-    sk.zorder.length === 0 ||
-    !sk.zorder.every((d) => ZOrder.isDimension(d))
-  ) {
+  if (!Array.isArray(sk.zorder) || sk.zorder.length === 0) {
     throw zorderMalformed(
       index,
-      "zorder must be a non-empty array of dimensions (ZOrder.int, ZOrder.dateTime, …).",
+      'zorder must be a non-empty array of dimension entries (e.g. { field: "price", min: 0, max: 100 }).',
     )
   }
   if (config.type === "clustered") {
@@ -323,7 +325,9 @@ const normalizeZOrderHalf = (
     }
     return { field: p.field, hash: p.hash }
   })
-  const dimensions = sk.zorder as ReadonlyArray<ZOrder.Dimension>
+  const dimensions = (sk.zorder as ReadonlyArray<unknown>).map((entry) =>
+    declareDimension(index, entry, (why) => zorderMalformed(index, why)),
+  )
   const composite = [...prefix.map((p) => p.field), ...dimensions.map((d) => d.field)]
   const twice = composite.find((field, i) => composite.indexOf(field) !== i)
   if (twice !== undefined) {

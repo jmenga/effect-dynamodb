@@ -482,7 +482,7 @@ describe("Diagnostics", () => {
             sk: {
               field: "gsi2sk",
               prefix: ["agencyId"],
-              zorder: [ZOrder.int("price", { min: 0, max: 5000000, step: 1000 }), ZOrder.int("bedrooms", { min: 0, max: 15 })],
+              zorder: [{ field: "price", min: 0, max: 5000000, step: 1000 }, { field: "bedrooms", min: 0, max: 15 }],
             },
           },
         },
@@ -519,10 +519,10 @@ describe("Diagnostics", () => {
     it("EDD-9093: a dimension declared by reference is still a Z-order field", () => {
       const source = listings(
         `const r = db.entities.Listings.search({ region: "north", listedAt: 5 }).collect()`,
-      ).replace('ZOrder.int("bedrooms", { min: 0, max: 15 })]', "bedrooms, listed]")
+      ).replace('{ field: "bedrooms", min: 0, max: 15 }]', "bedrooms, listed]")
       const diagnostics = diagnose(
-        `const bedrooms = ZOrder.int("bedrooms", { min: 0, max: 15 })
-        const listed = ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 })
+        `const bedrooms = { field: "bedrooms", min: 0, max: 15 }
+        const listed = { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 }
         ${source}`,
       )
       const misplaced = diagnostics.filter(

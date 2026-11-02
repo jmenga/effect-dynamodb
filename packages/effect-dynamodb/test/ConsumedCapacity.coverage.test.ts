@@ -25,7 +25,6 @@ import { CheckpointStore } from "../src/change-feed/index.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
-import { ZOrder } from "../src/index.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -211,8 +210,8 @@ const Parcels = Entity.make({
       sk: {
         field: "gsi4sk",
         zorder: [
-          ZOrder.int("weight", { min: 0, max: 7 }),
-          ZOrder.int("volume", { min: 0, max: 7 }),
+          { field: "weight", min: 0, max: 7 },
+          { field: "volume", min: 0, max: 7 },
         ],
       },
     },

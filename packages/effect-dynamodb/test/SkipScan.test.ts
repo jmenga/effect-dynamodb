@@ -16,7 +16,6 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Schema, Stream } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import { ZOrder } from "../src/index.js"
 import * as Cursor from "../src/internal/Cursor.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
@@ -855,8 +854,8 @@ class Desk extends Schema.Class<Desk>("Desk")({
 }) {}
 
 const deskDimensions = [
-  ZOrder.int("x", { min: 0, max: 7 }),
-  ZOrder.int("y", { min: 0, max: 7 }),
+  { field: "x", min: 0, max: 7 },
+  { field: "y", min: 0, max: 7 },
 ] as const
 
 /** Desks by site, then floor, wing and room — once with `wing` stored as a 2-byte hash. */

@@ -12,7 +12,6 @@
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
-import * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import { type Effect, Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -145,7 +144,7 @@ class Listing extends Schema.Class<Listing>("Listing")({
   agencyId: Schema.String,
   price: Schema.Number,
 }) {}
-const listingFacets = [ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 })] as const
+const listingFacets = [{ field: "price", min: 0, max: 5_000_000, step: 1_000 }] as const
 const PureListings = PureEntity.make({
   model: Listing,
   entityType: "Listing",

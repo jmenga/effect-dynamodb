@@ -66,7 +66,6 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Expression from "../src/Expression.js"
-import { ZOrder } from "../src/index.js"
 import {
   attributeBytes,
   ITEM_MAX_BYTES,
@@ -5855,9 +5854,9 @@ const zSchema = DynamoSchema.make({ name: "zorder-shapes", version: 1 })
 const zTableName = `zorder-shapes-${Date.now()}`
 
 const zFacets = [
-  ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-  ZOrder.int("bedrooms", { min: 0, max: 15 }),
-  ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+  { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+  { field: "bedrooms", min: 0, max: 15 },
+  { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
 ] as const
 
 const ZShapes = Entity.make({
@@ -5902,7 +5901,7 @@ const ZShapes = Entity.make({
     byStatus: {
       name: "gsi5",
       pk: { field: "gsi5pk", composite: ["region"] },
-      sk: { field: "gsi5sk", zorder: [ZOrder.literals("status", ["draft", "live"])] },
+      sk: { field: "gsi5sk", zorder: [{ field: "status", values: ["draft", "live"] }] },
     },
     // 7a′ — 1-bit literals + 13-bit int: 14 bits, 2 bytes.
     byStatusPrice: {
@@ -5911,8 +5910,8 @@ const ZShapes = Entity.make({
       sk: {
         field: "gsi6sk",
         zorder: [
-          ZOrder.literals("status", ["draft", "live"]),
-          ZOrder.int("price", { min: 0, max: 8191 }),
+          { field: "status", values: ["draft", "live"] },
+          { field: "price", min: 0, max: 8191 },
         ],
       },
     },
@@ -18847,7 +18846,7 @@ const g133DeviceIndexes = {
     pk: { field: "gsi1pk", composite: ["owner"] },
     sk: { field: "gsi1sk", composite: ["reading", "seq"] },
   },
-}
+} as const
 const G133Devices = g133Variants("Device", G133Device, {
   primaryKey: g133IdKey,
   indexes: g133DeviceIndexes,

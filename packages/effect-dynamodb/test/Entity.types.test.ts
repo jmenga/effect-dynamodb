@@ -13,7 +13,7 @@ import type * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
-import { type DimensionBound, type RangeBound, ZOrder } from "../src/index.js"
+import type { DimensionBound, RangeBound, ZOrder } from "../src/index.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import type { ConditionCheckOp } from "../src/Transaction.js"
@@ -642,7 +642,7 @@ describe("Entity type extractors", () => {
         primaryKey: {
           pk: { field: "pk", composite: [] as const },
           sk: { field: "sk", composite: [] as const },
-        } as unknown as Parameters<typeof Entity.make>[0]["primaryKey"],
+        } as never,
       }),
     ).toThrow()
   })
@@ -670,15 +670,15 @@ describe("Entity type extractors", () => {
   })
 
   it("rejects composite attributes that are not model fields", () => {
-    // Composite-name validation is enforced at runtime (make() throws), not at
-    // the type level — composites may legitimately reference ref-derived
-    // `${field}Id` names that are not raw model fields (see #54), so the type
-    // cannot statically reject every unknown name.
+    // A composite names a model field or a ref-derived `${field}Id` (#54):
+    // anything else is a type error on the name, and make() throws for
+    // untyped callers.
     expect(() =>
       Entity.make({
         model: User,
         entityType: "User",
         primaryKey: {
+          // @ts-expect-error not a model field
           pk: { field: "pk", composite: ["nonExistent"] },
           sk: { field: "sk", composite: [] },
         },
@@ -698,6 +698,7 @@ describe("Entity type extractors", () => {
         indexes: {
           byBogus: {
             name: "gsi1",
+            // @ts-expect-error not a model field
             pk: { field: "gsi1pk", composite: ["bogus"] },
             sk: { field: "gsi1sk", composite: [] },
           },
@@ -1528,8 +1529,8 @@ describe("Entity types — Z-order sort keys (#171)", () => {
   }) {}
 
   const facets = [
-    ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-    ZOrder.int("bedrooms", { min: 0, max: 15 }),
+    { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+    { field: "bedrooms", min: 0, max: 15 },
   ] as const
 
   const Listings = Entity.make({
@@ -1702,7 +1703,7 @@ describe("Entity types — Z-order sort keys (#171)", () => {
       listedAt: Schema.DateTimeUtc,
       status: Schema.Literals(["draft", "live", "sold"]),
     }) {}
-    const statusDim = ZOrder.literals("status", ["draft", "live", "sold"])
+    const statusDim = { field: "status", values: ["draft", "live", "sold"] } as const
     const Homes = Entity.make({
       model: Home,
       entityType: "Home",
@@ -1720,7 +1721,7 @@ describe("Entity types — Z-order sort keys (#171)", () => {
             zorder: [
               facets[0],
               facets[1],
-              ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+              { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
               statusDim,
             ],
           },
@@ -1760,10 +1761,29 @@ describe("Entity types — Z-order sort keys (#171)", () => {
     market.within({ listedAt: { gte: 1_700_000_000 } })
   })
 
-  it("dimension constructors carry the field name and kind", () => {
-    expectTypeOf(facets[0]).toMatchTypeOf<ZOrder.Dimension<"price", "int">>()
-    expectTypeOf(ZOrder.literals("status", ["draft", "live"])).toMatchTypeOf<
-      ZOrder.Dimension<"status", "literals">
+  it("an entry's options follow its field's type", () => {
+    type Fields = { price: number; listedAt: DateTime.Utc; status: "draft" | "live"; title: string }
+    expectTypeOf<ZOrder.DimensionFor<"price", number>>().toEqualTypeOf<
+      ZOrder.NumericDimension<"price"> | ZOrder.ListedLiteralsDimension<"price", number>
     >()
+    expectTypeOf<ZOrder.DimensionFor<"listedAt", DateTime.Utc>>().toEqualTypeOf<
+      ZOrder.DateTimeDimension<"listedAt">
+    >()
+    expectTypeOf<ZOrder.DimensionFor<"status", "draft" | "live">>().toEqualTypeOf<
+      | "status"
+      | ZOrder.LiteralsDimension<"status", "draft" | "live">
+      | ZOrder.StringDimension<"status">
+    >()
+    expectTypeOf<ZOrder.DimensionFor<"title", string>>().toEqualTypeOf<
+      ZOrder.StringDimension<"title"> | ZOrder.ListedLiteralsDimension<"title", string>
+    >()
+    expectTypeOf<ZOrder.DimensionFor<"open", boolean>>().toEqualTypeOf<
+      "open" | ZOrder.LiteralsDimension<"open", boolean>
+    >()
+    expectTypeOf<{ field: "price"; min: 0; max: 9 }>().toMatchTypeOf<ZOrder.Dimension<Fields>>()
+    expectTypeOf<"status">().toMatchTypeOf<ZOrder.Dimension<Fields>>()
+    // A bare name takes literal members only; a range takes a number field only.
+    expectTypeOf<"title">().not.toMatchTypeOf<ZOrder.Dimension<Fields>>()
+    expectTypeOf<{ field: "title"; min: 0; max: 9 }>().not.toMatchTypeOf<ZOrder.Dimension<Fields>>()
   })
 })

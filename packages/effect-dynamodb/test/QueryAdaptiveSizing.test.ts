@@ -539,12 +539,13 @@ describe("adaptive request sizing (#171)", () => {
       status: Schema.String,
     }) {}
 
-    const byStore = (id: string) => ({
-      name: "gsi1",
-      collection: "Catalog",
-      pk: { field: "gsi1pk", composite: ["storeId"] },
-      sk: { field: "gsi1sk", composite: [id] },
-    })
+    const byStore = <const Id extends string>(id: Id) =>
+      ({
+        name: "gsi1",
+        collection: "Catalog",
+        pk: { field: "gsi1pk", composite: ["storeId"] },
+        sk: { field: "gsi1sk", composite: [id] },
+      }) as const
     const Listings = Entity.make({
       model: Listing,
       entityType: "Listing",

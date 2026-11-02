@@ -30,7 +30,6 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
-import { ZOrder } from "../../src/index.js"
 import * as Table from "../../src/Table.js"
 import { random } from "./ListingsFixture.js"
 import { mockDynamoClientLayer, mockOutput } from "./MockDynamoClient.js"
@@ -61,8 +60,8 @@ const Configured = DynamoModel.configure(Model, { bedrooms: { field: "beds" } })
 
 export type ZListing = typeof Model.Type
 
-const price = ZOrder.int("price", { min: 0, max: 1023 })
-const bedrooms = ZOrder.int("bedrooms", { min: 0, max: 15 })
+const price = { field: "price", min: 0, max: 1023 } as const
+const bedrooms = { field: "bedrooms", min: 0, max: 15 } as const
 
 export const Listings = Entity.make({
   model: Configured,
@@ -89,22 +88,19 @@ export const Listings = Entity.make({
     byStatus: {
       name: "gsi3",
       pk: { field: "gsi3pk", composite: ["region"] },
-      sk: { field: "gsi3sk", zorder: [ZOrder.literals("status", STATUSES), price] },
+      sk: { field: "gsi3sk", zorder: [{ field: "status", values: STATUSES }, price] },
     },
     byText: {
       name: "gsi4",
       pk: { field: "gsi4pk", composite: ["region"] },
-      sk: { field: "gsi4sk", zorder: [ZOrder.int("priceText", { min: 0, max: 1023 }), bedrooms] },
+      sk: { field: "gsi4sk", zorder: [{ field: "priceText", min: 0, max: 1023 }, bedrooms] },
     },
     byListed: {
       name: "gsi5",
       pk: { field: "gsi5pk", composite: ["region"] },
       sk: {
         field: "gsi5sk",
-        zorder: [
-          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "seconds", bits: 20 }),
-          bedrooms,
-        ],
+        zorder: [{ field: "listedAt", from: "2024-01-01", unit: "seconds", bits: 20 }, bedrooms],
       },
     },
     byOpened: {
@@ -112,16 +108,13 @@ export const Listings = Entity.make({
       pk: { field: "gsi6pk", composite: ["region"] },
       sk: {
         field: "gsi6sk",
-        zorder: [
-          ZOrder.dateTime("openedAt", { from: "2024-01-01", unit: "hours", bits: 10 }),
-          bedrooms,
-        ],
+        zorder: [{ field: "openedAt", from: "2024-01-01", unit: "hours", bits: 10 }, bedrooms],
       },
     },
     byCode: {
       name: "gsi7",
       pk: { field: "gsi7pk", composite: ["region"] },
-      sk: { field: "gsi7sk", zorder: [ZOrder.literals("code", CODES), bedrooms] },
+      sk: { field: "gsi7sk", zorder: [{ field: "code", values: CODES }, bedrooms] },
     },
   },
 })

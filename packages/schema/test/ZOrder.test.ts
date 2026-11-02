@@ -7,12 +7,58 @@
  */
 import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Schema } from "effect"
+import type { DynamoEncoding } from "../src/DynamoModel.js"
+import * as DynamoModel from "../src/DynamoModel.js"
 import * as Curve from "../src/internal/ZOrderCurve.js"
-import * as ZOrder from "../src/ZOrder.js"
+import {
+  type DimensionField,
+  declareDimension,
+  resolveDimension,
+} from "../src/internal/ZOrderDimension.js"
+import type * as ZOrder from "../src/ZOrder.js"
 
 const NUMBER: Curve.DimensionStorage = { _tag: "Number", numeric: "number" }
 
-const bind = (dimension: ZOrder.Dimension, storage: Curve.DimensionStorage = NUMBER) =>
+const UTC_STRING: DynamoEncoding = { storage: "string", domain: "DateTime.Utc" }
+
+/** A dimension entry resolved against a field, as `Entity.make` resolves it. */
+const resolve = (entry: ZOrder.AnyDimension, field: DimensionField) => {
+  const declared = declareDimension("gsi1", entry, (why) => new Error(`[EDD-9086] ${why}`))
+  const { spec, storage } = resolveDimension("Test", "gsi1", declared, field)
+  return { spec, storage, field: spec.field, kind: spec.kind, bits: spec.bits }
+}
+
+type Resolved = ReturnType<typeof resolve>
+
+/** The literal schema whose members are `values`, so a bare entry takes them. */
+const literalField = (values: ReadonlyArray<ZOrder.LiteralValue>): Schema.Top =>
+  typeof values[0] === "number"
+    ? Schema.Number
+    : typeof values[0] === "boolean"
+      ? Schema.Boolean
+      : Schema.String
+
+// Entries over the field kinds the old constructors named, each resolved
+// against a field of that kind.
+const int = (field: string, options: { min: number; max: number; step?: number | undefined }) =>
+  resolve({ field, ...options }, { schema: Schema.Number, encoding: undefined })
+const float = (field: string, options: { min: number; max: number; step: number }) =>
+  resolve({ field, ...options }, { schema: Schema.Number, encoding: undefined })
+const dateTime = (field: string, options: Omit<ZOrder.DateTimeDimension, "field">) =>
+  resolve({ field, ...options }, { schema: DynamoModel.DateString, encoding: UTC_STRING })
+const literals = (
+  field: string,
+  values: ReadonlyArray<ZOrder.LiteralValue>,
+  options?: { bits?: number | undefined },
+) =>
+  resolve(
+    { field, values, ...(options?.bits === undefined ? {} : { bits: options.bits }) },
+    { schema: literalField(values), encoding: undefined },
+  )
+const string = (field: string, options: { bytes: number }) =>
+  resolve({ field, ...options }, { schema: Schema.String, encoding: undefined })
+
+const bind = (dimension: Resolved, storage: Curve.DimensionStorage = NUMBER) =>
   Curve.bindDimension(dimension.spec, storage)
 
 /** A layout of `literals` dimensions: `widths[i]` bits, `levels[i]` (≤ 2^bits) levels. */
@@ -20,7 +66,7 @@ const layoutOf = (widths: ReadonlyArray<number>, levels?: ReadonlyArray<number>)
   Curve.makeLayout(
     widths.map((bits, i) =>
       bind(
-        ZOrder.literals(
+        literals(
           `d${i}`,
           Array.from({ length: levels?.[i] ?? 2 ** bits }, (_, v) => v),
           { bits },
@@ -89,28 +135,21 @@ const bruteForce = (layout: Curve.Layout, box: Curve.Box): Array<bigint> => {
 const allAddresses = (layout: Curve.Layout): Array<bigint> =>
   Array.from({ length: 2 ** layout.bits }, (_, z) => BigInt(z))
 
-describe("ZOrder — dimension constructors", () => {
+describe("ZOrder — dimension entries", () => {
   it("derives bits from the level count, at least 1", () => {
-    expect(ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }).bits).toBe(13)
-    expect(ZOrder.int("bedrooms", { min: 0, max: 15 }).bits).toBe(4)
-    expect(ZOrder.int("flag", { min: 0, max: 1 }).bits).toBe(1)
-    expect(ZOrder.float("rating", { min: 0, max: 5, step: 0.5 }).bits).toBe(4)
-    expect(ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }).bits).toBe(
-      16,
-    )
-    expect(ZOrder.literals("status", ["pending", "active", "closed"]).bits).toBe(2)
-    expect(ZOrder.literals("only", ["one"]).bits).toBe(1)
-    expect(ZOrder.literals("status", ["a", "b"], { bits: 5 }).bits).toBe(5)
-    expect(ZOrder.string("name", { bytes: 2 }).bits).toBe(16)
+    expect(int("price", { min: 0, max: 5_000_000, step: 1_000 }).bits).toBe(13)
+    expect(int("bedrooms", { min: 0, max: 15 }).bits).toBe(4)
+    expect(int("flag", { min: 0, max: 1 }).bits).toBe(1)
+    expect(float("rating", { min: 0, max: 5, step: 0.5 }).bits).toBe(4)
+    expect(dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }).bits).toBe(16)
+    expect(literals("status", ["pending", "active", "closed"]).bits).toBe(2)
+    expect(literals("only", ["one"]).bits).toBe(1)
+    expect(literals("status", ["a", "b"], { bits: 5 }).bits).toBe(5)
+    expect(string("name", { bytes: 2 }).bits).toBe(16)
   })
 
-  it("is a TypeId'd, pipeable, inspectable value", () => {
-    const d = ZOrder.int("price", { min: 0, max: 100 })
-    expect(ZOrder.isDimension(d)).toBe(true)
-    expect(ZOrder.isDimension({ field: "price" })).toBe(false)
-    expect(d.pipe((x) => x.field)).toBe("price")
-    expect(d.toJSON()).toEqual({
-      _id: "ZOrder.Dimension",
+  it("picks integer arithmetic for integer options and float arithmetic otherwise", () => {
+    expect(int("price", { min: 0, max: 100 }).spec).toEqual({
       kind: "int",
       field: "price",
       min: 0,
@@ -118,27 +157,30 @@ describe("ZOrder — dimension constructors", () => {
       step: 1,
       bits: 7,
     })
-    expect(String(d)).toContain("ZOrder.Dimension")
+    expect(int("x", { min: 0.5, max: 10 }).kind).toBe("float")
+    expect(float("x", { min: 0, max: 1, step: 0.25 }).kind).toBe("float")
+    // Past 2^53 an option is no longer an exact integer: float, and refused if too fine.
+    expect(() => int("x", { min: 0, max: 2 ** 60 })).toThrow(/\[EDD-9087\].*2\^53/)
   })
 
   it("reads an explicit undefined option as unset", () => {
     // Typed code under exactOptionalPropertyTypes can pass a possibly-undefined value.
     const step: number | undefined = undefined
     const bits: number | undefined = undefined
-    expect(ZOrder.int("price", { min: 0, max: 100, step }).toJSON()).toEqual(
-      ZOrder.int("price", { min: 0, max: 100 }).toJSON(),
+    expect(int("price", { min: 0, max: 100, step }).spec).toEqual(
+      int("price", { min: 0, max: 100 }).spec,
     )
-    expect(ZOrder.literals("status", ["a", "b", "c"], { bits }).bits).toBe(2)
+    expect(literals("status", ["a", "b", "c"], { bits }).bits).toBe(2)
   })
 
-  it("accepts a Date or DateTime as dateTime's from", () => {
-    const iso = ZOrder.dateTime("t", { from: "2024-01-01T00:00:00Z", unit: "days", bits: 8 })
-    const date = ZOrder.dateTime("t", {
+  it("accepts a Date or DateTime as a date-time entry's from", () => {
+    const iso = dateTime("t", { from: "2024-01-01T00:00:00Z", unit: "days", bits: 8 })
+    const date = dateTime("t", {
       from: new Date("2024-01-01T00:00:00Z"),
       unit: "days",
       bits: 8,
     })
-    const dt = ZOrder.dateTime("t", {
+    const dt = dateTime("t", {
       from: DateTime.makeUnsafe("2024-01-01T00:00:00Z"),
       unit: "days",
       bits: 8,
@@ -147,44 +189,132 @@ describe("ZOrder — dimension constructors", () => {
     expect(iso.spec).toEqual(dt.spec)
   })
 
+  it("takes a bare name's members from the field, in schema order", () => {
+    const status = Schema.Literals(["pending", "active", "closed"])
+    const bare = resolve("status", { schema: status, encoding: undefined })
+    expect(bare.spec).toEqual({
+      kind: "literals",
+      field: "status",
+      values: ["pending", "active", "closed"],
+      bits: 2,
+    })
+    expect(
+      resolve({ field: "status", bits: 4 }, { schema: status, encoding: undefined }).bits,
+    ).toBe(4)
+    expect(resolve("open", { schema: Schema.Boolean, encoding: undefined }).spec).toMatchObject({
+      values: [false, true],
+      bits: 1,
+    })
+  })
+
+  it("reads a stringified number field as a numeric-string dimension", () => {
+    const d = resolve(
+      { field: "price", min: 0, max: 100 },
+      { schema: Schema.NumberFromString, encoding: undefined },
+    )
+    expect(d.storage).toEqual({ _tag: "NumericString", numeric: "number" })
+  })
+
+  describe("[EDD-9086] a malformed entry", () => {
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+      ["an empty name", ""],
+      ["an empty field", { field: "", min: 0, max: 1 }],
+      ["no field", { min: 0, max: 1 }],
+      ["a number", 3],
+      ["an array", ["price"]],
+    ]
+    for (const [name, entry] of cases) {
+      it(name, () => {
+        expect(() =>
+          resolve(entry as ZOrder.AnyDimension, { schema: Schema.Number, encoding: undefined }),
+        ).toThrow(/\[EDD-9086\]/)
+      })
+    }
+  })
+
   describe("[EDD-9087] per option", () => {
     const cases: ReadonlyArray<readonly [string, () => unknown]> = [
-      ["empty field", () => ZOrder.int("", { min: 0, max: 1 })],
-      ["int: non-integer min", () => ZOrder.int("x", { min: 0.5, max: 10 })],
-      ["int: unsafe max", () => ZOrder.int("x", { min: 0, max: 2 ** 60 })],
-      ["int: min = max", () => ZOrder.int("x", { min: 5, max: 5 })],
-      ["int: step 0", () => ZOrder.int("x", { min: 0, max: 10, step: 0 })],
-      ["int: step past the range", () => ZOrder.int("x", { min: 0, max: 10, step: 11 })],
-      ["float: infinite max", () => ZOrder.float("x", { min: 0, max: Infinity, step: 1 })],
-      ["float: min > max", () => ZOrder.float("x", { min: 2, max: 1, step: 0.1 })],
-      ["float: negative step", () => ZOrder.float("x", { min: 0, max: 1, step: -0.1 })],
-      ["float: over 2^53 levels", () => ZOrder.float("x", { min: 0, max: 1, step: 1e-17 })],
+      ["range: unsafe max", () => int("x", { min: 0, max: 2 ** 60 })],
+      ["range: min = max", () => int("x", { min: 5, max: 5 })],
+      ["range: step 0", () => int("x", { min: 0, max: 10, step: 0 })],
+      ["range: step past the range", () => int("x", { min: 0, max: 10, step: 11 })],
+      ["range: infinite max", () => float("x", { min: 0, max: Infinity, step: 1 })],
+      ["range: min > max", () => float("x", { min: 2, max: 1, step: 0.1 })],
+      ["range: negative step", () => float("x", { min: 0, max: 1, step: -0.1 })],
+      ["range: over 2^53 levels", () => float("x", { min: 0, max: 1, step: 1e-17 })],
+      [
+        "range: fractional options over a bigint field",
+        () =>
+          resolve(
+            { field: "x", min: 0, max: 1, step: 0.5 },
+            { schema: Schema.BigInt, encoding: undefined },
+          ),
+      ],
       [
         "dateTime: unparseable from",
-        () => ZOrder.dateTime("x", { from: "not a date", unit: "days", bits: 8 }),
+        () => dateTime("x", { from: "not a date", unit: "days", bits: 8 }),
       ],
       [
         "dateTime: unknown unit",
-        () => ZOrder.dateTime("x", { from: "2024-01-01", unit: "fortnights" as never, bits: 8 }),
+        () => dateTime("x", { from: "2024-01-01", unit: "fortnights" as never, bits: 8 }),
       ],
+      ["dateTime: bits 0", () => dateTime("x", { from: "2024-01-01", unit: "days", bits: 0 })],
+      ["dateTime: bits 54", () => dateTime("x", { from: "2024-01-01", unit: "days", bits: 54 })],
+      ["literals: empty", () => literals("x", [])],
+      ["literals: duplicates", () => literals("x", ["a", "a"])],
+      ["literals: an object member", () => literals("x", [{} as never])],
+      ["literals: bits too few", () => literals("x", ["a", "b", "c"], { bits: 1 })],
+      ["string: bytes 0", () => string("x", { bytes: 0 })],
+      ["string: bytes 17", () => string("x", { bytes: 17 })],
       [
-        "dateTime: bits 0",
-        () => ZOrder.dateTime("x", { from: "2024-01-01", unit: "days", bits: 0 }),
+        "options of two kinds",
+        () =>
+          resolve({ field: "x", min: 0, max: 1, bytes: 2 } as never, {
+            schema: Schema.Number,
+            encoding: undefined,
+          }),
       ],
-      [
-        "dateTime: bits 54",
-        () => ZOrder.dateTime("x", { from: "2024-01-01", unit: "days", bits: 54 }),
-      ],
-      ["literals: empty", () => ZOrder.literals("x", [])],
-      ["literals: duplicates", () => ZOrder.literals("x", ["a", "a"])],
-      ["literals: an object member", () => ZOrder.literals("x", [{} as never])],
-      ["literals: bits too few", () => ZOrder.literals("x", ["a", "b", "c"], { bits: 1 })],
-      ["string: bytes 0", () => ZOrder.string("x", { bytes: 0 })],
-      ["string: bytes 17", () => ZOrder.string("x", { bytes: 17 })],
     ]
     for (const [name, make] of cases) {
       it(name, () => {
         expect(make).toThrow(/\[EDD-9087\]/)
+      })
+    }
+  })
+
+  describe("[EDD-9088] an entry that doesn't fit its field", () => {
+    const cases: ReadonlyArray<readonly [string, ZOrder.AnyDimension, DimensionField]> = [
+      ["no field", { field: "x", min: 0, max: 1 }, { schema: undefined, encoding: undefined }],
+      [
+        "a range over a string field",
+        { field: "x", min: 0, max: 1 },
+        { schema: Schema.String, encoding: undefined },
+      ],
+      [
+        "a date-time window over a plain number",
+        { field: "x", from: "2024-01-01", unit: "days", bits: 8 },
+        { schema: Schema.Number, encoding: undefined },
+      ],
+      ["a bare name over a plain string", "x", { schema: Schema.String, encoding: undefined }],
+      [
+        "values missing a member",
+        { field: "x", values: ["a"] },
+        { schema: Schema.Literals(["a", "b"]), encoding: undefined },
+      ],
+      [
+        "a value of another type",
+        { field: "x", values: [1, 2] },
+        { schema: Schema.String, encoding: undefined },
+      ],
+      [
+        "a byte width over a number",
+        { field: "x", bytes: 2 },
+        { schema: Schema.Number, encoding: undefined },
+      ],
+    ]
+    for (const [name, entry, field] of cases) {
+      it(name, () => {
+        expect(() => resolve(entry, field)).toThrow(/\[EDD-9088\]/)
       })
     }
   })
@@ -195,7 +325,7 @@ describe("ZOrderCurve — quantization", () => {
     "int quantization is monotone and stays in range",
     { a: Int(-5000, 5000), b: Int(-5000, 5000) },
     ({ a, b }) => {
-      const d = bind(ZOrder.int("x", { min: -1000, max: 1000, step: 7 }))
+      const d = bind(int("x", { min: -1000, max: 1000, step: 7 }))
       const [lo, hi] = a <= b ? [a, b] : [b, a]
       expect(d.quantize(lo) <= d.quantize(hi)).toBe(true)
       expect(d.quantize(hi) < d.levels).toBe(true)
@@ -210,7 +340,7 @@ describe("ZOrderCurve — quantization", () => {
       b: Schema.Number.check(Schema.isBetween({ minimum: -50, maximum: 150 })),
     },
     ({ a, b }) => {
-      const d = bind(ZOrder.float("x", { min: -10.5, max: 99.25, step: 0.3 }))
+      const d = bind(float("x", { min: -10.5, max: 99.25, step: 0.3 }))
       const [lo, hi] = a <= b ? [a, b] : [b, a]
       expect(d.quantize(lo) <= d.quantize(hi)).toBe(true)
       expect(d.quantize(hi) < d.levels).toBe(true)
@@ -221,7 +351,7 @@ describe("ZOrderCurve — quantization", () => {
     "dateTime quantization is monotone across storages",
     { a: Int(1_600_000_000_000, 1_800_000_000_000), b: Int(1_600_000_000_000, 1_800_000_000_000) },
     ({ a, b }) => {
-      const spec = ZOrder.dateTime("t", { from: "2024-01-01", unit: "hours", bits: 12 }).spec
+      const spec = dateTime("t", { from: "2024-01-01", unit: "hours", bits: 12 }).spec
       const [lo, hi] = a <= b ? [a, b] : [b, a]
       const ms = Curve.bindDimension(spec, { _tag: "Epoch", unit: "epochMs" })
       const iso = Curve.bindDimension(spec, { _tag: "UtcIsoString" })
@@ -234,7 +364,7 @@ describe("ZOrderCurve — quantization", () => {
     "string quantization follows UTF-8 byte order",
     { a: Schema.String, b: Schema.String },
     ({ a, b }) => {
-      const d = bind(ZOrder.string("s", { bytes: 3 }), { _tag: "RawString" })
+      const d = bind(string("s", { bytes: 3 }), { _tag: "RawString" })
       const order = Curve.compareBytes(Curve.utf8(a), Curve.utf8(b))
       if (order <= 0) expect(d.quantize(a) <= d.quantize(b)).toBe(true)
       else expect(d.quantize(a) >= d.quantize(b)).toBe(true)
@@ -242,7 +372,7 @@ describe("ZOrderCurve — quantization", () => {
   )
 
   it.prop("a bigint int is quantized like the same number", { a: Int(-5000, 5000) }, ({ a }) => {
-    const d = bind(ZOrder.int("x", { min: -1000, max: 1000, step: 7 }), {
+    const d = bind(int("x", { min: -1000, max: 1000, step: 7 }), {
       _tag: "Number",
       numeric: "bigint",
     })
@@ -250,7 +380,7 @@ describe("ZOrderCurve — quantization", () => {
   })
 
   it("quantizes a bigint past 2^53 in bigint arithmetic", () => {
-    const d = bind(ZOrder.int("x", { min: -(2 ** 52), max: 2 ** 52, step: 2 }), {
+    const d = bind(int("x", { min: -(2 ** 52), max: 2 ** 52, step: 2 }), {
       _tag: "Number",
       numeric: "bigint",
     })
@@ -260,7 +390,7 @@ describe("ZOrderCurve — quantization", () => {
   })
 
   it("clamps values outside min..max to the edge levels", () => {
-    const d = bind(ZOrder.int("x", { min: 10, max: 20, step: 2 }))
+    const d = bind(int("x", { min: 10, max: 20, step: 2 }))
     expect(d.levels).toBe(6n)
     expect(d.quantize(-1e9)).toBe(0n)
     expect(d.quantize(10)).toBe(0n)
@@ -270,7 +400,7 @@ describe("ZOrderCurve — quantization", () => {
   })
 
   it("reads dates by storage: epoch seconds, zoned ISO", () => {
-    const spec = ZOrder.dateTime("t", {
+    const spec = dateTime("t", {
       from: "2024-01-01T00:00:00Z",
       unit: "hours",
       bits: 16,
@@ -283,10 +413,10 @@ describe("ZOrderCurve — quantization", () => {
   })
 
   it("throws a tagged [EDD-9092] for a value it can't place", () => {
-    const status = bind(ZOrder.literals("status", ["pending", "active"]), { _tag: "Literal" })
-    const price = bind(ZOrder.int("price", { min: 0, max: 100 }))
+    const status = bind(literals("status", ["pending", "active"]), { _tag: "Literal" })
+    const price = bind(int("price", { min: 0, max: 100 }))
     const at = Curve.bindDimension(
-      ZOrder.dateTime("t", { from: "2024-01-01", unit: "days", bits: 8 }).spec,
+      dateTime("t", { from: "2024-01-01", unit: "days", bits: 8 }).spec,
       { _tag: "UtcIsoString" },
     )
     for (const attempt of [
@@ -319,9 +449,9 @@ describe("ZOrderCurve — quantization", () => {
 describe("ZOrderCurve — layout and interleave", () => {
   it("lays out 13 / 4 / 16 bits MSB-aligned, declaration order breaking ties", () => {
     const layout = Curve.makeLayout([
-      bind(ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 })),
-      bind(ZOrder.int("bedrooms", { min: 0, max: 15 })),
-      bind(ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), {
+      bind(int("price", { min: 0, max: 5_000_000, step: 1_000 })),
+      bind(int("bedrooms", { min: 0, max: 15 })),
+      bind(dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), {
         _tag: "UtcIsoString",
       }),
     ])
@@ -493,8 +623,8 @@ describe("ZOrderCurve — boxes, BIGMIN / LITMAX, descent", () => {
 
 describe("ZOrderCurve — quantizeBounds", () => {
   const layout = Curve.makeLayout([
-    bind(ZOrder.int("price", { min: 0, max: 1000, step: 10 })),
-    bind(ZOrder.literals("status", ["pending", "active", "closed"]), { _tag: "Literal" }),
+    bind(int("price", { min: 0, max: 1000, step: 10 })),
+    bind(literals("status", ["pending", "active", "closed"]), { _tag: "Literal" }),
   ])
 
   it("leaves an unbounded dimension its whole bit range", () => {
@@ -528,9 +658,9 @@ describe("ZOrderCurve — quantizeBounds", () => {
 
   it("an unbounded dimension doesn't cut cells above its top level: one bound plans exactly", () => {
     const listings = Curve.makeLayout([
-      bind(ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 })), // 5,001 levels, 13 bits
-      bind(ZOrder.int("bedrooms", { min: 0, max: 15 })),
-      bind(ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), {
+      bind(int("price", { min: 0, max: 5_000_000, step: 1_000 })), // 5,001 levels, 13 bits
+      bind(int("bedrooms", { min: 0, max: 15 })),
+      bind(dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), {
         _tag: "Epoch",
         unit: "epochMs",
       }),

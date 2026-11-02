@@ -3,7 +3,6 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Layer, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as Entity from "../src/Entity.js"
-import { ZOrder } from "../src/index.js"
 import * as Table from "../src/Table.js"
 
 describe("Table", () => {
@@ -674,8 +673,8 @@ describe("Table", () => {
       bedrooms: Schema.Number,
     }) {}
     const facets = [
-      ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-      ZOrder.int("bedrooms", { min: 0, max: 15 }),
+      { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+      { field: "bedrooms", min: 0, max: 15 },
     ] as const
     const listingsWith = (entityType: string, sk: Record<string, unknown>) =>
       Entity.make({

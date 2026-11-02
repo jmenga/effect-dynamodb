@@ -22,7 +22,6 @@ import { Config, Console, DateTime, Effect, Layer, Schema } from "effect"
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -94,9 +93,9 @@ const Listings = Entity.make({
         prefix: ["agencyId"], // exact-match, in front of the address
         zorder: [
           // Declaration order is interleave priority.
-          ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }), // 13 bits
-          ZOrder.int("bedrooms", { min: 0, max: 15 }), // 4 bits
-          ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }), // 16 bits
+          { field: "price", min: 0, max: 5_000_000, step: 1_000 }, // 13 bits
+          { field: "bedrooms", min: 0, max: 15 }, // 4 bits
+          { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 }, // 16 bits
         ],
       },
     },

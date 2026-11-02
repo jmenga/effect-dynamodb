@@ -330,10 +330,18 @@ export type { IndexDefinition, KeyPart }
  */
 import {
   type AnyRefValue,
+  type AppendInputFields,
   buildEntityDefinition,
   type EntityDefinition,
   type EntityDefinitionConfig,
   type EntityDefinitionData,
+  type EntityGeneratedIdConfig,
+  type EntityIndexesConfig,
+  type EntityPrimaryKeyConfig,
+  type EntityRefsConfig,
+  type EntityTimeSeriesConfig,
+  type EntityUniqueConfig,
+  type EntityVectorIndexesConfig,
   type NormalizedIndexes,
   normalizeTtlSeconds,
   resolveUniqueTtl,
@@ -2059,13 +2067,6 @@ export interface PutPlan {
  * })
  * ```
  */
-/** Primary key definition — used in the new `primaryKey` config form. */
-type PrimaryKeyDef = IndexDefinition &
-  (
-    | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
-    | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
-  )
-
 /**
  * Create an Entity definition.
  *
@@ -2101,18 +2102,16 @@ type PrimaryKeyDef = IndexDefinition &
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TPrimaryKey extends PrimaryKeyDef,
-  const TGsiIndexes extends globalThis.Record<string, GsiConfig> = {},
+  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, TRefs>,
+  const TGsiIndexes extends EntityIndexesConfig<TModel, TRefs> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-  const TUnique extends UniqueConfig | undefined = undefined,
-  const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
-  const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
-  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
-  const TVectorIndexes extends
-    | globalThis.Record<string, VectorIndexConfig<any>>
-    | undefined = undefined,
+  const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
+  const TRefs extends EntityRefsConfig<TModel, TRefs> | undefined = undefined,
+  const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
+  const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
+  const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -2124,7 +2123,7 @@ export const make = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs
-  readonly timeSeries?: TTimeSeries
+  readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
 }): Entity<
@@ -2146,7 +2145,7 @@ export const make = <
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
     for (const [name, gsi] of Object.entries(config.indexes)) {
-      gsiIndexes[name] = normalizeGsiConfig(gsi)
+      gsiIndexes[name] = normalizeGsiConfig(gsi as unknown as GsiConfig)
     }
   }
 

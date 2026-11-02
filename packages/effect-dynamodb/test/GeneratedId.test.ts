@@ -149,8 +149,9 @@ describe("Entity.make({ generatedId }) — make()-time validation (EDD-9008)", (
           pk: { field: "pk", composite: ["id"] },
           sk: { field: "sk", composite: [] },
         },
-        // `missing` is not a model field — `GeneratedIdConfig.field` is a plain
-        // string, so this is caught at make() time, not by the type system.
+        // `missing` is not a model field: a type error, and caught at make()
+        // time for untyped callers.
+        // @ts-expect-error not a model field
         generatedId: { field: "missing" },
       }),
     ).toThrow(/EDD-9008.*does not name a model field/)

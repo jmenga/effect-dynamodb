@@ -34,7 +34,6 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { CompositeNullableError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -1235,9 +1234,9 @@ class ZListing extends Schema.Class<ZListing>("ZListing")({
 const ZSchema = DynamoSchema.make({ name: "zorder-policy", version: 1 })
 
 const facets = [
-  ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-  ZOrder.int("bedrooms", { min: 0, max: 15 }),
-  ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+  { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+  { field: "bedrooms", min: 0, max: 15 },
+  { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
 ] as const
 
 /** Every dimension of `facets`, as `.set()` takes them. */
@@ -1289,7 +1288,7 @@ const ZListings = Entity.make({
     byStatus: {
       name: "gsi6",
       pk: { field: "gsi6pk", composite: ["region"] },
-      sk: { field: "gsi6sk", zorder: [ZOrder.literals("status", ["draft", "live"])] },
+      sk: { field: "gsi6sk", zorder: [{ field: "status", values: ["draft", "live"] }] },
     },
     // Shape 7a′ — 1-bit literals + 13-bit int: 14 bits, 2 bytes.
     byStatusPrice: {
@@ -1298,8 +1297,8 @@ const ZListings = Entity.make({
       sk: {
         field: "gsi7sk",
         zorder: [
-          ZOrder.literals("status", ["draft", "live"]),
-          ZOrder.int("price", { min: 0, max: 8191 }),
+          { field: "status", values: ["draft", "live"] },
+          { field: "price", min: 0, max: 8191 },
         ],
       },
     },

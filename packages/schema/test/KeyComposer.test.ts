@@ -4,7 +4,6 @@ import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as KeyComposer from "../src/KeyComposer.js"
-import * as ZOrder from "../src/ZOrder.js"
 
 describe("KeyComposer", () => {
   const schema = DynamoSchema.make({ name: "myapp", version: 1 })
@@ -1534,9 +1533,9 @@ describe("KeyComposer", () => {
         title: Schema.String,
       })
       const facets = [
-        ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-        ZOrder.int("bedrooms", { min: 0, max: 15 }),
-        ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+        { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+        { field: "bedrooms", min: 0, max: 15 },
+        { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
       ] as const
       const byListingId = {
         pk: { field: "pk", composite: ["listingId"] },
@@ -1678,7 +1677,7 @@ describe("KeyComposer", () => {
             byStatus: {
               name: "gsi4",
               pk: { field: "gsi4pk", composite: ["region"] },
-              sk: { field: "gsi4sk", zorder: [ZOrder.literals("status", ["draft", "live"])] },
+              sk: { field: "gsi4sk", zorder: [{ field: "status", values: ["draft", "live"] }] },
             },
           },
         })
@@ -1717,8 +1716,8 @@ describe("KeyComposer", () => {
               sk: {
                 field: "gsi4sk",
                 zorder: [
-                  ZOrder.literals("status", ["draft", "live"]),
-                  ZOrder.int("price", { min: 0, max: 8191 }),
+                  { field: "status", values: ["draft", "live"] },
+                  { field: "price", min: 0, max: 8191 },
                 ],
               },
             },
@@ -2022,9 +2021,9 @@ describe("KeyComposer", () => {
       listedAt: DynamoModel.DateString,
     })
     const facets = [
-      ZOrder.int("price", { min: 0, max: 5_000_000, step: 1_000 }),
-      ZOrder.int("bedrooms", { min: 0, max: 15 }),
-      ZOrder.dateTime("listedAt", { from: "2024-01-01", unit: "hours", bits: 16 }),
+      { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+      { field: "bedrooms", min: 0, max: 15 },
+      { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
     ] as const
     const gsi = (sk: Record<string, unknown>, extra?: Record<string, unknown>) =>
       ({
@@ -2081,7 +2080,19 @@ describe("KeyComposer", () => {
           { field: "agencyId", hash: undefined },
           { field: "officeId", hash: 8 },
         ])
-        expect(half.zorderHalf.dimensions).toEqual(facets)
+        // The entries, checked and normalised: step defaults to 1, from is an ISO instant.
+        expect(half.zorderHalf.dimensions).toEqual([
+          { shape: "range", field: "price", min: 0, max: 5_000_000, step: 1_000 },
+          { shape: "range", field: "bedrooms", min: 0, max: 15, step: 1 },
+          {
+            shape: "dateTime",
+            field: "listedAt",
+            from: "2024-01-01T00:00:00.000Z",
+            fromMs: Date.UTC(2024, 0, 1),
+            unit: "hours",
+            bits: 16,
+          },
+        ])
         expect(half.zorderHalf.layout).toBeUndefined()
         expect(def.type).toBe("isolated")
       })
@@ -2103,7 +2114,9 @@ describe("KeyComposer", () => {
         ["composite with zorder", gsi({ composite: ["price"], zorder: facets })],
         ["prefix without zorder", gsi({ prefix: ["agencyId"] })],
         ["an empty zorder", gsi({ zorder: [] })],
-        ["a zorder entry that isn't a dimension", gsi({ zorder: [{ field: "price" }] })],
+        ["a zorder entry that isn't a name or an entry", gsi({ zorder: [42] })],
+        ["a zorder entry without a field", gsi({ zorder: [{ min: 0, max: 9 }] })],
+        ["a zorder entry with an empty name", gsi({ zorder: [""] })],
         ["type clustered", gsi({ zorder: facets }, { type: "clustered" })],
         ["a dimension listed twice", gsi({ zorder: [facets[0], facets[0]] })],
         ["a field as prefix and dimension", gsi({ prefix: ["price"], zorder: facets })],

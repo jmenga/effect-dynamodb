@@ -37,7 +37,6 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
-import { keyFormLiterals, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -68,17 +67,18 @@ import type {
   EntityRefCreateType,
   EntityRefInputType,
   EntityRefUpdateType,
+  KeyFields,
+  ModelFieldName,
   PrefixFieldNames,
 } from "./internal/EntityTypes.js"
-import { numericTypeWithStringEncoding } from "./internal/SchemaAccessors.js"
 import {
   type BoundDimension,
   bindDimension,
-  type DimensionStorage,
   MAX_ADDRESS_BITS,
   MAX_DIMENSION_BITS,
   makeLayout,
 } from "./internal/ZOrderCurve.js"
+import { type DimensionField, resolveDimension } from "./internal/ZOrderDimension.js"
 import type {
   GsiConfig,
   IndexDefinition,
@@ -93,7 +93,6 @@ import {
   normalizeVectorIndexConfig,
   validateVectorIndexes,
 } from "./VectorIndex.js"
-import type * as ZOrder from "./ZOrder.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -178,7 +177,7 @@ export const resolveUniqueTtl = (
  */
 export type NormalizedIndexes<
   TPrimaryKey extends PrimaryKeyDef,
-  TGsiIndexes extends globalThis.Record<string, GsiConfig>,
+  TGsiIndexes extends globalThis.Record<string, GsiConfig<any>>,
 > = keyof TGsiIndexes extends never
   ? { readonly primary: TPrimaryKey }
   : { readonly primary: TPrimaryKey } & {
@@ -190,8 +189,8 @@ export type NormalizedIndexes<
  * type — `zorder` and `prefix` are phantom carriers for the accessor typing
  * (the runtime value has `zorderHalf`) — beside the derived `composite`.
  */
-type NormalizedGsi<G extends GsiConfig> = G["sk"] extends {
-  readonly zorder: infer Z extends ReadonlyArray<ZOrder.Dimension>
+type NormalizedGsi<G extends GsiConfig<any>> = G["sk"] extends {
+  readonly zorder: infer Z extends ReadonlyArray<unknown>
 }
   ? IndexDefinition & {
       readonly collection: G["collection"]
@@ -210,12 +209,91 @@ type NormalizedGsi<G extends GsiConfig> = G["sk"] extends {
       }
     }
 
-/** Primary key definition — used in the `primaryKey` config form. */
-type PrimaryKeyDef = IndexDefinition &
-  (
-    | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
-    | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
+/**
+ * @internal Primary key definition — the `primaryKey` config form. `F` is the
+ * attribute names a composite may name: on `Entity.make`, the model's fields
+ * plus ref-derived ids ({@link KeyFields}). At least one half has a composite.
+ */
+export type PrimaryKeyDef<F extends string = string> = Omit<IndexDefinition, "pk" | "sk"> & {
+  readonly pk: KeyPart<F>
+  readonly sk: KeyPart<F>
+} & (
+    | { readonly pk: { readonly composite: readonly [F, ...F[]] } }
+    | { readonly sk: { readonly composite: readonly [F, ...F[]] } }
   )
+
+/**
+ * @internal The configs of `Entity.make` that name model attributes, typed
+ * from the model (`TModel`) and the refs config (`TRefs`). Shared with the
+ * runtime `Entity.make` in `effect-dynamodb`, so both reject a misspelled
+ * attribute name at compile time and complete the names in an editor.
+ */
+export type EntityPrimaryKeyConfig<TModel extends Schema.Top, TRefs> = PrimaryKeyDef<
+  keyof KeyFields<TModel, TRefs> & string
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the secondary indexes. */
+export type EntityIndexesConfig<TModel extends Schema.Top, TRefs> = globalThis.Record<
+  string,
+  GsiConfig<KeyFields<TModel, TRefs>>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: unique constraints over model fields. */
+export type EntityUniqueConfig<TModel extends Schema.Top> = UniqueConfig<ModelFieldName<TModel>>
+
+/**
+ * @internal See {@link EntityPrimaryKeyConfig}: refs keyed by the model's
+ * (ref) fields. The record half keeps it a `Record<string, AnyRefValue>`; the
+ * keyed half gives an editor the field names; the last half, over the refs
+ * as written (`TRefs`, the constraint naming its own parameter), turns a key
+ * that is not a model field into `never`, so the error lands on that key. A
+ * guard on the parameter instead of the constraint would make
+ * `Parameters<typeof Entity.make>` resolve to `never`.
+ */
+export type EntityRefsConfig<TModel extends Schema.Top, TRefs = {}> = globalThis.Record<
+  string,
+  AnyRefValue
+> & {
+  readonly [K in ModelFieldName<TModel>]?: AnyRefValue
+} & {
+  readonly [K in Exclude<keyof TRefs, ModelFieldName<TModel>>]: never
+}
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the time-series clock and append input. */
+export type EntityTimeSeriesConfig<TModel extends Schema.Top> = TimeSeriesConfig<
+  Schema.Top,
+  ModelFieldName<TModel>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the auto-generated id field. */
+export type EntityGeneratedIdConfig<TModel extends Schema.Top> = GeneratedIdConfig<
+  ModelFieldName<TModel>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: vector indexes over model fields. */
+export type EntityVectorIndexesConfig<TModel extends Schema.Top> = globalThis.Record<
+  string,
+  VectorIndexConfig<ModelFieldName<TModel>>
+>
+
+/**
+ * @internal A `timeSeries.appendInput` field that is not a model field: its
+ * name, as a type error on `appendInput` (`never` when every field is one).
+ */
+export type AppendInputFields<TModel extends Schema.Top, TTimeSeries> = TTimeSeries extends {
+  readonly appendInput: infer A extends Schema.Top
+}
+  ? string extends ModelFieldName<A>
+    ? unknown
+    : [Exclude<ModelFieldName<A>, ModelFieldName<TModel>>] extends [never]
+      ? unknown
+      : {
+          readonly appendInput: `EDD-9013: appendInput field "${Exclude<
+            ModelFieldName<A>,
+            ModelFieldName<TModel>
+          >}" is not a model field`
+        }
+  : unknown
 
 // ---------------------------------------------------------------------------
 // EntityDefinition — the pure half of an Entity (no AWS operations)
@@ -1091,113 +1169,39 @@ export const zorderInCollection = (entityType: string, indexName: string): Error
   )
 
 /**
- * Resolve how a dimension's field is stored (design §4.1), from the field's
- * schema in the entity's input schema and its date encoding. `[EDD-9088]` when
- * the dimension's kind doesn't fit the field, or the field's order is unknown.
- */
-const resolveDimensionStorage = (
-  entityType: string,
-  indexName: string,
-  dimension: ZOrder.Dimension,
-  field: { readonly schema: Schema.Top | undefined; readonly encoding: DynamoEncoding | undefined },
-): DimensionStorage => {
-  const refuse = (why: string): never => {
-    throw new Error(
-      `[EDD-9088] Entity "${entityType}": index "${indexName}" dimension ` +
-        `ZOrder.${dimension.kind}("${dimension.field}") doesn't fit its field: ${why}`,
-    )
-  }
-  const schema = field.schema
-  if (schema === undefined) {
-    return refuse("it isn't a model field, so its stored form is unknown.")
-  }
-  const kind = keyFormValueKind(schema)
-  const spec = dimension.spec
-  switch (spec.kind) {
-    case "int":
-    case "float": {
-      if (kind !== "number" && kind !== "bigint") {
-        return refuse(`a ${spec.kind} dimension needs a number or bigint field.`)
-      }
-      if (spec.kind === "float" && kind === "bigint") {
-        return refuse("a float dimension can't quantize a bigint field; use ZOrder.int.")
-      }
-      return numericTypeWithStringEncoding(schema)
-        ? { _tag: "NumericString", numeric: kind }
-        : { _tag: "Number", numeric: kind }
-    }
-    case "dateTime": {
-      const encoding = field.encoding
-      if (encoding?.storage === "epochMs" || encoding?.storage === "epochSeconds") {
-        return { _tag: "Epoch", unit: encoding.storage }
-      }
-      if (encoding?.storage === "string") {
-        return encoding.domain === "DateTime.Zoned"
-          ? { _tag: "ZonedIsoString" }
-          : { _tag: "UtcIsoString" }
-      }
-      return refuse(
-        "a dateTime dimension needs a date field with a known storage format " +
-          "(a DynamoModel date schema, or an Effect date schema) — a plain number or " +
-          "string has no known order.",
-      )
-    }
-    case "literals": {
-      if (kind !== "string" && kind !== "number" && kind !== "boolean") {
-        return refuse("a literals dimension needs a string, number or boolean field.")
-      }
-      const foreign = spec.values.find((value) => typeof value !== kind)
-      if (foreign !== undefined) {
-        return refuse(`${JSON.stringify(foreign)} is not a ${kind}, the field's key form.`)
-      }
-      const missing = keyFormLiterals(schema)?.filter((member) => !spec.values.includes(member))
-      if (missing !== undefined && missing.length > 0) {
-        return refuse(
-          `the field's values ${missing.map((m) => JSON.stringify(m)).join(", ")} are not ` +
-            `declared, so they would have no level.`,
-        )
-      }
-      return { _tag: "Literal" }
-    }
-    case "string": {
-      if (kind !== "string") return refuse("a string dimension needs a string field.")
-      return { _tag: "RawString" }
-    }
-  }
-}
-
-/**
  * Bind a normalised Z-order sort key to an entity's fields: resolve each
- * dimension's storage, check the bit budget (`[EDD-9089]`) and lay the address
- * out. One declared `Dimension` may be bound by several entities, each to its
- * own storage.
+ * declared dimension against its field (`[EDD-9087]`, `[EDD-9088]`), check the
+ * bit budget (`[EDD-9089]`) and lay the address out.
  */
 const bindZOrderHalf = (
   entityType: string,
   indexName: string,
   half: ZOrderSkPart,
-  fieldOf: (field: string) => {
-    readonly schema: Schema.Top | undefined
-    readonly encoding: DynamoEncoding | undefined
-  },
+  fieldOf: (field: string) => DimensionField,
 ): ZOrderSkPart => {
   const bound: Array<BoundDimension> = []
-  for (const dimension of half.zorderHalf.dimensions) {
-    const limit = MAX_DIMENSION_BITS[dimension.kind]
-    if (dimension.bits > limit) {
-      throw new Error(
-        `[EDD-9089] Entity "${entityType}": index "${indexName}" dimension ` +
-          `ZOrder.${dimension.kind}("${dimension.field}") needs ${dimension.bits} bits; a ` +
-          `${dimension.kind} dimension takes at most ${limit}. Widen its step or narrow its range.`,
-      )
-    }
-    const storage = resolveDimensionStorage(
+  for (const declared of half.zorderHalf.dimensions) {
+    const { spec, storage } = resolveDimension(
       entityType,
       indexName,
-      dimension,
-      fieldOf(dimension.field),
+      declared,
+      fieldOf(declared.field),
     )
-    bound.push(bindDimension(dimension.spec, storage))
+    const limit = MAX_DIMENSION_BITS[spec.kind]
+    if (spec.bits > limit) {
+      throw new Error(
+        `[EDD-9089] Entity "${entityType}": index "${indexName}" dimension ` +
+          `"${spec.field}" needs ${spec.bits} bits; a ${dimensionLabel(spec.kind)} dimension ` +
+          `takes at most ${limit}. ${
+            spec.kind === "int" || spec.kind === "float"
+              ? "Widen its step or narrow its range."
+              : spec.kind === "string"
+                ? "Lower its bytes."
+                : "Lower its bits."
+          }`,
+      )
+    }
+    bound.push(bindDimension(spec, storage))
   }
   const layout = makeLayout(bound)
   if (layout.bits > MAX_ADDRESS_BITS) {
@@ -1209,6 +1213,9 @@ const bindZOrderHalf = (
   }
   return { ...half, zorderHalf: { ...half.zorderHalf, layout } }
 }
+
+const dimensionLabel = (kind: BoundDimension["spec"]["kind"]): string =>
+  kind === "int" || kind === "float" ? "range" : kind === "dateTime" ? "date-time" : kind
 
 // ---------------------------------------------------------------------------
 // Pure decode helper used by the definition's `_decodeRecord` is AWS-coupled
@@ -1253,18 +1260,16 @@ const buildAttachPrototype = (data: EntityDefinitionData): ((decoded: any) => an
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TPrimaryKey extends PrimaryKeyDef,
-  const TGsiIndexes extends globalThis.Record<string, GsiConfig> = {},
+  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, TRefs>,
+  const TGsiIndexes extends EntityIndexesConfig<TModel, TRefs> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-  const TUnique extends UniqueConfig | undefined = undefined,
-  const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
-  const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
-  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
-  const TVectorIndexes extends
-    | globalThis.Record<string, VectorIndexConfig<any>>
-    | undefined = undefined,
+  const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
+  const TRefs extends EntityRefsConfig<TModel, TRefs> | undefined = undefined,
+  const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
+  const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
+  const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
@@ -1276,7 +1281,7 @@ export const make = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs
-  readonly timeSeries?: TTimeSeries
+  readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
 }): EntityDefinition<
@@ -1297,7 +1302,7 @@ export const make = <
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
     for (const [name, gsi] of Object.entries(config.indexes)) {
-      gsiIndexes[name] = normalizeGsiConfig(gsi)
+      gsiIndexes[name] = normalizeGsiConfig(gsi as unknown as GsiConfig)
     }
   }
   const indexes = { primary: config.primaryKey, ...gsiIndexes } as globalThis.Record<
