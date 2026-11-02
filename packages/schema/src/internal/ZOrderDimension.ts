@@ -340,12 +340,17 @@ export const resolveDimension = (
         )
       }
       const members = keyFormLiterals(schema) ?? (kind === "boolean" ? [false, true] : undefined)
+      if (kind === "number" && members === undefined) {
+        return refuse(
+          `a plain number field takes a range (${describeOptions("range")}), ordered by value; ` +
+            "values and bits belong to a literal union field.",
+        )
+      }
       const values = declared.values ?? members
       if (values === undefined) {
         return refuse(
           `the field isn't limited to literal members, so a bare name has no levels; ` +
-            `declare ${kind === "string" ? describeOptions("string") : describeOptions("range")}, ` +
-            `or list the members in values.`,
+            `declare ${describeOptions("string")}, or list the members in values.`,
         )
       }
       const foreign = values.find((value) => typeof value !== kind)

@@ -1004,7 +1004,7 @@ import type { ZOrder } from "effect-dynamodb"
 | a date with a known storage format (a `DynamoModel` date schema or an Effect date schema) | `{ field, from, unit, bits }` (`DateTimeDimension`) | `2^bits` levels of one `unit` (`"milliseconds"` … `"weeks"`) from `from` (an ISO string, `Date` or `DateTime`) |
 | a literal union, `boolean` | the bare name, or `{ field, values?, bits? }` (`LiteralsDimension`) | One level per member, in the schema's order; `values` reorders them and lists every member; `bits` reserves room for members appended later. Bounds may use `{ in: [...] }`. A string union also takes a byte width, a number union a range |
 | `string` | `{ field, bytes }` (`StringDimension`) | The first `bytes` (1..16) UTF-8 bytes, in byte order |
-| a plain `string` or `number` | `{ field, values, bits? }` (`ListedLiteralsDimension`) | One level per listed value; writing another value fails |
+| a plain `string` | `{ field, values, bits? }` (`ListedLiteralsDimension`) | One level per listed value; writing another value fails. A plain `number` takes a range only |
 
 `Entity.make` checks entries at runtime too. Options an entry can't use, options of two kinds or an unknown option throw `EDD-9087`; an entry that doesn't fit its field's schema throws `EDD-9088`; more than 53 bits for one dimension (128 for a byte width) or 512 in all throws `EDD-9089`.
 

@@ -305,7 +305,7 @@ describe("Entity.make — Z-order sort keys (#171)", () => {
         "a bare name over a plain number",
         { floors: Schema.Number },
         "floors",
-        /declare \{ field, min, max, step\? \}/,
+        /a plain number field takes a range \(\{ field, min, max, step\? \}\)/,
       ],
     ])("[EDD-9088] %s", (_, fields, dimension, why) => {
       expect(() => withZOrder(fields, { zorder: [dimension] })).toThrow(

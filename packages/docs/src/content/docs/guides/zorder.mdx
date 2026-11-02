@@ -96,7 +96,7 @@ Each entry names a model field, and the field's type in the model decides which 
 | a date with a known storage format: a `DynamoModel` date schema (`DateString`, `DateEpochMs`, `DateEpochSeconds`, `DateTimeZoned`, …) or an Effect date schema | `{ field, from, unit, bits }` | `2^bits` of one `unit` each, from `from` |
 | a literal union, or `boolean` | the bare name, or `{ field, values?, bits? }` (a string union also takes a byte width, a number union a range) | one per member, in the schema's order (`false`, `true` for a boolean). `values` reorders them and must list every member |
 | `string` | `{ field, bytes }` | the first `bytes` (1 to 16) UTF-8 bytes |
-| a plain `string` or `number` whose values you know | `{ field, values, bits? }` | one per listed value; a value outside the list fails the write |
+| a plain `string` whose values you know | `{ field, values, bits? }` | one per listed value; a value outside the list fails the write. A plain `number` takes a range only (`values` on it is `EDD-9088`): its order is the numbers' own |
 
 A literal union field needs no options at all:
 
@@ -113,7 +113,7 @@ The same rules hold at runtime, for untyped callers, when `Entity.make` runs:
 
 - `EDD-9086`: a malformed Z-order half. `zorder` belongs on a GSI sort key only, not on a partition key half or the primary key (both are also type errors); no `composite` beside `zorder`; no `type: "clustered"`; no field listed twice; each entry a field name or an object naming one.
 - `EDD-9087`: options an entry can't use: a bound, `step`, `bits`, `from`, `bytes` or `values` list out of range, options of two kinds, or an option no entry takes (a misspelled `stpe` is refused, not ignored).
-- `EDD-9088`: an entry that doesn't fit its field, such as a range over a `string` field, or a time window over a plain `number` or `string`, whose order is unknown.
+- `EDD-9088`: an entry that doesn't fit its field, such as a range over a `string` field, `values` over a plain `number` field, or a time window over a plain `number` or `string`, whose order is unknown.
 - `EDD-9089`: a dimension over its kind's bit limit (53, or 128 for a byte width), or more than 512 bits in all.
 - `EDD-9090`: a Z-order index can't be a `collection` member.
 

@@ -80,8 +80,10 @@ export interface DateTimeDimension<F extends string = string> {
  * for members added later: adding one keeps stored addresses valid only while
  * it fits the declared width.
  *
- * A plain `string` or `number` field takes one too, with `values` listed
- * ({@link ListedLiteralsDimension}); writing a value outside them fails.
+ * A plain `string` field takes one too, with `values` listed
+ * ({@link ListedLiteralsDimension}); writing a value outside them fails. A
+ * plain `number` field doesn't: it takes a range ({@link NumericDimension}),
+ * whose order is the numbers' own.
  */
 export interface LiteralsDimension<F extends string = string, L = LiteralValue> {
   readonly field: F
@@ -89,7 +91,7 @@ export interface LiteralsDimension<F extends string = string, L = LiteralValue> 
   readonly bits?: number | undefined
 }
 
-/** A {@link LiteralsDimension} whose `values` are required: over a plain `string` or `number` field. */
+/** A {@link LiteralsDimension} whose `values` are required: over a plain `string` field. */
 export interface ListedLiteralsDimension<F extends string = string, L = LiteralValue>
   extends LiteralsDimension<F, L> {
   readonly values: ReadonlyArray<L>
@@ -144,7 +146,7 @@ type IsLiterals<V> = true extends (V extends unknown ? IsWide<V> : never) ? fals
  *
  * | Field type | Entry |
  * |---|---|
- * | `number` | {@link NumericDimension} or {@link ListedLiteralsDimension} |
+ * | `number` | {@link NumericDimension} |
  * | `bigint` | {@link NumericDimension} |
  * | a date (`DateTime`, `Date`) | {@link DateTimeDimension} |
  * | a string literal union | `F`, {@link LiteralsDimension} or {@link StringDimension} |
@@ -173,9 +175,7 @@ type DimensionOf<F extends string, V> = [V] extends [never]
     : [V] extends [number | bigint]
       ? IsLiterals<V> extends true
         ? F | LiteralsDimension<F, V> | NumericDimension<F>
-        : [V] extends [number]
-          ? NumericDimension<F> | ListedLiteralsDimension<F, number>
-          : NumericDimension<F>
+        : NumericDimension<F>
       : [V] extends [string]
         ? IsLiterals<V> extends true
           ? F | LiteralsDimension<F, V> | StringDimension<F>

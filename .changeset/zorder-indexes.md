@@ -14,8 +14,8 @@ below).
 A Z-order dimension is a plain entry in `sk.zorder`, typed from the model: a bare field name, or
 `{ field, ...options }` whose options follow the field's type (`{ min, max, step? }` for a
 `number` or `bigint`, `{ from, unit, bits }` for a date, the bare name or `{ values?, bits? }` for
-a literal union or `boolean`, `{ bytes }` for a `string`, `{ values, bits? }` for a plain `string`
-or `number`). The editor completes the field names and options. `ZOrder` exports the entry types
+a literal union or `boolean`, `{ bytes }` or `{ values, bits? }` for a plain `string`; a plain
+`number` takes a range only). The editor completes the field names and options. `ZOrder` exports the entry types
 only. `Entity.make` checks entries at runtime too, and refuses an unknown option (`EDD-9087`).
 
 Every definition config that names a model attribute is now typed from the model: `Entity.make`

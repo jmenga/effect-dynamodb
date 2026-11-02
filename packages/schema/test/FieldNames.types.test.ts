@@ -281,6 +281,8 @@ describe("definition attribute names are typed from the model", () => {
                   "statuss",
                   // @ts-expect-error a literal union takes its members, not a range
                   { field: "status", from: "2024-01-01", unit: "days", bits: 4 },
+                  // @ts-expect-error a plain number field takes a range, not a values list
+                  { field: "price", values: [1, 2, 3] },
                 ],
               },
             },
@@ -290,6 +292,7 @@ describe("definition attribute names are typed from the model", () => {
       expect(make([{ field: "pricee", min: 0, max: 9 }])).toThrow(/EDD-9002/)
       expect(make([{ field: "listedAt", min: 0, max: 9 }])).toThrow(/EDD-9088/)
       expect(make(["title"])).toThrow(/EDD-9088/)
+      expect(make([{ field: "price", values: [1, 2, 3] }])).toThrow(/EDD-9088/)
     })
   })
 

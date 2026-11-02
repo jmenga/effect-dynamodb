@@ -193,7 +193,7 @@ export interface LiteralsDimension<F extends string = string, L = LiteralValue> 
   readonly bits?: number | undefined                                  // reserve room for members added later
 }
 export interface ListedLiteralsDimension<F extends string = string, L = LiteralValue>
-  extends LiteralsDimension<F, L> {                                   // plain string | number field
+  extends LiteralsDimension<F, L> {                                   // plain string field
   readonly values: ReadonlyArray<L>
 }
 export interface StringDimension<F extends string = string> {        // string field
@@ -203,7 +203,7 @@ export interface StringDimension<F extends string = string> {        // string f
 export type AnyDimension = string | NumericDimension | DateTimeDimension | LiteralsDimension | StringDimension
 
 /** The entries a field `F` of model type `V` takes (any entry when `V` is unknown). */
-export type DimensionFor<F extends string, V> = /* number → Numeric | ListedLiterals<number>;
+export type DimensionFor<F extends string, V> = /* number → Numeric;
   bigint → Numeric; date → DateTime; string literal union → F | Literals | String;
   number literal union → F | Literals | Numeric; boolean / mixed literal union → F | Literals;
   string → String | ListedLiterals<string>; anything else → never */
@@ -629,7 +629,8 @@ in §11, whether a bound can be a FilterExpression:
 
 Anything else is `[EDD-9088]`: `dateTime` on an un-annotated `number` or a plain `Schema.String`
 (its format, and so its order, is unknown), `int` / `float` on a non-numeric key form, `literals`
-missing a member of the field's literal union, `string` on a non-string key form.
+missing a member of the field's literal union or over a plain `number` (it takes a range, *owner
+2026-11-01*), `string` on a non-string key form.
 
 **Clamping is safe.** `q` is monotone non-decreasing, so a stored value outside `[min, max]`
 lands in the edge level, and any box containing that level's values reads it; the exact check
@@ -2010,7 +2011,7 @@ confirmed by the owner on 2026-11-01 as proposed. *(owner 2026-11-01)* = decided
 | A10 | `.onRequest()` as a second public hook beside `.explain()` *(confirmed 2026-10-27)* | **in** | The issue's Scope names "a plan/explain debug hook"; open question 3 asks for "addresses visited vs items returned", which a no-I/O `explain()` can't report. Alternative: drop `onRequest` and let tests read `ScannedCount` through a wrapped `DynamoClient` layer; users then have no per-request view. |
 | A11 | `auto` strategy = `precise` when the exact plan fits `maxRanges`, else `jump` *(confirmed 2026-10-27)* | **in** | The issue's proposed default (§5.6). An earlier draft added `naive` when address fill ≥ 0.5 (`NAIVE_FILL`); dropped because address fill isn't data density. |
 | A12 | ~~Public `ZOrder` surface = dimension constructors and types only~~ *(confirmed 2026-10-27; superseded by A13)* | **replaced** | The curve algebra (`interleave`, `bigmin`, `plan`, …) stays internal (`internal/ZOrderCurve.ts`) so its signatures and the stored layout aren't semver-bound before the geo follow-up needs them (§3.1). That part stands; the constructors are gone (A13). |
-| A13 | Dimensions declared as plain entries in `sk.zorder`, typed from the model; public `ZOrder` = types only *(owner 2026-11-01)* | **in** | A constructor (`ZOrder.int("price", …)`) restated a type the model already declares, and a free function can't complete or check its field name against the model. An entry is a bare field name or `{ field, ...options }`; its options follow the field's model type (`DimensionFor`, §3.1): a range for `number` / `bigint` (int or float by whether the options are integers), a time window for a date, the bare name or `{ values?, bits? }` for a literal union or `boolean`, `{ bytes }` for a `string`, `{ values, bits? }` for a plain `string` / `number`. `[EDD-9087]` moves from the constructors to `Entity.make` (`normalizeGsiConfig`), and also refuses an unknown option (types catch a misspelled field, not a misspelled option beside valid ones). `.within()` bounds are typed from the entry and the field as before. Type change: an entry or key config declared outside `Entity.make` needs `as const`. |
+| A13 | Dimensions declared as plain entries in `sk.zorder`, typed from the model; public `ZOrder` = types only *(owner 2026-11-01)* | **in** | A constructor (`ZOrder.int("price", …)`) restated a type the model already declares, and a free function can't complete or check its field name against the model. An entry is a bare field name or `{ field, ...options }`; its options follow the field's model type (`DimensionFor`, §3.1): a range for `number` / `bigint` (int or float by whether the options are integers), a time window for a date, the bare name or `{ values?, bits? }` for a literal union or `boolean`, `{ bytes }` or `{ values, bits? }` for a plain `string` (a plain `number` takes a range only; `values` on it is `[EDD-9088]`, *owner 2026-11-01*). `[EDD-9087]` moves from the constructors to `Entity.make` (`normalizeGsiConfig`), and also refuses an unknown option (types catch a misspelled field, not a misspelled option beside valid ones). `.within()` bounds are typed from the entry and the field as before. Type change: an entry or key config declared outside `Entity.make` needs `as const`. |
 | A14 | Every definition position that names a model attribute is typed from the model *(owner 2026-11-01)* | **in** | The owner's rule: "The field declarations for all fields MUST validate attribute names." The editor completes the names; a misspelled one is a compile error on that entry; the runtime checks stay for untyped callers. Covered: `Entity.make` key and index composites, `sk.prefix` / `sk.zorder`, `refs` keys, `unique`, `timeSeries.orderBy` / `appendInput`, `generatedId.field`, vector index fields; `DynamoModel.configure` keys; `Aggregate.make` `pk` / `collection` / `list` composites, `context`, `edges` keys, `many` edges' `sk.composite`; `Collections.member` / `Collections.make`; `GeoIndex.make` `index` / `fields`. Physical names stay strings (key `field`s, `configure` renames, timestamp / version / TTL names), as do labels that name no attribute (`one` / `many`'s first argument, discriminator keys). Pre-existing gaps closed with it: a `unique` field or an `appendInput` field the model lacks was accepted at runtime and is now refused (`[EDD-9002]`, `[EDD-9013]`). DESIGN.md §5 lists the positions. |
 | B1 | General binary keys for composite halves *(owner)* | **out** | Per the issue. |
 | B2 | Z-order on the table primary key *(owner)* | **out** | Per the issue; EDD-9086. Follow-up candidate: append-only event items. |

@@ -33,7 +33,7 @@ type Resolved = ReturnType<typeof resolve>
 /** The literal schema whose members are `values`, so a bare entry takes them. */
 const literalField = (values: ReadonlyArray<ZOrder.LiteralValue>): Schema.Top =>
   typeof values[0] === "number"
-    ? Schema.Number
+    ? Schema.Literals(values as ReadonlyArray<number>)
     : typeof values[0] === "boolean"
       ? Schema.Boolean
       : Schema.String
@@ -331,6 +331,17 @@ describe("ZOrder — dimension entries", () => {
       [
         "a byte width over a number",
         { field: "x", bytes: 2 },
+        { schema: Schema.Number, encoding: undefined },
+      ],
+      [
+        "values over a plain number",
+        { field: "x", values: [1, 2, 3] },
+        { schema: Schema.Number, encoding: undefined },
+      ],
+      ["a bare name over a plain number", "x", { schema: Schema.Number, encoding: undefined }],
+      [
+        "bits alone over a plain number",
+        { field: "x", bits: 4 },
         { schema: Schema.Number, encoding: undefined },
       ],
     ]

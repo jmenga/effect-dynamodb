@@ -1764,7 +1764,7 @@ describe("Entity types — Z-order sort keys (#171)", () => {
   it("an entry's options follow its field's type", () => {
     type Fields = { price: number; listedAt: DateTime.Utc; status: "draft" | "live"; title: string }
     expectTypeOf<ZOrder.DimensionFor<"price", number>>().toEqualTypeOf<
-      ZOrder.NumericDimension<"price"> | ZOrder.ListedLiteralsDimension<"price", number>
+      ZOrder.NumericDimension<"price">
     >()
     expectTypeOf<ZOrder.DimensionFor<"listedAt", DateTime.Utc>>().toEqualTypeOf<
       ZOrder.DateTimeDimension<"listedAt">
