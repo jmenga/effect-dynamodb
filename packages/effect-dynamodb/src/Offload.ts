@@ -21,19 +21,25 @@
  *   settle (an unknown DynamoDB outcome, a failed rollback delete, a lost
  *   multipart completion), so the application can queue the item for
  *   `gc.sweep`.
+ * - **{@link compareStored}** classifies what a change did to one offloaded
+ *   field from its stored old and new attribute values, without the blob
+ *   store ({@link OffloadChange}) — the raw form of
+ *   `Entity.decodeStreamRecord`'s `offloaded`.
  *
  * See `DESIGN.md §7 "Offloaded Storage"`.
  */
 
 import type { NoOffload, OffloadFields } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type {
   DefaultOffloadModes,
   OffloadMode,
   ResolvedOffloadModes,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
-import type { Layer } from "effect"
+import type { Effect, Layer } from "effect"
 import { layerObserver as makeObserverLayer, type ObserverOptions } from "./internal/BlobLedger.js"
-import type { BlobHandle, OffloadedValue } from "./internal/OffloadValues.js"
+import * as OffloadChange from "./internal/OffloadChange.js"
+import type { BlobHandle, OffloadedValue, OffloadKind } from "./internal/OffloadValues.js"
 
 export type {
   ExternalConfig,
@@ -57,9 +63,18 @@ export type {
   UnsettledUpload,
 } from "./internal/BlobLedger.js"
 export type { ByteRange } from "./internal/BlobStoreContract.js"
+export type {
+  OffloadChange,
+  StoredAttributeValue,
+} from "./internal/OffloadChange.js"
 export type { BinaryInput, BlobSource, BlobSourceOptions } from "./internal/OffloadInput.js"
 export { BlobSourceTypeId, isBlobSource, source } from "./internal/OffloadInput.js"
-export type { BlobHandle, OffloadedValue, OffloadLocation } from "./internal/OffloadValues.js"
+export type {
+  BlobHandle,
+  OffloadedValue,
+  OffloadKind,
+  OffloadLocation,
+} from "./internal/OffloadValues.js"
 export {
   BlobHandleTypeId,
   isBlobHandle,
@@ -203,3 +218,48 @@ export type ViewOf<O extends OffloadState> = View<O["item"], O["fields"], O["mod
  * ```
  */
 export const layerObserver: (options: ObserverOptions) => Layer.Layer<never> = makeObserverLayer
+
+/**
+ * What a change did to one offloaded field (design §10.3), read from the
+ * stored attribute values of its old and new images — DynamoDB JSON, `B` as
+ * bytes or base64 text as Lambda and EventBridge Pipes deliver it;
+ * `undefined` when an image has no such attribute. `kind` is the field's:
+ * `"overflow"` (`Packed({ external })`) or `"binary"` (`External`).
+ *
+ * - `unchanged` — a pointer to the same object version, or inline values
+ *   with the same content;
+ * - `rewritten` — another version, or another stored form, with the same
+ *   checksum algorithm, content checksum and content size: **probably** the
+ *   same content (a CRC can be matched by crafted content — a consumer that
+ *   must not miss a change treats it as `changed`, or compares the content);
+ * - `changed` — different content, or no canonical bytes to compare (a
+ *   legacy native map against any other form);
+ * - `added` / `removed` — only in the new / old image (both absent:
+ *   `unchanged`).
+ *
+ * Never touches the blob store. An inline compressed value is decompressed
+ * with the `Compression` service in scope to checksum its content (without
+ * its codec: a `ValidationError` whose `cause` is a `CompressorNotRegistered`).
+ * A value that is not a stored form of `kind` — a malformed pointer, an `S`
+ * value on a binary attribute that is not a pointer, a binary field's
+ * `~edbp:` text on an overflow attribute — fails with a `ValidationError`.
+ * A member set to `undefined` is no member: `{ S: "…", B: undefined }` is an
+ * `S` value. `Entity.decodeStreamRecord` applies it to every offloaded field
+ * of a record.
+ *
+ * @example
+ * ```ts
+ * // `record` is a DynamoDB Streams record of a NEW_AND_OLD_IMAGES stream.
+ * const change = yield* Offload.compareStored(
+ *   record.dynamodb.OldImage?.body,
+ *   record.dynamodb.NewImage?.body,
+ *   "overflow",
+ * )
+ * if (change !== "unchanged") yield* reindex(record)
+ * ```
+ */
+export const compareStored: (
+  oldValue: OffloadChange.StoredAttributeValue | undefined,
+  newValue: OffloadChange.StoredAttributeValue | undefined,
+  kind: OffloadKind,
+) => Effect.Effect<OffloadChange.OffloadChange, ValidationError> = OffloadChange.compareStored

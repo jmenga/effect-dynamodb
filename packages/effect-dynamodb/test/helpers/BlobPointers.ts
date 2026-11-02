@@ -7,8 +7,10 @@
 
 import { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
-import { Option } from "effect"
+import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
+import { Effect, Option } from "effect"
 import { expect } from "vitest"
+import type { BlobStoreService } from "../../src/BlobStore.js"
 
 const pointer = (fields: BlobPointer.BlobPointerFields): BlobPointer.BlobPointer => {
   const made = BlobPointer.make(fields)
@@ -73,15 +75,19 @@ export const expectPointerStoreFailure = (
 }
 
 /**
- * `error` is the `ValidationError` a read path that does not resolve
- * pointers yet raises on one (the codec's "cannot resolve" refusal): it names
- * the attribute and the object version, and never carries the pointer as a
- * value.
+ * `error` is the `ValidationError` a synchronous read (which does no I/O)
+ * raises on a pointer — the codec's "cannot resolve" refusal: it names the
+ * attribute and the object version, never carries the pointer as a value,
+ * and says what resolves it (`hint`, when given).
  */
 export const expectUnresolvedPointer = (
   error: unknown,
   attribute: string,
-  expected: { readonly entityType?: string; readonly operation?: string } = {},
+  expected: {
+    readonly entityType?: string
+    readonly operation?: string
+    readonly hint?: ReadonlyArray<string>
+  } = {},
 ): void => {
   expect(error).toBeInstanceOf(ValidationError)
   const validation = error as ValidationError
@@ -93,4 +99,49 @@ export const expectUnresolvedPointer = (
   expect(message).toContain(jsonPointer.ref.key)
   expect(message).toContain(jsonPointer.ref.version)
   expect(message).toContain("cannot resolve")
+  for (const text of expected.hint ?? []) expect(message).toContain(text)
 }
+
+/**
+ * Put `object` (default: `content`) into `store` and return the pointer
+ * naming it: `content` is what the pointer's checksum and content size
+ * describe (the object, unless it is compressed with `codec`); `overrides`
+ * corrupt the pointer.
+ */
+export const storeObject = (
+  store: BlobStoreService,
+  options: {
+    readonly key: string
+    readonly kind: BlobPointer.BlobPointerKind
+    readonly content: Uint8Array
+    readonly object?: Uint8Array | undefined
+    readonly codec?: "none" | "gzip" | "brotli" | "zstd" | undefined
+    readonly contentType?: string | undefined
+    readonly overrides?: Partial<BlobPointer.BlobPointerFields> | undefined
+  },
+): Effect.Effect<BlobPointer.BlobPointer> =>
+  Effect.gen(function* () {
+    const object = options.object ?? options.content
+    const { ref } = yield* Effect.orDie(
+      store.put({
+        key: options.key,
+        body: object,
+        contentLength: object.length,
+        checksum: Effect.succeed({ algorithm: "crc64nvme", value: crc64nvme(object) }),
+        contentType: options.contentType ?? "application/octet-stream",
+        metadata: {},
+      }),
+    )
+    const made = BlobPointer.make({
+      kind: options.kind,
+      codec: options.codec ?? "none",
+      ref,
+      objectSize: object.length,
+      contentSize: options.content.length,
+      checksum: { algorithm: "crc64nvme", value: crc64nvme(options.content) },
+      contentType: Option.fromNullishOr(options.contentType),
+      ...options.overrides,
+    })
+    if (typeof made === "string") return yield* Effect.die(new Error(made))
+    return made
+  })

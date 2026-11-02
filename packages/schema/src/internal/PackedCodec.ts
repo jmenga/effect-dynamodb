@@ -216,21 +216,24 @@ export const notRegistered = (
   })
 
 /**
- * The `ValidationError` of a read path that met a blob pointer (an offloaded
- * value, #179) it cannot resolve: it names the attribute and the object
- * version the pointer pins. Stored data never reads as the pointer itself.
+ * The `ValidationError` of a read that met a blob pointer (an offloaded value,
+ * #179) it cannot resolve — a synchronous one, which does no I/O: it names the
+ * attribute and the object version the pointer pins, then `hint` (what
+ * resolves it). Stored data never reads as the pointer itself.
  */
 export const unresolvedPointer = (
   ctx: OperationContext,
   attribute: string,
   pointer: BlobPointer,
+  hint = "read it through its entity's or stream's decoder, which resolves pointers through " +
+    "the BlobStore in context",
 ): ValidationError =>
   invalid(
     ctx,
     attribute,
     `the stored value is a blob pointer to an offloaded ${pointer.kind} value (object ` +
-      `"${pointer.ref.key}", version "${pointer.ref.version}"), which this version of ` +
-      "effect-dynamodb cannot resolve (written by a newer effect-dynamodb?)",
+      `"${pointer.ref.key}", version "${pointer.ref.version}"), which this read cannot ` +
+      `resolve: it does no I/O. ${hint}`,
   )
 
 // ---------------------------------------------------------------------------
@@ -514,6 +517,32 @@ export const unpackBytesSync = (
   ctx: OperationContext,
   attribute: string,
 ): unknown => {
+  const payload = unpackPayloadSync(stored, registry, ctx, attribute)
+  if (!(payload instanceof Uint8Array)) return payload
+  let text = looseDecoder.decode(payload)
+  if (text.includes("\uFFFD")) {
+    try {
+      text = fatalDecoder.decode(payload)
+    } catch (cause) {
+      return invalid(ctx, attribute, "the stored payload is not valid UTF-8", cause)
+    }
+  }
+  return parseJsonSync(text, ctx, attribute)
+}
+
+/**
+ * The content of a `B` value, without parsing it: for an inline (v1) value
+ * its JSON's UTF-8 bytes, decompressed per its header's codec — the bytes a
+ * pointer's content checksum covers (design §5) — or the {@link BlobPointer}
+ * a layout-`010` value holds, or the `ValidationError` it fails with
+ * (returned, never thrown). The refusals are {@link unpackBytesSync}'s.
+ */
+export const unpackPayloadSync = (
+  stored: Uint8Array,
+  registry: CompressionRegistry,
+  ctx: OperationContext,
+  attribute: string,
+): Uint8Array | BlobPointer | ValidationError => {
   if (stored.length === 0) return invalid(ctx, attribute, "the stored binary value is empty")
   const header = parseHeader(stored[0]!)
   if (typeof header === "string") return invalid(ctx, attribute, header)
@@ -530,32 +559,20 @@ export const unpackBytesSync = (
     }
     return pointer
   }
-  let payload = stored.subarray(1)
-  if (header.codec !== "none") {
-    const compressor = registry.get(header.codec)
-    if (compressor === undefined) return notRegistered(ctx, attribute, header.codec, "decompress")
-    try {
-      payload = compressor.decompress(payload)
-    } catch (cause) {
-      return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
-    }
-    if (!(payload instanceof Uint8Array)) {
-      return invalid(
-        ctx,
-        attribute,
-        `the "${header.codec}" decompressor did not return a Uint8Array`,
-      )
-    }
+  const payload = stored.subarray(1)
+  if (header.codec === "none") return payload
+  const compressor = registry.get(header.codec)
+  if (compressor === undefined) return notRegistered(ctx, attribute, header.codec, "decompress")
+  let decompressed: unknown
+  try {
+    decompressed = compressor.decompress(payload)
+  } catch (cause) {
+    return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
   }
-  let text = looseDecoder.decode(payload)
-  if (text.includes("\uFFFD")) {
-    try {
-      text = fatalDecoder.decode(payload)
-    } catch (cause) {
-      return invalid(ctx, attribute, "the stored payload is not valid UTF-8", cause)
-    }
+  if (!(decompressed instanceof Uint8Array)) {
+    return invalid(ctx, attribute, `the "${header.codec}" decompressor did not return a Uint8Array`)
   }
-  return parseJsonSync(text, ctx, attribute)
+  return decompressed
 }
 
 /**

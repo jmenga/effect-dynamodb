@@ -32,6 +32,9 @@ export type BlobHandleTypeId = typeof BlobHandleTypeId
 /** Where a lazily read value is: in the item (`inline`) or in the blob store (`external`). */
 export type OffloadLocation = "inline" | "external"
 
+/** Which kind of offloaded field: an overflow (`Packed({ external })`) or binary (`External`) one. */
+export type OffloadKind = "overflow" | "binary"
+
 /**
  * An overflow field read lazily. An inline value is already resolved, so
  * `read` does no I/O; an external one fetches, verifies, decompresses and

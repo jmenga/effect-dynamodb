@@ -7,22 +7,29 @@
  *   dispatches on the stored form, so it reads native, `S` and `B` values alike,
  *   and accepts `B` as bytes or base64 text (DynamoDB Streams via Lambda or
  *   EventBridge Pipes). {@link decodeUnmarshalled} does the same for a value
- *   already unmarshalled.
+ *   already unmarshalled. A blob pointer (an offloaded value, #179) resolves
+ *   through the `BlobStore` in scope.
+ * - {@link pointer}: the blob pointer a stored value holds, if any — its
+ *   object ref, sizes, content checksum and content type — with no I/O.
  * - {@link valueBytes}: the DynamoDB size of a value as it would be stored —
  *   packed under a config, or native — for caller-side planning against
  *   {@link limits}. An item's size is the sum, over its attributes, of the
  *   attribute name's UTF-8 bytes plus its value's bytes.
  *
- * Compressors come from the `Compression` service in scope (read like
- * `Effect.serviceOption`, so `R = never`). Without one, uncompressed values
- * work and a value that needs a codec fails with a `ValidationError` whose
- * `cause` is a `CompressorNotRegistered`.
+ * Compressors come from the `Compression` service in scope, and the blob store
+ * from the `BlobStore` service (both read like `Effect.serviceOption`, so
+ * `R = never`). Without a compressor, uncompressed values work and a value that
+ * needs a codec fails with a `ValidationError` whose `cause` is a
+ * `CompressorNotRegistered`; without a store, a pointer fails with a
+ * `ValidationError` whose `cause` is a `BlobStoreError` (`NotProvided`).
  *
  * Each helper has a synchronous twin — {@link encodeSync}, {@link decodeSync},
  * {@link decodeUnmarshalledSync}, {@link valueBytesSync} — for pure code (chunk
  * planning, a hand-rolled Lambda loop): it takes its compressors explicitly
  * (`{ compressors }`, none by default) and throws the `ValidationError` the
- * Effect form fails with. The Effect forms cost one Effect per call and look
+ * Effect form fails with. The sync decoders do no I/O, so a blob pointer
+ * throws there (read it with {@link pointer}, or resolve it with {@link decode}).
+ * The Effect forms cost one Effect per call and look
  * the registry up only when a value is compressed; to decode many values with
  * no Effect per value, resolve the registry once (`yield* Effect.serviceOption(
  * Compression)`) and call the sync twin in a loop.
@@ -43,8 +50,24 @@ import {
 } from "@effect-dynamodb/schema/Compression.js"
 import type { ExternalPackedConfig, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { isBase64PackedText, packValueSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Effect, Schema } from "effect"
+import {
+  type BlobPointer,
+  decode as decodePointer,
+  decodeText as decodePointerText,
+  isBlobPointer,
+  isPointerHeader,
+  isPointerText,
+} from "@effect-dynamodb/schema/internal/BlobPointer.js"
+import {
+  isBase64PackedText,
+  type OperationContext,
+  packValueSync,
+  unpackStoredSync,
+  unresolvedPointer,
+} from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import { Effect, Option, Result, Schema } from "effect"
+import { Base64 } from "effect/encoding"
+import { EAGER_MODES, makePendingBlob, resolveAll } from "./internal/BlobResolver.js"
 import {
   attributeBytes,
   ITEM_MAX_BYTES,
@@ -56,11 +79,13 @@ import {
   packAttributeValueSync,
   type StreamImage,
   storedToAttributeValue,
-  unpackImageItemSync,
-  unpackStoredValueSync,
+  toBytesSync,
   withRegistry,
 } from "./internal/Packed.js"
 import { toAttributeValue } from "./Marshaller.js"
+
+export type { BlobChecksum, BlobRef } from "@effect-dynamodb/schema/internal/BlobPointer.js"
+export type { BlobPointer }
 
 const ENTITY_TYPE = "StorageEncoding"
 
@@ -157,9 +182,14 @@ export const encodeSync = (
  * (encoded) form as plain JSON — not schema-decoded: `S` is JSON, `B` (bytes, or
  * base64 text as Lambda and EventBridge Pipes deliver it) is a header plus a
  * payload, and any other type (a legacy native `M`, say) is unmarshalled
- * unchanged. `undefined` (no attribute) returns `undefined`. A `B` blob pointer
- * (an offloaded value) fails with a `ValidationError` naming the object version
- * it pins: this version does not resolve pointers.
+ * unchanged. `undefined` (no attribute) returns `undefined`.
+ *
+ * A `B` blob pointer (an offloaded value, #179) is resolved through the
+ * `BlobStore` in scope — fetched, verified by size and checksum, decompressed
+ * and parsed. A store failure (`NotProvided` without a store, `NotFound`,
+ * `ChecksumMismatch`, …) is the `cause` of the `ValidationError` it fails
+ * with, so the error type does not change. A binary field's `~edbp:` pointer
+ * is not a packed value: read it with {@link pointer}.
  *
  * For a value already unmarshalled (`@aws-sdk/util-dynamodb`'s `unmarshall`, or
  * a `DocumentClient` row), use {@link decodeUnmarshalled}: the two forms cannot
@@ -169,21 +199,72 @@ export const decode = (
   stored: AttributeValue | { readonly B: string } | undefined,
 ): Effect.Effect<unknown, ValidationError> => {
   if (stored === undefined) return Effect.succeed(undefined)
-  // `S` never needs a compressor: no registry lookup.
+  // `S` never needs a compressor nor a store: no lookup.
   const text = (stored as { readonly S?: unknown }).S
-  if (typeof text === "string") {
-    return lift(unpackStoredValueSync(text, emptyRegistry, DECODE, "value"))
-  }
-  return withRegistry((registry) => decodeStep(stored, registry))
+  if (typeof text === "string") return lift(textStep(text, DECODE))
+  return Effect.flatMap(
+    withRegistry((registry) => decodeStep(stored, registry)),
+    (wire) => resolved(wire, DECODE),
+  )
 }
 
 const DECODE = { entityType: ENTITY_TYPE, operation: "StorageEncoding.decode" }
+
+const SYNC_HINT =
+  "Resolve it with StorageEncoding.decode / decodeUnmarshalled (which read it from the " +
+  "BlobStore in scope), or read the pointer itself with StorageEncoding.pointer."
+
+/** A stored `S` value: JSON — or a binary field's pointer, which is not a packed value. */
+const textStep = (text: string, ctx: OperationContext): unknown =>
+  isPointerText(text)
+    ? new ValidationError({
+        entityType: ctx.entityType,
+        operation: ctx.operation,
+        cause: new Error(
+          'Packed attribute "value": the stored text is a binary field\'s blob pointer ' +
+            "(~edbp:), not a packed value. Read it with StorageEncoding.pointer; the bytes it " +
+            "names are read through the entity's decoder.",
+        ),
+      })
+    : unpackStoredSync(text, emptyRegistry, ctx, "value")
+
+/**
+ * The wire form `wire` stands for: a blob pointer resolved through the store
+ * in scope (a store failure is the `cause` of a `ValidationError`), anything
+ * else as is.
+ */
+const resolved = (
+  wire: unknown,
+  ctx: OperationContext,
+): Effect.Effect<unknown, ValidationError> => {
+  if (!isBlobPointer(wire)) return Effect.succeed(wire)
+  const pending = makePendingBlob({
+    pointer: wire,
+    attribute: "value",
+    field: "value",
+    kind: "overflow",
+  })
+  return resolveAll([pending], { ...ctx, modes: EAGER_MODES }).pipe(
+    Effect.map((values) => values[0]),
+    Effect.catchTag("BlobStoreError", (cause) =>
+      Effect.fail(
+        new ValidationError({ entityType: ctx.entityType, operation: ctx.operation, cause }),
+      ),
+    ),
+  )
+}
+
+/** A sync decoder's step: a pointer is refused (no I/O), naming how to read it. */
+const refusingPointers = (wire: unknown, ctx: OperationContext): unknown =>
+  isBlobPointer(wire) ? unresolvedPointer(ctx, "value", wire, SYNC_HINT) : wire
 
 const decodeStep = (
   stored: AttributeValue | { readonly B: string } | undefined,
   registry: CompressionRegistry,
 ): unknown => {
   if (stored === undefined) return undefined
+  const text = (stored as { readonly S?: unknown }).S
+  if (typeof text === "string") return textStep(text, DECODE)
   // DynamoDB JSON: the S / B tag is unambiguous, so no base64 sniffing.
   const raw = normalizeImageSync({ value: stored } as StreamImage, DECODE, {
     form: "attributeValues",
@@ -191,25 +272,27 @@ const decodeStep = (
   if (raw instanceof ValidationError) return raw
   const value = raw.value
   return typeof value === "string" || value instanceof Uint8Array
-    ? unpackStoredValueSync(value, registry, DECODE, "value")
+    ? unpackStoredSync(value, registry, DECODE, "value")
     : value
 }
 
 /**
  * {@link decode}, synchronously, with explicit compressors (see
- * {@link SyncOptions}). Throws the `ValidationError` `decode` fails with.
+ * {@link SyncOptions}). Throws the `ValidationError` `decode` fails with — and
+ * one naming the object version for a blob pointer, which only `decode`
+ * resolves (no I/O here; {@link pointer} reads the pointer itself).
  */
 export const decodeSync = (
   stored: AttributeValue | { readonly B: string } | undefined,
   options?: SyncOptions,
-): unknown => orThrow(decodeStep(stored, registryFrom(options)))
+): unknown => orThrow(refusingPointers(decodeStep(stored, registryFrom(options)), DECODE))
 
 /**
  * Read an already-unmarshalled stored value by its form, returning its wire
  * (encoded) form as plain JSON — not schema-decoded: a string is JSON unless it
  * is base64 of a `B` value (it then starts with `I`–`X`, which JSON text never
  * does), bytes are `B`, and anything else is a native value returned unchanged.
- * A blob pointer fails as for {@link decode}.
+ * A blob pointer resolves as for {@link decode}.
  *
  * For an `AttributeValue` (DynamoDB JSON), use {@link decode}.
  */
@@ -217,12 +300,15 @@ export const decodeUnmarshalled = (stored: unknown): Effect.Effect<unknown, Vali
   // A native value is returned as is, and JSON text never needs a compressor:
   // only bytes (or base64 of them) look the registry up.
   if (typeof stored === "string" && !isBase64PackedText(stored)) {
-    return lift(unpackStoredValueSync(stored, emptyRegistry, DECODE_UNMARSHALLED, "value"))
+    return lift(textStep(stored, DECODE_UNMARSHALLED))
   }
   if (typeof stored !== "string" && !(stored instanceof Uint8Array)) {
     return Effect.succeed(stored)
   }
-  return withRegistry((registry) => decodeUnmarshalledStep(stored, registry))
+  return Effect.flatMap(
+    withRegistry((registry) => decodeUnmarshalledStep(stored, registry)),
+    (wire) => resolved(wire, DECODE_UNMARSHALLED),
+  )
 }
 
 const DECODE_UNMARSHALLED = {
@@ -231,21 +317,91 @@ const DECODE_UNMARSHALLED = {
 }
 
 const decodeUnmarshalledStep = (stored: unknown, registry: CompressionRegistry): unknown => {
-  if (typeof stored !== "string" && !(stored instanceof Uint8Array)) return stored
-  const raw: Record<string, unknown> = { value: stored }
-  const failure = unpackImageItemSync(raw, VALUE, registry, DECODE_UNMARSHALLED)
-  return failure ?? raw.value
+  if (typeof stored === "string") {
+    if (!isBase64PackedText(stored)) return textStep(stored, DECODE_UNMARSHALLED)
+    // Base64 of a `B` value (an unmarshalled stream image's).
+    const bytes = toBytesSync(stored, DECODE_UNMARSHALLED, "value")
+    if (bytes instanceof ValidationError) return bytes
+    return unpackStoredSync(bytes, registry, DECODE_UNMARSHALLED, "value")
+  }
+  return stored instanceof Uint8Array
+    ? unpackStoredSync(stored, registry, DECODE_UNMARSHALLED, "value")
+    : stored
 }
-
-const VALUE: ReadonlyArray<string> = ["value"]
 
 /**
  * {@link decodeUnmarshalled}, synchronously, with explicit compressors (see
  * {@link SyncOptions}). Throws the `ValidationError` `decodeUnmarshalled`
- * fails with. A native value is returned as is.
+ * fails with — and one naming the object version for a blob pointer (see
+ * {@link decodeSync}). A native value is returned as is.
  */
 export const decodeUnmarshalledSync = (stored: unknown, options?: SyncOptions): unknown =>
-  orThrow(decodeUnmarshalledStep(stored, registryFrom(options)))
+  orThrow(
+    refusingPointers(decodeUnmarshalledStep(stored, registryFrom(options)), DECODE_UNMARSHALLED),
+  )
+
+/**
+ * The blob pointer a stored attribute value holds, if it is one — pure, no
+ * I/O. Both stored forms (#179, design §4.2): an overflow field's layout-`010`
+ * `B` value (an `AttributeValue`, with `B` as bytes or base64 text, or the
+ * bytes themselves), and a binary field's `~edbp:` `S` text (an
+ * `AttributeValue`, or the text itself). A bare string is read as
+ * {@link decodeUnmarshalled} reads it: `~edbp:` text, or — when it starts
+ * with `I`–`X`, which neither JSON nor `~edbp:` text does — base64 of a `B`
+ * value, as an unmarshalled Lambda or EventBridge Pipes image carries it.
+ * `Option.none()` for any other value — inline JSON, compressed bytes, native
+ * bytes, a legacy native value — and for a malformed pointer, or one of the
+ * other kind than its form stores (a bytes pointer as `B`, a json pointer as
+ * `S` text), which the decoders refuse with a `ValidationError` saying why.
+ *
+ * The pointer names the object version (`ref`), the object's size and the
+ * content's (`objectSize`, `contentSize`), its content checksum (CRC-64/NVME
+ * over the uncompressed JSON or the bytes) and its content type.
+ *
+ * @example
+ * ```ts
+ * const ref = StorageEncoding.pointer(item.body).pipe(Option.map((p) => p.ref))
+ * ```
+ */
+export const pointer = (
+  stored: AttributeValue | { readonly B: string } | Uint8Array | string,
+): Option.Option<BlobPointer> => {
+  if (typeof stored === "string") {
+    if (isPointerText(stored)) return textPointer(stored)
+    // Base64 of a `B` value (an unmarshalled stream image's), else JSON text.
+    return isBase64PackedText(stored) ? base64Pointer(stored) : Option.none()
+  }
+  if (stored instanceof Uint8Array) return bytesPointer(stored)
+  if (typeof stored !== "object" || stored === null) return Option.none()
+  const text = (stored as { readonly S?: unknown }).S
+  if (typeof text === "string") return textPointer(text)
+  const bytes = (stored as { readonly B?: unknown }).B
+  if (bytes instanceof Uint8Array) return bytesPointer(bytes)
+  return typeof bytes === "string" ? base64Pointer(bytes) : Option.none()
+}
+
+/** A `B` value given as base64 text: its json pointer. */
+const base64Pointer = (text: string): Option.Option<BlobPointer> => {
+  const decoded = Base64.decode(text)
+  return Result.isSuccess(decoded) ? bytesPointer(decoded.success) : Option.none()
+}
+
+/** A layout-`010` `B` value's json pointer. */
+const bytesPointer = (bytes: Uint8Array): Option.Option<BlobPointer> => {
+  if (bytes.length === 0 || !isPointerHeader(bytes[0]!)) return Option.none()
+  const decoded = decodePointer(bytes)
+  return typeof decoded !== "string" && decoded.kind === "json"
+    ? Option.some(decoded)
+    : Option.none()
+}
+
+/** A binary field's `~edbp:` bytes pointer. */
+const textPointer = (text: string): Option.Option<BlobPointer> => {
+  const decoded = decodePointerText(text)
+  return decoded !== undefined && typeof decoded !== "string" && decoded.kind === "bytes"
+    ? Option.some(decoded)
+    : Option.none()
+}
 
 /**
  * The DynamoDB size, in bytes, of a value's attribute **value** as stored

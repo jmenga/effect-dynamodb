@@ -620,6 +620,44 @@ describe("unpackValue dispatch", () => {
     expect(notJson).toBeInstanceOf(ValidationError)
   })
 
+  it("unpackPayloadSync returns the content bytes a pointer's checksum covers, unparsed", () => {
+    const readOp = { entityType: "Order", operation: "decode" }
+    const value = payloadOfBytes(3000)
+    const content = encoder.encode(JSON.stringify(value))
+    // A v1 value of codec "none" (header 0x20) and a gzip one.
+    const gzipped = PackedCodec.packValueSync(withCodec("gzip", 0), value, all, ctx, "lines")
+    expect(gzipped).toBeInstanceOf(Uint8Array)
+    for (const stored of [new Uint8Array([0x20, ...content]), gzipped as Uint8Array]) {
+      const payload = PackedCodec.unpackPayloadSync(stored, all, readOp, "lines")
+      expect(payload).toBeInstanceOf(Uint8Array)
+      expect(Array.from(payload as Uint8Array)).toEqual(Array.from(content))
+    }
+    // Not JSON: the bytes are returned as stored — parsing is not this function's job.
+    const text = PackedCodec.unpackPayloadSync(
+      new Uint8Array([0x20, ...encoder.encode("{nope")]),
+      none,
+      readOp,
+      "lines",
+    )
+    expect(Array.from(text as Uint8Array)).toEqual(Array.from(encoder.encode("{nope")))
+    const missing = PackedCodec.unpackPayloadSync(gzipped as Uint8Array, none, readOp, "lines")
+    expect((missing as ValidationError).cause).toMatchObject({
+      _tag: "CompressorNotRegistered",
+      codec: "gzip",
+      direction: "decompress",
+    })
+    for (const [stored, message] of [
+      [new Uint8Array(0), "stored binary value is empty"],
+      [new Uint8Array([0x61, 1]), "newer effect-dynamodb"],
+      [new Uint8Array([0x41, 1]), "bad magic"],
+      [new Uint8Array([0x21, 1, 2, 3]), '"gzip" decompressor failed'],
+    ] as const) {
+      const result = PackedCodec.unpackPayloadSync(stored, all, readOp, "lines")
+      expect(result).toBeInstanceOf(ValidationError)
+      expect(causeMessage(result)).toContain(message)
+    }
+  })
+
   const invalidStored: ReadonlyArray<readonly [string, unknown, string]> = [
     ["empty B", new Uint8Array(0), "stored binary value is empty"],
     ["layout version 0", new Uint8Array([0x01, 1]), "layout version 0"],

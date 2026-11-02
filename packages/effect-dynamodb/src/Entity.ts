@@ -197,6 +197,8 @@ import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
+import type { StreamRecordLike } from "./internal/OffloadChange.js"
+import * as OffloadChange from "./internal/OffloadChange.js"
 import * as OffloadInput from "./internal/OffloadInput.js"
 import * as OffloadRead from "./internal/OffloadRead.js"
 import type {
@@ -205,7 +207,7 @@ import type {
   StateOf,
   WithBinaryInput,
 } from "./internal/OffloadTypes.js"
-import { type BlobHandle, isOffloadedValue } from "./internal/OffloadValues.js"
+import { type BlobHandle, isOffloadedValue, type OffloadKind } from "./internal/OffloadValues.js"
 import * as OffloadWrite from "./internal/OffloadWrite.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
@@ -1054,6 +1056,16 @@ export interface Entity<
     image: StreamImage,
     modes?: OffloadRead.Modes,
   ) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+
+  /**
+   * @internal Decode a DynamoDB Streams record — both images, and the change
+   * to each offloaded field (#179, design §10.3) — the implementation of
+   * {@link decodeStreamRecord}.
+   */
+  readonly _decodeStreamRecord: (
+    record: StreamRecordLike,
+    modes: OffloadRead.Modes,
+  ) => Effect.Effect<Option.Option<EntityChange<unknown>>, ValidationError | BlobStoreError>
 
   /**
    * @internal Load, in place, a batch of stored-name rows (#179): unpack every
@@ -7483,13 +7495,16 @@ const makeImpl = <
    * loaded — its stored-form attributes unpacked and its pointers resolved
    * per `modes` (lazy by default, design §10.1) — then sparse rebuild,
    * renames and the item-schema decode — exactly what a table read applies.
+   * `operation` names the decode in errors (a lazy value's reads name
+   * `<operation>.read`, design §8.7).
    */
   const decodeImageItem = (
     image: StreamImage,
     modes: OffloadRead.Modes = OffloadRead.LAZY_MODES,
+    operation = "decodeMarshalledItem",
   ): Effect.Effect<unknown, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
-      const ctx = { entityType, operation: "decodeMarshalledItem" }
+      const ctx = { entityType, operation }
       const options = { probe: config.indexes.primary.pk.field }
       // An image of another entity type is decoded as 1.25.0 decoded it: its
       // attributes are never read as packed values (a plain string of that
@@ -7499,26 +7514,117 @@ const makeImpl = <
       const raw = yield* normalizeImage(image, ctx, { ...options, form })
       if (owner === undefined || owner === entityType) {
         // Unmarshalled, a `B` value may still be base64 text.
-        yield* loadRow(raw, {
-          operation: "decodeMarshalledItem",
-          modes,
-          image: form === "unmarshalled",
-        })
+        yield* loadRow(raw, { operation, modes, image: form === "unmarshalled" })
       }
-      const corruption = versionCorruption(raw, "decodeMarshalledItem")
+      const corruption = versionCorruption(raw, operation)
       if (corruption !== undefined) return yield* corruption
       deserializeSparseFields(raw)
       renameFromDynamo(raw)
       const decoded = yield* Schema.decodeUnknownEffect(readSchema(schemas.itemSchema, modes))(
         raw,
       ).pipe(
-        Effect.mapError(
-          (cause) => new ValidationError({ entityType, operation: "decodeMarshalledItem", cause }),
-        ),
-        missingKeyOnDefect(raw, "decodeMarshalledItem"),
+        Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+        missingKeyOnDefect(raw, operation),
       )
       return attachPrototype(decoded)
     })
+
+  /**
+   * Decode a DynamoDB Streams record of this entity type (#179, design §10.3,
+   * §10.4) — the implementation of {@link decodeStreamRecord}: `[EDD-9119]`
+   * unless it carries the images of a `NEW_AND_OLD_IMAGES` stream (checked
+   * for every record, before its type), `Option.none()` when no image is of
+   * this type, else each image of this type decoded per `modes` (as
+   * {@link decodeImageItem}) and every offloaded field present in either
+   * classified from the two stored forms (`OffloadChange.compareForms`),
+   * with no store I/O. An image of another type counts as absent.
+   */
+  const decodeChange = (
+    record: StreamRecordLike,
+    modes: OffloadRead.Modes,
+  ): Effect.Effect<Option.Option<EntityChange<unknown>>, ValidationError | BlobStoreError> =>
+    Effect.gen(function* () {
+      const operation = "decodeStreamRecord"
+      const ctx = { entityType, operation }
+      const images = OffloadChange.recordImages(record, "Entity.decodeStreamRecord")
+      if (typeof images === "string") {
+        return yield* new ValidationError({ ...ctx, cause: new Error(images) })
+      }
+      const own = (image: OffloadChange.RecordImage | undefined) =>
+        image !== undefined && imageEntityType(image as StreamImage) === entityType
+          ? (image as StreamImage)
+          : undefined
+      const oldImage = own(images.oldImage)
+      const newImage = own(images.newImage)
+      if (oldImage === undefined && newImage === undefined) {
+        return Option.none<EntityChange<unknown>>()
+      }
+      const decode = (image: StreamImage | undefined) =>
+        image === undefined
+          ? Effect.succeed(Option.none<unknown>())
+          : Effect.map(decodeImageItem(image, modes, operation), Option.some)
+      const oldItem = yield* decode(oldImage)
+      const newItem = yield* decode(newImage)
+      const offloaded = yield* classifyOffloaded(oldImage, newImage, ctx)
+      return Option.some({ eventName: images.eventName, oldItem, newItem, offloaded })
+    })
+
+  /**
+   * Every offloaded field present in `oldImage` or `newImage`, by domain name,
+   * classified from its stored forms — read off the raw images, before any
+   * decode, with no store I/O (an inline compressed value is decompressed with
+   * the registry in scope to checksum its content). Empty when the entity
+   * offloads nothing.
+   */
+  const classifyOffloaded = (
+    oldImage: StreamImage | undefined,
+    newImage: StreamImage | undefined,
+    ctx: { readonly entityType: string; readonly operation: string },
+  ): Effect.Effect<
+    Readonly<globalThis.Record<string, OffloadChange.OffloadChange>>,
+    ValidationError
+  > =>
+    offloadInfo === undefined
+      ? Effect.succeed({})
+      : withRegistry((registry) => {
+          const probe = { probe: config.indexes.primary.pk.field }
+          const formsOf = (image: StreamImage | undefined) => {
+            if (image === undefined) return undefined
+            const form = imageForm(image, probe)
+            const values = image as Readonly<globalThis.Record<string, unknown>>
+            return (attribute: string, kind: OffloadKind) =>
+              form === "attributeValues"
+                ? OffloadChange.formOfAttributeValue(
+                    values[attribute],
+                    kind,
+                    registry,
+                    ctx,
+                    attribute,
+                  )
+                : OffloadChange.formOfUnmarshalled(
+                    values[attribute],
+                    kind,
+                    true,
+                    toAttributeValue,
+                    registry,
+                    ctx,
+                    attribute,
+                  )
+          }
+          const before = formsOf(oldImage)
+          const after = formsOf(newImage)
+          const out: globalThis.Record<string, OffloadChange.OffloadChange> = {}
+          for (const attribute of offloadedAttributeNames) {
+            const kind = readPlan.offloaded[attribute]!
+            const a = before === undefined ? OffloadChange.ABSENT : before(attribute, kind)
+            if (a instanceof ValidationError) return a
+            const b = after === undefined ? OffloadChange.ABSENT : after(attribute, kind)
+            if (b instanceof ValidationError) return b
+            if (a._tag === "absent" && b._tag === "absent") continue
+            out[offloadInfo.fieldOf[attribute] ?? attribute] = OffloadChange.compareForms(a, b)
+          }
+          return out
+        })
 
   /**
    * `_loadForReuse`: an eager load that snapshots the pointers the row held
@@ -21716,7 +21822,8 @@ const makeImpl = <
       const copy: globalThis.Record<string, unknown> = { ...record }
       return lacksAny(copy, names) ? lackedByName(record, copy, names, undefined, "getter") : copy
     },
-    _decodeImage: decodeImageItem,
+    _decodeImage: (image: StreamImage, modes?: OffloadRead.Modes) => decodeImageItem(image, modes),
+    _decodeStreamRecord: decodeChange,
     _loadRows: (
       rows: ReadonlyArray<globalThis.Record<string, unknown>>,
       options: {
@@ -23161,7 +23268,10 @@ export const decodeMarshalledItem: <
   )
 }
 
-/** What {@link decodeMarshalledItem} accepts: an entity, or a pure definition. */
+/**
+ * What {@link decodeMarshalledItem} accepts: an entity, a pure definition, or
+ * any object with its schemas (decoded by its item schema alone).
+ */
 type DecodableEntity = EntityWithSchemas & {
   readonly entityType: string
   readonly _decodeImage?:
@@ -23170,7 +23280,21 @@ type DecodableEntity = EntityWithSchemas & {
         modes?: OffloadRead.Modes,
       ) => Effect.Effect<unknown, ValidationError | BlobStoreError>)
     | undefined
+  readonly _decodeStreamRecord?: Entity["_decodeStreamRecord"] | undefined
 }
+
+/**
+ * What {@link decodeStreamRecord} accepts: an entity (`Entity.make`), which
+ * carries its record decoder, or a pure definition (the schema package's
+ * `Entity.make`), which carries what builds one — not a bare
+ * `{ schemas, entityType }`, which knows neither its keys nor its offloaded
+ * fields.
+ */
+type StreamRecordEntity = DecodableEntity &
+  (
+    | { readonly _decodeStreamRecord: Entity["_decodeStreamRecord"] }
+    | { readonly _config: object; readonly _data: object }
+  )
 
 /** {@link decodeMarshalledItem}'s options. */
 export interface DecodeMarshalledItemOptions<M extends OffloadMode | OffloadModes> {
@@ -23224,7 +23348,11 @@ type ImageBlobErrors<E, M extends OffloadMode | OffloadModes> = ReadBlobErrors<
  * decoded by `itemSchema` alone, so its packed fields came back as their
  * stored form (#147's gap).
  */
-const definitionImageDecoder = (entity: object): DecodableEntity["_decodeImage"] | undefined => {
+const definitionImageDecoder = (entity: object): DecodableEntity["_decodeImage"] | undefined =>
+  definitionRuntime(entity)?._decodeImage
+
+/** The runtime entity of a pure definition, built once per definition; `undefined` for anything else. */
+const definitionRuntime = (entity: object): Entity | undefined => {
   const def = entity as Partial<Pick<EntityDefinition, "_config" | "_data">>
   if (def._config === undefined || def._data === undefined) return undefined
   let runtime = definitionRuntimes.get(entity)
@@ -23235,7 +23363,129 @@ const definitionImageDecoder = (entity: object): DecodableEntity["_decodeImage"]
     ) as unknown as Entity
     definitionRuntimes.set(entity, runtime)
   }
-  return runtime._decodeImage
+  return runtime
 }
 
 const definitionRuntimes = new WeakMap<object, Entity>()
+
+// ---------------------------------------------------------------------------
+// Stream records and change detection (#179, design §10.3)
+// ---------------------------------------------------------------------------
+
+export type { StreamRecordLike }
+
+/**
+ * A DynamoDB Streams record of an entity, decoded by
+ * {@link decodeStreamRecord}: the event, both images as items (each
+ * `Option.none()` when the record has no image of the entity on that side —
+ * an `INSERT`'s old item, a `REMOVE`'s new one), and what the change did to
+ * each offloaded field present in either image, by domain name (`F`: the
+ * entity's offloaded field names).
+ */
+export interface EntityChange<A, F extends string = string> {
+  readonly eventName: "INSERT" | "MODIFY" | "REMOVE"
+  readonly oldItem: Option.Option<A>
+  readonly newItem: Option.Option<A>
+  /**
+   * Each offloaded field present in either image — `unchanged`, `rewritten`
+   * (probably identical: same checksum and size elsewhere), `changed`,
+   * `added` or `removed` (see `Offload.OffloadChange`). Read from the stored
+   * forms, with no store I/O. Empty for an entity that offloads nothing.
+   */
+  readonly offloaded: { readonly [K in F]?: OffloadChange.OffloadChange }
+}
+
+/** {@link decodeStreamRecord}'s options. */
+export interface DecodeStreamRecordOptions<M extends OffloadMode | OffloadModes> {
+  /**
+   * The read modes of the images' offloaded fields (#179): lazy by default —
+   * a pointer becomes a handle that fetches when read (its errors name the
+   * operation `decodeStreamRecord.read`), an inline value one that reads with
+   * no I/O. `"eager"` resolves them (a store failure is a `BlobStoreError`).
+   * The classification in `offloaded` never reads the store, whatever the
+   * mode. An entity that offloads nothing ignores it.
+   */
+  readonly offloaded?: M | undefined
+}
+
+/** The item type of {@link decodeStreamRecord}'s images: the entity's record under modes `M`. */
+export type StreamRecordItem<E, M extends OffloadMode | OffloadModes> = E extends {
+  readonly model: Schema.Top
+  readonly timestamps: any
+  readonly versioned: any
+  readonly timeSeries?: any
+}
+  ? Read<E, ResolveModes<M, LazyOffloadModes>>
+  : unknown
+
+/** The domain names of the fields an entity offloads (`never` when none). */
+export type OffloadedFieldNames<E> = OffloadFieldsOf<E>["overflow"] | OffloadFieldsOf<E>["binary"]
+
+/**
+ * Decode a DynamoDB Streams record of an entity (#179, design §3.9, §10.3) —
+ * both images, and what the change did to each offloaded field — as a
+ * change-feed consumer needs it: to index, scan or forward only what changed.
+ *
+ * - **Records.** Structural ({@link StreamRecordLike}): the SDK's `_Record`
+ *   (the change feed's), a Lambda `DynamoDBRecord` and an EventBridge Pipes
+ *   record fit; images in DynamoDB JSON (`B` as bytes or base64) or
+ *   unmarshalled. The stream must be `NEW_AND_OLD_IMAGES`: a record whose
+ *   `StreamViewType` is another, or that lacks an image its event has (a
+ *   `MODIFY` / `REMOVE` without `OldImage`, a `MODIFY` / `INSERT` without
+ *   `NewImage`), fails with a `ValidationError` carrying `[EDD-9119]` —
+ *   checked on every record, whatever its entity type.
+ * - **Other types.** `Option.none()` when no image is of this entity type
+ *   (another entity's item, a unique-constraint sentinel, an untyped item).
+ * - **Items** decode exactly as {@link decodeMarshalledItem} decodes an image
+ *   (packed fields unpacked, renames reversed, sparse maps rebuilt) — lazy by
+ *   default: an offloaded field is an `OffloadedValue` / `BlobHandle` that
+ *   fetches only when read; `{ offloaded: "eager" }` resolves them.
+ * - **`offloaded`** classifies each offloaded field present in either image
+ *   (see {@link EntityChange}) from the stored forms alone — no store I/O in
+ *   any mode. `rewritten` means probably identical: treat it as `changed`
+ *   where a change must never be missed.
+ *
+ * A handle read long after its record (a lagging consumer) may fail with
+ * `NotFound` once its version was superseded and reaped: the newer record
+ * carries the newer pointer, so treat it as superseded (design §8.7).
+ *
+ * @example
+ * ```ts
+ * const change = yield* Entity.decodeStreamRecord(Documents, record)
+ * if (Option.isSome(change) && change.value.offloaded.body !== "unchanged") {
+ *   yield* reindex(change.value.newItem)
+ * }
+ * ```
+ */
+export const decodeStreamRecord: <
+  E extends StreamRecordEntity,
+  const M extends OffloadMode | OffloadModes = "lazy",
+>(
+  entity: E,
+  record: StreamRecordLike,
+  options?: DecodeStreamRecordOptions<M>,
+) => Effect.Effect<
+  Option.Option<EntityChange<StreamRecordItem<E, M>, OffloadedFieldNames<E>>>,
+  ValidationError | ImageBlobErrors<E, M>
+> = (
+  entity: StreamRecordEntity,
+  record: StreamRecordLike,
+  options?: DecodeStreamRecordOptions<OffloadMode | OffloadModes>,
+): Effect.Effect<any, any> => {
+  const decodeRecord = entity._decodeStreamRecord ?? definitionRuntime(entity)?._decodeStreamRecord
+  if (decodeRecord === undefined) {
+    // Only untyped code reaches here: the parameter type admits no other value.
+    return Effect.die(
+      new Error(
+        "Entity.decodeStreamRecord: expected an entity (Entity.make) or an entity definition " +
+          "(the schema package's Entity.make).",
+      ),
+    )
+  }
+  const modes = OffloadRead.parseModesOption(options?.offloaded, OffloadRead.LAZY_MODES, {
+    entityType: entity.entityType,
+    operation: "decodeStreamRecord",
+  })
+  if (modes instanceof ValidationError) return Effect.fail(modes)
+  return decodeRecord(record, modes)
+}

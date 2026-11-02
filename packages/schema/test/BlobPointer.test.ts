@@ -756,6 +756,25 @@ describe("PackedCodec.unpackBytesSync / unpackValue — layout 010", () => {
     expect(message).toContain(pointer.ref.key)
     expect(message).toContain(pointer.ref.version)
     expect(message).toContain("cannot resolve")
+    expect(message).toContain("BlobStore in context")
+    expect(message).not.toContain("newer effect-dynamodb")
+    const hinted = PackedCodec.unresolvedPointer(ctx, "body", pointer, "Use the async decoder.")
+    expect((hinted.cause as Error).message).toMatch(/does no I\/O\. Use the async decoder\.$/)
+  })
+
+  it("unpackPayloadSync returns a json pointer and refuses a bytes one", () => {
+    const pointer = make(fields())
+    const result = PackedCodec.unpackPayloadSync(BlobPointer.encode(pointer), registry, ctx, "body")
+    expect(BlobPointer.isBlobPointer(result)).toBe(true)
+    expect(plain(result as BlobPointer.BlobPointer)).toEqual(plain(pointer))
+    const bytes = PackedCodec.unpackPayloadSync(
+      BlobPointer.encode(make(binaryFields())),
+      registry,
+      ctx,
+      "body",
+    )
+    expect(bytes).toBeInstanceOf(ValidationError)
+    expect(((bytes as ValidationError).cause as Error).message).toContain("kind bytes")
   })
 })
 

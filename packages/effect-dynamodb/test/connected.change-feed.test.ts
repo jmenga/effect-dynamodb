@@ -366,6 +366,8 @@ describeConnected("change feed (connected)", () => {
       // deposit is projected and the restarted run has committed a checkpoint past `committed`,
       // which it does only after `onBatch` has seen that batch.
       const second = yield* run()
+      // `onBatch` runs after the batch's projections apply, so the balance can
+      // read 15 before the batch reaches `seen`: wait for both.
       yield* eventually(
         Effect.gen(function* () {
           const balance = yield* balanceOf(account).pipe(
@@ -373,7 +375,12 @@ describeConnected("change feed (connected)", () => {
             Effect.orElseSucceed(() => 0),
           )
           const at = yield* committedAt(consumer)
-          return balance === 15 && at !== undefined && BigInt(at) > BigInt(committed)
+          return (
+            balance === 15 &&
+            seen.length > before &&
+            at !== undefined &&
+            BigInt(at) > BigInt(committed)
+          )
         }),
       )
       yield* Fiber.interrupt(second)

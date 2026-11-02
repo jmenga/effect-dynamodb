@@ -53,6 +53,7 @@ import {
   makeBlobHandle,
   makeOffloadedValue,
   type OffloadedValue,
+  type OffloadKind,
   registerHandleStore,
 } from "./OffloadValues.js"
 import { registryOf } from "./Packed.js"
@@ -64,8 +65,7 @@ import { registryOf } from "./Packed.js"
 export const PendingBlobTypeId: unique symbol = Symbol.for("effect-dynamodb/PendingBlob")
 export type PendingBlobTypeId = typeof PendingBlobTypeId
 
-/** Which kind of offloaded field: an overflow (`Packed({ external })`) or binary (`External`) one. */
-export type OffloadKind = "overflow" | "binary"
+export type { OffloadKind }
 
 /** A pointer an unpacked row holds in place of its value, until it is resolved. */
 export interface PendingBlob {

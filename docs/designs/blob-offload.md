@@ -626,8 +626,12 @@ backstop for leaks no row records (§11.5). Details in §11.
 
 ```ts
 /** The pointer an attribute value holds, if it is one (pure; no I/O). Accepts both stored
- *  forms: a layout-010 `B` value and a binary field's `~edbp:` `S` text (§4.2). */
-StorageEncoding.pointer(stored: AttributeValue | Uint8Array | string): Option<BlobPointer>
+ *  forms: a layout-010 `B` value and a binary field's `~edbp:` `S` text (§4.2). A bare
+ *  string is read as `decodeUnmarshalled` reads one: `~edbp:` text, or (starting `I`–`X`)
+ *  base64 of a `B` value, as an unmarshalled Lambda / Pipes image carries it. */
+StorageEncoding.pointer(
+  stored: AttributeValue | { readonly B: string } | Uint8Array | string,
+): Option<BlobPointer>
 
 interface BlobPointer {
   readonly kind: "json" | "bytes"
@@ -1809,8 +1813,11 @@ Change detection and the reaper need `NEW_AND_OLD_IMAGES`. Checked from the reco
 never with `DescribeTable`:
 
 - `dynamodb.StreamViewType` present and not `NEW_AND_OLD_IMAGES` → `[EDD-9119]`.
-- Absent (an EventBridge Pipe input template may strip it): a `MODIFY` / `REMOVE` without
-  `OldImage`, or a `MODIFY` / `INSERT` without `NewImage`, → `[EDD-9119]`.
+- Whatever the view type — absent (an EventBridge Pipe input template may strip it) or even
+  `NEW_AND_OLD_IMAGES` — a `MODIFY` / `REMOVE` without `OldImage`, or a `MODIFY` / `INSERT`
+  without `NewImage`, → `[EDD-9119]` *(commit 14: checked under a present view type too, so an
+  input template that drops an image is caught)*. One check, `internal/OffloadChange.ts`'s
+  `recordImages`, serves both consumers.
 - `BlobGc.reap` checks **every** record of the call before acting on any (a cheap presence
   test), and dies on the first violation (a deployment defect: a batch whose first record is an
   `INSERT` would otherwise pass a `NEW_IMAGE` stream, and every later `MODIFY` / `REMOVE` would
@@ -2611,7 +2618,7 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts`, `internal/EventProjection.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key — on a read, or a projection's `offloaded` (at definition) — or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
-| `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
+| `EDD-9119` | `internal/OffloadChange.ts` (`recordImages`, shared by the reaper and `decodeStreamRecord`), `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is present and not `NEW_AND_OLD_IMAGES`, or — whatever its view type — a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
 | `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream`, handle or source for an aggregate edge (or an `OffloadedValue` for its overflow field); or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
 | `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty printable US-ASCII string ≤ 255 bytes |
 | `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, a GSI's `shards.by` source, `timeSeries.orderBy`), a unique-constraint field, a ref field, the entity's identifier, a vector index source, partition or filter field, or an aggregate discriminator / `many` sort-key composite. (An aggregate's list and collection composites are root fields, and a root model takes no `configure`, so none can be `External`: there is nothing to check there.) |
@@ -4060,6 +4067,121 @@ a write path, deletes the gate.
 14. **Streams** — `decodeStreamRecord`, `Offload.compareStored`, `StorageEncoding.pointer` and
     pointer-aware `decode`, projection poison-record exclusion, `EDD-9119` (decoder side).
     *(The projection poison-record exclusion was built in commit 13 — see its deviations.)*
+    *Implementation notes (commit 14):*
+    - `internal/OffloadChange.ts` (no AWS SDK, so `Offload.ts`'s import graph stays SDK-free —
+      the `BlobStore.test.ts` guard) holds the record check, the stored-form reader and the
+      classifier. `recordImages(record, consumer)` is §10.4's check, shared with commit 16's
+      reaper: a `StreamViewType` other than `NEW_AND_OLD_IMAGES`, or a missing image the event
+      has, is `[EDD-9119]`; an `INSERT`'s `OldImage` and a `REMOVE`'s `NewImage` are ignored; a
+      missing or unknown `eventName` (or a record that is not an object) is a plain
+      `ValidationError`, not `EDD-9119` — it is not a view-type problem. Image presence is
+      checked even when `StreamViewType` is present and correct (§10.4 checked it only on a
+      record with no view type; §10.4 and the `EDD-9119` rows now say so).
+    - Each image's attribute is read into a `StoredForm` (`absent` / `null` / `pointer` /
+      `inline` content bytes / `native`), with no store I/O: an inline `S` is its UTF-8 JSON, an
+      inline `B` its payload decompressed with the `Compression` registry in context
+      (`PackedCodec.unpackPayloadSync`, new: `unpackBytesSync` without the JSON parse — the bytes
+      a pointer's checksum covers, §5), a binary field's inline `B` its bytes. `compareForms`
+      applies §10.3; three cases the table leaves open are decided as: inline / inline compares
+      the **exact content bytes** (stricter than checksum + size, and free — both are local);
+      native / native (an overflow field's legacy native value, an `M` / `L` written before it
+      was packed) compares **structurally** (sets as sets, `B` as bytes or base64) —
+      `unchanged` or `changed`; `NULL` is `unchanged` against `NULL` and `changed` against
+      anything else. A binary field holds only `B`, `~edbp:` text or `NULL`: any other value is
+      a `ValidationError`; an overflow field's `S` (an unmarshalled image's string) is JSON,
+      so `~edbp:` text there is one too. Both absent is `unchanged` (a field in neither image is
+      omitted from `offloaded`).
+    - `Offload.compareStored(old, new, kind)` returns an **Effect** (`Effect<OffloadChange,
+      ValidationError>`, `R = never`): checksumming an inline compressed value needs the
+      `Compression` registry, read from context as everywhere else (`CompressorNotRegistered` as
+      the `ValidationError`'s cause). Its errors name entity type `Offload` and operation
+      `Offload.compareStored`; an invalid `kind`, or a value that is not a stored form of it (a
+      binary field's `~edbp:` text on an overflow field, a malformed pointer), is a
+      `ValidationError`. Its parameters are a structural `Offload.StoredAttributeValue` (every
+      member optional, `B` as bytes or base64 text), which the SDK's `AttributeValue` and
+      Lambda's both fit: the guard forbids even a type import of the SDK in that graph. Since
+      its members admit `undefined`, a member set to `undefined` is no member, at any depth:
+      `{ S: "…", B: undefined }` is an `S` value.
+      `OffloadKind` moved to `internal/OffloadValues.ts` and is exported from `Offload`.
+    - `Entity.decodeStreamRecord(entity, record, { offloaded? })` checks the record first (so
+      `EDD-9119` fires whatever its entity type), then keeps only the images of the entity's
+      type: an image of another type counts as absent, and `Option.none()` when neither is the
+      entity's (another type, a sentinel, an untyped item). Each image decodes through the same
+      path as `decodeMarshalledItem` (DynamoDB JSON or unmarshalled, `B` as bytes or base64),
+      in the requested modes (lazy by default); its errors — and a lazy value's reads, as
+      `decodeStreamRecord.read` (§8.7) — name the operation `decodeStreamRecord`. `offloaded` is
+      classified from the raw images, never the store, and is keyed by domain name. An unknown
+      mode is `[EDD-9117]`. A pure definition decodes through its cached runtime entity (as
+      `decodeMarshalledItem`). The parameter admits only an entity (it carries
+      `_decodeStreamRecord`) or a pure definition (`_config` and `_data`) — narrower than
+      `decodeMarshalledItem`'s, which also takes a bare `{ schemas, entityType }` and decodes it
+      by its item schema: such an object knows neither its keys nor its offloaded fields. Only
+      untyped code can pass anything else, and it dies (a defect).
+    - Types. `EntityChange<A, F extends string = string>` gains `F`, so `offloaded` is typed
+      `{ readonly [K in F]?: OffloadChange }` over the entity's offloaded field names (`{}` for
+      an entity that offloads nothing) — §3.9's `Readonly<Record<string, …>>` is the default.
+      The items are `Entity.Read<E, M>` for every entity, including one that offloads nothing
+      (its `Entity.Record`) — unlike `decodeMarshalledItem`'s `unknown` for those, kept for
+      compatibility; this API is new. `BlobStoreError` is in the error channel only for an
+      eager mode on an offloading entity. `Entity.StreamRecordLike` is structural (`eventName?`,
+      `dynamodb?: { Keys?, OldImage?, NewImage?, StreamViewType?: string,
+      ApproximateCreationDateTime?: Date | number }`); the SDK's `_Record` (the change feed's
+      `ChangeFeedRecord`) and Lambda's `DynamoDBRecord` shape are assignable (type-tested).
+    - `StorageEncoding.pointer(stored)` accepts an `AttributeValue`, a Lambda-style `{ B:
+      base64 }`, bytes or a string — read as `decodeUnmarshalled` reads one: `~edbp:` text, or,
+      starting `I`–`X`, base64 of a `B` value (an unmarshalled Lambda / Pipes image's) — and
+      returns `Option.none()` for anything that is not a
+      well-formed pointer of the form's kind (a `B` value must hold a json pointer, an `S` text
+      a bytes pointer) — a malformed one included: it answers "is this a pointer?", and the
+      decoders report what is wrong with it. `StorageEncoding.BlobPointer`, `BlobRef` and
+      `BlobChecksum` are exported as types. `decode` / `decodeUnmarshalled` resolve a json
+      pointer through the store in context (`BlobResolver.resolveAll`, eager, verified; a
+      `BlobStoreError` — `NotProvided` without a store — becomes the `ValidationError`'s
+      `cause`), and refuse a binary field's `~edbp:` text with a message pointing at `pointer`
+      (they decode packed values; the bytes are an entity's). The `*Sync` twins refuse a pointer
+      with `PackedCodec.unresolvedPointer`, which now takes the hint naming what resolves it.
+    - Tests: `test/Entity.decodeStreamRecord.test.ts` (18) — every §10.3 row through
+      `compareStored` (equal checksums with different content sizes, a key-order restatement,
+      inline ↔ pointer by computed checksum, native and `NULL` values, Lambda base64, invalid
+      forms and kinds, a missing compressor, members set to `undefined`), and through
+      `decodeStreamRecord`: the
+      INSERT / MODIFY / REMOVE lifecycle with no store reads, inline → external `rewritten`,
+      Lambda / unmarshalled / base64-unmarshalled images, eager vs lazy, a lazy read's
+      `decodeStreamRecord.read` error, every `EDD-9119` case (another type's record included),
+      other types and untyped items, a non-offloading entity and a pure definition, `EDD-9117`;
+      mutation-checked (each classification branch and the view-type check). `StorageEncoding`
+      pointer tests (both forms, resolution plain and gzip, store failures as causes, the sync
+      refusals); type tests (item and `offloaded` types by mode, the error channel, record and
+      attribute-value assignability); schema tests for `unpackPayloadSync` and the hint. The
+      connected end-to-end over raw-fetched items rewritten as Lambda records stays with
+      commit 17 (§19.4).
+    *Debt fixed (commit 14):*
+    - `PackedCodec.unresolvedPointer`'s message still asked whether the value was "written by a
+      newer effect-dynamodb?" — a pointer is a known layout now; it says what resolves it.
+    - `internal/Packed.ts` still said no read path resolves pointers; it says which do.
+    - `OffloadKind` lived in `internal/BlobResolver.ts` (the resolver), not with the other
+      offload value types; moved, and re-exported where it was.
+    - `definitionImageDecoder`'s runtime-entity cache lookup is now `definitionRuntime`, shared
+      with `decodeStreamRecord`.
+    - `connected.change-feed.test.ts`'s restart case raced: `runChangeFeed` calls `onBatch`
+      after the batch's projections apply, so the balance could read its final value before
+      the batch reached the test's `seen` list (one failure in a full connected run). It now
+      waits for both.
+    *Review fixes (commit 14):* `compareStored` read an overflow attribute's `S` (and an
+    unmarshalled image's string) as inline JSON without checking it, so a binary field's
+    `~edbp:` text there — a caller passing the wrong `kind` — classified (`removed`,
+    `unchanged`) instead of failing as the note above says; both readers refuse it now.
+    `StorageEncoding.pointer` read every bare string as `~edbp:` text, so the base64 `B` text
+    of an unmarshalled Lambda / Pipes image — the form `decodeUnmarshalled` documents — was
+    "not a pointer" while `decodeUnmarshalled` resolved it; it dispatches strings as
+    `decodeUnmarshalled` does (above, and §3.11). A hand-built `StoredAttributeValue` with a
+    member set to `undefined` (which the type admits) was refused as not DynamoDB JSON, and a
+    nested one compared `changed`; the tag is the one defined member now. The `EDD-9119` rows
+    (§14.3, `DESIGN.md`) and §10.4 said images were checked only on a record with no view type
+    and did not name `internal/OffloadChange.ts`; they match the code now.
+    `decodeStreamRecord`'s parameter type admitted any `{ schemas, entityType }`, on which it
+    died although this note said the type forbade it; the type is narrowed (above), with a
+    type test.
 15. **S3 store + CI** — `src/blob/s3.ts` (put / copy `VersionId` checks and cleanup, list, head,
     tag marks), subpath export, optional peer, guard test, unit tests on a stubbed `S3Client`;
     MinIO in CI; `connected.blob-s3.test.ts`.

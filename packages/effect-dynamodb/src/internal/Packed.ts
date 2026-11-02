@@ -13,9 +13,10 @@
  * - **Read:** after `fromAttributeMap`, before sparse rebuild and renames —
  *   {@link unpackItem} dispatches each dispatch-eligible attribute on its
  *   stored form (native → unchanged, `S` → JSON, `B` → header + payload). A
- *   `B` blob pointer (an offloaded value, #179) is refused with a
- *   `ValidationError` naming it ({@link unpackStoredValueSync}): no read path
- *   resolves pointers yet.
+ *   `B` blob pointer (an offloaded value, #179) is refused here with a
+ *   `ValidationError` naming it ({@link unpackStoredValueSync}): these steps
+ *   are synchronous and do no I/O. The members' read paths load rows through
+ *   `OffloadRead.loadRows`, which resolves pointers.
  * - **Streams:** {@link normalizeImage} turns a Streams image (DynamoDB JSON,
  *   `B`/`BS` as bytes or base64, or an already-unmarshalled item) into an
  *   unmarshalled item with real bytes, and {@link unpackImageItem} additionally
@@ -254,11 +255,12 @@ export const packAttributeValueSync = (
 // ---------------------------------------------------------------------------
 
 /**
- * `unpackStoredSync` for the library's read paths: the JSON wire form, or the
- * `ValidationError` it fails with (returned, never thrown). A blob pointer (an
- * offloaded value, #179) is refused with a `ValidationError` naming the
- * attribute and the object version it pins — no read path resolves pointers
- * yet, so stored data never reads as the pointer itself.
+ * `unpackStoredSync` for the synchronous steps here: the JSON wire form, or
+ * the `ValidationError` it fails with (returned, never thrown). A blob pointer
+ * (an offloaded value, #179) is refused with a `ValidationError` naming the
+ * attribute and the object version it pins — a synchronous step cannot fetch
+ * it (`OffloadRead.loadRows` resolves pointers) — so stored data never reads
+ * as the pointer itself.
  */
 export const unpackStoredValueSync = (
   stored: string | Uint8Array,

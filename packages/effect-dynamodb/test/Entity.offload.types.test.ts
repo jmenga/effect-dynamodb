@@ -10,6 +10,7 @@
  * Compile-time only; checked by `tsc -p tsconfig.test.json` (`pnpm check`).
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as SchemaEntity from "@effect-dynamodb/schema/Entity.js"
@@ -18,12 +19,13 @@ import type {
   BlobStoreError,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, type Option, Schema, Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import type { AggregateCreateError, AggregateWriteError } from "../src/Aggregate.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
+import type { ChangeFeedRecord } from "../src/change-feed/index.js"
 import { DynamoClient, type DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type * as EventStore from "../src/EventStore.js"
@@ -703,6 +705,115 @@ describe("the read types (#179)", () => {
       expectTypeOf<Entity.Read<typeof Docs>["scan"]>().toEqualTypeOf<BlobHandle | undefined>()
       expectTypeOf<Entity.Read<typeof Docs>["body"]>().toEqualTypeOf<Body>()
       expectTypeOf<Entity.Read<typeof Plain>>().toEqualTypeOf<Entity.Record<typeof Plain>>()
+    })
+    expect(true).toBe(true)
+  })
+
+  it("types decodeStreamRecord's items by its modes and its offloaded keys by field", () => {
+    typeOnly(() => {
+      const record = { eventName: "INSERT", dynamodb: { NewImage: {} } }
+      const lazy = Entity.decodeStreamRecord(Docs, record)
+      type LazyChange = Option.Option.Value<Effect.Success<typeof lazy>>
+      type LazyItem = Option.Option.Value<LazyChange["newItem"]>
+      expectTypeOf<LazyItem["body"]>().toEqualTypeOf<OffloadedValue<Body>>()
+      expectTypeOf<LazyItem["scan"]>().toEqualTypeOf<BlobHandle | undefined>()
+      expectTypeOf<LazyChange["eventName"]>().toEqualTypeOf<"INSERT" | "MODIFY" | "REMOVE">()
+      expectTypeOf<LazyChange["offloaded"]>().toEqualTypeOf<{
+        readonly body?: Offload.OffloadChange
+        readonly scan?: Offload.OffloadChange
+      }>()
+      expectTypeOf<Effect.Error<typeof lazy>>().toEqualTypeOf<ValidationError>()
+
+      const eager = Entity.decodeStreamRecord(PureDocs, record, { offloaded: "eager" })
+      type EagerItem = Option.Option.Value<
+        Option.Option.Value<Effect.Success<typeof eager>>["oldItem"]
+      >
+      expectTypeOf<EagerItem["body"]>().toEqualTypeOf<Body>()
+      expectTypeOf<EagerItem["scan"]>().toEqualTypeOf<Uint8Array | undefined>()
+      expectTypeOf<Effect.Error<typeof eager>>().toEqualTypeOf<ValidationError | BlobStoreError>()
+
+      const binary = Entity.decodeStreamRecord(Docs, record, { offloaded: { binary: "eager" } })
+      type BinaryItem = Option.Option.Value<
+        Option.Option.Value<Effect.Success<typeof binary>>["newItem"]
+      >
+      expectTypeOf<BinaryItem["body"]>().toEqualTypeOf<OffloadedValue<Body>>()
+      expectTypeOf<BinaryItem["scan"]>().toEqualTypeOf<Uint8Array | undefined>()
+
+      // A member that offloads nothing: its record, and no offloaded keys.
+      const plain = Entity.decodeStreamRecord(Plain, record)
+      type PlainChange = Option.Option.Value<Effect.Success<typeof plain>>
+      expectTypeOf<Option.Option.Value<PlainChange["newItem"]>>().toEqualTypeOf<
+        Entity.Record<typeof Plain>
+      >()
+      expectTypeOf<PlainChange["offloaded"]>().toEqualTypeOf<{}>()
+      expectTypeOf<Effect.Error<typeof plain>>().toEqualTypeOf<ValidationError>()
+
+      // Only an entity or a pure definition: a bare `{ schemas, entityType }`
+      // (which `decodeMarshalledItem` decodes by its item schema) knows
+      // neither its keys nor its offloaded fields.
+      // @ts-expect-error — not an entity nor a definition
+      Entity.decodeStreamRecord({ schemas: Docs.schemas, entityType: "Doc" }, record)
+    })
+    expect(true).toBe(true)
+  })
+
+  it("takes the SDK's, Lambda's and the change feed's records and attribute values", () => {
+    typeOnly(() => {
+      // The change feed's record (the SDK's `_Record`).
+      const fromFeed = (record: ChangeFeedRecord) => Entity.decodeStreamRecord(Docs, record)
+      // A Lambda `DynamoDBRecord` (aws-lambda's shape: every member optional, B as base64).
+      type LambdaAttributeValue = {
+        B?: string | undefined
+        BS?: Array<string> | undefined
+        BOOL?: boolean | undefined
+        L?: Array<LambdaAttributeValue> | undefined
+        M?: { [id: string]: LambdaAttributeValue } | undefined
+        N?: string | undefined
+        NS?: Array<string> | undefined
+        NULL?: boolean | undefined
+        S?: string | undefined
+        SS?: Array<string> | undefined
+      }
+      type LambdaRecord = {
+        eventID?: string | undefined
+        eventName?: "INSERT" | "MODIFY" | "REMOVE" | undefined
+        dynamodb?:
+          | {
+              ApproximateCreationDateTime?: number | undefined
+              Keys?: { [key: string]: LambdaAttributeValue } | undefined
+              NewImage?: { [key: string]: LambdaAttributeValue } | undefined
+              OldImage?: { [key: string]: LambdaAttributeValue } | undefined
+              StreamViewType?:
+                | "KEYS_ONLY"
+                | "NEW_IMAGE"
+                | "OLD_IMAGE"
+                | "NEW_AND_OLD_IMAGES"
+                | undefined
+            }
+          | undefined
+      }
+      const fromLambda = (record: LambdaRecord) =>
+        Effect.gen(function* () {
+          yield* Entity.decodeStreamRecord(Docs, record)
+          yield* Offload.compareStored(
+            record.dynamodb?.OldImage?.body,
+            record.dynamodb?.NewImage?.body,
+            "overflow",
+          )
+        })
+      // The SDK's AttributeValue.
+      const fromSdk = (before: AttributeValue, after: AttributeValue | undefined) =>
+        Offload.compareStored(before, after, "binary")
+      expectTypeOf<
+        Effect.Success<ReturnType<typeof fromSdk>>
+      >().toEqualTypeOf<Offload.OffloadChange>()
+      expectTypeOf<Effect.Error<ReturnType<typeof fromSdk>>>().toEqualTypeOf<ValidationError>()
+      // @ts-expect-error — not an attribute value
+      Offload.compareStored({ X: 1 }, undefined, "overflow")
+      // @ts-expect-error — not a kind
+      Offload.compareStored(undefined, undefined, "json")
+      void fromFeed
+      void fromLambda
     })
     expect(true).toBe(true)
   })
