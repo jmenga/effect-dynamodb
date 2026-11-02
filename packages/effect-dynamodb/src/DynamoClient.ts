@@ -174,12 +174,17 @@ import {
 import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
+import { BlobStore } from "./BlobStore.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import {
   bind as entityBind,
   fromDefinition as entityFromDefinition,
   storedRefIdOf,
 } from "./Entity.js"
+import {
+  type BlobStoreService,
+  validateService as validateBlobStore,
+} from "./internal/BlobStoreContract.js"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
@@ -1872,6 +1877,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * yield* db.collections.assignments({ userId: "123" }).collect()
    * yield* db.tables.MainTable.create()
    * ```
+   *
+   * @param config.blobStore - The store offloaded values of the bound members
+   *   are written to and read from (#179). It wins over a `BlobStore` in
+   *   context at bind time, which is captured otherwise; it is validated as
+   *   `BlobStore.layer` validates a store.
+   * @throws `[EDD-9116]` when `blobStore` is not a valid store.
    */
   static readonly make: {
     <
@@ -1885,6 +1896,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -1900,6 +1912,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -1915,6 +1928,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -1926,6 +1940,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -2554,6 +2569,7 @@ const makeFromConfig = (config: {
   readonly crypto?: SecureRandom.SecureRandom["Service"]
   readonly embedder?: EmbedderService
   readonly compressors?: ReadonlyArray<Compressor>
+  readonly blobStore?: BlobStoreService
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the headline output of the
@@ -2639,10 +2655,22 @@ const makeFromConfig = (config: {
       compressionRegistry,
     )
     if (codecError !== undefined) throw codecError
-    const ctx =
+    const withCompression =
       compressionRegistry !== undefined
         ? Context.add(withEmbedder, Compression, compressionRegistry)
         : withEmbedder
+    // The blob store for offloaded values (#179): an explicit `blobStore`
+    // wins over one in context at bind time, which `baseCtx` already holds
+    // (`Capacity.detachContext` keeps it). Validated as `BlobStore.layer`
+    // validates one ([EDD-9116]).
+    const ctx =
+      config.blobStore !== undefined
+        ? Context.add(
+            withCompression,
+            BlobStore,
+            validateBlobStore("DynamoClient.make", config.blobStore),
+          )
+        : withCompression
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

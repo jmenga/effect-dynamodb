@@ -159,6 +159,11 @@ export interface BlobStoreService {
   readonly writeConcurrency: number
   /** MUST return an immutable reference: the bytes `ref` names never change. */
   readonly put: (request: BlobPutRequest) => Effect.Effect<BlobPutResult, BlobStoreFailure>
+  /**
+   * The bytes `ref` names, in chunks. Each chunk is handed over: the store
+   * never reuses or changes one it has emitted (the library may return it to
+   * the caller as is).
+   */
   readonly get: (
     ref: BlobRef,
     options?: { readonly range?: ByteRange | undefined },

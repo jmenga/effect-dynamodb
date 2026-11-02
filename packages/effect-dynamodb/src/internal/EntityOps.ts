@@ -12,6 +12,7 @@ import { type DateTime, Effect, Pipeable, type Schema, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
+import * as BlobLedger from "./BlobLedger.js"
 import * as Capacity from "./Capacity.js"
 import type { RawCondition } from "./TransactableOps.js"
 
@@ -546,7 +547,7 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
       Capacity.operation(
         `Entity.${this._putKind}`,
         Capacity.entityTarget(this._entity),
-        this._run(mode),
+        BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._run(mode)),
       )
   }
   asEffect(): Effect.Effect<A, E, R> {
@@ -592,7 +593,7 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
       Capacity.operation(
         this._updateState.patch ? "Entity.patch" : "Entity.update",
         Capacity.entityTarget(this._entity),
-        this._run(mode),
+        BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._run(mode)),
       )
   }
   asEffect(): Effect.Effect<A, E, R> {
@@ -655,7 +656,7 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
         ? "Entity.deleteIfExists"
         : (Capacity.builderName(this._builder) ?? "Entity.delete"),
       Capacity.entityTarget(this._entity),
-      this._core(),
+      BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._core()),
     )
   }
   [Symbol.iterator]() {

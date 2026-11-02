@@ -12,6 +12,10 @@
  * - **{@link View}** is the type of a read's result: the model with each
  *   offloaded field typed by its mode. For a member that offloads nothing it
  *   is the model itself.
+ * - **{@link layerObserver}** reports every upload the library could not
+ *   settle (an unknown DynamoDB outcome, a failed rollback delete, a lost
+ *   multipart completion), so the application can queue the item for
+ *   `gc.sweep`.
  *
  * See `DESIGN.md §7 "Offloaded Storage"`.
  */
@@ -22,6 +26,8 @@ import type {
   OffloadMode,
   ResolvedOffloadModes,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import type { Layer } from "effect"
+import { layerObserver as makeObserverLayer, type ObserverOptions } from "./internal/BlobLedger.js"
 import type { BlobHandle, OffloadedValue } from "./internal/OffloadValues.js"
 
 export type {
@@ -40,6 +46,11 @@ export type {
   ResolvedOffloadModes,
   WriteBlobErrors,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+export type {
+  ObserverOptions,
+  UnsettledReason,
+  UnsettledUpload,
+} from "./internal/BlobLedger.js"
 export type { ByteRange } from "./internal/BlobStoreContract.js"
 export type { BlobHandle, OffloadedValue, OffloadLocation } from "./internal/OffloadValues.js"
 export {
@@ -142,3 +153,43 @@ export type NoOffloadState = {
 
 /** The result type a builder in state `O` returns. */
 export type ViewOf<O extends OffloadState> = View<O["item"], O["fields"], O["modes"]>
+
+/**
+ * Report every upload the library could not settle — for everything run
+ * under this layer, and for every client bound (`DynamoClient.make`,
+ * `EventStore.bind`, …) while it was in context.
+ *
+ * A write uploads its offloaded values before it reaches DynamoDB, and keeps
+ * a version only when DynamoDB committed the write, or may have. The
+ * library deletes a version only when DynamoDB provably did not commit the
+ * write; the rest it cannot settle, and reports here once the operation
+ * exits:
+ *
+ * - `inDoubt` — the write's outcome is unknown (a timeout, an
+ *   `InternalServerError`, an interruption while it was in flight, a refusal
+ *   after an SDK retry): the version is kept;
+ * - `rollbackFailed` — DynamoDB rejected the write but the delete of its
+ *   version failed: the version is left behind;
+ * - `completeLost` — a multipart upload completed but its response was lost:
+ *   the version it made has no pointer;
+ * - `answerRefused` — the store's answer to an upload broke the `BlobStore`
+ *   contract (no ref, a ref outside the requested key, a ref it had already
+ *   returned) and was refused: the version it wrote, if any, has no pointer.
+ *
+ * Each is also logged at `Warning`. Queue the item (`rowKey`) for `gc.sweep`;
+ * `gc.sweepStore` finds what no process could report. A failing observer is
+ * logged and never changes the operation's result. Off by default.
+ *
+ * @example
+ * ```ts
+ * // `enqueueSweep` is the application's own: e.g. a queue a sweeper drains.
+ * const AppLayer = Layer.mergeAll(
+ *   DynamoClient.layer({ region: "eu-west-1" }),
+ *   BlobStore.layer(store),
+ *   Offload.layerObserver({
+ *     onUnsettled: (upload) => enqueueSweep({ table: upload.table, key: upload.rowKey }),
+ *   }),
+ * )
+ * ```
+ */
+export const layerObserver: (options: ObserverOptions) => Layer.Layer<never> = makeObserverLayer

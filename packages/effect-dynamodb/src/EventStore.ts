@@ -110,6 +110,7 @@ import {
 } from "effect"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
@@ -2951,6 +2952,17 @@ export const makeStream = <
     ): ((...args: Args) => Effect.Effect<A, E, R>) =>
     (...args) =>
       Capacity.operation(`EventStream.${name}`, { target: config.streamName }, op(...args))
+  /**
+   * A writing stream method as an upload-ledger root (#179): the uploads of
+   * one call settle by the request that carries them, and are rolled back at
+   * exit when DynamoDB provably did not commit it.
+   */
+  const rooted =
+    <Args extends ReadonlyArray<any>, A, E, R>(
+      op: (...args: Args) => Effect.Effect<A, E, R>,
+    ): ((...args: Args) => Effect.Effect<A, E, R>) =>
+    (...args) =>
+      BlobLedger.root(op(...args))
   /** The `[EDD-9076]` guard for queries of a stream whose `data` is packed. */
   const dataGuards: ReadonlyArray<PackedAttributeGuard> =
     dataStoredAs === undefined
@@ -6018,9 +6030,9 @@ export const makeStream = <
     snapshotConfig: snapshotSettings,
     storedAs: storage,
     indexes: indexSettings,
-    writeSnapshot: checked(named("writeSnapshot", writeSnapshot)),
+    writeSnapshot: checked(named("writeSnapshot", rooted(writeSnapshot))),
     readSnapshot: checked(named("readSnapshot", readSnapshot)),
-    append: checked(named("append", append)),
+    append: checked(named("append", rooted(append))),
     appendOp,
     read: checked(named("read", read)),
     readFrom: checked(named("readFrom", readFrom)),
@@ -7890,10 +7902,13 @@ const makeCommandHandlerImpl = <
     // One report per invocation: the load and the append (and retries) nest
     // under it (#174). A bound stream's captured setting applies, as it does
     // to the bound calls inside.
+    // The invocation is one upload-ledger root (#179): a retry that decides
+    // the same content uploads it once, and what no attempt committed is
+    // rolled back at exit.
     return Capacity.operation(
       "EventStore.commandHandler",
       { target: stream.streamName },
-      run,
+      BlobLedger.root(run),
       (stream as { readonly [Capacity.CapturedReporting]?: Capacity.Settings })[
         Capacity.CapturedReporting
       ],

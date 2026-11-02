@@ -28,6 +28,7 @@ import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
@@ -406,7 +407,12 @@ export const transactWrite = (
   | TransactionOverflow
   | RefNotFound,
   DynamoClient | TableConfig
-> => Capacity.operation("Transaction.transactWrite", undefined, transactWriteCore(operations))
+> =>
+  Capacity.operation(
+    "Transaction.transactWrite",
+    undefined,
+    BlobLedger.root(transactWriteCore(operations)),
+  )
 
 const transactWriteCore = (
   operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,

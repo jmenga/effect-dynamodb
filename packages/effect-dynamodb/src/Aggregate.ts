@@ -121,6 +121,7 @@ import {
 import * as Batch from "./Batch.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
 import { entityNaming } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
@@ -5990,10 +5991,14 @@ const withOperations = <A extends Aggregate<any, any, any, any>>(
   return {
     ...ops,
     get: (key: any) => Capacity.operation("Aggregate.get", target, ops.get(key)),
-    create: (input: any) => Capacity.operation("Aggregate.create", target, ops.create(input)),
+    // The writes are ledger roots (#179): the edge entities' uploads settle
+    // by the one transaction that carries them.
+    create: (input: any) =>
+      Capacity.operation("Aggregate.create", target, BlobLedger.root(ops.create(input))),
     update: (key: any, mutationFn: any) =>
-      Capacity.operation("Aggregate.update", target, ops.update(key, mutationFn)),
-    delete: (key: any) => Capacity.operation("Aggregate.delete", target, ops.delete(key)),
+      Capacity.operation("Aggregate.update", target, BlobLedger.root(ops.update(key, mutationFn))),
+    delete: (key: any) =>
+      Capacity.operation("Aggregate.delete", target, BlobLedger.root(ops.delete(key))),
     list: (filter: any, options: any) =>
       Capacity.operation("Aggregate.list", target, ops.list(filter, options)),
   }

@@ -67,6 +67,7 @@ import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 import type * as Query from "../Query.js"
 import { type RekeyAmbiguity, resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import { attributeValueEquals } from "./AttributeValueEquals.js"
+import * as BlobLedger from "./BlobLedger.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
@@ -2035,11 +2036,15 @@ export const makeEngine = (config: EngineConfig) => {
           }),
     )
 
+  // One row's read-fold-write, retries included, is an upload-ledger root
+  // (#179): a re-fold that writes the same content uploads it once, and what
+  // no attempt committed is rolled back when the row's write settles.
   const withRetry = <X>(attempt: Effect.Effect<X, any, any>): Effect.Effect<X, any, any> =>
     Effect.retry(attempt, {
       schedule: config.retry,
       while: (error: unknown) => error instanceof LostRace,
     }).pipe(
+      (self) => BlobLedger.root(self),
       Effect.mapError((error) =>
         error instanceof LostRace
           ? new ConcurrentModification({

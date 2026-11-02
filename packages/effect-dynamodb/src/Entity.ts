@@ -132,6 +132,7 @@ import { SecureRandom } from "effect/crypto"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
 import {
   isBoundOp,
   makeBoundAppend,
@@ -15008,7 +15009,10 @@ const makeImpl = <
     Capacity.operation(
       "Entity.append",
       { target: entityType },
-      appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+      BlobLedger.rootIf(
+        data.offload !== undefined,
+        appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+      ),
     )
 
   const historyQuery = (key: unknown) => {

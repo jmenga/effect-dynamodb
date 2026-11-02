@@ -451,9 +451,10 @@ A member with an offloaded field needs a store where it is first resolvable (§1
 
 **Observer**. `Offload.layerObserver({ onUnsettled })` (a `Context.Reference`, off by default,
 like `ConsumedCapacity`'s `onOperation`) receives every upload the library could not settle —
-in-doubt outcomes, failed rollback deletes and lost multipart completions — with the table,
-entity type, attribute, row key and ref (§6.2), so an application can queue those items for
-`gc.sweep`.
+in-doubt outcomes, failed rollback deletes, lost multipart completions and (*added in
+commit 6*) store answers refused as naming no version of the requested key (`answerRefused`,
+§6.2) — with the table, entity type, attribute, row key and ref (§6.2), so an application can
+queue those items for `gc.sweep`.
 
 ### 3.7 Read modes and result types — `.offloaded(mode)`
 
@@ -1025,9 +1026,11 @@ consumed capacity's `CurrentOperation`:
 
 - **Root.** The outermost library operation that can upload opens the ledger; nested library
   calls reuse it. Roots include an entity write, `Transaction.transactWrite`, `Batch.write`,
-  `EventStream.append` / `commandHandler`, an aggregate write, a projection's batch and
-  `GeoIndex.put`. Bound clients' captured context is detached from it (`detachContext` clears
-  it, as it clears `CurrentOperation`).
+  `EventStream.append` / `writeSnapshot` / `commandHandler`, an aggregate write, each
+  projection row's read-fold-write (retries included; *as built in commit 6*, it was "a
+  projection's batch") and `GeoIndex.put` (through the entity put it runs). Bound clients'
+  captured context is detached from it (`detachContext` clears it, as it clears
+  `CurrentOperation`), and so is a long-lived forked fiber's (`Capacity.detached`).
 - **Entries.** Each upload is an entry `{ ref, store, memo, startedAt, state }`, starting
   `pending`. `memo` is `(key, contentChecksum, contentSize, kind, contentType)` for buffered
   content, or **(input `Stream` identity, target object key)** for a stream. An upload whose
@@ -1050,7 +1053,11 @@ consumed capacity's `CurrentOperation`:
 - **Unsettled uploads are reported, not just logged.** `inDoubt` entries and failed rollback
   deletes are logged at `Warning` with the table, entity type, attribute, row key and refs, and
   delivered to the `Offload.layerObserver({ onUnsettled })` observer when one is provided
-  (§3.6), so the application can queue the item for `gc.sweep`. Leaks no process could report
+  (§3.6), so the application can queue the item for `gc.sweep`. So are, when the root exits,
+  uploads whose version no entry names (*as built in commit 6*): a lost multipart completion
+  (`completeLost`, §7) and a store `put` answer refused as naming no version of the requested
+  key (`answerRefused`: no ref, a ref outside the key, a ref already returned for another
+  upload), reported by the requested key with no ref — the answer's ref is never deleted. Leaks no process could report
   (a crash between upload and exit) are found by `gc.sweepStore` (§11.5).
 - **Read cache.** The ledger also maps each entry's ref to the wire value or bytes it uploaded,
   so decoding what the op just wrote (§6.13) never re-fetches it.
@@ -1067,12 +1074,13 @@ Settlement by outcome (evidence first, metadata second):
 | Request outcome | Pointers it carried become |
 |---|---|
 | Success (`PutItem`, `UpdateItem`, `DeleteItem`, `TransactWriteItems`) | `committed`. Exception: an `UpdateItem` that writes an offloaded attribute with `if_not_exists` (upsert of an immutable field) settles by the returned `ALL_NEW` image — a pointer the item did not keep is `rejected` |
-| `BatchWriteItem` | processed requests → `committed`. A request still in `UnprocessedItems` after the library's retries → `rejected` only if **every** `BatchWriteItem` response that carried it reported `$metadata.attempts === 1`; otherwise (an SDK resend, an unknown attempt count, a chunk lost to a transport error) → `inDoubt`. `BatchWriteItem` has no idempotency token, so a lost response followed by a throttled resend may hide a commit |
+| `BatchWriteItem` | processed requests → `committed` — per pointer: one a processed request carried is `committed` even when another request in the same call that carried it is unprocessed (*as built in commit 6*). A request still in `UnprocessedItems` after the library's retries → `rejected` only if **every** `BatchWriteItem` response that carried it reported `$metadata.attempts === 1`; otherwise (an SDK resend, an unknown attempt count, a chunk lost to a transport error) → `inDoubt`. `BatchWriteItem` has no idempotency token, so a lost response followed by a throttled resend may hide a commit |
 | Not sent (marked `NotSent`: recorded for a transaction, answered locally) | unchanged |
 | `TransactionCanceled`, `ValidationException` or `ConditionalCheckFailed` on a `TransactWriteItems` carrying the library's token | `rejected` |
 | `IdempotentParameterMismatch` or `TransactionInProgress` on a `TransactWriteItems` | `inDoubt` |
 | `ConditionalCheckFailed` on a single-item write (always sent with `ReturnValuesOnConditionCheckFailure: ALL_OLD` when it carries a pointer) | **by the returned item**: it holds the pointer → `committed` (an earlier attempt applied it). It is absent or does not hold the pointer → `rejected` for members whose rows never copy pointers (plain entities, EventStore snapshot rows, projection rows); `inDoubt` for `retain`, `softDelete` and `timeSeries` members, where an earlier commit's pointer may have been copied into a snapshot or tombstone the live row no longer shows |
 | `ValidationException`, `ResourceNotFound`, `ItemCollectionSizeLimitExceeded`, throttling, `TransactionConflict`, `AccessDenied` on a single-item write | `rejected` when the error reports `$metadata.attempts === 1`; `inDoubt` when it reports more, or reports none (a mock, a wrapper, or a client that hides the SDK error) |
+| `ValidationException`, `ResourceNotFound`, throttling or `AccessDenied` refusing a whole `TransactWriteItems` or `BatchWriteItem` (*added in commit 6*) | `rejected` when the error reports `$metadata.attempts === 1` — DynamoDB applies nothing of a request it refuses; `inDoubt` otherwise (a `TransactWriteItems` `ValidationException` carrying the library's token is `rejected` by the row above) |
 | Transport error, `InternalServerError`, any other `DynamoError`, or interruption while the request is in flight | `inDoubt` |
 
 Notes:
@@ -1210,7 +1218,7 @@ built under its own captured `BlobStore` and compressor registry when it is a bo
 (§3.6), the ambient ones otherwise. `Batch.write` builds every item (uploading) before sending
 chunks, as today. Settlement is per request (§6.2):
 
-- processed requests → `committed`;
+- processed requests → `committed` (per pointer: one any processed request carried, §6.2);
 - `UnprocessedItems` left after retries → `rejected` only when every response that carried the
   request was a first attempt, else `inDoubt`;
 - a chunk lost to a transport error → `inDoubt`;
@@ -1481,8 +1489,11 @@ A **full** read verifies before returning:
 - CRC64NVME over the content equals the pointer's checksum — over the bytes (binary), or over
   the decompressed JSON (overflow), which also catches a corrupt or wrong-codec payload.
 
-Mismatch → `BlobStoreError { reason: "ChecksumMismatch" }`. A **ranged** read (`read({ range
-})`, `stream({ range })`) cannot verify a full-object checksum and does not; the docs say so.
+Mismatch → `BlobStoreError { reason: "ChecksumMismatch" }`. A buffered full read (eager, or a
+lazy `read()`) fails as soon as the bytes run past the pointer's object size, so an oversized
+or corrupt object is never buffered whole (*as built in commit 6*). A **ranged** read
+(`read({ range })`, `stream({ range })`) cannot verify a full-object checksum and does not;
+the docs say so.
 `stream()` without a range verifies as the last chunk arrives, failing the stream after the
 bytes were emitted, which is documented on `stream()`.
 
@@ -2235,6 +2246,7 @@ export interface BlobStoreService {
   readonly writeConcurrency: number
   /** MUST return an immutable reference: the bytes `ref` names never change. */
   readonly put: (request: BlobPutRequest) => Effect.Effect<BlobPutResult, BlobStoreFailure>
+  /** Each chunk is handed over: never reused or changed once emitted (commit 6). */
   readonly get: (ref: BlobRef, options?: { readonly range?: ByteRange }) => Stream.Stream<Uint8Array, BlobStoreFailure>
   /** Idempotent: deleting an absent ref succeeds. */
   readonly delete: (refs: ReadonlyArray<BlobRef>) => Effect.Effect<void, BlobStoreFailure>
@@ -2682,7 +2694,7 @@ in-doubt outcomes are **kept and reported**:
   - a rollback delete that fails, leaving the operation's error unchanged, a `Warning` log entry
     and an observer call;
   - `Offload.layerObserver` receives every unsettled ref (in doubt, failed rollback delete,
-    lost `Complete`) with its entity, attribute and operation;
+    lost `Complete`, a refused store answer) with its entity, attribute and operation;
   - `maxUploadAge`: an upload whose `startedAt` is older than the store's `maxUploadAge` when its
     write is about to be sent fails with `Expired`, sends nothing to DynamoDB and deletes the
     version (`TestClock`).
@@ -3067,6 +3079,93 @@ a write path, deletes the gate.
    `commandHandler` / `writeSnapshot`, projection writes, `GeoIndex.put`.
    `internal/BlobResolver.ts` (two-phase decode, read cache, verification). Unit-tested with
    synthetic ops.
+   *Implementation notes (commit 6):* three internal modules, none importing the AWS SDK —
+   `internal/BlobCalls.ts` (new: every store call in an `effect-dynamodb.BlobStore.<action>`
+   client span, its `BlobStoreFailure` wrapped as a `BlobStoreError` with the operation's
+   context; a store failing with anything else is `Rejected` with that as the cause),
+   `internal/BlobLedger.ts` and `internal/BlobResolver.ts`. `Offload.layerObserver` and the
+   `UnsettledUpload` / `UnsettledReason` / `ObserverOptions` types re-export the ledger's, so
+   `Offload.ts` stays AWS-free (the import-graph guard of `test/BlobStore.test.ts` holds). The
+   ledger is a `Context.Reference`; `Capacity.client`'s instrumented view hands a write request
+   to `BlobLedger.guard` only when the fiber's ledger is open and holds entries, so a ledger
+   that uploaded nothing costs nothing per request. `BlobLedger.upload` takes buffered content
+   (the stream memo and `EDD-9120` are commit 10's) and computes its CRC-64/NVME itself — the
+   memo key and the pointer — plus the body's for a compressed body. The roots:
+   `EntityOps`' put / update / delete terminals and `Entity.append`, each gated on
+   `entity.offload !== undefined` (an entity that offloads nothing pays nothing); and,
+   unconditionally (one object and one finalizer), `Batch.write`, `Transaction.transactWrite`
+   (its planning and its send in one ledger), `Aggregate` create / update / delete,
+   `EventStream.append` / `writeSnapshot` (the public methods, bound and unbound),
+   `commandHandler` (load, decide, append and retries) and the projection engine's `withRetry`
+   (one row's read-fold-write). `GeoIndex.put` — bound and unbound — runs the entity's put
+   terminal, which is its root. `Capacity.detachContext` and `Capacity.detached` clear the
+   ledger. `DynamoClient.make({ blobStore })` (all four overloads) bundles a store into the
+   client's captured context, validated with `EDD-9116`; an explicit store wins over one in
+   context at bind time, which is captured otherwise (the `EDD-9115` bind checks are
+   commit 7's). The resolver's placeholders (`PendingBlob`) and `resolveRows` / `resolveAll`
+   are ready for commit 8's decoders: eager values are fetched at the store's
+   `readConcurrency` (the ledger's read cache first; a copy of cached bytes is returned, and
+   fetched bytes are handed out uncopied — the `get` contract now says a store's chunks are
+   handed over), the read failing as soon as it runs past the pointer's object size, then
+   verified (object size, then content size and CRC-64/NVME after decompression), decompressed
+   and `JSON.parse`d; a lazy value captures the resolving fiber's store and compressor registry
+   but never its ledger, fetches and verifies on every `read()` (errors name
+   `<operation>.read`), serves ranged reads unverified, and verifies a whole `stream()` as it
+   ends; `presignedUrl` defaults to 15 minutes. `inlineOffloadedValue` / `inlineBlobHandle`
+   build the lazy forms of values stored inline. A failure after a verified fetch (no
+   compressor, a decompressor that throws, content that is not UTF-8 JSON) is a
+   `ValidationError`; size and checksum mismatches are `ChecksumMismatch`; a missing store is
+   `NotProvided`. No write path uploads and no decoder resolves yet, so nothing user-visible
+   changes: the refusal and the test-only gate stay.
+   *Deviations (commit 6):*
+   - Whole-request refusals of a `TransactWriteItems` / `BatchWriteItem` the SDK sent once
+     are `rejected` (§6.2's table gains the row): DynamoDB applies nothing of a request it
+     refuses, exactly as for a single-item write.
+   - A `BatchWriteItem` response settles per pointer, not per request: `UnprocessedItems`
+     holds copies of the requests it left, so a pointer is `committed` when more of the call's
+     put requests carried it than were left (some processed request wrote it), and only a
+     pointer every carrying request left takes the unprocessed rule. No path sends one
+     pointer twice in a call today; this keeps the rule from drifting once later commits copy
+     pointers.
+   - A `TransactWriteItems` refusal proves the write did not commit only when it carries a
+     token **this ledger** generated (`Ledger.tokens`); a caller-set token is kept and leaves
+     the entry `inDoubt`. The library sets none itself, so this only guards a future caller.
+   - `ReturnValuesOnConditionCheckFailure: "ALL_OLD"` is added at the choke point, to a
+     single-item write that carries a ledger pointer and does not set it, rather than by each
+     builder; a caller's own setting is kept (and a `ConditionalCheckFailed` without `ALL_OLD`
+     is `inDoubt`).
+   - The store's `put` answer is checked before it is trusted: its ref must extend the
+     requested key by at most `limits.maxKeySuffixBytes`, its version fit
+     `limits.maxVersionBytes`, its `size` equal the body's length, and the ref be new to the
+     ledger — else `BlobStoreError { reason: "Rejected" }`. A ref in the requested key that
+     breaks a limit or misreports the size names what the store wrote for this upload: it is
+     registered as `pending` first, so it is rolled back like any other. An answer with no
+     ref, a ref outside the requested key, or a ref already returned for another upload names
+     nothing this upload provably wrote — deleting it could delete another row's committed
+     version (§6.2: a rollback deletes only versions no committed row can name) — so it is
+     neither recorded nor deleted; the requested key is reported at exit with the new observer
+     reason `answerRefused` (no ref), for `gc.sweep` / `gc.sweepStore` to reclaim the version
+     the store actually wrote.
+   - `UnsettledReason` gains `answerRefused` (above), and every upload whose version no entry
+     names — `answerRefused`, and `completeLost` reported inside an open ledger — is reported
+     when the root exits, with the rest, as `onUnsettled`'s contract says ("after the
+     operation that made it exits"); `reportCompleteLost` outside a ledger still reports at
+     once.
+   - Uploads run at the store's `writeConcurrency` per ledger (a semaphore per store), not
+     per process.
+   - A memoised upload older than its store's `maxUploadAge` that nothing committed (`pending`
+     or `rejected`) is not reused: a fresh upload replaces it, and the stale one is deleted at
+     exit. Reusing it would fail every later request with `Expired`.
+   - Transaction planning's recording client is marked (`Capacity.markRecording`): its
+     recorded writes are neither prepared nor settled — the transaction that sends the plan
+     is. (§6.2's "Not sent" row still applies to a client failure marked `NotSent`.)
+   - Roots: a projection row, not a projection's batch (each row's write is the only request
+     carrying its uploads, so a batch root would only hold them, and their cached content,
+     longer); `EventStream.writeSnapshot` is a root too; `GeoIndex.put` needs no root of its
+     own.
+   - `Expired` reaches the caller as a `BlobStoreError` from the raw client call, outside
+     `DynamoClientService`'s static error type; commit 7 declares it on the write paths that
+     upload (`WriteBlobErrors`) and lets it through their catch-alls and failure diagnosis.
 7. **Entity writes** — put / create / upsert / update (both paths): named fields always upload,
    untouched pointers pinned, budget routing, the size-rejection retry on the read-merge path
    only (not append or path-op updates); immutables (checksum fast path, structural confirm,

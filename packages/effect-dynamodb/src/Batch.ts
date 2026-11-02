@@ -19,6 +19,7 @@ import { Effect } from "effect"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
@@ -274,7 +275,7 @@ export const write = (
   operations: ReadonlyArray<BatchWriteOp>,
   config?: BatchRetryConfig,
 ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
-  Capacity.operation("Batch.write", undefined, writeCore(operations, config))
+  Capacity.operation("Batch.write", undefined, BlobLedger.root(writeCore(operations, config)))
 
 const writeCore = (
   operations: ReadonlyArray<BatchWriteOp>,
