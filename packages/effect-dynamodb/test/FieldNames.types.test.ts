@@ -212,6 +212,15 @@ describe("definition attribute names are typed from the model (runtime package)"
         }),
       )
       typeOnly(() =>
+        Aggregate.make(Appointment, {
+          root: { entityType: "AppointmentItem" },
+          edges: {
+            // @ts-expect-error not a schema field (sub-aggregate form)
+            oficial: Aggregate.one("official", { entityType: "Appointee", entity: Officials }),
+          },
+        }),
+      )
+      typeOnly(() =>
         Aggregate.make(Match, {
           table: MainTable,
           schema: AppSchema,

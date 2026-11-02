@@ -128,7 +128,36 @@ describe("definition attribute names are typed from the model", () => {
         pk: { field: "pk", composite: ["playerId"] },
         sk: { field: "sk", composite: [] },
       } as const
-      Entity.make({ model, entityType: "Player", primaryKey, refs: { team: { entity: Teams } } })
+      const Players = Entity.make({
+        model,
+        entityType: "Player",
+        primaryKey,
+        refs: { team: { entity: Teams } },
+      })
+      const Unreferenced = Entity.make({ model, entityType: "Player", primaryKey })
+      type RefsOf<E> =
+        E extends Entity.EntityDefinition<
+          any,
+          any,
+          any,
+          any,
+          any,
+          any,
+          any,
+          infer R,
+          any,
+          any,
+          any,
+          any,
+          any
+        >
+          ? R
+          : never
+      expectTypeOf<RefsOf<typeof Players>>().toEqualTypeOf<{
+        readonly team: { readonly entity: typeof Teams }
+      }>()
+      // Left out, refs resolve to none (not to the constraint the editor completes from).
+      expectTypeOf<RefsOf<typeof Unreferenced>>().toEqualTypeOf<undefined>()
       expect(() =>
         Entity.make({
           model,
@@ -491,6 +520,15 @@ describe("definition attribute names are typed from the model", () => {
               entityType: "MatchOfficial",
               entity: Officials,
             }),
+          },
+        }),
+      )
+      typeOnly(() =>
+        Aggregate.make(Appointment, {
+          root: { entityType: "AppointmentItem" },
+          edges: {
+            // @ts-expect-error not a schema field (sub-aggregate form)
+            oficial: Aggregate.one("official", { entityType: "Appointee", entity: Officials }),
           },
         }),
       )

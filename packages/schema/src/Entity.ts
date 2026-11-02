@@ -244,20 +244,33 @@ export type EntityUniqueConfig<TModel extends Schema.Top> = UniqueConfig<ModelFi
 /**
  * @internal See {@link EntityPrimaryKeyConfig}: refs keyed by the model's
  * (ref) fields. The record half keeps it a `Record<string, AnyRefValue>`; the
- * keyed half gives an editor the field names; the last half, over the refs
- * as written (`TRefs`, the constraint naming its own parameter), turns a key
- * that is not a model field into `never`, so the error lands on that key. A
- * guard on the parameter instead of the constraint would make
- * `Parameters<typeof Entity.make>` resolve to `never`.
+ * keyed half gives an editor the field names. A key that is not a model field
+ * is refused by {@link RefsKeyGuard} on the config.
  */
-export type EntityRefsConfig<TModel extends Schema.Top, TRefs = {}> = globalThis.Record<
-  string,
-  AnyRefValue
-> & {
+export type EntityRefsConfig<TModel extends Schema.Top> = globalThis.Record<string, AnyRefValue> & {
   readonly [K in ModelFieldName<TModel>]?: AnyRefValue
-} & {
-  readonly [K in Exclude<keyof TRefs, ModelFieldName<TModel>>]: never
 }
+
+/**
+ * @internal The keys of the refs as written (`TRefs`) that are not model
+ * fields, each typed `never`, so the error lands on the misspelled key. Keyed
+ * by remapping (`as`), not `Exclude`: the `Exclude` form, beside the indexes
+ * constraint that also reads `TRefs`, made `Parameters<typeof Entity.make>`
+ * resolve to `never`.
+ */
+export type RefsKeyGuard<TModel extends Schema.Top, TRefs> = {
+  readonly [K in keyof TRefs as K extends ModelFieldName<TModel> ? never : K]: never
+}
+
+/**
+ * @internal The refs `Entity.make` was given, or `undefined` when it was given
+ * none. `TRefs` has no default so that, while an editor completes inside
+ * `refs`, it falls back to its constraint (which lists the model's fields)
+ * instead of to a default of `undefined` (which lists nothing); left out, it
+ * resolves to that constraint, which includes `undefined` and maps here to
+ * `undefined`.
+ */
+export type RefsOrNone<TRefs> = undefined extends TRefs ? undefined : TRefs
 
 /** @internal See {@link EntityPrimaryKeyConfig}: the time-series clock and append input. */
 export type EntityTimeSeriesConfig<TModel extends Schema.Top> = TimeSeriesConfig<
@@ -1285,13 +1298,13 @@ const buildAttachPrototype = (data: EntityDefinitionData): ((decoded: any) => an
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, TRefs>,
-  const TGsiIndexes extends EntityIndexesConfig<TModel, TRefs> = {},
+  const TRefs extends EntityRefsConfig<TModel> | undefined,
+  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, RefsOrNone<TRefs>>,
+  const TGsiIndexes extends EntityIndexesConfig<TModel, RefsOrNone<TRefs>> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
   const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
-  const TRefs extends EntityRefsConfig<TModel, TRefs> | undefined = undefined,
   const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
   const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
   const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
@@ -1305,7 +1318,7 @@ export const make = <
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
-  readonly refs?: TRefs
+  readonly refs?: TRefs & RefsKeyGuard<TModel, TRefs>
   readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
@@ -1317,7 +1330,7 @@ export const make = <
   TVersioned,
   TSoftDelete,
   TUnique,
-  TRefs,
+  RefsOrNone<TRefs>,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,

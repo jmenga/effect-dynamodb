@@ -344,6 +344,8 @@ import {
   type EntityVectorIndexesConfig,
   type NormalizedIndexes,
   normalizeTtlSeconds,
+  type RefsKeyGuard,
+  type RefsOrNone,
   resolveUniqueTtl,
   zorderInCollection,
 } from "@effect-dynamodb/schema/Entity.js"
@@ -2102,13 +2104,13 @@ export interface PutPlan {
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, TRefs>,
-  const TGsiIndexes extends EntityIndexesConfig<TModel, TRefs> = {},
+  const TRefs extends EntityRefsConfig<TModel> | undefined,
+  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, RefsOrNone<TRefs>>,
+  const TGsiIndexes extends EntityIndexesConfig<TModel, RefsOrNone<TRefs>> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
   const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
-  const TRefs extends EntityRefsConfig<TModel, TRefs> | undefined = undefined,
   const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
   const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
   const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
@@ -2122,7 +2124,7 @@ export const make = <
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
-  readonly refs?: TRefs
+  readonly refs?: TRefs & RefsKeyGuard<TModel, TRefs>
   readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
@@ -2134,7 +2136,7 @@ export const make = <
   TVersioned,
   TSoftDelete,
   TUnique,
-  TRefs,
+  RefsOrNone<TRefs>,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,

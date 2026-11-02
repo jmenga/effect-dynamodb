@@ -151,6 +151,7 @@ import {
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
+  AggregateEdgesGuard,
   AggregateInputType,
   BoundSubAggregate,
   SubAggregate,
@@ -675,32 +676,38 @@ interface AggregateConfig<
  * **Top-level form** — `Aggregate.make(Schema, { table, schema, pk, collection, ... })`:
  * Returns an operational Aggregate with `.get()` for reading.
  */
+// The top-level form comes first: an editor completing a config takes its
+// contextual type from the first overload, and the top-level form is the one
+// whose `pk`, `collection`, `list` and `context` name schema fields.
 export function make<
   TSchema extends Schema.Top,
-  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
+  const TEdges extends AggregateEdgesConfig<TSchema>,
+  const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
+>(
+  schema: TSchema,
+  config: AggregateConfig<TSchema, TEdges, TPK> & {
+    readonly edges: AggregateEdgesGuard<TSchema, TEdges>
+  },
+): Aggregate<
+  TSchema,
+  Record<string, unknown>,
+  AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>
+>
+export function make<
+  TSchema extends Schema.Top,
+  const TEdges extends AggregateEdgesConfig<TSchema>,
 >(
   schema: TSchema,
   // The top-level form's keys, refused here, so an error in a top-level config
   // is reported against the top-level overload (it fails this one on each key).
   config: SubAggregateConfig<TEdges> & {
+    readonly edges: AggregateEdgesGuard<TSchema, TEdges>
     readonly table?: undefined
     readonly schema?: undefined
     readonly pk?: undefined
     readonly collection?: undefined
   },
 ): SubAggregate<TSchema, TEdges>
-export function make<
-  TSchema extends Schema.Top,
-  const TEdges extends AggregateEdgesConfig<TSchema, TEdges>,
-  const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
->(
-  schema: TSchema,
-  config: AggregateConfig<TSchema, TEdges, TPK>,
-): Aggregate<
-  TSchema,
-  Record<string, unknown>,
-  AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>
->
 export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,

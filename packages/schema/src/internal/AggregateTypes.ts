@@ -228,15 +228,25 @@ type _Simplify<T> = T extends infer O ? { [K in keyof O]: O[K] } : never
 
 /**
  * @internal An aggregate's `edges`: keyed by fields of its schema. The record
- * half keeps it an edges record; the last half, over the edges as written
- * (`TEdges`, the constraint naming its own parameter), turns a key that is not
- * a schema field into `never`, so the error lands on that key.
+ * half keeps it an edges record; the keyed half gives an editor the field
+ * names. {@link AggregateEdgesGuard} on the config refuses the rest.
  */
-export type AggregateEdgesConfig<TSchema extends Schema.Top, TEdges = {}> = Record<
+export type AggregateEdgesConfig<TSchema extends Schema.Top> = Record<
   string,
   AggregateEdge | BoundSubAggregate<any, any>
 > & {
-  readonly [K in Exclude<keyof TEdges, ModelFieldName<TSchema>>]: never
+  readonly [K in ModelFieldName<TSchema>]?: AggregateEdge | BoundSubAggregate<any, any>
+}
+
+/**
+ * @internal Over the edges as written (`TEdges`): a key that is not a schema
+ * field is typed `never`, and a many edge whose `sk.composite` names a path its
+ * element lacks is typed with the paths it may name, so each error lands on
+ * that edge's key. A guard on the config rather than in `TEdges`'s constraint
+ * (the constraint naming its own parameter) keeps the editor's completions.
+ */
+export type AggregateEdgesGuard<TSchema extends Schema.Top, TEdges> = {
+  readonly [K in keyof TEdges as K extends ModelFieldName<TSchema> ? never : K]: never
 } & {
   readonly [K in keyof TEdges & ModelFieldName<TSchema>]: ManyEdgeSkCheck<
     TEdges[K],
