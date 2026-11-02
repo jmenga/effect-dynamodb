@@ -122,6 +122,28 @@ export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"
+export type {
+  BlobChecksum,
+  BlobCopyRequest,
+  BlobListing,
+  BlobPresignOptions,
+  BlobPutRequest,
+  BlobPutResult,
+  BlobRef,
+  BlobSourceFailure,
+  BlobStoreLimits,
+  BlobStoreMarks,
+  BlobStoreService,
+  ByteRange,
+  Crc64NvmeFunction,
+  MemoryBlobCall,
+  MemoryBlobFault,
+  MemoryBlobSnapshot,
+  MemoryBlobStore,
+  MemoryBlobStoreOptions,
+  MemoryBlobVersion,
+} from "./BlobStore.js"
+export { BlobStore, BlobStoreFailure } from "./BlobStore.js"
 export type { Collection as CollectionType } from "./Collection.js"
 export * as Collection from "./Collection.js"
 export * as ConsumedCapacity from "./ConsumedCapacity.js"
@@ -201,6 +223,8 @@ export type {
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
 export * as Marshaller from "./Marshaller.js"
+export type { BlobHandle, OffloadedValue } from "./Offload.js"
+export * as Offload from "./Offload.js"
 export type { PlanMode, QueryExplain, QueryRequestEvent, ZOrderOptions } from "./Query.js"
 export * as Query from "./Query.js"
 export * as StorageEncoding from "./StorageEncoding.js"

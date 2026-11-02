@@ -521,7 +521,9 @@ export interface ByteRange { readonly offset: number; readonly length?: number |
   stays valid for its whole life under the defaults. A longer `expiresIn` needs a reaper grace
   at least as long; the docs say so.
 - `BlobHandle` equality is by location and ref (external) or content checksum (inline), so
-  `Equal.equals(a, b)` is a cheap "same stored value" test.
+  `Equal.equals(a, b)` is a cheap "same stored value" test. *(Commit 5: the inline comparison
+  also requires equal checksum algorithm and size — the `rewritten` test of §10.3 — so it only
+  ever errs towards "different".)*
 - Module `Offload` (core) exports the types, the type ids, `isBlobHandle`,
   `isOffloadedValue`, `Offload.source` (§3.8) and the type-level view `Offload.View` (§9.2).
 
@@ -781,8 +783,28 @@ O = hex128(SHA-256(F 0x00 canon(row sk) 0x00 attribute))               — the r
 `hex128` is the first 16 bytes of the digest as 32 lowercase hex characters (collision
 probability is negligible at 128 bits; a collision would let the sweep see another item's
 versions, which is why the digest is cryptographic). `canon` writes a key attribute value with
-its type (`s:` + text, `n:` + text, `b:` + base64), so `S "1"` and `N 1` differ. `table` is the
-physical table name.
+its type (`s:` + text, `n:` + the number's canonical text, `b:` + standard base64), so `S "1"`
+and `N 1` differ. `table` is the physical table name. Strings enter the digests as UTF-8, and
+`P` and `F` enter the next level as their hex text. *(Implementation notes, commit 5: a number
+is canonicalised — digits without leading or trailing zeros and a decimal exponent, `"1.50"` →
+`15e-1`, zero → `0` — rather than hashed as spelled, so a key DynamoDB returns with its zeros
+trimmed hashes like the one written; the library's own tables key only on strings. The parts are
+separated by `0x00` and only the last part may contain it, except that the row key precedes
+the attribute name in `O`: an attribute name containing U+0000 is refused, which keeps the digest
+input unambiguous.)*
+
+*Key text (`escapeKeys: true`, §11.10).* Offloading requires `escapeKeys: true`, and `canon`
+hashes a key's text exactly as stored, so that setting's key text enters the digests as it is: a
+number composite in its order-preserving text (`-5` → `-9999999999999994:`, `-3.14` →
+`-9999999999999996.85:`), and every composite's U+0000–U+0025 escaped as `%XX` (`#` → `%23`,
+space → `%20`, `%` → `%25`, U+0000 → `%00`), in partition and sort keys alike, with non-ASCII text
+as UTF-8. Nothing is re-escaped or decoded first: two rows have the same object keys only when
+their stored keys are equal. A composed key therefore never holds U+0000; a raw one may, and stays
+unambiguous by the rule above. The same values' key text under `escapeKeys` off is another
+partition's `P`, which is why a row holding a pointer must never move to it (§11.10). A binary key
+value (a raw table's, or a Z-order index's — never a primary key the library composes) is
+`b:` + standard padded base64. Pinned by `BlobKeys.test.ts` ("key text the composer writes":
+fixed vectors cross-checked with Python's `hashlib`).
 
 The digest is a **fixed SHA-256**, a pure-JS implementation vendored in the schema package
 beside CRC64NVME (`internal/Sha256.ts`, synchronous, ~120 lines, tested against Web Crypto's
@@ -839,6 +861,22 @@ Metadata is for traceability (inventory, logs, incident tooling) and for one lib
 the store-wide sweep recovers an orphaned family's item key from `edd-item` (§11.5). A family
 whose keys are too long for `edd-item` is reported by that sweep as unattributable rather than
 swept.
+
+*Implementation notes (commit 5, `internal/BlobMetadata.ts`):* the canonical `[pk, sk]` is the
+UTF-8 JSON text of `[canon(pk), canon(sk)]` (§4.5's `canon`), `edd-item` its unpadded
+base64url, `edd-item-sha256` the hex SHA-256 of the same bytes, `edd-checksum` standard
+(padded) base64. The 2 KB is counted conservatively: the UTF-8 bytes of every value and of every
+key with its `x-amz-meta-` header prefix. An entity type or attribute name that is not printable
+US-ASCII without `%` is written with `%XX` UTF-8 escapes for the other characters (`%` itself is
+`%25`), so every value is US-ASCII and reads back exactly. A set that does not fit even with
+`edd-item-sha256` (an entity type or attribute name of kilobytes) is left for the store to
+refuse — diagnosed on failure, not pre-checked. The parser refuses anything this scheme did not
+write (another `edd-v`, a missing or malformed field, both or neither of `edd-item` /
+`edd-item-sha256`) and matches keys case-insensitively, as S3 lowercases them.
+ The `edd-item` JSON
+escapes what JSON escapes (`"`, `\`, U+0000–U+001F) and keeps the rest as UTF-8, so the
+composer's key text (§4.5), raw text holding control characters, numbers (read back by their
+canonical text) and binary keys all round-trip (`BlobMetadata.test.ts`, "round-trips edd-item").
 
 ### 4.7 Binary fields: dispatch eligibility and switching
 
@@ -1510,7 +1548,7 @@ overflow field stays a packed field.
 
 ```ts
 type DefaultModes = { readonly overflow: "eager"; readonly binary: "lazy" }
-type Resolve<M extends OffloadModes> = { overflow: M["overflow"] extends OffloadMode ? M["overflow"] : "eager"; … }
+type Resolve<M extends OffloadModes> = { overflow: [M["overflow"]] extends [OffloadMode] ? M["overflow"] : Extract<M["overflow"], OffloadMode> | "eager"; … }
 
 export type View<A, T extends OffloadFields, M> =
   [T["overflow"] | T["binary"]] extends [never] ? A : {
@@ -1531,6 +1569,18 @@ export interface OffloadState {
 export type NoOffloadState = { readonly fields: NoOffload; readonly modes: DefaultModes; readonly item: never }
 ```
 
+- *Implementation notes (commit 5, `Offload.ts`):* a mode that is not a single literal (the
+  widened `OffloadMode`, from generic or untyped code) types the field as either form
+  (`A[K] | Lazy<…>`), matching `ReadBlobErrors`' "counts as eager" (§9.3), so neither the value
+  type nor the error union under-reports. `Offload.ResolveModes<M, Base = DefaultOffloadModes>`
+  resolves `.offloaded(m)`'s argument over `Base` — a string sets both kinds, an object
+  overrides the kinds it names — so commit 8 can resolve over a builder's current modes or the
+  defaults. A kind the argument may or may not set (an optional property, or `OffloadModes`
+  itself, from generic code) resolves to the union of its mode and `Base`'s
+  (`[V] extends [OffloadMode] ? V : Extract<V, OffloadMode> | Base`), not to `Base` alone, so
+  the widening reaches `View` and `ReadBlobErrors` instead of being narrowed away first: a
+  binary-only member read with `OffloadModes` keeps `BlobStoreError`. `{}` and an explicit
+  `undefined` still give `Base`. `Offload.ViewOf<O>` is `View<O["item"], O["fields"], O["modes"]>`.
 - Reads of an entity without offloaded fields return exactly today's types (the first branch).
 - `BoundEntity`'s read results are `View<Model, TOffload, DefaultModes>`. For an entity with a
   binary field this **is** a change of the read type (`scan: BlobHandle`, not `Uint8Array`) —
@@ -2212,6 +2262,10 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
 }> {}
 ```
 
+- **`BlobSourceFailure`** (commit 5) is `BlobStoreFailure & { reason: "SourceFailed" }`: the
+  library wraps the input `Stream`'s error (its `cause`) before handing the body to the store,
+  so a store's `put` lets a source failure through as its own failure, with no second error
+  type in the contract.
 - **Where `BlobRef` and `BlobChecksum` live.** They are defined in the schema package, in
   `@effect-dynamodb/schema` `internal/BlobPointer.ts` beside the pointer codec, because the
   codec and `BlobStoreError` (`ref?: BlobRef`, §14.1) live there and the schema package cannot
@@ -2309,6 +2363,42 @@ maxVersionBytes?, maxUploadAge?, clock?, failures?: … })`:
   after the write took effect, or interrupt mid-stream.
 - **Inspection.** `inspect()` exposes the store's contents (versions, metadata, marks) for
   assertions.
+
+*Implementation notes (commit 5):*
+
+- **Options** beyond the list above: `prefix` (default `""`, the store-prefix rule of `[EDD-9116]`),
+  `readConcurrency` / `writeConcurrency` (defaults 16 / 8) and `readChunkBytes` (default
+  65,536, the chunk size of a `get`, so tests can exercise multi-chunk reads). Unknown keys are
+  refused. `maxVersionBytes` is the declared `limits.maxVersionBytes`: from the ids the store
+  makes (32 versioned, 0 key-per-write) to 1,024. `maxKeySuffixBytes` is 0 versioned, 27
+  key-per-write. `name` is `memory://<prefix>`.
+- **Ids.** Version ids are 32 lowercase hex characters from Effect's `Random` (so
+  `Random.withSeed` reproduces them); a key-per-write suffix is a 10-character millisecond
+  timestamp plus 16 random characters, Crockford base32, monotonic per store as a monotonic
+  ULID is: when the clock has not passed the last suffix's millisecond (the same millisecond, a
+  frozen `TestClock`, a clock that stepped back) the suffix keeps that timestamp and counts the
+  random part up by one, so a family's keys list in write order even within one millisecond.
+- **Like S3.** A `put` checks the body against its `checksum` (`ChecksumMismatch`) and
+  `contentLength`, and refuses (`Rejected`) a key over 1,024 bytes (after the key-per-write
+  suffix), an empty content type, and metadata that is not US-ASCII or exceeds 2 KB (§4.6's
+  count); metadata keys are stored lowercased. A range must have a non-negative integer offset
+  no greater than the size, and an optional non-negative integer length (clipped at the end).
+  Listings are in UTF-8 (code point) key order, versions newest first, `startAfter` exclusive.
+  Every byte array in and out is copied.
+- **The `failures` hook** receives `{ action, n, key?, ref?, refs?, mark? }` (`n` counts calls per
+  action; `mark` names the marks operation) and returns `undefined` or a fault, directly or as
+  an `Effect` (so a test can pause a call on a `Deferred`): `{ _tag: "Fail", reason }` or
+  `{ _tag: "Interrupt" }`, each with `at: "request"` (default: no effect — a `put` first consumes
+  its whole body, or `afterChunks` chunks; a `get` / `list` first emits `afterChunks` items,
+  default none) or `at: "response"` (the call takes effect, then fails or is interrupted — a
+  lost response; a `put` or `copy` failure names the version it stored, while a request-time
+  `copy` fault names the source). Naming the stored ref is a **test convenience the S3 store
+  cannot provide**: when a response is lost, S3 never reported the version. So no settlement
+  may depend on a failed upload's `ref` — a failed upload fails the operation and is found by
+  the sweeps (§7, §11.5) — and tests that inspect the stored version should use `inspect()`.
+- **`inspect()`** returns `{ versions, calls }`: every version (ref, size, a copy of the bytes,
+  content type, metadata, `lastModified`, `isLatest`, `mark`) in listing order, and the number
+  of calls per action.
 
 ### 12.4 Stores without versioning
 
@@ -2422,7 +2512,7 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9111` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field does not exist on the model, or its encoded side is not `Uint8Array` (e.g. `Uint8ArrayFromBase64`, a string, a union with a non-binary member) |
 | `EDD-9114` | `Entity.ts` (schema), `EventStore.ts` | `offload` options invalid: an unknown key, `itemBudget` not a safe integer in 1 … 409,600, `prefix` not a non-empty string of unreserved characters and `/` ≤ 256 bytes, `itemBudget` without an overflow field, or `offload` on a member without an offloaded field |
 | `EDD-9115` | `DynamoClient.ts`, `EventStore.ts`, `GeoIndex.ts` (geo), `BlobGc.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`) | A member with an offloaded field is bound (`DynamoClient.make`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `Entity.bind`, `Aggregate.bind`, `BlobGc.make`), or an unbound stream or `EventStore.processBatch` / `runChangeFeed` runs its first operation, with no `BlobStore` resolvable |
-| `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, or a custom store whose `limits` are not non-negative integers or whose `maxUploadAge` is not a positive duration |
+| `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key, or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
 | `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
@@ -2941,6 +3031,34 @@ a write path, deletes the gate.
 5. **BlobStore contract + in-memory store + `Offload` types** — `BlobStore.ts`, `Offload.ts`,
    key derivation (`internal/BlobKeys.ts`, vendored SHA-256), metadata builder,
    `maxUploadAge`, capabilities (`list`, `head`, `marks`), `EDD-9116`.
+   *Implementation notes (commit 5):* the public modules are `src/BlobStore.ts` (the service with
+   `layer`, `memory`, `layerMemory` and `crc64nvme` — `crc64nvme(bytes)` one-shot,
+   `crc64nvme.make()` incremental — re-exporting the contract types, `BlobRef` / `BlobChecksum`
+   and `BlobStoreFailure`) and `src/Offload.ts` (modes, `OffloadedValue` / `BlobHandle` with
+   their type ids and guards, `View`, `ResolveModes`, `OffloadState` / `NoOffloadState` /
+   `ViewOf`, re-exporting `OffloadFields` / `NoOffload` / `ExtractOffloadFields` and the blob
+   error helpers). The barrel exports `BlobStore`, `BlobStoreFailure` and the contract types
+   directly and `Offload` as a namespace. The internals are `internal/BlobStoreContract.ts` (the
+   contract, `BlobStoreFailure`, defaults and the `EDD-9116` checks, which the S3 store of
+   commit 15 reuses), `internal/MemoryBlobStore.ts` (§12.3), `internal/BlobKeys.ts` (§4.5) and
+   `internal/BlobMetadata.ts` (§4.6, builder and parser), all in core — their callers are core's
+   write paths and GC, so the key derivation's fixed vectors are in core's
+   `test/BlobKeys.test.ts` rather than the schema package's SHA-256 test (§19.1) — and
+   `internal/OffloadValues.ts`, whose `OffloadedValue` / `BlobHandle` constructors are for the
+   read path (commit 6) and are not exported. `BlobStore.layer` checks a store when it is called,
+   as `Compression.layer` does, and `BlobStore.memory` its options and its result. Beyond
+   §14.3's `limits` and `maxUploadAge`, a custom store must have a non-empty `name`, a prefix
+   that passes the store-prefix rule, `limits.maxVersionBytes` ≤ 1,024 (the pointer's bound),
+   `limits.maxKeySuffixBytes` ≤ 670 (1,024 − the longest prefix, 256, − the hashed `P/F/O`, 98,
+   so every key fits a pointer), a *finite* `maxUploadAge` (GC adds 15 minutes to it), positive
+   integer concurrencies, `put` / `get` / `delete` functions and well-formed optional
+   capabilities; other properties are allowed (the memory store's `inspect`). `BlobSourceFailure`
+   is defined in §12.1. Nothing calls the store, the keys or the metadata yet — no write path
+   uploads until commit 7, and offloading members stay refused — and the spans around store
+   calls and the `BlobStoreFailure` → `BlobStoreError` wrapping are their callers' (commit 6).
+   `Offload.source` (10), `Offload.layerObserver` (6), `Offload.compareStored` (14),
+   `DynamoClient.make({ blobStore })` (6–7) and run-time mode resolution with `EDD-9117` (8) are
+   not in this commit.
 6. **Ledger + resolver** — `internal/BlobLedger.ts` (entries, memo by identity and target key,
    lattice, exit, `maxUploadAge` → `Expired`), settling at `Capacity.client` per §6.2's table
    (library `ClientRequestToken`s, `$metadata.attempts`, ALL_OLD evidence), `Warning` logs and
