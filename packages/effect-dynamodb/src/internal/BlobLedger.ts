@@ -13,6 +13,13 @@
  *   to the same key in one ledger is memoised: a re-planned transaction, a
  *   rebuilt `additionalItems`, a `commandHandler` retry that decides the same
  *   content upload once.
+ * - **Streams and handles** (design §3.8, §7). A stream is single-use: it
+ *   uploads once, for one key of one ledger, memoised by its identity — a
+ *   second key, a later operation or a retry after its upload failed is
+ *   refused (`[EDD-9120]`). A handle's content is copied into a new version
+ *   (the store's `copy` within the handle's own store, else streamed into a
+ *   `put`), never shared. A `put` failure that says its multipart upload may
+ *   have completed (`completeLost`) is reported at exit.
  * - **Settling.** `Capacity.client`, the one place every library DynamoDB
  *   request goes through, hands each write request of a ledger with entries to
  *   {@link guard}: it refuses a request carrying an upload older than its
@@ -33,8 +40,9 @@
  *   names no version of the requested key, which is refused and never
  *   deleted) are logged at `Warning` and delivered to the
  *   `Offload.layerObserver` observer.
- * - **Read cache.** Each entry's content (the JSON text, or the bytes) is kept
- *   by ref, so decoding what the operation just wrote never fetches it.
+ * - **Read cache.** Each buffered entry's content (the JSON text, or the
+ *   bytes) is kept by ref, so decoding what the operation just wrote never
+ *   fetches it. A stream's or a copy's content is never in hand, so is not.
  *
  * No AWS SDK import: requests and responses are read structurally.
  *
@@ -42,7 +50,7 @@
  */
 
 import type { CompressionCodec } from "@effect-dynamodb/schema/DynamoModel.js"
-import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
+import type { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   type BlobChecksum,
   type BlobPointer,
@@ -54,7 +62,7 @@ import {
   isPointerText,
   make as makePointer,
 } from "@effect-dynamodb/schema/internal/BlobPointer.js"
-import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
+import { crc64nvme, make as makeCrc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
 import {
   Cause,
   Clock,
@@ -66,9 +74,19 @@ import {
   Layer,
   Option,
   Semaphore,
+  Stream,
 } from "effect"
 import { type BlobCallContext, blobError, call, refKey } from "./BlobCalls.js"
-import { type BlobStoreService, utf8Bytes } from "./BlobStoreContract.js"
+import {
+  type BlobPutRequest,
+  type BlobPutResult,
+  type BlobSourceFailure,
+  BlobStoreFailure,
+  type BlobStoreService,
+  utf8Bytes,
+} from "./BlobStoreContract.js"
+import { unusable } from "./OffloadInput.js"
+import { type BlobHandle, handleStoreOf } from "./OffloadValues.js"
 
 // ---------------------------------------------------------------------------
 // Observer (public through Offload.ts)
@@ -192,7 +210,7 @@ export interface LedgerEntry {
 }
 
 interface Memo {
-  readonly deferred: Deferred.Deferred<Uploaded, BlobStoreError>
+  readonly deferred: Deferred.Deferred<Uploaded, BlobStoreError | ValidationError>
 }
 
 /** A settled-to-be upload: its entry and the pointer naming it. */
@@ -285,16 +303,42 @@ export const offloads = (member: unknown): boolean =>
 // Upload
 // ---------------------------------------------------------------------------
 
+/**
+ * A stream to upload (design §3.8, §7): **single-use** — run at most once,
+ * for one target object. Its checksum is computed as it is consumed.
+ */
+export interface StreamContent {
+  readonly kind: "stream"
+  readonly stream: Stream.Stream<Uint8Array, unknown>
+  /** The caller's `Stream` value, which single use is keyed on. */
+  readonly identity: object
+  /** The body's length, when the caller gave it (`Offload.source`). */
+  readonly contentLength: number | undefined
+}
+
+/**
+ * A handle's content, to copy into a new version (design §3.8): with the
+ * store's `copy` when the handle reads from the target store, else streamed
+ * from the handle into a `put`.
+ */
+export interface CopyContent {
+  readonly kind: "copy"
+  readonly handle: BlobHandle
+}
+
+/** What an upload sends: buffered content, a stream, or a handle's content. */
+export type UploadContent = LedgerContent | StreamContent | CopyContent
+
 /** One value to upload. */
 export interface UploadSpec {
   readonly store: BlobStoreService
   /** The derived object key (design §4.5). */
   readonly key: string
-  /** The content: the uncompressed JSON (json), or the field's bytes. */
-  readonly content: LedgerContent
+  /** The content: the uncompressed JSON (json), the field's bytes, a stream or a handle. */
+  readonly content: UploadContent
   /** Codec of the object bytes (json only; `"none"` for bytes). */
   readonly codec: CompressionCodec | "none"
-  /** The object bytes, when compressed. Default: the content's bytes. */
+  /** The object bytes, when compressed (buffered content only). Default: the content's bytes. */
   readonly body?: Uint8Array | undefined
   /** The object's `Content-Type` (design §4.4). */
   readonly contentType: string
@@ -304,13 +348,18 @@ export interface UploadSpec {
    * The object metadata (design §4.6), or its builder given the content
    * checksum: the ledger computes that checksum once, for the memo key, the
    * pointer and the metadata, which it builds only when the upload is not
-   * memoised.
+   * memoised. A stream's checksum is known only once it is consumed, so its
+   * builder is given a zero checksum — metadata records one only for
+   * compressed json, never for bytes.
    */
   readonly metadata:
     | Readonly<Record<string, string>>
     | ((checksum: BlobChecksum) => Readonly<Record<string, string>>)
   readonly target: UploadTarget
 }
+
+/** What an upload fails with: the store's failure, or an unusable input (`[EDD-9120]`). */
+export type UploadError = BlobStoreError | ValidationError
 
 const encoder = new TextEncoder()
 
@@ -333,18 +382,19 @@ const permitsOf = (ledger: Ledger, store: BlobStoreService): Semaphore.Semaphore
 }
 
 /**
- * A store's answer to an upload, checked against the contract:
+ * A store's answer to an upload (a `put`, or a `copy` of `source`), checked
+ * against the contract:
  *
  * - `Accepted` — a ref in the requested key, new to the ledger, within the
  *   store's declared limits, for the body's size;
  * - `Refused` — a ref in the requested key, new to the ledger, that breaks a
  *   limit or misreports the size: it names what the store wrote for this
  *   upload, so it is recorded and rolled back;
- * - `Unknown` — no ref, a ref outside the requested key, or one the store
- *   already returned for another upload: it cannot name what this upload
- *   wrote (deleting it could delete another row's version), so nothing is
- *   recorded or deleted, and the requested key is reported at exit
- *   (`answerRefused`) for `gc.sweep`.
+ * - `Unknown` — no ref, a ref outside the requested key, one the store
+ *   already returned for another upload, or a copy's own source: it cannot
+ *   name what this upload wrote (deleting it could delete another row's
+ *   version, or the copied one), so nothing is recorded or deleted, and the
+ *   requested key is reported at exit (`answerRefused`) for `gc.sweep`.
  */
 type StoreAnswer =
   | { readonly _tag: "Accepted"; readonly ref: BlobRef }
@@ -355,8 +405,10 @@ const checkAnswer = (
   ledger: Ledger,
   store: BlobStoreService,
   key: string,
+  action: "put" | "copy",
   bodyBytes: number,
   result: unknown,
+  source: BlobRef | undefined,
 ): StoreAnswer => {
   const answered = (result as { readonly ref?: unknown } | null)?.ref as
     | { readonly key?: unknown; readonly version?: unknown }
@@ -365,46 +417,492 @@ const checkAnswer = (
     return {
       _tag: "Unknown",
       ref: undefined,
-      message: "the store's put returned no { key, version } ref",
+      message: `the store's ${action} returned no { key, version } ref`,
     }
   }
   const ref: BlobRef = { key: answered.key, version: answered.version }
+  if (source !== undefined && ref.key === source.key && ref.version === source.version) {
+    return {
+      _tag: "Unknown",
+      ref,
+      message: "the store's copy returned its source's ref, not a new version's",
+    }
+  }
   if (!ref.key.startsWith(key)) {
     return {
       _tag: "Unknown",
       ref,
-      message: `the store's put returned key "${ref.key}", outside the requested key "${key}"`,
+      message: `the store's ${action} returned key "${ref.key}", outside the requested key "${key}"`,
     }
   }
   if (ledger.entries.has(refKey(ref))) {
     return {
       _tag: "Unknown",
       ref,
-      message: "the store's put returned a ref it already returned for another upload",
+      message: `the store's ${action} returned a ref it already returned for another upload`,
     }
   }
   const refused = (message: string): StoreAnswer => ({ _tag: "Refused", ref, message })
   const suffix = (utf8Bytes(ref.key) ?? Number.POSITIVE_INFINITY) - (utf8Bytes(key) ?? 0)
   if (suffix > store.limits.maxKeySuffixBytes) {
     return refused(
-      `the store's put extended the key by ${suffix} bytes, over its declared ` +
+      `the store's ${action} extended the key by ${suffix} bytes, over its declared ` +
         `limits.maxKeySuffixBytes (${store.limits.maxKeySuffixBytes})`,
     )
   }
   const version = utf8Bytes(ref.version) ?? Number.POSITIVE_INFINITY
   if (version > store.limits.maxVersionBytes) {
     return refused(
-      `the store's put returned a ${version}-byte version, over its declared ` +
+      `the store's ${action} returned a ${version}-byte version, over its declared ` +
         `limits.maxVersionBytes (${store.limits.maxVersionBytes})`,
     )
   }
   const size = (result as { readonly size?: unknown }).size
   if (size !== bodyBytes) {
     return refused(
-      `the store's put reported ${String(size)} stored bytes for a ${bodyBytes}-byte body`,
+      `the store's ${action} reported ${String(size)} stored bytes for a ${bodyBytes}-byte body`,
     )
   }
   return { _tag: "Accepted", ref }
+}
+
+/** What a store answered, and what the pointer naming it records. */
+interface Answered {
+  readonly action: "put" | "copy"
+  readonly startedAt: number
+  readonly result: unknown
+  readonly kind: BlobPointerKind
+  readonly objectSize: number
+  readonly contentSize: number
+  readonly checksum: BlobChecksum
+  /** A copy's source: never what the copy wrote. */
+  readonly source?: BlobRef | undefined
+  /** Why an accepted answer must still be refused (a stream the put never finished). */
+  readonly problem?: string | undefined
+}
+
+/**
+ * Record a store's answer: the entry of the version it names (`pending`,
+ * rolled back at exit unless a request settles it) and the pointer naming
+ * it; a refused answer is recorded, then fails the upload; an unknown one is
+ * reported at exit and fails it.
+ */
+const record = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  ctx: BlobCallContext,
+  answered: Answered,
+): Effect.Effect<Uploaded, BlobStoreError> =>
+  Effect.suspend(() => {
+    const checked = checkAnswer(
+      ledger,
+      spec.store,
+      spec.key,
+      answered.action,
+      answered.objectSize,
+      answered.result,
+      answered.source,
+    )
+    const answer: StoreAnswer =
+      checked._tag === "Accepted" && answered.problem !== undefined
+        ? { _tag: "Refused", ref: checked.ref, message: answered.problem }
+        : checked
+    if (answer._tag === "Unknown") {
+      // Nothing names what the store wrote under the requested key: the
+      // key is reported at exit, and no ref the answer gave is deleted.
+      const error = blobError(ctx, answered.action, "Rejected", answer.ref, answer.message)
+      ledger.lost.push(
+        unsettledOf(spec.target, spec.store, "answerRefused", spec.key, undefined, error),
+      )
+      return Effect.fail(error)
+    }
+    const ref = answer.ref
+    const pointer =
+      answer._tag === "Refused"
+        ? answer.message
+        : makePointer({
+            kind: answered.kind,
+            codec: spec.codec,
+            ref,
+            objectSize: answered.objectSize,
+            contentSize: answered.contentSize,
+            checksum: answered.checksum,
+            contentType: Option.fromNullishOr(spec.pointerContentType),
+          })
+    const entry: LedgerEntry = {
+      ref,
+      store: spec.store,
+      target: spec.target,
+      startedAt: answered.startedAt,
+      pointer: typeof pointer === "string" ? undefined : pointer,
+      state: "pending",
+    }
+    // Registered before anything else can fail: whatever happens next,
+    // the version is deleted at exit unless a request settles it.
+    ledger.entries.set(refKey(ref), entry)
+    if (typeof pointer === "string") {
+      return Effect.fail(blobError(ctx, answered.action, "Rejected", ref, pointer))
+    }
+    return Effect.succeed({ entry, pointer } satisfies Uploaded)
+  })
+
+/**
+ * A store `put`, its failure wrapped. A failure that says its multipart
+ * upload may have completed (`completeLost`) is reported at exit: a version
+ * may exist that no ref names (design §7).
+ */
+const putCall = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  ctx: BlobCallContext,
+  request: BlobPutRequest,
+): Effect.Effect<BlobPutResult, BlobStoreError> =>
+  call(spec.store, "put", ctx, { key: spec.key }, () => spec.store.put(request)).pipe(
+    Effect.tapError((error) =>
+      Effect.sync(() => {
+        if ((error.cause as { readonly completeLost?: unknown } | null)?.completeLost === true) {
+          ledger.lost.push(
+            unsettledOf(spec.target, spec.store, "completeLost", spec.key, undefined, error),
+          )
+        }
+      }),
+    ),
+  )
+
+const memoOf = (ledger: Ledger, store: BlobStoreService): Map<string, Memo> => {
+  let byStore = ledger.memo.get(store)
+  if (byStore === undefined) {
+    byStore = new Map()
+    ledger.memo.set(store, byStore)
+  }
+  return byStore
+}
+
+/**
+ * Run `start` once per `memoKey` in the ledger, at the store's write
+ * concurrency: a later call with the same key reuses its pointer — unless
+ * that upload is too old to commit any more and nothing committed it, when
+ * a fresh one runs (the old one is deleted at exit). A failed upload is
+ * forgotten, so a retry runs it again.
+ */
+const withMemo = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  memoKey: string,
+  start: () => Effect.Effect<Uploaded, UploadError>,
+): Effect.Effect<BlobPointer, UploadError> => {
+  const byStore = memoOf(ledger, spec.store)
+  const hit = byStore.get(memoKey)
+  if (hit !== undefined) {
+    return Effect.flatMap(Deferred.await(hit.deferred), ({ entry, pointer }) =>
+      Effect.flatMap(Clock.currentTimeMillis, (now) => {
+        const stale =
+          RANK[entry.state] < RANK.inDoubt &&
+          now - entry.startedAt > Duration.toMillis(entry.store.maxUploadAge)
+        if (!stale) return Effect.succeed(pointer)
+        if (byStore.get(memoKey) === hit) byStore.delete(memoKey)
+        return upload(spec)
+      }),
+    )
+  }
+  const memo: Memo = { deferred: Deferred.makeUnsafe<Uploaded, UploadError>() }
+  byStore.set(memoKey, memo)
+  return permitsOf(ledger, spec.store)
+    .withPermit(Effect.suspend(start))
+    .pipe(
+      Effect.onExit((exit) => {
+        if (Exit.isFailure(exit) && byStore.get(memoKey) === memo) byStore.delete(memoKey)
+        return Deferred.done(memo.deferred, exit)
+      }),
+      Effect.map(({ pointer }) => pointer),
+    )
+}
+
+const ZERO_CHECKSUM: BlobChecksum = { algorithm: "crc64nvme", value: new Uint8Array(8) }
+
+const metadataOf = (spec: UploadSpec, checksum: BlobChecksum): Readonly<Record<string, string>> =>
+  typeof spec.metadata === "function" ? spec.metadata(checksum) : spec.metadata
+
+/** Buffered content: the bytes, or the JSON text (compressed into `spec.body`). */
+const bufferedUpload = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  ledgerContent: LedgerContent,
+): Effect.Effect<BlobPointer, UploadError> => {
+  const kind: BlobPointerKind = ledgerContent.kind
+  const content =
+    ledgerContent.kind === "json" ? encoder.encode(ledgerContent.text) : ledgerContent.bytes
+  if (kind === "bytes" && spec.codec !== "none") {
+    return Effect.die(new Error("BlobLedger: a bytes value is never compressed"))
+  }
+  const body = spec.body ?? content
+  if (spec.codec === "none" && body.length !== content.length) {
+    return Effect.die(new Error("BlobLedger: an uncompressed object's body is its content"))
+  }
+  const checksum: BlobChecksum = { algorithm: "crc64nvme", value: crc64nvme(content) }
+  const memoKey = [spec.key, hexOf(checksum.value), content.length, kind, spec.contentType].join(
+    "\u0000",
+  )
+  const ctx = ctxOf(spec.target)
+  return withMemo(ledger, spec, memoKey, () => {
+    const metadata = metadataOf(spec, checksum)
+    const bodyChecksum: BlobChecksum =
+      body === content ? checksum : { algorithm: "crc64nvme", value: crc64nvme(body) }
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const startedAt = yield* Clock.currentTimeMillis
+        const result = yield* restore(
+          putCall(ledger, spec, ctx, {
+            key: spec.key,
+            body,
+            contentLength: body.length,
+            checksum: Effect.succeed(bodyChecksum),
+            contentType: spec.contentType,
+            metadata,
+          }),
+        )
+        const uploaded = yield* record(ledger, spec, ctx, {
+          action: "put",
+          startedAt,
+          result,
+          kind,
+          objectSize: body.length,
+          contentSize: content.length,
+          checksum,
+        })
+        ledger.cache.set(refKey(uploaded.entry.ref), ledgerContent)
+        return uploaded
+      }),
+    )
+  })
+}
+
+const sourceFailed = (cause: unknown): BlobSourceFailure =>
+  new BlobStoreFailure({ reason: "SourceFailed", cause }) as BlobSourceFailure
+
+/**
+ * Upload a stream of bytes with a `put`: the body handed to the store is the
+ * stream tapped with the incremental CRC-64/NVME and its length counted
+ * (checked against `contentLength`, when given); `request.checksum` resolves
+ * when it ends. Its failure is `SourceFailed`.
+ */
+const streamedPut = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  ctx: BlobCallContext,
+  stream: Stream.Stream<Uint8Array, unknown>,
+  contentLength: number | undefined,
+): Effect.Effect<Uploaded, BlobStoreError> =>
+  Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const hasher = makeCrc64nvme()
+      let size = 0
+      let ended = false
+      const checksum = Deferred.makeUnsafe<BlobChecksum>()
+      const body: Stream.Stream<Uint8Array, BlobSourceFailure> = stream.pipe(
+        Stream.mapError((cause) => sourceFailed(cause)),
+        Stream.mapEffect((chunk: unknown) => {
+          if (!(chunk instanceof Uint8Array)) {
+            return Effect.fail(
+              sourceFailed(new Error("the stream emitted a chunk that is not a Uint8Array")),
+            )
+          }
+          size += chunk.length
+          if (contentLength !== undefined && size > contentLength) {
+            return Effect.fail(
+              sourceFailed(
+                new Error(`the stream gave more bytes than its contentLength of ${contentLength}`),
+              ),
+            )
+          }
+          hasher.update(chunk)
+          return Effect.succeed(chunk)
+        }),
+        Stream.onEnd(
+          Effect.suspend(() => {
+            if (contentLength !== undefined && size !== contentLength) {
+              return Effect.fail(
+                sourceFailed(
+                  new Error(
+                    `the stream gave ${size} bytes, but its contentLength is ${contentLength}`,
+                  ),
+                ),
+              )
+            }
+            ended = true
+            const value: BlobChecksum = { algorithm: "crc64nvme", value: hasher.digest() }
+            return Deferred.succeed(checksum, value)
+          }),
+        ),
+      )
+      const startedAt = yield* Clock.currentTimeMillis
+      const result = yield* restore(
+        putCall(ledger, spec, ctx, {
+          key: spec.key,
+          body,
+          contentLength,
+          checksum: Deferred.await(checksum),
+          contentType: spec.contentType,
+          metadata: metadataOf(spec, ZERO_CHECKSUM),
+        }),
+      )
+      return yield* record(ledger, spec, ctx, {
+        action: "put",
+        startedAt,
+        result,
+        kind: "bytes",
+        objectSize: size,
+        contentSize: size,
+        checksum: ended ? yield* Deferred.await(checksum) : ZERO_CHECKSUM,
+        problem: ended ? undefined : "the store's put succeeded before its body ended",
+      })
+    }),
+  )
+
+/** Who consumed a stream: single use (design §3.8). */
+interface StreamUse {
+  readonly ledger: Ledger
+  readonly store: BlobStoreService
+  readonly key: string
+  readonly memo: Memo
+  failed: boolean
+}
+
+const streamUses = new WeakMap<object, StreamUse>()
+
+/**
+ * Why a stream cannot be uploaded to `key` of `store` in `ledger`, or
+ * `undefined` when it can (its first use, or the same upload again: a
+ * re-planned or retried request reuses its pointer). A stream is consumed
+ * once, for one target object: never for a second object, by a later
+ * operation, or again after its upload failed.
+ */
+export const streamRefusal = (
+  ledger: Ledger | undefined,
+  identity: object,
+  store: BlobStoreService,
+  key: string,
+): string | undefined => {
+  const use = streamUses.get(identity)
+  if (use === undefined) return undefined
+  if (use.ledger === ledger && use.store === store && use.key === key) {
+    return use.failed ? "its upload failed, and a consumed stream is never replayed" : undefined
+  }
+  return use.ledger === ledger
+    ? "it is already the content of another value of this operation"
+    : "an earlier operation already consumed it"
+}
+
+/** The `[EDD-9120]` refusal of a stream {@link streamRefusal} refused. */
+export const singleUseError = (
+  entityType: string,
+  operation: string,
+  attribute: string,
+  why: string,
+): ValidationError =>
+  unusable(
+    entityType,
+    operation,
+    `the Stream given for attribute "${attribute}" is single-use, and ${why}. Give each ` +
+      "value its own Stream (or its bytes, a BlobHandle, or Offload.source(...)).",
+  )
+
+const streamUpload = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  content: StreamContent,
+): Effect.Effect<BlobPointer, UploadError> => {
+  const why = streamRefusal(ledger, content.identity, spec.store, spec.key)
+  if (why !== undefined) {
+    return Effect.fail(
+      singleUseError(spec.target.entityType, spec.target.operation, spec.target.attribute, why),
+    )
+  }
+  const known = streamUses.get(content.identity)
+  if (known !== undefined) {
+    // The same upload again: its pointer (a stale one is refused at the
+    // choke point with `Expired` — a consumed stream is never re-run).
+    return Effect.map(Deferred.await(known.memo.deferred), ({ pointer }) => pointer)
+  }
+  const use: StreamUse = {
+    ledger,
+    store: spec.store,
+    key: spec.key,
+    memo: { deferred: Deferred.makeUnsafe<Uploaded, UploadError>() },
+    failed: false,
+  }
+  streamUses.set(content.identity, use)
+  const ctx = ctxOf(spec.target)
+  return permitsOf(ledger, spec.store)
+    .withPermit(streamedPut(ledger, spec, ctx, content.stream, content.contentLength))
+    .pipe(
+      Effect.onExit((exit) => {
+        if (Exit.isFailure(exit)) use.failed = true
+        return Deferred.done(use.memo.deferred, exit)
+      }),
+      Effect.map(({ pointer }) => pointer),
+    )
+}
+
+/**
+ * A handle's content as a new version under `spec.key`: the store's `copy`
+ * when the handle reads from this store (its checksum is the source's), else
+ * its content streamed into a `put`. Never the handle's own version — even
+ * when it is the field's current one.
+ */
+const copyUpload = (
+  ledger: Ledger,
+  spec: UploadSpec,
+  content: CopyContent,
+): Effect.Effect<BlobPointer, UploadError> => {
+  const { handle } = content
+  const source = Option.getOrUndefined(handle.ref)
+  const copy = spec.store.copy
+  const viaCopy = copy !== undefined && source !== undefined && handleStoreOf(handle) === spec.store
+  const memoKey = [
+    "copy",
+    spec.key,
+    source === undefined ? `inline:${hexOf(handle.checksum.value)}` : refKey(source),
+    handle.size,
+    spec.contentType,
+  ].join("\u0000")
+  const ctx = ctxOf(spec.target)
+  return withMemo(ledger, spec, memoKey, () => {
+    if (!viaCopy) {
+      return streamedPut(
+        ledger,
+        spec,
+        ctx,
+        Stream.suspend(() => handle.stream()),
+        handle.size,
+      )
+    }
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const startedAt = yield* Clock.currentTimeMillis
+        const result = yield* restore(
+          call(spec.store, "copy", ctx, { key: spec.key, ref: source }, () =>
+            copy(source, {
+              key: spec.key,
+              contentLength: handle.size,
+              contentType: spec.contentType,
+              metadata: metadataOf(spec, handle.checksum),
+            }),
+          ),
+        )
+        return yield* record(ledger, spec, ctx, {
+          action: "copy",
+          startedAt,
+          result,
+          kind: "bytes",
+          objectSize: handle.size,
+          contentSize: handle.size,
+          checksum: handle.checksum,
+          source,
+        })
+      }),
+    )
+  })
 }
 
 /**
@@ -412,12 +910,19 @@ const checkAnswer = (
  * names it. The entry is `pending` until a request carrying the pointer
  * settles it. The same content for the same key and store in one ledger
  * uploads once (an upload older than the store's `maxUploadAge` that no
- * request committed is not reused). Uploads run at the store's
+ * request committed is not reused); a stream uploads at most once, for one
+ * key (`[EDD-9120]` otherwise). Uploads run at the store's
  * `writeConcurrency` per ledger.
  *
  * Dies when no ledger is open: every write path runs under a root.
  */
-export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreError> =>
+export const upload: {
+  /** Buffered content never fails with a `ValidationError`. */
+  (
+    spec: UploadSpec & { readonly content: LedgerContent },
+  ): Effect.Effect<BlobPointer, BlobStoreError>
+  (spec: UploadSpec): Effect.Effect<BlobPointer, UploadError>
+} = (spec: UploadSpec): Effect.Effect<BlobPointer, any> =>
   Effect.withFiber((fiber) => {
     const ledger = fiber.getRef(CurrentLedger)
     if (ledger === undefined || ledger.closed) {
@@ -428,112 +933,15 @@ export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreEr
         ),
       )
     }
-    const kind: BlobPointerKind = spec.content.kind
-    const content =
-      spec.content.kind === "json" ? encoder.encode(spec.content.text) : spec.content.bytes
-    if (kind === "bytes" && spec.codec !== "none") {
-      return Effect.die(new Error("BlobLedger: a bytes value is never compressed"))
+    const content = spec.content
+    switch (content.kind) {
+      case "stream":
+        return streamUpload(ledger, spec, content)
+      case "copy":
+        return copyUpload(ledger, spec, content)
+      default:
+        return bufferedUpload(ledger, spec, content)
     }
-    const body = spec.body ?? content
-    if (spec.codec === "none" && body.length !== content.length) {
-      return Effect.die(new Error("BlobLedger: an uncompressed object's body is its content"))
-    }
-    const checksum: BlobChecksum = { algorithm: "crc64nvme", value: crc64nvme(content) }
-    const memoKey = [spec.key, hexOf(checksum.value), content.length, kind, spec.contentType].join(
-      "\u0000",
-    )
-    let byStore = ledger.memo.get(spec.store)
-    if (byStore === undefined) {
-      byStore = new Map()
-      ledger.memo.set(spec.store, byStore)
-    }
-    const hit = byStore.get(memoKey)
-    if (hit !== undefined) {
-      return Effect.flatMap(Deferred.await(hit.deferred), ({ entry, pointer }) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) => {
-          // An upload too old to commit any more, that nothing committed, is
-          // not reused: a fresh one is (the old one is deleted at exit).
-          const stale =
-            RANK[entry.state] < RANK.inDoubt &&
-            now - entry.startedAt > Duration.toMillis(entry.store.maxUploadAge)
-          if (!stale) return Effect.succeed(pointer)
-          if (byStore!.get(memoKey) === hit) byStore!.delete(memoKey)
-          return upload(spec)
-        }),
-      )
-    }
-    // Built before the memo is registered: nothing can then fail outside `run`.
-    const metadata = typeof spec.metadata === "function" ? spec.metadata(checksum) : spec.metadata
-    const memo: Memo = { deferred: Deferred.makeUnsafe<Uploaded, BlobStoreError>() }
-    byStore.set(memoKey, memo)
-    const ctx = ctxOf(spec.target)
-    const bodyChecksum: BlobChecksum =
-      body === content ? checksum : { algorithm: "crc64nvme", value: crc64nvme(body) }
-    const run = Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const startedAt = yield* Clock.currentTimeMillis
-        const result = yield* restore(
-          call(spec.store, "put", ctx, { key: spec.key }, () =>
-            spec.store.put({
-              key: spec.key,
-              body,
-              contentLength: body.length,
-              checksum: Effect.succeed(bodyChecksum),
-              contentType: spec.contentType,
-              metadata,
-            }),
-          ),
-        )
-        const answer = checkAnswer(ledger, spec.store, spec.key, body.length, result)
-        if (answer._tag === "Unknown") {
-          // Nothing names what the store wrote under the requested key: the
-          // key is reported at exit, and no ref the answer gave is deleted.
-          const error = blobError(ctx, "put", "Rejected", answer.ref, answer.message)
-          ledger.lost.push(
-            unsettledOf(spec.target, spec.store, "answerRefused", spec.key, undefined, error),
-          )
-          return yield* Effect.fail(error)
-        }
-        const ref = answer.ref
-        const pointer =
-          answer._tag === "Refused"
-            ? answer.message
-            : makePointer({
-                kind,
-                codec: spec.codec,
-                ref,
-                objectSize: body.length,
-                contentSize: content.length,
-                checksum,
-                contentType: Option.fromNullishOr(spec.pointerContentType),
-              })
-        const entry: LedgerEntry = {
-          ref,
-          store: spec.store,
-          target: spec.target,
-          startedAt,
-          pointer: typeof pointer === "string" ? undefined : pointer,
-          state: "pending",
-        }
-        // Registered before anything else can fail: whatever happens next,
-        // the version is deleted at exit unless a request settles it.
-        ledger.entries.set(refKey(ref), entry)
-        if (typeof pointer === "string") {
-          return yield* Effect.fail(blobError(ctx, "put", "Rejected", ref, pointer))
-        }
-        ledger.cache.set(refKey(ref), spec.content)
-        return { entry, pointer } satisfies Uploaded
-      }),
-    )
-    return permitsOf(ledger, spec.store)
-      .withPermit(run)
-      .pipe(
-        Effect.onExit((exit) => {
-          if (Exit.isFailure(exit) && byStore!.get(memoKey) === memo) byStore!.delete(memoKey)
-          return Deferred.done(memo.deferred, exit)
-        }),
-        Effect.map(({ pointer }) => pointer),
-      )
   })
 
 // ---------------------------------------------------------------------------
@@ -1080,28 +1488,6 @@ const report = (upload: UnsettledUpload): Effect.Effect<void> =>
         ),
       ),
     )
-  })
-
-/**
- * Report an upload whose version the library never learned (a multipart
- * `Complete` whose response was lost): it has no pointer, so no request can
- * settle it. Inside an open ledger it is reported when the root exits, with
- * the rest; outside one, now.
- */
-export const reportCompleteLost = (
-  target: UploadTarget,
-  store: BlobStoreService,
-  key: string,
-  cause: unknown,
-): Effect.Effect<void> =>
-  Effect.withFiber((fiber) => {
-    const upload = unsettledOf(target, store, "completeLost", key, undefined, cause)
-    const ledger = fiber.getRef(CurrentLedger)
-    if (ledger !== undefined && !ledger.closed) {
-      ledger.lost.push(upload)
-      return Effect.void
-    }
-    return report(upload).pipe(Effect.provideService(CurrentLedger, undefined))
   })
 
 const deleteContext = (entries: ReadonlyArray<LedgerEntry>): BlobCallContext => {

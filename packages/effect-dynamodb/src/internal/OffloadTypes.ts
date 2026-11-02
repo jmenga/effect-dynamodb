@@ -28,6 +28,7 @@ import type {
   View,
   ViewOf,
 } from "../Offload.js"
+import type { BinaryInput } from "./OffloadInput.js"
 
 /** True iff the member a state describes offloads a field. */
 export type Offloads<O extends OffloadState> = [
@@ -234,3 +235,25 @@ export type OpOffloadedErrors<E, O extends OffloadState, M extends OffloadMode |
  */
 export type ViewWith<O extends OffloadState, Item> =
   Offloads<O> extends true ? View<Item, O["fields"], O["modes"]> : Item
+
+// ---------------------------------------------------------------------------
+// Write inputs (design §3.8, §9.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * A binary field's write input type: its bytes widened to every
+ * {@link BinaryInput} (a `Uint8Array`, a `Stream` of bytes, a `BlobHandle`,
+ * `Offload.source(...)`); `undefined` / `null` (optionality) kept.
+ */
+export type BinaryInputOf<V> = V extends Uint8Array ? V | Exclude<BinaryInput, Uint8Array> : V
+
+/**
+ * `T` (a write input or update payload) with each binary field `K` of
+ * `TOffload` taking a {@link BinaryInput}, optionality preserved. The
+ * identity for a member without binary fields, and for type-erased fields.
+ */
+export type WithBinaryInput<T, TOffload extends OffloadFields> = 0 extends 1 & TOffload
+  ? T
+  : [TOffload["binary"]] extends [never]
+    ? T
+    : { [K in keyof T]: K extends TOffload["binary"] ? BinaryInputOf<T[K]> : T[K] }

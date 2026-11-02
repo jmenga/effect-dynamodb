@@ -13,14 +13,22 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as SchemaEntity from "@effect-dynamodb/schema/Entity.js"
 import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Schema } from "effect"
+import { Effect, Schema, Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type * as EventStore from "../src/EventStore.js"
-import type { BlobHandle, NoOffload, OffloadedValue } from "../src/Offload.js"
+import type { WithBinaryInput } from "../src/internal/OffloadTypes.js"
+import type {
+  BinaryInput,
+  BlobHandle,
+  BlobSource,
+  NoOffload,
+  OffloadedValue,
+} from "../src/Offload.js"
+import * as Offload from "../src/Offload.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -277,10 +285,23 @@ describe("the offload type parameter (#179)", () => {
     expect(true).toBe(true)
   })
 
-  it("keeps the ref-aware input helpers for a member that offloads", () => {
-    expectTypeOf<Entity.Input<typeof Docs>>().toEqualTypeOf<Entity.Input<typeof InlineDocs>>()
-    expectTypeOf<Entity.Update<typeof Docs>>().toEqualTypeOf<Entity.Update<typeof InlineDocs>>()
-    expectTypeOf<Entity.Create<typeof Docs>>().toEqualTypeOf<Entity.Create<typeof InlineDocs>>()
+  it("keeps the ref-aware input helpers for a member that offloads, binary fields widened", () => {
+    type Others<T> = Omit<T, "scan">
+    expectTypeOf<Others<Entity.Input<typeof Docs>>>().toEqualTypeOf<
+      Others<Entity.Input<typeof InlineDocs>>
+    >()
+    expectTypeOf<Others<Entity.Update<typeof Docs>>>().toEqualTypeOf<
+      Others<Entity.Update<typeof InlineDocs>>
+    >()
+    expectTypeOf<Others<Entity.Create<typeof Docs>>>().toEqualTypeOf<
+      Others<Entity.Create<typeof InlineDocs>>
+    >()
+    // A binary field takes any BinaryInput (#179, design §9.4).
+    expectTypeOf<Entity.Input<typeof Docs>["scan"]>().toEqualTypeOf<BinaryInput | undefined>()
+    // PartiQL `insert()` uploads as `put` does, so it takes the same binary inputs.
+    expectTypeOf<Parameters<typeof Docs.insert>[0]>().toEqualTypeOf<
+      Parameters<typeof Docs.create>[0]
+    >()
   })
 })
 
@@ -673,6 +694,58 @@ describe("the read types (#179)", () => {
       expectTypeOf<Entity.Read<typeof Docs>["scan"]>().toEqualTypeOf<BlobHandle | undefined>()
       expectTypeOf<Entity.Read<typeof Docs>["body"]>().toEqualTypeOf<Body>()
       expectTypeOf<Entity.Read<typeof Plain>>().toEqualTypeOf<Entity.Record<typeof Plain>>()
+    })
+    expect(true).toBe(true)
+  })
+})
+
+describe("binary write inputs (#179, design §3.8, §9.4)", () => {
+  const bytes = new Uint8Array([1, 2, 3])
+  const stream = Stream.make(bytes)
+
+  it("types a binary field's input as BinaryInput on put, create, upsert and update", () => {
+    typeOnly(() =>
+      Effect.gen(function* () {
+        expectTypeOf<NonNullable<Entity.Input<typeof Docs>["scan"]>>().toEqualTypeOf<
+          Uint8Array | Stream.Stream<Uint8Array, unknown, never> | BlobHandle | BlobSource
+        >()
+        expectTypeOf<Entity.Input<typeof Docs>["title"]>().toEqualTypeOf<string>()
+        // Optionality is kept.
+        expectTypeOf<{}>().toMatchTypeOf<Pick<Entity.Update<typeof Docs>, "scan">>()
+        expectTypeOf<NonNullable<Entity.Update<typeof Docs>["scan"]>>().toEqualTypeOf<BinaryInput>()
+        expectTypeOf<
+          NonNullable<Entity.Create<typeof Scans>["scan"]>
+        >().toEqualTypeOf<BinaryInput>()
+        Docs.put({ ...doc, scan: stream })
+        Docs.put({ ...doc, scan: Offload.source(stream, { contentLength: 3 }) })
+        Docs.create({ ...doc, scan: Offload.source(bytes, { contentType: "image/png" }) })
+        Docs.update(key).pipe(Docs.set({ scan: stream }))
+        const db = yield* DynamoClient.make({ entities: { Docs, Readings }, tables: { MainTable } })
+        const read = yield* db.entities.Docs.get(key)
+        const handle: BlobHandle | undefined = read.scan
+        if (handle !== undefined) yield* db.entities.Docs.put({ ...doc, scan: handle })
+        yield* db.entities.Docs.upsert({ ...doc, scan: stream })
+        yield* db.entities.Docs.update(key).set({ scan: Offload.source(stream) })
+        yield* db.entities.Docs.patch(key).set({ scan: bytes })
+        yield* db.entities.Readings.append({ sensorId: "s", at: 1, raw: stream })
+        // @ts-expect-error a stream of strings is not a binary input
+        Docs.put({ ...doc, scan: Stream.make("text") })
+        // @ts-expect-error an overflow field takes its domain value only
+        Docs.put({ ...doc, body: stream })
+      }),
+    )
+    expect(true).toBe(true)
+  })
+
+  it("leaves the inputs of a member without binary fields as they were", () => {
+    expectTypeOf<Entity.Input<typeof Plain>["scan"]>().toEqualTypeOf<Uint8Array | undefined>()
+    expectTypeOf<Entity.Update<typeof Plain>["scan"]>().toEqualTypeOf<Uint8Array | undefined>()
+    type Shape = { readonly a: string; readonly b?: Uint8Array }
+    expectTypeOf<WithBinaryInput<Shape, NoOffload>>().toEqualTypeOf<Shape>()
+    expectTypeOf<WithBinaryInput<Shape, any>>().toEqualTypeOf<Shape>()
+    typeOnly(() => {
+      // @ts-expect-error a member that does not offload takes bytes only
+      Plain.put({ ...doc, scan: stream })
     })
     expect(true).toBe(true)
   })

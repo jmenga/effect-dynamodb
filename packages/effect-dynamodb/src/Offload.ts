@@ -1,6 +1,7 @@
 /**
- * Offload — the read-side vocabulary of offloaded storage (#179): read modes,
- * the lazy forms of offloaded values, and the type-level view a read returns.
+ * Offload — the vocabulary of offloaded storage (#179): read modes, the lazy
+ * forms of offloaded values, the type-level view a read returns, and what a
+ * binary field takes on a write.
  *
  * - **Read modes.** An overflow field (`DynamoModel.Packed({ external })`) is
  *   read `"eager"` by default — its domain value, resolved from the store; a
@@ -12,6 +13,10 @@
  * - **{@link View}** is the type of a read's result: the model with each
  *   offloaded field typed by its mode. For a member that offloads nothing it
  *   is the model itself.
+ * - **Binary inputs.** A binary field takes a {@link BinaryInput} on a write:
+ *   its bytes, a `Stream` of them (single-use: one target object, run once),
+ *   a {@link BlobHandle} (content to copy into a new version) or
+ *   {@link source}`(bytes | stream, { contentType, contentLength })`.
  * - **{@link layerObserver}** reports every upload the library could not
  *   settle (an unknown DynamoDB outcome, a failed rollback delete, a lost
  *   multipart completion), so the application can queue the item for
@@ -52,6 +57,8 @@ export type {
   UnsettledUpload,
 } from "./internal/BlobLedger.js"
 export type { ByteRange } from "./internal/BlobStoreContract.js"
+export type { BinaryInput, BlobSource, BlobSourceOptions } from "./internal/OffloadInput.js"
+export { BlobSourceTypeId, isBlobSource, source } from "./internal/OffloadInput.js"
 export type { BlobHandle, OffloadedValue, OffloadLocation } from "./internal/OffloadValues.js"
 export {
   BlobHandleTypeId,

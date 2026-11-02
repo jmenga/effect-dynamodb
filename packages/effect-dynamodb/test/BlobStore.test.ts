@@ -259,6 +259,11 @@ describe("BlobStore", () => {
         [{ readConcurrency: 0 }, /readConcurrency/],
         [{ writeConcurrency: -1 }, /writeConcurrency/],
         [{ readChunkBytes: 0 }, /readChunkBytes/],
+        [{ partSize: 0 }, /partSize/],
+        [{ partSize: 1.5 }, /partSize/],
+        [{ maxParts: 0 }, /maxParts/],
+        [{ uploadConcurrency: 0 }, /uploadConcurrency/],
+        [{ partAttempts: -1 }, /partAttempts/],
         [{ clock: {} }, /clock/],
         [{ failures: 1 }, /failures/],
       ]
@@ -385,6 +390,11 @@ describe("BlobStore", () => {
             [request("k".repeat(1_025), body), /1025 UTF-8 bytes/],
             [request("k", body, { contentLength: 2 }), /contentLength is 2/],
             [request("k", body, { contentType: "" }), /contentType/],
+            [
+              request("k", body, { contentType: "text/plain\r\nX-Injected: 1" }),
+              /contentType must be a non-empty printable US-ASCII string/,
+            ],
+            [request("k", body, { contentType: "text/é" }), /printable US-ASCII/],
             [request("k", body, { metadata: { "edd-attr": "dök" } }), /US-ASCII/],
             [request("k", body, { metadata: { big: "x".repeat(2_048) } }), /over S3's 2048-byte/],
             [request("k", "text" as never), /body must be/],
@@ -959,4 +969,251 @@ describe("BlobStore", () => {
       }),
     )
   })
+})
+
+// ---------------------------------------------------------------------------
+// The memory store's multipart simulation (#179, design §7, §12.3)
+// ---------------------------------------------------------------------------
+
+describe("BlobStore.memory — multipart", () => {
+  const body = (n: number): Uint8Array => Uint8Array.from({ length: n }, (_, i) => (i * 7) % 251)
+  /** A put request of `bytes` as a stream of `chunk`-byte chunks, checksum resolved. */
+  const streamed = (
+    key: string,
+    bytes: Uint8Array,
+    chunk: number,
+    overrides: Partial<BlobPutRequest> = {},
+  ): BlobPutRequest => {
+    const chunks: Array<Uint8Array> = []
+    for (let at = 0; at < bytes.length; at += chunk) chunks.push(bytes.slice(at, at + chunk))
+    return request(key, Stream.fromIterable(chunks), {
+      contentLength: undefined,
+      checksum: Effect.succeed({ algorithm: "crc64nvme", value: crc(bytes) }),
+      ...overrides,
+    })
+  }
+
+  it("has the documented multipart defaults", () => {
+    const store = BlobStore.memory()
+    expect(store.inspect().multipart).toEqual({
+      creates: 0,
+      parts: 0,
+      completes: 0,
+      aborts: 0,
+      inProgress: 0,
+    })
+  })
+
+  it.effect("uploads a body of at most one part in one call, a longer one in parts", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory({ partSize: 8 })
+      const single = yield* store.put(streamed("a", body(8), 3))
+      expect(store.inspect().multipart.creates).toBe(0)
+      const multi = yield* store.put(streamed("b", body(30), 7))
+      expect(store.inspect().multipart).toEqual({
+        creates: 1,
+        parts: 4,
+        completes: 1,
+        aborts: 0,
+        inProgress: 0,
+      })
+      const [b, a] = [multi, single].map(
+        (result) => store.inspect().versions.find((v) => v.ref.key === result.ref.key)!,
+      )
+      expect(b!.bytes).toEqual(body(30))
+      expect(a!.bytes).toEqual(body(8))
+      expect(multi.size).toBe(30)
+      // A buffered body over the part size goes multipart too.
+      yield* store.put(request("c", body(17)))
+      expect(store.inspect().multipart.creates).toBe(2)
+      // The empty body is one call.
+      yield* store.put(streamed("d", new Uint8Array(0), 1))
+      expect(store.inspect().calls.put).toBe(4)
+      expect(store.inspect().multipart.creates).toBe(2)
+    }),
+  )
+
+  it.effect("checks the whole body's checksum and length at completion, and aborts", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory({ partSize: 4 })
+      const wrong = failureOf(
+        yield* Effect.exit(
+          store.put(
+            streamed("k", body(10), 3, {
+              checksum: Effect.succeed({ algorithm: "crc64nvme", value: crc(body(9)) }),
+            }),
+          ),
+        ),
+      )
+      expect(wrong.reason).toBe("ChecksumMismatch")
+      const short = failureOf(
+        yield* Effect.exit(store.put(streamed("k", body(10), 3, { contentLength: 11 }))),
+      )
+      expect(short.reason).toBe("Rejected")
+      expect(store.inspect().versions).toEqual([])
+      expect(store.inspect().multipart).toMatchObject({ creates: 2, aborts: 2, inProgress: 0 })
+    }),
+  )
+
+  it.effect("asks the hook about every phase as a multipart call, with the put's own n", () =>
+    Effect.gen(function* () {
+      const seen: Array<MemoryBlobCall> = []
+      const store = BlobStore.memory({
+        partSize: 4,
+        failures: (call) => {
+          seen.push(call)
+          return undefined
+        },
+      })
+      yield* store.put(request("k", body(2)))
+      yield* store.put(streamed("k", body(9), 9))
+      expect(seen.map((c) => [c.action, c.n, c.multipart?.phase, c.multipart?.part])).toEqual([
+        ["put", 1, undefined, undefined],
+        ["put", 2, undefined, undefined],
+        ["multipart", 2, "create", undefined],
+        ["multipart", 2, "part", 1],
+        ["multipart", 2, "part", 2],
+        ["multipart", 2, "part", 3],
+        ["multipart", 2, "complete", undefined],
+      ])
+      // Phases are not puts: neither counted nor seen by a hook keyed on "put".
+      expect(store.inspect().calls.put).toBe(2)
+      expect(seen.filter((c) => c.action === "put").every((c) => c.multipart === undefined)).toBe(
+        true,
+      )
+    }),
+  )
+
+  it.effect("retries a throttled part, as the SDK does, and fails once attempts run out", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory({
+        partSize: 4,
+        partAttempts: 2,
+        failures: (call) =>
+          call.multipart?.phase === "part" &&
+          call.multipart.part === 2 &&
+          (call.n === 2 || call.multipart.attempt === 1)
+            ? { _tag: "Fail", reason: "Throttled" }
+            : undefined,
+      })
+      yield* store.put(streamed("k", body(12), 5))
+      expect(store.inspect().multipart).toMatchObject({ parts: 4, completes: 1 })
+      const failed = failureOf(yield* Effect.exit(store.put(streamed("k", body(12), 5))))
+      expect(failed.reason).toBe("Throttled")
+      expect(store.inspect().multipart).toMatchObject({ completes: 1, aborts: 1, inProgress: 0 })
+      expect(store.inspect().versions).toHaveLength(1)
+    }),
+  )
+
+  it.effect(
+    "fails part maxParts + 1 as TooLarge, naming the part size; a known length adapts",
+    () =>
+      Effect.gen(function* () {
+        const store = BlobStore.memory({ partSize: 4, maxParts: 3 })
+        const tooLarge = failureOf(yield* Effect.exit(store.put(streamed("k", body(13), 13))))
+        expect(tooLarge.reason).toBe("TooLarge")
+        expect(String((tooLarge.cause as Error).message)).toMatch(/more than 3 parts of 4 bytes/)
+        expect(store.inspect().multipart).toMatchObject({ aborts: 1, inProgress: 0 })
+        // With its length known, the part size rises to ceil(13 / 3) = 5.
+        yield* store.put(streamed("k", body(13), 13, { contentLength: 13 }))
+        expect(store.inspect().multipart).toMatchObject({ completes: 1 })
+        expect(store.inspect().versions[0]!.bytes).toEqual(body(13))
+      }),
+  )
+
+  it.effect("loses a Complete response: the version is stored, the failure says completeLost", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory({
+        partSize: 4,
+        failures: (call) =>
+          call.multipart?.phase === "complete"
+            ? { _tag: "Fail", reason: "Unavailable", at: "response" }
+            : undefined,
+      })
+      const lost = failureOf(yield* Effect.exit(store.put(streamed("k", body(9), 2))))
+      expect(lost.reason).toBe("Unavailable")
+      expect(lost.completeLost).toBe(true)
+      expect(lost.ref).toBeUndefined()
+      expect(store.inspect().versions).toHaveLength(1)
+    }),
+  )
+
+  it.effect("aborts an interrupted upload after its in-flight parts are interrupted", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const store = BlobStore.memory({
+        partSize: 4,
+        failures: (call) =>
+          call.multipart?.phase === "part" && call.multipart.part === 2
+            ? Effect.andThen(Deferred.succeed(started, undefined), Effect.never)
+            : undefined,
+      })
+      const fiber = yield* store.put(streamed("k", body(12), 4)).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(fiber)
+      expect(store.inspect().multipart).toMatchObject({
+        creates: 1,
+        completes: 0,
+        aborts: 1,
+        inProgress: 0,
+      })
+      expect(store.inspect().versions).toEqual([])
+    }),
+  )
+
+  it.effect("keeps put-level faults: a request fault after the body stores nothing", () =>
+    Effect.gen(function* () {
+      const pulled = { n: 0 }
+      const store = BlobStore.memory({
+        partSize: 4,
+        failures: (call) =>
+          call.action === "put" && call.n === 1
+            ? { _tag: "Fail", reason: "Unavailable" }
+            : undefined,
+      })
+      const req = streamed("k", body(10), 3)
+      const counted: BlobPutRequest = {
+        ...req,
+        body: (req.body as Stream.Stream<Uint8Array>).pipe(
+          Stream.tap(() =>
+            Effect.sync(() => {
+              pulled.n++
+            }),
+          ),
+        ),
+      }
+      const failed = failureOf(yield* Effect.exit(store.put(counted)))
+      expect(failed.reason).toBe("Unavailable")
+      // The whole body was consumed; the fault fired before completion. The
+      // part already uploaded was aborted with its upload.
+      expect(pulled.n).toBe(4)
+      expect(store.inspect().versions).toEqual([])
+      expect(store.inspect().multipart).toEqual({
+        creates: 1,
+        parts: 1,
+        completes: 0,
+        aborts: 1,
+        inProgress: 0,
+      })
+    }),
+  )
+
+  it.effect("keeps put-level faults: a response fault on a multipart body names its version", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory({
+        partSize: 4,
+        failures: (call) =>
+          call.action === "put"
+            ? { _tag: "Fail", reason: "Unavailable", at: "response" }
+            : undefined,
+      })
+      const lost = failureOf(yield* Effect.exit(store.put(streamed("k", body(10), 3))))
+      expect(lost.reason).toBe("Unavailable")
+      expect(lost.completeLost).toBeUndefined()
+      const [stored] = store.inspect().versions
+      expect(lost.ref).toEqual(stored!.ref)
+      expect(stored!.bytes).toEqual(body(10))
+      expect(store.inspect().multipart).toMatchObject({ creates: 1, completes: 1, aborts: 0 })
+    }),
+  )
 })

@@ -68,13 +68,27 @@ describe("DynamoModel.External", () => {
     )
   })
 
-  it("refuses a content type that is empty, too long, not ASCII or not a string (EDD-9141)", () => {
-    for (const contentType of ["", "x".repeat(256), "image/pngé", "text/plain; charset=☃", 5]) {
+  it("refuses a content type that is empty, too long, not printable ASCII or not a string (EDD-9141)", () => {
+    for (const contentType of [
+      "",
+      "x".repeat(256),
+      "image/pngé",
+      "text/plain; charset=☃",
+      "text/plain\r\nX-Injected: 1",
+      "text/plain\u0000",
+      "text/\tplain",
+      "text/plain\u007f",
+      5,
+    ]) {
       expectEdd9141(
         () => DynamoModel.External({ contentType } as never),
-        "contentType must be a non-empty US-ASCII string of at most 255 bytes",
+        "contentType must be a non-empty printable US-ASCII string of at most 255 bytes",
       )
     }
+    // Spaces and every printable character are a header's to carry.
+    expect(DynamoModel.External({ contentType: 'text/plain; charset="utf-8"' }).contentType).toBe(
+      'text/plain; charset="utf-8"',
+    )
   })
 
   it("is distinct from Packed and SparseMap configs", () => {

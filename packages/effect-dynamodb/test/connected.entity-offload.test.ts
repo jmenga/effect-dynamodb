@@ -7,7 +7,9 @@
  * mode — gets, index queries with projections and `limit`, scans, batch and
  * transactional gets, lifecycle reads and stream-image decoding. Objects go
  * to the in-memory blob store, whose call counts say what each read fetched
- * (the S3 store and MinIO are later commits').
+ * (the S3 store and MinIO are later commits'). Binary inputs (§3.8, §7):
+ * streams through the store's multipart simulation, single use, handle
+ * copies and source failures.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -15,7 +17,8 @@ import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
-import { Config, Effect, Layer, Schema } from "effect"
+import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
+import { Cause, Config, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { afterAll, beforeAll, beforeEach, describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { BlobStore } from "../src/BlobStore.js"
@@ -629,4 +632,96 @@ describeConnected("Entity offloaded fields (#179)", () => {
         }),
       ),
   )
+
+  describe("binary inputs (§3.8, §7)", () => {
+    const content = Uint8Array.from({ length: 40 }, (_, i) => (i * 13) % 256)
+    const chunked = (bytes: Uint8Array, size: number) => {
+      const chunks: Array<Uint8Array> = []
+      for (let at = 0; at < bytes.length; at += size) chunks.push(bytes.slice(at, at + size))
+      return Stream.fromIterable(chunks)
+    }
+    const causeOf = <A, E>(exit: Exit.Exit<A, E>): string => {
+      if (Exit.isSuccess(exit)) throw new Error("expected a failure")
+      const error = Cause.findErrorOption(exit.cause)
+      return Option.isSome(error)
+        ? `${String(error.value)} ${String((error.value as any).cause)}`
+        : ""
+    }
+
+    it.effect(
+      "a stream uploads multipart; its pointer has the bytes' checksum and reads back",
+      () => {
+        blobs = BlobStore.memory({ partSize: 8, uploadConcurrency: 2 })
+        return provide(
+          Effect.gen(function* () {
+            const db = yield* client
+            yield* db.entities.Docs.put({ docId: "st-1", title: "t", scan: chunked(content, 7) })
+            const row = yield* liveDoc("doc", "st-1")
+            expect(isBinaryPointer(row.scan)).toBe(true)
+            const pointer = BlobPointer.decodeText(row.scan!.S!)
+            if (pointer === undefined || typeof pointer === "string") throw new Error("no pointer")
+            expect(pointer.checksum.value).toEqual(crc64nvme(content))
+            expect(blobs.inspect().multipart).toMatchObject({ creates: 1, parts: 5, completes: 1 })
+            const read = yield* db.entities.Docs.get({ docId: "st-1" }).offloaded("eager")
+            expect(read.scan).toEqual(content)
+          }),
+        )
+      },
+    )
+
+    it.effect("a stream is single-use: a later operation reusing it is refused (EDD-9120)", () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          const source = chunked(content, 10)
+          yield* db.entities.Docs.put({ docId: "st-2", title: "t", scan: source })
+          const exit = yield* Effect.exit(
+            db.entities.Docs.put({ docId: "st-3", title: "t", scan: source }).asEffect(),
+          )
+          expect(causeOf(exit)).toMatch(/\[EDD-9120\].*single-use/)
+          expect(yield* rawItem("$offload-ent#v1#doc#docid_st-3", "$offload-ent#v1#doc")).toBe(
+            undefined,
+          )
+          expect(blobs.inspect().calls.put).toBe(1)
+        }),
+      ),
+    )
+
+    it.effect("a source failure fails the write with SourceFailed; nothing is written", () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          const source = Stream.concat(chunked(content, 10), Stream.fail("gone"))
+          const exit = yield* Effect.exit(
+            db.entities.Docs.put({ docId: "st-4", title: "t", scan: source }).asEffect(),
+          )
+          expect(causeOf(exit)).toMatch(/SourceFailed/)
+          expect(yield* rawItem("$offload-ent#v1#doc#docid_st-4", "$offload-ent#v1#doc")).toBe(
+            undefined,
+          )
+          expect(blobs.inspect().versions).toEqual([])
+        }),
+      ),
+    )
+
+    it.effect("a BlobHandle input is copied into a new version of the new item's key", () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* db.entities.Docs.put({ docId: "st-5", title: "t", scan: content })
+          const handle = (yield* db.entities.Docs.get({ docId: "st-5" })).scan!
+          yield* db.entities.Docs.put({
+            docId: "st-6",
+            title: "t",
+            scan: Offload.isBlobHandle(handle) ? handle : content,
+          })
+          expect(blobs.inspect().calls.copy).toBe(1)
+          const read = yield* db.entities.Docs.get({ docId: "st-6" }).offloaded("eager")
+          expect(read.scan).toEqual(content)
+          const keys = new Set(blobs.inspect().versions.map((v) => v.ref.key))
+          expect(keys.size).toBe(2)
+        }),
+      ),
+    )
+  })
 })

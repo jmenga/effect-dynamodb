@@ -331,7 +331,8 @@ export const getExternalFields: (model: Schema.Top) => Record<string, ExternalCo
   `NullOr`). `Uint8ArrayFromBase64` encodes to a string and is refused — it stores text, not
   bytes.
 - Invalid options are `[EDD-9141]` (an unknown key; a `contentType` that is not a non-empty
-  US-ASCII string of at most 255 bytes).
+  printable US-ASCII string of at most 255 bytes — *printable since commit 10*: a control
+  character such as CR, LF or NUL cannot travel in an HTTP header).
 - `field` (rename) and `immutable` combine with `External`; nothing else does (§15). An
   `External` field is not the entity's `identifier` either (`[EDD-9142]`): refs and their
   cascade indexes compose the identifier into keys.
@@ -558,9 +559,16 @@ db.entities.Documents.put({ id, owner, body, scan: Offload.source(fileStream, { 
   "SourceFailed", cause }`; the source's own error type is not threaded into the operation's
   channel (it cannot be inferred through the derived input type).
 - A **`BlobHandle`** is content to copy, never a pointer to share: the store's `copy`
-  capability (server-side `CopyObject` for S3) writes a new version under this item's key, or
-  the library streams `handle.stream()` into `put` when the store has no `copy`. This holds
-  even when the handle names the version the field already holds.
+  capability (server-side `CopyObject` for S3) writes a new version under this item's key when
+  the handle was read through the **same** store and names a version; otherwise — a store
+  without `copy`, a handle read through another store, an inline handle (a value stored
+  natively) — the library streams `handle.stream()` into a `put` (*as built in commit 10*: a
+  server-side copy cannot reach another store). This holds even when the handle names the
+  version the field already holds.
+- An **immutable** binary field (§6.5) restated by a handle compares by the handle's checksum
+  and size with the stored value, and is dropped from the write when they match — no copy, no
+  fetch. One restated by a `Stream` is refused (`[EDD-9120]`): its content cannot be compared
+  with the stored value without consuming it (*added in commit 10*).
 - Overflow fields take their domain value, as today. A `Stream`, handle or source given to an
   overflow field, or a value of the wrong shape to a binary field, is a `ValidationError`
   (`[EDD-9120]`) — reachable only from untyped code.
@@ -1213,7 +1221,7 @@ Two consequences:
 | `update` record `.set()` (UpdateItem) | `runUpdate` SET loop (~`:6814`) | upload, `SET #f = :ptr`; `.remove()` / `null` unchanged (`REMOVE #f`) |
 | `update` read-merge (retain / unique / computed composites / both images) | `runUpdate` (~`:6161`) | named fields route per §6.3 on the merged item and upload; untouched pointers stay byte-identical and out of the request; immutables run before uploads |
 | `update` too-wide fallback `Put` | `runUpdate` (~`:6320`) | unchanged guard choice (version when versioned, else `deleteGuard(current, "item")`), with offloaded attributes first in the fallback order so every carried pointer is compared |
-| immutable assertions | `packedImmutableMismatch` (~`:2463`) | a stored pointer compares by content checksum and size with the restated value's JSON / bytes. A match passes; a mismatch is confirmed by fetching the stored value and comparing structurally (`attributeValueEquals`, key-order-insensitive, as today) before refusing. A restated immutable value that passes is dropped from the write: the attribute stays as stored |
+| immutable assertions | `packedImmutableMismatch` (~`:2463`) | a stored pointer compares by content checksum and size with the restated value's JSON / bytes. A match passes; a mismatch is confirmed by fetching the stored value and comparing structurally (`attributeValueEquals`, key-order-insensitive, as today) before refusing. A restated immutable value that passes is dropped from the write: the attribute stays as stored. *Commit 10:* a binary immutable restated by a `BlobHandle` compares by the handle's checksum and size — with the stored pointer's, or with a native `B` value's own — and, matching, is dropped (no copy, no fetch; different checksums or sizes are different bytes, so a mismatch is refused unfetched); one restated by a `Stream` is refused (`[EDD-9120]`, its content not in hand without consuming it); one restated by `Offload.source(bytes)` compares as its bytes |
 | vector source text | `unpackedDomainCopy` (~`:2608`) | an untouched offloaded source field is resolved eagerly (one GET) when the embedding must be recomputed; documented |
 | `patch` / `updateOrCreate` / `deleteIfExists` | as `update` / `delete` | — |
 | `delete` | — | no uploads; `ALL_OLD` return values decode per mode (§8.4) |
@@ -2289,10 +2297,17 @@ export interface BlobStoreService {
 export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
   readonly reason: BlobStoreReason
   readonly ref?: BlobRef | undefined
+  /** A put whose multipart upload may have completed although its response was lost (commit 10). */
+  readonly completeLost?: boolean | undefined
   readonly cause: unknown
 }> {}
 ```
 
+- **`completeLost`** (*added in commit 10*): a store's `put` sets it on a failure after which
+  its multipart upload may have completed with no ref reported — a `CompleteMultipartUpload`
+  whose response was lost, or whose retry found no upload (§7). The library cannot tell that
+  from any other failed put through the rest of the contract, so the store says it; the
+  ledger reports the requested key to the observer (`completeLost`) for `gc.sweep`.
 - **`BlobSourceFailure`** (commit 5) is `BlobStoreFailure & { reason: "SourceFailed" }`: the
   library wraps the input `Stream`'s error (its `cause`) before handing the body to the store,
   so a store's `put` lets a source failure through as its own failure, with no second error
@@ -2411,8 +2426,9 @@ maxVersionBytes?, maxUploadAge?, clock?, failures?: … })`:
   random part up by one, so a family's keys list in write order even within one millisecond.
 - **Like S3.** A `put` checks the body against its `checksum` (`ChecksumMismatch`) and
   `contentLength`, and refuses (`Rejected`) a key over 1,024 bytes (after the key-per-write
-  suffix), an empty content type, and metadata that is not US-ASCII or exceeds 2 KB (§4.6's
-  count); metadata keys are stored lowercased. A range must have a non-negative integer offset
+  suffix), a content type that is empty or not printable US-ASCII (*commit 10*: no control
+  character, which no HTTP header carries), and metadata that is not printable US-ASCII or
+  exceeds 2 KB (§4.6's count); metadata keys are stored lowercased. A range must have a non-negative integer offset
   no greater than the size, and an optional non-negative integer length (clipped at the end).
   Listings are in UTF-8 (code point) key order, versions newest first, `startAfter` exclusive.
   Every byte array in and out is copied.
@@ -2430,6 +2446,33 @@ maxVersionBytes?, maxUploadAge?, clock?, failures?: … })`:
 - **`inspect()`** returns `{ versions, calls }`: every version (ref, size, a copy of the bytes,
   content type, metadata, `lastModified`, `isLatest`, `mark`) in listing order, and the number
   of calls per action.
+
+*Implementation notes (commit 10):*
+
+- **Multipart, simulated.** Every `put` runs the multipart driver the S3 store will
+  (`internal/Multipart.ts`, §7): a body of at most `partSize` bytes is one upload; a longer one
+  is created, uploaded in parts of exactly `partSize` bytes (raised to `ceil(contentLength /
+  maxParts)` for a known length) at `uploadConcurrency`, and completed — or aborted on any
+  failure or interruption. Options: `partSize` (default 8 MiB, any positive integer: unlike S3
+  there is no 5 MiB floor, so tests exercise multipart with small bodies), `maxParts` (default
+  10,000), `uploadConcurrency` (default 4) and `partAttempts` (default 3: a part failing with
+  `Throttled` / `Unavailable` is retried, as the SDK's retry strategy resends one), each a
+  positive integer (`[EDD-9116]`). Part `maxParts + 1` fails with `TooLarge`, naming the part
+  size. Completion checks the whole body's length and CRC-64/NVME, as a single put does.
+- **Phases in the hook.** `failures` is also asked about each phase of a multipart upload, as
+  its own action — `{ action: "multipart", n, key, multipart: { phase: "create" | "part" |
+  "complete" | "abort", part?, attempt? } }`, `n` the put's own (phases are not counted in
+  `calls`) — so a hook keyed on `action === "put"` (with or without `n`) sees each put once,
+  never its phases. A fault on a phase fails (or interrupts) it, before or after it takes
+  effect; a `complete` fault `at: "response"` stores the version, then fails the put with
+  `completeLost: true` and **no** ref, as S3's lost completion does; a `create` fault
+  `at: "response"` opens an upload the put never learns of, left `inProgress` as S3 leaves one
+  for a lifecycle `AbortIncompleteMultipartUpload` rule. Put-level faults keep their meaning: a
+  request-time one fires once the body has ended (or after `afterChunks` chunks) and before
+  completion — a multipart body's parts may already have been uploaded, and are aborted with
+  the upload; a response-time one after the version is stored.
+- **`inspect().multipart`** counts the multipart calls (`creates`, `parts` — attempts
+  included — `completes`, `aborts`) and the uploads still open (`inProgress`).
 
 ### 12.4 Stores without versioning
 
@@ -2547,8 +2590,8 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key, or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
 | `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
-| `EDD-9120` | `Entity.ts`, `internal/TransactableOps.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle or source for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; a `Stream` or source for an aggregate edge; or a `Stream` given to a second target (another field, item or op) or to a later operation after its first use — a `Stream` is single-use (§3.8) |
-| `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty US-ASCII string ≤ 255 bytes |
+| `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream` or source for an aggregate edge; or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
+| `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty printable US-ASCII string ≤ 255 bytes |
 | `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, a GSI's `shards.by` source, `timeSeries.orderBy`), a unique-constraint field, a ref field, the entity's identifier, a vector index source, partition or filter field, or an aggregate discriminator / `many` sort-key composite. (An aggregate's list and collection composites are root fields, and a root model takes no `configure`, so none can be `External`: there is nothing to check there.) |
 | `EDD-9143` | `Entity.ts` (schema), `Aggregate.ts` | A ref (entity ref, aggregate ref edge, or the ref a `many` edge's element wraps — `PlayerSheet { player }`, which hydration fills by name — at any depth) whose schema includes a field the referenced entity offloads — the denormalised copy would inline it (400 KB risk), need to marshal a lazy handle, or copy a pointer across item families (§11.2). Reference a subset model without the field |
 | `EDD-9146` | `DynamoClient.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`), `EventStore.ts`, `GeoIndex.ts` (geo), `internal/OffloadWrite.ts` (`route`), `internal/Rekey.ts` | A member with an offloaded field on a table whose schema doesn't set `escapeKeys: true`: bound (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, the streams given to `rekey`) — a defect naming every such member and field; or written unbound — a `ValidationError` from the routing, nothing uploaded or sent. Also `rekey` about to move a row that holds a blob pointer — a `ValidationError` naming the row's key, nothing written (only after `escapeKeys` was turned off over rows offloading wrote, §11.10) |
@@ -3166,10 +3209,12 @@ a write path, deletes the gate.
      reason `answerRefused` (no ref), for `gc.sweep` / `gc.sweepStore` to reclaim the version
      the store actually wrote.
    - `UnsettledReason` gains `answerRefused` (above), and every upload whose version no entry
-     names — `answerRefused`, and `completeLost` reported inside an open ledger — is reported
-     when the root exits, with the rest, as `onUnsettled`'s contract says ("after the
-     operation that made it exits"); `reportCompleteLost` outside a ledger still reports at
-     once.
+     names — `answerRefused` and `completeLost` — is reported when the root exits, with the
+     rest, as `onUnsettled`'s contract says ("after the operation that made it exits").
+     (*Commit 10:* the `reportCompleteLost` entry point this commit added is removed. A store
+     reports a lost completion only by setting `completeLost` on its put failure (§12.1), which
+     the ledger's put records; every upload runs inside a ledger, so nothing reports outside
+     one.)
    - Uploads run at the store's `writeConcurrency` per ledger (a semaphore per store), not
      per process.
    - A memoised upload older than its store's `maxUploadAge` that nothing committed (`pending`
@@ -3531,6 +3576,129 @@ a write path, deletes the gate.
    item budget counts it, and pins the reused pointers onto the row-token condition.
 10. **Binary inputs and streaming** — `BinaryInput`, `Offload.source`, single-use streams +
     memo, handle copy (with `VersionId` check), in-memory multipart simulation, `EDD-9120`.
+    *Implementation notes (commit 10):* `Offload.source(body, { contentType?, contentLength? })`
+    is a frozen `BlobSource` (type id, `Pipeable`, `Inspectable`); `Offload` also exports
+    `BinaryInput`, `BlobSource`, `BlobSourceOptions`, `isBlobSource` and `BlobSourceTypeId`.
+    Its options are checked when the write runs (`[EDD-9120]`): a content type by
+    `External`'s rule (non-empty printable US-ASCII, at most 255 bytes), a length that is a non-negative
+    safe integer and, for bytes, their length. **Placeholders** (`internal/OffloadInput.ts`):
+    every write path prepares its input before reading it — the put core, the update core
+    (after a removed default is re-materialised), `upsert` (both paths), `append`, and the new
+    internal `Entity._encodeInput` that `validateAndBuildPutItem` (Batch, Transaction and
+    projection puts) now encodes through. A binary input that is not a `Uint8Array` becomes a
+    fresh `Uint8Array` registered, by identity, with what it stands for: `Offload.source(bytes)`
+    a copy of the bytes (the field's schema checks them as any bytes), a stream or handle an
+    empty, **opaque** array that the encode passes through a cached variant of the schema with
+    those fields `Schema.Unknown`. Renames, sparse flattening, packing and marshalling keep the
+    array (`marshall` keeps a `Uint8Array` as is), so `OffloadWrite.binaryUpload` uploads what
+    the placeholder stands for; preparing is idempotent (a guarded upsert's create, an update
+    that creates its item). A value of the wrong shape for a binary field, and a stream,
+    handle, source or `OffloadedValue` for an overflow field, are refused (`[EDD-9120]`).
+    **Ledger** (`BlobLedger.upload` takes `UploadContent`: buffered, `stream` or `copy`): a
+    stream is tapped with the incremental CRC-64/NVME and its length counted (a stream longer
+    or shorter than its `contentLength`, a chunk that is not a `Uint8Array`, or its own failure
+    → `SourceFailed`, the source's error as cause); `request.checksum` resolves at its end; the
+    metadata builder gets a zero checksum (§4.6 records one only for compressed json); a put
+    that succeeds before its body ended is refused and rolled back. **Single use** is a
+    module-level weak map keyed by the caller's `Stream` value: the same upload again (same
+    ledger, store and key — a retried or re-planned request) awaits its pointer; another key,
+    a later operation, or a reuse after its upload failed is `[EDD-9120]`. `OffloadWrite.route`
+    checks an item's streams — duplicates within it, and the ledger's `streamRefusal` — before
+    any of its uploads starts. **Copies**: the store's `copy` when the resolver built the
+    handle over this same store (`BlobResolver.lazyBinary` records each external handle's
+    store) and it names a version; otherwise `handle.stream()` (verified, for an external
+    handle) is streamed into a `put`. The copy is memoised by key, source ref (or an inline
+    handle's checksum), size and content type; its pointer records the handle's checksum; its
+    answer is checked as a put's (`checkAnswer` names the action), and an answer naming the
+    copy's own source is `Unknown` (`answerRefused`, never deleted). A put failure with
+    `completeLost` is reported at exit. Streams and copies seed no read cache (their content
+    is never in hand). Upload errors widen to `BlobStoreError | ValidationError` (buffered
+    content stays `BlobStoreError`, by overload). **Multipart driver**
+    (`internal/Multipart.ts`, which commit 15's S3 store speaks): re-chunks into exact parts,
+    the last marked only after the body **ended** — an explicit end marker, since Effect's
+    `zipWithNext` and `mapAccum`'s `onHalt` also fire when a stream fails, which would mark a
+    truncated body's last part complete; one `single` call for at most one part, else
+    `create` (once, uninterruptible, so the finalizer always knows the upload), parts at the
+    store's concurrency and `complete`, with `abort` in an uninterruptible finalizer on any
+    failure or interruption (a failed abort is logged); `partSizeFor` is §7's rule. **Content
+    type** (§4.4): the source's, else the field's `External` one — for a handle too, never the
+    handle's own. **Immutables**: a binary immutable restated by a handle compares by the
+    handle's checksum and size (`OffloadWrite.matchesChecksum` for a pointer,
+    `bytesMatch` for a native `B` value) and, passing, is dropped from the write; no copy and
+    no fetch. **Projection reuse** never matches a stream's or handle's placeholder, nor a
+    source whose content type differs from the read pointer's. **Types**:
+    `WithBinaryInput<T, TOffload>` (`internal/OffloadTypes.ts`, the identity without binary
+    fields or for `any`) widens each binary field to `BinaryInput`, optionality kept, on
+    `put` / `create` / `upsert` inputs, update and patch payloads (`U` and the member `set`),
+    `append` inputs, their bound counterparts, and `Entity.Input` / `Create` / `Update`. Unit
+    tests: `test/Offload.stream.test.ts` (single PUT and multipart agree on the checksum,
+    part-size adaptation, interruption aborts, a retried part, `SourceFailed` and a wrong
+    `contentLength`, a chunk that is not a `Uint8Array`, a put that succeeds before its body
+    ended (refused, rolled back), a streamed upload past `maxUploadAge` (`Expired`, rolled back),
+    a stream's version rolled back when DynamoDB refuses the create (reuse `[EDD-9120]`), a
+    failed put then `[EDD-9120]` on reuse, a lost `Complete` reported,
+    buffered multipart; handles copied with and without `copy` and across stores, the copy's
+    answer checked — its source refused, an over-long version rolled back — and an immutable
+    restated by a handle or a stream; `Offload.source` content types and option checks, wrong
+    shapes, a stream to two fields, to a later operation and to two items of a `Batch.write`, a
+    retried batch request reusing its upload, and streams through update, upsert and append),
+    `test/Multipart.test.ts` (re-chunking, the end marker, abort and its logged failure),
+    `test/BlobStore.test.ts` (the memory store's multipart options, phases, retries, `TooLarge`,
+    lost completion and interruption); type tests in `test/Entity.offload.types.test.ts`;
+    `test/connected.entity-offload.test.ts` gains a multipart stream, single use, a source
+    failure and a handle copy against DynamoDB Local.
+    *Deviations (commit 10):*
+    - `BlobStoreFailure` gains `completeLost` (§12.1): a store must say that a failed put may
+      have completed, which the ledger cannot infer from the contract as written. That flag is
+      the only way a store reports a lost completion: commit 6's `reportCompleteLost` is
+      removed (the S3 store of commit 15 sets the flag and calls nothing — calling both would
+      report the same version to the observer twice), and item 6's note says so.
+    - Content types are **printable** US-ASCII (0x20–0x7e), not any US-ASCII: a control
+      character (CR, LF, NUL…) cannot travel in an HTTP header, so a per-write
+      `Offload.source` content type carrying one would pass the check and fail on S3 with an
+      opaque transport error. `Offload.source` (`[EDD-9120]`), `External` (`[EDD-9141]`, §3.2)
+      and the memory store's `put` / `copy` (`Rejected`, §12.3) all apply the rule. The
+      pointer codec still reads any US-ASCII content type (every writer is checked).
+    - A handle is copied with the store's `copy` only when it was read through the **same**
+      store; a handle from another store, or an inline one, streams its content into a `put`
+      (§3.8 named only "no `copy`": a server-side copy cannot reach another store).
+    - A copy whose answer names its own source is refused and never deleted — §6.2's
+      `Unknown` rule extended to copies (deleting it would delete the copied version).
+    - An immutable binary field restated by a `Stream` is refused (`[EDD-9120]`): its content
+      cannot be compared with the stored value without consuming it, and §6.5 had no case for
+      it. One restated by a handle compares by checksum and size only.
+    - A stream's or a handle's field is not checked by the field's own schema (its content is
+      not in hand before the upload); `Offload.source(bytes)` bytes are.
+    - §19.2's Entity bullet (a `Stream` given to two fields of one put, or to a later
+      operation) is tested in `test/Offload.stream.test.ts` with the streaming tests; the
+      stubbed-`S3Client.send` half of the streaming tests is commit 15's (the S3 store).
+    - The memory store's multipart options and hook phases (§12.3) were not in §12.3's list.
+      Phases are asked as their own action, `"multipart"`, so a hook keyed on
+      `action === "put"` keeps its meaning; a put-level request fault on a multipart body fires
+      after the body ends, before completion (its parts are aborted).
+    - §3.8 and §6.5 now state the handle and stream rules above (copy through the same store
+      only; an immutable compared by a handle's checksum and size; a `Stream` immutable
+      refused); §14.3's `EDD-9120` row names the files that raise it and the refusals this
+      commit added.
+    *Debt fixed (commit 10):* `validateAndBuildPutItem` duplicated `Entity.put`'s
+    encode-or-decode-then-encode and reported the fallback's error rather than the first
+    encode's (whose message is keyed on the caller's input shape); it now encodes through the
+    entity's `_encodeInput` (one implementation; its `operation` unchanged). The member
+    `set` dual (`Docs.set(...)`) dropped the update's trailing offload state from its type, so
+    piping it into an offloading entity's `update` did not type-check; it now carries it, as
+    `Entity.set` does.
+    *Port onto 1.42.2 (commit 10):* main decides a write input's stored form in one place
+    (`internal/InputForm.ts`, `encodeInput`) and checks every entity write in one function
+    (`encodeForWrite`: a value that wouldn't read back, `EDD-9126`, and a key value read back as
+    the other numeric kind, `EDD-9128`). The port folds this commit's entity-local encode into
+    `encodeForWrite` (a placeholder field left unchecked through `withOpaque`, then
+    `OffloadInput.carry`) instead of adding a second encode, so `_encodeInput` is `prepareInput`
+    then `encodeForWrite`. `validateAndBuildPutItem` encodes through `_encodeInput`, which runs
+    those checks, so the separate `_refuseNotReadBack` hook is gone, and a refusal on a
+    transaction's or a batch's put now carries the domain form's issue, as `Entity.put`'s does.
+    `upsert` prepares its input before main's `createdAt` and guarded-path decisions read it,
+    and PartiQL `insert()` (1.41.0) takes a `BinaryInput` for a binary field, as `put` does.
+    The stream tests' schema sets `escapeKeys: true`.
 11. **Aggregates** — diff first, route + upload after `buildDynamoItems` on stored attributes,
     no read-pointer reuse, per-group settlement, eager assembly, `AggregateType` error
     parameter. (The aggregate-edge interleaving of §19 is item 16's: it needs the reaper.)

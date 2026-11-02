@@ -32,12 +32,21 @@ export class BlobStoreFailure extends Data.TaggedError("BlobStoreFailure")<{
   readonly reason: BlobStoreReason
   /** The object version involved, when there is one. */
   readonly ref?: BlobRef | undefined
+  /**
+   * A `put` whose multipart upload may have completed although its response
+   * was lost (a `CompleteMultipartUpload` that failed without an answer, or
+   * whose retry found no upload): a version may exist that no ref names. The
+   * library reports the requested key to the observer (`completeLost`) for
+   * `gc.sweep`.
+   */
+  readonly completeLost?: boolean | undefined
   /** The store's own error (for the S3 store, the SDK error). */
   readonly cause: unknown
 }> {
   constructor(fields: {
     readonly reason: BlobStoreReason
     readonly ref?: BlobRef | undefined
+    readonly completeLost?: boolean | undefined
     readonly cause: unknown
   }) {
     super(fields)

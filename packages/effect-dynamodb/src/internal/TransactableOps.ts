@@ -26,7 +26,6 @@ import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshall
 import { resolveTtlAttributeName, type TableConfig, tableKeyAttributes } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
 import type { PutKind, ReturnValuesMode, UpdateState } from "./EntityOps.js"
-import { encodeInput } from "./InputForm.js"
 import { DEFAULT_MODES, type Modes } from "./OffloadRead.js"
 
 /**
@@ -1256,22 +1255,11 @@ export const validateAndBuildPutItem = (
     // Clock-backed time source resolved once per op; threaded into the sync
     // timestamp builder so the value is deterministic under `TestClock`.
     const now = yield* DateTime.now
-    const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
-    // The input's stored form, decided as `Entity.put` decides it (`InputForm`).
-    // Omitted decoding defaults are stored, exactly as `Entity.put` does.
+    // Omitted decoding defaults are stored, and the input encoded, exactly
+    // as `Entity.put` does (binary inputs included, #179).
     const filled = yield* entity._fillDecodingDefaults(input)
     const unsentineled = entity._unsentineledDefaults(input)
-    const encoded = yield* encodeInput(inputSchema, filled).pipe(
-      Effect.mapError(
-        ({ stored }) =>
-          new ValidationError({
-            entityType: entity.entityType,
-            operation,
-            cause: stored,
-          }),
-      ),
-    )
-    yield* entity._refuseNotReadBack(encoded, operation)
+    const encoded = yield* entity._encodeInput(filled, operation)
 
     const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType

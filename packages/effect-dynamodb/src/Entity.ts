@@ -196,9 +196,15 @@ import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
+import * as OffloadInput from "./internal/OffloadInput.js"
 import * as OffloadRead from "./internal/OffloadRead.js"
-import type { DeleteOpStateOf, OpStateOf, StateOf } from "./internal/OffloadTypes.js"
-import { isOffloadedValue } from "./internal/OffloadValues.js"
+import type {
+  DeleteOpStateOf,
+  OpStateOf,
+  StateOf,
+  WithBinaryInput,
+} from "./internal/OffloadTypes.js"
+import { type BlobHandle, isOffloadedValue } from "./internal/OffloadValues.js"
 import * as OffloadWrite from "./internal/OffloadWrite.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
@@ -874,11 +880,12 @@ const encodeOrDecodeEncode = (
   input: unknown,
   entityType: string,
   operation: string,
+  /** The failure's `operation`; default `${operation}.decode`. */
+  errorOperation: string = `${operation}.decode`,
 ): Effect.Effect<unknown, ValidationError> =>
   encodeInput(schema, input).pipe(
     Effect.mapError(
-      ({ domain }) =>
-        new ValidationError({ entityType, operation: `${operation}.decode`, cause: domain }),
+      ({ domain }) => new ValidationError({ entityType, operation: errorOperation, cause: domain }),
     ),
   )
 
@@ -1263,16 +1270,6 @@ export interface Entity<
   /** @internal Fill omitted decoding-default fields of a put's input (see `put`). */
   readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
   /**
-   * Refuses an encoded payload holding a value of a custom declaration that wouldn't read back
-   * (`EDD-9126`), or a key value of a field taking both numeric kinds that reads back as the other
-   * (`EDD-9128`). For a write path outside this entity's own operations.
-   * @internal
-   */
-  readonly _refuseNotReadBack: (
-    encoded: unknown,
-    operation: string,
-  ) => Effect.Effect<void, ValidationError>
-  /**
    * @internal The schema a put written whole composes its keys under (#242, `EDD-9162`): an object
    * composing `[object Object]` into a key it composes is refused where it's composed.
    */
@@ -1285,6 +1282,20 @@ export interface Entity<
     under: DynamoSchema.DynamoSchema,
     record: globalThis.Record<string, unknown>,
   ) => void
+
+  /**
+   * @internal Encode a put input through `inputSchema` exactly as `put` does,
+   * for the batch, transaction and projection write paths: its binary inputs
+   * replaced by their placeholders first (#179, design §3.8 — `[EDD-9120]`
+   * for an unusable one), then through `encodeForWrite`: the input's stored
+   * form (`InputForm`), refusing a value that wouldn't read back (`EDD-9126`)
+   * and a key value read back as the other numeric kind (`EDD-9128`). A
+   * failure carries the domain form's issue, under `operation`.
+   */
+  readonly _encodeInput: (
+    input: unknown,
+    operation: string,
+  ) => Effect.Effect<unknown, ValidationError>
 
   /** @internal Unique fields a put's input leaves to an index-stored default. */
   readonly _unsentineledDefaults: (input: unknown) => ReadonlyArray<string>
@@ -1544,9 +1555,12 @@ export interface Entity<
    * `OptimisticLockError` (versioned) or `ConcurrentModification`.
    */
   readonly put: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => EntityPut<
     View<ModelType<TModel>, TOffload>,
@@ -1578,7 +1592,10 @@ export interface Entity<
   ) => EntityUpdate<
     View<ModelType<TModel>, TOffload>,
     View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned> &
+    WithBinaryInput<
+      EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+      TOffload
+    > &
       Removable<RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>>,
     | DynamoClientError
     | TransactionOverflow
@@ -1628,9 +1645,12 @@ export interface Entity<
    * version retained for the key, to continue after it).
    */
   readonly create: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => EntityPut<
     View<ModelType<TModel>, TOffload>,
@@ -1663,9 +1683,12 @@ export interface Entity<
    * Offloaded fields are uploaded first, as `put` uploads them (#179).
    */
   readonly insert: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => EntityInsert<
     View<ModelType<TModel>, TOffload>,
@@ -1696,7 +1719,10 @@ export interface Entity<
   ) => EntityUpdate<
     View<ModelType<TModel>, TOffload>,
     View<EntityRecordType<TModel, TTimestamps, TVersioned>, TOffload>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned> &
+    WithBinaryInput<
+      EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+      TOffload
+    > &
       Removable<RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>>,
     | DynamoClientError
     | TransactionOverflow
@@ -1757,9 +1783,12 @@ export interface Entity<
    * attempt is an `OptimisticLockError` (versioned) or `ConcurrentModification`.
    */
   readonly upsert: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => EntityPut<
     View<ModelType<TModel>, TOffload>,
@@ -1905,7 +1934,7 @@ export interface Entity<
   readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
     ? {
         (
-          input: AppendInputType<TAI>,
+          input: WithBinaryInput<AppendInputType<TAI>, TOffload>,
           condition?: Expr | ConditionInput,
           skipFollowUp?: false,
           removeAttrs?: ReadonlyArray<
@@ -1930,7 +1959,7 @@ export interface Entity<
           DynamoClient | TableConfig
         >
         (
-          input: AppendInputType<TAI>,
+          input: WithBinaryInput<AppendInputType<TAI>, TOffload>,
           condition: Expr | ConditionInput | undefined,
           skipFollowUp: true,
           removeAttrs?: ReadonlyArray<
@@ -1995,12 +2024,20 @@ export interface Entity<
    */
   readonly set: {
     (
-      updates: EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
-    ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-    <A, Rec, U, E, R>(
-      self: EntityUpdate<A, Rec, U, E, R>,
-      updates: EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
-    ): EntityUpdate<A, Rec, U, E, R>
+      updates: WithBinaryInput<
+        EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+        TOffload
+      >,
+    ): <A, Rec, U, E, R, O extends OffloadState>(
+      self: EntityUpdate<A, Rec, U, E, R, O>,
+    ) => EntityUpdate<A, Rec, U, E, R, O>
+    <A, Rec, U, E, R, O extends OffloadState>(
+      self: EntityUpdate<A, Rec, U, E, R, O>,
+      updates: WithBinaryInput<
+        EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+        TOffload
+      >,
+    ): EntityUpdate<A, Rec, U, E, R, O>
   }
 
   /**
@@ -2254,9 +2291,12 @@ export interface BoundEntity<
    * ```
    */
   readonly put: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
@@ -2280,9 +2320,12 @@ export interface BoundEntity<
    * primary key already exists. Returns a fluent {@link BoundPut}.
    */
   readonly create: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
@@ -2311,9 +2354,12 @@ export interface BoundEntity<
    * Offloaded fields are uploaded first, as `put` uploads them (#179).
    */
   readonly insert: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => import("./internal/BoundCrud.js").BoundInsert<
     View<ModelType<TModel>, TOffload>,
@@ -2343,7 +2389,10 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
     View<ModelType<TModel>, TOffload>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+    WithBinaryInput<
+      EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+      TOffload
+    >,
     | DynamoClientError
     | TransactionOverflow
     | ItemNotFound
@@ -2396,9 +2445,12 @@ export interface BoundEntity<
    * composite) reads the item once and creates or updates it.
    */
   readonly upsert: (
-    input: WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    input: WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >,
   ) => import("./internal/BoundCrud.js").BoundPut<
     ModelType<TModel>,
@@ -2432,7 +2484,10 @@ export interface BoundEntity<
   ) => import("./internal/BoundCrud.js").BoundUpdate<
     ModelType<TModel>,
     View<ModelType<TModel>, TOffload>,
-    EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+    WithBinaryInput<
+      EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>,
+      TOffload
+    >,
     | DynamoClientError
     | TransactionOverflow
     | ItemNotFound
@@ -2595,7 +2650,7 @@ export interface BoundEntity<
    */
   readonly append: [TTimeSeries] extends [TimeSeriesConfig<infer TAI extends Schema.Top>]
     ? (
-        input: AppendInputType<TAI>,
+        input: WithBinaryInput<AppendInputType<TAI>, TOffload>,
       ) => import("./internal/BoundCrud.js").BoundAppend<
         ModelType<TModel>,
         { readonly current: View<ModelType<TModel>, TOffload> },
@@ -4635,16 +4690,33 @@ const makeImpl = <
     schema: Schema.Codec<any>,
     input: unknown,
     operation: string,
+    errorOperation?: string,
   ): Effect.Effect<unknown, ValidationError> => {
-    const encoded = encodeOrDecodeEncode(schema, input, entityType, operation)
+    // A binary field holding a stream's or a handle's placeholder (a prepared
+    // input, `prepareInput`) is not checked by its schema: its content is not
+    // in hand before the upload (#179, design §3.8); `Offload.source(bytes)`
+    // bytes are. The placeholder is carried into the encoded value.
+    const opaque =
+      inputFields === undefined ? [] : OffloadInput.opaqueFields(input, inputFields.binary)
+    const encoded = encodeOrDecodeEncode(
+      opaque.length === 0 ? schema : withOpaque(schema, opaque),
+      input,
+      entityType,
+      operation,
+      errorOperation,
+    )
     const readBack =
       readBacks.size === 0
         ? encoded
         : encoded.pipe(Effect.tap((value) => refuseNotReadBack(value, operation)))
     const reads = operation === "append" ? kindReads().append : kindReads().model
-    return reads.size === 0
-      ? readBack
-      : readBack.pipe(Effect.tap((value) => refuseOtherKindRead(value, operation, reads)))
+    const checked =
+      reads.size === 0
+        ? readBack
+        : readBack.pipe(Effect.tap((value) => refuseOtherKindRead(value, operation, reads)))
+    return inputFields === undefined
+      ? checked
+      : Effect.map(checked, (out) => OffloadInput.carry(input, out, inputFields.binary))
   }
 
   /**
@@ -5507,6 +5579,11 @@ const makeImpl = <
      * from the write.
      */
     readonly offloaded: "overflow" | "binary" | undefined
+    /**
+     * A binary field restated by a `BlobHandle` (#179, design §3.8): compared
+     * by the handle's checksum and size, its content never fetched.
+     */
+    readonly handle?: BlobHandle | undefined
   }
 
   /**
@@ -5522,7 +5599,22 @@ const makeImpl = <
     for (const field of immutableFields) {
       // Read twice, as 1.40.0 read it.
       if (given(record, field) === undefined) continue
-      const encoded = encodePathValue([field], given(record, field), "value")
+      const restated = given(record, field)
+      // A binary input's placeholder (#179, design §3.8): a stream's content
+      // is not in hand without consuming it; a handle's is its checksum.
+      const prepared = OffloadInput.preparedOf(restated)
+      if (prepared?._tag === "Stream") {
+        return (
+          `[EDD-9120] Entity "${entityType}": .set() of immutable binary field "${field}" ` +
+          "restates it with a Stream, whose content cannot be compared with the stored value " +
+          "without consuming it. Restate it with its bytes or a BlobHandle, or leave it out."
+        )
+      }
+      const handle = prepared?._tag === "Handle" ? prepared.handle : undefined
+      const encoded =
+        handle === undefined
+          ? encodePathValue([field], restated, "value")
+          : { encoded: restated, issue: undefined }
       if (encoded.issue !== undefined) {
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }
@@ -5539,6 +5631,7 @@ const makeImpl = <
           : Object.hasOwn(data.externalFields, field)
             ? "binary"
             : undefined,
+        handle,
       })
     }
     return out
@@ -5581,6 +5674,13 @@ const makeImpl = <
       const pointer = OffloadWrite.pointerOf(offloadInfo, asserted.attr, raw[asserted.attr])
       if (pointer === undefined) return undefined
       if (asserted.offloaded === "binary") {
+        if (asserted.handle !== undefined) {
+          return OffloadWrite.matchesChecksum(
+            pointer,
+            asserted.handle.checksum,
+            asserted.handle.size,
+          )
+        }
         return (
           asserted.wire instanceof Uint8Array && OffloadWrite.matchesPointer(pointer, asserted.wire)
         )
@@ -5627,8 +5727,15 @@ const makeImpl = <
           continue
         }
         if (!packed) {
-          // A binary value stored natively (before the field was `External`).
-          if (!attributeValueEquals(storedValue, value)) return immutableChangedMessage(field)
+          // A binary value stored natively (before the field was `External`);
+          // a handle restating it compares by checksum and size.
+          const { handle } = immutable
+          const same =
+            handle === undefined
+              ? attributeValueEquals(storedValue, value)
+              : storedValue.B !== undefined &&
+                OffloadWrite.bytesMatch(storedValue.B, handle.checksum, handle.size)
+          if (!same) return immutableChangedMessage(field)
           continue
         }
         const raw = fromAttributeMap({ [attr]: storedValue }) as globalThis.Record<string, unknown>
@@ -5838,6 +5945,58 @@ const makeImpl = <
 
   /** Domain name → `External` config of every binary field. */
   const binaryFields: Readonly<globalThis.Record<string, ExternalConfig>> = data.externalFields
+
+  /**
+   * The offloaded fields a write input may hold a stream, handle or source on
+   * (#179, design §3.8): `undefined` when the entity offloads nothing.
+   */
+  const inputFields: OffloadInput.InputFields | undefined =
+    offloadInfo === undefined
+      ? undefined
+      : {
+          entityType,
+          binary: Object.keys(data.externalFields),
+          overflow: Object.keys(data.overflowFields),
+        }
+
+  /**
+   * A write input with every binary input that is not a `Uint8Array` (a
+   * stream, a handle, `Offload.source(...)`) replaced by its placeholder, and
+   * an unusable one refused (`[EDD-9120]`). Idempotent; the input itself when
+   * the entity has no offloaded field.
+   */
+  const prepareInput = (
+    input: unknown,
+    operation: string,
+  ): Effect.Effect<unknown, ValidationError> =>
+    inputFields === undefined
+      ? Effect.succeed(input)
+      : OffloadInput.prepare(input, inputFields, operation)
+
+  /** `schema` with each of `opaque` (fields holding a stream's or handle's placeholder) left unchecked. */
+  const opaqueVariants = new Map<Schema.Codec<any>, Map<string, Schema.Codec<any>>>()
+  const withOpaque = (
+    schema: Schema.Codec<any>,
+    opaque: ReadonlyArray<string>,
+  ): Schema.Codec<any> => {
+    const fields = (schema as { readonly fields?: Schema.Struct.Fields }).fields
+    if (fields === undefined) return schema
+    let variants = opaqueVariants.get(schema)
+    if (variants === undefined) {
+      variants = new Map()
+      opaqueVariants.set(schema, variants)
+    }
+    const id = opaque.join("\u0000")
+    let variant = variants.get(id)
+    if (variant === undefined) {
+      variant = Schema.Struct({
+        ...fields,
+        ...Object.fromEntries(opaque.map((field) => [field, Schema.Unknown])),
+      }) as unknown as Schema.Codec<any>
+      variants.set(id, variant)
+    }
+    return variant
+  }
 
   /** The row of a stored-name item an operation's uploads are for (its live key). */
   const offloadRow = (
@@ -10310,7 +10469,10 @@ const makeImpl = <
           // so this keeps the bound `put` at `R = never`. The filled id then
           // flows through input validation → key composition → stored item →
           // returned record in this same pass.
-          const withGeneratedId = yield* fillGeneratedId(input)
+          // Binary inputs (#179, design §3.8): streams, handles and sources
+          // become their placeholders before anything reads the input.
+          const prepared = yield* prepareInput(input, operation)
+          const withGeneratedId = yield* fillGeneratedId(prepared)
           const unsentineled = unsentineledDefaults(withGeneratedId)
           const inputWithGeneratedId = yield* fillDecodingDefaults(withGeneratedId)
 
@@ -10794,8 +10956,14 @@ const makeImpl = <
       }
       // Removing a defaulted index composite re-materialises its default —
       // stored, keys recomposed from it — as a put that omits it does (#133).
-      const { state: uState, defaulted: removedToDefault } =
+      const { state: rematerialized, defaulted: removedToDefault } =
         yield* rematerializeRemovedDefaults(normalized)
+      // Binary inputs (#179, design §3.8) become their placeholders.
+      const preparedUpdates = yield* prepareInput(rematerialized.updates, "update")
+      const uState: UpdateState =
+        preparedUpdates === rematerialized.updates
+          ? rematerialized
+          : { ...rematerialized, updates: preparedUpdates as UpdateState["updates"] }
       const refusedSet = refusedRecordSet(uState.updates, key)
       if (refusedSet !== undefined) {
         return yield* new ValidationError({
@@ -14649,10 +14817,12 @@ const makeImpl = <
           })
     })
 
-  const upsert = (input: unknown) =>
+  const upsert = (rawInput: unknown) =>
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
+          // Binary inputs (#179, design §3.8) become their placeholders.
+          const input = yield* prepareInput(rawInput, "upsert")
           const lacks = writeLacks()
           // A primary key over `createdAt` the input doesn't supply names no item that exists yet.
           if (
@@ -15100,7 +15270,7 @@ const makeImpl = <
           return yield* decodeWritten(raw, result.Attributes, mode, "upsert")
         }),
       self,
-      input as globalThis.Record<string, unknown>,
+      rawInput as globalThis.Record<string, unknown>,
       undefined,
       undefined,
       // Tagged so the transact/batch compilers can refuse it: this op is an
@@ -15333,7 +15503,12 @@ const makeImpl = <
       // Encode user input via appendInputSchema (see `put` for strategy).
       const encodedInput = yield* encodeForWrite(
         appendInputSchema,
-        removedToDefault.length === 0 ? input : { ...(input as object), ...(defaulted as object) },
+        yield* prepareInput(
+          removedToDefault.length === 0
+            ? input
+            : { ...(input as object), ...(defaulted as object) },
+          "append",
+        ),
         "append",
       )
       const encoded = encodedInput as globalThis.Record<string, unknown>
@@ -21559,13 +21734,10 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
-    _refuseNotReadBack: (encoded: unknown, operation: string) =>
-      kindReads().model.size === 0
-        ? refuseNotReadBack(encoded, operation)
-        : Effect.andThen(
-            refuseNotReadBack(encoded, operation),
-            refuseOtherKindRead(encoded, operation),
-          ),
+    _encodeInput: (input: unknown, operation: string) =>
+      Effect.flatMap(prepareInput(input, operation), (prepared) =>
+        encodeForWrite(schemas.inputSchema as Schema.Codec<any>, prepared, operation, operation),
+      ),
     _ownSchema: () => ownSchema(),
     _composeUniqueSentinels: (
       under: DynamoSchema.DynamoSchema,
@@ -21833,9 +22005,12 @@ export const bind = <
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     type Key = EntityKeyType<TModel, TIndexes, TRefs>
-    type Input = WithGeneratedId<
-      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
-      TGeneratedId
+    type Input = WithBinaryInput<
+      WithGeneratedId<
+        EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+        TGeneratedId
+      >,
+      TOffload
     >
 
     // The path builder every callback of the binding gets (`pathBuilderOf`), so `.entry(key)`
@@ -22665,6 +22840,9 @@ export type Read<
  *
  * `Entity.Input<typeof Users>` = model fields only
  * `Entity.Input<typeof TeamPlayerSelection>` = `{ teamId: string, playerId: string, ... }`
+ *
+ * A binary field (`DynamoModel.External()`) takes any `Offload.BinaryInput`
+ * (#179): its bytes, a `Stream` of them, a `BlobHandle` or `Offload.source(...)`.
  */
 export type Input<E extends { readonly model: Schema.Top }> =
   E extends Entity<
@@ -22684,8 +22862,8 @@ export type Input<E extends { readonly model: Schema.Top }> =
     infer _Un extends string,
     infer _O extends OffloadFields
   >
-    ? EntityRefInputType<M, R>
-    : EntityInputType<E["model"]>
+    ? WithBinaryInput<EntityRefInputType<M, R>, OffloadFieldsOf<E>>
+    : WithBinaryInput<EntityInputType<E["model"]>, OffloadFieldsOf<E>>
 
 /**
  * Extract the create type from an Entity — input fields minus the identifier.
@@ -22712,8 +22890,14 @@ export type Create<E extends { readonly model: Schema.Top; readonly indexes: any
     infer _Un extends string,
     infer _O extends OffloadFields
   >
-    ? EntityRefCreateType<M, I, R, Id extends string ? Id : undefined>
-    : Omit<EntityInputType<E["model"]>, PrimaryKeyComposites<E["indexes"]>>
+    ? WithBinaryInput<
+        EntityRefCreateType<M, I, R, Id extends string ? Id : undefined>,
+        OffloadFieldsOf<E>
+      >
+    : WithBinaryInput<
+        Omit<EntityInputType<E["model"]>, PrimaryKeyComposites<E["indexes"]>>,
+        OffloadFieldsOf<E>
+      >
 
 /**
  * Extract the update type from an Entity. Ref-aware: when refs are present,
@@ -22739,8 +22923,8 @@ export type Update<E extends { readonly model: Schema.Top; readonly indexes: any
     infer _Un extends string,
     infer _O extends OffloadFields
   >
-    ? EntityRefUpdateType<M, I, R>
-    : EntityUpdateType<E["model"], E["indexes"]>
+    ? WithBinaryInput<EntityRefUpdateType<M, I, R>, OffloadFieldsOf<E>>
+    : WithBinaryInput<EntityUpdateType<E["model"], E["indexes"]>, OffloadFieldsOf<E>>
 
 /**
  * Extract the key type from an Entity.

@@ -11,7 +11,8 @@
  *   the contract's path for stores without versioning (§12.4).
  * - **Like S3.** Uploads are validated as S3 validates them: the body against
  *   the request's CRC-64/NVME (`ChecksumMismatch`) and its `contentLength`,
- *   keys up to 1,024 bytes, user metadata US-ASCII within 2 KB (`Rejected`).
+ *   keys up to 1,024 bytes, a content type and user metadata of printable
+ *   US-ASCII, the metadata within 2 KB (`Rejected`).
  *   Metadata keys are stored lowercased. Ranged reads honour offsets; a range
  *   starting past the end is `Rejected`. Listings are in UTF-8 key order,
  *   versions newest first.
@@ -19,13 +20,27 @@
  *   the calling fiber (or the `clock` option), so `TestClock` drives
  *   `lastModified` — GC and `maxUploadAge` tests — and `Random.withSeed`
  *   makes version ids reproducible.
+ * - **Multipart, simulated.** A `put` runs the multipart driver S3's does
+ *   (`Multipart.upload`, design §7): a body of at most `partSize` bytes is one
+ *   upload, a longer one is created, uploaded in parts of exactly `partSize`
+ *   bytes (raised for a known `contentLength` past `maxParts` parts) at
+ *   `uploadConcurrency`, and completed — or aborted on any failure or
+ *   interruption. A part failing with `Throttled` / `Unavailable` is retried
+ *   (`partAttempts`), as the SDK retries one; part `maxParts + 1` is
+ *   `TooLarge`. Unlike S3, any part size is allowed, so tests exercise
+ *   multipart with small bodies.
  * - **Fault injection.** `failures` is asked about every call, numbered per
  *   action, and may fail it with a reason or interrupt it, before it takes
  *   effect or after (a lost response), or part-way through a stream. A lost
  *   `put` or `copy` response names the version it stored — a test
  *   convenience an S3 store cannot offer, which no settlement may rely on.
+ *   It is also asked about each phase of a multipart upload (create, every
+ *   part attempt, complete, abort) as its own action, `"multipart"`, with the
+ *   put's `n` — so a hook keyed on `action === "put"` sees only the put; a
+ *   lost `complete` response fails the put with `completeLost` and no ref, as
+ *   S3's does.
  * - **Inspection.** `inspect()` returns the stored versions (bytes, metadata,
- *   marks) and the number of calls per action.
+ *   marks), the number of calls per action, and the multipart calls.
  *
  * Not part of the public API (`BlobStore.memory` is).
  */
@@ -54,6 +69,7 @@ import {
   invalid,
   utf8Bytes,
 } from "./BlobStoreContract.js"
+import * as Multipart from "./Multipart.js"
 
 // ---------------------------------------------------------------------------
 // Options
@@ -61,8 +77,17 @@ import {
 
 /** A call the memory store is about to serve, as its `failures` hook sees it. */
 export interface MemoryBlobCall {
-  readonly action: BlobStoreAction
-  /** 1-based: this is the `n`-th call of `action` on this store. */
+  /**
+   * The store action, or `"multipart"` for a phase of a `put`'s multipart
+   * upload (`multipart` says which): a hook keyed on `action === "put"` sees
+   * each put once, never its phases.
+   */
+  readonly action: BlobStoreAction | "multipart"
+  /**
+   * 1-based: this is the `n`-th call of `action` on this store — for a
+   * `"multipart"` phase, the `n` of the put it belongs to (phases are not
+   * counted in `calls`).
+   */
   readonly n: number
   /** `put` / `copy`: the requested key; `list`: the prefix. */
   readonly key?: string | undefined
@@ -72,15 +97,36 @@ export interface MemoryBlobCall {
   readonly refs?: ReadonlyArray<BlobRef> | undefined
   /** `mark`: which of the marks operations. */
   readonly mark?: "get" | "set" | "clear" | undefined
+  /**
+   * `"multipart"` only: the phase of the put's multipart upload — `create`, a
+   * `part` (its number and 1-based attempt), `complete` or `abort`. A
+   * `complete` fault `at: "response"` stores the version, then fails the put
+   * with `completeLost` and no ref. A `create` fault `at: "response"` opens an
+   * upload the put never learns of: it stays `inProgress`, as an S3 upload
+   * whose create response was lost stays until a lifecycle
+   * `AbortIncompleteMultipartUpload` rule aborts it.
+   */
+  readonly multipart?:
+    | {
+        readonly phase: "create" | "part" | "complete" | "abort"
+        readonly part?: number | undefined
+        readonly attempt?: number | undefined
+      }
+    | undefined
 }
+
+/** A store call, as `begin` counts it (a multipart phase is asked directly). */
+type StoreCall = Omit<MemoryBlobCall, "n" | "action"> & { readonly action: BlobStoreAction }
 
 /**
  * A fault to inject into a call.
  *
  * - `at: "request"` (default): the call fails (or is interrupted) **without
  *   taking effect** — a `put` first consumes `afterChunks` body chunks (default:
- *   the whole body, so a single-use stream is drained), a `get` or `list`
- *   first emits `afterChunks` items (default none).
+ *   the whole body, so a single-use stream is drained), then fails before it
+ *   completes: a multipart body's parts may already be uploaded, and the
+ *   upload is aborted; a `get` or `list` first emits `afterChunks` items
+ *   (default none).
  * - `at: "response"`: the call **takes effect**, then its response is lost —
  *   an upload is stored (or a version deleted) and the caller sees the
  *   failure; a `get` or `list` emits everything, then fails. A `put` or
@@ -123,6 +169,18 @@ export interface MemoryBlobStoreOptions {
   readonly writeConcurrency?: number | undefined
   /** Bytes per chunk a `get` emits (default 65,536). */
   readonly readChunkBytes?: number | undefined
+  /**
+   * Bytes per part of a multipart upload (default 8 MiB); a body of at most
+   * this many bytes is one upload. Any positive integer: unlike S3, no 5 MiB
+   * floor, so tests exercise multipart with small bodies.
+   */
+  readonly partSize?: number | undefined
+  /** The most parts an upload may have (default 10,000, S3's). */
+  readonly maxParts?: number | undefined
+  /** Parts uploaded at once (default 4). */
+  readonly uploadConcurrency?: number | undefined
+  /** Attempts per part on `Throttled` / `Unavailable`, as the SDK retries (default 3). */
+  readonly partAttempts?: number | undefined
   /** The clock `lastModified` comes from; default the calling fiber's. */
   readonly clock?: Clock.Clock | undefined
   /** Asked about every call; `undefined` lets it run. May be an effect (to pause a call). */
@@ -147,11 +205,22 @@ export interface MemoryBlobVersion {
   readonly mark: Date | undefined
 }
 
+/** The multipart calls a memory store served (attempts included), and the uploads still open. */
+export interface MemoryMultipartSnapshot {
+  readonly creates: number
+  readonly parts: number
+  readonly completes: number
+  readonly aborts: number
+  /** Uploads created and neither completed nor aborted. */
+  readonly inProgress: number
+}
+
 /** What the memory store holds, and how often each action was called. */
 export interface MemoryBlobSnapshot {
   /** Keys ascending (UTF-8 order), versions newest first. */
   readonly versions: ReadonlyArray<MemoryBlobVersion>
   readonly calls: Readonly<Record<BlobStoreAction, number>>
+  readonly multipart: MemoryMultipartSnapshot
 }
 
 /** The in-memory store: every capability, plus {@link MemoryBlobStore.inspect}. */
@@ -173,6 +242,10 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "readConcurrency",
   "writeConcurrency",
   "readChunkBytes",
+  "partSize",
+  "maxParts",
+  "uploadConcurrency",
+  "partAttempts",
   "clock",
   "failures",
 ])
@@ -317,8 +390,9 @@ const notFound = (ref: BlobRef): BlobStoreFailure =>
  *   `"versioned"` / `"keyPerWrite"`; a `prefix` over 256 bytes or starting
  *   with `/`; `presign` not a boolean; `maxVersionBytes` not an integer from
  *   the ids the store makes (32 / 0) to 1,024; `maxUploadAge` outside 1 minute
- *   … 7 days; a concurrency or `readChunkBytes` not a positive integer;
- *   `clock` not a `Clock`; `failures` not a function.
+ *   … 7 days; a concurrency, `readChunkBytes`, `partSize`, `maxParts` or
+ *   `partAttempts` not a positive integer; `clock` not a `Clock`; `failures`
+ *   not a function.
  */
 export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
   if (typeof options !== "object" || options === null) {
@@ -371,6 +445,18 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
     "readChunkBytes",
     options.readChunkBytes ?? DEFAULT_READ_CHUNK_BYTES,
   )
+  const partSize = checkPositiveInteger(
+    WHERE,
+    "partSize",
+    options.partSize ?? Multipart.DEFAULT_PART_SIZE,
+  )
+  const maxParts = checkPositiveInteger(WHERE, "maxParts", options.maxParts ?? Multipart.MAX_PARTS)
+  const uploadConcurrency = checkPositiveInteger(
+    WHERE,
+    "uploadConcurrency",
+    options.uploadConcurrency ?? Multipart.DEFAULT_UPLOAD_CONCURRENCY,
+  )
+  const partAttempts = checkPositiveInteger(WHERE, "partAttempts", options.partAttempts ?? 3)
   const clock = options.clock
   if (
     clock !== undefined &&
@@ -396,20 +482,31 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
     presign: 0,
   }
 
+  const multipart = { creates: 0, parts: 0, completes: 0, aborts: 0 }
+  /** Open multipart uploads: id → their parts by number. */
+  const uploads = new Map<number, Map<number, Uint8Array>>()
+  let nextUpload = 0
+
   const now: Effect.Effect<number> =
     clock === undefined ? Clock.currentTimeMillis : clock.currentTimeMillis
 
-  /** Count the call and ask the hook about it. */
-  const begin = (call: Omit<MemoryBlobCall, "n">): Effect.Effect<MemoryBlobFault | undefined> =>
+  /** Ask the hook about a call. */
+  const ask = (call: MemoryBlobCall): Effect.Effect<MemoryBlobFault | undefined> =>
     Effect.suspend(() => {
-      calls[call.action] += 1
       if (failures === undefined) return Effect.succeed(undefined)
-      const answer = failures({ ...call, n: calls[call.action] })
+      const answer = failures(call)
       return Effect.flatMap(Effect.isEffect(answer) ? answer : Effect.succeed(answer), (fault) =>
         fault === undefined || fault._tag === "Fail" || fault._tag === "Interrupt"
           ? Effect.succeed(fault)
           : Effect.die(new Error(`${WHERE}: failures returned an unknown fault`)),
       )
+    })
+
+  /** Count the call and ask the hook about it. */
+  const begin = (call: StoreCall): Effect.Effect<MemoryBlobFault | undefined> =>
+    Effect.suspend(() => {
+      calls[call.action] += 1
+      return ask({ ...call, n: calls[call.action] })
     })
 
   const trigger = (
@@ -441,7 +538,7 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
    * (default `ref`).
    */
   const call = <A>(
-    info: Omit<MemoryBlobCall, "n">,
+    info: StoreCall,
     ref: BlobRef | undefined,
     body: Effect.Effect<A, BlobStoreFailure>,
     responseRef: (result: A) => BlobRef | undefined = () => ref,
@@ -458,7 +555,7 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
 
   /** Run a stream-shaped call: the fault after `afterChunks` items, or at the end. */
   const streamCall = <A>(
-    info: Omit<MemoryBlobCall, "n">,
+    info: StoreCall,
     ref: BlobRef | undefined,
     items: Effect.Effect<ReadonlyArray<A>, BlobStoreFailure>,
   ): Stream.Stream<A, BlobStoreFailure> =>
@@ -495,8 +592,13 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
   const checkUpload = (request: BlobCopyRequest): BlobStoreFailure | undefined => {
     const keyFailure = checkKey(request.key)
     if (keyFailure !== undefined) return keyFailure
-    if (typeof request.contentType !== "string" || request.contentType.length === 0) {
-      return rejected("contentType must be a non-empty string")
+    if (
+      typeof request.contentType !== "string" ||
+      request.contentType.length === 0 ||
+      !isAsciiPrintable(request.contentType)
+    ) {
+      // An HTTP header carries no control character (CR, LF, NUL…).
+      return rejected("contentType must be a non-empty printable US-ASCII string")
     }
     const metadata = request.metadata as Readonly<Record<string, unknown>> | null | undefined
     if (typeof metadata !== "object" || metadata === null) {
@@ -504,7 +606,7 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
     }
     for (const [key, value] of Object.entries(metadata)) {
       if (key.length === 0 || typeof value !== "string" || !isAsciiPrintable(key + value)) {
-        return rejected(`metadata entry ${JSON.stringify(key)} is not a US-ASCII string`)
+        return rejected(`metadata entry ${JSON.stringify(key)} is not a printable US-ASCII string`)
       }
     }
     const bytes = metadataBytes(metadata as Readonly<Record<string, string>>)
@@ -550,47 +652,170 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
       return { ref: { key, version }, size: bytes.length }
     })
 
-  const put = (request: BlobPutRequest): Effect.Effect<BlobPutResult, BlobStoreFailure> =>
-    Effect.flatMap(begin({ action: "put", key: request.key }), (fault) =>
+  /** The stored body checked as S3 checks one: its length and its CRC-64/NVME. */
+  const checkBody = (
+    request: BlobPutRequest,
+    bytes: Uint8Array,
+  ): Effect.Effect<void, BlobStoreFailure> =>
+    Effect.gen(function* () {
+      if (request.contentLength !== undefined && request.contentLength !== bytes.length) {
+        return yield* rejected(
+          `the body is ${bytes.length} bytes, but contentLength is ${request.contentLength}`,
+        )
+      }
+      const checksum = yield* request.checksum
+      if (checksum.algorithm !== "crc64nvme" || !sameBytes(checksum.value, crc64nvme(bytes))) {
+        return yield* new BlobStoreFailure({
+          reason: "ChecksumMismatch",
+          cause: new Error(`${WHERE}: the body does not match its CRC-64/NVME`),
+        })
+      }
+    })
+
+  const RETRIED: ReadonlySet<BlobStoreReason> = new Set(["Throttled", "Unavailable"])
+
+  /** S3's multipart protocol, simulated, for one put (`n` is its call number). */
+  const protocolOf = (
+    request: BlobPutRequest,
+    n: number,
+  ): Multipart.MultipartProtocol<number, number> => {
+    const phase = (
+      info: NonNullable<MemoryBlobCall["multipart"]>,
+    ): Effect.Effect<MemoryBlobFault | undefined> =>
+      ask({ action: "multipart", n, key: request.key, multipart: info })
+    const part = (
+      id: number,
+      req: Multipart.PartRequest,
+      attempt: number,
+    ): Effect.Effect<number, BlobStoreFailure> =>
       Effect.gen(function* () {
-        const failure = checkUpload(request)
-        if (failure !== undefined) return yield* failure
-        const limit = atRequest(fault) ? fault.afterChunks : undefined
-        const chunks: Array<Uint8Array> = []
-        const take = (chunk: Uint8Array): Effect.Effect<void, BlobStoreFailure> =>
-          Effect.suspend(() => {
-            if (limit !== undefined && chunks.length >= limit && fault !== undefined) {
-              return trigger(fault, "put", undefined)
-            }
-            chunks.push(new Uint8Array(chunk))
-            return Effect.void
+        multipart.parts += 1
+        const fault = yield* phase({ phase: "part", part: req.number, attempt })
+        const open = uploads.get(id)
+        if (open === undefined) {
+          return yield* rejected(`no multipart upload ${id} is open (NoSuchUpload)`)
+        }
+        if (req.number > maxParts) {
+          return yield* new BlobStoreFailure({
+            reason: "TooLarge",
+            cause: new Error(
+              `${WHERE}: the body needs more than ${maxParts} parts of ${req.partSize} bytes; ` +
+                "give its length (Offload.source(stream, { contentLength })) so the part size " +
+                "adapts, or raise partSize",
+            ),
           })
-        if (request.body instanceof Uint8Array) {
-          yield* take(request.body)
-        } else if (Stream.isStream(request.body)) {
-          yield* Stream.runForEach(request.body, (chunk) => take(chunk))
-        } else {
-          return yield* rejected("body must be a Uint8Array or a Stream")
         }
         if (atRequest(fault)) return yield* trigger(fault, "put", undefined)
-        const bytes = concat(chunks)
-        if (request.contentLength !== undefined && request.contentLength !== bytes.length) {
-          return yield* rejected(
-            `the body is ${bytes.length} bytes, but contentLength is ${request.contentLength}`,
-          )
-        }
-        const checksum = yield* request.checksum
-        if (checksum.algorithm !== "crc64nvme" || !sameBytes(checksum.value, crc64nvme(bytes))) {
-          return yield* new BlobStoreFailure({
-            reason: "ChecksumMismatch",
-            cause: new Error(`${WHERE}: the body does not match its CRC-64/NVME`),
-          })
-        }
-        const result = yield* store(request, bytes)
-        if (atResponse(fault)) return yield* trigger(fault, "put", result.ref)
-        return result
+        open.set(req.number, new Uint8Array(req.bytes))
+        if (atResponse(fault)) return yield* trigger(fault, "put", undefined)
+        return req.number
+      }).pipe(
+        Effect.catchIf(
+          (failure) => RETRIED.has(failure.reason) && attempt < partAttempts,
+          () => part(id, req, attempt + 1),
+        ),
+      )
+    return {
+      single: (bytes) =>
+        Effect.gen(function* () {
+          yield* checkBody(request, bytes)
+          return yield* store(request, new Uint8Array(bytes))
+        }),
+      create: Effect.gen(function* () {
+        multipart.creates += 1
+        const fault = yield* phase({ phase: "create" })
+        if (atRequest(fault)) return yield* trigger(fault, "put", undefined)
+        const id = ++nextUpload
+        uploads.set(id, new Map())
+        if (atResponse(fault)) return yield* trigger(fault, "put", undefined)
+        return id
       }),
-    )
+      part: (id, req) => part(id, req, 1),
+      complete: (id, numbers) =>
+        Effect.gen(function* () {
+          multipart.completes += 1
+          const fault = yield* phase({ phase: "complete" })
+          const lost = atResponse(fault) ? fault : undefined
+          if (atRequest(fault)) return yield* trigger(fault, "put", undefined)
+          const open = uploads.get(id)
+          if (open === undefined) {
+            return yield* rejected(`no multipart upload ${id} is open (NoSuchUpload)`)
+          }
+          const parts = numbers.map((number) => open.get(number))
+          if (parts.some((bytes) => bytes === undefined)) {
+            return yield* rejected("a completed part was never uploaded (InvalidPart)")
+          }
+          const bytes = concat(parts as ReadonlyArray<Uint8Array>)
+          yield* checkBody(request, bytes)
+          uploads.delete(id)
+          const result = yield* store(request, bytes)
+          if (lost !== undefined) {
+            if (lost._tag === "Interrupt") return yield* Effect.interrupt
+            // S3 never learns the version a lost Complete made.
+            return yield* new BlobStoreFailure({
+              reason: lost.reason,
+              completeLost: true,
+              cause: new Error(
+                `${WHERE}: injected ${lost.reason} on put (its multipart upload completed, ` +
+                  "but the response was lost)",
+              ),
+            })
+          }
+          return result
+        }),
+      abort: (id) =>
+        Effect.gen(function* () {
+          multipart.aborts += 1
+          const fault = yield* phase({ phase: "abort" })
+          if (atRequest(fault)) return yield* trigger(fault, "put", undefined)
+          uploads.delete(id)
+          if (atResponse(fault)) return yield* trigger(fault, "put", undefined)
+        }),
+    }
+  }
+
+  const put = (request: BlobPutRequest): Effect.Effect<BlobPutResult, BlobStoreFailure> =>
+    Effect.suspend(() => {
+      calls.put += 1
+      const n = calls.put
+      return Effect.flatMap(ask({ action: "put", n, key: request.key }), (fault) =>
+        Effect.gen(function* () {
+          const failure = checkUpload(request)
+          if (failure !== undefined) return yield* failure
+          let body: Uint8Array | Stream.Stream<Uint8Array, BlobStoreFailure>
+          if (request.body instanceof Uint8Array) {
+            body = request.body
+          } else if (Stream.isStream(request.body)) {
+            body = request.body
+          } else {
+            return yield* rejected("body must be a Uint8Array or a Stream")
+          }
+          if (atRequest(fault)) {
+            // No effect: the body is consumed (`afterChunks` chunks, default all
+            // of it — a single-use stream is drained), then the call fails
+            // before it completes (a multipart upload's parts are aborted).
+            const limit = fault.afterChunks
+            const chunks = body instanceof Uint8Array ? Stream.succeed(body) : body
+            body = Stream.concat(
+              Stream.mapEffect(chunks, (chunk, i) =>
+                limit !== undefined && i >= limit
+                  ? trigger(fault, "put", undefined)
+                  : Effect.succeed(chunk),
+              ),
+              Stream.fromEffect(trigger(fault, "put", undefined)),
+            )
+          }
+          const result = yield* Multipart.upload(
+            body,
+            request.contentLength,
+            { partSize, concurrency: uploadConcurrency, maxParts, where: WHERE },
+            protocolOf(request, n),
+          )
+          if (atResponse(fault)) return yield* trigger(fault, "put", result.ref)
+          return result
+        }),
+      )
+    })
 
   const checkRange = (range: ByteRange | undefined, size: number): string | undefined => {
     if (range === undefined) return undefined
@@ -799,6 +1024,7 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
           .reverse()
       }),
     calls: { ...calls },
+    multipart: { ...multipart, inProgress: uploads.size },
   })
 
   return {

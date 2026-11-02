@@ -21,7 +21,7 @@ import {
   Pipeable,
   type Stream,
 } from "effect"
-import type { ByteRange } from "./BlobStoreContract.js"
+import type { BlobStoreService, ByteRange } from "./BlobStoreContract.js"
 
 export const OffloadedValueTypeId: unique symbol = Symbol.for("effect-dynamodb/OffloadedValue")
 export type OffloadedValueTypeId = typeof OffloadedValueTypeId
@@ -222,3 +222,23 @@ export const makeBlobHandle = (fields: BlobHandleFields): BlobHandle => {
     }),
   )
 }
+
+// ---------------------------------------------------------------------------
+// The store a handle reads from (a write's copy source, design §3.8)
+// ---------------------------------------------------------------------------
+
+const handleStores = new WeakMap<BlobHandle, BlobStoreService>()
+
+/** Record the store an external handle reads from (the resolver, when it builds one). */
+export const registerHandleStore = (handle: BlobHandle, store: BlobStoreService): BlobHandle => {
+  handleStores.set(handle, store)
+  return handle
+}
+
+/**
+ * The store an external handle reads from, when the library built it with
+ * one: a write given the handle copies within that store (`copy`) instead of
+ * streaming its content through.
+ */
+export const handleStoreOf = (handle: BlobHandle): BlobStoreService | undefined =>
+  handleStores.get(handle)

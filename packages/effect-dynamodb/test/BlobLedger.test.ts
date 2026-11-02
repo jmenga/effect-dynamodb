@@ -1576,33 +1576,6 @@ describe("BlobLedger — exit", () => {
       expect(seen).toEqual([undefined])
     }),
   )
-
-  it.effect("a lost multipart completion is reported as completeLost", () =>
-    Effect.gen(function* () {
-      const store = BlobStore.memory()
-      const { reports, layer } = observed()
-      yield* BlobLedger.reportCompleteLost(target(), store, "p/doc/scan", "NoSuchUpload").pipe(
-        Effect.provide(layer),
-      )
-      expect(reports).toEqual([
-        expect.objectContaining({
-          reason: "completeLost",
-          key: "p/doc/scan",
-          ref: undefined,
-          cause: "NoSuchUpload",
-        }),
-      ])
-      // Inside an open ledger: reported when the root exits, with the rest.
-      reports.length = 0
-      yield* BlobLedger.root(
-        Effect.gen(function* () {
-          yield* BlobLedger.reportCompleteLost(target(), store, "p/doc/scan", "NoSuchUpload")
-          expect(reports).toEqual([])
-        }),
-      ).pipe(Effect.provide(layer))
-      expect(reports.map((r) => r.reason)).toEqual(["completeLost"])
-    }),
-  )
 })
 
 // ---------------------------------------------------------------------------

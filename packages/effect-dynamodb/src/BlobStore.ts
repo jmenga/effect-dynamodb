@@ -54,6 +54,7 @@ export type {
   MemoryBlobStore,
   MemoryBlobStoreOptions,
   MemoryBlobVersion,
+  MemoryMultipartSnapshot,
 } from "./internal/MemoryBlobStore.js"
 export type { Crc64Nvme }
 

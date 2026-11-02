@@ -865,7 +865,8 @@ const MAX_CONTENT_TYPE_BYTES = 255
 export interface ExternalBinaryOptions {
   /**
    * Content-Type of the stored object when a write does not name one. A
-   * non-empty US-ASCII string of at most 255 bytes. Default
+   * non-empty printable US-ASCII string (no control character, which no HTTP
+   * header carries) of at most 255 bytes. Default
    * `"application/octet-stream"`.
    */
   readonly contentType?: string | undefined
@@ -883,8 +884,12 @@ export interface ExternalConfig {
   readonly contentType: string
 }
 
-const isUsAscii = (text: string): boolean => {
-  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false
+/** Printable US-ASCII (0x20–0x7e): what an HTTP `Content-Type` header can carry. */
+const isPrintableAscii = (text: string): boolean => {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code < 0x20 || code > 0x7e) return false
+  }
   return true
 }
 
@@ -908,7 +913,8 @@ const isUsAscii = (text: string): boolean => {
  * ```
  *
  * @throws `[EDD-9141]` on invalid options: not an object, an unknown key, or a
- *   `contentType` that is not a non-empty US-ASCII string of at most 255 bytes.
+ *   `contentType` that is not a non-empty printable US-ASCII string of at most
+ *   255 bytes.
  */
 export const External = (options?: ExternalBinaryOptions): ExternalConfig => {
   if (options === undefined) {
@@ -940,11 +946,11 @@ export const External = (options?: ExternalBinaryOptions): ExternalConfig => {
     typeof contentType !== "string" ||
     contentType.length === 0 ||
     contentType.length > MAX_CONTENT_TYPE_BYTES ||
-    !isUsAscii(contentType)
+    !isPrintableAscii(contentType)
   ) {
     throw externalError(
       "External",
-      `contentType must be a non-empty US-ASCII string of at most ${MAX_CONTENT_TYPE_BYTES} ` +
+      `contentType must be a non-empty printable US-ASCII string of at most ${MAX_CONTENT_TYPE_BYTES} ` +
         `bytes, got ${typeof contentType === "string" ? JSON.stringify(contentType) : String(contentType)}`,
     )
   }

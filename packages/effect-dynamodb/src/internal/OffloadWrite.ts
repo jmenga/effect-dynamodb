@@ -10,6 +10,8 @@
  * flattening and packing: an overflow value arrives as its inline stored form
  * (a JSON string, or a v1 header byte + compressed bytes) and leaves as a `B`
  * pointer; a binary value arrives as its bytes and leaves as `~edbp:` text.
+ * A binary value given as a stream, a handle or `Offload.source(...)` arrives
+ * as its placeholder (`OffloadInput`), which uploads what it stands for.
  *
  * Not part of the public API.
  */
@@ -22,6 +24,7 @@ import type {
   ExternalPackedConfig,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import { type BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { BlobChecksum } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import {
   type BlobPointer,
   type BlobPointerKind,
@@ -45,6 +48,7 @@ import * as BlobLedger from "./BlobLedger.js"
 import * as BlobMetadata from "./BlobMetadata.js"
 import type { BlobStoreService } from "./BlobStoreContract.js"
 import { attributeBytes, itemBytes, utf8Bytes } from "./ItemSize.js"
+import * as OffloadInput from "./OffloadInput.js"
 import { currentRegistry } from "./Packed.js"
 
 // ---------------------------------------------------------------------------
@@ -178,14 +182,14 @@ const decoder = new TextDecoder("utf-8", { fatal: true })
 /** What one upload sends, derived from an attribute's inline stored value. */
 interface Upload {
   readonly kind: BlobPointerKind
-  readonly content: BlobLedger.LedgerContent
+  readonly content: BlobLedger.UploadContent
   readonly codec: CompressionCodec | "none"
   readonly body: Uint8Array | undefined
   readonly contentType: string
   readonly pointerContentType: string | undefined
-  /** Bytes of the stored object. */
+  /** Bytes of the stored object (the largest a pointer records, for a stream of unknown length). */
   readonly objectSize: number
-  /** Bytes the checksum covers. */
+  /** Bytes the checksum covers (`undefined`: not yet known). */
   readonly contentSize: number | undefined
 }
 
@@ -282,20 +286,59 @@ const overflowUpload = (
   }
 }
 
-/** The upload of a binary attribute's bytes. */
-const binaryUpload = (config: ExternalConfig, bytes: Uint8Array): Upload => ({
-  kind: "bytes",
-  content: { kind: "bytes", bytes },
-  codec: "none",
-  body: undefined,
-  contentType: config.contentType,
-  pointerContentType: config.contentType,
-  objectSize: bytes.length,
-  contentSize: bytes.length,
-})
-
 /** Largest LEB128 content size a pointer can record (8 groups, every safe integer). */
 const MAX_CONTENT_SIZE = Number.MAX_SAFE_INTEGER
+
+/**
+ * The upload of a binary attribute's value (design §3.8, §4.4): its bytes, or
+ * what its placeholder stands for — a stream (single-use), a handle's content
+ * to copy, or `Offload.source` bytes. The content type is the source's, else
+ * the field's `External({ contentType })`.
+ */
+const binaryUpload = (config: ExternalConfig, bytes: Uint8Array): Upload => {
+  const prepared = OffloadInput.preparedOf(bytes)
+  if (prepared?._tag === "Stream") {
+    const contentType = prepared.contentType ?? config.contentType
+    return {
+      kind: "bytes",
+      content: {
+        kind: "stream",
+        stream: prepared.stream,
+        identity: prepared.identity,
+        contentLength: prepared.contentLength,
+      },
+      codec: "none",
+      body: undefined,
+      contentType,
+      pointerContentType: contentType,
+      objectSize: prepared.contentLength ?? MAX_CONTENT_SIZE,
+      contentSize: prepared.contentLength,
+    }
+  }
+  if (prepared?._tag === "Handle") {
+    return {
+      kind: "bytes",
+      content: { kind: "copy", handle: prepared.handle },
+      codec: "none",
+      body: undefined,
+      contentType: config.contentType,
+      pointerContentType: config.contentType,
+      objectSize: prepared.handle.size,
+      contentSize: prepared.handle.size,
+    }
+  }
+  const contentType = prepared?.contentType ?? config.contentType
+  return {
+    kind: "bytes",
+    content: { kind: "bytes", bytes },
+    codec: "none",
+    body: undefined,
+    contentType,
+    pointerContentType: contentType,
+    objectSize: bytes.length,
+    contentSize: bytes.length,
+  }
+}
 
 /**
  * The bytes the attribute's pointer can take at most (design §6.3): the real
@@ -348,7 +391,7 @@ const uploadOne = (
   row: OffloadRow,
   attribute: string,
   upload: Upload,
-): Effect.Effect<BlobPointer, BlobStoreError> => {
+): Effect.Effect<BlobPointer, BlobStoreError | ValidationError> => {
   const rowSk = row.rowSk ?? row.sk
   return BlobLedger.upload({
     store,
@@ -536,6 +579,20 @@ export const route = (
         : overflowUpload(info, attribute, value, registry, row.operation)
       if (upload instanceof ValidationError) return yield* upload
       uploads.push([attribute, upload])
+    }
+    // Single-use streams (design §3.8): refused before any upload starts.
+    const ledger = yield* BlobLedger.current
+    const streams = new Set<object>()
+    for (const [attribute, upload] of uploads) {
+      if (upload.content.kind !== "stream") continue
+      const { identity } = upload.content
+      const why = streams.has(identity)
+        ? "it is also the content of another field of this item"
+        : BlobLedger.streamRefusal(ledger, identity, store, keyOf(info, store, row, attribute))
+      if (why !== undefined) {
+        return yield* BlobLedger.singleUseError(info.entityType, row.operation, attribute, why)
+      }
+      streams.add(identity)
     }
     yield* forEachSettled(uploads, ([attribute, upload]) =>
       Effect.map(uploadOne(info, store, row, attribute, upload), (pointer) => {
@@ -729,7 +786,13 @@ export const reuse = (
           if (!uploadable(info, attribute, value)) continue
           let content: BlobLedger.LedgerContent
           if (Object.hasOwn(info.binary, attribute)) {
+            // A stream's or a handle's placeholder holds no content to compare;
+            // a source naming another content type is a new object.
+            const prepared = OffloadInput.preparedOf(value)
             if (
+              (prepared !== undefined && prepared._tag !== "Bytes") ||
+              (prepared?.contentType !== undefined &&
+                prepared.contentType !== Option.getOrUndefined(previous.pointer.contentType)) ||
               !(previous.content instanceof Uint8Array) ||
               !sameBytes(value as Uint8Array, previous.content)
             ) {
@@ -804,12 +867,29 @@ const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
  */
 export const matchesPointer = (pointer: BlobPointer, content: string | Uint8Array): boolean => {
   const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content
-  return (
-    bytes.length === pointer.contentSize &&
-    pointer.checksum.algorithm === "crc64nvme" &&
-    sameBytes(crc64nvme(bytes), pointer.checksum.value)
-  )
+  return matchesChecksum(pointer, { algorithm: "crc64nvme", value: crc64nvme(bytes) }, bytes.length)
 }
+
+/** Whether `bytes` (a value stored natively) have `checksum` and `size` (a `BlobHandle`'s). */
+export const bytesMatch = (bytes: Uint8Array, checksum: BlobChecksum, size: number): boolean =>
+  bytes.length === size &&
+  checksum.algorithm === "crc64nvme" &&
+  sameBytes(crc64nvme(bytes), checksum.value)
+
+/**
+ * Whether content of `size` bytes with `checksum` (a `BlobHandle`'s,
+ * restating an immutable binary field) has the pointer's content checksum
+ * and size.
+ */
+export const matchesChecksum = (
+  pointer: BlobPointer,
+  checksum: BlobChecksum,
+  size: number,
+): boolean =>
+  size === pointer.contentSize &&
+  pointer.checksum.algorithm === "crc64nvme" &&
+  checksum.algorithm === "crc64nvme" &&
+  sameBytes(checksum.value, pointer.checksum.value)
 
 // ---------------------------------------------------------------------------
 // Bind-time check ([EDD-9115])

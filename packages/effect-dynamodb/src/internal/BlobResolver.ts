@@ -51,6 +51,7 @@ import {
   makeBlobHandle,
   makeOffloadedValue,
   type OffloadedValue,
+  registerHandleStore,
 } from "./OffloadValues.js"
 import { registryOf } from "./Packed.js"
 
@@ -465,7 +466,7 @@ const lazyBinary = (env: Environment, pending: PendingBlob, ctx: BlobCallContext
   const store = env.store
   const readCtx = readContext(ctx)
   const later: Environment = { store, registry: env.registry, ledger: undefined }
-  return makeBlobHandle({
+  const handle = makeBlobHandle({
     location: "external",
     ref: Option.some(pointer.ref),
     size: pointer.objectSize,
@@ -497,6 +498,8 @@ const lazyBinary = (env: Environment, pending: PendingBlob, ctx: BlobCallContext
     },
     presignedUrl: (options) => presignedUrl(store, pointer.ref, readCtx, options?.expiresIn),
   })
+  // A write given the handle copies within this store (design §3.8).
+  return store === undefined ? handle : registerHandleStore(handle, store)
 }
 
 // ---------------------------------------------------------------------------
