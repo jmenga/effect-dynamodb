@@ -24,7 +24,6 @@ import type { MemoryBlobStore } from "../src/internal/MemoryBlobStore.js"
 import type * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import { InMemoryClient, resetStore, store as rows } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 import { makePartition, type Row } from "./helpers/PartitionMock.js"
 
 const AppSchema = DynamoSchema.make({ name: "plans", version: 1, escapeKeys: true })
@@ -41,38 +40,36 @@ class Place extends Schema.Class<Place>("Place")({
 }) {}
 
 /** Every body is over its 16-byte threshold: each row holds a pointer. */
-const Places = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Place, {
-      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 16 } }) },
-    }),
-    entityType: "Place",
-    primaryKey: {
-      pk: { field: "pk", composite: ["placeId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    indexes: {
-      /** Z-order over price × bedrooms. */
-      byBox: {
-        name: "gsi1",
-        pk: { field: "gsi1pk", composite: ["region"] },
-        sk: {
-          field: "gsi1sk",
-          zorder: [
-            { field: "price", min: 0, max: 1023 },
-            { field: "bedrooms", min: 0, max: 15 },
-          ],
-        },
-      },
-      /** `.within({ price })` skip-scans `status`, a literal composite. */
-      byStatus: {
-        name: "gsi2",
-        pk: { field: "gsi2pk", composite: ["region"] },
-        sk: { field: "gsi2sk", composite: ["status", "price"] },
-      },
-    },
+const Places = Entity.make({
+  model: DynamoModel.configure(Place, {
+    body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 16 } }) },
   }),
-)
+  entityType: "Place",
+  primaryKey: {
+    pk: { field: "pk", composite: ["placeId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    /** Z-order over price × bedrooms. */
+    byBox: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: {
+        field: "gsi1sk",
+        zorder: [
+          { field: "price", min: 0, max: 1023 },
+          { field: "bedrooms", min: 0, max: 15 },
+        ],
+      },
+    },
+    /** `.within({ price })` skip-scans `status`, a literal composite. */
+    byStatus: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["region"] },
+      sk: { field: "gsi2sk", composite: ["status", "price"] },
+    },
+  },
+})
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Places } })
 const tableLayer = MainTable.layer({ name: "main" })

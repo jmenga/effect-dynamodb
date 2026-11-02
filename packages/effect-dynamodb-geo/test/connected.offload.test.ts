@@ -19,7 +19,6 @@ import {
 } from "effect-dynamodb"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -76,16 +75,14 @@ const courierConfig = {
   },
 } as const
 
-const Couriers = withOffloadGate(() =>
-  Entity.make({
-    ...courierConfig,
-    entityType: "Courier",
-    model: DynamoModel.configure(Courier, {
-      notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-      photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
-    }),
+const Couriers = Entity.make({
+  ...courierConfig,
+  entityType: "Courier",
+  model: DynamoModel.configure(Courier, {
+    notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
   }),
-)
+})
 
 const PackedCouriers = Entity.make({
   ...courierConfig,

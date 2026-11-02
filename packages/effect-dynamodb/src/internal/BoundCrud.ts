@@ -913,7 +913,9 @@ type OpBlobErrorsOf<E> = 0 extends 1 & E ? never : Extract<E, BlobStoreError>
 /**
  * The blob errors a write op of `Batch.write` / `Transaction.transactWrite`
  * raises (#179, design §9.3): its own `BlobStoreError` — present for an op
- * over a member that offloads a field — and `never` for any other op: one
+ * over a member that offloads a field, and for another stream's append
+ * (`stream.appendOp`, read off its build) when that stream offloads — and
+ * `never` for any other op: one
  * over a member that offloads nothing, a `Transaction.check`, and an op whose
  * type was erased (`any`, the documented price of an untyped array). Read off
  * the op's `asEffect`, which every unbound intermediate and bound builder
@@ -923,7 +925,9 @@ export type WriteOpBlobErrors<T> = T extends {
   readonly asEffect: () => Effect.Effect<any, infer E, any>
 }
   ? OpBlobErrorsOf<E>
-  : never
+  : T extends { readonly _build: (source: string) => Effect.Effect<any, infer E, any> }
+    ? OpBlobErrorsOf<E>
+    : never
 
 // ---------------------------------------------------------------------------
 // Factory helpers

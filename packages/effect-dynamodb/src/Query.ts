@@ -332,7 +332,9 @@ interface QueryState {
    * swap the sort key `begins_with` operand and add a row filter (`keep`)
    * applied, like {@link liveRows}, to rows before they are decoded. An entity's
    * `versions` uses it to read history written by an earlier release alongside
-   * its own (#133).
+   * its own (#133); an offloading event stream's queries, to run the stream's
+   * first-use store check (#179, design §13), so a terminal checks and
+   * `asParams`, which sends nothing, does not.
    */
   readonly prepare: QueryPrepare | undefined
   /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */

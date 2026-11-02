@@ -34,7 +34,6 @@ import { toAttributeMap } from "../src/Marshaller.js"
 import * as Offload from "../src/Offload.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -90,45 +89,37 @@ const docModel = (threshold: number) =>
     },
   })
 
-const Docs = withOffloadGate(() =>
-  Entity.make({ model: docModel(1_024), entityType: "Doc", primaryKey: docKey }),
-)
+const Docs = Entity.make({ model: docModel(1_024), entityType: "Doc", primaryKey: docKey })
 
 /** Thresholds out of reach: the item budget routes. */
-const Budgeted = withOffloadGate(() =>
-  Entity.make({
-    model: docModel(400_000),
-    entityType: "Budgeted",
-    primaryKey: docKey,
-    offload: { itemBudget: 300_000 },
-  }),
-)
+const Budgeted = Entity.make({
+  model: docModel(400_000),
+  entityType: "Budgeted",
+  primaryKey: docKey,
+  offload: { itemBudget: 300_000 },
+})
 
-const Kept = withOffloadGate(() =>
-  Entity.make({
-    model: docModel(1_024),
-    entityType: "Kept",
-    primaryKey: docKey,
-    versioned: { retain: true },
-    softDelete: true,
-  }),
-)
+const Kept = Entity.make({
+  model: docModel(1_024),
+  entityType: "Kept",
+  primaryKey: docKey,
+  versioned: { retain: true },
+  softDelete: true,
+})
 
 /** An index to query offloading rows through. */
-const Shelved = withOffloadGate(() =>
-  Entity.make({
-    model: docModel(1_024),
-    entityType: "Shelved",
-    primaryKey: docKey,
-    indexes: {
-      byTitle: {
-        name: "gsi1",
-        pk: { field: "gsi1pk", composite: ["title"] },
-        sk: { field: "gsi1sk", composite: ["docId"] },
-      },
+const Shelved = Entity.make({
+  model: docModel(1_024),
+  entityType: "Shelved",
+  primaryKey: docKey,
+  indexes: {
+    byTitle: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["title"] },
+      sk: { field: "gsi1sk", composite: ["docId"] },
     },
-  }),
-)
+  },
+})
 
 class Reading extends Schema.Class<Reading>("Reading")({
   sensorId: Schema.String,
@@ -136,37 +127,33 @@ class Reading extends Schema.Class<Reading>("Reading")({
   raw: Schema.optional(Schema.Uint8Array),
 }) {}
 
-const Readings = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
-    entityType: "Reading",
-    primaryKey: {
-      pk: { field: "pk", composite: ["sensorId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    timeSeries: {
-      orderBy: "at",
-      appendInput: Schema.Struct({
-        sensorId: Schema.String,
-        at: Schema.Number,
-        raw: Schema.optional(Schema.Uint8Array),
-      }),
-    },
-  }),
-)
+const Readings = Entity.make({
+  model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      sensorId: Schema.String,
+      at: Schema.Number,
+      raw: Schema.optional(Schema.Uint8Array),
+    }),
+  },
+})
 
 /** Docs an aggregate hydrates its edges from: hydration keys them by their identifier. */
-const AlbumDocs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, {
-      docId: { identifier: true },
-      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 1_024 } }) },
-      scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
-    }),
-    entityType: "AlbumSource",
-    primaryKey: docKey,
+const AlbumDocs = Entity.make({
+  model: DynamoModel.configure(Doc, {
+    docId: { identifier: true },
+    body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 1_024 } }) },
+    scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
   }),
-)
+  entityType: "AlbumSource",
+  primaryKey: docKey,
+})
 
 const MainTable = Table.make({
   schema: AppSchema,

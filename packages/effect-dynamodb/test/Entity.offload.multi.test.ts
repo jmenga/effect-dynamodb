@@ -38,7 +38,6 @@ import {
   resetStore,
   store as rows,
 } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -70,40 +69,34 @@ const offloaded = {
 } as const
 
 /** An external overflow body and a binary scan. */
-const Docs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, offloaded),
-    entityType: "Doc",
-    primaryKey: docKey,
-  }),
-)
+const Docs = Entity.make({
+  model: DynamoModel.configure(Doc, offloaded),
+  entityType: "Doc",
+  primaryKey: docKey,
+})
 
 /** Versioned: `Batch.write` sends its puts as create-only transactions. */
-const VDocs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, offloaded),
-    entityType: "VDoc",
-    primaryKey: docKey,
-    versioned: true,
-  }),
-)
+const VDocs = Entity.make({
+  model: DynamoModel.configure(Doc, offloaded),
+  entityType: "VDoc",
+  primaryKey: docKey,
+  versioned: true,
+})
 
 /** A gzip-packed field beside the offloaded ones: needs a compressor registry. */
-const GzDocs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, {
-      ...offloaded,
-      meta: {
-        storedAs: DynamoModel.Packed({
-          format: "json",
-          compression: { codec: "gzip", threshold: 0 },
-        }),
-      },
-    }),
-    entityType: "GzDoc",
-    primaryKey: docKey,
+const GzDocs = Entity.make({
+  model: DynamoModel.configure(Doc, {
+    ...offloaded,
+    meta: {
+      storedAs: DynamoModel.Packed({
+        format: "json",
+        compression: { codec: "gzip", threshold: 0 },
+      }),
+    },
   }),
-)
+  entityType: "GzDoc",
+  primaryKey: docKey,
+})
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Docs, VDocs, GzDocs } })
 

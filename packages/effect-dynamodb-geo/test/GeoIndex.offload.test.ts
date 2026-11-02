@@ -31,7 +31,6 @@ import {
 } from "effect-dynamodb"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Model and entities
@@ -75,16 +74,14 @@ const courierConfig = {
 } as const
 
 /** Overflow `notes` offloads from 64 stored bytes; binary `photo` always does. */
-const Couriers = withOffloadGate(() =>
-  Entity.make({
-    ...courierConfig,
-    entityType: "Courier",
-    model: DynamoModel.configure(Courier, {
-      notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-      photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
-    }),
+const Couriers = Entity.make({
+  ...courierConfig,
+  entityType: "Courier",
+  model: DynamoModel.configure(Courier, {
+    notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
   }),
-)
+})
 
 /** Offloads nothing: a packed `notes`, a renamed `label` and a sparse `stops` (the #147 gap). */
 const PackedCouriers = Entity.make({
@@ -120,15 +117,13 @@ const MainTable = Table.make({
 })
 
 /** The offloading entity on a table whose schema doesn't escape key text (`[EDD-9146]`). */
-const UnescapedCouriers = withOffloadGate(() =>
-  Entity.make({
-    ...courierConfig,
-    entityType: "UnescapedCourier",
-    model: DynamoModel.configure(Courier, {
-      photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
-    }),
+const UnescapedCouriers = Entity.make({
+  ...courierConfig,
+  entityType: "UnescapedCourier",
+  model: DynamoModel.configure(Courier, {
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
   }),
-)
+})
 
 const UnescapedTable = Table.make({
   schema: DynamoSchema.make({ name: "geooffload", version: 1, escapeKeys: false }),

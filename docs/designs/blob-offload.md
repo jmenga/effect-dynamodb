@@ -1826,7 +1826,10 @@ projections because the objects they read never go away while the event exists: 
 are immutable and never reaped (§11.3), only purged with the stream. A store `NotFound` that
 persists past the store's `notFoundRetry` therefore means data loss or an out-of-band delete,
 and failing loudly is right. A pointer that fails to parse is still a `ValidationError` and
-poison.
+poison. *As built (commit 13):* "loudly" is the batch result's `storeFailures` (`{ record,
+error: BlobStoreError }`) and a `Warning` log naming the record and stream; a `ValidationError`
+whose cause is a `BlobStoreError` — a pointer met on a stream that no longer offloads `data`
+(§4.7), resolved through the store — counts as the store failure it carries.
 
 ---
 
@@ -2240,7 +2243,10 @@ reaper never sees a pointer leave a row that still exists elsewhere. Pinned by
 and `Aggregate.bind`, and from an unbound write's routing, nothing uploaded; "rekey never moves a
 pointer row": `rekey` over a table offloading wrote, under the same setting, moves nothing, and
 with `escapeKeys` turned off refuses the row naming its key, a dry run included), and by the
-aggregate, EventStore and geo suites for their members.
+aggregate, EventStore and geo suites for their members (`EventStore.offload.test.ts`: `[EDD-9146]`
+from `EventStore.bind`, `bindProjection`, `rekey`'s `streams` and an unbound append's routing, and
+`rekey` refusing to move a stream row that holds a pointer, a dry run included;
+`GeoIndex.offload.test.ts`: `[EDD-9146]` from `GeoIndex.bind`).
 
 ---
 
@@ -2504,7 +2510,14 @@ the `[EDD-9078]` pattern:
   `snapshot.storedAs` with `external`.
 - **An unbound `EventStream`**, and **`EventStore.processBatch` / `runChangeFeed`** over
   streams that offload, check on their first operation per context (the `runtimeCodecCheck`
-  `WeakSet` pattern, `Packed.ts:152-166`).
+  `WeakSet` pattern, `Packed.ts:152-166`). *As built (commit 13):* per store, on every
+  operation of the stream (reads, writes, `measure*`, `decodeStreamImage`, the handler's
+  probes, and each terminal of `query.events` / `query.index` — through the query's `prepare`
+  hook, so `Query.asParams`, which sends nothing, checks nothing; the queries run the store
+  check only, the `[EDD-9078]` codec check staying off them as #147 decided,
+  `storage-encoding.md` row 63); `processBatch` / `runChangeFeed` check through the decode of
+  each unbound stream they meet — the first record of an offloading stream — while a bound
+  projection's streams were checked at `bindProjection`.
 - **`GeoIndex.bind`** checks the geo entity (geo reads resolve eagerly, §8.4). *As built
   (commit 12):* through the entity's own binding checks, so the `[EDD-9078]` codec check runs
   there too (debt).
@@ -2596,7 +2609,7 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9114` | `Entity.ts` (schema), `EventStore.ts` | `offload` options invalid: an unknown key, `itemBudget` not a safe integer in 1 … 409,600, `prefix` not a non-empty string of unreserved characters and `/` ≤ 256 bytes, `itemBudget` without an overflow field, or `offload` on a member without an offloaded field |
 | `EDD-9115` | `DynamoClient.ts`, `EventStore.ts`, `GeoIndex.ts` (geo), `BlobGc.ts`, `Entity.ts` (`bind`), `Aggregate.ts` (`bind`) | A member with an offloaded field is bound (`DynamoClient.make`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `Entity.bind`, `Aggregate.bind`, `BlobGc.make`), or an unbound stream or `EventStore.processBatch` / `runChangeFeed` runs its first operation, with no `BlobStore` resolvable |
 | `EDD-9116` | `BlobStore.ts`, `blob/s3.ts` | Store options invalid: an empty bucket, a prefix starting with `/` or over 256 bytes, `partSize` outside 5 MiB … 5 GiB, a concurrency that is not a positive integer, `maxUploadAge` outside 1 minute … 7 days, memory-store options invalid, or a custom store (`BlobStore.layer`) whose `limits` are not non-negative integers (`maxVersionBytes` at most 1,024, `maxKeySuffixBytes` at most 670), whose `maxUploadAge` is not a positive finite duration, or whose name, prefix, concurrencies or operations are invalid |
-| `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key, or `.offloaded()` after `.filterBy()` |
+| `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts`, `internal/EventProjection.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key — on a read, or a projection's `offloaded` (at definition) — or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
 | `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
 | `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream`, handle or source for an aggregate edge (or an `OffloadedValue` for its overflow field); or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
@@ -3915,8 +3928,138 @@ a write path, deletes the gate.
     first-operation checks; the typing of `EventStream.append` / `commandHandler`'s
     `additionalItems` (`const` generics over the ops, `BlobStoreError` in `AppendError`; moved
     from commit 9). **The gate is deleted**: the refusal is lifted for every member.
+    *Implementation notes (commit 13):*
+    - The gate is gone: `internal/OffloadGate.ts` and its test helpers (schema, core, geo) are
+      deleted, `Entity.make` / `makeStream` define every offloading member, and
+      `test/Offload.config.test.ts` asserts the definitions (`entity.offload` with the default
+      options, `stream.offload` for `data`, `state` and both). The stream's resolved options
+      (commit 4) are now exposed as `stream.offload` (`StreamOffloadSettings { itemBudget,
+      prefix, overflow }`, `undefined` when nothing offloads), on bound streams too.
+    - Writes route each event item's `data` and the snapshot item's `state` through
+      `OffloadWrite.route`, one `OffloadInfo` per attribute: `copiesPointers: false`, the stream
+      as the item family (`STREAM_FAMILY_SK`) and the event or snapshot SK as the row (§4.5),
+      `itemBudget` as for entities. An append's event uploads settle together
+      (`forEachSettled`) before its transaction; the inline snapshot routes as it is built;
+      `writeSnapshot`'s Put carries `ALL_OLD` through the ledger's `prepare`, so a lost
+      monotonic race deletes its upload; `appendOp` / nested appends upload under the outer
+      operation's ledger. `commandHandler` is the root: a retry at the same version with the
+      same content hits the memo (nothing re-uploaded, nothing deleted); a retry at another
+      version uploads under the new event key, and the cancelled attempt's uploads (event and
+      inline snapshot) are deleted at exit, in one store call.
+    - `measureAppend` / `measureSnapshot` route exactly as the write would (`OffloadWrite.decide`,
+      now shared by `route` and the new `measure`) and upload nothing: each value the write
+      would offload is replaced by a placeholder at its pointer's upper bound (§6.3), so the
+      item measures at least what the write sends (exact but for the `VersionId` bytes). The
+      measurement's `offloaded` lists `{ item, attribute, objectBytes }` — `item` the event's
+      index in the call, or `"snapshot"` — events first; `[]` when nothing offloads. The bound
+      depends on the store's limits, so measuring an offloading stream needs a store.
+    - An upload's report (`rowKey`, the observer's) names the row the object is keyed by
+      (`rowSk`): the event or snapshot item — and, for an entity's time-series append, the
+      event item (it named the live item, whose SK a stream does not have: its family SK is
+      empty).
+    - Reads load event rows through `OffloadRead.loadRows` (an event plan reading `data` raw;
+      the stream decodes it after loading) and decode `state` the same way; lazy wraps the
+      schema decode in the `OffloadedValue`'s `read()`. `read`, `readFrom`, `readLatest`,
+      `readSnapshot`, `readIndex` and `decodeStreamImage` take `offloaded` (an unknown mode:
+      `[EDD-9117]`, a `ValidationError`); `query.events` / `query.index` take
+      `Query.offloaded`, raw rows (`Query.select`) included. `currentVersion` and the handler's
+      head probe read lazily (they never need a payload); `currentVersion` takes
+      `CurrentVersionOptions` (`{ consistentRead }`, which `ReadOptions` extends), so it accepts
+      no `offloaded` it would ignore. The page prefetch (§8.2) is set only for a stream that
+      offloads `data`; `readLatest` loads its events and seal together.
+    - A stream that does not offload meets a pointer only after offload was switched off
+      (§4.7): it now resolves through the store, failing with the `ValidationError` whose cause
+      is the `BlobStoreError` (`NotProvided` without a store), instead of the codec's "cannot
+      resolve" refusal; the error `operation`s are unchanged (`EventStore.decode`,
+      `EventStore.select`, and `EventStore.decodeStreamImage` for a stored form an image's
+      decode cannot read — the schema decode stays `EventStore.decode`'s).
+      `test/EventStore.packed.test.ts` now expects that.
+    - `decodeStreamImage` defaults to lazy; `EventProjection` and `MultiProjection` take
+      `offloaded` (default `"lazy"`, `[EDD-9117]` at definition for another value), carried on
+      the engine source so gap reads, `catchUp`, `rebuild` and the change-feed decode read in
+      the projection's mode. Each projection's route carries its mode, and
+      `EventStore.processBatch` / `runChangeFeed` (and a projection's own `processBatch`)
+      decode a record once per mode its readers take — lazy first, through a lazy projection's
+      (bound) decode when there is one, else through the stream `streams` names — so a lazy and
+      an eager projection of one stream each receive their own shape and `streams`
+      (`unrouted`) are always lazy. A record decodes in every mode or fails as a whole.
+    - Types. `makeStream` infers `TOffloaded` through a `const` generic over `storedAs`
+      (`OffloadedKindsOf`). `LazyStreamEvent` / `LazyRawStreamEvent` / `LazySnapshot` are the
+      lazy results (`StreamEventOf`, `StreamSnapshotOf`, `LatestStateOf`); `readIndex` infers
+      its mode from the `offloaded` value alone (a `const` options generic picked one member of
+      `ReadIndexOptions`' union). `decodeStreamImage`'s last overload takes no options and is
+      lazy: it is the signature `EventStore.decoder`'s `DecodableStream` matches and its event
+      type is inferred from. The middle overload takes `options?: Opt` with `Opt extends
+      DecodeStreamImageOptions | undefined`, so a caller forwarding its own optional options
+      (or `undefined`) type-checks — on a stream that offloads nothing, exactly as before.
+      `AppendWriteOp` includes `StreamAppendOp<any>` and `WriteOpBlobErrors` reads a
+      `StreamAppendOp`'s `_build` errors, so ops passed inline or as a `const` tuple are typed
+      and the default (`ReadonlyArray<never>`) adds nothing. The
+      `any` guard on a stream's `TOffloaded` is `unknown extends T`: `0 extends 1 & T` never
+      fires there, because TypeScript reduces `1 & T` to `never` when `T` is constrained to
+      string literals. `MultiProjection` threads the mode through `SourceBuilder<K, S, Mode>`
+      and `MultiSource`; its error union gains the sources' eager read errors.
+    - Store checks (`[EDD-9115]`): `EventStore.bind` dies without a store; `bindProjection`
+      binds each stream, so it does too; an unbound stream checks per store on its first
+      operation; `processBatch` / `runChangeFeed` through the streams' decode (§13).
+    - Tests: `test/EventStore.offload.test.ts` (38) — append (keys, inline values, the lost
+      race, `offload.itemBudget` / `prefix`, a failed upload rolled back, a replayed idempotent
+      append), the inline snapshot, `appendOp`, `writeSnapshot`'s lost race, `commandHandler`'s
+      memo and re-upload, `measureAppend` / `measureSnapshot`, every read path eager and lazy
+      (`readIndex` and `query.index` included, a `"keys"` GSI fetching from the table,
+      `readLatest` with events past the snapshot and on a sealed stream, verified or not),
+      `[EDD-9117]` on reads and projections, raw rows, store failures, `decodeStreamImage`,
+      both projection runtimes lazy and eager, `EventStore.processBatch` and `runChangeFeed`
+      (a lazy and an eager projection of one stream with `streams`, in both orders), the
+      poison-record exclusion (`storeFailures`, the `Warning` log, and a pointer on a stream
+      that no longer offloads) and the bind / first-use checks (`query.*` terminals
+      included); `test/EventStore.offload.types.test.ts` (11) — inference, per-mode results
+      and errors, `Query.offloaded`, `additionalItems` (offloading, plain and `any` ops),
+      `commandHandler`, `decodeStreamImage` (forwarded optional options included) and
+      `decoder`, `currentVersion`'s options, the handler types of both projection runtimes,
+      and erased streams. The EventStore connected item of §19.4 stays commit 17's.
+    *Deviations (commit 13):*
+    - `AppendError` is unchanged: `BlobStoreError` joins `append`'s, `appendOp`'s and the
+      handler's unions through `StreamWriteErrors<TOffloaded>` and the ops'
+      `WriteOpBlobErrors` (as §9.3 has it: "`EventStream.append` adds them to its own
+      `WriteBlobErrors`"). In `AppendError` itself it would reach every stream, against §22.
+    - Per kind, finer than §9.3's "when `TOffloaded` is not `never`": event reads carry
+      `BlobStoreError` only when `data` offloads, `readSnapshot` and `writeSnapshot` only when
+      `state` does, `readLatest` when either does, writes that upload when any does.
+    - A type-erased stream (`TOffloaded` = `any`) counts as offloading both kinds — its errors
+      include `BlobStoreError` and its events are `StreamEvent<A | OffloadedValue<A>>` — so
+      every stream, lazy or not, is assignable to it. §9.3's "an op typed `any` contributes
+      nothing" still holds for `additionalItems`.
+    - The projection poison-record exclusion (§10.5), planned for commit 14, is built here:
+      an eager projection's decode reads the store, and without it a `BlobStoreError` would
+      have been typed as, and skippable like, a `ValidationError` decode failure. A record
+      whose decode fails with one — or with a `ValidationError` whose cause is one (a pointer
+      on a stream that no longer offloads `data`) — is reported in the batch response whatever
+      `onDecodeFailure` says, is not in `decodeFailures`, and is surfaced: in the result's new
+      `storeFailures` (`{ record, error: BlobStoreError }`, on every `processBatch` result and
+      `runChangeFeed`'s `onBatch`) and in a `Warning` log naming the record (position and
+      identifier) and stream. Commit 18's API reference documents `storeFailures` and
+      `CurrentVersionOptions`.
+    *Debt fixed (commit 13):*
+    - `SnapshotConfig.storedAs` admitted an `ExternalPackedConfig` (commit 4) without saying
+      what it does; documented.
+    *Port onto 1.42 (commit 13):*
+    - Escaped key text (§11.10): `EventStore.bind` dies with `[EDD-9146]` before the store
+      check for a stream that offloads over a table without `escapeKeys: true`, and
+      `bindProjection` (which binds each stream) with it; an unbound stream's write is refused
+      where it routes (`OffloadWrite.decide`, a `ValidationError`), `measureAppend` included,
+      with nothing uploaded; `rekey({ streams })` dies on such a stream before reading, and its
+      stream pass refuses a row holding a pointer (`Rekey.refusePointerRow`), dry run included,
+      before anything is planned or written. There is no 1.36 inline rule for stream rows.
+    - `AppendMeasurement` keeps main's `requestBytes` beside `offloaded`; both count each
+      offloaded value at its pointer's upper bound. An offloading `additionalItems` op is
+      measured under `OffloadWrite.Measuring` (placeholders, no upload); `offloaded` lists the
+      stream's own values only.
+    - Event and snapshot items are marshalled through main's `marshalOrFail` after routing;
+      `writeSnapshot` keeps main's single `PutItem`.
 14. **Streams** — `decodeStreamRecord`, `Offload.compareStored`, `StorageEncoding.pointer` and
     pointer-aware `decode`, projection poison-record exclusion, `EDD-9119` (decoder side).
+    *(The projection poison-record exclusion was built in commit 13 — see its deviations.)*
 15. **S3 store + CI** — `src/blob/s3.ts` (put / copy `VersionId` checks and cleanup, list, head,
     tag marks), subpath export, optional peer, guard test, unit tests on a stubbed `S3Client`;
     MinIO in CI; `connected.blob-s3.test.ts`.

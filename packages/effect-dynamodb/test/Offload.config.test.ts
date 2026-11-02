@@ -1,13 +1,11 @@
 /**
  * Offloaded storage (#179) — the config surface of the runtime members:
- * `Entity.make` (refusal, test-only gate, `entity.offload`, index composites),
- * `fromDefinition`, the aggregate guards (EDD-9111 / EDD-9142 on edge items,
- * EDD-9143 on ref edges and wrapped `many` refs at any depth), and
- * `EventStore.makeStream` (`Packed({ external })` data / state, `offload`
- * options, an `External` config refused as a stream storage config). Nothing
- * here reads or writes: offloaded storage is refused as not yet supported
- * until its write paths are wired, and the gate lifts that refusal for the
- * definitions under test.
+ * `Entity.make` (`entity.offload`, index composites), `fromDefinition`, the
+ * aggregate guards (EDD-9111 / EDD-9142 on edge items, EDD-9143 on ref edges
+ * and wrapped `many` refs at any depth), and `EventStore.makeStream`
+ * (`Packed({ external })` data / state, `stream.offload`, `offload` options,
+ * an `External` config refused as a stream storage config). Nothing here
+ * reads or writes.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -21,7 +19,6 @@ import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Barrel from "../src/index.js"
 import * as Table from "../src/Table.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // Offloading requires escaped key text (design §11.10).
 const AppSchema = DynamoSchema.make({ name: "offload", version: 1, escapeKeys: true })
@@ -50,18 +47,18 @@ const scanConfig = {
 } as const
 
 describe("Entity.make (runtime) — offloaded storage", () => {
-  it("refuses an entity that offloads as not yet supported", () => {
-    expect(() => Entity.make(scanConfig)).toThrow(
-      'Entity "Scan": offloaded storage (DynamoModel.Packed({ external }) / DynamoModel.External) ' +
-        'is not yet supported by this version of effect-dynamodb — offloaded: "notes" (overflow), ' +
-        '"image" (binary).',
-    )
+  it("defines an entity that offloads, with the default offload options", () => {
+    const Scans = Entity.make(scanConfig)
+    expect(Scans.offload).toEqual({
+      itemBudget: undefined,
+      prefix: undefined,
+      overflow: ["notes"],
+      binary: ["image"],
+    })
   })
 
-  it("resolves entity.offload with the gate open", () => {
-    const Scans = withOffloadGate(() =>
-      Entity.make({ ...scanConfig, offload: { itemBudget: 200_000, prefix: "scans" } }),
-    )
+  it("resolves entity.offload", () => {
+    const Scans = Entity.make({ ...scanConfig, offload: { itemBudget: 200_000, prefix: "scans" } })
     expect(Scans.offload).toEqual({
       itemBudget: 200_000,
       prefix: "scans",
@@ -106,16 +103,14 @@ describe("Entity.make (runtime) — offloaded storage", () => {
   })
 
   it("fromDefinition carries a pure definition's offload settings", () => {
-    const pure = withOffloadGate(() =>
-      SchemaEntity.make({
-        ...scanConfig,
-        model: DynamoModel.configure(Scan, {
-          scanId: { identifier: true },
-          image: { storedAs: DynamoModel.External() },
-        }),
-        offload: { prefix: "pure" },
+    const pure = SchemaEntity.make({
+      ...scanConfig,
+      model: DynamoModel.configure(Scan, {
+        scanId: { identifier: true },
+        image: { storedAs: DynamoModel.External() },
       }),
-    )
+      offload: { prefix: "pure" },
+    })
     const runtime = Entity.fromDefinition(pure as never)
     expect(runtime.offload).toEqual({
       itemBudget: undefined,
@@ -135,7 +130,7 @@ describe("Entity.make (runtime) — offloaded storage", () => {
 // ---------------------------------------------------------------------------
 
 describe("Aggregate.make — offloaded edge fields", () => {
-  const Scans = withOffloadGate(() => Entity.make(scanConfig))
+  const Scans = Entity.make(scanConfig)
   const MainTable = Table.make({ schema: AppSchema, entities: { Scans } })
 
   class Album extends Schema.Class<Album>("Album")({
@@ -362,41 +357,41 @@ describe("EventStore.makeStream — offloaded storage", () => {
   } as const
   const plain = DynamoModel.Packed({ format: "json" })
 
-  it("refuses an overflow data or state as not yet supported", () => {
-    expect(() => EventStore.makeStream({ ...streamConfig, storedAs: { data: overflow } })).toThrow(
-      'EventStream "Ledger": offloaded storage (DynamoModel.Packed({ external }) / ' +
-        "DynamoModel.External) is not yet supported by this version of effect-dynamodb — " +
-        'offloaded: "data" (overflow).',
-    )
-    expect(() =>
+  it("defines a stream that offloads data, state or both, reporting stream.offload", () => {
+    const none = { itemBudget: undefined, prefix: undefined }
+    expect(
+      EventStore.makeStream({ ...streamConfig, storedAs: { data: overflow } }).offload,
+    ).toEqual({ ...none, overflow: ["data"] })
+    expect(
       EventStore.makeStream({
         ...streamConfig,
         storedAs: { data: overflow },
         snapshot: { schema: State, storedAs: overflow },
-      }),
-    ).toThrow('offloaded: "data" (overflow), "state" (overflow).')
-    expect(() =>
-      EventStore.makeStream({ ...streamConfig, snapshot: { schema: State, storedAs: overflow } }),
-    ).toThrow('offloaded: "state" (overflow).')
+      }).offload,
+    ).toEqual({ ...none, overflow: ["data", "state"] })
+    expect(
+      EventStore.makeStream({ ...streamConfig, snapshot: { schema: State, storedAs: overflow } })
+        .offload,
+    ).toEqual({ ...none, overflow: ["state"] })
   })
 
-  it("defines an offloading stream with the gate open, reporting its storage", () => {
-    const Ledger = withOffloadGate(() =>
-      EventStore.makeStream({
-        ...streamConfig,
-        storedAs: { data: overflow },
-        snapshot: { schema: State, storedAs: plain },
-        offload: { itemBudget: 350_000, prefix: "ledger" },
-      }),
-    )
+  it("defines an offloading stream, reporting its storage and offload options", () => {
+    const Ledger = EventStore.makeStream({
+      ...streamConfig,
+      storedAs: { data: overflow },
+      snapshot: { schema: State, storedAs: plain },
+      offload: { itemBudget: 350_000, prefix: "ledger" },
+    })
     expect(Ledger.storedAs.data).toBe(overflow)
     expect(Ledger.storedAs.data?.external).toEqual({ threshold: 1_024 })
     expect(Ledger.storedAs.state?.external).toBeUndefined()
+    expect(Ledger.offload).toEqual({ itemBudget: 350_000, prefix: "ledger", overflow: ["data"] })
   })
 
-  it("does not refuse a stream that offloads nothing", () => {
+  it("stream.offload is undefined for a stream that offloads nothing", () => {
     const Ledger = EventStore.makeStream({ ...streamConfig, storedAs: { data: plain } })
     expect(Ledger.storedAs.data?.external).toBeUndefined()
+    expect(Ledger.offload).toBeUndefined()
   })
 
   it("refuses the offload options with EDD-9114", () => {

@@ -47,7 +47,6 @@ import {
   store as rows,
   tableIndexes,
 } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -101,9 +100,12 @@ const docModel = DynamoModel.configure(Doc, {
   meta: { storedAs: DynamoModel.Packed({ format: "json" }) },
 })
 
-const Docs = withOffloadGate(() =>
-  Entity.make({ model: docModel, entityType: "Doc", primaryKey: docKey, indexes: { byOwner } }),
-)
+const Docs = Entity.make({
+  model: docModel,
+  entityType: "Doc",
+  primaryKey: docKey,
+  indexes: { byOwner },
+})
 
 class Note extends Schema.Class<Note>("Note")({
   noteId: Schema.String,
@@ -127,20 +129,16 @@ const Notes = Entity.make({
 })
 
 /** Version snapshots and tombstones. */
-const Kept = withOffloadGate(() =>
-  Entity.make({
-    model: docModel,
-    entityType: "Kept",
-    primaryKey: docKey,
-    versioned: { retain: true },
-    softDelete: true,
-  }),
-)
+const Kept = Entity.make({
+  model: docModel,
+  entityType: "Kept",
+  primaryKey: docKey,
+  versioned: { retain: true },
+  softDelete: true,
+})
 
 /** A pure definition, from the AWS-free package. */
-const PureDocs = withOffloadGate(() =>
-  SchemaEntity.make({ model: docModel, entityType: "PureDoc", primaryKey: docKey }),
-)
+const PureDocs = SchemaEntity.make({ model: docModel, entityType: "PureDoc", primaryKey: docKey })
 
 class Tally extends Schema.Class<Tally>("Tally")({
   tallyId: Schema.String,
@@ -169,15 +167,13 @@ const tallyConfig = {
   softDelete: true,
 } as const
 
-const Tallies = withOffloadGate(() =>
-  Entity.make({
-    ...tallyConfig,
-    model: DynamoModel.configure(Tally, {
-      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-      scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
-    }),
+const Tallies = Entity.make({
+  ...tallyConfig,
+  model: DynamoModel.configure(Tally, {
+    body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+    scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
   }),
-)
+})
 
 const MainTable = Table.make({
   schema: AppSchema,
@@ -213,19 +209,17 @@ class Card extends Schema.Class<Card>("Card")({
 }) {}
 
 /** Vector search over an offloading member: the vector source is an inline field. */
-const Cards = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Card, {
-      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-      scan: { storedAs: DynamoModel.External() },
-    }),
-    entityType: "Card",
-    primaryKey: { pk: { field: "pk", composite: ["cardId"] }, sk: { field: "sk", composite: [] } },
-    vectorIndexes: {
-      byTitle: { name: "vec1", dimensions: 2, distance: "cosine", source: { fields: ["title"] } },
-    },
+const Cards = Entity.make({
+  model: DynamoModel.configure(Card, {
+    body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+    scan: { storedAs: DynamoModel.External() },
   }),
-)
+  entityType: "Card",
+  primaryKey: { pk: { field: "pk", composite: ["cardId"] }, sk: { field: "sk", composite: [] } },
+  vectorIndexes: {
+    byTitle: { name: "vec1", dimensions: 2, distance: "cosine", source: { fields: ["title"] } },
+  },
+})
 class Brief extends Schema.Class<Brief>("Brief")({
   briefId: Schema.String,
   title: Schema.String,
@@ -249,28 +243,24 @@ const briefSource = {
 }
 
 /** Vector search over an offloading member whose embedding source is offloaded. */
-const Briefs = withOffloadGate(() =>
-  Entity.make({
-    model: briefModel,
-    entityType: "Brief",
-    primaryKey: briefKey,
-    vectorIndexes: {
-      byText: { name: "vec2", dimensions: 2, distance: "cosine", source: briefSource },
-    },
-  }),
-)
+const Briefs = Entity.make({
+  model: briefModel,
+  entityType: "Brief",
+  primaryKey: briefKey,
+  vectorIndexes: {
+    byText: { name: "vec2", dimensions: 2, distance: "cosine", source: briefSource },
+  },
+})
 /** `Briefs` with retained versions: an update takes the read-merge (retain) path. */
-const RetainedBriefs = withOffloadGate(() =>
-  Entity.make({
-    model: briefModel,
-    entityType: "RetainedBrief",
-    primaryKey: briefKey,
-    versioned: { retain: true },
-    vectorIndexes: {
-      byText: { name: "vec3", dimensions: 2, distance: "cosine", source: briefSource },
-    },
-  }),
-)
+const RetainedBriefs = Entity.make({
+  model: briefModel,
+  entityType: "RetainedBrief",
+  primaryKey: briefKey,
+  versioned: { retain: true },
+  vectorIndexes: {
+    byText: { name: "vec3", dimensions: 2, distance: "cosine", source: briefSource },
+  },
+})
 const CardTable = Table.make({ schema: AppSchema, entities: { Cards, Briefs, RetainedBriefs } })
 
 // ---------------------------------------------------------------------------

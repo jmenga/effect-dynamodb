@@ -6,10 +6,8 @@
  * offloaded fields eagerly (§8.4).
  *
  * This package sees effect-dynamodb through its public entry point, so the
- * test reads the library's two internal references by their keys: the
- * test-only offload gate (`helpers/OffloadGate.ts`, to define an offloading
- * entity before its write paths are wired) and the current ledger (to
- * observe it from inside the request).
+ * test reads the library's current ledger by its reference key, to observe
+ * it from inside the request.
  */
 
 import { Context, Effect, Layer, Schema } from "effect"
@@ -24,7 +22,6 @@ import {
 } from "effect-dynamodb"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 /** effect-dynamodb's `internal/BlobLedger.ts` `CurrentLedger`, by its key. */
 const CurrentLedger = Context.Reference<{ readonly closed: boolean } | undefined>(
@@ -61,14 +58,12 @@ const courierConfig = {
   },
 } as const
 
-const OffloadingCouriers = withOffloadGate(() =>
-  Entity.make({
-    ...courierConfig,
-    model: DynamoModel.configure(Courier, {
-      photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
-    }),
+const OffloadingCouriers = Entity.make({
+  ...courierConfig,
+  model: DynamoModel.configure(Courier, {
+    photo: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
   }),
-)
+})
 
 const PlainCouriers = Entity.make({ ...courierConfig, entityType: "PlainCourier", model: Courier })
 

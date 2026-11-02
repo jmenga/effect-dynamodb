@@ -39,7 +39,7 @@ import {
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { parseHeader } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { Cause, Effect, Exit, Option } from "effect"
+import { Cause, Context, Effect, Exit, Option } from "effect"
 import { BlobStore } from "../BlobStore.js"
 import { toAttributeMap, toAttributeValue } from "../Marshaller.js"
 import { blobError } from "./BlobCalls.js"
@@ -419,7 +419,7 @@ const uploadOne = (
       attribute,
       rowKey: {
         [row.pkAttribute]: plainKeyValue(row.pk),
-        [row.skAttribute]: plainKeyValue(row.sk),
+        [row.skAttribute]: plainKeyValue(rowSk),
       },
       operation: row.operation,
       copiesPointers: info.copiesPointers,
@@ -502,78 +502,22 @@ export const route = (
   only?: ReadonlySet<string>,
 ): Effect.Effect<Routed, BlobStoreError | ValidationError> =>
   Effect.gen(function* () {
-    // Offloading requires escaped key text (design §11.10, `[EDD-9146]`). A
-    // bound member was refused at bind; an unbound write is refused here,
-    // before anything is uploaded or sent.
-    if (!row.escapeKeys) {
-      return yield* new ValidationError({
-        entityType: info.entityType,
-        operation: row.operation,
-        cause: unescapedKeysText(
-          row.operation,
-          `${info.entityType} offloads ${offloadedAttributes(info)
-            .map((attribute) => `"${info.fieldOf[attribute] ?? attribute}"`)
-            .join(", ")}`,
-        ),
-      })
-    }
-    const candidates = offloadedAttributes(info).filter(
-      (attribute) =>
-        (only === undefined || only.has(attribute)) &&
-        uploadable(info, attribute, ownValue(item, attribute)),
-    )
-    if (candidates.length === 0) return { uploaded: new Set<string>() }
-    const out = new Set(
-      candidates.filter((attribute) =>
-        overThreshold(info, attribute, ownValue(item, attribute) as string | Uint8Array),
-      ),
-    )
-    const store = yield* currentStore
-    const budget = info.itemBudget
-    if (budget !== undefined) {
-      const marshalled = toAttributeMap(item)
-      const measured = new Map<string, Upload>()
-      const measure = (attribute: string): Upload | ValidationError => {
-        const known = measured.get(attribute)
-        if (known !== undefined) return known
-        const value = ownValue(item, attribute) as string | Uint8Array
-        const upload = Object.hasOwn(info.binary, attribute)
-          ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
-          : overflowUpload(info, attribute, value, undefined, row.operation)
-        if (!(upload instanceof ValidationError)) measured.set(attribute, upload)
-        return upload
-      }
-      const bound = (
-        attribute: string,
-      ): Effect.Effect<number, BlobStoreError | ValidationError> => {
-        if (store === undefined) return Effect.fail(notProvided(info, attribute, row.operation))
-        const upload = measure(attribute)
-        if (upload instanceof ValidationError) return Effect.fail(upload)
-        return Effect.succeed(pointerBound(store, keyOf(info, store, row, attribute), upload))
-      }
-      const inline = (attribute: string): number => {
-        const value = marshalled[attribute]
-        return value === undefined ? 0 : attributeBytes(value)
-      }
-      let size = itemBytes(marshalled)
-      for (const attribute of out) size += (yield* bound(attribute)) - inline(attribute)
-      const rest = candidates
-        .filter((attribute) => !out.has(attribute))
-        .sort((a, b) => inline(b) - inline(a) || (a < b ? -1 : a > b ? 1 : 0))
-      for (const attribute of rest) {
-        if (size <= budget) break
-        out.add(attribute)
-        size += (yield* bound(attribute)) - inline(attribute)
-      }
-    }
+    const { out, store } = yield* decide(info, item, row, only)
     if (out.size === 0) return { uploaded: out }
     if (store === undefined) {
       return yield* notProvided(info, [...out][0]!, row.operation)
     }
+    // A measurement of the write (`measureAppend`'s additional items): each
+    // value takes its pointer's upper bound, and nothing is uploaded.
+    if (yield* Measuring) {
+      const placed = placeholders(info, item, row, out, store)
+      if (placed instanceof ValidationError) return yield* placed
+      return { uploaded: out }
+    }
     const registry = yield* currentRegistry
     const uploads: Array<readonly [attribute: string, upload: Upload]> = []
     for (const attribute of out) {
-      const value = item[attribute] as string | Uint8Array
+      const value = ownValue(item, attribute) as string | Uint8Array
       const upload = Object.hasOwn(info.binary, attribute)
         ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
         : overflowUpload(info, attribute, value, registry, row.operation)
@@ -596,11 +540,164 @@ export const route = (
     }
     yield* forEachSettled(uploads, ([attribute, upload]) =>
       Effect.map(uploadOne(info, store, row, attribute, upload), (pointer) => {
-        item[attribute] = storedPointer(pointer)
+        setOwn(item, attribute, storedPointer(pointer))
       }),
     )
     return { uploaded: out }
   })
+
+/**
+ * Which attributes of `item` {@link route} sends to the store (design §6.3),
+ * and the store in context: the routing decision alone, shared by `route`
+ * and {@link measure} so a measurement routes exactly as the write would.
+ */
+const decide = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+  only: ReadonlySet<string> | undefined,
+): Effect.Effect<
+  { readonly out: Set<string>; readonly store: BlobStoreService | undefined },
+  BlobStoreError | ValidationError
+> =>
+  Effect.gen(function* () {
+    // Offloading requires escaped key text (design §11.10, `[EDD-9146]`). A
+    // bound member was refused at bind; an unbound write is refused here,
+    // before anything is uploaded or sent (a measurement, before anything is
+    // measured).
+    if (!row.escapeKeys) {
+      return yield* new ValidationError({
+        entityType: info.entityType,
+        operation: row.operation,
+        cause: unescapedKeysText(
+          row.operation,
+          `${info.entityType} offloads ${offloadedAttributes(info)
+            .map((attribute) => `"${info.fieldOf[attribute] ?? attribute}"`)
+            .join(", ")}`,
+        ),
+      })
+    }
+    const candidates = offloadedAttributes(info).filter(
+      (attribute) =>
+        (only === undefined || only.has(attribute)) &&
+        uploadable(info, attribute, ownValue(item, attribute)),
+    )
+    if (candidates.length === 0) return { out: new Set<string>(), store: undefined }
+    const out = new Set(
+      candidates.filter((attribute) =>
+        overThreshold(info, attribute, ownValue(item, attribute) as string | Uint8Array),
+      ),
+    )
+    const store = yield* currentStore
+    const budget = info.itemBudget
+    if (budget !== undefined) {
+      const marshalled = toAttributeMap(item)
+      const measured = new Map<string, Upload>()
+      const measureOne = (attribute: string): Upload | ValidationError => {
+        const known = measured.get(attribute)
+        if (known !== undefined) return known
+        const value = ownValue(item, attribute) as string | Uint8Array
+        const upload = Object.hasOwn(info.binary, attribute)
+          ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
+          : overflowUpload(info, attribute, value, undefined, row.operation)
+        if (!(upload instanceof ValidationError)) measured.set(attribute, upload)
+        return upload
+      }
+      const bound = (
+        attribute: string,
+      ): Effect.Effect<number, BlobStoreError | ValidationError> => {
+        if (store === undefined) return Effect.fail(notProvided(info, attribute, row.operation))
+        const upload = measureOne(attribute)
+        if (upload instanceof ValidationError) return Effect.fail(upload)
+        return Effect.succeed(pointerBound(store, keyOf(info, store, row, attribute), upload))
+      }
+      const inline = (attribute: string): number => {
+        const value = marshalled[attribute]
+        return value === undefined ? 0 : attributeBytes(value)
+      }
+      let size = itemBytes(marshalled)
+      for (const attribute of out) size += (yield* bound(attribute)) - inline(attribute)
+      const rest = candidates
+        .filter((attribute) => !out.has(attribute))
+        .sort((a, b) => inline(b) - inline(a) || (a < b ? -1 : a > b ? 1 : 0))
+      for (const attribute of rest) {
+        if (size <= budget) break
+        out.add(attribute)
+        size += (yield* bound(attribute)) - inline(attribute)
+      }
+    }
+    return { out, store }
+  })
+
+/** One attribute {@link measure} found the write would offload. */
+export interface MeasuredOffload {
+  /** The stored attribute name. */
+  readonly attribute: string
+  /** The object's bytes: the JSON text, or the compressed payload after its header. */
+  readonly objectBytes: number
+}
+
+/**
+ * Measure, in place, what {@link route} would do to `item` without uploading
+ * anything (design §6.10, `measureAppend` / `measureSnapshot`): each attribute
+ * the write would offload is replaced by a placeholder of its pointer's upper
+ * bound (§6.3) — so the item measures at most what the write would send — and
+ * reported with the bytes its object would hold. Fails as `route` does when a
+ * value must go to the store and none is in context (the bound needs its
+ * limits).
+ */
+export const measure = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+): Effect.Effect<ReadonlyArray<MeasuredOffload>, BlobStoreError | ValidationError> =>
+  Effect.gen(function* () {
+    const { out, store } = yield* decide(info, item, row, undefined)
+    if (out.size === 0) return []
+    if (store === undefined) return yield* notProvided(info, [...out][0]!, row.operation)
+    const placed = placeholders(info, item, row, out, store)
+    if (placed instanceof ValidationError) return yield* placed
+    return placed
+  })
+
+/**
+ * Replace each of `out` in `item` by a placeholder of its pointer's upper
+ * bound (§6.3), uploading nothing: what {@link measure} and a measuring
+ * {@link route} ({@link Measuring}) leave for the item to be measured with.
+ */
+const placeholders = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+  out: ReadonlySet<string>,
+  store: BlobStoreService,
+): ReadonlyArray<MeasuredOffload> | ValidationError => {
+  const measured: Array<MeasuredOffload> = []
+  for (const attribute of out) {
+    const value = ownValue(item, attribute) as string | Uint8Array
+    const upload = Object.hasOwn(info.binary, attribute)
+      ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
+      : overflowUpload(info, attribute, value, undefined, row.operation)
+    if (upload instanceof ValidationError) return upload
+    const bound = pointerBound(store, keyOf(info, store, row, attribute), upload)
+    // `B` bytes for an overflow pointer, `~edbp:` text for a binary one.
+    setOwn(item, attribute, upload.kind === "json" ? new Uint8Array(bound) : "~".repeat(bound))
+    measured.push({ attribute, objectBytes: upload.objectSize })
+  }
+  return measured
+}
+
+/**
+ * @internal Set while a write is only being measured (`measureAppend` builds
+ * the transaction `append` would send, its `additionalItems` included):
+ * {@link route} then gives each value it would upload a placeholder of its
+ * pointer's upper bound, so the item measures at most what the write would
+ * send, and uploads nothing.
+ */
+export const Measuring = Context.Reference<boolean>(
+  "effect-dynamodb/internal/OffloadWrite/Measuring",
+  { defaultValue: () => false },
+)
 
 /** One offloaded attribute an `UpdateItem` `SET`s: its `:value` token and stored name. */
 export interface OffloadSet {

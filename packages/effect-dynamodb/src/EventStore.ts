@@ -84,9 +84,9 @@ import {
   readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import type { DefaultOffloadModes } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import { refuseUnsupportedOffload } from "@effect-dynamodb/schema/internal/OffloadGate.js"
 import { classOf, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isDispatchEligible,
@@ -96,7 +96,7 @@ import {
 import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
-  type Cause,
+  Cause,
   Context,
   DateTime,
   type Duration,
@@ -109,9 +109,13 @@ import {
   Schedule,
   Schema,
 } from "effect"
+import { BlobStore } from "./BlobStore.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
+import { STREAM_FAMILY_SK } from "./internal/BlobKeys.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
+import type { BlobStoreService } from "./internal/BlobStoreContract.js"
+import type { WriteOpBlobErrors } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
@@ -127,18 +131,24 @@ import {
   type MultiProjection,
   type MultiSource,
 } from "./internal/MultiProjection.js"
+import * as OffloadRead from "./internal/OffloadRead.js"
+import {
+  isOffloadedValue,
+  makeOffloadedValue,
+  type OffloadedValue,
+} from "./internal/OffloadValues.js"
+import * as OffloadWrite from "./internal/OffloadWrite.js"
 import {
   type CodecRequirement,
   codecRequirements,
   currentRegistry,
-  decodeImage,
   imageEntityType,
+  imageForm,
+  normalizeImage,
   type PackedAttributeGuard,
   runtimeCodecCheck,
   type StreamImage,
-  unpackStoredValueSync,
   unregisteredCodecError,
-  withRegistry,
 } from "./internal/Packed.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
@@ -168,6 +178,7 @@ import {
   withCause,
 } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
+import type { NoOffloadState } from "./Offload.js"
 import * as Query from "./Query.js"
 import {
   addTableKeyAttributes,
@@ -259,6 +270,14 @@ export interface DecodeStreamImageOptions {
    * schema does not model, without parsing the image a second time.
    */
   readonly raw?: boolean | undefined
+  /**
+   * How an offloaded `data` is returned (#179, design §10.2): `"lazy"`
+   * (default) as a {@link LazyStreamEvent} — nothing is fetched until
+   * `event.data.read()` — or `"eager"`, fetched before the decode returns
+   * (which then carries `BlobStoreError`). Nothing changes on a stream whose
+   * `data` is not offloaded.
+   */
+  readonly offloaded?: StreamReadMode | undefined
 }
 
 /**
@@ -292,6 +311,60 @@ const streamCodecRequirements = (
     ["data", storedAs.data],
     ["state", storedAs.state],
   ])
+
+/**
+ * The store requirement of a stream that offloads: `[EDD-9146]` on a table
+ * whose schema doesn't set `escapeKeys: true`, `[EDD-9115]` when no store is
+ * resolvable.
+ */
+const streamStoreRequirements = (
+  streamName: string,
+  offload: StreamOffloadSettings | undefined,
+  escapeKeys: boolean | undefined,
+): ReadonlyArray<OffloadWrite.StoreRequirement> =>
+  offload === undefined
+    ? []
+    : [{ owner: `stream "${streamName}"`, fields: offload.overflow, escapeKeys }]
+
+/**
+ * @internal The store requirements of a stream, bound or not (`[EDD-9146]`,
+ * `[EDD-9115]`): checked by {@link bind}, `bindProjection` and the streams a
+ * table's `rekey` is given.
+ */
+export const storeRequirementsOf = (stream: {
+  readonly streamName: string
+  readonly offload: StreamOffloadSettings | undefined
+
+  /**
+   * @internal The stream's store requirements: its offloaded kinds, and
+   * whether its table's schema sets `escapeKeys: true` (`[EDD-9146]`).
+   */
+  readonly _storeRequirements?: ReadonlyArray<OffloadWrite.StoreRequirement> | undefined
+}): ReadonlyArray<OffloadWrite.StoreRequirement> =>
+  (stream as { readonly _storeRequirements?: ReadonlyArray<OffloadWrite.StoreRequirement> })
+    ._storeRequirements ?? streamStoreRequirements(stream.streamName, stream.offload, undefined)
+
+/**
+ * The first-use store check of an unbound stream that offloads (design §13,
+ * the `runtimeCodecCheck` pattern): the first operation run with a given
+ * store passes it, and one run with no store in context dies with
+ * `[EDD-9115]`. `undefined` for a stream that offloads nothing.
+ */
+const runtimeStoreCheck = (
+  where: string,
+  requirements: ReadonlyArray<OffloadWrite.StoreRequirement>,
+): Effect.Effect<void> | undefined => {
+  if (requirements.length === 0) return undefined
+  const passed = new WeakSet<BlobStoreService>()
+  return Effect.withFiber((fiber) => {
+    const store = Context.getOrUndefined(fiber.context, BlobStore)
+    if (store !== undefined && passed.has(store)) return Effect.void
+    const error = OffloadWrite.missingStoreError(where, requirements, store)
+    if (error !== undefined) return Effect.die(error)
+    passed.add(store!)
+    return Effect.void
+  })
+}
 
 /** The attributes a stream image reads by stored form: event `data` only. */
 const DATA_ATTRIBUTES: ReadonlyArray<string> = ["data"]
@@ -400,7 +473,10 @@ export interface SnapshotConfig<TSchema extends Schema.Top = Schema.Top> {
    * JSON string, compressed to binary at or over the threshold when that is
    * smaller. Packing shrinks a large state the most: an inline snapshot rides
    * in every append's transaction, and DynamoDB's item and transaction size
-   * limits count its **stored** bytes.
+   * limits count its **stored** bytes. `DynamoModel.Packed({ external })`
+   * (#179) also offloads the state to the blob store at or over
+   * `external.threshold`, the item keeping a pointer; reads resolve it
+   * eagerly, or lazily with `{ offloaded: "lazy" }` (a {@link LazySnapshot}).
    *
    * The state schema's encoded side must be object- or array-shaped
    * (`[EDD-9073]`). Reads go by the stored form, so changing this setting
@@ -432,6 +508,211 @@ export interface StreamStorageSettings {
   /** Snapshot `state` (`snapshot.storedAs`); `undefined` = native map. */
   readonly state: PackedConfig | ExternalPackedConfig | undefined
 }
+
+// ---------------------------------------------------------------------------
+// Offloaded storage (#179)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a stream sends to the blob store: event `data` and snapshot `state`,
+ * each when stored `DynamoModel.Packed({ external })` (#179).
+ */
+export type StreamOffloadKind = "data" | "state"
+
+/** The resolved offload settings exposed on a stream that offloads (`stream.offload`). */
+export interface StreamOffloadSettings {
+  /** `offload.itemBudget`, applied per event item and per snapshot item. */
+  readonly itemBudget: number | undefined
+  /** `offload.prefix`, replacing the blob store's prefix for this stream's objects. */
+  readonly prefix: string | undefined
+  /** What the stream offloads (overflow values). */
+  readonly overflow: ReadonlyArray<StreamOffloadKind>
+}
+
+/** @internal A `Packed({ external })` config: one whose values may be offloaded. */
+const isOffloadingConfig = (
+  storedAs: PackedConfig | ExternalPackedConfig | undefined,
+): storedAs is ExternalPackedConfig => storedAs !== undefined && storedAs.external !== undefined
+
+/**
+ * How a stream read returns an offloaded event `data` or snapshot `state`
+ * (`{ offloaded }`, #179, design §8.4, §10.2):
+ *
+ * - `"eager"` — the value, fetched from the blob store (verified by size and
+ *   checksum) before the read returns; the read then carries
+ *   `BlobStoreError`;
+ * - `"lazy"` — an {@link OffloadedValue}: nothing is fetched until its
+ *   `read()`, which carries the error instead. An inline value resolves with
+ *   no I/O.
+ *
+ * Reads (`read`, `readFrom`, `readLatest`, `readSnapshot`, `readIndex`,
+ * `query.*`) are eager by default; stream-image and change-feed decoding
+ * (`decodeStreamImage`, projections, `processBatch`, `runChangeFeed`) lazy.
+ * On a stream that offloads nothing the mode changes nothing.
+ */
+export type StreamReadMode = "eager" | "lazy"
+
+/**
+ * A {@link StreamEvent} whose `data` is read lazily (#179, design §10.2): the
+ * envelope (`eventType`, `version`, `metadata`, timestamps) decoded, `data`
+ * an {@link OffloadedValue} of the event — dispatch on `eventType`, and
+ * `yield* event.data.read()` for the payload (which adds `BlobStoreError`).
+ */
+export interface LazyStreamEvent<A, M = Record<string, unknown> | undefined>
+  extends StreamEvent<OffloadedValue<A>, M> {}
+
+/** A {@link RawStreamEvent} whose `data` and `rawData` are read lazily. */
+export interface LazyRawStreamEvent<A, M = Record<string, unknown> | undefined>
+  extends LazyStreamEvent<A, M> {
+  /** The event's `data` as stored, in wire form — see {@link RawStreamEvent.rawData}. */
+  readonly rawData: OffloadedValue<Readonly<Record<string, unknown>>>
+}
+
+/** A {@link Snapshot} whose `state` is read lazily (#179). */
+export interface LazySnapshot<State> extends Snapshot<OffloadedValue<State>> {}
+
+/**
+ * @internal What a stream's type offloads: `T` itself, or both kinds for a
+ * type-erased stream (`any`), which may offload either.
+ */
+type OffloadedKinds<T> = unknown extends T ? StreamOffloadKind : T
+
+/**
+ * The {@link StreamReadMode} of a read's options `O`: the `offloaded` it
+ * names, `Default` when it names none — and either when it may or may not.
+ */
+export type StreamReadModeOf<O, Default extends StreamReadMode = "eager"> = unknown extends O
+  ? StreamReadMode
+  : [O] extends [undefined]
+    ? Default
+    : "offloaded" extends keyof NonNullable<O>
+      ?
+          | Extract<NonNullable<O>["offloaded" & keyof NonNullable<O>], StreamReadMode>
+          | (undefined extends NonNullable<O>["offloaded" & keyof NonNullable<O>] ? Default : never)
+          | (undefined extends O ? Default : never)
+      : Default
+
+/**
+ * The {@link StreamReadMode} of an `offloaded` option's value `M`: `M`,
+ * `Default` when it is absent — and either when it may or may not be.
+ */
+export type StreamReadModeFor<M, Default extends StreamReadMode = "eager"> = unknown extends M
+  ? StreamReadMode
+  : [M] extends [undefined]
+    ? Default
+    : Extract<M, StreamReadMode> | (undefined extends M ? Default : never)
+
+/**
+ * The event a read in mode `Mode` returns: a {@link LazyStreamEvent} when the
+ * stream offloads `data` and the read is lazy, a {@link StreamEvent}
+ * otherwise. A type-erased stream's (`any`) `data` may be either — one
+ * `StreamEvent` over both, since a union of the two would reduce to the lazy
+ * one when `TEvent` is `any`.
+ */
+export type StreamEventOf<
+  TEvent,
+  M,
+  TOffloaded,
+  Mode extends StreamReadMode,
+> = unknown extends TOffloaded
+  ? StreamEvent<TEvent | OffloadedValue<TEvent>, M>
+  : [Extract<TOffloaded, "data">] extends [never]
+    ? StreamEvent<TEvent, M>
+    : Mode extends "lazy"
+      ? LazyStreamEvent<TEvent, M>
+      : StreamEvent<TEvent, M>
+
+/** {@link StreamEventOf} with the event's stored `data` (`decodeStreamImage(..., { raw: true })`). */
+export type RawStreamEventOf<
+  TEvent,
+  M,
+  TOffloaded,
+  Mode extends StreamReadMode,
+> = unknown extends TOffloaded
+  ? RawStreamEvent<TEvent | OffloadedValue<TEvent>, M> | LazyRawStreamEvent<TEvent, M>
+  : [Extract<TOffloaded, "data">] extends [never]
+    ? RawStreamEvent<TEvent, M>
+    : Mode extends "lazy"
+      ? LazyRawStreamEvent<TEvent, M>
+      : RawStreamEvent<TEvent, M>
+
+/** The snapshot a read in mode `Mode` returns (see {@link StreamEventOf}). */
+export type StreamSnapshotOf<
+  TState,
+  TOffloaded,
+  Mode extends StreamReadMode,
+> = unknown extends TOffloaded
+  ? Snapshot<TState | OffloadedValue<TState>>
+  : [Extract<TOffloaded, "state">] extends [never]
+    ? Snapshot<TState>
+    : Mode extends "lazy"
+      ? LazySnapshot<TState>
+      : Snapshot<TState>
+
+/**
+ * The blob errors of a read in mode `Mode` of `Kind`: `BlobStoreError` when
+ * the stream offloads one of them and the read is eager.
+ */
+export type StreamReadErrors<TOffloaded, Kind extends StreamOffloadKind, Mode> = [
+  Extract<OffloadedKinds<TOffloaded>, Kind>,
+] extends [never]
+  ? never
+  : "eager" extends Mode
+    ? BlobStoreError
+    : never
+
+/** The blob errors of a write of `Kind`: `BlobStoreError` when the stream offloads one. */
+export type StreamWriteErrors<TOffloaded, Kind extends StreamOffloadKind = StreamOffloadKind> = [
+  Extract<OffloadedKinds<TOffloaded>, Kind>,
+] extends [never]
+  ? never
+  : BlobStoreError
+
+/**
+ * What a stream definition offloads, from its `storedAs` and `snapshot`
+ * configs (`makeStream`'s inference of `EventStream`'s `TOffloaded`).
+ */
+export type OffloadedKindsOf<TStorage, TSnapshot> =
+  | (TStorage extends { readonly data?: infer D }
+      ? D extends ExternalPackedConfig
+        ? "data"
+        : never
+      : never)
+  | (TSnapshot extends { readonly storedAs?: infer S }
+      ? S extends ExternalPackedConfig
+        ? "state"
+        : never
+      : never)
+
+/**
+ * @internal The offload state of a stream's event queries (`query.events`,
+ * `query.index`), which `Query.offloaded` re-types `data` from.
+ */
+export type StreamQueryState<TOffloaded, Item> = [
+  Extract<OffloadedKinds<TOffloaded>, "data">,
+] extends [never]
+  ? NoOffloadState
+  : {
+      readonly fields: { readonly overflow: "data"; readonly binary: never }
+      readonly modes: DefaultOffloadModes
+      readonly item: Item
+    }
+
+/**
+ * The state {@link EventStream.readLatest} returns in mode `Mode`: a
+ * {@link LatestState} whose snapshot and events are typed per
+ * {@link StreamSnapshotOf} / {@link StreamEventOf}.
+ */
+export type LatestStateOf<TState, TEvent, M, TOffloaded, Mode extends StreamReadMode> = [
+  OffloadedKinds<TOffloaded>,
+] extends [never]
+  ? LatestState<TState, TEvent, M>
+  : Mode extends "lazy"
+    ? LatestStateView<
+        StreamSnapshotOf<TState, TOffloaded, "lazy">,
+        StreamEventOf<TEvent, M, TOffloaded, "lazy">
+      >
+    : LatestState<TState, TEvent, M>
 
 /**
  * The bytes an {@link EventStream.append} would write, by DynamoDB's own size
@@ -476,6 +757,26 @@ export interface AppendMeasurement {
    * `TransactWriteItems`). `0` when the append would send nothing.
    */
   readonly requestBytes: number
+  /**
+   * What the append would offload (#179, design §6.10): one entry per event
+   * `data` (`item` its index in `events`) or inline snapshot `state`
+   * (`item: "snapshot"`) routed to the blob store, with the bytes its object
+   * would hold. Nothing is uploaded: the sizes above count each such value as
+   * its pointer at its upper bound (`requestBytes` too), so they never under-measure the
+   * request.
+   * Empty for a stream that offloads nothing.
+   */
+  readonly offloaded: ReadonlyArray<AppendOffloadMeasurement>
+}
+
+/** One value an {@link EventStream.measureAppend} found the append would offload. */
+export interface AppendOffloadMeasurement {
+  /** The event's index in `events`, or `"snapshot"` for the inline snapshot. */
+  readonly item: number | "snapshot"
+  /** The offloaded attribute. */
+  readonly attribute: "data" | "state"
+  /** The object's bytes: the JSON text, or the compressed payload. */
+  readonly objectBytes: number
 }
 
 /**
@@ -613,7 +914,10 @@ export type HeadProof = { readonly additionalItem: number } | "snapshot" | "none
  * `TState` is the stream's snapshot state type (`never` for a stream without a
  * `snapshot` config, so `snapshot` cannot be supplied there).
  */
-export interface AppendOptionsBase<TState = never> {
+export interface AppendOptionsBase<
+  TState = never,
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
+> {
   /**
    * Caller-owned transact items committed atomically with the events — the same
    * op union `Transaction.transactWrite` accepts (`EntityPut`, `EntityDelete`,
@@ -645,7 +949,7 @@ export interface AppendOptionsBase<TState = never> {
    * type and forwards the value to `transactWrite` must annotate it
    * `ReadonlyArray<TransactWriteOp>`.
    */
-  readonly additionalItems?: ReadonlyArray<AppendWriteOp>
+  readonly additionalItems?: TOps
   /** Opt in to exactly-once command processing — see {@link AppendIdempotency}. */
   readonly idempotency?: AppendIdempotency
   /**
@@ -830,8 +1134,11 @@ export interface AppendOptionsBase<TState = never> {
  * A type alias rather than an interface, since it is an intersection with a
  * union: an interface cannot extend it.
  */
-export type AppendOptions<TMetadata, TState = never> = AppendOptionsBase<TState> &
-  AppendMetadataOptions<TMetadata>
+export type AppendOptions<
+  TMetadata,
+  TState = never,
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
+> = AppendOptionsBase<TState, TOps> & AppendMetadataOptions<TMetadata>
 
 /**
  * The options of {@link EventStream.appendOp}: those of
@@ -872,8 +1179,16 @@ export type AppendError =
 // ---------------------------------------------------------------------------
 
 /**
- * Options accepted by {@link EventStream.read}, {@link EventStream.readFrom} and
- * {@link EventStream.currentVersion}.
+ * Options accepted by {@link EventStream.currentVersion}: `consistentRead`
+ * (see {@link ReadOptions}). It reads the newest event's version, never its
+ * `data`, so it takes no `offloaded` mode (#179).
+ */
+export interface CurrentVersionOptions {
+  readonly consistentRead?: boolean | undefined
+}
+
+/**
+ * Options accepted by {@link EventStream.read} and {@link EventStream.readFrom}.
  *
  * `consistentRead: true` sets `ConsistentRead` on every `Query` page, so the
  * read observes every append acknowledged before it started (read-your-writes).
@@ -882,8 +1197,20 @@ export type AppendError =
  * {@link commandHandler} loads state with strongly consistent reads by default —
  * see {@link CommandHandlerOptions.consistentRead}.
  */
-export interface ReadOptions {
-  readonly consistentRead?: boolean | undefined
+export interface ReadOptions extends CurrentVersionOptions {
+  /**
+   * How an offloaded event `data` / snapshot `state` is returned (#179):
+   * `"eager"` (default) fetches it, `"lazy"` returns an `OffloadedValue` —
+   * see {@link StreamReadMode}. Nothing changes on a stream that offloads
+   * nothing.
+   */
+  readonly offloaded?: StreamReadMode | undefined
+}
+
+/** Options of {@link EventStream.readSnapshot}. */
+export interface ReadSnapshotOptions {
+  /** See {@link ReadOptions.offloaded}. Default `"eager"`. */
+  readonly offloaded?: StreamReadMode | undefined
 }
 
 /**
@@ -940,9 +1267,17 @@ export interface ReadLatestOptions extends ReadOptions {
  * - `seal` — the sealing event, when the read found one (see
  *   {@link AppendOptionsBase.seal}).
  */
-export interface LatestState<TState, TEvent, M = Record<string, unknown> | undefined> {
-  readonly snapshot: Option.Option<Snapshot<TState>>
-  readonly events: ReadonlyArray<StreamEvent<TEvent, M>>
+export interface LatestState<TState, TEvent, M = Record<string, unknown> | undefined>
+  extends LatestStateView<Snapshot<TState>, StreamEvent<TEvent, M>> {}
+
+/**
+ * A {@link LatestState} over snapshot type `S` and event type `Ev` — what a
+ * lazy `readLatest` of a stream that offloads returns (`LazySnapshot`,
+ * `LazyStreamEvent`, #179).
+ */
+export interface LatestStateView<S, Ev> {
+  readonly snapshot: Option.Option<S>
+  readonly events: ReadonlyArray<Ev>
   readonly version: number
   /**
    * The sealing event when the read found one, absent otherwise. It is
@@ -960,7 +1295,7 @@ export interface LatestState<TState, TEvent, M = Record<string, unknown> | undef
    * `seal.version < version` means events were written past the seal by a
    * writer that does not enforce it: they are on a closed stream.
    */
-  readonly seal?: StreamEvent<TEvent, M>
+  readonly seal?: Ev
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1640,8 @@ export type ReadIndexOptions = {
   readonly reverse?: boolean | undefined
   readonly limit?: number | undefined
   readonly consistentRead?: boolean | undefined
+  /** See {@link ReadOptions.offloaded}. Default `"eager"`. */
+  readonly offloaded?: StreamReadMode | undefined
 } & (
   | { readonly beginsWith?: string | undefined; readonly between?: undefined }
   | { readonly between?: readonly [string, string] | undefined; readonly beginsWith?: undefined }
@@ -1321,15 +1658,17 @@ export type ReadIndexOptions = {
  * assignable to one whose indexes do not, as every stream is to
  * `EventStream<E, F, M, S>`).
  */
-export type ReadIndexArgs<N extends string, TPartitionedIndexName extends string> = [
-  TPartitionedIndexName,
-] extends [never]
+export type ReadIndexArgs<
+  N extends string,
+  TPartitionedIndexName extends string,
+  Opt extends ReadIndexOptions = ReadIndexOptions,
+> = [TPartitionedIndexName] extends [never]
   ? // No index derives its partition: resolved even while `N` is a type
     // parameter, so a generic wrapper over a stream's indexes type-checks.
-    [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+    [options?: (Opt & { readonly partition?: string | undefined }) | undefined]
   : [N] extends [TPartitionedIndexName]
-    ? [options: ReadIndexOptions & { readonly partition: string }]
-    : [options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined]
+    ? [options: Opt & { readonly partition: string }]
+    : [options?: (Opt & { readonly partition?: string | undefined }) | undefined]
 
 /**
  * The options argument of `query.index` for index `N` — `partition`, required
@@ -2126,6 +2465,7 @@ export interface EventStream<
     readonly [K in TIndexName]: "all"
   },
   TPartitionedIndexName extends string = never,
+  TOffloaded extends StreamOffloadKind = never,
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -2173,6 +2513,19 @@ export interface EventStream<
   readonly storedAs: StreamStorageSettings
 
   /**
+   * The stream's resolved offload settings (#179) — `offload.itemBudget`,
+   * `offload.prefix` and what it offloads — or `undefined` for a stream
+   * whose `data` and snapshot `state` are not `DynamoModel.Packed({ external })`.
+   */
+  readonly offload: StreamOffloadSettings | undefined
+
+  /**
+   * @internal The stream's store requirements: its offloaded kinds, and
+   * whether its table's schema sets `escapeKeys: true` (`[EDD-9146]`).
+   */
+  readonly _storeRequirements?: ReadonlyArray<OffloadWrite.StoreRequirement> | undefined
+
+  /**
    * Write (or overwrite) this stream's snapshot.
    *
    * Monotonic: a snapshot at an equal or newer `asOfVersion` already present is
@@ -2210,7 +2563,11 @@ export interface EventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ): Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | StreamWriteErrors<TOffloaded, "state">,
+    DynamoClient | TableConfig
+  >
 
   /**
    * Read this stream's snapshot, if one has been written.
@@ -2219,11 +2576,14 @@ export interface EventStream<
    * with `ValidationError` — it is never silently discarded, because that would
    * hide state-schema evolution bugs.
    */
-  readSnapshot(
+  readSnapshot<const Opt extends ReadSnapshotOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: Opt,
   ): Effect.Effect<
-    Option.Option<Snapshot<TState>>,
-    DynamoClientError | ValidationError,
+    Option.Option<StreamSnapshotOf<TState, TOffloaded, StreamReadModeOf<Opt>>>,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "state", StreamReadModeOf<Opt>>,
     DynamoClient | TableConfig
   >
 
@@ -2247,12 +2607,16 @@ export interface EventStream<
    * A method, like `writeSnapshot`, so a snapshot-less stream (whose
    * `options.snapshot` is `never`) stays assignable to other streams.
    */
-  append(
+  append<const TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<never>>(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<TMetadata, TState> | undefined,
-  ): Effect.Effect<AppendResult<TEvent>, AppendError, DynamoClient | TableConfig>
+    options?: AppendOptions<TMetadata, TState, TOps> | undefined,
+  ): Effect.Effect<
+    AppendResult<TEvent>,
+    AppendError | StreamWriteErrors<TOffloaded> | WriteOpBlobErrors<TOps[number]>,
+    DynamoClient | TableConfig
+  >
 
   /**
    * An append of this stream as a transact item of ANOTHER stream's append
@@ -2307,18 +2671,22 @@ export interface EventStream<
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: NestedAppendOptions<TMetadata, TState> | undefined,
-  ): StreamAppendOp
+  ): StreamAppendOp<StreamWriteErrors<TOffloaded>>
 
   /**
    * Read every event of the stream, ascending by version. Pass
    * `{ consistentRead: true }` for read-your-writes — see {@link ReadOptions}.
    */
-  read(
+  read<const Opt extends ReadOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt>>,
     DynamoClient | TableConfig
   >
 
@@ -2327,24 +2695,29 @@ export interface EventStream<
    * `toVersion` (inclusive) when given. Pass `{ consistentRead: true }` for
    * read-your-writes — see {@link ReadFromOptions}.
    */
-  readFrom(
+  readFrom<const Opt extends ReadFromOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-    options?: ReadFromOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt>>,
     DynamoClient | TableConfig
   >
 
   /**
    * The version of the stream's newest event (`0` for an empty stream), in one
    * request. Pass `{ consistentRead: true }` for read-your-writes — see
-   * {@link ReadOptions}.
+   * {@link ReadOptions}. Only the version is read: an offloaded `data` is
+   * never fetched.
    */
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: CurrentVersionOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
@@ -2378,12 +2751,14 @@ export interface EventStream<
    * the read fetches the sealing event, in any mode (see
    * {@link LatestState.seal} for the cases it does not).
    */
-  readLatest(
+  readLatest<const Opt extends ReadLatestOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadLatestOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError,
+    LatestStateOf<TState, TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, StreamOffloadKind, StreamReadModeOf<Opt>>,
     DynamoClient | TableConfig
   >
 
@@ -2406,13 +2781,26 @@ export interface EventStream<
    * `streamId` in it — not the other streams sharing the partition, nor any
    * snapshot — by filtering on the table's `pk`, which every index projects.
    */
-  readIndex<N extends TIndexName>(
+  readIndex<N extends TIndexName, const Mode extends StreamReadMode | undefined = undefined>(
     name: N,
     streamId: StreamIdInput<TStreamIdFields>,
-    ...options: ReadIndexArgs<N, TPartitionedIndexName>
+    ...options: ReadIndexArgs<
+      N,
+      TPartitionedIndexName,
+      ReadIndexOptions & { readonly offloaded?: Mode }
+    >
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<
+        TEvent,
+        IndexEventMetadata<TMetadata, TIndexProjections[N]>,
+        TOffloaded,
+        StreamReadModeFor<Mode>
+      >
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeFor<Mode>>,
     DynamoClient | TableConfig
   >
 
@@ -2486,27 +2874,56 @@ export interface EventStream<
    * failing with a typed error. Provide `Compression` where the handler runs,
    * or decode through {@link EventStore.bind}, which captures it.
    */
-  decodeStreamImage(
+  decodeStreamImage<const Opt extends DecodeStreamImageOptions & { readonly raw: true }>(
     image: StreamImage,
-    options: DecodeStreamImageOptions & { readonly raw: true },
+    options: Opt,
   ): Effect.Effect<
-    Option.Option<RawStreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    ValidationError,
+    Option.Option<
+      RawStreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt, "lazy">>
+    >,
+    ValidationError | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt, "lazy">>,
     never
   >
+  // `options` may be `undefined` (a caller forwarding its own optional
+  // options): the mode it may name, or the default.
+  decodeStreamImage<const Opt extends DecodeStreamImageOptions | undefined = undefined>(
+    image: StreamImage,
+    options?: Opt,
+  ): Effect.Effect<
+    Option.Option<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt, "lazy">>
+    >,
+    ValidationError | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt, "lazy">>,
+    never
+  >
+  // Last: the signature a stream is matched by (`EventStore.decoder`'s
+  // `DecodableStream`) and the one an event type is inferred from.
   decodeStreamImage(
     image: StreamImage,
-    options?: DecodeStreamImageOptions,
   ): Effect.Effect<
-    Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    Option.Option<StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, "lazy">>,
     ValidationError,
     never
   >
 
+  /**
+   * The stream's query builders. On a stream that offloads (#179), each
+   * terminal (`Query.collect`, `Query.execute`, `Query.paginate`,
+   * `Query.count`) runs the stream's first-use store check as every other
+   * operation does: it dies with `[EDD-9115]` when no `BlobStore` is in
+   * context. `Query.asParams` sends nothing and checks nothing. The codec
+   * check (`[EDD-9078]`) does not run here: a compressed row the running
+   * registry cannot read fails as a `ValidationError` caused by
+   * `CompressorNotRegistered`.
+   */
   readonly query: {
     events(
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<
+      StreamEvent<TEvent, StreamMetadata<TMetadata>>,
+      StreamReadErrors<TOffloaded, "data", "eager">,
+      StreamQueryState<TOffloaded, StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    >
     /**
      * A query of one of the stream's indexes (#140), scoped to `streamId`:
      * decoded events in index-key order. It composes with the `Query`
@@ -2531,7 +2948,14 @@ export interface EventStream<
       name: N,
       streamId: StreamIdInput<TStreamIdFields>,
       ...options: IndexQueryArgs<N, TPartitionedIndexName>
-    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
+    ): Query.Query<
+      StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>,
+      StreamReadErrors<TOffloaded, "data", "eager">,
+      StreamQueryState<
+        TOffloaded,
+        StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>
+      >
+    >
   }
 }
 
@@ -2768,6 +3192,7 @@ export const makeStream = <
   const TStreamId extends { readonly composite: ReadonlyArray<string> },
   TMetadata extends Schema.Top | undefined = undefined,
   TSnapshot extends SnapshotConfig | undefined = undefined,
+  const TStorage extends StreamStorageConfig | undefined = undefined,
   const TIndexes extends {
     readonly [K in keyof TIndexes]: StreamIndexConfig<
       Schema.Schema.Type<TEvents[number]>,
@@ -2791,7 +3216,7 @@ export const makeStream = <
       SnapshotStateOf<TSnapshot>
     >
   /** How event `data` is stored — see {@link StreamStorageConfig}. */
-  readonly storedAs?: StreamStorageConfig | undefined
+  readonly storedAs?: TStorage
   /**
    * Item-level offload settings (#179) for a stream whose event `data` or
    * snapshot `state` is `DynamoModel.Packed({ external })`: `itemBudget`
@@ -2806,7 +3231,8 @@ export const makeStream = <
   SnapshotStateOf<TSnapshot>,
   keyof TIndexes & string,
   IndexProjectionsOf<TIndexes>,
-  PartitionedIndexesOf<TIndexes>
+  PartitionedIndexesOf<TIndexes>,
+  OffloadedKindsOf<TStorage, TSnapshot>
 > => {
   type TEvent = Schema.Schema.Type<TEvents[number]>
   type TStreamIdFields = TStreamId["composite"]
@@ -2901,24 +3327,52 @@ export const makeStream = <
 
   // Packed storage (EDD-9079, EDD-9073) — validated at definition time.
   const storage = resolveStreamStorage(config.streamName, config.storedAs, snapshot)
-  // Offloaded storage (#179): `offload` options (EDD-9114). Until the
-  // EventStore offload paths are wired, a stream that offloads `data` or
-  // `state` is refused here as not yet supported.
-  {
-    const offloaded = [
-      ...(storage.data?.external === undefined ? [] : ['"data" (overflow)']),
-      ...(storage.state?.external === undefined ? [] : ['"state" (overflow)']),
-    ]
-    resolveOffloadOptions(`EventStream "${config.streamName}"`, config.offload, {
-      overflow: offloaded.length > 0,
-      offloaded: offloaded.length > 0,
-    })
-    refuseUnsupportedOffload(`EventStream "${config.streamName}"`, offloaded)
-  }
   /** Event `data` packing, or `undefined` for the native map. */
   const dataStoredAs = storage.data
   /** Snapshot `state` packing, or `undefined` for the native map. */
   const stateStoredAs = storage.state
+  // Offloaded storage (#179): `offload` options (EDD-9114), and what the
+  // stream sends to the blob store — event `data` and snapshot `state` when
+  // `DynamoModel.Packed({ external })`.
+  const offloadedKinds: ReadonlyArray<StreamOffloadKind> = [
+    ...(isOffloadingConfig(dataStoredAs) ? (["data"] as const) : []),
+    ...(isOffloadingConfig(stateStoredAs) ? (["state"] as const) : []),
+  ]
+  const offloadOptions = resolveOffloadOptions(
+    `EventStream "${config.streamName}"`,
+    config.offload,
+    { overflow: offloadedKinds.length > 0, offloaded: offloadedKinds.length > 0 },
+  )
+  const offloadSettings: StreamOffloadSettings | undefined =
+    offloadedKinds.length === 0
+      ? undefined
+      : {
+          itemBudget: offloadOptions.itemBudget,
+          prefix: offloadOptions.prefix,
+          overflow: offloadedKinds,
+        }
+  /**
+   * How an event item's / a snapshot item's offloaded attribute is routed
+   * (design §6.10): the stream's objects are keyed per item under the stream
+   * family (§4.5), and its rows never copy pointers (`copiesPointers: false`
+   * — an `ALL_OLD` image without the pointer proves a write did not commit).
+   */
+  const streamOffloadInfo = (
+    attribute: "data" | "state",
+    storedAs: PackedConfig | ExternalPackedConfig | undefined,
+    owner: string,
+  ): OffloadWrite.OffloadInfo | undefined =>
+    !isOffloadingConfig(storedAs)
+      ? undefined
+      : {
+          entityType: owner,
+          overflow: { [attribute]: storedAs },
+          binary: {},
+          fieldOf: { [attribute]: attribute },
+          itemBudget: offloadOptions.itemBudget,
+          prefix: offloadOptions.prefix,
+          copiesPointers: false,
+        }
   /**
    * Whether a snapshot's stored `state` is read by its stored form: when it is
    * configured packed, or when its schema's encoded side is object- or
@@ -2927,6 +3381,46 @@ export const makeStream = <
    */
   const stateDispatch =
     snapshot !== undefined && (stateStoredAs !== undefined || isDispatchEligible(snapshot.schema))
+  /** The routing of an event item's offloaded `data`, or `undefined` (#179). */
+  const eventOffload = streamOffloadInfo("data", dataStoredAs, entityType)
+  /** The routing of a snapshot item's offloaded `state`, or `undefined` (#179). */
+  const snapshotOffload = streamOffloadInfo("state", stateStoredAs, snapshotEntityType)
+  /**
+   * How an event row is read (#179): `data` by its stored form — a native
+   * map as it is, a JSON string parsed, compressed binary decompressed and
+   * parsed — and, when it is a blob pointer, resolved per the read's modes.
+   * Rows are always loaded raw (`data` stays its wire form, a lazy value
+   * reads the wire form): the event schema decodes it afterwards.
+   */
+  const eventPlan: OffloadRead.ReadPlan = {
+    entityType,
+    dispatch: DATA_ATTRIBUTES,
+    binary: [],
+    offloaded: eventOffload === undefined ? {} : { data: "overflow" },
+    fieldOf: { data: "data" },
+    contentTypeOf: {},
+    decodeField: (_field, wire) => Effect.succeed(wire),
+  }
+  /** How a snapshot row is read: `state` by its stored form when it may be packed. */
+  const snapshotPlan: OffloadRead.ReadPlan = {
+    entityType: snapshotEntityType,
+    dispatch: stateDispatch ? ["state"] : [],
+    binary: [],
+    offloaded: snapshotOffload === undefined ? {} : { state: "overflow" },
+    fieldOf: { state: "state" },
+    contentTypeOf: {},
+    decodeField: (_field, wire) => Effect.succeed(wire),
+  }
+  /**
+   * An unbound stream that offloads checks on its first operation per store
+   * that one is in context (`[EDD-9115]`, a defect, design §13): it meets
+   * pointers on every read and needs the store on every write. `bind`
+   * checks the context it captures up front instead.
+   */
+  const storeCheck = runtimeStoreCheck(
+    `EventStore (first use of stream "${config.streamName}")`,
+    streamStoreRequirements(config.streamName, offloadSettings, schema.escapeKeys === true),
+  )
   /**
    * The first operation run with a given compressor registry checks that it
    * has every codec `storedAs` names (`[EDD-9078]`, a defect): the stream
@@ -2937,10 +3431,16 @@ export const makeStream = <
     `EventStore (first use of stream "${config.streamName}")`,
     streamCodecRequirements(config.streamName, storage),
   )
+  const firstUseCheck =
+    codecCheck === undefined
+      ? storeCheck
+      : storeCheck === undefined
+        ? codecCheck
+        : Effect.andThen(codecCheck, storeCheck)
   const checked = <Args extends ReadonlyArray<any>, A, E, R>(
     op: (...args: Args) => Effect.Effect<A, E, R>,
   ): ((...args: Args) => Effect.Effect<A, E, R>) =>
-    codecCheck === undefined ? op : (...args) => Effect.andThen(codecCheck, op(...args))
+    firstUseCheck === undefined ? op : (...args) => Effect.andThen(firstUseCheck, op(...args))
   /**
    * A stream method as a named operation for consumed-capacity reports
    * (#174). Internal compositions call the unwrapped closures, so only the
@@ -3178,43 +3678,67 @@ export const makeStream = <
   const decodeSnapshotState = decodingStream(snapshot?.schema ?? Schema.Unknown)
 
   /**
-   * An event's stored `data` → its wire form (plain JSON), by the stored
-   * form. A native value costs one `typeof` check.
+   * Load event rows in place (#179, design §8.2): every `data` read by its
+   * stored form to its wire form (plain JSON) — whatever its stored form (R3:
+   * a stream that switched encoding holds a mix) — and an offloaded one
+   * resolved per `modes`: fetched (eager) or an `OffloadedValue` of its wire
+   * form (lazy). Rows already loaded (a query's page prefetch) are skipped; a
+   * native value costs one `typeof` check.
    */
-  const unpackData = (
-    stored: unknown,
+  const loadEventRows = (
+    rows: ReadonlyArray<Record<string, unknown>>,
+    modes: OffloadRead.Modes,
     operation: string,
-  ): Effect.Effect<unknown, ValidationError> =>
-    typeof stored === "string" || stored instanceof Uint8Array
-      ? withRegistry((registry) =>
-          unpackStoredValueSync(stored, registry, { entityType, operation }, "data"),
-        )
-      : Effect.succeed(stored)
+    image = false,
+  ): Effect.Effect<void, ValidationError | BlobStoreError> =>
+    OffloadRead.loadRows(eventPlan, rows, { operation, modes, raw: true, image })
 
   /**
    * A raw event row (`Query.select`) with its `data` — when projected — as
-   * plain parsed JSON, whatever its stored form (R3: a stream that switched
-   * encoding holds a mix). Never schema-decoded. Only this stream's event
+   * plain parsed JSON, whatever its stored form, or (lazy, #179) an
+   * `OffloadedValue` of it. Never schema-decoded. Only this stream's event
    * rows are read: a row of another type (`Query.ignoreOwnership`) is handed
    * back untouched, its `__edd_e__` borrowed for the check and stripped again.
    * In place, so the strip reaches the row returned.
    */
   const rawEventRow: Query.QueryRawRow = Object.assign(
-    (raw: Record<string, unknown>) => {
-      const stored = raw.data
-      if (raw.__edd_e__ !== entityType) return Effect.succeed(raw)
-      if (typeof stored !== "string" && !(stored instanceof Uint8Array)) return Effect.succeed(raw)
-      return Effect.map(unpackData(stored, "EventStore.select"), (data) => {
-        raw.data = data
-        return raw
-      })
-    },
+    (raw: Record<string, unknown>, modes: OffloadRead.Modes) =>
+      raw.__edd_e__ !== entityType
+        ? Effect.succeed(raw)
+        : Effect.as(loadEventRows([raw], modes, "EventStore.select"), raw),
     { reads: ["__edd_e__"], attributes: ["data"] },
   )
 
+  /** Decode an event's wire `data` through the event schemas. */
+  const decodeEventValue = (wire: unknown): Effect.Effect<TEvent, ValidationError> =>
+    (decodeEventData(wire) as Effect.Effect<TEvent, unknown>).pipe(
+      Effect.mapError(
+        (cause) => new ValidationError({ entityType, operation: "EventStore.decode", cause }),
+      ),
+    )
+
+  /**
+   * The lazy `data` of an event (#179, design §10.2): the loaded value of its
+   * wire form, decoded through the event schemas on each `read()`.
+   */
+  const lazyEventData = (wire: OffloadedValue<unknown>): OffloadedValue<TEvent> =>
+    makeOffloadedValue<TEvent>({
+      location: wire.location,
+      ref: wire.ref,
+      size: wire.size,
+      checksum: wire.checksum,
+      read: () => Effect.flatMap(wire.read(), (value) => decodeEventValue(value)),
+    })
+
+  /**
+   * Decode a raw event row into a {@link StreamEvent}: the envelope first,
+   * then `data` loaded per `modes` (see {@link loadEventRows}) and decoded —
+   * lazily, as a {@link LazyStreamEvent}, when it was loaded lazily.
+   */
   const decodeStreamEvent = (
     raw: Record<string, unknown>,
-  ): Effect.Effect<StreamEvent<TEvent>, ValidationError> =>
+    modes: OffloadRead.Modes = OffloadRead.EAGER_MODES,
+  ): Effect.Effect<StreamEvent<TEvent>, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
       const toValidationError = (operation: string) => (cause: unknown) =>
         new ValidationError({ entityType, operation, cause })
@@ -3225,11 +3749,13 @@ export const makeStream = <
 
       // `data` is read by its stored form (#147): a native map as it is, a
       // JSON string (`S`) parsed, compressed binary (`B`) decompressed and
-      // parsed — whatever the stream's current `storedAs` says.
-      const wireData = yield* unpackData(raw.data, "EventStore.decode")
-      const data = yield* (decodeEventData(wireData) as Effect.Effect<TEvent, unknown>).pipe(
-        Effect.mapError(toValidationError("EventStore.decode")),
-      )
+      // parsed — whatever the stream's current `storedAs` says — and a blob
+      // pointer (#179) resolved per the read's modes.
+      yield* loadEventRows([raw], modes, "EventStore.decode")
+      const stored = raw.data
+      const data = isOffloadedValue(stored)
+        ? lazyEventData(stored)
+        : yield* decodeEventValue(stored)
 
       // Metadata is decoded through its schema when the stream declares one —
       // the mirror of the encode performed by `append`. Streams without a
@@ -3243,7 +3769,7 @@ export const makeStream = <
           : raw.metadata
       }
 
-      const event: StreamEvent<TEvent, unknown> = {
+      const event: StreamEvent<unknown, unknown> = {
         streamId: envelope.streamId,
         version: envelope.version,
         eventType: envelope.eventType,
@@ -3255,7 +3781,33 @@ export const makeStream = <
         ...(raw[SEALED_ATTRIBUTE] === true ? { sealed: true as const } : {}),
       }
       return event
-    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError>
+    }) as Effect.Effect<StreamEvent<TEvent>, ValidationError | BlobStoreError>
+
+  /**
+   * The read modes of a stream read's `offloaded` option (#179): `base` when
+   * absent; a `ValidationError` (`[EDD-9117]`) for a value other than
+   * `"eager"` / `"lazy"` (unreachable through the types).
+   */
+  const readModes = (
+    options: { readonly offloaded?: unknown } | undefined,
+    where: string,
+    base: OffloadRead.Modes = OffloadRead.EAGER_MODES,
+  ): Effect.Effect<OffloadRead.Modes, ValidationError> => {
+    const mode = options?.offloaded
+    if (mode === undefined) return Effect.succeed(base)
+    if (mode === "eager") return Effect.succeed(OffloadRead.EAGER_MODES)
+    if (mode === "lazy") return Effect.succeed(OffloadRead.LAZY_MODES)
+    return Effect.fail(
+      new ValidationError({
+        entityType,
+        operation: where,
+        cause: OffloadRead.modeError(
+          `${where}: unknown offloaded mode ${JSON.stringify(mode) ?? String(mode)}; expected ` +
+            '"eager" or "lazy".',
+        ),
+      }),
+    )
+  }
 
   // ---------------------------------------------------------------------------
   // append
@@ -3697,6 +4249,15 @@ export const makeStream = <
   }
 
   /**
+   * How a build routes offloaded values (#179): uploads them (a write), or
+   * measures them into `offloaded` with nothing uploaded (`measure*`).
+   */
+  type Routing =
+    | { readonly _tag: "write" }
+    | { readonly _tag: "measure"; readonly offloaded: Array<AppendOffloadMeasurement> }
+  const WRITE: Routing = { _tag: "write" }
+
+  /**
    * The snapshot item for `state` at `asOfVersion`: the state encoded through
    * the state schema, then packed per `snapshot.storedAs` (#147) — so every
    * size measured afterwards is stored bytes — with its entry in each index
@@ -3714,9 +4275,11 @@ export const makeStream = <
     asOfVersion: number,
     now: string,
     operation: string,
+    tableName: string,
+    routing: Routing,
     eventPartitions?: ReadonlyMap<string, IndexPartitionOrigin> | undefined,
     sealed = false,
-  ): Effect.Effect<Record<string, AttributeValue>, ValidationError> =>
+  ): Effect.Effect<Record<string, AttributeValue>, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
       const encoded = yield* encodeSnapshotState(state, operation)
       const stored =
@@ -3765,8 +4328,54 @@ export const makeStream = <
       }
       // Top-level and native, beside `state`, so packing never touches it.
       if (sealed) item[SEALED_ATTRIBUTE] = true
+      // An offloaded `state` (#179) is routed last, on the item as stored:
+      // its pointer replaces it, keyed by the snapshot SK (§4.5).
+      yield* routeItem(snapshotOffload, item, tableName, operation, routing, "snapshot")
       return yield* marshalOrFail(snapshotEntityType, operation, () => toAttributeMap(item))
     })
+
+  /**
+   * Route an item's offloaded attribute (#179, design §6.10) in place:
+   * upload it through the operation's ledger (a write), or measure it — a
+   * placeholder of its pointer's upper bound, recorded in the routing — with
+   * nothing uploaded (`measureAppend` / `measureSnapshot`). The stream is the
+   * item family (§4.5): the object is keyed by the item's own sort key.
+   *
+   * Offloading requires `escapeKeys: true` (design §11.10, `[EDD-9146]`): a
+   * bound stream is refused at bind, and an unbound one's write here, before
+   * anything is uploaded. Under it, every item is written at its stream's
+   * final key text, so `rekey` never moves a pointer row.
+   */
+  const routeItem = (
+    info: OffloadWrite.OffloadInfo | undefined,
+    item: Record<string, unknown>,
+    tableName: string,
+    operation: string,
+    routing: Routing,
+    entry: number | "snapshot",
+  ): Effect.Effect<void, ValidationError | BlobStoreError> => {
+    if (info === undefined) return Effect.void
+    const row: OffloadWrite.OffloadRow = {
+      table: tableName,
+      pkAttribute: "pk",
+      pk: { S: item.pk as string },
+      skAttribute: "sk",
+      sk: STREAM_FAMILY_SK,
+      rowSk: { S: item.sk as string },
+      operation,
+      escapeKeys: schema.escapeKeys === true,
+    }
+    if (routing._tag === "write") return Effect.asVoid(OffloadWrite.route(info, item, row))
+    return Effect.map(OffloadWrite.measure(info, item, row), (measured) => {
+      for (const { attribute, objectBytes } of measured) {
+        routing.offloaded.push({
+          item: entry,
+          attribute: attribute as "data" | "state",
+          objectBytes,
+        })
+      }
+    })
+  }
 
   /**
    * The stream's own items of an append — everything but the caller's
@@ -3780,7 +4389,8 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options: AppendOptions<unknown, unknown> | undefined,
-  ): Effect.Effect<AppendParts | undefined, ValidationError, TableConfig> =>
+    routing: Routing = WRITE,
+  ): Effect.Effect<AppendParts | undefined, ValidationError | BlobStoreError, TableConfig> =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
       const idempotency = options?.idempotency
@@ -3993,7 +4603,7 @@ export const makeStream = <
       // Events are encoded to wire form through their schema (codec symmetry
       // with the read path, which decodes through the same schema), so this is
       // an effectful build rather than a plain `map`.
-      const eventItems: ReadonlyArray<TransactWriteItem> = yield* Effect.forEach(
+      const eventRecords: ReadonlyArray<Record<string, unknown>> = yield* Effect.forEach(
         events,
         (event, i) =>
           Effect.gen(function* () {
@@ -4119,12 +4729,32 @@ export const makeStream = <
             // the typed envelope, as `metadata` is.
             if (sealing && i === events.length - 1) item[SEALED_ATTRIBUTE] = true
 
-            return {
+            return item
+          }),
+      )
+
+      // Offloaded `data` (#179) is routed on each item as stored, keyed by
+      // its event SK (§4.5) — once per append (the attempts of its
+      // transaction resend the same items), the events' uploads together:
+      // a failed one fails the append once the others have settled.
+      if (eventOffload !== undefined) {
+        // An item that can't be stored is refused before anything is uploaded.
+        for (const item of eventRecords) {
+          yield* marshalOrFail(entityType, "EventStore.append", () => toAttributeMap(item))
+        }
+        yield* OffloadWrite.forEachSettled(eventRecords.entries(), ([i, item]) =>
+          routeItem(eventOffload, item, tableName, "EventStore.append", routing, i),
+        )
+      }
+      const eventItems: ReadonlyArray<TransactWriteItem> = yield* Effect.forEach(
+        eventRecords,
+        (item, i) =>
+          Effect.map(
+            marshalOrFail(entityType, "EventStore.append", () => toAttributeMap(item)),
+            (Item): TransactWriteItem => ({
               Put: {
                 TableName: tableName,
-                Item: yield* marshalOrFail(entityType, "EventStore.append", () =>
-                  toAttributeMap(item),
-                ),
+                Item,
                 ConditionExpression: "attribute_not_exists(pk)",
                 // The first put of a writer one version behind a seal lands on
                 // the sealing event: its item tells `StreamSealed` from a
@@ -4132,8 +4762,8 @@ export const makeStream = <
                 // bloat a failure response for writers already far behind.
                 ...(i === 0 ? { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } : {}),
               },
-            }
-          }),
+            }),
+          ),
       )
 
       // The idempotency sentinel: a Put guarded by `attribute_not_exists(pk)`.
@@ -4181,6 +4811,8 @@ export const makeStream = <
           expectedVersion + events.length,
           now,
           "EventStore.append.snapshot",
+          tableName,
+          routing,
           eventPartitions,
           sealing,
         )
@@ -4252,7 +4884,7 @@ export const makeStream = <
         snapshotPut,
       }
       return parts
-    }) as Effect.Effect<AppendParts | undefined, ValidationError, TableConfig>
+    }) as Effect.Effect<AppendParts | undefined, ValidationError | BlobStoreError, TableConfig>
 
   /**
    * The additional item a head proof names (#164), which must exist: checked
@@ -4455,7 +5087,7 @@ export const makeStream = <
     source: string,
   ): Effect.Effect<
     BuiltStreamAppend,
-    ValidationError | DynamoClientError,
+    ValidationError | DynamoClientError | BlobStoreError,
     TableConfig | DynamoClient
   > =>
     Effect.gen(function* () {
@@ -4535,7 +5167,7 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: NestedAppendOptions<unknown, unknown> | undefined,
-  ): StreamAppendOp => ({
+  ): StreamAppendOp<BlobStoreError> => ({
     [StreamAppendTypeId]: StreamAppendTypeId,
     streamName: config.streamName,
     // The codec check runs as for every other operation of the stream.
@@ -4562,7 +5194,12 @@ export const makeStream = <
       // an item the caller adds, so the append is a transaction.
       const proofOp =
         additionalOps === undefined ? undefined : yield* headProofOp(headProof, additionalOps)
-      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
+      // Offloaded values (#179) are measured, never uploaded: the stream's own
+      // are recorded in `offloaded`, each at its pointer's upper bound.
+      const routing = { _tag: "measure" as const, offloaded: [] as Array<AppendOffloadMeasurement> }
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options, routing).pipe(
+        Effect.catchTag("BlobStoreError", (cause) => measureFailed(cause, "measureAppend")),
+      )
       if (parts === undefined) {
         return {
           events: [],
@@ -4570,14 +5207,23 @@ export const makeStream = <
           snapshot: undefined,
           transactionBytes: 0,
           requestBytes: 0,
+          offloaded: [],
         }
       }
       // The transaction `append` would send, built by the same code: the
       // stream's items and the items the caller's `additionalItems` build, in
       // the same places. Nothing is sent: an item `append` reads the table to
-      // build has no size without that read, and fails the measurement.
+      // build has no size without that read, and fails the measurement. An
+      // additional item's offloaded value is measured at its pointer's upper
+      // bound and nothing is uploaded (`OffloadWrite.Measuring`).
       const built = yield* Capacity.withoutRequests(
-        buildAppendTransaction(parts, additionalOps ?? [], expectedVersion, headProof, proofOp),
+        buildAppendTransaction(
+          parts,
+          additionalOps ?? [],
+          expectedVersion,
+          headProof,
+          proofOp,
+        ).pipe(Effect.provideService(OffloadWrite.Measuring, true)),
       )
       if (built.refused !== undefined) {
         const { command, input } = built.refused
@@ -4593,7 +5239,12 @@ export const makeStream = <
         })
       }
       if (Exit.isFailure(built.exit)) {
-        // No request was refused, so nothing here is a client error.
+        // No request was refused, so nothing here is a client error; a store
+        // error is the measurement's own (`measureFailed`).
+        const error = Cause.findErrorOption(built.exit.cause)
+        if (Option.isSome(error) && error.value._tag === "BlobStoreError") {
+          return yield* measureFailed(error.value, "measureAppend")
+        }
         return yield* Effect.failCause(built.exit.cause as Cause.Cause<ValidationError>)
       }
       const tx = built.exit.value
@@ -4615,9 +5266,23 @@ export const makeStream = <
         requestBytes: single
           ? jsonBytes({ ...sent[0]!.Put, ...fields })
           : transactWriteBodyBytes({ TransactItems: sent, ...fields }),
+        // Events in order, then the snapshot.
+        offloaded: routing.offloaded.sort(
+          (a, b) =>
+            (a.item === "snapshot" ? Infinity : a.item) -
+            (b.item === "snapshot" ? Infinity : b.item),
+        ),
       }
       return measurement
     })
+
+  /**
+   * A measurement cannot fail with a store error (nothing is uploaded): the
+   * only one is `NotProvided`, which the first-use and bind checks rule out.
+   * Reported as the `ValidationError` it would be, its cause the store error.
+   */
+  const measureFailed = (cause: BlobStoreError, operation: string) =>
+    Effect.fail(new ValidationError({ entityType, operation: `EventStore.${operation}`, cause }))
 
   const measureSnapshot = (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -4627,13 +5292,16 @@ export const makeStream = <
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("measureSnapshot")
       const now = DateTime.formatIso(yield* DateTime.now)
+      const { name: tableName } = yield* config.table.Tag
       const item = yield* buildSnapshotItem(
         streamId as Record<string, unknown>,
         state,
         asOfVersion,
         now,
         "EventStore.measureSnapshot",
-      )
+        tableName,
+        { _tag: "measure", offloaded: [] },
+      ).pipe(Effect.catchTag("BlobStoreError", (cause) => measureFailed(cause, "measureSnapshot")))
       return itemBytes(item)
     })
 
@@ -4644,7 +5312,7 @@ export const makeStream = <
   const decodeStreamImage = (
     image: StreamImage,
     options?: DecodeStreamImageOptions,
-  ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError> =>
+  ): Effect.Effect<Option.Option<StreamEvent<TEvent>>, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
       const ctx = { entityType, operation: "EventStore.decodeStreamImage" }
       // Not one of this stream's events — its snapshot, a sentinel, another
@@ -4658,13 +5326,25 @@ export const makeStream = <
       ) {
         return Option.none<StreamEvent<TEvent>>()
       }
+      // Lazy by default (#179, design §10.2): an offloaded `data` is fetched
+      // only on `read()`, unless `{ offloaded: "eager" }`.
+      const modes = yield* readModes(
+        options,
+        "EventStore.decodeStreamImage",
+        OffloadRead.LAZY_MODES,
+      )
       // In DynamoDB JSON the S / B tag says what `data` is; unmarshalled, a
       // string that is base64 of a `B` value is told apart from JSON text.
-      const raw = yield* decodeImage(image, DATA_ATTRIBUTES, ctx)
-      const event = yield* decodeStreamEvent(raw)
+      const form = imageForm(image)
+      const raw = yield* normalizeImage(image, ctx, { form })
+      // `data` read by its stored form under this operation, as before #179;
+      // the schema decode below stays `EventStore.decode`'s.
+      yield* loadEventRows([raw], modes, ctx.operation, form === "unmarshalled")
+      const event = yield* decodeStreamEvent(raw, modes)
       if (options?.raw !== true) return Option.some(event)
       // `raw.data` is the wire form the decode just read: the parsed JSON of a
-      // packed value, the unmarshalled map of a native one.
+      // packed value, the unmarshalled map of a native one — or, lazily, its
+      // `OffloadedValue`.
       const withRaw: RawStreamEvent<TEvent> = {
         ...event,
         rawData: raw.data as Readonly<Record<string, unknown>>,
@@ -4676,20 +5356,32 @@ export const makeStream = <
   // read
   // ---------------------------------------------------------------------------
 
-  /** Apply {@link ReadOptions} to an event query. */
-  const withReadOptions = <A>(query: Query.Query<A>, options: ReadOptions | undefined) =>
-    options?.consistentRead === true ? Query.consistentRead(query) : query
+  /**
+   * Apply {@link ReadOptions} to an event query: `consistentRead`, and the
+   * read mode of an offloaded `data` (#179; validated, `[EDD-9117]`).
+   */
+  const withReadOptions = <A>(
+    query: Query.Query<A>,
+    options: ReadOptions | undefined,
+    where: string,
+  ): Effect.Effect<Query.Query<A>, ValidationError> =>
+    Effect.map(readModes(options, where), (modes) => {
+      const consistent = options?.consistentRead === true ? Query.consistentRead(query) : query
+      return modes.overflow === "lazy"
+        ? (Query.offloaded(consistent, "lazy") as unknown as Query.Query<A>)
+        : consistent
+    })
 
   const read = (
     streamId: StreamIdInput<TStreamIdFields>,
     options?: ReadOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const query = withReadOptions(buildEventsQuery(streamId), options)
+      const query = yield* withReadOptions(buildEventsQuery(streamId), options, "EventStore.read")
       return yield* Query.collect(query)
     })
 
@@ -4703,7 +5395,7 @@ export const makeStream = <
     options?: ReadFromOptions | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -4714,11 +5406,12 @@ export const makeStream = <
       const upper =
         options?.toVersion === undefined ? maxEventSk : composeEventSk(options.toVersion)
       if (options?.toVersion !== undefined && options.toVersion <= afterVersion) return []
-      const query = withReadOptions(
+      const query = yield* withReadOptions(
         buildEventsQuery(streamId).pipe(
           Query.where({ between: [composeEventSk(afterVersion + 1), upper] }),
         ),
         options,
+        "EventStore.readFrom",
       )
       return yield* Query.collect(query)
     })
@@ -4729,7 +5422,7 @@ export const makeStream = <
 
   const currentVersion = (
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: CurrentVersionOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       // Single page, not `collect`: with `Limit: 1` DynamoDB returns a
@@ -4737,9 +5430,12 @@ export const makeStream = <
       // whole partition one request per item. The `begins_with` bound on
       // `buildEventsQuery` guarantees the single evaluated item is the newest
       // *event* (never the snapshot, which sorts last).
-      const query = withReadOptions(
+      // Lazily (#179): only the version is read, so an offloaded `data` is
+      // never fetched.
+      const query = yield* withReadOptions(
         buildEventsQuery(streamId).pipe(Query.reverse, Query.limit(1)),
-        options,
+        { ...options, offloaded: "lazy" },
+        "EventStore.currentVersion",
       )
       const page = yield* Query.execute(query)
       const newest = page.items[0]
@@ -4757,13 +5453,14 @@ export const makeStream = <
       // Reverse, `Limit: 1`, bounded below by `floorVersion + 1`: an empty range
       // (the common case — nothing appended past the snapshot) reads no items;
       // otherwise the single evaluated item is the head.
-      const query = withReadOptions(
+      const query = yield* withReadOptions(
         buildEventsQuery(streamId as StreamIdInput<TStreamIdFields>).pipe(
           Query.where({ between: [composeEventSk(floorVersion + 1), maxEventSk] }),
           Query.reverse,
           Query.limit(1),
         ),
-        options,
+        { ...options, offloaded: "lazy" },
+        "EventStore.headAbove",
       )
       const page = yield* Query.execute(query)
       const newest = page.items[0]
@@ -4786,7 +5483,11 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     state: unknown,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | BlobStoreError,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("writeSnapshot")
 
@@ -4809,13 +5510,17 @@ export const makeStream = <
         })
 
       // Packed per `snapshot.storedAs` (#147): the diagnosis below measures
-      // the stored bytes.
+      // the stored bytes. An offloaded `state` (#179) is uploaded first; a
+      // write that provably did not commit (a lost race, a cancelled
+      // transaction) has the upload deleted.
       const item = yield* buildSnapshotItem(
         streamId as Record<string, unknown>,
         state,
         asOfVersion,
         now,
         "EventStore.writeSnapshot",
+        tableName,
+        WRITE,
       )
 
       const put = {
@@ -4850,7 +5555,11 @@ export const makeStream = <
           rewrite,
         }),
       )
-    }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
+    }) as Effect.Effect<
+      void,
+      DynamoClientError | ValidationError | BlobStoreError,
+      DynamoClient | TableConfig
+    >
 
   /**
    * Decode a stored snapshot item. A snapshot that fails to decode through the
@@ -4859,35 +5568,37 @@ export const makeStream = <
   const decodeSnapshotItem = (
     raw: Record<string, unknown>,
     operation: string,
-  ): Effect.Effect<Snapshot<unknown>, ValidationError> =>
-    // `state` is read by its stored form (#147) when it may be packed — see
-    // `stateDispatch` — then decoded through the state schema as before.
-    (stateDispatch && (typeof raw.state === "string" || raw.state instanceof Uint8Array)
-      ? withRegistry((registry) =>
-          unpackStoredValueSync(
-            raw.state as string | Uint8Array,
-            registry,
-            { entityType: snapshotEntityType, operation },
-            "state",
-          ),
-        )
-      : Effect.succeed(raw.state)
-    ).pipe(
-      Effect.flatMap((state) =>
-        decodeSnapshotState(state).pipe(
+    modes: OffloadRead.Modes = OffloadRead.EAGER_MODES,
+  ): Effect.Effect<Snapshot<unknown>, ValidationError | BlobStoreError> =>
+    Effect.gen(function* () {
+      // `state` is read by its stored form (#147) when it may be packed — see
+      // `stateDispatch` — and a blob pointer (#179) resolved per `modes`,
+      // then decoded through the state schema as before (on each `read()`
+      // of a lazy one).
+      yield* OffloadRead.loadRows(snapshotPlan, [raw], { operation, modes, raw: true })
+      const decode = (wire: unknown) =>
+        decodeSnapshotState(wire).pipe(
           Effect.mapError(
             (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
           ),
-        ),
-      ),
-      Effect.map(
-        (state): Snapshot<unknown> => ({
-          state,
-          asOfVersion: raw.asOfVersion as number,
-          timestamp: raw.timestamp as string,
-        }),
-      ),
-    )
+        )
+      const stored = raw.state
+      const state = isOffloadedValue(stored)
+        ? makeOffloadedValue<unknown>({
+            location: stored.location,
+            ref: stored.ref,
+            size: stored.size,
+            checksum: stored.checksum,
+            read: () => Effect.flatMap(stored.read(), (value) => decode(value)),
+          })
+        : yield* decode(stored)
+      const decoded: Snapshot<unknown> = {
+        state,
+        asOfVersion: raw.asOfVersion as number,
+        timestamp: raw.timestamp as string,
+      }
+      return decoded
+    })
 
   /** The raw snapshot item, by its exact key, in one `GetItem`. */
   const getSnapshotItem = (
@@ -4946,19 +5657,21 @@ export const makeStream = <
 
   const readSnapshot = (
     streamId: StreamIdInput<TStreamIdFields>,
+    options?: ReadSnapshotOptions | undefined,
   ): Effect.Effect<
     Option.Option<Snapshot<unknown>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
       if (snapshot === undefined) return yield* snapshotUnavailable("readSnapshot")
+      const modes = yield* readModes(options, "EventStore.readSnapshot")
       const raw = yield* getSnapshotItem(streamId, true)
       if (raw === undefined) return Option.none<Snapshot<unknown>>()
-      return Option.some(yield* decodeSnapshotItem(raw, "EventStore.readSnapshot"))
+      return Option.some(yield* decodeSnapshotItem(raw, "EventStore.readSnapshot", modes))
     }) as Effect.Effect<
       Option.Option<Snapshot<unknown>>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | BlobStoreError,
       DynamoClient | TableConfig
     >
 
@@ -4971,10 +5684,11 @@ export const makeStream = <
     options?: ReadLatestOptions | undefined,
   ): Effect.Effect<
     LatestState<unknown, TEvent>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
+      const modes = yield* readModes(options, "EventStore.readLatest")
       // Without a snapshot config there is nothing to read but the events
       // (`verifySnapshot` is ignored).
       if (snapshot === undefined) {
@@ -5001,7 +5715,7 @@ export const makeStream = <
         if (refusal !== undefined) return yield* Effect.die(new Error(refusal))
         const raw = yield* getSnapshotItem(streamId, options.consistentRead === true)
         if (raw !== undefined) {
-          const current = yield* decodeSnapshotItem(raw, "EventStore.readLatest")
+          const current = yield* decodeSnapshotItem(raw, "EventStore.readLatest", modes)
           // A snapshot written by a sealing append carries the marker (#166):
           // its version is the seal's, so one `GetItem` of that event returns
           // the sealing event — paid only on a sealed stream.
@@ -5025,7 +5739,7 @@ export const makeStream = <
               snapshot: Option.some(current),
               events: [],
               version: current.asOfVersion,
-              seal: yield* decodeStreamEvent(sealRaw),
+              seal: yield* decodeStreamEvent(sealRaw, modes),
             }
             return state
           }
@@ -5097,10 +5811,9 @@ export const makeStream = <
       const latest =
         snapshotRaw === undefined
           ? Option.none<Snapshot<unknown>>()
-          : Option.some(yield* decodeSnapshotItem(snapshotRaw, "EventStore.readLatest"))
+          : Option.some(yield* decodeSnapshotItem(snapshotRaw, "EventStore.readLatest", modes))
       const asOfVersion = Option.isSome(latest) ? latest.value.asOfVersion : 0
       const delta = eventRaws.filter((raw) => (raw.version as number) > asOfVersion).reverse()
-      const events = yield* Effect.forEach(delta, (raw) => decodeStreamEvent(raw))
       // The sealing event (#166), from ANY event item the query fetched —
       // including those at or below the snapshot, which `events` leaves out
       // (a snapshot at the seal already folds it in) — with no extra request.
@@ -5110,12 +5823,20 @@ export const makeStream = <
       for (const raw of eventRaws) {
         if (raw[SEALED_ATTRIBUTE] === true) sealRaw = raw
       }
+      // The rows decoded, loaded together: their offloaded `data` (#179)
+      // resolves at the store's read concurrency (§8.2).
+      yield* loadEventRows(
+        sealRaw === undefined || delta.includes(sealRaw) ? delta : [...delta, sealRaw],
+        modes,
+        "EventStore.decode",
+      )
+      const events = yield* Effect.forEach(delta, (raw) => decodeStreamEvent(raw, modes))
       const seal =
         sealRaw === undefined
           ? undefined
           : (sealRaw.version as number) > asOfVersion
             ? events.find((event) => event.version === sealRaw.version)
-            : yield* decodeStreamEvent(sealRaw)
+            : yield* decodeStreamEvent(sealRaw, modes)
       const state: LatestState<unknown, TEvent> = {
         snapshot: latest,
         events,
@@ -5125,7 +5846,7 @@ export const makeStream = <
       return state
     }) as Effect.Effect<
       LatestState<unknown, TEvent>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | BlobStoreError,
       DynamoClient | TableConfig
     >
 
@@ -5154,6 +5875,34 @@ export const makeStream = <
   // query.events helper
   // ---------------------------------------------------------------------------
 
+  /**
+   * The page prefetch of the stream's event queries (#179, design §8.2): a
+   * window of rows loaded together, so their offloaded `data` resolves at
+   * the store's read concurrency. Raw rows (`Query.select`) of another type
+   * (`Query.ignoreOwnership`) are left as they are. Only for a stream that
+   * offloads `data`; otherwise each row is loaded as it is decoded.
+   */
+  const eventPrefetch: Query.QueryPrefetch | undefined =
+    eventOffload === undefined
+      ? undefined
+      : (rows, { modes, raw, operation }) =>
+          loadEventRows(
+            raw ? rows.filter((row) => row.__edd_e__ === entityType) : rows,
+            modes,
+            operation,
+          )
+
+  /**
+   * The first-use store check (`[EDD-9115]`, design §13) of `query.events` /
+   * `query.index`: run at the start of each terminal (the query's `prepare`),
+   * so a query of an offloading stream run without a store dies as every
+   * other operation of the stream does. The codec check (`[EDD-9078]`) stays
+   * off the query descriptors, as #147 decided: a compressed row they cannot
+   * read is a `ValidationError` caused by `CompressorNotRegistered`.
+   */
+  const checkedQuery: Query.QueryPrepare | undefined =
+    storeCheck === undefined ? undefined : () => Effect.as(storeCheck, {})
+
   const buildEventsQuery = (
     streamId: StreamIdInput<TStreamIdFields>,
   ): Query.Query<StreamEvent<TEvent>> => {
@@ -5165,7 +5914,9 @@ export const makeStream = <
       pkValue: pk,
       skField: "sk",
       entityTypes: [entityType],
-      decoder: (raw) => decodeStreamEvent(raw),
+      decoder: (raw, modes) => decodeStreamEvent(raw, modes),
+      prefetch: eventPrefetch,
+      prepare: checkedQuery,
       // Raw rows (`Query.select`) carry `data` as parsed JSON, whatever its
       // stored form, and a filter inside a packed `data` is refused (#147).
       rawRow: rawEventRow,
@@ -5251,6 +6002,8 @@ export const makeStream = <
       skField: idx.sk,
       entityTypes: [entityType],
       decoder: indexDecoder(idx),
+      prefetch: eventPrefetch,
+      prepare: checkedQuery,
       // As for `query.events` (#147) — the `"keys"` hydration path decodes
       // its fetched rows through the same hooks.
       rawRow: rawEventRow,
@@ -5295,15 +6048,17 @@ export const makeStream = <
    */
   const indexDecoder =
     (idx: ResolvedStreamIndex) =>
-    (raw: Record<string, unknown>): Effect.Effect<StreamEvent<TEvent>, ValidationError> => {
-      if (idx.projection === "keys") return decodeStreamEvent(raw)
-      let row = raw
-      if (idx.projection === "withoutMetadata" && raw.metadata !== undefined) {
-        row = { ...raw }
-        delete row.metadata
-      }
-      return decodeStreamEvent(row).pipe(
+    (
+      raw: Record<string, unknown>,
+      modes: OffloadRead.Modes,
+    ): Effect.Effect<StreamEvent<TEvent>, ValidationError | BlobStoreError> => {
+      if (idx.projection === "keys") return decodeStreamEvent(raw, modes)
+      // In place: a copy would lose the row's loaded state (#179).
+      const row = raw
+      if (idx.projection === "withoutMetadata") delete row.metadata
+      return decodeStreamEvent(row, modes).pipe(
         Effect.mapError((error) => {
+          if (error._tag === "BlobStoreError") return error
           const missing = PROJECTED_ENVELOPE_ATTRIBUTES.filter((name) => row[name] === undefined)
           if (missing.length === 0) return error
           return new ValidationError({
@@ -5327,7 +6082,7 @@ export const makeStream = <
     options?: (ReadIndexOptions & { readonly partition?: string | undefined }) | undefined,
   ): Effect.Effect<
     ReadonlyArray<StreamEvent<TEvent>>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
@@ -5355,11 +6110,11 @@ export const makeStream = <
       }
       if (options?.reverse === true) query = Query.reverse(query)
       if (limit !== undefined) query = Query.limit(query, limit)
-      if (options?.consistentRead === true) query = Query.consistentRead(query)
+      query = yield* withReadOptions(query, options, "EventStore.readIndex")
       return yield* Query.collect(query)
     }) as Effect.Effect<
       ReadonlyArray<StreamEvent<TEvent>>,
-      DynamoClientError | ValidationError,
+      DynamoClientError | ValidationError | BlobStoreError,
       DynamoClient | TableConfig
     >
 
@@ -5540,6 +6295,27 @@ export const makeStream = <
           if (copy[attr]?.S === from) copy[attr] = { S: to }
         }
         return copy
+      }
+      /**
+       * The backstop of design §11.10 (#179): a row holding a blob pointer
+       * names its objects from its own key text and must never move. Offloading
+       * requires `escapeKeys: true`, under which a stream is written only at
+       * its final key text, so this is reached only when `escapeKeys` was
+       * turned off over rows offloading wrote: the run fails naming the row,
+       * with nothing written for it (`[EDD-9146]`).
+       */
+      const refusePointerRows = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
+        for (const row of rows) {
+          const attribute = BlobLedger.pointerAttributeOf(row)
+          if (attribute !== undefined) {
+            return Rekey.refusePointerRow(
+              `stream "${config.streamName}"`,
+              { pk: from, sk: skOf(row) },
+              attribute,
+            )
+          }
+        }
+        return Effect.void
       }
       /** This stream's rows left under the old key: another id's there are its own to move. */
       const readOwn = Effect.map(readAll(from), (rows) =>
@@ -5736,6 +6512,7 @@ export const makeStream = <
        */
       const drain = Effect.gen(function* () {
         const left = yield* readOwn
+        yield* refusePointerRows(left)
         const { there, refused } = yield* toDrain(left)
         if (refused !== undefined) return refused
         for (const row of left) {
@@ -5757,6 +6534,9 @@ export const makeStream = <
         const rows = yield* readOwn
         // Moved since the scan read it.
         if (rows.length === 0) return tally
+        // Never a row holding a blob pointer (#179, design §11.10): nothing is
+        // copied, dry run included.
+        yield* refusePointerRows(rows)
         const first = rows.find((row) => skOf(row) === firstSk)
         // Flipped by an earlier attempt or run — or never started here: the
         // stream lives at `to`, and the rows left move to it.
@@ -6030,6 +6810,12 @@ export const makeStream = <
     parseStreamId: (id: string) => parseStreamIdWith(config.streamName, compositeFields, id),
     snapshotConfig: snapshotSettings,
     storedAs: storage,
+    offload: offloadSettings,
+    _storeRequirements: streamStoreRequirements(
+      config.streamName,
+      offloadSettings,
+      schema.escapeKeys === true,
+    ),
     indexes: indexSettings,
     writeSnapshot: checked(named("writeSnapshot", rooted(writeSnapshot))),
     readSnapshot: checked(named("readSnapshot", readSnapshot)),
@@ -6055,7 +6841,8 @@ export const makeStream = <
     SnapshotStateOf<TSnapshot>,
     keyof TIndexes & string,
     IndexProjectionsOf<TIndexes>,
-    PartitionedIndexesOf<TIndexes>
+    PartitionedIndexesOf<TIndexes>,
+    OffloadedKindsOf<TStorage, TSnapshot>
   >
 }
 
@@ -6093,6 +6880,7 @@ export interface BoundEventStream<
     readonly [K in TIndexName]: "all"
   },
   TPartitionedIndexName extends string = never,
+  TOffloaded extends StreamOffloadKind = never,
 > extends Pipeable.Pipeable {
   readonly [EventStreamTypeId]: EventStreamTypeId
   readonly streamName: string
@@ -6115,6 +6903,19 @@ export interface BoundEventStream<
   /** See {@link EventStream.storedAs}. */
   readonly storedAs: StreamStorageSettings
 
+  /**
+   * The stream's resolved offload settings (#179) — `offload.itemBudget`,
+   * `offload.prefix` and what it offloads — or `undefined` for a stream
+   * whose `data` and snapshot `state` are not `DynamoModel.Packed({ external })`.
+   */
+  readonly offload: StreamOffloadSettings | undefined
+
+  /**
+   * @internal The stream's store requirements: its offloaded kinds, and
+   * whether its table's schema sets `escapeKeys: true` (`[EDD-9146]`).
+   */
+  readonly _storeRequirements?: ReadonlyArray<OffloadWrite.StoreRequirement> | undefined
+
   /** See {@link EventStream.indexes}. */
   readonly indexes: { readonly [K in TIndexName]: StreamIndexSettings }
 
@@ -6123,20 +6924,35 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     state: TState,
     asOfVersion: number,
-  ): Effect.Effect<void, DynamoClientError | ValidationError, never>
+  ): Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | StreamWriteErrors<TOffloaded, "state">,
+    never
+  >
 
   /** See {@link EventStream.readSnapshot}. */
-  readSnapshot(
+  readSnapshot<const Opt extends ReadSnapshotOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
-  ): Effect.Effect<Option.Option<Snapshot<TState>>, DynamoClientError | ValidationError, never>
+    options?: Opt,
+  ): Effect.Effect<
+    Option.Option<StreamSnapshotOf<TState, TOffloaded, StreamReadModeOf<Opt>>>,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "state", StreamReadModeOf<Opt>>,
+    never
+  >
 
   /** See {@link EventStream.append}. */
-  append(
+  append<const TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<never>>(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: AppendOptions<TMetadata, TState> | undefined,
-  ): Effect.Effect<AppendResult<TEvent>, AppendError, never>
+    options?: AppendOptions<TMetadata, TState, TOps> | undefined,
+  ): Effect.Effect<
+    AppendResult<TEvent>,
+    AppendError | StreamWriteErrors<TOffloaded> | WriteOpBlobErrors<TOps[number]>,
+    never
+  >
 
   /**
    * See {@link EventStream.appendOp}. The op builds in this bound stream's
@@ -6151,53 +6967,76 @@ export interface BoundEventStream<
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: NestedAppendOptions<TMetadata, TState> | undefined,
-  ): StreamAppendOp
+  ): StreamAppendOp<StreamWriteErrors<TOffloaded>>
 
   /** See {@link EventStream.read}. */
-  read(
+  read<const Opt extends ReadOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt>>,
     never
   >
 
   /** See {@link EventStream.readFrom}. */
-  readFrom(
+  readFrom<const Opt extends ReadFromOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
     afterVersion: number,
-    options?: ReadFromOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt>>,
     never
   >
 
   /** See {@link EventStream.currentVersion}. */
   currentVersion(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadOptions | undefined,
+    options?: CurrentVersionOptions | undefined,
   ): Effect.Effect<number, DynamoClientError | ValidationError, never>
 
   /** See {@link EventStream.readLatest}. */
-  readLatest(
+  readLatest<const Opt extends ReadLatestOptions | undefined = undefined>(
     streamId: StreamIdInput<TStreamIdFields>,
-    options?: ReadLatestOptions | undefined,
+    options?: Opt,
   ): Effect.Effect<
-    LatestState<TState, TEvent, StreamMetadata<TMetadata>>,
-    DynamoClientError | ValidationError,
+    LatestStateOf<TState, TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt>>,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, StreamOffloadKind, StreamReadModeOf<Opt>>,
     never
   >
 
   /** See {@link EventStream.readIndex}. */
-  readIndex<N extends TIndexName>(
+  readIndex<N extends TIndexName, const Mode extends StreamReadMode | undefined = undefined>(
     name: N,
     streamId: StreamIdInput<TStreamIdFields>,
-    ...options: ReadIndexArgs<N, TPartitionedIndexName>
+    ...options: ReadIndexArgs<
+      N,
+      TPartitionedIndexName,
+      ReadIndexOptions & { readonly offloaded?: Mode }
+    >
   ): Effect.Effect<
-    ReadonlyArray<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>,
-    DynamoClientError | ValidationError,
+    ReadonlyArray<
+      StreamEventOf<
+        TEvent,
+        IndexEventMetadata<TMetadata, TIndexProjections[N]>,
+        TOffloaded,
+        StreamReadModeFor<Mode>
+      >
+    >,
+    | DynamoClientError
+    | ValidationError
+    | StreamReadErrors<TOffloaded, "data", StreamReadModeFor<Mode>>,
     never
   >
 
@@ -6217,19 +7056,34 @@ export interface BoundEventStream<
   ): Effect.Effect<number, ValidationError, never>
 
   /** See {@link EventStream.decodeStreamImage}. */
-  decodeStreamImage(
+  decodeStreamImage<const Opt extends DecodeStreamImageOptions & { readonly raw: true }>(
     image: StreamImage,
-    options: DecodeStreamImageOptions & { readonly raw: true },
+    options: Opt,
   ): Effect.Effect<
-    Option.Option<RawStreamEvent<TEvent, StreamMetadata<TMetadata>>>,
-    ValidationError,
+    Option.Option<
+      RawStreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt, "lazy">>
+    >,
+    ValidationError | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt, "lazy">>,
     never
   >
+  // `options` may be `undefined` (a caller forwarding its own optional
+  // options): the mode it may name, or the default.
+  decodeStreamImage<const Opt extends DecodeStreamImageOptions | undefined = undefined>(
+    image: StreamImage,
+    options?: Opt,
+  ): Effect.Effect<
+    Option.Option<
+      StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, StreamReadModeOf<Opt, "lazy">>
+    >,
+    ValidationError | StreamReadErrors<TOffloaded, "data", StreamReadModeOf<Opt, "lazy">>,
+    never
+  >
+  // Last: the signature a stream is matched by (`EventStore.decoder`'s
+  // `DecodableStream`) and the one an event type is inferred from.
   decodeStreamImage(
     image: StreamImage,
-    options?: DecodeStreamImageOptions,
   ): Effect.Effect<
-    Option.Option<StreamEvent<TEvent, StreamMetadata<TMetadata>>>,
+    Option.Option<StreamEventOf<TEvent, StreamMetadata<TMetadata>, TOffloaded, "lazy">>,
     ValidationError,
     never
   >
@@ -6244,13 +7098,24 @@ export interface BoundEventStream<
   readonly query: {
     events(
       streamId: StreamIdInput<TStreamIdFields>,
-    ): Query.Query<StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    ): Query.Query<
+      StreamEvent<TEvent, StreamMetadata<TMetadata>>,
+      StreamReadErrors<TOffloaded, "data", "eager">,
+      StreamQueryState<TOffloaded, StreamEvent<TEvent, StreamMetadata<TMetadata>>>
+    >
     /** See `EventStream.query.index`. */
     index<N extends TIndexName>(
       name: N,
       streamId: StreamIdInput<TStreamIdFields>,
       ...options: IndexQueryArgs<N, TPartitionedIndexName>
-    ): Query.Query<StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>>
+    ): Query.Query<
+      StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>,
+      StreamReadErrors<TOffloaded, "data", "eager">,
+      StreamQueryState<
+        TOffloaded,
+        StreamEvent<TEvent, IndexEventMetadata<TMetadata, TIndexProjections[N]>>
+      >
+    >
   }
 
   /** Escape hatch: provide DynamoClient | TableConfig to an arbitrary effect. */
@@ -6287,6 +7152,7 @@ export const bind = <
     readonly [K in TIndexName]: "all"
   },
   TPartitionedIndexName extends string = never,
+  TOffloaded extends StreamOffloadKind = never,
 >(
   stream: EventStream<
     TEvent,
@@ -6295,7 +7161,8 @@ export const bind = <
     TState,
     TIndexName,
     TIndexProjections,
-    TPartitionedIndexName
+    TPartitionedIndexName,
+    TOffloaded
   >,
 ): Effect.Effect<
   BoundEventStream<
@@ -6305,7 +7172,8 @@ export const bind = <
     TState,
     TIndexName,
     TIndexProjections,
-    TPartitionedIndexName
+    TPartitionedIndexName,
+    TOffloaded
   >,
   never,
   DynamoClient | TableConfig
@@ -6313,6 +7181,12 @@ export const bind = <
   Effect.gen(function* () {
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
+    // A stream that offloads (#179) needs escaped key text (`[EDD-9146]`,
+    // design §11.10): its objects are named from its rows' key text, so a
+    // pointer row must be written only at its final text. Checked first.
+    const requirements = storeRequirementsOf(stream)
+    const keysError = OffloadWrite.unescapedKeysError("EventStore.bind", requirements)
+    if (keysError !== undefined) throw keysError
     // The stream meets values compressed with every codec its `storedAs`
     // names, so the registry captured here must have them (#147).
     const codecError = unregisteredCodecError(
@@ -6321,6 +7195,15 @@ export const bind = <
       Context.getOrUndefined(ctx, Compression),
     )
     if (codecError !== undefined) throw codecError
+    // A stream that offloads (#179) meets pointers on every read and uploads
+    // on every write, so the context captured here must hold a store
+    // (`[EDD-9115]`, design §13).
+    const storeError = OffloadWrite.missingStoreError(
+      "EventStore.bind",
+      requirements,
+      Context.getOrUndefined(ctx, BlobStore),
+    )
+    if (storeError !== undefined) throw storeError
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -6341,17 +7224,19 @@ export const bind = <
       parseStreamId: (id: string) => stream.parseStreamId(id),
       snapshotConfig: stream.snapshotConfig,
       storedAs: stream.storedAs,
+      offload: stream.offload,
+      _storeRequirements: storeRequirementsOf(stream),
       indexes: stream.indexes,
       writeSnapshot: (streamId, state, asOfVersion) =>
         provide(stream.writeSnapshot(streamId, state, asOfVersion)),
-      readSnapshot: (streamId) => provide(stream.readSnapshot(streamId)),
+      readSnapshot: (streamId, options) => provide(stream.readSnapshot(streamId, options)),
       append: (streamId, events, expectedVersion, options) =>
         provide(stream.append(streamId, events, expectedVersion, options)),
       // Built in the captured context (#166): only its TableConfig and
       // Compression are used — the outer append sends the items.
       appendOp: (streamId, events, expectedVersion, options) => {
         const op = stream.appendOp(streamId, events, expectedVersion, options)
-        const bound: StreamAppendOp = {
+        const bound: StreamAppendOp<any> = {
           [StreamAppendTypeId]: StreamAppendTypeId,
           streamName: op.streamName,
           _build: (source) => provide(op._build(source)),
@@ -6364,7 +7249,7 @@ export const bind = <
       currentVersion: (streamId, options) => provide(stream.currentVersion(streamId, options)),
       readLatest: (streamId, options) => provide(stream.readLatest(streamId, options)),
       readIndex: (name, streamId, ...options) =>
-        provide(stream.readIndex(name, streamId, ...options)),
+        provide(stream.readIndex(name, streamId, ...(options as [never]))),
       // The captured context carries a `Compression` registry provided where
       // the stream was bound (#147).
       measureAppend: (streamId, events, expectedVersion, options) =>
@@ -6379,7 +7264,8 @@ export const bind = <
         TState,
         TIndexName,
         TIndexProjections,
-        TPartitionedIndexName
+        TPartitionedIndexName,
+        TOffloaded
       >["decodeStreamImage"],
       query: stream.query,
       provide,
@@ -6402,7 +7288,8 @@ export const bind = <
       TState,
       TIndexName,
       TIndexProjections,
-      TPartitionedIndexName
+      TPartitionedIndexName,
+      TOffloaded
     >
   })
 
@@ -6876,11 +7763,13 @@ export interface Decision<State, Event> {
  * Code that reads this type and forwards a static array to
  * `Transaction.transactWrite` must annotate it `ReadonlyArray<TransactWriteOp>`.
  */
-export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
-  | ReadonlyArray<AppendWriteOp>
-  | ((
-      decision: Decision<State, Event>,
-    ) => ReadonlyArray<AppendWriteOp> | Effect.Effect<ReadonlyArray<AppendWriteOp>, E2, R2>)
+export type AdditionalItemsInput<
+  State,
+  Event,
+  E2 = never,
+  R2 = never,
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
+> = TOps | ((decision: Decision<State, Event>) => TOps | Effect.Effect<TOps, E2, R2>)
 
 /**
  * The form `eventMetadata` ({@link CommandMetadataOptions}) accepts: a
@@ -6993,6 +7882,7 @@ export interface CommandOptionsBase<
   R2 = never,
   E4 = never,
   R4 = never,
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
 > {
   /**
    * Identifier for this command delivery. Required when the handler was created
@@ -7039,7 +7929,7 @@ export interface CommandOptionsBase<
    * it returns count towards `AppendTooLarge`, and the `indices` of an
    * `AdditionalItemConditionFailed` refer to the array it returned.
    */
-  readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2>
+  readonly additionalItems?: AdditionalItemsInput<State, Event, E2, R2, TOps>
   /**
    * Per-event timestamps derived from the {@link Decision}: the function
    * returns one entry per event, in order, directly or as an `Effect` (see
@@ -7098,7 +7988,8 @@ export type CommandOptions<
   R3 = never,
   E4 = never,
   R4 = never,
-> = CommandOptionsBase<State, Event, E2, R2, E4, R4> &
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
+> = CommandOptionsBase<State, Event, E2, R2, E4, R4, TOps> &
   CommandMetadataOptions<TMetadata, State, Event, E3, R3>
 
 /** Per-call options when the handler was created with `idempotency` — `commandId` is required. */
@@ -7112,7 +8003,8 @@ export type IdempotentCommandOptions<
   R3 = never,
   E4 = never,
   R4 = never,
-> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3, E4, R4> & {
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
+> = CommandOptions<TMetadata, State, Event, E2, R2, E3, R3, E4, R4, TOps> & {
   readonly commandId: string
 }
 
@@ -7132,9 +8024,10 @@ type CommandOptionsArgs<
   R3,
   E4,
   R4,
+  TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<AppendWriteOp>,
 > = TConfig extends { readonly idempotency: object }
-  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4>]
-  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4> | undefined]
+  ? [options: IdempotentCommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4, TOps>]
+  : [options?: CommandOptions<TMetadata, State, TEvent, E2, R2, E3, R3, E4, R4, TOps> | undefined]
 
 /** A command's own error `E` and everything {@link EventStream.append} can raise. */
 type CommandHandlerErrors<E> = E | AppendError
@@ -7153,13 +8046,28 @@ type CommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
+  TOffloaded = never,
+> = <
+  E2 = never,
+  R2 = never,
+  E3 = never,
+  R3 = never,
+  E4 = never,
+  R4 = never,
+  const TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<never>,
+>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4, TOps>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2 | E3 | E4 | LoadStateError<TConfig>,
+  | CommandHandlerErrors<E>
+  | E2
+  | E3
+  | E4
+  | LoadStateError<TConfig>
+  | StreamWriteErrors<TOffloaded>
+  | WriteOpBlobErrors<TOps[number]>,
   DynamoClient | TableConfig | R2 | R3 | R4 | LoadStateContext<TConfig>
 >
 
@@ -7176,13 +8084,28 @@ type BoundCommandHandler<
   TStreamIdFields extends ReadonlyArray<string>,
   TMetadata,
   TConfig extends CommandHandlerOptions | undefined = undefined,
-> = <E2 = never, R2 = never, E3 = never, R3 = never, E4 = never, R4 = never>(
+  TOffloaded = never,
+> = <
+  E2 = never,
+  R2 = never,
+  E3 = never,
+  R3 = never,
+  E4 = never,
+  R4 = never,
+  const TOps extends ReadonlyArray<AppendWriteOp> = ReadonlyArray<never>,
+>(
   streamId: StreamIdInput<TStreamIdFields>,
   command: Command,
-  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4>
+  ...options: CommandOptionsArgs<TMetadata, TConfig, State, TEvent, E2, R2, E3, R3, E4, R4, TOps>
 ) => Effect.Effect<
   CommandHandlerResult<State, TEvent>,
-  CommandHandlerErrors<E> | E2 | E3 | E4 | LoadStateError<TConfig>,
+  | CommandHandlerErrors<E>
+  | E2
+  | E3
+  | E4
+  | LoadStateError<TConfig>
+  | StreamWriteErrors<TOffloaded>
+  | WriteOpBlobErrors<TOps[number]>,
   R2 | R3 | R4 | LoadStateContext<TConfig>
 >
 
@@ -7200,10 +8123,37 @@ type CommandHandlerFor<
   E,
   TConfig extends CommandHandlerOptions | undefined,
 > =
-  S extends BoundEventStream<any, infer TStreamIdFields, infer TMetadata, any, any, any, any>
-    ? BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
-    : S extends EventStream<any, infer TStreamIdFields, infer TMetadata, any, any, any, any>
-      ? CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
+  S extends BoundEventStream<
+    any,
+    infer TStreamIdFields,
+    infer TMetadata,
+    any,
+    any,
+    any,
+    any,
+    infer TOffloaded
+  >
+    ? BoundCommandHandler<
+        State,
+        Command,
+        TEvent,
+        E,
+        TStreamIdFields,
+        TMetadata,
+        TConfig,
+        TOffloaded
+      >
+    : S extends EventStream<
+          any,
+          infer TStreamIdFields,
+          infer TMetadata,
+          any,
+          any,
+          any,
+          any,
+          infer TOffloaded
+        >
+      ? CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig, TOffloaded>
       : never
 
 /** @internal Both `EventStream` and `BoundEventStream` carry this brand. */
@@ -8031,8 +8981,8 @@ export const commandHandler: {
     options?: TConfig,
   ): <
     S extends
-      | BoundEventStream<TEvent, any, any, State, any, any, any>
-      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any, any>,
+      | BoundEventStream<TEvent, any, any, State, any, any, any, any>
+      | EventStream<TEvent, ReadonlyArray<string>, any, State, any, any, any, any>,
   >(
     stream: S,
   ) => CommandHandlerFor<S, State, Command, TEvent, E, TConfig>
@@ -8049,6 +8999,7 @@ export const commandHandler: {
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     TPartitionedIndexName extends string,
+    TOffloaded extends StreamOffloadKind,
     const TConfig extends CommandHandlerOptions<State, StreamIdInput<TStreamIdFields>> | undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
@@ -8059,10 +9010,11 @@ export const commandHandler: {
       TState,
       TIndexName,
       TIndexProjections,
-      TPartitionedIndexName
+      TPartitionedIndexName,
+      TOffloaded
     >,
     options?: TConfig,
-  ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
+  ): BoundCommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig, TOffloaded>
 
   // Data-first: EventStream → CommandHandler
   <
@@ -8076,6 +9028,7 @@ export const commandHandler: {
     TIndexName extends string,
     TIndexProjections extends { readonly [K in TIndexName]: StreamIndexProjection },
     TPartitionedIndexName extends string,
+    TOffloaded extends StreamOffloadKind,
     const TConfig extends CommandHandlerOptions<State, StreamIdInput<TStreamIdFields>> | undefined,
   >(
     decider: Decider<State, Command, TEvent, E>,
@@ -8086,10 +9039,11 @@ export const commandHandler: {
       TState,
       TIndexName,
       TIndexProjections,
-      TPartitionedIndexName
+      TPartitionedIndexName,
+      TOffloaded
     >,
     options?: TConfig,
-  ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig>
+  ): CommandHandler<State, Command, TEvent, E, TStreamIdFields, TMetadata, TConfig, TOffloaded>
 } = ((decider: any, streamOrOptions?: any, maybeOptions?: any) => {
   if (hasEventStreamBrand(streamOrOptions)) {
     return makeCommandHandlerImpl(decider, streamOrOptions, maybeOptions)
@@ -8224,9 +9178,11 @@ export {
 /**
  * Bind a projection to the services its operations need — `DynamoClient`,
  * the `TableConfig`s of the stream's table and the read model's, `evolve`'s
- * requirements, and a `Compression` registry for packed event data — so every
- * operation has `R = never`. Like {@link bind}, it checks the registry holds
- * the codecs the stream's `storedAs` names (`[EDD-9078]`).
+ * requirements, a `Compression` registry for packed event data and the
+ * `BlobStore` for offloaded event data (#179) — so every operation has
+ * `R = never`. Like {@link bind}, it checks the registry holds the codecs the
+ * stream's `storedAs` names (`[EDD-9078]`) and, for a stream that offloads,
+ * that a `BlobStore` is provided (`[EDD-9115]`).
  *
  * @example
  * ```ts
@@ -8242,7 +9198,7 @@ export const bindProjection: {
   <S, A, TStreamIdFields extends ReadonlyArray<string>, M, Err, R, K, E, I extends boolean, O>(
     projection: EventProjection<S, A, TStreamIdFields, M, Err, R, K, E, I, O>,
   ): Effect.Effect<EventProjection<S, A, TStreamIdFields, M, Err, never, K, E, I, O>, never, R>
-  <S, K, Sources extends Record<string, MultiSource<any, any, any, any, any>>, Err, R, O>(
+  <S, K, Sources extends Record<string, MultiSource<any, any, any, any, any, any>>, Err, R, O>(
     projection: MultiProjection<S, K, Sources, Err, R, O>,
   ): Effect.Effect<MultiProjection<S, K, Sources, Err, never, O>, never, R>
 } = (projection: any): Effect.Effect<any, never, any> =>
@@ -8250,7 +9206,7 @@ export const bindProjection: {
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const ctx = Capacity.detachContext(yield* Effect.context<any>())
     // The codec check `bind` makes, for every stream, against the registry captured here.
-    const streams: ReadonlyArray<EventStream<any, any, any, any, any, any, any>> =
+    const streams: ReadonlyArray<EventStream<any, any, any, any, any, any, any, any>> =
       isMultiProjection(projection)
         ? Object.values(projection.sources as Record<string, { readonly stream: any }>).map(
             (source) => source.stream,

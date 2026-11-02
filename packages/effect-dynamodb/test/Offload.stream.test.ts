@@ -38,7 +38,6 @@ import {
   resetStore,
   store as rows,
 } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -61,17 +60,15 @@ const key = {
   sk: { field: "sk", composite: [] },
 } as const
 
-const Docs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, {
-      scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
-      thumb: { storedAs: DynamoModel.External() },
-      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-    }),
-    entityType: "Doc",
-    primaryKey: key,
+const Docs = Entity.make({
+  model: DynamoModel.configure(Doc, {
+    scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+    thumb: { storedAs: DynamoModel.External() },
+    body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
   }),
-)
+  entityType: "Doc",
+  primaryKey: key,
+})
 
 class Scan extends Schema.Class<Scan>("Scan")({
   scanId: Schema.String,
@@ -80,15 +77,13 @@ class Scan extends Schema.Class<Scan>("Scan")({
 }) {}
 
 /** A binary immutable. */
-const Scans = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Scan, {
-      image: { storedAs: DynamoModel.External(), immutable: true },
-    }),
-    entityType: "Scan",
-    primaryKey: { pk: { field: "pk", composite: ["scanId"] }, sk: { field: "sk", composite: [] } },
+const Scans = Entity.make({
+  model: DynamoModel.configure(Scan, {
+    image: { storedAs: DynamoModel.External(), immutable: true },
   }),
-)
+  entityType: "Scan",
+  primaryKey: { pk: { field: "pk", composite: ["scanId"] }, sk: { field: "sk", composite: [] } },
+})
 
 class Reading extends Schema.Class<Reading>("Reading")({
   sensorId: Schema.String,
@@ -96,24 +91,22 @@ class Reading extends Schema.Class<Reading>("Reading")({
   raw: Schema.optional(Schema.Uint8Array),
 }) {}
 
-const Readings = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
-    entityType: "Reading",
-    primaryKey: {
-      pk: { field: "pk", composite: ["sensorId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    timeSeries: {
-      orderBy: "at",
-      appendInput: Schema.Struct({
-        sensorId: Schema.String,
-        at: Schema.Number,
-        raw: Schema.optional(Schema.Uint8Array),
-      }),
-    },
-  }),
-)
+const Readings = Entity.make({
+  model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      sensorId: Schema.String,
+      at: Schema.Number,
+      raw: Schema.optional(Schema.Uint8Array),
+    }),
+  },
+})
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Docs, Scans, Readings } })
 

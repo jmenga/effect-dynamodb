@@ -239,13 +239,19 @@ export interface EngineSource {
     readFrom(id: any, after: number, options?: any): Effect.Effect<ReadonlyArray<any>, any, any>
     read(id: any, options?: any): Effect.Effect<ReadonlyArray<any>, any, any>
     readonly query: { events(id: any): Query.Query<any, any, any> }
-    decodeStreamImage(image: any): Effect.Effect<Option.Option<any>, ValidationError, any>
+    decodeStreamImage(image: any, options?: any): Effect.Effect<Option.Option<any>, any, any>
   }
   /** `K`, or `Option<K>` (none: the event addresses no row). */
   readonly key: (streamId: any, event: any) => unknown
   readonly evolve: (state: any, event: any, context: EvolveContext) => Effect.Effect<any, any, any>
   readonly mode: "fold" | "latest"
   readonly terminal: ((error: any) => boolean) | undefined
+  /**
+   * How the source's events are read and decoded (#179): the gap reads in
+   * the projection's mode, so a gap-filled event has the shape of a
+   * delivered one.
+   */
+  readonly offloaded: "eager" | "lazy"
 }
 
 /** What `evolve` is told about the event it folds. */
@@ -2150,6 +2156,7 @@ export const makeEngine = (config: EngineConfig) => {
       const read = (yield* work.source.stream.readFrom(work.streamId, slotAt, {
         consistentRead: true,
         toVersion: upTo,
+        offloaded: work.source.offloaded,
       })) as ReadonlyArray<AnyEvent>
       let last = slotAt
       for (const e of read) {

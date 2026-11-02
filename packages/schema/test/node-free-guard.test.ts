@@ -62,7 +62,6 @@ describe("node-free guard", () => {
       "internal/Crc64Nvme.js",
       "internal/Sha256.js",
       "internal/EntityOffload.js",
-      "internal/OffloadGate.js",
     ]) {
       expect(existsSync(join(distDir, file)), `${file} missing from dist — rebuild`).toBe(true)
     }

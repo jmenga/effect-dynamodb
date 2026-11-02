@@ -45,7 +45,6 @@ import {
   DDB_ITEM_SIZE,
   DDB_ITEM_SIZE_UPDATE,
 } from "./helpers/MockDynamoClient.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 // ---------------------------------------------------------------------------
@@ -93,43 +92,35 @@ const docModel = (threshold: number) =>
   })
 
 /** Plain: thresholds of 64 bytes, no item budget. */
-const Docs = withOffloadGate(() =>
-  Entity.make({ model: docModel(64), entityType: "Doc", primaryKey: docKey }),
-)
+const Docs = Entity.make({ model: docModel(64), entityType: "Doc", primaryKey: docKey })
 
 /** Thresholds out of reach: only the item budget routes. */
-const Budgeted = withOffloadGate(() =>
-  Entity.make({
-    model: docModel(100_000),
-    entityType: "Budgeted",
-    primaryKey: docKey,
-    offload: { itemBudget: 3_000 },
-  }),
-)
+const Budgeted = Entity.make({
+  model: docModel(100_000),
+  entityType: "Budgeted",
+  primaryKey: docKey,
+  offload: { itemBudget: 3_000 },
+})
 
 /** One reachable threshold beside a budget: an update's first attempt uploads. */
-const Mixed = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, {
-      body: { storedAs: overflow(64) },
-      notes: { field: "n", storedAs: overflow(100_000) },
-    }),
-    entityType: "Mixed",
-    primaryKey: docKey,
-    offload: { itemBudget: 3_000 },
+const Mixed = Entity.make({
+  model: DynamoModel.configure(Doc, {
+    body: { storedAs: overflow(64) },
+    notes: { field: "n", storedAs: overflow(100_000) },
   }),
-)
+  entityType: "Mixed",
+  primaryKey: docKey,
+  offload: { itemBudget: 3_000 },
+})
 
 /** Version snapshots and tombstones: lifecycle copies of pointers. */
-const Kept = withOffloadGate(() =>
-  Entity.make({
-    model: docModel(64),
-    entityType: "Kept",
-    primaryKey: docKey,
-    versioned: { retain: true },
-    softDelete: true,
-  }),
-)
+const Kept = Entity.make({
+  model: docModel(64),
+  entityType: "Kept",
+  primaryKey: docKey,
+  versioned: { retain: true },
+  softDelete: true,
+})
 
 class Scan extends Schema.Class<Scan>("Scan")({
   scanId: Schema.String,
@@ -138,13 +129,11 @@ class Scan extends Schema.Class<Scan>("Scan")({
 }) {}
 
 /** A binary immutable. */
-const Scans = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Scan, { image: { storedAs: pdf, immutable: true } }),
-    entityType: "Scan",
-    primaryKey: { pk: { field: "pk", composite: ["scanId"] }, sk: { field: "sk", composite: [] } },
-  }),
-)
+const Scans = Entity.make({
+  model: DynamoModel.configure(Scan, { image: { storedAs: pdf, immutable: true } }),
+  entityType: "Scan",
+  primaryKey: { pk: { field: "pk", composite: ["scanId"] }, sk: { field: "sk", composite: [] } },
+})
 
 class KeptScan extends Schema.Class<KeptScan>("KeptScan")({
   scanId: Schema.String,
@@ -188,16 +177,14 @@ const readingConfig = {
 } as const
 
 /** A budget too: an append is never retried for size (no read-merge form). */
-const Readings = withOffloadGate(() =>
-  Entity.make({
-    ...readingConfig,
-    model: DynamoModel.configure(Reading, {
-      raw: { storedAs: DynamoModel.External() },
-      detail: { storedAs: overflow(100_000) },
-    }),
-    offload: { itemBudget: 2_000 },
+const Readings = Entity.make({
+  ...readingConfig,
+  model: DynamoModel.configure(Reading, {
+    raw: { storedAs: DynamoModel.External() },
+    detail: { storedAs: overflow(100_000) },
   }),
-)
+  offload: { itemBudget: 2_000 },
+})
 
 /** The same items, appended by a member that no longer offloads (§4.7). */
 const LegacyReadings = Entity.make({
@@ -216,17 +203,15 @@ class Wide extends Schema.Class<Wide>("Wide")({
 }) {}
 
 /** Unversioned, unique, with a sparse map: the read-merge update's wide fallback. */
-const Wides = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Wide, {
-      totals: { storedAs: DynamoModel.SparseMap() },
-      body: { storedAs: overflow(64) },
-    }),
-    entityType: "Wide",
-    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
-    unique: { email: ["email"] },
+const Wides = Entity.make({
+  model: DynamoModel.configure(Wide, {
+    totals: { storedAs: DynamoModel.SparseMap() },
+    body: { storedAs: overflow(64) },
   }),
-)
+  entityType: "Wide",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  unique: { email: ["email"] },
+})
 
 const gzipped = DynamoModel.Packed({
   format: "json",
@@ -241,13 +226,11 @@ class Venue extends Schema.Class<Venue>("Venue")({
 }) {}
 
 /** For the aggregate bind checks: an edge entity with a binary field. */
-const Venues = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Venue, { plan: { storedAs: pdf } }),
-    entityType: "Venue",
-    primaryKey: { pk: { field: "pk", composite: ["venueId"] }, sk: { field: "sk", composite: [] } },
-  }),
-)
+const Venues = Entity.make({
+  model: DynamoModel.configure(Venue, { plan: { storedAs: pdf } }),
+  entityType: "Venue",
+  primaryKey: { pk: { field: "pk", composite: ["venueId"] }, sk: { field: "sk", composite: [] } },
+})
 
 /** For the codec checks: a packed field needing gzip. */
 const Gzipped = Entity.make({
@@ -281,9 +264,7 @@ const GzMatches = matchesOver(Gzipped)
 
 /** Key text not escaped (#183): offloading requires it escaped (`EDD-9146`, design §11.10). */
 const UnescapedSchema = DynamoSchema.make({ name: "off", version: 1, escapeKeys: false })
-const UnescapedDocs = withOffloadGate(() =>
-  Entity.make({ model: docModel(64), entityType: "Doc", primaryKey: docKey }),
-)
+const UnescapedDocs = Entity.make({ model: docModel(64), entityType: "Doc", primaryKey: docKey })
 const UnescapedTable = Table.make({ schema: UnescapedSchema, entities: { UnescapedDocs } })
 const UnescapedMatches = Aggregate.make(Match, {
   table: UnescapedTable,

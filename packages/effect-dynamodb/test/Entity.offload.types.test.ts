@@ -39,7 +39,6 @@ import * as Offload from "../src/Offload.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 class Doc extends Schema.Class<Doc>("Doc")({
   docId: Schema.String,
@@ -58,18 +57,19 @@ const offloaded = DynamoModel.configure(Doc, {
   scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
 })
 
-const Docs = withOffloadGate(() =>
-  Entity.make({ model: offloaded, entityType: "Doc", primaryKey, versioned: { retain: true } }),
-)
+const Docs = Entity.make({
+  model: offloaded,
+  entityType: "Doc",
+  primaryKey,
+  versioned: { retain: true },
+})
 
 /** Binary only: its writes still reach the store. */
-const Scans = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, { scan: { storedAs: DynamoModel.External() } }),
-    entityType: "Scan",
-    primaryKey,
-  }),
-)
+const Scans = Entity.make({
+  model: DynamoModel.configure(Doc, { scan: { storedAs: DynamoModel.External() } }),
+  entityType: "Scan",
+  primaryKey,
+})
 
 const Plain = Entity.make({ model: Doc, entityType: "PlainDoc", primaryKey })
 
@@ -84,9 +84,7 @@ const InlineDocs = Entity.make({
 })
 
 /** A pure definition, from the AWS-free package. */
-const PureDocs = withOffloadGate(() =>
-  SchemaEntity.make({ model: offloaded, entityType: "PureDoc", primaryKey }),
-)
+const PureDocs = SchemaEntity.make({ model: offloaded, entityType: "PureDoc", primaryKey })
 
 class Reading extends Schema.Class<Reading>("Reading")({
   sensorId: Schema.String,
@@ -94,24 +92,22 @@ class Reading extends Schema.Class<Reading>("Reading")({
   raw: Schema.optional(Schema.Uint8Array),
 }) {}
 
-const Readings = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
-    entityType: "Reading",
-    primaryKey: {
-      pk: { field: "pk", composite: ["sensorId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    timeSeries: {
-      orderBy: "at",
-      appendInput: Schema.Struct({
-        sensorId: Schema.String,
-        at: Schema.Number,
-        raw: Schema.optional(Schema.Uint8Array),
-      }),
-    },
-  }),
-)
+const Readings = Entity.make({
+  model: DynamoModel.configure(Reading, { raw: { storedAs: DynamoModel.External() } }),
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      sensorId: Schema.String,
+      at: Schema.Number,
+      raw: Schema.optional(Schema.Uint8Array),
+    }),
+  },
+})
 
 /** Members of an explicit collection: one offloads, one does not. */
 const shelf = {
@@ -120,9 +116,12 @@ const shelf = {
   pk: { field: "gsi1pk", composite: ["title"] },
   sk: { field: "gsi1sk", composite: ["docId"] },
 } as const
-const ShelfDocs = withOffloadGate(() =>
-  Entity.make({ model: offloaded, entityType: "ShelfDoc", primaryKey, indexes: { shelf } }),
-)
+const ShelfDocs = Entity.make({
+  model: offloaded,
+  entityType: "ShelfDoc",
+  primaryKey,
+  indexes: { shelf },
+})
 const ShelfPlain = Entity.make({
   model: Doc,
   entityType: "ShelfPlain",
@@ -142,9 +141,12 @@ const byTitle = {
   distance: "cosine",
   source: { fields: ["title"] },
 } as const
-const Cards = withOffloadGate(() =>
-  Entity.make({ model: offloaded, entityType: "Card", primaryKey, vectorIndexes: { byTitle } }),
-)
+const Cards = Entity.make({
+  model: offloaded,
+  entityType: "Card",
+  primaryKey,
+  vectorIndexes: { byTitle },
+})
 const PlainCards = Entity.make({
   model: Doc,
   entityType: "PlainCard",

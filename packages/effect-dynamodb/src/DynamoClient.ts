@@ -229,6 +229,7 @@ import {
   aggregateStoreRequirements,
   entityStoreRequirements,
   missingStoreError,
+  type StoreRequirement,
   unescapedKeysError,
 } from "./internal/OffloadWrite.js"
 import {
@@ -3603,6 +3604,18 @@ const makeFromConfig = (config: {
               ...Object.values(config.entities).map(operational).filter(onTable),
               ...Object.values(config.aggregates ?? {}).filter(onTable),
             ]
+            // A stream given to `rekey` that offloads needs escaped key text, as
+            // `EventStore.bind` checks it (`[EDD-9146]`, design §11.10): under it, a
+            // pointer row is written only at its final key text and never moved.
+            const streamKeysError = unescapedKeysError(
+              "rekey",
+              (options?.streams ?? []).flatMap(
+                (stream) =>
+                  (stream as { readonly _storeRequirements?: ReadonlyArray<StoreRequirement> })
+                    ._storeRequirements ?? [],
+              ),
+            )
+            if (streamKeysError !== undefined) throw streamKeysError
             for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
               const handler = Rekey.handlerOf(member)
               if (handler !== undefined) handlers.add(handler)

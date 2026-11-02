@@ -28,7 +28,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as StorageEncoding from "../src/StorageEncoding.js"
 import * as Table from "../src/Table.js"
-import { expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
+import { expectPointerStoreFailure, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import {
   awsValidationException,
@@ -675,7 +675,11 @@ describe("EventStore packed storage — every read path on a mixed M/S/B stream 
 // Blob pointers (#179): refused until reads resolve them
 // ---------------------------------------------------------------------------
 
-describe("EventStore packed storage — blob pointers (Packed layout 010) are refused", () => {
+// A stream that does not offload `data` / `state` still reads a pointer met
+// there (#179, design §4.7: switching offload off), through the store — none
+// is in context here, so the read fails with the `ValidationError` whose
+// cause is the store's `NotProvided`.
+describe("EventStore packed storage — blob pointers (Packed layout 010) on a stream that does not offload", () => {
   const withPointer = (item: Item, attribute: "data" | "state"): Item => ({
     ...item,
     [attribute]: { B: jsonPointerBytes() },
@@ -688,15 +692,15 @@ describe("EventStore packed storage — blob pointers (Packed layout 010) are re
       store.set(keyOf(item!), withPointer(item!, "data"))
       const event = { entityType: "ledger.event", operation: "EventStore.decode" }
       for (const ledger of [JsonLedger, ZstdLedger, NativeLedger]) {
-        expectUnresolvedPointer(yield* ledger.read(id).pipe(Effect.flip), "data", event)
-        expectUnresolvedPointer(
+        expectPointerStoreFailure(yield* ledger.read(id).pipe(Effect.flip), "data", event)
+        expectPointerStoreFailure(
           yield* ledger.query.events(id).pipe(Query.collect, Effect.flip),
           "data",
           event,
         )
       }
       // A raw row (`select`) reads `data` by its stored form too.
-      expectUnresolvedPointer(
+      expectPointerStoreFailure(
         yield* JsonLedger.query
           .events(id)
           .pipe(Query.select(["version", "data"]), Query.collect, Effect.flip),
@@ -717,7 +721,7 @@ describe("EventStore packed storage — blob pointers (Packed layout 010) are re
         { ...fromAttributeMap(image), data: base64 },
       ]) {
         const error = yield* ZstdLedger.decodeStreamImage(candidate).pipe(Effect.flip)
-        expectUnresolvedPointer(error, "data")
+        expectPointerStoreFailure(error, "data", { operation: "EventStore.decodeStreamImage" })
       }
     }).pipe(Effect.provide(TestLayer)),
   )
@@ -729,9 +733,9 @@ describe("EventStore packed storage — blob pointers (Packed layout 010) are re
       store.set(keyOf(snapshot), withPointer(snapshot, "state"))
       const state = { entityType: "ledger.snapshot" }
       for (const ledger of [ZstdLedger, JsonLedger, NativeLedger]) {
-        expectUnresolvedPointer(yield* ledger.readSnapshot(id).pipe(Effect.flip), "state", state)
+        expectPointerStoreFailure(yield* ledger.readSnapshot(id).pipe(Effect.flip), "state", state)
       }
-      expectUnresolvedPointer(yield* ZstdLedger.readLatest(id).pipe(Effect.flip), "state", state)
+      expectPointerStoreFailure(yield* ZstdLedger.readLatest(id).pipe(Effect.flip), "state", state)
     }).pipe(Effect.provide(TestLayer)),
   )
 })
@@ -1019,6 +1023,7 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
     Effect.gen(function* () {
       expect(yield* ZstdLedger.measureAppend(id, [], 0)).toEqual({
         events: [],
+        offloaded: [],
         sentinel: undefined,
         snapshot: undefined,
         transactionBytes: 0,
@@ -1332,10 +1337,18 @@ describe("EventStore packed storage — decodeStreamImage (#147, R2)", () => {
       const broken = { ...item!, data: { S: '{"_tag":"Recorded","amount":"nope"}' } }
       const error = yield* ZstdLedger.decodeStreamImage(broken).pipe(Effect.flip)
       expect(error).toBeInstanceOf(ValidationError)
+      // A schema failure is the decode's; a stored form that does not read is
+      // the image's.
+      expect((error as ValidationError).operation).toBe("EventStore.decode")
       const notBase64 = { ...lambdaImage(item!), data: { B: "!!!" } }
-      expect(
-        yield* ZstdLedger.decodeStreamImage(notBase64 as never).pipe(Effect.flip),
-      ).toBeInstanceOf(ValidationError)
+      const unreadable = yield* ZstdLedger.decodeStreamImage(notBase64 as never).pipe(Effect.flip)
+      expect(unreadable).toBeInstanceOf(ValidationError)
+      expect((unreadable as ValidationError).operation).toBe("EventStore.decodeStreamImage")
+      // A corrupt packed value (a header with no valid payload).
+      const corrupt = { ...item!, data: { B: new Uint8Array([0x40, 1, 2]) } }
+      const unpacked = yield* ZstdLedger.decodeStreamImage(corrupt).pipe(Effect.flip)
+      expect(unpacked).toBeInstanceOf(ValidationError)
+      expect((unpacked as ValidationError).operation).toBe("EventStore.decodeStreamImage")
       expect(yield* ZstdLedger.decodeStreamImage("nope" as never).pipe(Effect.flip)).toBeInstanceOf(
         ValidationError,
       )

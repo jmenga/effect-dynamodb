@@ -10,7 +10,6 @@ import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 class Scan extends Schema.Class<Scan>("Scan")({
   scanId: Schema.String,
@@ -28,7 +27,24 @@ const primaryKey = {
 
 describe("shards.by on an offloading entity", () => {
   it("names a scalar sort key composite (positive)", () => {
-    const Scans = withOffloadGate(() =>
+    const Scans = Entity.make({
+      model,
+      entityType: "Scan",
+      primaryKey,
+      indexes: {
+        byTenant: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["tenantId"] },
+          sk: { field: "gsi1sk", composite: ["label"] },
+          shards: { count: 4, by: ["label"] },
+        },
+      },
+    })
+    expect(Scans.indexes.byTenant.shards?.source).toEqual(["label"])
+  })
+
+  it("refuses a misspelled name at compile time (typo)", () => {
+    expect(() =>
       Entity.make({
         model,
         entityType: "Scan",
@@ -38,32 +54,11 @@ describe("shards.by on an offloading entity", () => {
             name: "gsi1",
             pk: { field: "gsi1pk", composite: ["tenantId"] },
             sk: { field: "gsi1sk", composite: ["label"] },
-            shards: { count: 4, by: ["label"] },
+            // @ts-expect-error — not a sort key composite of this index
+            shards: { count: 4, by: ["labl"] },
           },
         },
       }),
-    )
-    expect(Scans.indexes.byTenant.shards?.source).toEqual(["label"])
-  })
-
-  it("refuses a misspelled name at compile time (typo)", () => {
-    expect(() =>
-      withOffloadGate(() =>
-        Entity.make({
-          model,
-          entityType: "Scan",
-          primaryKey,
-          indexes: {
-            byTenant: {
-              name: "gsi1",
-              pk: { field: "gsi1pk", composite: ["tenantId"] },
-              sk: { field: "gsi1sk", composite: ["label"] },
-              // @ts-expect-error — not a sort key composite of this index
-              shards: { count: 4, by: ["labl"] },
-            },
-          },
-        }),
-      ),
     ).toThrow(/\[EDD-9102\]/)
   })
 

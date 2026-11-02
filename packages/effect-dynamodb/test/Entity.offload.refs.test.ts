@@ -14,7 +14,6 @@ import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 type Row = Record<string, AttributeValue>
@@ -32,21 +31,19 @@ class OwnerSummary extends Schema.Class<OwnerSummary>("OwnerSummary")({
 
 /** The referenced entity, plain or retaining versions (its cascade runs from another path). */
 const define = (retain: boolean) => {
-  const Owners = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Owner, {
-        ownerId: { identifier: true },
-        avatar: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
-        profile: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 16 } }) },
-      }),
-      entityType: "Owner",
-      primaryKey: {
-        pk: { field: "pk", composite: ["ownerId"] },
-        sk: { field: "sk", composite: [] },
-      },
-      ...(retain ? { versioned: { retain: true } } : {}),
-    } as never),
-  ) as any
+  const Owners = Entity.make({
+    model: DynamoModel.configure(Owner, {
+      ownerId: { identifier: true },
+      avatar: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
+      profile: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 16 } }) },
+    }),
+    entityType: "Owner",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ownerId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    ...(retain ? { versioned: { retain: true } } : {}),
+  } as never) as any
   const Folder = Schema.Struct({
     folderId: Schema.String,
     owner: OwnerSummary.pipe(DynamoModel.ref),

@@ -35,7 +35,6 @@ import * as Capacity from "../src/internal/Capacity.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import { InMemoryClient, resetStore } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -61,13 +60,11 @@ const docKey = {
   sk: { field: "sk", composite: [] },
 } as const
 
-const Docs = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Doc, offloaded),
-    entityType: "Doc",
-    primaryKey: docKey,
-  }),
-)
+const Docs = Entity.make({
+  model: DynamoModel.configure(Doc, offloaded),
+  entityType: "Doc",
+  primaryKey: docKey,
+})
 
 const PlainDocs = Entity.make({ model: Doc, entityType: "PlainDoc", primaryKey: docKey })
 
@@ -78,26 +75,24 @@ class Reading extends Schema.Class<Reading>("Reading")({
   raw: Schema.optional(Schema.Uint8Array),
 }) {}
 
-const Readings = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Reading, {
-      raw: { storedAs: DynamoModel.External() },
-    }),
-    entityType: "Reading",
-    primaryKey: {
-      pk: { field: "pk", composite: ["sensorId"] },
-      sk: { field: "sk", composite: [] },
-    },
-    timeSeries: {
-      orderBy: "at",
-      appendInput: Schema.Struct({
-        sensorId: Schema.String,
-        at: Schema.Number,
-        value: Schema.Number,
-      }),
-    },
+const Readings = Entity.make({
+  model: DynamoModel.configure(Reading, {
+    raw: { storedAs: DynamoModel.External() },
   }),
-)
+  entityType: "Reading",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sensorId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      sensorId: Schema.String,
+      at: Schema.Number,
+      value: Schema.Number,
+    }),
+  },
+})
 
 class Venue extends Schema.Class<Venue>("Venue")({
   venueId: Schema.String.pipe(DynamoModel.identifier),

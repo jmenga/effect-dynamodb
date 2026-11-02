@@ -1,17 +1,15 @@
 /**
  * Offloaded entity fields (#179) — the definition-time surface of the pure
  * `Entity.make` (shared with the runtime one through `buildEntityDefinition`):
- * the "not yet supported" refusal and its test-only gate, the resolved
- * `entity.offload`, and the guards EDD-9111 (missing / non-binary External
- * field), EDD-9142 (External key / index / unique / ref / identifier / vector
- * source), EDD-9143 (a ref copying an offloaded field) and EDD-9114 (`offload`
- * options). The guards run before the refusal, so they need no gate.
+ * the resolved `entity.offload`, and the guards EDD-9111 (missing / non-binary
+ * External field), EDD-9142 (External key / index / unique / ref / identifier
+ * / vector source), EDD-9143 (a ref copying an offloaded field) and EDD-9114
+ * (`offload` options).
  */
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 class Document extends Schema.Class<Document>("Document")({
   docId: Schema.String,
@@ -48,27 +46,19 @@ const make = (
     ...extra,
   } as never) as unknown as Entity.EntityDefinition
 
-const makeOpen = (
-  attrs: Record<string, unknown>,
-  extra: Record<string, unknown> = {},
-  model: Schema.Top = Document,
-) => withOffloadGate(() => make(attrs, extra, model))
-
-describe("Entity.make — offloaded storage refusal", () => {
-  it("refuses an entity that offloads, naming what it offloads", () => {
-    const thunk = () => make({ body: { storedAs: overflow }, scan: { storedAs: binary } })
-    expect(thunk).toThrow(
-      /^Entity "Document": offloaded storage .* is not yet supported by this version of effect-dynamodb/,
-    )
-    expect(thunk).toThrow('offloaded: "body" (overflow), "scan" (binary).')
+describe("Entity.make — offloading members", () => {
+  it("defines an entity that offloads", () => {
+    expect(make({ body: { storedAs: overflow }, scan: { storedAs: binary } }).offload).toEqual({
+      itemBudget: undefined,
+      prefix: undefined,
+      overflow: ["body"],
+      binary: ["scan"],
+    })
+    expect(make({ scan: { storedAs: binary } }).offload?.binary).toEqual(["scan"])
+    expect(make({ body: { storedAs: overflow } }).offload?.overflow).toEqual(["body"])
   })
 
-  it("refuses a binary-only and an overflow-only entity", () => {
-    expect(() => make({ scan: { storedAs: binary } })).toThrow(/not yet supported/)
-    expect(() => make({ body: { storedAs: overflow } })).toThrow(/not yet supported/)
-  })
-
-  it("does not refuse an entity that offloads nothing", () => {
+  it("leaves entity.offload undefined for an entity that offloads nothing", () => {
     const def = make({ body: { storedAs: DynamoModel.Packed({ format: "json" }) } })
     expect(def.offload).toBeUndefined()
     expect(def._data.externalFields).toEqual({})
@@ -76,7 +66,7 @@ describe("Entity.make — offloaded storage refusal", () => {
     expect(make({}).offload).toBeUndefined()
   })
 
-  it("runs every guard before the refusal", () => {
+  it("runs every guard on an offloading entity", () => {
     expect(() => make({ scan: { storedAs: binary } }, { unique: { byScan: ["scan"] } })).toThrow(
       /\[EDD-9142\]/,
     )
@@ -84,16 +74,11 @@ describe("Entity.make — offloaded storage refusal", () => {
       /\[EDD-9114\]/,
     )
   })
-
-  it("the gate is scoped to the fiber that runs the definition", () => {
-    makeOpen({ scan: { storedAs: binary } })
-    expect(() => make({ scan: { storedAs: binary } })).toThrow(/not yet supported/)
-  })
 })
 
-describe("Entity.make — resolved offload settings (gate open)", () => {
+describe("Entity.make — resolved offload settings", () => {
   it("resolves entity.offload with the offloaded field names by kind", () => {
-    const def = makeOpen(
+    const def = make(
       {
         body: { storedAs: overflow },
         scan: { field: "s", storedAs: binary },
@@ -117,7 +102,7 @@ describe("Entity.make — resolved offload settings (gate open)", () => {
   })
 
   it("leaves itemBudget and prefix undefined when offload is not given", () => {
-    const def = makeOpen({ scan: { storedAs: binary } })
+    const def = make({ scan: { storedAs: binary } })
     expect(def.offload).toEqual({
       itemBudget: undefined,
       prefix: undefined,
@@ -127,7 +112,7 @@ describe("Entity.make — resolved offload settings (gate open)", () => {
   })
 
   it("accepts optional, optionalKey and NullOr binary fields", () => {
-    const def = makeOpen({
+    const def = make({
       thumbnail: { storedAs: binary },
       preview: { storedAs: binary },
       sketch: { storedAs: binary },
@@ -136,7 +121,7 @@ describe("Entity.make — resolved offload settings (gate open)", () => {
   })
 
   it("combines External with field and immutable", () => {
-    const def = makeOpen({ scan: { field: "s", immutable: true, storedAs: binary } })
+    const def = make({ scan: { field: "s", immutable: true, storedAs: binary } })
     expect(def.offload?.binary).toEqual(["scan"])
   })
 })
@@ -215,7 +200,7 @@ describe("EDD-9142 — External key, index and constraint sources", () => {
       make({ scan: { storedAs: binary } }, { indexes: sharded(["title", "scan"]) }),
     ).toThrow(bySource)
     // Named before its composite, and on an injected (collection-owned) index too.
-    const def = makeOpen({ scan: { storedAs: binary } })
+    const def = make({ scan: { storedAs: binary } })
     expect(() =>
       def._injectIndex("coll", {
         index: "gsi9",
@@ -225,7 +210,7 @@ describe("EDD-9142 — External key, index and constraint sources", () => {
       }),
     ).toThrow(/\[EDD-9142\].*"scan" cannot be a shards\.by source of index "coll"/)
     // A scalar source beside an External field elsewhere is accepted.
-    const accepted = makeOpen(
+    const accepted = make(
       { scan: { storedAs: binary } },
       {
         indexes: {
@@ -242,7 +227,7 @@ describe("EDD-9142 — External key, index and constraint sources", () => {
   })
 
   it("refuses an index injected later (collection-owned) whose composite is External", () => {
-    const def = makeOpen({ scan: { storedAs: binary } })
+    const def = make({ scan: { storedAs: binary } })
     expect(() =>
       def._injectIndex("coll", {
         index: "gsi9",
@@ -284,7 +269,7 @@ describe("EDD-9142 — External key, index and constraint sources", () => {
     ).toThrow(/\[EDD-9142\] Entity "Document": External field "scan" cannot be a composite/)
     // A composite with such a name is not External.
     expect(() =>
-      makeOpen(
+      make(
         { scan: { storedAs: binary } },
         {
           indexes: {
@@ -387,19 +372,17 @@ describe("EDD-9143 — a ref copying an offloaded field", () => {
   }) {}
 
   const Owners = (attrs: Record<string, unknown>) =>
-    withOffloadGate(() =>
-      Entity.make({
-        model: DynamoModel.configure(Owner, {
-          ownerId: { identifier: true },
-          ...attrs,
-        } as never),
-        entityType: "Owner",
-        primaryKey: {
-          pk: { field: "pk", composite: ["ownerId"] },
-          sk: { field: "sk", composite: [] },
-        },
+    Entity.make({
+      model: DynamoModel.configure(Owner, {
+        ownerId: { identifier: true },
+        ...attrs,
       } as never),
-    )
+      entityType: "Owner",
+      primaryKey: {
+        pk: { field: "pk", composite: ["ownerId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    } as never)
 
   const Folder = (owner: Schema.Top) =>
     Schema.Struct({ folderId: Schema.String, owner: owner.pipe(DynamoModel.ref) })
@@ -486,8 +469,8 @@ describe("EDD-9114 — offload options", () => {
   })
 
   it("accepts itemBudget at both ends of the range", () => {
-    expect(makeOpen(both, { offload: { itemBudget: 1 } }).offload?.itemBudget).toBe(1)
-    expect(makeOpen(both, { offload: { itemBudget: 409_600 } }).offload?.itemBudget).toBe(409_600)
+    expect(make(both, { offload: { itemBudget: 1 } }).offload?.itemBudget).toBe(1)
+    expect(make(both, { offload: { itemBudget: 409_600 } }).offload?.itemBudget).toBe(409_600)
   })
 
   it("refuses itemBudget on a binary-only entity", () => {
@@ -506,13 +489,13 @@ describe("EDD-9114 — offload options", () => {
 
   it("accepts a prefix of unreserved characters and slashes", () => {
     const prefix = "prod/docs-1_x.~/"
-    expect(makeOpen(both, { offload: { prefix } }).offload?.prefix).toBe(prefix)
+    expect(make(both, { offload: { prefix } }).offload?.prefix).toBe(prefix)
     const longest = "p".repeat(256)
-    expect(makeOpen(both, { offload: { prefix: longest } }).offload?.prefix).toBe(longest)
+    expect(make(both, { offload: { prefix: longest } }).offload?.prefix).toBe(longest)
   })
 
   it("accepts an empty offload object", () => {
-    expect(makeOpen(both, { offload: {} }).offload).toEqual({
+    expect(make(both, { offload: {} }).offload).toEqual({
       itemBudget: undefined,
       prefix: undefined,
       overflow: ["body"],

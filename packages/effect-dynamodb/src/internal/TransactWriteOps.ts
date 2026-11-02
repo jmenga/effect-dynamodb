@@ -152,25 +152,28 @@ export interface BuiltStreamAppend {
  * Accepted only there — `Transaction.transactWrite` refuses it (its type does
  * not admit it, and at runtime it fails with `ValidationError`).
  */
-export interface StreamAppendOp {
+export interface StreamAppendOp<E = never> {
   readonly [StreamAppendTypeId]: StreamAppendTypeId
   /** The inner stream's name. */
   readonly streamName: string
   /**
    * @internal Build the nested append's items. `source` names the op in a
-   * diagnosed rejection (`"operation 0"`).
+   * diagnosed rejection (`"operation 0"`). `E` is the inner stream's own
+   * build errors: the `BlobStoreError` of a stream that offloads (#179) —
+   * its events' `data` and inline snapshot's `state` are uploaded here —
+   * which the outer append's errors carry (`WriteOpBlobErrors`).
    */
   readonly _build: (
     source: string,
   ) => Effect.Effect<
     BuiltStreamAppend,
-    ValidationError | DynamoClientError,
+    ValidationError | DynamoClientError | E,
     TableConfig | DynamoClient
   >
 }
 
 /** @internal Whether `op` is a {@link StreamAppendOp}. */
-export const isStreamAppendOp = (op: unknown): op is StreamAppendOp =>
+export const isStreamAppendOp = (op: unknown): op is StreamAppendOp<any> =>
   typeof op === "object" && op !== null && StreamAppendTypeId in op
 
 /**
@@ -178,7 +181,7 @@ export const isStreamAppendOp = (op: unknown): op is StreamAppendOp =>
  * {@link TransactWriteOp}, plus another stream's append ({@link StreamAppendOp}).
  * Accepted by `EventStream.append` and `commandHandler`, nowhere else.
  */
-export type AppendWriteOp = TransactWriteOp | StreamAppendOp
+export type AppendWriteOp = TransactWriteOp | StreamAppendOp<any>
 
 /**
  * An `update` — accepted by `Transaction.transactWrite` alone.

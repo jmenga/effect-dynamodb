@@ -1037,8 +1037,7 @@ export const buildEntityDefinition = (config: {
   // ---------------------------------------------------------------------------
   // Offloaded fields (Packed({ external }) / External) and `offload` options —
   // EDD-9111..9114 (#179). Overflow fields are packed, so the Packed guards
-  // above already ran on them. Until offload writes are wired, an entity that
-  // offloads anything is refused here as not yet supported.
+  // above already ran on them.
   // ---------------------------------------------------------------------------
 
   const offloadPlan = resolveOffloadPlan({

@@ -47,7 +47,6 @@ import {
   resetStore,
   store as rows,
 } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 // ---------------------------------------------------------------------------
@@ -76,17 +75,15 @@ const scanKey = {
 } as const
 
 /** A binary image (always offloaded) and overflow notes (at 64 bytes). */
-const Scans = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Scan, {
-      id: { identifier: true },
-      image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
-      notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-    }),
-    entityType: "Scan",
-    primaryKey: scanKey,
+const Scans = Entity.make({
+  model: DynamoModel.configure(Scan, {
+    id: { identifier: true },
+    image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
+    notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
   }),
-)
+  entityType: "Scan",
+  primaryKey: scanKey,
+})
 
 /** The same entity type, configured without offloading (design §4.7). */
 const PlainScans = Entity.make({
@@ -1061,18 +1058,16 @@ describe("Aggregate ref hydration — offloading targets", () => {
       id: Schema.String,
       thumb: Schema.Uint8Array,
     }) {}
-    const Prints = withOffloadGate(() =>
-      Entity.make({
-        model: DynamoModel.configure(Print, {
-          id: { identifier: true },
-          image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
-          thumb: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
-          notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-        }),
-        entityType: "Print",
-        primaryKey: scanKey,
+    const Prints = Entity.make({
+      model: DynamoModel.configure(Print, {
+        id: { identifier: true },
+        image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
+        thumb: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
+        notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
       }),
-    )
+      entityType: "Print",
+      primaryKey: scanKey,
+    })
     const PrintTable = Table.make({ schema: AppSchema, entities: { Prints } })
     const Shelves = shelfOf(PrintThumb, "Contact", Prints, PrintTable)
     return withStore(
@@ -1099,19 +1094,17 @@ describe("Aggregate — an edge entity's item budget", () => {
     id: Schema.String,
     notes: Notes,
   }) {}
-  const BudgetNotes = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Note, {
-        id: { identifier: true },
-        notes: {
-          storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 100_000 } }),
-        },
-      }),
-      entityType: "Note",
-      primaryKey: scanKey,
-      offload: { itemBudget: 2_000 },
+  const BudgetNotes = Entity.make({
+    model: DynamoModel.configure(Note, {
+      id: { identifier: true },
+      notes: {
+        storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 100_000 } }),
+      },
     }),
-  )
+    entityType: "Note",
+    primaryKey: scanKey,
+    offload: { itemBudget: 2_000 },
+  })
   class Book extends Schema.Class<Book>("Book")({
     bookId: Schema.String,
     notes: Schema.Array(Note),
@@ -1162,17 +1155,15 @@ describe("Aggregate — an edge entity's item budget", () => {
 
 /** Key text not escaped (#183): offloading requires it escaped (`EDD-9146`). */
 const UnescapedSchema = DynamoSchema.make({ name: "aggoff", version: 1, escapeKeys: false })
-const UnescapedScans = withOffloadGate(() =>
-  Entity.make({
-    model: DynamoModel.configure(Scan, {
-      id: { identifier: true },
-      image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
-      notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-    }),
-    entityType: "Scan",
-    primaryKey: scanKey,
+const UnescapedScans = Entity.make({
+  model: DynamoModel.configure(Scan, {
+    id: { identifier: true },
+    image: { storedAs: DynamoModel.External({ contentType: "image/png" }) },
+    notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
   }),
-)
+  entityType: "Scan",
+  primaryKey: scanKey,
+})
 const UnescapedTable = Table.make({ schema: UnescapedSchema, entities: { UnescapedScans } })
 const UnescapedAlbums = Aggregate.make(Album, {
   table: UnescapedTable,

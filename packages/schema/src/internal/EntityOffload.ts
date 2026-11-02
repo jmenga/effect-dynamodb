@@ -24,9 +24,6 @@
  *   offloads: the denormalised copy would inline it, need to marshal a lazy
  *   handle, or copy a pointer across item families.
  * - `[EDD-9114]` invalid `offload` options (see {@link resolveOffloadOptions}).
- *
- * Then, until the commit that wires the last offload write path, a member that
- * offloads anything is refused as not yet supported (`internal/OffloadGate.ts`).
  */
 
 import { type Schema, SchemaAST } from "effect"
@@ -48,7 +45,6 @@ import type {
   UniqueConfig,
 } from "./EntityConfig.js"
 import { resolveUniqueFields } from "./EntitySchemas.js"
-import { refuseUnsupportedOffload } from "./OffloadGate.js"
 import { binaryShapeRefusal } from "./PackedCodec.js"
 import { firstTypeParameterAst } from "./SchemaAccessors.js"
 
@@ -75,12 +71,6 @@ export const offloadedFieldsOf = (model: Schema.Top): OffloadedFields => {
   }
   return { overflow, binary: getExternalFields(model) }
 }
-
-/** `"body" (overflow), "scan" (binary)` — for messages. */
-export const describeOffloaded = (fields: OffloadedFields): ReadonlyArray<string> => [
-  ...Object.keys(fields.overflow).map((field) => `"${field}" (overflow)`),
-  ...Object.keys(fields.binary).map((field) => `"${field}" (binary)`),
-]
 
 /** The resolved `offload` options of a member. */
 export interface OffloadOptions {
@@ -267,8 +257,7 @@ const refusal = (code: string, entityType: string, field: string, message: strin
 /**
  * Validate the offloaded fields and `offload` options of an entity definition
  * and derive its {@link OffloadPlan}. Throws on the first refusal (see the
- * module header), then refuses any offloading entity as not yet supported
- * unless the test-only gate is set.
+ * module header).
  */
 export const resolveOffloadPlan = (args: {
   readonly entityType: string
@@ -397,7 +386,6 @@ export const resolveOffloadPlan = (args: {
     overflow: overflow.length > 0,
     offloaded: overflow.length + binary.length > 0,
   })
-  refuseUnsupportedOffload(`Entity "${entityType}"`, describeOffloaded(fields))
 
   return {
     externalFields: fields.binary,

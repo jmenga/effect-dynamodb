@@ -21,7 +21,6 @@ import {
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
 import type * as GeoSearch from "../src/GeoSearch.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 class Courier extends Schema.Class<Courier>("Courier")({
   courierId: Schema.String,
@@ -50,15 +49,13 @@ const config = {
   },
 } as const
 
-const Offloading = withOffloadGate(() =>
-  Entity.make({
-    ...config,
-    model: DynamoModel.configure(Courier, {
-      notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
-      photo: { storedAs: DynamoModel.External() },
-    }),
+const Offloading = Entity.make({
+  ...config,
+  model: DynamoModel.configure(Courier, {
+    notes: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 64 } }) },
+    photo: { storedAs: DynamoModel.External() },
   }),
-)
+})
 const Plain = Entity.make({ ...config, model: Courier })
 
 const geo = {

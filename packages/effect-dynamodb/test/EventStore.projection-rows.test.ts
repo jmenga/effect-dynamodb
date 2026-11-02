@@ -33,7 +33,6 @@ import {
   store,
   tableIndexes,
 } from "./helpers/InMemoryTables.js"
-import { withOffloadGate } from "./helpers/OffloadGate.js"
 
 const AppSchema = DynamoSchema.make({ name: "rows", version: 1 })
 
@@ -665,16 +664,14 @@ describe("projection rows of an offloading read model (#179)", () => {
     version: Schema.Number,
     scan: Schema.optional(Schema.Uint8Array),
   })
-  const Receipts = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Receipt, { scan: { storedAs: DynamoModel.External() } }),
-      entityType: "Receipt",
-      primaryKey: {
-        pk: { field: "pk", composite: ["orderId"] },
-        sk: { field: "sk", composite: [] },
-      },
-    }),
-  )
+  const Receipts = Entity.make({
+    model: DynamoModel.configure(Receipt, { scan: { storedAs: DynamoModel.External() } }),
+    entityType: "Receipt",
+    primaryKey: {
+      pk: { field: "pk", composite: ["orderId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
   const Announcement = Schema.Struct({
     orderId: Schema.String,
     total: Schema.Number,
@@ -682,16 +679,14 @@ describe("projection rows of an offloading read model (#179)", () => {
     rev: Schema.Number,
     scan: Schema.optional(Schema.Uint8Array),
   })
-  const Announcements = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Announcement, { scan: { storedAs: DynamoModel.External() } }),
-      entityType: "Announcement",
-      primaryKey: {
-        pk: { field: "pk", composite: ["orderId"] },
-        sk: { field: "sk", composite: [] },
-      },
-    }),
-  )
+  const Announcements = Entity.make({
+    model: DynamoModel.configure(Announcement, { scan: { storedAs: DynamoModel.External() } }),
+    entityType: "Announcement",
+    primaryKey: {
+      pk: { field: "pk", composite: ["orderId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
   const rowKey = {
     pk: { field: "pk", composite: ["orderId"] },
     sk: { field: "sk", composite: [] },
@@ -705,13 +700,11 @@ describe("projection rows of an offloading read model (#179)", () => {
     searchKey: DynamoModel.Hidden(Schema.String),
     scan: Schema.optional(Schema.Uint8Array),
   })
-  const KeyedReceipts = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Keyed, { scan: { storedAs: DynamoModel.External() } }),
-      entityType: "KeyedReceipt",
-      primaryKey: rowKey,
-    }),
-  )
+  const KeyedReceipts = Entity.make({
+    model: DynamoModel.configure(Keyed, { scan: { storedAs: DynamoModel.External() } }),
+    entityType: "KeyedReceipt",
+    primaryKey: rowKey,
+  })
   const Noted = Schema.Struct({
     orderId: Schema.String,
     total: Schema.Number,
@@ -719,13 +712,11 @@ describe("projection rows of an offloading read model (#179)", () => {
     note: Schema.optionalKey(DynamoModel.Hidden(Schema.String)),
     scan: Schema.optional(Schema.Uint8Array),
   })
-  const NotedReceipts = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Noted, { scan: { storedAs: DynamoModel.External() } }),
-      entityType: "NotedReceipt",
-      primaryKey: rowKey,
-    }),
-  )
+  const NotedReceipts = Entity.make({
+    model: DynamoModel.configure(Noted, { scan: { storedAs: DynamoModel.External() } }),
+    entityType: "NotedReceipt",
+    primaryKey: rowKey,
+  })
   // An overflow field, offloaded at 8 stored bytes: plain JSON, and gzip-compressed.
   const Ledger = Schema.Struct({
     orderId: Schema.String,
@@ -733,30 +724,26 @@ describe("projection rows of an offloading read model (#179)", () => {
     version: Schema.Number,
     body: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   })
-  const Ledgers = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Ledger, {
-        body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 8 } }) },
-      }),
-      entityType: "Ledger",
-      primaryKey: rowKey,
+  const Ledgers = Entity.make({
+    model: DynamoModel.configure(Ledger, {
+      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 8 } }) },
     }),
-  )
-  const GzLedgers = withOffloadGate(() =>
-    Entity.make({
-      model: DynamoModel.configure(Ledger, {
-        body: {
-          storedAs: DynamoModel.Packed({
-            format: "json",
-            compression: { codec: "gzip", threshold: 0 },
-            external: { threshold: 8 },
-          }),
-        },
-      }),
-      entityType: "GzLedger",
-      primaryKey: rowKey,
+    entityType: "Ledger",
+    primaryKey: rowKey,
+  })
+  const GzLedgers = Entity.make({
+    model: DynamoModel.configure(Ledger, {
+      body: {
+        storedAs: DynamoModel.Packed({
+          format: "json",
+          compression: { codec: "gzip", threshold: 0 },
+          external: { threshold: 8 },
+        }),
+      },
     }),
-  )
+    entityType: "GzLedger",
+    primaryKey: rowKey,
+  })
   // Offloading requires escaped keys (#179).
   const ReceiptTable = Table.make({
     schema: DynamoSchema.make({ name: "rows", version: 1, escapeKeys: true }),
