@@ -85,6 +85,36 @@ describe("definition attribute names are typed from the model (runtime package)"
     ).toThrow(/EDD-9002/)
   })
 
+  it("Entity.make: a misspelled option on a Z-order entry or a hashed prefix part", () => {
+    expect(() =>
+      Entity.make({
+        model: Task,
+        entityType: "Task",
+        primaryKey: {
+          pk: { field: "pk", composite: ["task"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byProject: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["project"] },
+            sk: {
+              field: "gsi1sk",
+              prefix: [
+                // @ts-expect-error `hsh` is not an option of a prefix part
+                { field: "employee", hash: 4, hsh: 4 },
+              ],
+              zorder: [
+                // @ts-expect-error `bites` is not an option of a byte width
+                { field: "task", bytes: 2, bites: 2 },
+              ],
+            },
+          },
+        },
+      }),
+    ).toThrow(/EDD-9087/)
+  })
+
   it("Collections.member: SK composites of the member's model", () => {
     Collections.member(Tasks, ["project", "task"])
     // @ts-expect-error not a field of Task

@@ -107,12 +107,12 @@ zorder: ["status", { field: "price", min: 0, max: 2_000, step: 10 }]
 
 These are the dimensions of a **literals** kind: one level per value, ranges over the value order. A dimension takes as many bits as its levels need, unless `bits` says otherwise. Values below `min` or above `max` share the edge levels, so a box that reaches an edge still reads them, and the exact bound check removes any that fall outside it. Fewer levels means fewer bits and a smaller search space, so pick the coarsest `step` your queries can live with.
 
-`Entity.make` types every entry from the model: the editor completes the field names and each field's options, and a misspelled field, an option of another kind (`from` on a `number` field), or a bare name on a field with no members is a compile error on that entry. An entry declared outside `Entity.make` (in a shared array, say) needs `as const` to keep its field name a literal.
+`Entity.make` types every entry from the model: the editor completes the field names and each field's options, and a misspelled field, a misspelled option (`stpe` beside `min` and `max`), an option of another kind (`from` on a `number` field), or a bare name on a field with no members is a compile error on that entry. The same holds for a hashed prefix part, which takes `field` and `hash` only. An entry declared outside `Entity.make` (in a shared array, say) needs `as const` to keep its field name a literal.
 
 The same rules hold at runtime, for untyped callers, when `Entity.make` runs:
 
 - `EDD-9086`: a malformed Z-order half. `zorder` belongs on a GSI sort key only, not on a partition key half or the primary key (both are also type errors); no `composite` beside `zorder`; no `type: "clustered"`; no field listed twice; each entry a field name or an object naming one.
-- `EDD-9087`: options an entry can't use: a bound, `step`, `bits`, `from`, `bytes` or `values` list out of range, options of two kinds, or an option no entry takes (a misspelled `stpe` is refused, not ignored).
+- `EDD-9087`: options an entry can't use: a bound, `step`, `bits`, `from`, `bytes` or `values` list out of range, options of two kinds, or an option no entry of its kind takes (a misspelled `stpe` is refused, not ignored); on a prefix part, a `hash` outside 1 to 8 or a key other than `field` and `hash`.
 - `EDD-9088`: an entry that doesn't fit its field, such as a range over a `string` field, `values` over a plain `number` field, or a time window over a plain `number` or `string`, whose order is unknown.
 - `EDD-9089`: a dimension over its kind's bit limit (53, or 128 for a byte width), or more than 512 bits in all.
 - `EDD-9090`: a Z-order index can't be a `collection` member.

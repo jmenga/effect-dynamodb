@@ -93,6 +93,7 @@ import {
   normalizeVectorIndexConfig,
   validateVectorIndexes,
 } from "./VectorIndex.js"
+import type { DimensionFor } from "./ZOrder.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
@@ -261,6 +262,58 @@ export type EntityRefsConfig<TModel extends Schema.Top> = globalThis.Record<stri
 export type RefsKeyGuard<TModel extends Schema.Top, TRefs> = {
   readonly [K in keyof TRefs as K extends ModelFieldName<TModel> ? never : K]: never
 }
+
+/** Every option an entry of some kind takes, for an entry whose field the guard can't look up. */
+type AnyEntryKey = "field" | "min" | "max" | "step" | "from" | "unit" | "bits" | "values" | "bytes"
+
+/** The keys the entries over field `F` take (a bare name contributes none). */
+type EntryKeysOf<D> = D extends string ? never : keyof D
+
+/** The keys an object entry may carry: those of the entries its field's type takes. */
+type AllowedEntryKeys<E, TFields> = E extends { readonly field: infer F extends string }
+  ? F extends keyof TFields
+    ? EntryKeysOf<DimensionFor<F, TFields[F]>>
+    : AnyEntryKey
+  : AnyEntryKey
+
+/**
+ * @internal Over the indexes as written (`TIndexes`): on each Z-order sort
+ * key, every key of a `zorder` entry its field's entries don't take, and every
+ * key of a `{ field, hash }` prefix part but those two, typed `never`, so a
+ * misspelled option (`stpe`) is an error on that entry. Like
+ * {@link RefsKeyGuard}, a guard on the config: in the indexes' constraint it
+ * loses the editor's completions.
+ */
+export type ZOrderEntriesGuard<TIndexes, TFields> = {
+  readonly [K in keyof TIndexes]: TIndexes[K] extends { readonly sk: infer SK }
+    ? { readonly sk: ZOrderHalfGuard<SK, TFields> }
+    : unknown
+}
+
+/** @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name. */
+export type EntityIndexesGuard<TModel extends Schema.Top, TRefs, TIndexes> = ZOrderEntriesGuard<
+  TIndexes,
+  KeyFields<TModel, RefsOrNone<TRefs>>
+>
+
+type ZOrderHalfGuard<SK, TFields> = (SK extends { readonly zorder: infer Z }
+  ? {
+      readonly zorder: {
+        readonly [I in keyof Z]: Z[I] extends string
+          ? unknown
+          : { readonly [P in Exclude<keyof Z[I], AllowedEntryKeys<Z[I], TFields>>]: never }
+      }
+    }
+  : unknown) &
+  (SK extends { readonly prefix: infer P }
+    ? {
+        readonly prefix: {
+          readonly [I in keyof P]: P[I] extends string
+            ? unknown
+            : { readonly [Q in Exclude<keyof P[I], "field" | "hash">]: never }
+        }
+      }
+    : unknown)
 
 /**
  * @internal The refs `Entity.make` was given, or `undefined` when it was given
@@ -1313,7 +1366,7 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes
+  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete

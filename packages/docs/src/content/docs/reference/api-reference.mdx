@@ -992,7 +992,7 @@ const proj = Projection.projection(["name", "email", "status"])
 
 ## ZOrder
 
-Types for the dimensions of a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each `zorder` entry names a model field (a bare name, or `{ field, ...options }`) and quantizes it into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. The entry's options follow the field's type in the model, and `Entity.make` types each entry from the model: a misspelled field or an option of another kind is a compile error. The module exports types only. Also exported from `@effect-dynamodb/schema`.
+Types for the dimensions of a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each `zorder` entry names a model field (a bare name, or `{ field, ...options }`) and quantizes it into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. The entry's options follow the field's type in the model, and `Entity.make` types each entry from the model: a misspelled field, a misspelled option or an option of another kind is a compile error. The module exports types only. Also exported from `@effect-dynamodb/schema`.
 
 ```typescript
 import type { ZOrder } from "effect-dynamodb"

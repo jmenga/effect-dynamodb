@@ -2133,6 +2133,16 @@ describe("KeyComposer", () => {
           ),
         ).toThrow(/\[EDD-9087\] Index "gsi2" prefix composite "officeId"/)
       })
+
+      it("[EDD-9087] an unknown key on a hashed prefix part", () => {
+        expect(() =>
+          KeyComposer.normalizeGsiConfig(
+            gsi({ prefix: [{ field: "officeId", hash: 4, hsh: 4 }], zorder: facets }),
+          ),
+        ).toThrow(
+          '[EDD-9087] Index "gsi2" prefix composite "officeId": "hsh" is not an option of a prefix part, which takes { field, hash }.',
+        )
+      })
     })
 
     describe("composeZOrderSk", () => {

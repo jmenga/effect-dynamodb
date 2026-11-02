@@ -323,6 +323,17 @@ const normalizeZOrderHalf = (
           `must be an integer from 1 to 8 (bytes of its FNV-1a-64 hash).`,
       )
     }
+    // As for a dimension entry: a misspelled key beside `field` and `hash` is
+    // refused, not ignored.
+    const unknown = Object.keys(p).filter((key) => key !== "field" && key !== "hash")
+    if (unknown.length > 0) {
+      throw new Error(
+        `[EDD-9087] Index "${index}" prefix composite "${p.field}": ` +
+          `${unknown.map((key) => JSON.stringify(key)).join(", ")} ` +
+          `${unknown.length === 1 ? "is not an option" : "are not options"} of a prefix part, ` +
+          `which takes { field, hash }.`,
+      )
+    }
     return { field: p.field, hash: p.hash }
   })
   const dimensions = (sk.zorder as ReadonlyArray<unknown>).map((entry) =>

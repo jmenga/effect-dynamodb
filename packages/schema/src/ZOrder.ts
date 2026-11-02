@@ -27,8 +27,9 @@
  * takes ({@link DimensionFor}): a number or bigint field a range, a date field
  * a time window, a literal union its members (a bare name takes them in the
  * schema's order), a string field a byte width. `Entity.make` types each entry
- * from the model, so a misspelled field or an option of another kind is a
- * compile error; at runtime it checks the options (`[EDD-9087]`) and the field
+ * from the model, so a misspelled field, a misspelled option or an option of
+ * another kind is a compile error; at runtime it checks the options
+ * (`[EDD-9087]`) and the field
  * (`[EDD-9088]`). Declaration order is interleave priority.
  *
  * This module holds the types only. The curve algebra (interleaving, range

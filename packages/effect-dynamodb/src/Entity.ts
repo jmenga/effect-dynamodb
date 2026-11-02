@@ -337,6 +337,7 @@ import {
   type EntityDefinitionData,
   type EntityGeneratedIdConfig,
   type EntityIndexesConfig,
+  type EntityIndexesGuard,
   type EntityPrimaryKeyConfig,
   type EntityRefsConfig,
   type EntityTimeSeriesConfig,
@@ -2119,7 +2120,7 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes
+  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete

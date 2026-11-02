@@ -294,6 +294,40 @@ describe("definition attribute names are typed from the model", () => {
       expect(make(["title"])).toThrow(/EDD-9088/)
       expect(make([{ field: "price", values: [1, 2, 3] }])).toThrow(/EDD-9088/)
     })
+
+    // Each entry here is otherwise complete: only the guard on the entry's
+    // keys refuses the extra option (the runtime refuses it too, EDD-9087).
+    it("a misspelled option on an entry, or on a hashed prefix part", () => {
+      const typed = () =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            search: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["region"] },
+              sk: {
+                field: "gsi2sk",
+                prefix: [
+                  "agencyId",
+                  // @ts-expect-error `hsh` is not an option of a prefix part
+                  { field: "title", hash: 4, hsh: 4 },
+                ],
+                zorder: [
+                  // @ts-expect-error `stpe` is not an option of a range
+                  { field: "price", min: 0, max: 100, stpe: 5 },
+                  // @ts-expect-error `step` is a range's option, not a time window's
+                  { field: "listedAt", from: "2024-01-01", unit: "days", bits: 8, step: 1 },
+                  // @ts-expect-error `bitz` is not an option of a literals entry
+                  { field: "status", bitz: 3 },
+                ],
+              },
+            },
+          },
+        })
+      expect(typed).toThrow(/EDD-9087/)
+    })
   })
 
   describe("Entity.make other model-field positions", () => {
