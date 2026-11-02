@@ -281,11 +281,21 @@ const box = db.entities.Listings.search({ region: "north" })
   .within({ price: { between: [600_000, 900_000] }, bedrooms: { gte: 3 } })
   .limit(8)
 
-const page1 = yield* box.fetch()
-const page2 = yield* box.startFrom(page1.cursor!).fetch()
-const page3 = yield* box.startFrom(page2.cursor!).fetch()
-// Each cursor resumes exactly where the previous page stopped.
+// Each page's cursor resumes the box exactly where that page stopped; the stream
+// ends at the page without one.
+const paged = yield* Stream.paginate(box, (query) =>
+  query.fetch().pipe(
+    Effect.map((page) =>
+      [
+        page.items,
+        Option.map(Option.fromNullOr(page.cursor), (cursor) => box.startFrom(cursor)),
+      ] as const,
+    ),
+  ),
+).pipe(Stream.runCollect)
 ```
+
+A page's `cursor` is `null` on the last page, so `Option.fromNullOr` turns it into the stream's stop signal. To hand pages to a client one request at a time, run `box.startFrom(cursor).fetch()` with the cursor it sent back. To read every item in one process, `box.paginate()` streams them directly.
 
 A Z-order cursor records a **position**: how far through the box the query has got (and, while skip-scanning, which prefix value it is in), never a range to read. Resuming recomputes the plan and starts it at that position. So a cursor stays valid when you change `strategy`, `maxRanges` or `concurrency` between pages, and the chain of pages returns exactly what one `collect()` would.
 

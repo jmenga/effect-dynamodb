@@ -17,7 +17,7 @@
  *   npx tsx examples/guide-zorder.ts
  */
 
-import { Config, Console, DateTime, Effect, Layer, Schema } from "effect"
+import { Config, Console, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -250,22 +250,28 @@ const program = Effect.gen(function* () {
     .within({ price: { between: [600_000, 900_000] }, bedrooms: { gte: 3 } })
     .limit(8)
 
-  const page1 = yield* box.fetch()
-  const page2 = yield* box.startFrom(page1.cursor!).fetch()
-  const page3 = yield* box.startFrom(page2.cursor!).fetch()
-  // Each cursor resumes exactly where the previous page stopped.
+  // Each page's cursor resumes the box exactly where that page stopped; the stream
+  // ends at the page without one.
+  const paged = yield* Stream.paginate(box, (query) =>
+    query.fetch().pipe(
+      Effect.map((page) =>
+        [
+          page.items,
+          Option.map(Option.fromNullOr(page.cursor), (cursor) => box.startFrom(cursor)),
+        ] as const,
+      ),
+    ),
+  ).pipe(Stream.runCollect)
   // #endregion
   const wholeBox = yield* db.entities.Listings.search({ region: "north" })
     .within({ price: { between: [600_000, 900_000] }, bedrooms: { gte: 3 } })
     .collect()
   assertEq(
-    [...page1.items, ...page2.items, ...page3.items].map((l) => l.listingId),
-    wholeBox.slice(0, 24).map((l) => l.listingId),
+    paged.map((l) => l.listingId),
+    wholeBox.map((l) => l.listingId),
     "fetch chain equals collect",
   )
-  yield* Console.log(
-    `Pages: ${page1.items.length}, ${page2.items.length}, ${page3.items.length} of ${wholeBox.length}\n`,
-  )
+  yield* Console.log(`Fetched ${paged.length} of ${wholeBox.length} in pages of 8\n`)
 
   // -------------------------------------------------------------------------
   // explain() and onRequest()
