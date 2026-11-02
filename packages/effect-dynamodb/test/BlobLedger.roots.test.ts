@@ -14,7 +14,9 @@
  *   pins it (`Capacity.detachContext`), and a forked `Capacity.detached`
  *   fiber runs outside it.
  *
- * No write path uploads yet (commit 7), so nothing here settles anything.
+ * The writes here carry no offloaded value, so nothing uploads and nothing
+ * settles (`Entity.offload.test.ts` covers entity uploads). A store is in the
+ * layer because binding an offloading entity requires one (`EDD-9115`).
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -24,6 +26,7 @@ import { Effect, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
+import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -197,6 +200,7 @@ const SpyClient = Layer.effect(
 
 const TestLayer = Layer.mergeAll(
   SpyClient,
+  BlobStore.layerMemory(),
   MainTable.layer({ name: "main" }),
   EventsTable.layer({ name: "events" }),
   ReadTable.layer({ name: "read" }),
@@ -246,12 +250,8 @@ describe("ledger roots — entities", () => {
       root()
       yield* db.entities.Docs.create({ docId: "d-2", title: "two" })
       root()
-      // The in-memory tables cannot evaluate an upsert's `if_not_exists`; the
-      // request is what is observed here.
-      yield* Effect.exit(db.entities.Docs.upsert({ docId: "d-3", title: "three" }).asEffect())
+      yield* db.entities.Docs.upsert({ docId: "d-3", title: "three" })
       root()
-      yield* db.entities.Docs.put({ docId: "d-3", title: "three" })
-      seen.length = 0
       yield* db.entities.Docs.update({ docId: "d-1" }).set({ title: "uno" })
       root()
       yield* db.entities.Docs.patch({ docId: "d-1" }).set({ title: "eins" })
@@ -283,11 +283,7 @@ describe("ledger roots — entities", () => {
   it.effect("a time-series append of an offloading entity is a root", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: { Readings }, tables: { MainTable } })
-      // The in-memory tables apply only a transaction's Puts, so the append's
-      // read-back of its current item fails; its request is what is observed.
-      yield* Effect.exit(
-        db.entities.Readings.append({ sensorId: "s-1", at: 1, value: 10 }).asEffect(),
-      )
+      yield* db.entities.Readings.append({ sensorId: "s-1", at: 1, value: 10 })
       expect(commands()).toContain("TransactWriteItems")
       oneLedger()
     }).pipe(Effect.provide(TestLayer)),

@@ -601,6 +601,20 @@ const readFailure = (error: unknown): Failure | undefined => {
 /** Whether `error` is a rejection this module could diagnose at all. */
 export const isDiagnosable = (error: unknown): boolean => readFailure(error) !== undefined
 
+/**
+ * Whether `error` is DynamoDB refusing a single-item write for item size (an
+ * item over 400 KB, or an update growing one past it) — what an entity with an
+ * offload item budget answers by re-running the update on its read-merge path
+ * (#179, design §6.3).
+ */
+export const isItemSizeRejection = (error: unknown): boolean => {
+  const failure = readFailure(error)
+  return (
+    failure?._tag === "Request" &&
+    (ITEM_SIZE.test(failure.message) || ITEM_SIZE_UPDATE.test(failure.message))
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Measure
 // ---------------------------------------------------------------------------

@@ -1058,7 +1058,11 @@ consumed capacity's `CurrentOperation`:
   (`completeLost`, §7) and a store `put` answer refused as naming no version of the requested
   key (`answerRefused`: no ref, a ref outside the key, a ref already returned for another
   upload), reported by the requested key with no ref — the answer's ref is never deleted. Leaks no process could report
-  (a crash between upload and exit) are found by `gc.sweepStore` (§11.5).
+  (a crash between upload and exit) are found by `gc.sweepStore` (§11.5). The library never
+  interrupts an upload it has sent (*as built in commit 7*): the uploads of one write run
+  concurrently, and a failed one fails the write only once every other has settled, so each
+  version a store wrote is registered — and rolled back — rather than left behind by a
+  sibling's failure.
 - **Read cache.** The ledger also maps each entry's ref to the wire value or bytes it uploaded,
   so decoding what the op just wrote (§6.13) never re-fetches it.
 
@@ -1145,7 +1149,10 @@ route(item):
   budget applies **on failure**, the diagnose-on-failure way: when
   DynamoDB rejects the request for item size (the existing diagnosis names it) and the entity
   has a budget, the update runs **once more on the read-merge path**, which has the whole item
-  and routes it. The first attempt's uploads were `rejected` and are rolled back. Two paths
+  and routes it. The retry runs in the same operation and ledger, so it reuses the first
+  attempt's upload of any content it routes again (the ledger's memo, §6.2); a first-attempt
+  upload the retry does not reuse is deleted when the operation exits, as every upload no
+  committed request names is. Two paths
   cannot take that retry and apply thresholds only (documented, and pinned by tests):
   - time-series `append`: its CAS transaction has no read-merge form;
   - an update that mixes record operations with path operations (`.pathSet()` and friends):
@@ -1209,6 +1216,15 @@ Two consequences:
 | vector source text | `unpackedDomainCopy` (~`:2608`) | an untouched offloaded source field is resolved eagerly (one GET) when the embedding must be recomputed; documented |
 | `patch` / `updateOrCreate` / `deleteIfExists` | as `update` / `delete` | — |
 | `delete` | — | no uploads; `ALL_OLD` return values decode per mode (§8.4) |
+| `insert` (PartiQL, #189) | `Entity.ts` `put`, its `insert` branch before `runInsert` | route + upload as `put` does, after the local guards (`[EDD-9110]`); the `INSERT` (or `INSERT`-only transaction) is settled by the ledger (§6.2); the result decodes the written values (`decodeWritten`, no GET) |
+
+*Escaped keys only (§11.10), commit 7:* an offloading entity is bound only on a schema with
+`escapeKeys: true` (`[EDD-9146]`, §13), so every op composes the one key text it writes and
+there is no other key text an item could be under: routing runs on that key and every pointer
+is keyed by it. `append`'s result and its stale `current` decode through the offload decoder
+in the follow-up read and compare-and-swap paths. An index a collection injects after
+`make()` (`_injectIndex`) is checked against offloaded fields as a declared one is, then added
+to the mutable `allIndexes` the write paths compose from.
 
 ### 6.6 `Batch.write`
 
@@ -3180,6 +3196,83 @@ a write path, deletes the gate.
    "packed or External"; and `TPackedFields` gains the binary fields (§9.1), so their paths are
    `PackedPath`s. Only the guards: the packed codec and stored-form dispatch stay packed-only.
    Item 8's read paths inherit the walker.
+   *Implementation notes (commit 7):* the write side is `internal/OffloadWrite.ts` (no AWS SDK
+   import): per member, stored attribute → config for both kinds; `route` (thresholds, every
+   binary value, then the budget loop of §6.3 sorting by `attributeBytes` of the stored value —
+   the attribute name is not counted — ties by stored name, each pointer at its bound: the real
+   key plus `limits.maxKeySuffixBytes`, a `limits.maxVersionBytes` version, the largest content
+   size while a compressed value's is unknown); `setValues` for an `UpdateItem`'s `SET`s
+   (thresholds only, one `route` of them all); the eager read-back of a write's result; the
+   checksum fast path of an immutable; and the `EDD-9115` requirement builders. Uploads run on
+   the packed, stored-name item just before marshalling — after every local guard, the
+   tombstone read and the immutable checks, so a refused write uploads nothing — and an
+   upload's object key is the row's (live SK for both family and row, the event SK as the row
+   of a time-series event). `route` builds every upload of a write before starting any, runs
+   them concurrently, and fails only once all have settled (`forEachSettled`, §6.2): an upload
+   already sent is never interrupted by a sibling's failure. The ledger computes each
+   content's CRC-64/NVME once (`UploadSpec.metadata` may be a builder given it), for the memo
+   key, the pointer and the object metadata.
+   The update paths (`runUpdate`, both branches) and `upsert` record each offloaded `:value` as
+   they build the request and upload once it is otherwise built. A size rejection of the
+   standard `UpdateItem` under an `itemBudget` (and with no path operation) raises an internal
+   `OffloadSizeRetry`, which `runUpdateSized` (every caller of `runUpdate`: `update`,
+   `patch`, `updateOrCreate`, the guarded upsert) turns into one forced read-merge run; the
+   retry reuses the first attempt's uploads of the same content through the ledger's memo. A
+   plain `upsert` rejected for size runs the guarded upsert with that forced read-merge (a
+   missing item is then created by a routed put). On the read-merge path a restated offloaded
+   immutable that passed is put back to its stored value on the merged item and left out of
+   the "named" set, so the diff drops it; only named, non-cleared offloaded attributes route.
+   Every write result (put / create / upsert / update / patch / delete `allOld` / restore /
+   append's `current`) resolves its pointers eagerly — this operation's uploads from the
+   ledger's read cache, any other pointer fetched — with `committed: true` on a failed fetch;
+   `delete` passes a `BlobStoreError` through rather than wrapping it in
+   `DeleteAppliedButUnreadable`. `Entity.bind` gains the `EDD-9078` codec check and both binds
+   the `EDD-9115` check, named by entity type there and by the client key in
+   `DynamoClient.make`; `Aggregate` records `_offloadByType` (edge entity type → offloaded
+   fields of its items) and `_name` for them. `TOffload` is carried by a type-only optional
+   member, `_offloadFields?: TOffload` (never set), on `Entity` and `EntityDefinition`: an
+   unused type parameter cannot be inferred by `TypedClient`'s `infer` patterns, and a
+   conditional use (`WriteBlobErrors<TOffload>`) is not a reliable inference site.
+   `TypedClient` passes it to `BoundEntity` only — `scan`, `EntityIndexAccessors` and
+   `BoundQuery` gain it with the read types (commit 8). The schema package's `_packedFields`
+   lists External fields too. Restore uploads nothing and runs outside a ledger root.
+   Unit tests are `test/Entity.offload.test.ts` (requests captured from the in-memory tables)
+   and `test/Entity.offload.types.test.ts`; `test/connected.entity-offload.test.ts` checks
+   settlement against DynamoDB Local's own answers (`ALL_OLD` on a refused create, `ALL_NEW`
+   after `if_not_exists`, the 400 KB rejection that triggers the read-merge retry, a cancelled
+   append) with the in-memory store; S3 and MinIO end to end stay item 17's.
+   *Owner decisions applied in commit 7 (2026-11-14):* offloading requires `escapeKeys: true`
+   (§11.10): `DynamoClient.make`, `Entity.bind` and `Aggregate.bind` throw `[EDD-9146]` before
+   the store check, and `route` refuses an unbound write (`OffloadRow.escapeKeys`, a required
+   field every later write path supplies) with the same code as a `ValidationError`. Rekey's
+   backstop is `refuseMovingPointerRow` in the entity's `moveItem` / `moveHistoryRow`: judged on
+   the consistent read the move acts on (dry run included), before anything is written, by the
+   first attribute holding a well-formed pointer in either form at any depth, whatever the
+   entity now declares (`BlobLedger.pointerAttributeOf`); the member raises
+   `Rekey.PointerRowRefusal` as a defect (its error channel is the client's) and `Rekey.run`
+   turns it into its `ValidationError`, naming the row's key. Valueless rows hold no values,
+   so they move as before. `insert()` routes and uploads before `runInsert` and decodes the
+   written values; the ledger scans `ExecuteStatement` / `ExecuteTransaction` parameters (not a
+   `SELECT`'s), gives an `ExecuteTransaction` its token, and settles them by §6.2's table.
+   *Deviations (commit 7):*
+   - Write results resolve **both** kinds eagerly and keep today's result types: the lazy
+     binary default and the `View` result types are commit 8's, and a lazy value cannot be
+     typed as the model's `Uint8Array` meanwhile.
+   - Error payloads that carry the stored item (the `current` of `ConcurrentModification`,
+     `ConditionalCheckFailed` and `StaleAppend`) are decoded without store I/O (§6.13): an item
+     holding a pointer gives `Option.none()` until commit 8's lazy handles can stand in for it.
+     Only a pointer does: a stale append's `current` that fails to decode for any other reason
+     (a corrupt item) still fails with `ValidationError`, as for an entity that offloads
+     nothing.
+   - A **binary** immutable that fails the checksum-and-size fast path is refused without
+     fetching the stored value: bytes have no other equality, and a size or CRC-64/NVME
+     mismatch proves the bytes differ. Only an overflow immutable is confirmed by a fetch and
+     the key-order-insensitive comparison.
+   - Transaction planning runs the update path, so a planned update of an offloading entity
+     uploads (and the transaction's root settles it), but a `BlobStoreError` raised while
+     planning is still a defect (`isPlanUpdateError`): typing it is commit 9's, with
+     `Transaction.transactWrite`'s error union. `Batch.write` and transaction puts do not
+     route yet (commit 9); aggregate writes do not (commit 11).
 8. **Entity reads** — all decoders, the trailing `O` state on every builder, `.offloaded()` on
    `BoundGet`, `BoundQuery` and CRUD builders, `Entity.offloaded` / `Query.offloaded` duals,
    `Query<A, E, O>` / `BoundQuery<…, O>`, page prefetch in `examinePage`, raw-row hook, scans,

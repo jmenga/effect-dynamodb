@@ -142,6 +142,8 @@ const scripted = (
     deleteItem: method("DeleteItem") as never,
     batchWriteItem: method("BatchWriteItem") as never,
     transactWriteItems: method("TransactWriteItems") as never,
+    executeStatement: method("ExecuteStatement") as never,
+    executeTransaction: method("ExecuteTransaction") as never,
   })
   return { client: Capacity.instrument(raw) as DynamoClientService & Record<string, any>, sent }
 }
@@ -1212,6 +1214,195 @@ describe("BlobLedger — settling transactions and batches", () => {
 // ---------------------------------------------------------------------------
 // maxUploadAge
 // ---------------------------------------------------------------------------
+
+describe("BlobLedger — settling PartiQL statements", () => {
+  /** An `INSERT` of the row, every value a parameter (`InsertStatement.ts`). */
+  const insertOf = (pointer: BlobPointer.BlobPointer) => ({
+    Statement: `INSERT INTO "docs" VALUE {'pk': ?, 'sk': ?, 'body': ?}`,
+    Parameters: [rowKey.pk, rowKey.sk, asB(pointer)],
+  })
+
+  /** Upload one value, send one PartiQL request carrying it with `answer`. */
+  const settleStatement = (
+    answer: (command: string, input: Record<string, any>) => Effect.Effect<unknown, unknown>,
+    request: (pointer: BlobPointer.BlobPointer) => {
+      readonly command: "executeStatement" | "executeTransaction"
+      readonly input: Record<string, unknown>
+    } = (pointer) => ({ command: "executeStatement", input: insertOf(pointer) }),
+  ) =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory()
+      const { client, sent } = scripted(answer)
+      const { reports, layer } = observed()
+      const state = yield* BlobLedger.root(
+        Effect.gen(function* () {
+          const pointer = yield* uploadJson(store, "value")
+          const { command, input } = request(pointer)
+          const send: Effect.Effect<unknown, unknown> =
+            command === "executeStatement"
+              ? client.executeStatement(input as never)
+              : client.executeTransaction(input as never)
+          yield* Effect.exit(send)
+          return yield* stateOf(pointer)
+        }),
+      ).pipe(Effect.provide(layer))
+      return { state, kept: versions(store).length === 1, sent, reports }
+    })
+
+  const transaction = (pointer: BlobPointer.BlobPointer, extra: Record<string, unknown> = {}) => ({
+    command: "executeTransaction" as const,
+    input: {
+      TransactStatements: [
+        insertOf(pointer),
+        {
+          Statement: `INSERT INTO "docs" VALUE {'pk': ?, 'sk': ?}`,
+          Parameters: [{ S: "$sentinel" }, { S: "$sentinel" }],
+        },
+      ],
+      ...extra,
+    },
+  })
+
+  it.effect("an INSERT commits on success, sent as given", () =>
+    Effect.gen(function* () {
+      const { state, kept, sent } = yield* settleStatement(() => ok())
+      expect(state).toBe("committed")
+      expect(kept).toBe(true)
+      expect(sent[0]!.input).not.toHaveProperty("ClientRequestToken")
+      expect(sent[0]!.input).not.toHaveProperty("ReturnValuesOnConditionCheckFailure")
+    }),
+  )
+
+  it.effect("a duplicate item, a failed condition or a refusal sent once is rejected", () =>
+    Effect.gen(function* () {
+      const cases: ReadonlyArray<readonly [string, () => Error & { name: string }]> = [
+        ["DuplicateItemException", () => serviceError("DuplicateItemException", 1)],
+        // DynamoDB Local's name for it.
+        ["DuplicateItem", () => serviceError("DuplicateItem", 1)],
+        ["ConditionalCheckFailedException", () => conditionFailed(1)],
+        ["ValidationException", () => serviceError("ValidationException", 1)],
+        ["ThrottlingException", () => serviceError("ThrottlingException", 1)],
+        ["AccessDeniedException", () => serviceError("AccessDeniedException", 1)],
+      ]
+      for (const [name, make] of cases) {
+        const once = yield* settleStatement(() => Effect.fail(wrapped("ExecuteStatement", make())))
+        expect([name, once.state]).toEqual([name, "rejected"])
+        expect(once.kept).toBe(false)
+        expect(once.reports).toEqual([])
+      }
+    }),
+  )
+
+  it.effect(
+    "a duplicate after a resend, or of unknown attempts, is in doubt: kept and reported",
+    () =>
+      Effect.gen(function* () {
+        // An INSERT is not idempotent: the resend may be refusing the item the first attempt wrote.
+        for (const attempts of [2, undefined]) {
+          const { state, kept, reports } = yield* settleStatement(() =>
+            Effect.fail(
+              wrapped("ExecuteStatement", serviceError("DuplicateItemException", attempts)),
+            ),
+          )
+          expect([attempts, state]).toEqual([attempts, "inDoubt"])
+          expect(kept).toBe(true)
+          expect(reports.map((r) => r.reason)).toEqual(["inDoubt"])
+        }
+      }),
+  )
+
+  it.effect("an unknown outcome is in doubt: a server error, another error, a defect", () =>
+    Effect.gen(function* () {
+      const server = yield* settleStatement(() =>
+        Effect.fail(
+          wrapped(
+            "ExecuteStatement",
+            new SdkInternalServerError({ message: "oops", ...metadata(1) }),
+          ),
+        ),
+      )
+      expect(server.state).toBe("inDoubt")
+      expect(server.kept).toBe(true)
+      const other = yield* settleStatement(() =>
+        Effect.fail(wrapped("ExecuteStatement", serviceError("SomethingElse", 1))),
+      )
+      expect(other.state).toBe("inDoubt")
+      const defect = yield* settleStatement(() => Effect.die("socket hang up"))
+      expect(defect.state).toBe("inDoubt")
+    }),
+  )
+
+  it.effect("a SELECT settles nothing and is sent unchanged", () =>
+    Effect.gen(function* () {
+      const { state, kept, sent } = yield* settleStatement(
+        () => ok(),
+        (pointer) => ({
+          command: "executeStatement",
+          input: { Statement: `SELECT * FROM "docs" WHERE body = ?`, Parameters: [asB(pointer)] },
+        }),
+      )
+      expect(state).toBe("pending")
+      expect(kept).toBe(false)
+      expect(sent[0]!.input).toEqual({
+        Statement: `SELECT * FROM "docs" WHERE body = ?`,
+        Parameters: [sent[0]!.input.Parameters[0]],
+      })
+    }),
+  )
+
+  it.effect("an INSERT-only transaction carries the library's token and commits on success", () =>
+    Effect.gen(function* () {
+      const { state, kept, sent } = yield* settleStatement(() => ok(), transaction)
+      expect(state).toBe("committed")
+      expect(kept).toBe(true)
+      expect(sent[0]!.input.ClientRequestToken).toMatch(/^[0-9a-f]{32}$/)
+    }),
+  )
+
+  it.effect("a cancelled transaction with the token is rejected, however often it was sent", () =>
+    Effect.gen(function* () {
+      for (const failure of [
+        new TransactionCanceledException({ message: "cancelled", ...metadata(3) }),
+        serviceError("ValidationException", 2),
+      ]) {
+        const { state, kept } = yield* settleStatement(
+          () => Effect.fail(wrapped("ExecuteTransaction", failure)),
+          transaction,
+        )
+        expect([failure.name, state]).toEqual([failure.name, "rejected"])
+        expect(kept).toBe(false)
+      }
+    }),
+  )
+
+  it.effect("a caller's token, a mismatch or a transaction in progress is in doubt", () =>
+    Effect.gen(function* () {
+      const own = yield* settleStatement(
+        () =>
+          Effect.fail(
+            wrapped(
+              "ExecuteTransaction",
+              new TransactionCanceledException({ message: "cancelled", ...metadata(1) }),
+            ),
+          ),
+        (pointer) => transaction(pointer, { ClientRequestToken: "caller-token" }),
+      )
+      expect(own.sent[0]!.input.ClientRequestToken).toBe("caller-token")
+      expect(own.state).toBe("inDoubt")
+      for (const failure of [
+        new IdempotentParameterMismatchException({ message: "mismatch", ...metadata(1) }),
+        new TransactionInProgressException({ message: "in progress", ...metadata(1) }),
+      ]) {
+        const { state, kept } = yield* settleStatement(
+          () => Effect.fail(wrapped("ExecuteTransaction", failure)),
+          transaction,
+        )
+        expect(state).toBe("inDoubt")
+        expect(kept).toBe(true)
+      }
+    }),
+  )
+})
 
 describe("BlobLedger — maxUploadAge", () => {
   it.effect("a request carrying an upload older than maxUploadAge fails Expired, unsent", () =>

@@ -732,6 +732,36 @@ const decodeToken = (token: string, tableName: string): ReadonlyArray<Position> 
 const optionError = (cause: string) =>
   new ValidationError({ entityType: "Table", operation: "rekey", cause: `[EDD-9098] ${cause}` })
 
+/**
+ * A member's refusal to move a row holding a blob pointer (#179, design §11.10). Object keys are
+ * named from the key text of the row that holds them, so a pointer row moved to other key text
+ * would name objects no write of its new key made, and garbage collection there could delete
+ * them. Offloading requires `escapeKeys: true`, under which a pointer row is only ever written at
+ * its final key text, so no rekey of a bound table meets one: this is the backstop. A member
+ * raises it as a defect from inside its move (its error channel is the client's), and the run
+ * turns it into its `ValidationError` (`[EDD-9146]`), naming the row.
+ */
+export class PointerRowRefusal {
+  readonly _tag = "PointerRowRefusal"
+  constructor(readonly message: string) {}
+}
+
+/** Refuse the move of the pointer row `key` names, of `member`; `attribute` holds the pointer. */
+export const refusePointerRow = (
+  member: string,
+  key: Readonly<Record<string, unknown>>,
+  attribute: string,
+): Effect.Effect<never> =>
+  Effect.die(
+    new PointerRowRefusal(
+      `[EDD-9146] ${member}: the row at ${JSON.stringify(key)} holds a blob pointer on ` +
+        `"${attribute}" and is under other key text, so rekey would move it: refused. A pointer ` +
+        `row names its objects from its own key text and must never move; offloading requires ` +
+        `escapeKeys: true, under which a pointer row is written only at its final key text. ` +
+        `Nothing was written for this row; the run stopped.`,
+    ),
+  )
+
 const positiveInteger = (value: number | undefined, name: string): string | undefined =>
   value === undefined || (Number.isInteger(value) && value > 0)
     ? undefined
@@ -1758,204 +1788,226 @@ export const run = (args: {
   readonly options: RekeyOptions | undefined
 }): Effect.Effect<RekeyReport, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
   Capacity.measured("Table.rekey", { target: args.tableName }, (capacity) =>
-    Effect.gen(function* () {
-      const { tableName, members } = args
-      const options = args.options ?? {}
-      const dryRun = options.dryRun === true
-      const problem =
-        positiveInteger(options.segments, "segments") ??
-        positiveInteger(options.concurrency, "concurrency") ??
-        positiveInteger(options.pageSize, "pageSize") ??
-        positiveInteger(options.maxPages, "maxPages") ??
-        positiveInteger(options.journalCapacity, "journalCapacity") ??
-        ((options.journalCapacity ?? 0) > MAX_JOURNAL_CAPACITY
-          ? `journalCapacity must be at most ${MAX_JOURNAL_CAPACITY}; received ${options.journalCapacity}.`
-          : undefined)
-      if (problem !== undefined) return yield* optionError(problem)
-      if (options.releaseOrphanedReservations === true && options.writesStopped !== true) {
-        return yield* optionError(
-          "releaseOrphanedReservations needs writesStopped: true. Releasing is a maintenance step: " +
-            "stop every writer to the table first, another cleanup releasing reservations included.",
-        )
-      }
-
-      let positions: Array<Position>
-      if (options.resume !== undefined) {
-        const decoded = decodeToken(options.resume, tableName)
-        if (typeof decoded === "string") {
-          return yield* optionError(`The resume token can't be used: ${decoded}.`)
-        }
-        if (options.segments !== undefined && options.segments !== decoded.length) {
-          return yield* optionError(
-            `The resume token was made with ${decoded.length} scan segment(s), but segments is ` +
-              `${options.segments}: resume with the token's segment count.`,
-          )
-        }
-        positions = [...decoded]
-      } else {
-        positions = Array.from({ length: options.segments ?? 1 }, (): Position => 0)
-      }
-      const startedAtTheBeginning = positions.every((position) => position === 0)
-
-      // Members by the `__edd_e__` values they claim, in registration order.
-      const byType = new Map<string, Array<RekeyMember>>()
-      for (const member of members) {
-        for (const type of member.types) {
-          const list = byType.get(type) ?? []
-          list.push(member)
-          byType.set(type, list)
-        }
-      }
-      const prefixed = members.flatMap((member) =>
-        (member.typePrefixes ?? []).map((prefix) => ({ prefix, member })),
-      )
-
-      const totals = new Totals()
-      const budget = new Budget(options.journalCapacity ?? DEFAULT_JOURNAL_CAPACITY)
-      const journal = new Journal(
-        tableName,
-        members.find((member) => member.key !== undefined)?.key,
-        totals,
-        budget,
-        dryRun,
-      )
-      const units = new Units(totals, budget)
-      const claimed = new Set<string>()
-      const atEnd: Array<{ readonly member: string; readonly judge: () => RekeyTally }> = []
-      const ctx: RekeyRowContext = {
-        tableName,
-        dryRun,
-        repairIndexKeys: options.repairIndexKeys === true,
-        reservations: options.reservations === true || options.releaseOrphanedReservations === true,
-        releaseOrphanedReservations: options.releaseOrphanedReservations === true,
-        writesStopped: options.writesStopped === true,
-        sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
-        claim: (unit) => {
-          const key = digest(unit)
-          if (claimed.has(key)) return false
-          if (budget.admit()) claimed.add(key)
-          return true
-        },
-        claimed: (unit) => claimed.has(digest(unit)),
-        keep: () => budget.admit(),
-        awaitsMove: (row) => journal.awaitsMove(row),
-        atEnd: (member, judge) => {
-          if (budget.admit()) atEnd.push({ member, judge })
-          else totals.add(member, judge())
-        },
-        judge: (member, unit, work) => units.judge(member, unit, work),
-        plan: (items) => journal.plan(items),
-        vacated: (key) => journal.vacated(key),
-        journalFull: () => budget.full,
-        placed: (key) => journal.placed(key),
-        putting: (key) => journal.putting(key),
-        yieldTo: (row, rows) =>
-          Effect.gen(function* () {
-            const type = row.__edd_e__?.S
-            if (type === undefined) return undefined
-            for (const member of byType.get(type) ?? []) {
-              if (member.holder === undefined) continue
-              const judged = yield* member.holder(row, rows, ctx)
-              if (judged !== undefined) return judged
-            }
-            return undefined
-          }),
-      }
-
-      const handle = (found: Item, pageSeq: number) =>
-        Effect.suspend(() => {
-          const visit = journal.visit(found, pageSeq)
-          if (visit === undefined) return Effect.void
-          return judgeRow(visit.row).pipe(Effect.ensuring(Effect.sync(() => journal.left(visit))))
-        })
-
-      const judgeRow = (row: Item) =>
-        Effect.gen(function* () {
-          const type = row.__edd_e__?.S
-          if (type === undefined) {
-            totals.add(undefined, { skipped: { notLibrary: 1 } })
-            return
-          }
-          const claiming = [
-            ...(byType.get(type) ?? []),
-            ...prefixed.filter((p) => type.startsWith(p.prefix)).map((p) => p.member),
-          ]
-          const exclusive = claiming.filter((member) => member.exclusive === true)
-          const candidates = exclusive.length > 0 ? exclusive : claiming
-          // A member that can't read the row's key back (`unrecognizedKey`) isn't its owner: the
-          // key names another member's key space. The search goes on, so the order members are
-          // listed in doesn't choose one, and the row is counted unrecognized only when no member
-          // recognises it.
-          let unrecognized: { readonly member: RekeyMember; readonly tally: RekeyTally } | undefined
-          for (const member of candidates) {
-            const tally = yield* member.row(row, ctx)
-            if (tally === undefined) continue
-            if (onlyUnrecognized(tally)) {
-              unrecognized ??= { member, tally }
-              continue
-            }
-            totals.add(member.name, tally)
-            return
-          }
-          if (unrecognized !== undefined) {
-            totals.add(unrecognized.member.name, unrecognized.tally)
-            return
-          }
-          totals.add(undefined, { skipped: { unregistered: 1 } })
-        })
-
-      const token = (): string | undefined =>
-        positions.every((p) => p === 1) ? undefined : encodeToken(tableName, positions)
-      const snapshot = (): RekeyReport => totals.report(dryRun, capacity(), token(), budget)
-
-      let pagesLeft = options.maxPages ?? Number.POSITIVE_INFINITY
-      const concurrency = options.concurrency ?? 4
-      // The scan reads through the instrumented client; handlers read and write through the
-      // journal's view of it, which `Capacity.client` hands them as is.
-      const client = yield* Capacity.client
-      const view = journal.view(client)
-      const viaView = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-        Effect.provideService(effect, DynamoClient, view)
-
-      const scanSegment = (segment: number) =>
-        Effect.gen(function* () {
-          while (positions[segment] !== 1) {
-            if (pagesLeft <= 0) return
-            pagesLeft--
-            const at = positions[segment]!
-            const pageSeq = journal.seq
-            const page = yield* client.scan({
-              TableName: tableName,
-              ...(positions.length > 1 && { Segment: segment, TotalSegments: positions.length }),
-              ...(options.pageSize !== undefined && { Limit: options.pageSize }),
-              ...(at !== 0 && { ExclusiveStartKey: keyFromWire(at) }),
-            })
-            yield* viaView(
-              Effect.forEach(page.Items ?? [], (row) => handle(row, pageSeq), {
-                concurrency,
-                discard: true,
+    runScan(args, capacity).pipe(
+      Effect.catchDefect((defect) =>
+        defect instanceof PointerRowRefusal
+          ? Effect.fail(
+              new ValidationError({
+                entityType: "Table",
+                operation: "rekey",
+                cause: defect.message,
               }),
             )
-            const last = page.LastEvaluatedKey as Item | undefined
-            positions[segment] = last === undefined ? 1 : (keyToWire(last) ?? 1)
-            if (options.onProgress !== undefined) yield* options.onProgress(snapshot())
-          }
-        })
-
-      yield* Effect.forEach(
-        positions.map((_, segment) => segment),
-        scanSegment,
-        { concurrency: "unbounded", discard: true },
-      )
-      for (const { member, judge } of atEnd) totals.add(member, judge())
-      for (const member of members) {
-        if (member.finish !== undefined) {
-          totals.add(member.name, yield* viaView(member.finish(ctx)))
-        }
-      }
-      return snapshot()
-    }),
+          : Effect.die(defect),
+      ),
+    ),
   )
+
+const runScan = (
+  args: {
+    readonly tableName: string
+    readonly members: ReadonlyArray<RekeyMember>
+    readonly options: RekeyOptions | undefined
+  },
+  capacity: () => Capacity.CapacityTotals,
+): Effect.Effect<RekeyReport, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+  Effect.gen(function* () {
+    const { tableName, members } = args
+    const options = args.options ?? {}
+    const dryRun = options.dryRun === true
+    const problem =
+      positiveInteger(options.segments, "segments") ??
+      positiveInteger(options.concurrency, "concurrency") ??
+      positiveInteger(options.pageSize, "pageSize") ??
+      positiveInteger(options.maxPages, "maxPages") ??
+      positiveInteger(options.journalCapacity, "journalCapacity") ??
+      ((options.journalCapacity ?? 0) > MAX_JOURNAL_CAPACITY
+        ? `journalCapacity must be at most ${MAX_JOURNAL_CAPACITY}; received ${options.journalCapacity}.`
+        : undefined)
+    if (problem !== undefined) return yield* optionError(problem)
+    if (options.releaseOrphanedReservations === true && options.writesStopped !== true) {
+      return yield* optionError(
+        "releaseOrphanedReservations needs writesStopped: true. Releasing is a maintenance step: " +
+          "stop every writer to the table first, another cleanup releasing reservations included.",
+      )
+    }
+
+    let positions: Array<Position>
+    if (options.resume !== undefined) {
+      const decoded = decodeToken(options.resume, tableName)
+      if (typeof decoded === "string") {
+        return yield* optionError(`The resume token can't be used: ${decoded}.`)
+      }
+      if (options.segments !== undefined && options.segments !== decoded.length) {
+        return yield* optionError(
+          `The resume token was made with ${decoded.length} scan segment(s), but segments is ` +
+            `${options.segments}: resume with the token's segment count.`,
+        )
+      }
+      positions = [...decoded]
+    } else {
+      positions = Array.from({ length: options.segments ?? 1 }, (): Position => 0)
+    }
+    const startedAtTheBeginning = positions.every((position) => position === 0)
+
+    // Members by the `__edd_e__` values they claim, in registration order.
+    const byType = new Map<string, Array<RekeyMember>>()
+    for (const member of members) {
+      for (const type of member.types) {
+        const list = byType.get(type) ?? []
+        list.push(member)
+        byType.set(type, list)
+      }
+    }
+    const prefixed = members.flatMap((member) =>
+      (member.typePrefixes ?? []).map((prefix) => ({ prefix, member })),
+    )
+
+    const totals = new Totals()
+    const budget = new Budget(options.journalCapacity ?? DEFAULT_JOURNAL_CAPACITY)
+    const journal = new Journal(
+      tableName,
+      members.find((member) => member.key !== undefined)?.key,
+      totals,
+      budget,
+      dryRun,
+    )
+    const units = new Units(totals, budget)
+    const claimed = new Set<string>()
+    const atEnd: Array<{ readonly member: string; readonly judge: () => RekeyTally }> = []
+    const ctx: RekeyRowContext = {
+      tableName,
+      dryRun,
+      repairIndexKeys: options.repairIndexKeys === true,
+      reservations: options.reservations === true || options.releaseOrphanedReservations === true,
+      releaseOrphanedReservations: options.releaseOrphanedReservations === true,
+      writesStopped: options.writesStopped === true,
+      sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
+      claim: (unit) => {
+        const key = digest(unit)
+        if (claimed.has(key)) return false
+        if (budget.admit()) claimed.add(key)
+        return true
+      },
+      claimed: (unit) => claimed.has(digest(unit)),
+      keep: () => budget.admit(),
+      awaitsMove: (row) => journal.awaitsMove(row),
+      atEnd: (member, judge) => {
+        if (budget.admit()) atEnd.push({ member, judge })
+        else totals.add(member, judge())
+      },
+      judge: (member, unit, work) => units.judge(member, unit, work),
+      plan: (items) => journal.plan(items),
+      vacated: (key) => journal.vacated(key),
+      journalFull: () => budget.full,
+      placed: (key) => journal.placed(key),
+      putting: (key) => journal.putting(key),
+      yieldTo: (row, rows) =>
+        Effect.gen(function* () {
+          const type = row.__edd_e__?.S
+          if (type === undefined) return undefined
+          for (const member of byType.get(type) ?? []) {
+            if (member.holder === undefined) continue
+            const judged = yield* member.holder(row, rows, ctx)
+            if (judged !== undefined) return judged
+          }
+          return undefined
+        }),
+    }
+
+    const handle = (found: Item, pageSeq: number) =>
+      Effect.suspend(() => {
+        const visit = journal.visit(found, pageSeq)
+        if (visit === undefined) return Effect.void
+        return judgeRow(visit.row).pipe(Effect.ensuring(Effect.sync(() => journal.left(visit))))
+      })
+
+    const judgeRow = (row: Item) =>
+      Effect.gen(function* () {
+        const type = row.__edd_e__?.S
+        if (type === undefined) {
+          totals.add(undefined, { skipped: { notLibrary: 1 } })
+          return
+        }
+        const claiming = [
+          ...(byType.get(type) ?? []),
+          ...prefixed.filter((p) => type.startsWith(p.prefix)).map((p) => p.member),
+        ]
+        const exclusive = claiming.filter((member) => member.exclusive === true)
+        const candidates = exclusive.length > 0 ? exclusive : claiming
+        // A member that can't read the row's key back (`unrecognizedKey`) isn't its owner: the
+        // key names another member's key space. The search goes on, so the order members are
+        // listed in doesn't choose one, and the row is counted unrecognized only when no member
+        // recognises it.
+        let unrecognized: { readonly member: RekeyMember; readonly tally: RekeyTally } | undefined
+        for (const member of candidates) {
+          const tally = yield* member.row(row, ctx)
+          if (tally === undefined) continue
+          if (onlyUnrecognized(tally)) {
+            unrecognized ??= { member, tally }
+            continue
+          }
+          totals.add(member.name, tally)
+          return
+        }
+        if (unrecognized !== undefined) {
+          totals.add(unrecognized.member.name, unrecognized.tally)
+          return
+        }
+        totals.add(undefined, { skipped: { unregistered: 1 } })
+      })
+
+    const token = (): string | undefined =>
+      positions.every((p) => p === 1) ? undefined : encodeToken(tableName, positions)
+    const snapshot = (): RekeyReport => totals.report(dryRun, capacity(), token(), budget)
+
+    let pagesLeft = options.maxPages ?? Number.POSITIVE_INFINITY
+    const concurrency = options.concurrency ?? 4
+    // The scan reads through the instrumented client; handlers read and write through the
+    // journal's view of it, which `Capacity.client` hands them as is.
+    const client = yield* Capacity.client
+    const view = journal.view(client)
+    const viaView = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.provideService(effect, DynamoClient, view)
+
+    const scanSegment = (segment: number) =>
+      Effect.gen(function* () {
+        while (positions[segment] !== 1) {
+          if (pagesLeft <= 0) return
+          pagesLeft--
+          const at = positions[segment]!
+          const pageSeq = journal.seq
+          const page = yield* client.scan({
+            TableName: tableName,
+            ...(positions.length > 1 && { Segment: segment, TotalSegments: positions.length }),
+            ...(options.pageSize !== undefined && { Limit: options.pageSize }),
+            ...(at !== 0 && { ExclusiveStartKey: keyFromWire(at) }),
+          })
+          yield* viaView(
+            Effect.forEach(page.Items ?? [], (row) => handle(row, pageSeq), {
+              concurrency,
+              discard: true,
+            }),
+          )
+          const last = page.LastEvaluatedKey as Item | undefined
+          positions[segment] = last === undefined ? 1 : (keyToWire(last) ?? 1)
+          if (options.onProgress !== undefined) yield* options.onProgress(snapshot())
+        }
+      })
+
+    yield* Effect.forEach(
+      positions.map((_, segment) => segment),
+      scanSegment,
+      { concurrency: "unbounded", discard: true },
+    )
+    for (const { member, judge } of atEnd) totals.add(member, judge())
+    for (const member of members) {
+      if (member.finish !== undefined) {
+        totals.add(member.name, yield* viaView(member.finish(ctx)))
+      }
+    }
+    return snapshot()
+  })
 
 /** Tallies added up, field by field. */
 export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally => {

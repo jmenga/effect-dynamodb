@@ -110,9 +110,10 @@ describe("Entity.make — resolved offload settings (gate open)", () => {
     expect(Object.isFrozen(def.offload)).toBe(true)
     expect(def._data.overflowFields).toEqual({ body: overflow })
     expect(def._data.externalFields).toEqual({ scan: binary, thumbnail: DynamoModel.External() })
-    // An overflow field is a packed field.
+    // An overflow field is a packed field; External fields are as opaque to
+    // expressions, so the expression guards cover them too (EDD-9076).
     expect(def._data.packedFields.body).toBe(overflow)
-    expect(def._packedFields).toEqual(["body"])
+    expect(def._packedFields).toEqual(["body", "scan", "thumbnail"])
   })
 
   it("leaves itemBudget and prefix undefined when offload is not given", () => {

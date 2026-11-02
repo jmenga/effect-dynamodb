@@ -86,8 +86,6 @@
  * - A request field `checkFields` doesn't list: `ReturnItemCollectionMetrics`, a `Scan`'s
  *   `IndexName` (the library sends neither) and the legacy parameters (`AttributesToGet`,
  *   `KeyConditions`, `Expected`, …).
- * - A `TransactWriteItems`' `ClientRequestToken`: what DynamoDB Local does with one is measured at
- *   `TOKEN_NOT_MODELLED`. The library sends none; the AWS SDK fills one in below the client.
  * - A `Limit`, `Segment` or `TotalSegments` that isn't an integer.
  * - A value in a shape the AWS SDK never sends (an `S` that isn't a string, a `BOOL` that isn't a
  *   boolean, …), which DynamoDB Local stores as something else.
@@ -3151,15 +3149,6 @@ const asReason = (problem: IndexProblem, what: unknown): string => {
 }
 
 /**
- * Measured on DynamoDB Local: a committed transaction resent with its `ClientRequestToken` is
- * answered with success and writes nothing (whatever the items hold now); resent with other items
- * or another table it is refused (`IdempotentParameterMismatchException`); a cancelled one leaves
- * its token unused. The library never sends one (the AWS SDK fills it in below the client).
- */
-const TOKEN_NOT_MODELLED =
-  "not modelled (DynamoDB Local answers a committed transaction resent with its token with success, writing nothing, and one resent with other items with IdempotentParameterMismatchException)"
-
-/**
  * A `TransactWriteItems` as DynamoDB Local answers it. None, or over 100, items refuse it. Every
  * item's request is checked first, as DynamoDB Local checks it (measured; a refusal is
  * request-wide): every item's values ({@link checkTransactValues}); then every item's
@@ -3180,7 +3169,47 @@ export const transactWrite = (
   options?: WriteOptions,
 ): TransactOutcome => {
   const token = (input as { readonly ClientRequestToken?: unknown }).ClientRequestToken
-  if (token !== undefined) unreadable("the ClientRequestToken", String(token), TOKEN_NOT_MODELLED)
+  if (token === undefined) return transactWriteOnce(input, tables, options)
+  if (typeof token !== "string") {
+    return unreadable("the ClientRequestToken", String(token), "not a string")
+  }
+  // What DynamoDB Local does with a token (measured): a committed transaction resent with it is
+  // answered with success and writes nothing; resent with other items, refused; a cancelled one
+  // leaves its token unused. The upload ledger (#179) sends one on a transaction carrying uploads.
+  const fingerprint = JSON.stringify(input.TransactItems ?? [])
+  let committed = tokensCommitted.get(tables)
+  if (committed === undefined) {
+    committed = new Map()
+    tokensCommitted.set(tables, committed)
+  }
+  const seen = committed.get(token)
+  if (seen !== undefined) {
+    return seen === fingerprint
+      ? { _tag: "Committed", writes: [] }
+      : {
+          _tag: "Cancelled",
+          error: Object.assign(
+            new Error(
+              "Request with the same ClientRequestToken and different parameters was received",
+            ),
+            { name: "IdempotentParameterMismatchException" },
+          ),
+        }
+  }
+  const { ClientRequestToken: _, ...rest } = input as Record<string, unknown>
+  const outcome = transactWriteOnce(rest as typeof input, tables, options)
+  if (outcome._tag === "Committed") committed.set(token, fingerprint)
+  return outcome
+}
+
+/** The `ClientRequestToken` of each committed transaction, per set of tables, with its items. */
+const tokensCommitted = new WeakMap<Tables, Map<string, string>>()
+
+const transactWriteOnce = (
+  input: { readonly TransactItems?: ReadonlyArray<Record<string, any>> | undefined },
+  tables: Tables,
+  options?: WriteOptions,
+): TransactOutcome => {
   checkFields("TransactWriteItems", input)
   const entries = transactItems(input.TransactItems, NO_TRANSACT_WRITE_ITEMS).map((op) => {
     const kinds = KINDS.filter((kind) => op[kind] !== undefined)

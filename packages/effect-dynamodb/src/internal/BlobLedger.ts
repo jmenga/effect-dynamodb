@@ -17,8 +17,8 @@
  *   request goes through, hands each write request of a ledger with entries to
  *   {@link guard}: it refuses a request carrying an upload older than its
  *   store's `maxUploadAge` (`BlobStoreError { reason: "Expired" }`, nothing
- *   sent), gives a `TransactWriteItems` the library's own
- *   `ClientRequestToken` and a single-item write `ReturnValuesOnConditionCheckFailure:
+ *   sent), gives a `TransactWriteItems` or PartiQL `ExecuteTransaction` the
+ *   library's own `ClientRequestToken` and a single-item write `ReturnValuesOnConditionCheckFailure:
  *   "ALL_OLD"`, and settles the entries the request carries by its outcome —
  *   `$metadata.attempts`, the token, the `ALL_OLD` / `ALL_NEW` evidence
  *   (the table of §6.2).
@@ -44,6 +44,7 @@
 import type { CompressionCodec } from "@effect-dynamodb/schema/DynamoModel.js"
 import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import {
+  type BlobChecksum,
   type BlobPointer,
   type BlobPointerKind,
   type BlobRef,
@@ -284,8 +285,15 @@ export interface UploadSpec {
   readonly contentType: string
   /** The content type the pointer records, if any. */
   readonly pointerContentType?: string | undefined
-  /** The object metadata (design §4.6). */
-  readonly metadata: Readonly<Record<string, string>>
+  /**
+   * The object metadata (design §4.6), or its builder given the content
+   * checksum: the ledger computes that checksum once, for the memo key, the
+   * pointer and the metadata, which it builds only when the upload is not
+   * memoised.
+   */
+  readonly metadata:
+    | Readonly<Record<string, string>>
+    | ((checksum: BlobChecksum) => Readonly<Record<string, string>>)
   readonly target: UploadTarget
 }
 
@@ -415,7 +423,7 @@ export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreEr
     if (spec.codec === "none" && body.length !== content.length) {
       return Effect.die(new Error("BlobLedger: an uncompressed object's body is its content"))
     }
-    const checksum = { algorithm: "crc64nvme" as const, value: crc64nvme(content) }
+    const checksum: BlobChecksum = { algorithm: "crc64nvme", value: crc64nvme(content) }
     const memoKey = [spec.key, hexOf(checksum.value), content.length, kind, spec.contentType].join(
       "\u0000",
     )
@@ -439,11 +447,13 @@ export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreEr
         }),
       )
     }
+    // Built before the memo is registered: nothing can then fail outside `run`.
+    const metadata = typeof spec.metadata === "function" ? spec.metadata(checksum) : spec.metadata
     const memo: Memo = { deferred: Deferred.makeUnsafe<Uploaded, BlobStoreError>() }
     byStore.set(memoKey, memo)
     const ctx = ctxOf(spec.target)
-    const bodyChecksum =
-      body === content ? checksum : { algorithm: "crc64nvme" as const, value: crc64nvme(body) }
+    const bodyChecksum: BlobChecksum =
+      body === content ? checksum : { algorithm: "crc64nvme", value: crc64nvme(body) }
     const run = Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const startedAt = yield* Clock.currentTimeMillis
@@ -455,7 +465,7 @@ export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreEr
               contentLength: body.length,
               checksum: Effect.succeed(bodyChecksum),
               contentType: spec.contentType,
-              metadata: spec.metadata,
+              metadata,
             }),
           ),
         )
@@ -515,13 +525,18 @@ export const upload = (spec: UploadSpec): Effect.Effect<BlobPointer, BlobStoreEr
 // Settling at the choke point
 // ---------------------------------------------------------------------------
 
-/** The write commands a ledger settles. */
+/**
+ * The write commands a ledger settles. A PartiQL request is one too (`insert()`, design §6.2);
+ * one that only reads (`SELECT`) carries no pointer to settle ({@link refsOfRequest}).
+ */
 export const WRITE_COMMANDS: ReadonlySet<string> = new Set([
   "PutItem",
   "UpdateItem",
   "DeleteItem",
   "BatchWriteItem",
   "TransactWriteItems",
+  "ExecuteStatement",
+  "ExecuteTransaction",
 ])
 
 /** The ledger a request of `command` settles: an open one with entries, for a write. */
@@ -568,11 +583,36 @@ const visitItem = (item: unknown, out: Set<string>): void => {
   for (const key in item) visitValue(item[key], out)
 }
 
+/**
+ * The first attribute of a marshalled row that holds a well-formed blob pointer, in either stored
+ * form and at any depth, whatever its member now declares; `undefined` when none does. Rekey's
+ * backstop (design §11.10): a row holding one must never move.
+ */
+export const pointerAttributeOf = (item: unknown): string | undefined => {
+  if (!isObject(item)) return undefined
+  for (const key in item) {
+    const out = new Set<string>()
+    visitValue(item[key], out)
+    if (out.size > 0) return key
+  }
+  return undefined
+}
+
 /** The refs of every pointer an item (a marshalled image) holds. */
 export const refsOfItem = (item: unknown): Set<string> => {
   const out = new Set<string>()
   visitItem(item, out)
   return out
+}
+
+const isSelect = (statement: unknown): boolean =>
+  typeof statement === "string" && /^\s*SELECT\b/i.test(statement)
+
+/** A PartiQL statement's parameters (`AttributeValue`s), unless it only reads. */
+const visitStatement = (entry: unknown, out: Set<string>): void => {
+  if (!isObject(entry) || isSelect(entry.Statement)) return
+  const parameters = entry.Parameters
+  if (Array.isArray(parameters)) for (const parameter of parameters) visitValue(parameter, out)
 }
 
 const IF_NOT_EXISTS = /if_not_exists\s*\(\s*[^,()]*,\s*(:[A-Za-z0-9_]+)\s*\)/g
@@ -618,6 +658,14 @@ const refsOfRequest = (
           }
         }
       }
+      break
+    }
+    case "ExecuteStatement":
+      visitStatement(input, all)
+      break
+    case "ExecuteTransaction": {
+      const statements = input.TransactStatements
+      if (Array.isArray(statements)) for (const entry of statements) visitStatement(entry, all)
       break
     }
   }
@@ -677,15 +725,19 @@ const makeToken = (): string =>
 
 const SINGLE_ITEM: ReadonlySet<string> = new Set(["PutItem", "UpdateItem", "DeleteItem"])
 
+/** The transactions whose `ClientRequestToken` the SDK models as an idempotency token. */
+const TRANSACTIONS: ReadonlySet<string> = new Set(["TransactWriteItems", "ExecuteTransaction"])
+
 /**
- * The request as sent: a `TransactWriteItems` carries the library's own
- * `ClientRequestToken` (fresh per request, so a resend of this request object
- * is idempotent and a cancellation proves it did not commit), a single-item
+ * The request as sent: a `TransactWriteItems` or `ExecuteTransaction` carries
+ * the library's own `ClientRequestToken` (fresh per request, so a resend of
+ * this request object is idempotent and a cancellation proves it did not
+ * commit), a single-item
  * write asks for `ALL_OLD` on a failed condition (the evidence a
  * `ConditionalCheckFailed` is settled by). A field the caller set is kept.
  */
 const prepare = (ledger: Ledger, command: string, input: Item): Item => {
-  if (command === "TransactWriteItems" && input.ClientRequestToken === undefined) {
+  if (TRANSACTIONS.has(command) && input.ClientRequestToken === undefined) {
     const token = makeToken()
     ledger.tokens.add(token)
     return { ...input, ClientRequestToken: token }
@@ -751,7 +803,20 @@ const SINGLE_REFUSALS: ReadonlySet<string> = new Set([
   "AccessDeniedException",
 ])
 
-/** A `TransactWriteItems` carrying a token: refused outright, so never committed. */
+/**
+ * Refusals of a PartiQL `ExecuteStatement`: rejected when the SDK sent it once. An `INSERT` is
+ * not idempotent, so `DuplicateItemException` after a resend may be refusing the item the first
+ * attempt wrote: it proves non-commit only for a statement sent once.
+ */
+const STATEMENT_REFUSALS: ReadonlySet<string> = new Set([
+  ...SINGLE_REFUSALS,
+  "DuplicateItemException",
+  // DynamoDB Local's name for it (`isAwsDuplicateItem`).
+  "DuplicateItem",
+  "ConditionalCheckFailedException",
+])
+
+/** A transaction carrying a token: refused outright, so never committed. */
 const TRANSACT_REJECTED: ReadonlySet<string> = new Set([
   "TransactionCanceledException",
   "ValidationException",
@@ -831,7 +896,7 @@ const outcomeOf = (
   const once = attemptsOf(error) === 1
   const refusedOnce = (refusals: ReadonlySet<string>): EntryState =>
     name !== undefined && refusals.has(name) && once ? "rejected" : "inDoubt"
-  if (command === "TransactWriteItems") {
+  if (TRANSACTIONS.has(command)) {
     if (name !== undefined && TRANSACT_REJECTED.has(name)) {
       // Only the library's own token proves it: a resend of this request
       // object is idempotent, so a cancellation means no attempt committed.
@@ -842,6 +907,7 @@ const outcomeOf = (
     return every(refusedOnce(REQUEST_REFUSALS))
   }
   if (command === "BatchWriteItem") return every(refusedOnce(REQUEST_REFUSALS))
+  if (command === "ExecuteStatement") return every(refusedOnce(STATEMENT_REFUSALS))
   if (name === "ConditionalCheckFailedException") {
     // The evidence: the row as stored, returned because the request asked.
     if (sent.ReturnValuesOnConditionCheckFailure !== "ALL_OLD") return every("inDoubt")

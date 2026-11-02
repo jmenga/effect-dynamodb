@@ -38,6 +38,7 @@ import {
 } from "@effect-dynamodb/schema/Compression.js"
 import type {
   CompressionCodec,
+  ExternalConfig,
   ExternalPackedConfig,
   PackedConfig,
 } from "@effect-dynamodb/schema/DynamoModel.js"
@@ -653,21 +654,28 @@ export const decodeImage = (
 // ---------------------------------------------------------------------------
 
 /**
- * A packed attribute an expression or projection may not look inside: DynamoDB
- * sees one opaque `S` or `B` value, so a path below it, or any operator but
- * `attribute_exists` / `attribute_not_exists` on it as a whole, can never
- * match what the reader means.
+ * A packed or External attribute an expression or projection may not look
+ * inside: DynamoDB sees one opaque `S` or `B` value (packed JSON, or a blob
+ * pointer), so a path below it, or any operator but `attribute_exists` /
+ * `attribute_not_exists` on it as a whole, can never match what the reader
+ * means.
  */
 export interface PackedAttributeGuard {
   /** The stored (top-level) attribute name. */
   readonly attribute: string
   /** Who stores it, for the message — e.g. `EventStream "Ledger"`. */
   readonly owner: string
-  /** Its storage config (the message names the format). */
-  readonly storedAs: PackedConfig | ExternalPackedConfig
+  /** Its storage config (the message names the format, or the External content type). */
+  readonly storedAs: PackedConfig | ExternalPackedConfig | ExternalConfig
   /** What to do instead, given the refused path as written (`data.amount`). */
   readonly alternative: (path: string) => string
 }
+
+/** How a guarded attribute is stored, for the messages: `packed (format "json")` / `External (…)`. */
+const storageOf = (storedAs: PackedAttributeGuard["storedAs"]): string =>
+  "format" in storedAs
+    ? `packed (format "${storedAs.format}")`
+    : `External (content type "${storedAs.contentType}", in the blob store)`
 
 /** Render path segments as written: `data.items[0].sku`. */
 export const formatPath = (segments: ReadonlyArray<string | number>): string =>
@@ -697,8 +705,8 @@ const refusal = (
   path: string,
   problem: string,
 ): string =>
-  `[EDD-9076] ${guard.owner}: the ${usage} ${problem}, but \`${guard.attribute}\` is stored packed ` +
-  `(format "${guard.storedAs.format}"): DynamoDB sees one opaque string or binary value and ` +
+  `[EDD-9076] ${guard.owner}: the ${usage} ${problem}, but \`${guard.attribute}\` is stored ` +
+  `${storageOf(guard.storedAs)}: DynamoDB sees one opaque string or binary value and ` +
   "cannot evaluate a path inside it, or compare it — only attribute_exists / " +
   `attribute_not_exists apply to it as a whole. ${guard.alternative(path)}`
 
@@ -816,9 +824,9 @@ export const packedProjectionRefusal = (
     const path = segments.length === 1 ? head : formatPath(segments)
     return (
       `[EDD-9076] ${guard.owner}: the projection names "${path}", but \`${guard.attribute}\` is ` +
-      `stored packed (format "${guard.storedAs.format}"): DynamoDB holds it as one opaque string or ` +
-      `binary value and cannot project a path inside it. Select "${guard.attribute}" whole — a ` +
-      "projected packed attribute comes back as its parsed JSON."
+      `stored ${storageOf(guard.storedAs)}: DynamoDB holds it as one opaque string or ` +
+      `binary value and cannot project a path inside it. Select ` +
+      `"${guard.attribute}" whole — a projected packed attribute comes back as its parsed JSON.`
     )
   }
   return undefined

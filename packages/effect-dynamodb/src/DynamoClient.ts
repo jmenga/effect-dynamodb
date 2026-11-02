@@ -115,6 +115,11 @@ import {
   type Compressor,
   make as makeCompressionRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
+import {
+  type ExternalPackedConfig,
+  isPackedConfig,
+  type PackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -211,6 +216,12 @@ import {
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag, type StoredFormAt } from "./internal/Expr.js"
+import {
+  aggregateStoreRequirements,
+  entityStoreRequirements,
+  missingStoreError,
+  unescapedKeysError,
+} from "./internal/OffloadWrite.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -2077,7 +2088,7 @@ export type TypedClient<
    * A member may be a runtime `Entity` (authored with `effect-dynamodb`'s
    * `Entity.make`) OR a pure `EntityDefinition` (authored with
    * `@effect-dynamodb/schema`'s `Entity.make` — the AWS-free contract surface).
-   * Both carry the same 11 type parameters, so both map to the same bound shape,
+   * Both carry the same 14 type parameters, so both map to the same bound shape,
    * and both branches forward the inferred refs `R` — the two packages now share
    * one structural `AnyRefValue` (`entity: RefEntity`), so ref-derived composite
    * types (e.g. `${field}Id`) survive into the bound client for either authoring
@@ -2099,10 +2110,11 @@ export type TypedClient<
       infer GenId,
       infer VI,
       infer P,
-      infer Un
+      infer Un,
+      infer O
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
+          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un, O> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
@@ -2126,10 +2138,11 @@ export type TypedClient<
             infer GenId,
             infer VI,
             infer P,
-            infer Un
+            infer Un,
+            infer O
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
+            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un, O> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
@@ -2556,11 +2569,13 @@ const collectionLiveRows = (
  */
 const packedFieldConfigs = (
   entity: EntityLike,
-): Array<readonly [string, PackedAttributeGuard["storedAs"] | undefined]> =>
-  (entity._packedFields ?? []).map((field) => [
-    field,
-    entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs,
-  ])
+): Array<readonly [string, PackedConfig | ExternalPackedConfig | undefined]> =>
+  (entity._packedFields ?? []).flatMap((field) => {
+    const storedAs = entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs
+    // `_packedFields` also names `External` (binary) fields, for the
+    // expression guards (#179): they name no codec.
+    return storedAs !== undefined && !isPackedConfig(storedAs) ? [] : [[field, storedAs] as const]
+  })
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
@@ -2671,6 +2686,30 @@ const makeFromConfig = (config: {
             validateBlobStore("DynamoClient.make", config.blobStore),
           )
         : withCompression
+    // A bound member with an offloaded field uploads on every write and
+    // resolves pointers on every read, so a store must be resolvable here —
+    // a configuration defect (`[EDD-9115]`) at bind, naming every member and
+    // field, not a `NotProvided` on the first value (#179).
+    const storeRequirements = [
+      ...Object.entries(config.entities).flatMap(([key, entity]) =>
+        entityStoreRequirements(`entity "${key}"`, entity),
+      ),
+      ...Object.entries(config.aggregates ?? {}).flatMap(([key, aggregate]) =>
+        aggregateStoreRequirements(`aggregate "${key}"`, aggregate),
+      ),
+    ]
+    // Offloading requires escaped key text (`[EDD-9146]`, design §11.10):
+    // object keys are named from a row's key text, so a pointer row must be
+    // written only at its final text. Checked first: a store doesn't make the
+    // key text right.
+    const keysError = unescapedKeysError("DynamoClient.make", storeRequirements)
+    if (keysError !== undefined) throw keysError
+    const storeError = missingStoreError(
+      "DynamoClient.make",
+      storeRequirements,
+      Context.getOrUndefined(ctx, BlobStore),
+    )
+    if (storeError !== undefined) throw storeError
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)

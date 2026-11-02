@@ -11,6 +11,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { TypeId as SchemaAggregateTypeId } from "@effect-dynamodb/schema/Aggregate.js"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -104,7 +105,7 @@ import {
   BigDecimal,
   Cause,
   Chunk,
-  type Context,
+  Context,
   DateTime,
   Effect,
   Equal,
@@ -119,6 +120,7 @@ import {
   SchemaAST,
 } from "effect"
 import * as Batch from "./Batch.js"
+import { BlobStore } from "./BlobStore.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
@@ -146,7 +148,19 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
-import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
+import {
+  aggregateStoreRequirements,
+  missingStoreError,
+  unescapedKeysError,
+} from "./internal/OffloadWrite.js"
+import {
+  codecRequirements,
+  hasStoredForm,
+  packItemSync,
+  unpackItemSync,
+  unregisteredCodecError,
+  withRegistry,
+} from "./internal/Packed.js"
 import { type PathBuilder, pathBuilderOf, type StoredBelow } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
 import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
@@ -323,6 +337,13 @@ interface ResolvedNode {
    * current config.
    */
   readonly dispatch?: ReadonlyArray<string> | undefined
+  /**
+   * The edge entity's offloaded fields (#179) that are top-level attributes of
+   * this node's items: overflow (`Packed({ external })`) and binary
+   * (`External`). `DynamoClient.make()` / `Aggregate.bind()` require a blob
+   * store for them (`[EDD-9115]`).
+   */
+  readonly offloaded?: ReadonlyArray<string> | undefined
   readonly cardinality: "root" | "one" | "many"
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
@@ -601,6 +622,22 @@ export interface Aggregate<
 
   /** @internal What `DynamoClient.make` checks this aggregate's `ownsRows` against. */
   readonly _ownership?: Ownership
+
+  /**
+   * @internal The offloaded fields of each edge entity type's items (#179).
+   * `DynamoClient.make()` and `Aggregate.bind()` require a blob store for them
+   * (`[EDD-9115]`).
+   */
+  readonly _offloadByType?: ReadonlyMap<string, ReadonlyArray<string>>
+
+  /** @internal The aggregate's name (its root entity type), for bind-time messages. */
+  readonly _name?: string | undefined
+
+  /**
+   * @internal The schema the aggregate composes its keys under: offloaded edge
+   * fields require `escapeKeys: true` (`[EDD-9146]`, checked at bind).
+   */
+  readonly _keySchema?: DynamoSchemaModule.DynamoSchema | undefined
 
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
@@ -2421,6 +2458,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   // Packed edge attributes, and those read by stored form, by item entity type (#147).
   const packedByType = collectPackedByType(rootNode)
+  const offloadByType = collectOffloadByType(rootNode)
   const dispatchByType = collectDispatchByType(rootNode)
 
   // Attribute ENCODERS for the root item: decompose works from the
@@ -5519,6 +5557,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       _ownsRows: ownsRows,
       _attributeWriters: attributeWriters,
       _ownership: ownership,
+      _offloadByType: offloadByType,
+      _name: aggregateName,
+      _keySchema: config.schema,
       schema,
       pkField: config.pk.field,
       collection: {
@@ -6029,6 +6070,29 @@ export const bind = <
   Effect.gen(function* () {
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
+    // Configuration checks where the aggregate is first resolvable (#147,
+    // #179): its edges' packed codecs must be registered (`[EDD-9078]`) and
+    // their offloaded fields need a blob store (`[EDD-9115]`) in the context
+    // it is bound with — `DynamoClient.make` binds under the one it bundled.
+    const owner = `aggregate "${aggregate._name ?? "?"}"`
+    const requirements = aggregateStoreRequirements(owner, aggregate)
+    // Offloading requires escaped key text (`[EDD-9146]`), before the store.
+    const keysError = unescapedKeysError("Aggregate.bind", requirements)
+    if (keysError !== undefined) throw keysError
+    const codecError = unregisteredCodecError(
+      "Aggregate.bind",
+      [...(aggregate._packedByType ?? new Map())].flatMap(([edgeType, packed]) =>
+        codecRequirements(`${owner} (edge "${edgeType}")`, Object.entries(packed)),
+      ),
+      Context.getOrUndefined(ctx, Compression),
+    )
+    if (codecError !== undefined) throw codecError
+    const storeError = missingStoreError(
+      "Aggregate.bind",
+      requirements,
+      Context.getOrUndefined(ctx, BlobStore),
+    )
+    if (storeError !== undefined) throw storeError
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -6186,6 +6250,7 @@ interface ResolveNodeArgs {
   readonly dispatch?: ReadonlyArray<string> | undefined
   /** The schema's `escapeKeys`: an `entity:` edge's sort key composition follows it. */
   readonly escapeKeys?: boolean | undefined
+  readonly offloaded?: ReadonlyArray<string> | undefined
 }
 
 /**
@@ -6348,16 +6413,37 @@ const edgeDispatchFields = (
   return dispatch.size > 0 ? [...dispatch] : undefined
 }
 
-/** A node's packed and stored-form-dispatch attributes, as `resolveNode` args. */
+/** The edge entity's offloaded fields among the node's item attributes (#179). */
+const edgeOffloadedFields = (
+  packed:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined,
+  entity: { readonly model: Schema.Top } | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+): ReadonlyArray<string> | undefined => {
+  if (entity === undefined) return undefined
+  const offloaded = [
+    ...Object.entries(packed ?? {})
+      .filter(([, storedAs]) => storedAs.external !== undefined)
+      .map(([field]) => field),
+    ...Object.keys(DynamoModel.getExternalFields(entity.model)).filter(
+      (field) => itemFields === undefined || Object.hasOwn(itemFields, field),
+    ),
+  ]
+  return offloaded.length > 0 ? offloaded : undefined
+}
+
+/** A node's packed, stored-form-dispatch and offloaded attributes, as `resolveNode` args. */
 const edgeStorage = (
   packed:
     | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
     | undefined,
   entity: { readonly model: Schema.Top } | undefined,
   itemFields: Record<string, Schema.Top> | undefined,
-): Pick<ResolveNodeArgs, "packed" | "dispatch"> => ({
+): Pick<ResolveNodeArgs, "packed" | "dispatch" | "offloaded"> => ({
   packed,
   dispatch: edgeDispatchFields(entity, itemFields, packed),
+  offloaded: edgeOffloadedFields(packed, entity, itemFields),
 })
 
 const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
@@ -6603,6 +6689,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(refIdentifierField !== undefined && { refIdentifierField }),
     ...(args.packed !== undefined && { packed: args.packed }),
     ...(args.dispatch !== undefined && { dispatch: args.dispatch }),
+    ...(args.offloaded !== undefined && { offloaded: args.offloaded }),
     attrEncoders,
     ...(args.elementEncoder !== undefined && { elementEncoder: args.elementEncoder }),
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
@@ -6636,6 +6723,21 @@ const collectPackedByType = (
   }
   walk(root)
   return out
+}
+
+/** Every node's offloaded fields (#179), by the entity type of its items. */
+const collectOffloadByType = (root: ResolvedNode): ReadonlyMap<string, ReadonlyArray<string>> => {
+  const out = new Map<string, Set<string>>()
+  const walk = (node: ResolvedNode): void => {
+    if (node.offloaded !== undefined) {
+      const fields = out.get(node.entityType) ?? new Set<string>()
+      for (const field of node.offloaded) fields.add(field)
+      out.set(node.entityType, fields)
+    }
+    for (const child of node.children) walk(child)
+  }
+  walk(root)
+  return new Map([...out].map(([type, fields]) => [type, [...fields]]))
 }
 
 /** Every node's stored-form-dispatch attributes, by the entity type of its items. */

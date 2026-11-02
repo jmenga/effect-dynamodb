@@ -14,19 +14,26 @@ import type {
   UpdateItemCommandInput,
   WriteRequest,
 } from "@aws-sdk/client-dynamodb"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
+  type ExternalConfig,
   type ExtractIdentifier,
+  type ExtractOffloadFields,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
   isConfiguredModel,
+  isPackedConfig,
   isRefField,
+  type NoOffload,
+  type OffloadFields,
 } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import {
+  type BlobStoreError,
   CascadePartialFailure,
   ConcurrentModification,
   ConditionalCheckFailed,
@@ -83,7 +90,7 @@ import {
   setOwn,
   type UnreadableName,
 } from "@effect-dynamodb/schema/internal/OwnNames.js"
-import { unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import { stringifyStrict, unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { restoredObjectReading } from "@effect-dynamodb/schema/internal/RestoredKeyText.js"
 import {
   type AbsentReading,
@@ -129,6 +136,7 @@ import {
   Stream,
 } from "effect"
 import { SecureRandom } from "effect/crypto"
+import { BlobStore } from "./BlobStore.js"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
@@ -184,8 +192,10 @@ import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { insertStatement } from "./internal/InsertStatement.js"
+import * as OffloadWrite from "./internal/OffloadWrite.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
+  codecRequirements,
   decodeImage,
   imageEntityType,
   ownRowsRawRow,
@@ -196,6 +206,7 @@ import {
   packItemSync,
   type StreamImage,
   unpackRow,
+  unregisteredCodecError,
   withRegistry,
 } from "./internal/Packed.js"
 import {
@@ -240,6 +251,7 @@ import {
   type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
+  isItemSizeRejection,
   keyAttributesOf,
   storedTypeName,
   targetsFor,
@@ -414,6 +426,7 @@ import type {
   RemovableFields,
   VectorErrors,
   WithGeneratedId,
+  WriteBlobErrors,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import {
   asModel,
@@ -671,6 +684,14 @@ const keyFormFor = (
 }
 
 /**
+ * Internal: the standard `UpdateItem` of an entity with an item budget was
+ * rejected for item size; the caller re-runs the update on the read-merge
+ * branch, which routes the whole item to the blob store (#179, design §6.3).
+ * Never escapes the entity.
+ */
+class OffloadSizeRetry extends Data.TaggedError("OffloadSizeRetry")<{}> {}
+
+/**
  * @internal A plain update of a complete item found no item: the caller
  * creates it instead (`updateOrCreate`). Never escapes the update operation.
  */
@@ -881,6 +902,7 @@ export interface Entity<
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
   TUnremovable extends string = never,
+  TOffload extends OffloadFields = NoOffload,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -902,6 +924,12 @@ export interface Entity<
    * when the entity offloads nothing.
    */
   readonly offload: ResolvedOffload | undefined
+  /**
+   * @internal Type-only (never set at runtime): the domain names of the fields
+   * this entity offloads, by kind ({@link NoOffload} when none) — what the
+   * operation types add `BlobStoreError` from (#179, §9.1, §9.3).
+   */
+  readonly _offloadFields?: TOffload | undefined
 
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
@@ -931,9 +959,10 @@ export interface Entity<
   readonly _refuseTableAttributes: (tableConfig: TableConfig) => void
 
   /**
-   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
-   * Carries the `TPackedFields` type, which narrows expression path builders:
-   * a packed field can be tested only with `exists` / `notExists` as a whole.
+   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`) or
+   * External (`storedAs: DynamoModel.External(...)`). Carries the
+   * `TPackedFields` type, which narrows expression path builders: such a field
+   * can be tested only with `exists` / `notExists` as a whole.
    */
   readonly _packedFields: ReadonlyArray<TPackedFields>
 
@@ -1435,7 +1464,8 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1459,7 +1489,8 @@ export interface Entity<
     | UniqueConstraintViolation
     | ValidationError
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1476,7 +1507,8 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | DeleteAppliedButUnreadable,
+    | DeleteAppliedButUnreadable
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig,
     void,
     ModelType<TModel>
@@ -1504,7 +1536,8 @@ export interface Entity<
     | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1514,6 +1547,7 @@ export interface Entity<
    * with `ItemAlreadyExists` if the key is taken. Sends one write and no reads;
    * a `unique` entity sends an `INSERT`-only transaction. It takes no condition,
    * cannot join a transaction or batch, and is refused on `versioned: { retain: true }`.
+   * Offloaded fields are uploaded first, as `put` uploads them (#179).
    */
   readonly insert: (
     input: WithGeneratedId<
@@ -1529,7 +1563,8 @@ export interface Entity<
     | UniqueConstraintViolation
     | ItemAlreadyExists
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1554,7 +1589,8 @@ export interface Entity<
     | ValidationError
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1572,7 +1608,8 @@ export interface Entity<
     | ConcurrentModification
     | ValidationError
     | DeleteAppliedButUnreadable
-    | ConditionalCheckFailed,
+    | ConditionalCheckFailed
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig,
     void,
     ModelType<TModel>
@@ -1610,7 +1647,8 @@ export interface Entity<
     | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1644,7 +1682,8 @@ export interface Entity<
     | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
-    | ConcurrentModification,
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -1656,7 +1695,10 @@ export interface Entity<
    */
   readonly purge: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
-  ) => EntityDelete<DynamoClientError | ValidationError, DynamoClient | TableConfig>
+  ) => EntityDelete<
+    DynamoClientError | ValidationError | WriteBlobErrors<TOffload>,
+    DynamoClient | TableConfig
+  >
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -1719,7 +1761,8 @@ export interface Entity<
           | ValidationError
           | StaleAppend
           | ConditionalCheckFailed
-          | ConcurrentModification,
+          | ConcurrentModification
+          | WriteBlobErrors<TOffload>,
           DynamoClient | TableConfig
         >
         (
@@ -1739,7 +1782,11 @@ export interface Entity<
           >,
         ): Effect.Effect<
           void,
-          DynamoClientError | ValidationError | StaleAppend | ConcurrentModification,
+          | DynamoClientError
+          | ValidationError
+          | StaleAppend
+          | ConcurrentModification
+          | WriteBlobErrors<TOffload>,
           DynamoClient | TableConfig
         >
       }
@@ -1971,6 +2018,7 @@ export interface BoundEntity<
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
   TUnremovable extends string = never,
+  TOffload extends OffloadFields = NoOffload,
 > {
   // --- CRUD Operations ---
 
@@ -2022,7 +2070,8 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields
   >
@@ -2047,7 +2096,8 @@ export interface BoundEntity<
     | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields
   >
@@ -2058,6 +2108,7 @@ export interface BoundEntity<
    * with `ItemAlreadyExists` if the key is taken. Sends one write and no reads;
    * a `unique` entity sends an `INSERT`-only transaction. It takes no condition,
    * cannot join a transaction or batch, and is refused on `versioned: { retain: true }`.
+   * Offloaded fields are uploaded first, as `put` uploads them (#179).
    */
   readonly insert: (
     input: WithGeneratedId<
@@ -2072,7 +2123,8 @@ export interface BoundEntity<
     | UniqueConstraintViolation
     | ItemAlreadyExists
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>
   >
 
@@ -2100,7 +2152,8 @@ export interface BoundEntity<
     | UniqueConstraintViolation
     | ValidationError
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
     RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
@@ -2126,7 +2179,8 @@ export interface BoundEntity<
     | OptimisticLockError
     | ConcurrentModification
     | ValidationError
-    | DeleteAppliedButUnreadable,
+    | DeleteAppliedButUnreadable
+    | WriteBlobErrors<TOffload>,
     void,
     TPackedFields
   >
@@ -2155,7 +2209,8 @@ export interface BoundEntity<
     | ConcurrentModification
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields
   >
@@ -2184,7 +2239,8 @@ export interface BoundEntity<
     | ValidationError
     | ConditionalCheckFailed
     | RefErrors<TRefs>
-    | VectorErrors<TVectorIndexes>,
+    | VectorErrors<TVectorIndexes>
+    | WriteBlobErrors<TOffload>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
     RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
@@ -2203,7 +2259,8 @@ export interface BoundEntity<
     | ConcurrentModification
     | ValidationError
     | DeleteAppliedButUnreadable
-    | ConditionalCheckFailed,
+    | ConditionalCheckFailed
+    | WriteBlobErrors<TOffload>,
     void,
     TPackedFields
   >
@@ -2248,7 +2305,8 @@ export interface BoundEntity<
     | TransactionOverflow
     | ValidationError
     | UniqueConstraintViolation
-    | ConcurrentModification,
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
     never
   >
 
@@ -2258,7 +2316,9 @@ export interface BoundEntity<
    * backoff; not atomic, so a failure says exactly how many items it had
    * already deleted.
    */
-  readonly purge: (key: TKey) => Effect.Effect<void, DynamoClientError | ValidationError, never>
+  readonly purge: (
+    key: TKey,
+  ) => Effect.Effect<void, DynamoClientError | ValidationError | WriteBlobErrors<TOffload>, never>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -2319,8 +2379,13 @@ export interface BoundEntity<
         | ValidationError
         | StaleAppend
         | ConditionalCheckFailed
-        | ConcurrentModification,
-        DynamoClientError | ValidationError | StaleAppend | ConcurrentModification,
+        | ConcurrentModification
+        | WriteBlobErrors<TOffload>,
+        | DynamoClientError
+        | ValidationError
+        | StaleAppend
+        | ConcurrentModification
+        | WriteBlobErrors<TOffload>,
         TPackedFields,
         AppendRemovableFields<
           TModel,
@@ -2640,8 +2705,10 @@ export const make = <
   TTimeSeries,
   TGeneratedId,
   TVectorIndexes,
-  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
-  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>["binary"],
+  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>,
+  ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   // Normalize GSI configs to internal IndexDefinition format
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
@@ -2883,8 +2950,10 @@ const makeImpl = <
   TTimeSeries,
   TGeneratedId,
   TVectorIndexes,
-  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
-  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>["binary"],
+  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>,
+  ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   // Derivation (validation + schema/ref/sparse/rename resolution) is shared with
   // the pure `@effect-dynamodb/schema` Entity.make via `buildEntityDefinition`,
@@ -5169,6 +5238,13 @@ const makeImpl = <
      * read — never by a condition on the stored value.
      */
     readonly packed: boolean
+    /**
+     * An offloaded field (#179): its stored value may be a pointer, compared
+     * by content checksum and size, then fetched (design §6.5) — never by a
+     * condition on the stored value. A restated value that passes is dropped
+     * from the write.
+     */
+    readonly offloaded: "overflow" | "binary" | undefined
   }
 
   /**
@@ -5196,6 +5272,11 @@ const makeImpl = <
         value: toAttributeValue(encoded.encoded),
         wire: encoded.encoded,
         packed: Object.hasOwn(packedFields, field),
+        offloaded: Object.hasOwn(data.overflowFields, field)
+          ? "overflow"
+          : Object.hasOwn(data.externalFields, field)
+            ? "binary"
+            : undefined,
       })
     }
     return out
@@ -5203,34 +5284,86 @@ const makeImpl = <
   const immutableChangedMessage = (field: string) =>
     `.set() of "${field}": "${field}" is immutable and the update's value ` +
     "differs from the stored one."
-  /** A restated immutable value that differs from the stored item's (packed fields excepted). */
+  /** A restated immutable value that differs from the stored item's (packed and offloaded fields excepted). */
   const immutableMismatch = (
     asserted: ReadonlyArray<AssertedImmutable>,
     stored: Readonly<globalThis.Record<string, unknown>>,
   ): string | undefined => {
     const changed = asserted.find(
-      ({ attr, value, packed }) =>
+      ({ attr, value, packed, offloaded }) =>
         !packed &&
+        offloaded === undefined &&
         !attributeValueEquals(ownValue(stored, attr) as AttributeValue | undefined, value),
     )
     return changed === undefined ? undefined : immutableChangedMessage(changed.field)
   }
   /**
-   * A restated immutable PACKED value that differs from the stored item's,
-   * compared by the stored value's unpacked JSON (#147) — whatever codec or
-   * threshold it was written under.
+   * Whether a restated immutable OFFLOADED value matches the pointer stored
+   * for it (#179, design §6.5): by content checksum and size first — a match
+   * passes — then, for an overflow value whose checksum differs, by fetching
+   * the stored JSON and comparing structurally (key order aside), as a packed
+   * value is compared. A binary value whose checksum or size differs is
+   * different bytes: no fetch can make it equal. `undefined` when the stored
+   * value is not a pointer (it is compared inline).
+   */
+  const offloadedImmutableMatches = (
+    asserted: AssertedImmutable,
+    storedValue: AttributeValue,
+  ): Effect.Effect<boolean | undefined, ValidationError | BlobStoreError> =>
+    Effect.gen(function* () {
+      if (offloadInfo === undefined || asserted.offloaded === undefined) return undefined
+      const raw = fromAttributeMap({ [asserted.attr]: storedValue }) as globalThis.Record<
+        string,
+        unknown
+      >
+      const pointer = OffloadWrite.pointerOf(offloadInfo, asserted.attr, raw[asserted.attr])
+      if (pointer === undefined) return undefined
+      if (asserted.offloaded === "binary") {
+        return (
+          asserted.wire instanceof Uint8Array && OffloadWrite.matchesPointer(pointer, asserted.wire)
+        )
+      }
+      let text: string
+      try {
+        text = stringifyStrict(asserted.wire, asserted.field)
+      } catch {
+        return false
+      }
+      if (OffloadWrite.matchesPointer(pointer, text)) return true
+      yield* resolveOffloaded(raw, "update.immutable", false)
+      return attributeValueEquals(
+        toAttributeValue(raw[asserted.attr]),
+        toAttributeValue(asserted.wire),
+      )
+    })
+  /**
+   * A restated immutable PACKED or OFFLOADED value that differs from the
+   * stored item's, compared by the stored value's unpacked JSON (#147) —
+   * whatever codec or threshold it was written under — or, for a pointer, by
+   * {@link offloadedImmutableMatches}.
    */
   const packedImmutableMismatch = (
     asserted: ReadonlyArray<AssertedImmutable>,
     stored: Readonly<globalThis.Record<string, AttributeValue>>,
-  ): Effect.Effect<string | undefined, ValidationError> =>
+  ): Effect.Effect<string | undefined, ValidationError | BlobStoreError> =>
     Effect.gen(function* () {
-      for (const { field, attr, wire, packed } of asserted) {
-        if (!packed) continue
+      for (const immutable of asserted) {
+        const { field, attr, wire, value, packed, offloaded } = immutable
+        if (!packed && offloaded === undefined) continue
         const storedValue = ownValue(stored, attr)
         if (storedValue === undefined) {
           if (wire === undefined || wire === null) continue
           return immutableChangedMessage(field)
+        }
+        const viaPointer = yield* offloadedImmutableMatches(immutable, storedValue)
+        if (viaPointer !== undefined) {
+          if (!viaPointer) return immutableChangedMessage(field)
+          continue
+        }
+        if (!packed) {
+          // A binary value stored natively (before the field was `External`).
+          if (!attributeValueEquals(storedValue, value)) return immutableChangedMessage(field)
+          continue
         }
         const raw = fromAttributeMap({ [attr]: storedValue }) as globalThis.Record<string, unknown>
         yield* unpackFields(raw, "update.decode")
@@ -5388,42 +5521,147 @@ const makeImpl = <
       ? Effect.void
       : unpackRow(raw, dispatchAttributes, { entityType, operation })
 
+  // ---------------------------------------------------------------------------
+  // Offloaded fields (#179) — `Packed({ external })` (overflow) and `External`
+  // (binary): see `docs/designs/blob-offload.md` §6. Routing and uploads run
+  // on the packed, stored-name item, just before marshalling; write results
+  // resolve the pointers the write stored (its own uploads from the ledger's
+  // read cache).
+  // ---------------------------------------------------------------------------
+
+  const offloadInfo: OffloadWrite.OffloadInfo | undefined =
+    data.offload === undefined
+      ? undefined
+      : {
+          entityType,
+          overflow: Object.fromEntries(
+            Object.entries(data.overflowFields).map(([field, storedAs]) => [
+              resolveDbName(field),
+              storedAs,
+            ]),
+          ),
+          binary: Object.fromEntries(
+            Object.entries(data.externalFields).map(([field, storedAs]) => [
+              resolveDbName(field),
+              storedAs,
+            ]),
+          ),
+          fieldOf: Object.fromEntries(
+            [...Object.keys(data.overflowFields), ...Object.keys(data.externalFields)].map(
+              (field) => [resolveDbName(field), field],
+            ),
+          ),
+          itemBudget: data.offload.itemBudget,
+          prefix: data.offload.prefix,
+          copiesPointers:
+            (typeof config.versioned === "object" &&
+              config.versioned !== null &&
+              (config.versioned as { retain?: boolean }).retain === true) ||
+            config.softDelete === true ||
+            (typeof config.softDelete === "object" && config.softDelete !== null) ||
+            config.timeSeries !== undefined,
+        }
+
+  /** The stored names of the offloaded attributes (empty when the entity offloads nothing). */
+  const offloadedAttributeNames: ReadonlyArray<string> =
+    offloadInfo === undefined ? [] : OffloadWrite.offloadedAttributes(offloadInfo)
+
+  /** Domain name → `External` config of every binary field. */
+  const binaryFields: Readonly<globalThis.Record<string, ExternalConfig>> = data.externalFields
+
+  /** The row of a stored-name item an operation's uploads are for (its live key). */
+  const offloadRow = (
+    item: Readonly<globalThis.Record<string, unknown>>,
+    table: string,
+    operation: string,
+  ): OffloadWrite.OffloadRow =>
+    OffloadWrite.rowOf(item, {
+      table,
+      pkAttribute: config.indexes.primary.pk.field,
+      skAttribute: config.indexes.primary.sk.field,
+      operation: `Entity.${operation}`,
+      escapeKeys: schema.escapeKeys === true,
+    })
+
+  /**
+   * Route and upload, in place, the offloaded attributes of a packed,
+   * stored-name item (design §6.3): `only` restricts it to the attributes the
+   * write names (a read-merge update), the rest keep what they hold.
+   */
+  const offloadItem = (
+    item: globalThis.Record<string, unknown>,
+    table: string,
+    operation: string,
+    only?: ReadonlySet<string>,
+  ): Effect.Effect<ReadonlySet<string>, BlobStoreError | ValidationError> =>
+    offloadInfo === undefined
+      ? Effect.succeed(new Set<string>())
+      : Effect.map(
+          OffloadWrite.route(offloadInfo, item, offloadRow(item, table, operation), only),
+          (routed) => routed.uploaded,
+        )
+
+  /**
+   * Resolve, in place, the pointers an unmarshalled stored-name row holds,
+   * eagerly (overflow to JSON wire, binary to bytes). `committed`: the row is
+   * a committed write's result (a store failure then says so, §6.13).
+   */
+  const resolveOffloaded = (
+    raw: globalThis.Record<string, unknown>,
+    operation: string,
+    committed: boolean,
+  ): Effect.Effect<void, BlobStoreError | ValidationError> =>
+    offloadInfo === undefined
+      ? Effect.void
+      : OffloadWrite.resolveStored(offloadInfo, raw, { operation, committed })
+
   /**
    * A domain-named copy of `record` with its packed (or once-packed) attributes
    * read by their stored form. The update paths derive vector source text from
    * it: an untouched packed field still holds its stored value there (a JSON
-   * string or compressed bytes), not the value the source `compose` expects.
-   * `record` itself is left as is, so the write still carries the stored bytes.
+   * string or compressed bytes), not the value the source `compose` expects —
+   * and an untouched offloaded one its pointer, resolved here eagerly (one GET
+   * per pointer, design §6.5). `record` itself is left as is, so the write
+   * still carries the stored bytes.
    */
   const unpackedDomainCopy = (
     record: globalThis.Record<string, unknown>,
     operation: string,
-  ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError> => {
-    if (dispatchAttributes.length === 0) return Effect.succeed(record)
+  ): Effect.Effect<globalThis.Record<string, unknown>, ValidationError | BlobStoreError> => {
+    if (dispatchAttributes.length === 0 && offloadedAttributeNames.length === 0) {
+      return Effect.succeed(record)
+    }
     const stored = { ...record }
     renameToDynamo(stored)
-    return Effect.map(unpackFields(stored, operation), () => {
-      renameFromDynamo(stored)
-      return stored
-    })
+    return Effect.flatMap(resolveOffloaded(stored, operation, false), () =>
+      Effect.map(unpackFields(stored, operation), () => {
+        renameFromDynamo(stored)
+        return stored
+      }),
+    )
   }
 
-  /** The packed attributes an expression or projection may not look inside (EDD-9076). */
-  const packedGuards: ReadonlyArray<PackedAttributeGuard> = Object.entries(packedFields).flatMap(
-    ([field, storedAs]) => {
-      const guard = (attribute: string): PackedAttributeGuard => ({
-        attribute,
-        owner: `Entity "${entityType}"`,
-        storedAs,
-        alternative: () =>
-          `To filter on it, use .filterBy((item) => ...), which runs on the decoded item; to ` +
-          `condition a write on it, read the item and compare in code, then write the whole ` +
-          `value with .set({ ${field} }).`,
-      })
-      const stored = resolveDbName(field)
-      return stored === field ? [guard(field)] : [guard(field), guard(stored)]
-    },
-  )
+  /**
+   * The packed and External attributes an expression or projection may not
+   * look inside (EDD-9076): a binary field's stored value is a pointer (#179),
+   * as opaque to DynamoDB as packed JSON.
+   */
+  const packedGuards: ReadonlyArray<PackedAttributeGuard> = [
+    ...Object.entries(packedFields),
+    ...Object.entries(binaryFields),
+  ].flatMap(([field, storedAs]: readonly [string, PackedAttributeGuard["storedAs"]]) => {
+    const guard = (attribute: string): PackedAttributeGuard => ({
+      attribute,
+      owner: `Entity "${entityType}"`,
+      storedAs,
+      alternative: () =>
+        `To filter on it, use .filterBy((item) => ...), which runs on the decoded item; to ` +
+        `condition a write on it, read the item and compare in code, then write the whole ` +
+        `value with .set({ ${field} }).`,
+    })
+    const stored = resolveDbName(field)
+    return stored === field ? [guard(field)] : [guard(field), guard(stored)]
+  })
 
   /** Throw `[EDD-9076]` when an expression looks inside a packed field. */
   const refusePackedExpr = (expr: Expr, usage: string): void => {
@@ -5451,12 +5689,16 @@ const makeImpl = <
    * value. `undefined` when the update is fine.
    */
   const refusedPackedUpdate = (uState: UpdateState): string | undefined => {
-    if (!hasPackedFields) return undefined
+    if (!hasPackedFields && Object.keys(binaryFields).length === 0) return undefined
+    const guarded = (field: string) => field in packedFields || Object.hasOwn(binaryFields, field)
     const refuse = (op: string, field: string) =>
-      `[EDD-9077] Entity "${entityType}": ${op} on "${field}", but "${field}" is stored packed ` +
-      `(format "${packedFields[field]!.format}"): DynamoDB holds it as one opaque string or ` +
-      `binary value and cannot apply ${op} inside it. Write the whole value with ` +
-      `.set({ ${field} }) (or .remove(["${field}"])).`
+      `[EDD-9077] Entity "${entityType}": ${op} on "${field}", but "${field}" is stored ` +
+      (field in packedFields
+        ? `packed (format "${packedFields[field]!.format}")`
+        : `External (content type "${binaryFields[field]!.contentType}", in the blob store)`) +
+      ": DynamoDB holds it as one opaque string or binary value " +
+      `and cannot apply ${op} inside it. Write the whole value with .set({ ${field} }) ` +
+      `(or .remove(["${field}"])).`
     const records: ReadonlyArray<readonly [string, object | undefined]> = [
       [".add()", uState.add],
       [".subtract()", uState.subtract],
@@ -5465,7 +5707,7 @@ const makeImpl = <
     ]
     for (const [op, values] of records) {
       for (const field of Object.keys(values ?? {})) {
-        if (Object.hasOwn(packedFields, field)) return refuse(op, field)
+        if (guarded(field)) return refuse(op, field)
       }
     }
     const pathOps: ReadonlyArray<
@@ -5484,14 +5726,46 @@ const makeImpl = <
       for (const { segments } of ops) {
         const head = segments[0]
         if (typeof head !== "string" || entryOfPath(segments) !== undefined) continue
-        if (Object.hasOwn(packedFields, head)) return refuse(op, head)
+        if (guarded(head)) return refuse(op, head)
+      }
+    }
+    // A copy FROM a packed or External field would put its opaque stored value (a packed string,
+    // or a blob pointer the collector never looks for there) into another attribute.
+    const copies: ReadonlyArray<
+      readonly [
+        string,
+        ReadonlyArray<{
+          readonly isPath?: boolean
+          readonly valueSegments?: ReadonlyArray<string | number> | undefined
+        }>,
+      ]
+    > = [
+      ["pathSet", uState.pathSets ?? []],
+      ["pathSubtract", uState.pathSubtracts ?? []],
+    ]
+    for (const [op, ops] of copies) {
+      for (const copy of ops) {
+        if (!isCopy(copy)) continue
+        const source = copy.valueSegments!
+        const head = source[0]
+        if (typeof head !== "string" || entryOfPath(source) !== undefined) continue
+        if (guarded(head)) {
+          return (
+            `[EDD-9077] Entity "${entityType}": ${op} copies from "${head}", but "${head}" is stored ` +
+            (head in packedFields
+              ? `packed (format "${packedFields[head]!.format}")`
+              : `External (content type "${binaryFields[head]!.contentType}", in the blob store)`) +
+            ": DynamoDB holds it as one opaque string or binary value, so a copy would put that " +
+            `stored form in another attribute. Read the value and write it with .set().`
+          )
+        }
       }
     }
     for (const { field } of uState.sparseRemoveEntries ?? []) {
-      if (Object.hasOwn(packedFields, field)) return refuse(".removeEntries()", field)
+      if (guarded(field)) return refuse(".removeEntries()", field)
     }
     for (const field of uState.sparseClearFields ?? []) {
-      if (Object.hasOwn(packedFields, field)) return refuse(".clearMap()", field)
+      if (guarded(field)) return refuse(".clearMap()", field)
     }
     return undefined
   }
@@ -6507,6 +6781,36 @@ const makeImpl = <
     if (corruption !== undefined) return Effect.fail(corruption)
     // Native: the item as stored — packed values stay their `S` / `B`.
     if (mode === "native") return Effect.succeed(marshalled)
+    return decodeStored(raw, mode)
+  }
+
+  /**
+   * {@link decodeAs} of a write's result (#179, design §6.13): the item's
+   * offloaded pointers are resolved first, eagerly — what `operation`
+   * uploaded from the ledger's read cache (no GET), anything else fetched —
+   * and a store failure is `BlobStoreError { committed: true }`. Exactly
+   * `decodeAs` for an entity that offloads nothing. Reads and error payloads
+   * use `decodeAs`, which refuses a pointer as before (commit 8 reads them).
+   */
+  const decodeWritten = (
+    raw: globalThis.Record<string, unknown>,
+    marshalled: globalThis.Record<string, AttributeValue>,
+    mode: DecodeMode,
+    operation: string,
+  ): Effect.Effect<any, ValidationError | BlobStoreError> => {
+    if (offloadInfo === undefined || mode === "native") return decodeAs(raw, marshalled, mode)
+    const corruption = versionCorruption(raw, "decode")
+    if (corruption !== undefined) return Effect.fail(corruption)
+    return Effect.flatMap(resolveOffloaded(raw, `${operation}.decode`, true), () =>
+      decodeStored(raw, mode),
+    )
+  }
+
+  /** {@link decodeAs} once the item's pointers (if any) are resolved. */
+  const decodeStored = (
+    raw: globalThis.Record<string, unknown>,
+    mode: Exclude<DecodeMode, "native">,
+  ): Effect.Effect<any, ValidationError> => {
     return Effect.flatMap(unpackFields(raw), () => {
       // Collect flattened sparse-map attributes back into the domain Record.
       // Must happen before rename so the rebuilt Record sits at the domain field
@@ -7117,7 +7421,7 @@ const makeImpl = <
     uState: UpdateState,
   ): Effect.Effect<
     VectorWriteResult,
-    EmbeddingError | DynamoClientError | ValidationError,
+    EmbeddingError | DynamoClientError | ValidationError | BlobStoreError,
     DynamoClient
   > =>
     Effect.gen(function* () {
@@ -7146,7 +7450,9 @@ const makeImpl = <
         if (current.Item) {
           const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
           // Packed fields are read by their stored form: the source text is
-          // derived from the value, not its JSON string or compressed bytes.
+          // derived from the value, not its JSON string or compressed bytes —
+          // and an offloaded one is fetched (one GET per pointer, #179).
+          yield* resolveOffloaded(currentDomain, "update.vector", false)
           yield* unpackFields(currentDomain, "update.vector")
           deserializeSparseFields(currentDomain)
           renameFromDynamo(currentDomain)
@@ -7536,8 +7842,12 @@ const makeImpl = <
         resolveUniqueFields(def as UniqueConstraintDef).map(compositeAttribute),
       )
       const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
+      // Offloaded attributes come first (#179, design §6.4): a write carrying a
+      // pointer it did not upload must be pinned to the row still holding it,
+      // so a narrowed guard never drops one.
       const ordered = [
         ...new Set([
+          ...offloadedAttributeNames,
           ...(updatedAttr !== null ? [updatedAttr] : []),
           ...uniqueAttrs,
           ...modelAttrs,
@@ -7753,7 +8063,9 @@ const makeImpl = <
     image: globalThis.Record<string, AttributeValue> | undefined,
     attributes: ReadonlySet<string>,
     mode: DecodeMode,
-  ) => {
+    /** The write whose result this is: its pointers resolve (see `decodeWritten`). */
+    written?: string,
+  ): Effect.Effect<unknown, ValidationError | BlobStoreError> => {
     const corruption = versionCorruption(image, "decode")
     if (corruption !== undefined) return Effect.fail(corruption)
     const projected: globalThis.Record<string, AttributeValue> = {}
@@ -7762,24 +8074,31 @@ const makeImpl = <
     }
     if (mode === "native") return Effect.succeed(projected)
     const raw = fromAttributeMap(projected) as globalThis.Record<string, unknown>
-    return Effect.flatMap(unpackFields(raw), () => {
-      deserializeSparseFields(raw)
-      renameFromDynamo(raw)
-      const target =
-        mode === "model"
-          ? schemas.modelSchema
-          : mode === "record"
-            ? schemas.recordSchema
-            : schemas.itemSchema
-      const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
-      const present = Object.fromEntries(
-        Object.entries(fields).filter(([name]) => hasOwnName(raw, name)),
-      )
-      const presentSchema = Schema.Struct(present)
-      return Schema.decodeUnknownEffect(presentSchema as unknown as Schema.Codec<any>)(raw).pipe(
-        Effect.mapError((cause) => new ValidationError({ entityType, operation: "decode", cause })),
-      )
-    })
+    const resolved =
+      written === undefined ? Effect.void : resolveOffloaded(raw, `${written}.decode`, true)
+    return Effect.flatMap(
+      Effect.flatMap(resolved, () => unpackFields(raw)),
+      () => {
+        deserializeSparseFields(raw)
+        renameFromDynamo(raw)
+        const target =
+          mode === "model"
+            ? schemas.modelSchema
+            : mode === "record"
+              ? schemas.recordSchema
+              : schemas.itemSchema
+        const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
+        const present = Object.fromEntries(
+          Object.entries(fields).filter(([name]) => hasOwnName(raw, name)),
+        )
+        const presentSchema = Schema.Struct(present)
+        return Schema.decodeUnknownEffect(presentSchema as unknown as Schema.Codec<any>)(raw).pipe(
+          Effect.mapError(
+            (cause) => new ValidationError({ entityType, operation: "decode", cause }),
+          ),
+        )
+      },
+    )
   }
   /**
    * The value an update returns for its `returnValues` mode, from the item
@@ -7794,21 +8113,28 @@ const makeImpl = <
     written: ReadonlySet<string>,
     mode: DecodeMode,
     encodedKey: globalThis.Record<string, unknown>,
-  ): Effect.Effect<unknown, ValidationError | ItemNotFound> => {
+    /** The operation whose committed result this is (its pointers resolve, §6.13). */
+    operation = "update",
+  ): Effect.Effect<unknown, ValidationError | ItemNotFound | BlobStoreError> => {
     const landed = rv === "allOld" || rv === "updatedOld" ? "replaced" : "stored"
     switch (rv) {
       case "none":
         return Effect.succeed(undefined)
       case "updatedOld":
-        return appliedUpdate(decodePartial(old, written, mode), landed)
+        return appliedUpdate(decodePartial(old, written, mode, operation), landed)
       case "updatedNew":
-        return appliedUpdate(decodePartial(next, written, mode), landed)
+        return appliedUpdate(decodePartial(next, written, mode, operation), landed)
       default: {
         const image = rv === "allOld" ? old : next
         if (image === undefined)
           return Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
         return appliedUpdate(
-          decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, mode),
+          decodeWritten(
+            fromAttributeMap(image) as globalThis.Record<string, unknown>,
+            image,
+            mode,
+            operation,
+          ),
           landed,
         )
       }
@@ -7822,11 +8148,14 @@ const makeImpl = <
    * every update. So the failure says what happened, or a caller reads "validation
    * failed" as "nothing changed".
    */
-  const appliedUpdate = <A>(
-    decoding: Effect.Effect<A, ValidationError>,
+  const appliedUpdate = <A, E extends ValidationError | BlobStoreError>(
+    decoding: Effect.Effect<A, E>,
     row: "stored" | "replaced",
-  ): Effect.Effect<A, ValidationError> =>
-    Effect.mapError(decoding, (error) => {
+  ): Effect.Effect<A, E | ValidationError> =>
+    Effect.mapError(decoding, (error): E | ValidationError => {
+      // A store failure resolving the written row's pointers (#179) is its own
+      // `BlobStoreError { committed: true }`, passed through as it is.
+      if (error._tag === "BlobStoreError") return error
       const problem = decodeProblem(error.cause)
       return new ValidationError({
         entityType,
@@ -9589,6 +9918,10 @@ const makeImpl = <
           if (projected !== undefined) Object.assign(item, projected.attributes)
 
           if (opts.putKind === "insert") {
+            // Offloaded fields (#179, design §6.2): routed and uploaded as
+            // `put` does, before the `INSERT`; the ledger settles the
+            // statement (or the `INSERT`-only transaction) that carries them.
+            yield* offloadItem(item, tableName, operation)
             const marshalled = yield* runInsert({
               tableName,
               ttlAttrName,
@@ -9596,7 +9929,7 @@ const makeImpl = <
               item,
               given: encodedInput as globalThis.Record<string, unknown>,
             })
-            return yield* decodeAs(item, marshalled, mode)
+            return yield* decodeWritten(item, marshalled, mode, operation)
           }
 
           // The caller's condition, ANDed onto `create`'s not-exists guard —
@@ -9632,6 +9965,13 @@ const makeImpl = <
             }
           }
 
+          // Offloaded fields (#179, design §6.5): every one the item holds is
+          // routed (thresholds, then the item budget) and uploaded — after the
+          // local guards and the tombstone read, so a refused write uploads
+          // nothing — and its pointer replaces the value. A guarded put's
+          // snapshot of the replaced item copies that item's pointers.
+          yield* offloadItem(item, tableName, operation)
+
           if (guarded) {
             const plan = yield* runGuardedPut({
               tableName,
@@ -9646,7 +9986,7 @@ const makeImpl = <
                 composeAllKeys({ ...keyValues, ...carried }, operation, ownSchema()),
               given: encodedInput as globalThis.Record<string, unknown>,
             })
-            return yield* decodeAs(plan.item, plan.marshalled, mode)
+            return yield* decodeWritten(plan.item, plan.marshalled, mode, operation)
           }
 
           const marshalledItem = yield* marshalOrFail(
@@ -9698,7 +10038,7 @@ const makeImpl = <
           }
 
           // Decode and return using selected mode
-          return yield* decodeAs(item, marshalledItem, mode)
+          return yield* decodeWritten(item, marshalledItem, mode, operation)
         }),
       self,
       input as globalThis.Record<string, unknown>,
@@ -9849,7 +10189,7 @@ const makeImpl = <
       if (unreadable !== undefined) {
         return yield* new ValidationError({ entityType, operation: "update", cause: unreadable })
       }
-      // A packed field takes only a whole-value .set() / .remove() (#147).
+      // A packed or External field takes only a whole-value .set() / .remove() (#147, #179).
       const packedRefusal = refusedPackedUpdate(requested)
       if (packedRefusal !== undefined) {
         return yield* new ValidationError({
@@ -10309,6 +10649,12 @@ const makeImpl = <
      * map (#238).
      */
     preRead?: globalThis.Record<string, AttributeValue>,
+    /**
+     * Take the read-then-write branch (#179, design §6.3): the standard
+     * `UpdateItem` of an entity with an `itemBudget` was rejected for item
+     * size, and the read-merge branch routes the whole merged item.
+     */
+    forceReadMerge = false,
   ) =>
     Effect.gen(function* () {
       const {
@@ -10356,7 +10702,8 @@ const makeImpl = <
           touchesUniqueFields,
           computedComposites,
           pathOpsPresent,
-        })
+        }) ||
+        (forceReadMerge && !pathOpsPresent)
       ) {
         // --- Retain path: read-then-transact ---
         // Read current item (needed to create snapshot of pre-update state)
@@ -10404,6 +10751,11 @@ const makeImpl = <
           ...uState.upsertOver?.fill,
           ...currentDomainItem,
         }
+        // An upsert's fill values the row lacked land in `newItem` as given: they are packed and
+        // routed like the fields the update names (#179), never stored as their plain encoding.
+        const filled = Object.keys(uState.upsertOver?.fill ?? {}).filter(
+          (field) => !Object.hasOwn(currentDomainItem, field),
+        )
         // Sparse-map clear: blow away the entire bucket Record, before anything
         // the update writes into it, as the expression an update sends clears
         // first (#238). The retain path always reads-then-writes the full item,
@@ -10790,7 +11142,10 @@ const makeImpl = <
           newItem,
           "update",
           new Set(
-            Object.entries(hydratedUpdates as globalThis.Record<string, unknown>)
+            [
+              ...Object.entries(hydratedUpdates as globalThis.Record<string, unknown>),
+              ...filled.map((field) => [field, uState.upsertOver?.fill[field]] as const),
+            ]
               .filter(([field, value]) => Object.hasOwn(packedFields, field) && value != null)
               .map(([field]) => resolveDbName(field)),
           ),
@@ -10807,6 +11162,37 @@ const makeImpl = <
             operation: "update",
             cause: immutableChange,
           })
+        }
+        // A restated offloaded immutable that passed stays as stored (#179,
+        // design §6.5): its stored value is carried byte-identical — so the
+        // diff below leaves it out — and it uploads nothing.
+        const keptImmutables = new Set<string>()
+        for (const { attr, offloaded } of immutables) {
+          if (offloaded === undefined || currentItem[attr] === undefined) continue
+          newItem[attr] = fromAttributeValue(currentItem[attr]!)
+          keptImmutables.add(attr)
+        }
+        // Offloaded fields this update names (and does not clear) route on
+        // the merged item and upload — after the local guards above, so a
+        // refused update uploads nothing. Untouched pointers stay as read.
+        if (offloadInfo !== undefined) {
+          yield* offloadItem(
+            newItem,
+            tableName,
+            "update",
+            new Set(
+              [
+                ...Object.entries(hydratedUpdates as globalThis.Record<string, unknown>),
+                ...filled.map((field) => [field, uState.upsertOver?.fill[field]] as const),
+              ]
+                .filter(([, value]) => value != null)
+                .map(([field]) => resolveDbName(field))
+                .filter(
+                  (attr) =>
+                    OffloadWrite.isOffloaded(offloadInfo, attr) && !keptImmutables.has(attr),
+                ),
+            ),
+          )
         }
         const pkField = config.indexes.primary.pk.field
         const skField = config.indexes.primary.sk.field
@@ -10829,7 +11215,9 @@ const makeImpl = <
             ...Object.keys(uState.subtract ?? {}),
             ...Object.keys(uState.append ?? {}),
             ...Object.keys(uState.deleteFromSet ?? {}),
-          ].map(resolveDbName),
+          ]
+            .map(resolveDbName)
+            .filter((attr) => !keptImmutables.has(attr)),
         )
         if (systemFields.version) named.add(systemFields.version)
         if (systemFields.updatedAt) named.add(systemFields.updatedAt)
@@ -11287,10 +11675,11 @@ const makeImpl = <
         if (uState.cascade) {
           const domainData = {
             ...((yield* appliedUpdate(
-              decodeAs(
+              decodeWritten(
                 fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
                 newImage,
                 "model",
+                "update",
               ),
               "stored",
             )) as object),
@@ -11426,7 +11815,10 @@ const makeImpl = <
       // read its row missing writes nothing that requires it, which is what
       // `transactWrite`'s planner relies on.
       let packedRead: globalThis.Record<string, AttributeValue> | undefined
-      if (plainWrite && immutables.some((asserted) => asserted.packed)) {
+      if (
+        plainWrite &&
+        immutables.some((asserted) => asserted.packed || asserted.offloaded !== undefined)
+      ) {
         const stored = yield* readCurrent(tableName, marshalledKey)
         if (stored.Item === undefined) {
           return yield* createsOnMissing
@@ -11606,8 +11998,19 @@ const makeImpl = <
       const nullClears: Array<string> = []
       // A sparse map's entries with no stored form, by their placeholders.
       const entryClears: Array<string> = []
+      // Offloaded values (#179): set inline here, uploaded once the request is
+      // otherwise built (design §6.5) — so a refusal below uploads nothing.
+      const offloadSets: Array<OffloadWrite.OffloadSet> = []
+      // A restated offloaded immutable was read and matched above: it stays
+      // as stored and uploads nothing (design §6.5).
+      const keptImmutables = new Set(
+        immutables
+          .filter((asserted) => asserted.offloaded !== undefined && asserted.wire != null)
+          .map((asserted) => asserted.field),
+      )
       for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
         if (updateSystemColliders.has(attr)) continue
+        if (keptImmutables.has(attr)) continue
 
         if (val === undefined || (val === null && lacks.omits(attr))) {
           // Sparse fields: clearing a sparse field with null is a no-op
@@ -11666,6 +12069,9 @@ const makeImpl = <
         const set = yield* setOf(attr, val, "update")
         names[nameKey] = set.attribute
         values[valKey] = set.value
+        if (offloadInfo !== undefined && OffloadWrite.isOffloaded(offloadInfo, set.attribute)) {
+          offloadSets.push({ valKey, attr: set.attribute })
+        }
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -12144,8 +12550,8 @@ const makeImpl = <
       }
       if (plainWrite) {
         // Restated immutable values must match the item's.
-        for (const [i, { attr, value, packed }] of immutables.entries()) {
-          if (packed) continue // read and compared above (#147)
+        for (const [i, { attr, value, packed, offloaded }] of immutables.entries()) {
+          if (packed || offloaded !== undefined) continue // read and compared above (#147, #179)
           names[`#imm${i}`] = attr
           values[`:imm${i}`] = value
           condParts.push(`#imm${i} = :imm${i}`)
@@ -12200,6 +12606,18 @@ const makeImpl = <
             })
       }
 
+      // Upload the offloaded values this update sets (thresholds only: the
+      // whole item is not in hand, design §6.3) — every one named, even when
+      // equal to what the item holds (§6.4).
+      if (offloadInfo !== undefined && offloadSets.length > 0) {
+        yield* OffloadWrite.setValues(
+          offloadInfo,
+          offloadSets,
+          values,
+          offloadRow(primaryKey, tableName, "update"),
+        )
+      }
+
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
       const written = expressionTargets(updateExpression, names)
@@ -12212,7 +12630,12 @@ const makeImpl = <
               : undefined
           if (sourceId == null) return
           const domainData = yield* appliedUpdate(
-            decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, "model"),
+            decodeWritten(
+              fromAttributeMap(image) as globalThis.Record<string, unknown>,
+              image,
+              "model",
+              "update",
+            ),
             "stored",
           )
           yield* executeCascade(uState.cascade, { ...(domainData as object) }, sourceId)
@@ -12395,6 +12818,17 @@ const makeImpl = <
             return err
           },
         ),
+        // An entity with an item budget: an update rejected for item size runs
+        // once more on the read-merge branch, which routes the whole item
+        // (design §6.3). Not with path operations (no read-merge form).
+        Effect.catchIf(
+          (err) =>
+            offloadInfo?.itemBudget !== undefined &&
+            !pathOpsPresent &&
+            !forceReadMerge &&
+            isItemSizeRejection(err),
+          () => Effect.fail(new OffloadSizeRetry()),
+        ),
         diagnoseItemWrite(
           "update",
           { Update: updateInput as NonNullable<TransactWriteItem["Update"]> },
@@ -12423,10 +12857,41 @@ const makeImpl = <
     requested: UpdateState,
     /** See {@link runPreparedUpdate}. */
     preRead?: globalThis.Record<string, AttributeValue>,
+    /** See {@link runPreparedUpdate}. */
+    forceReadMerge = false,
   ) =>
     Effect.flatMap(prepareUpdate(key, requested), (prepared) =>
-      runPreparedUpdate(key, prepared, mode, preRead),
+      runPreparedUpdate(key, prepared, mode, preRead, forceReadMerge),
     )
+
+  /**
+   * {@link runUpdate}, re-run once on the read-merge branch when its standard
+   * `UpdateItem` was rejected for item size under an item budget (#179,
+   * design §6.3). The retry reuses the first attempt's uploads of the same
+   * content (the ledger's memo); any it does not send again was rejected
+   * with that request and is rolled back at the root's exit.
+   */
+  const sizedUpdate = <A, E, R>(
+    run: (forceReadMerge: boolean) => Effect.Effect<A, E | OffloadSizeRetry, R>,
+  ): Effect.Effect<A, Exclude<E, OffloadSizeRetry>, R> =>
+    run(false).pipe(
+      Effect.catchIf(
+        (e): e is OffloadSizeRetry => e instanceof OffloadSizeRetry,
+        () => run(true),
+      ),
+      // A forced read-merge never retries: what escapes is a defect.
+      Effect.catchIf(
+        (e): e is OffloadSizeRetry => e instanceof OffloadSizeRetry,
+        () => Effect.die(new Error("OffloadSizeRetry escaped the read-merge update")),
+      ),
+    ) as Effect.Effect<A, Exclude<E, OffloadSizeRetry>, R>
+
+  const runUpdateSized = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) => sizedUpdate((force) => runUpdate(key, mode, requested, preRead, force))
 
   /**
    * An update; on a missing item, a plain `.set()` of a complete item creates
@@ -12444,8 +12909,8 @@ const makeImpl = <
   ) => {
     const once = () =>
       prepared === undefined
-        ? runUpdate(key, mode, requested, held)
-        : runPreparedUpdate(key, prepared, mode, held)
+        ? runUpdateSized(key, mode, requested, held)
+        : sizedUpdate((force) => runPreparedUpdate(key, prepared, mode, held, force))
     // A form race (#238): the row's renamed sparse map changed form between the update's read and
     // its write. Read again and written again, as a guarded put is; once every attempt raced, the
     // race is reported naming the map. A row handed in (a transaction's plan) is never re-read here:
@@ -12897,16 +13362,19 @@ const makeImpl = <
             if (opts.returnValues !== "allOld" || old === undefined)
               return Effect.succeed(undefined)
             const raw = fromAttributeMap(old) as globalThis.Record<string, unknown>
-            // The delete is applied: a decode failure must not read as a refusal.
-            return decodeAs({ ...raw }, old, "model").pipe(
-              Effect.mapError(
-                (cause) =>
-                  new DeleteAppliedButUnreadable({
-                    entityType,
-                    key: encodedKey as globalThis.Record<string, unknown>,
-                    item: raw,
-                    cause,
-                  }),
+            // The delete is applied: a decode failure must not read as a
+            // refusal. A store failure resolving the removed item's pointers
+            // (#179) is its own `BlobStoreError { committed: true }`.
+            return decodeWritten({ ...raw }, old, "model", "delete").pipe(
+              Effect.mapError((cause) =>
+                cause._tag === "BlobStoreError"
+                  ? cause
+                  : new DeleteAppliedButUnreadable({
+                      entityType,
+                      key: encodedKey as globalThis.Record<string, unknown>,
+                      item: raw,
+                      cause,
+                    }),
               ),
             )
           }
@@ -13440,6 +13908,12 @@ const makeImpl = <
     opts: EntityPutOpts,
     /** The stored item, when the caller has it: a rejected write returned it. */
     stored?: globalThis.Record<string, AttributeValue>,
+    /**
+     * A plain upsert's `UpdateItem` was rejected for item size under an item
+     * budget (#179, design §6.3): an existing item is updated on the
+     * read-merge branch, which routes the whole merged item.
+     */
+    forceReadMerge = false,
   ) =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -13561,18 +14035,17 @@ const makeImpl = <
           if (current === undefined) return yield* created
           continue
         }
+        const upsertState: UpdateState = {
+          ...emptyUpdateState,
+          updates,
+          condition: opts.condition,
+          withVectors: opts.withVectors,
+          upsertOver: { fill },
+        }
         const updated = yield* Effect.exit(
-          runUpdate(
-            key,
-            mode,
-            {
-              ...emptyUpdateState,
-              updates,
-              condition: opts.condition,
-              withVectors: opts.withVectors,
-              upsertOver: { fill },
-            },
-            current,
+          (forceReadMerge
+            ? runUpdate(key, mode, upsertState, current, true)
+            : runUpdateSized(key, mode, upsertState, current)
           ).pipe(
             // Its errors name the upsert, not the update it runs.
             Effect.mapError((e) =>
@@ -13730,6 +14203,10 @@ const makeImpl = <
           // The sparse maps a `field:` rename stores whole whose entries this upsert writes as
           // attributes of their own: guarded on the row not holding the map whole (#238).
           const entriesWritten = new Set<string>()
+          // Offloaded values (#179): set inline, uploaded once the request is
+          // otherwise built — each before it becomes its `:v`; an immutable one
+          // keeps `if_not_exists`, and the ledger settles it by `ALL_NEW`.
+          const offloadSets: Array<OffloadWrite.OffloadSet> = []
 
           // The physical key attributes (`pk` / `sk`) live in `Key` and cannot
           // appear in an UpdateExpression. The COMPOSITE SOURCE fields are
@@ -13808,6 +14285,9 @@ const makeImpl = <
             const set = yield* setOf(attr, val, "upsert")
             names[nameKey] = set.attribute
             values[valKey] = set.value
+            if (offloadInfo !== undefined && OffloadWrite.isOffloaded(offloadInfo, set.attribute)) {
+              offloadSets.push({ valKey, attr: set.attribute })
+            }
 
             placeholders.set(attr, [nameKey, valKey])
             // Immutable fields use if_not_exists — only set on first create
@@ -13987,6 +14467,15 @@ const makeImpl = <
           }
           // The row a key guard's rejection returned: DynamoDB charges no read for it.
           const rejected: { row?: globalThis.Record<string, AttributeValue> } = {}
+          if (offloadInfo !== undefined && offloadSets.length > 0) {
+            yield* OffloadWrite.setValues(
+              offloadInfo,
+              offloadSets,
+              values,
+              offloadRow(primaryKey, tableName, "upsert"),
+            )
+          }
+
           const mapUpsertFailure = (
             err: DynamoClientError,
           ): DynamoClientError | ConditionalCheckFailed | ValidationError => {
@@ -14019,8 +14508,15 @@ const makeImpl = <
             }
             return err
           }
+          // An entity with an item budget: rejected for item size, the upsert
+          // runs once more through the read-then-write path, which routes the
+          // whole item (#179, design §6.3).
+          const sizeRetry = (err: unknown): boolean =>
+            offloadInfo?.itemBudget !== undefined && isItemSizeRejection(err)
           const written = yield* client.updateItem(upsertInput).pipe(
             Effect.mapError(mapUpsertFailure),
+            Effect.map((output) => Option.some(output)),
+            Effect.catchIf(sizeRetry, () => Effect.succeed(Option.none())),
             diagnoseItemWrite("upsert", {
               Update: upsertInput as NonNullable<TransactWriteItem["Update"]>,
             }),
@@ -14030,7 +14526,9 @@ const makeImpl = <
           // condition that rejected the write, this write is rejected too.
           if (rejected.row !== undefined)
             return yield* guardedUpsert(input, mode, opts, rejected.row)
-          const result = yield* written
+          const sent = yield* written
+          if (Option.isNone(sent)) return yield* guardedUpsert(input, mode, opts, undefined, true)
+          const result = sent.value
 
           if (!result.Attributes) {
             return yield* new ItemNotFound({
@@ -14040,7 +14538,7 @@ const makeImpl = <
           }
 
           const raw = fromAttributeMap(result.Attributes)
-          return yield* decodeAs(raw, result.Attributes, mode)
+          return yield* decodeWritten(raw, result.Attributes, mode, "upsert")
         }),
       self,
       input as globalThis.Record<string, unknown>,
@@ -14417,6 +14915,9 @@ const makeImpl = <
       // attributes on the item (mirrors `.put()`), and though their values
       // never change, writing them on every append makes the first append
       // (where the row doesn't yet exist) materialise the row correctly.
+      // Offloaded `appendInput` fields (#179): uploaded once the request is
+      // built, keyed by the event item (design §6.8).
+      const appendOffloads: Array<{ readonly valKey: string; readonly attr: string }> = []
       for (const [attr, val] of Object.entries(serialisedInput)) {
         if (val === undefined || isEmptySet(val)) continue
         const nameKey = `#a${counter}`
@@ -14426,6 +14927,9 @@ const makeImpl = <
         values[valKey] = toAttributeValue(
           Object.hasOwn(packedFields, attr) ? packedStored[storedName] : val,
         )
+        if (offloadInfo !== undefined && OffloadWrite.isOffloaded(offloadInfo, storedName)) {
+          appendOffloads.push({ valKey, attr: storedName })
+        }
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -14617,6 +15121,33 @@ const makeImpl = <
         }
       }
 
+      // Offloaded `appendInput` values (#179, design §6.8): uploaded once —
+      // thresholds only (the append's CAS transaction has no read-merge
+      // form) — under the EVENT item's key, and the one pointer is SET on the
+      // current item and written on the event item.
+      if (offloadInfo !== undefined && appendOffloads.length > 0) {
+        const staged: globalThis.Record<string, unknown> = {}
+        for (const { attr } of appendOffloads) staged[attr] = eventItem[attr]
+        const row: OffloadWrite.OffloadRow = {
+          ...offloadRow(
+            { [primary.pk.field]: pkValue, [primary.sk.field]: currentSk },
+            tableName,
+            "append",
+          ),
+          rowSk: { S: eventSk },
+        }
+        const { uploaded } = yield* OffloadWrite.route(
+          { ...offloadInfo, itemBudget: undefined },
+          staged,
+          row,
+        )
+        for (const { valKey, attr } of appendOffloads) {
+          if (!uploaded.has(attr)) continue
+          values[valKey] = toAttributeValue(staged[attr])
+          eventItem[attr] = staged[attr]
+        }
+      }
+
       const marshalledEventItem = toAttributeMap(eventItem)
 
       /**
@@ -14751,6 +15282,23 @@ const makeImpl = <
           "model",
         ) as Effect.Effect<ModelType<TModel>, ValidationError>
 
+      /**
+       * The current item for an error's `current`: an offloading entity's
+       * error payload never does store I/O (#179), so an item holding a
+       * pointer is `Option.none()` until lazy decoding (commit 8); any other
+       * decode failure (a corrupt item) fails as it does without offload.
+       */
+      const errorCurrent = (item: globalThis.Record<string, AttributeValue>) => {
+        if (offloadInfo !== undefined) {
+          const raw = fromAttributeMap(item) as globalThis.Record<string, unknown>
+          const holdsPointer = offloadedAttributeNames.some(
+            (attr) => OffloadWrite.pointerOf(offloadInfo, attr, raw[attr]) !== undefined,
+          )
+          if (holdsPointer) return Effect.succeed(Option.none<ModelType<TModel>>())
+        }
+        return Effect.map(decodeCurrent(item), (decoded) => Option.some(decoded))
+      }
+
       const staleAppend = (current: Option.Option<unknown>) =>
         new StaleAppend({ entityType, orderByField, attemptedOrderBy: newObValue, current })
 
@@ -14775,6 +15323,13 @@ const makeImpl = <
             operation: "append.followUp",
             cause: "Current item not found after append — possible TTL race or concurrent delete.",
           })
+        }
+        // An offloading entity's result resolves its pointers — this append's
+        // from the ledger's read cache (#179, §6.13).
+        if (offloadInfo !== undefined) {
+          const raw = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
+          const current = yield* decodeWritten(raw, followUp.Item, "model", "append")
+          return { current: current as ModelType<TModel> }
         }
         return { current: yield* decodeCurrent(followUp.Item) }
       })
@@ -14818,7 +15373,7 @@ const makeImpl = <
             ) {
               return yield* skipFollowUp
                 ? staleAppend(Option.none())
-                : staleAppend(Option.some(yield* decodeCurrent(current)))
+                : staleAppend(yield* errorCurrent(current))
             }
             if (createdAtKeyed) {
               const stored = ownValue(current, resolveDbName(systemFields.createdAt!))
@@ -14853,8 +15408,7 @@ const makeImpl = <
               // something other than a condition cancelled it, which 1.36
               // reported as stale too).
               if (skipFollowUp) return yield* staleAppend(Option.none())
-              const decoded =
-                again === undefined ? Option.none() : Option.some(yield* decodeCurrent(again))
+              const decoded = again === undefined ? Option.none() : yield* errorCurrent(again)
               return yield* userCondition !== undefined
                 ? new ConditionalCheckFailed({
                     entityType,
@@ -14974,6 +15528,33 @@ const makeImpl = <
         })
       }
       const rawCurrent = fromAttributeMap(followUp.Item) as globalThis.Record<string, unknown>
+      if (offloadInfo !== undefined) {
+        // An offloading entity (#179): a stale append's error payload never
+        // does I/O, so a current item holding a pointer is
+        // `current: Option.none()` until lazy decoding (commit 8).
+        const storedOrderBy = fromAttributeMap(followUp.Item)[resolveDbName(orderByField)]
+        // Only a pointer makes `current` none: any other decode failure (a
+        // corrupt item) fails as it does for an entity that offloads nothing.
+        const holdsPointer = offloadedAttributeNames.some(
+          (attr) => OffloadWrite.pointerOf(offloadInfo, attr, rawCurrent[attr]) !== undefined,
+        )
+        const current = holdsPointer
+          ? Option.none()
+          : Option.some(yield* decodeAs(rawCurrent, followUp.Item, "model"))
+        if (!isCasFailure(storedOrderBy, newObValue) && userCondition !== undefined) {
+          return yield* new ConditionalCheckFailed({
+            entityType,
+            key: encoded as globalThis.Record<string, unknown>,
+            current,
+          })
+        }
+        return yield* new StaleAppend({
+          entityType,
+          orderByField,
+          attemptedOrderBy: newObValue,
+          current,
+        })
+      }
       const currentModel = yield* decodeAs(rawCurrent, followUp.Item, "model")
       // Compare in the WIRE form (what DynamoDB evaluated): `newObValue` is
       // the encoded value passed to the CAS, and `rawCurrent` carries the
@@ -15700,7 +16281,7 @@ const makeImpl = <
               diagnoseTransactionWrite("restore", transactItems),
             )
 
-          return yield* decodeAs(restoredItem, marshalledRestoredItem, mode)
+          return yield* decodeWritten(restoredItem, marshalledRestoredItem, mode, "restore")
         }),
       self,
       key as globalThis.Record<string, unknown>,
@@ -16592,6 +17173,7 @@ const makeImpl = <
         if (targets === undefined || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
+        yield* refuseMovingPointerRow(read!, from)
         // Its Delete is guarded on the row as read: one nothing proves unchanged is the context's.
         const guard = deleteGuard(read!, "item", undefined)
         if (!guard.proves) {
@@ -17034,6 +17616,24 @@ const makeImpl = <
   const moveGap = (guard: ReturnType<typeof deleteGuard>): "stamp" | "sparse" | undefined =>
     guard.by === "stamp" ? "stamp" : guard.by === "row" && hasSparseFields ? "sparse" : undefined
 
+  /**
+   * Rekey's backstop (#179, design §11.10): a row holding a blob pointer never moves. Its objects
+   * are named from its key text, so moved it would name objects no write of its new key made.
+   * Offloading requires `escapeKeys: true`, under which such a row is only ever written at its
+   * final key text: judged on the consistent read a move acts on, dry run or not, before anything
+   * is written. Any well-formed pointer, at any depth, whatever the entity now declares: a table
+   * can only be rekeyed off escaped text once its members' offloaded declarations are removed.
+   */
+  const refuseMovingPointerRow = (
+    read: globalThis.Record<string, AttributeValue>,
+    from: StoredKey,
+  ): Effect.Effect<void> => {
+    const attribute = BlobLedger.pointerAttributeOf(read)
+    return attribute === undefined
+      ? Effect.void
+      : Rekey.refusePointerRow(`Entity "${entityType}"`, from, attribute)
+  }
+
   const moveItem = (
     ctx: Rekey.RekeyRowContext,
     from: StoredKey,
@@ -17055,6 +17655,7 @@ const makeImpl = <
         if (targets?.kind !== "item" || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
+        yield* refuseMovingPointerRow(read!, from)
         // Its Delete is guarded on the item as read: one nothing proves unchanged is the context's.
         // On a versioned entity with vector indexes, its vector attributes as read too
         // (`vectorsAsRead`): a move copying old ones lost a `reembed`'s write (#240).
@@ -20356,7 +20957,8 @@ const makeImpl = <
     _vectorIndexes: vectorIndexes,
     _reembedGuard: reembedGuard,
     _refuseTableAttributes: refuseTableAttributes,
-    _packedFields: Object.keys(packedFields),
+    // Packed and External (binary) fields: both are opaque to expressions (#179, §9.1).
+    _packedFields: [...Object.keys(packedFields), ...Object.keys(binaryFields)],
     _packFields: packFields,
     _unpackFields: unpackFields,
     _dispatchAttributes: dispatchAttributes,
@@ -20542,8 +21144,10 @@ const makeImpl = <
     TTimeSeries,
     TGeneratedId,
     TVectorIndexes,
-    ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
-    ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
+    | ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+    | ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>["binary"],
+    ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>,
+    ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>
   >
 
   // Assign self so operation closures can reference the entity
@@ -20579,6 +21183,7 @@ export const bind = <
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
   TUnremovable extends string = never,
+  TOffload extends OffloadFields = NoOffload,
 >(
   entity: Entity<
     TModel,
@@ -20594,7 +21199,8 @@ export const bind = <
     TGeneratedId,
     TVectorIndexes,
     TPackedFields,
-    TUnremovable
+    TUnremovable,
+    TOffload
   >,
 ): Effect.Effect<
   BoundEntity<
@@ -20608,7 +21214,8 @@ export const bind = <
     TGeneratedId,
     TVectorIndexes,
     TPackedFields,
-    TUnremovable
+    TUnremovable,
+    TOffload
   >,
   never,
   DynamoClient | TableConfig
@@ -20624,6 +21231,35 @@ export const bind = <
     // (we only fill the default when absent). See `DESIGN.md`.
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
+    // Configuration checks where the entity is first resolvable (#147, #179):
+    // a packed codec must be registered (`[EDD-9078]`) and an offloaded field
+    // needs a blob store (`[EDD-9115]`) in the context it is bound with —
+    // `DynamoClient.make` binds under the one it bundled.
+    const owner = `entity "${entity.entityType}"`
+    const requirements = OffloadWrite.entityStoreRequirements(owner, entity)
+    // Offloading requires escaped key text (`[EDD-9146]`), before the store.
+    const keysError = OffloadWrite.unescapedKeysError("Entity.bind", requirements)
+    if (keysError !== undefined) throw keysError
+    const codecError = unregisteredCodecError(
+      "Entity.bind",
+      codecRequirements(
+        owner,
+        entity._packedFields.flatMap((field) => {
+          const storedAs = entity._packedGuards.find((g) => g.attribute === field)?.storedAs
+          return storedAs !== undefined && isPackedConfig(storedAs)
+            ? [[field as string, storedAs] as const]
+            : []
+        }),
+      ),
+      Context.getOrUndefined(baseCtx, Compression),
+    )
+    if (codecError !== undefined) throw codecError
+    const storeError = OffloadWrite.missingStoreError(
+      "Entity.bind",
+      requirements,
+      Context.getOrUndefined(baseCtx, BlobStore),
+    )
+    if (storeError !== undefined) throw storeError
     const ctx = Option.isSome(Context.getOption(baseCtx, SecureRandom.SecureRandom))
       ? (baseCtx as Context.Context<DynamoClient | TableConfig | SecureRandom.SecureRandom>)
       : Context.add(baseCtx, SecureRandom.SecureRandom, makeDefaultCrypto())
@@ -21105,7 +21741,8 @@ export const bind = <
       TGeneratedId,
       TVectorIndexes,
       TPackedFields,
-      TUnremovable
+      TUnremovable,
+      TOffload
     >
   })
 
@@ -21398,7 +22035,8 @@ export type Input<E extends { readonly model: Schema.Top }> =
     undefined,
     undefined,
     infer _P extends string,
-    any
+    infer _Un extends string,
+    infer _O extends OffloadFields
   >
     ? EntityRefInputType<M, R>
     : EntityInputType<E["model"]>
@@ -21425,7 +22063,8 @@ export type Create<E extends { readonly model: Schema.Top; readonly indexes: any
     undefined,
     undefined,
     infer _P extends string,
-    any
+    infer _Un extends string,
+    infer _O extends OffloadFields
   >
     ? EntityRefCreateType<M, I, R, Id extends string ? Id : undefined>
     : Omit<EntityInputType<E["model"]>, PrimaryKeyComposites<E["indexes"]>>
@@ -21451,7 +22090,8 @@ export type Update<E extends { readonly model: Schema.Top; readonly indexes: any
     undefined,
     undefined,
     infer _P extends string,
-    any
+    infer _Un extends string,
+    infer _O extends OffloadFields
   >
     ? EntityRefUpdateType<M, I, R>
     : EntityUpdateType<E["model"], E["indexes"]>
@@ -21477,7 +22117,8 @@ export type Key<E extends { readonly model: Schema.Top; readonly indexes: any }>
     any,
     any,
     infer _P extends string,
-    any
+    infer _Un extends string,
+    infer _O extends OffloadFields
   >
     ? EntityKeyType<M, I, R>
     : EntityKeyType<E["model"], E["indexes"]>

@@ -23,6 +23,7 @@ import {
   type ExternalConfig,
   type ExternalPackedConfig,
   type ExtractIdentifier,
+  type ExtractOffloadFields,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
   getIdentifierField,
@@ -34,6 +35,8 @@ import {
   isRecordSchema,
   isRef,
   isRefField,
+  type NoOffload,
+  type OffloadFields,
   type PackedConfig,
   type SparseConfig,
 } from "./DynamoModel.js"
@@ -664,6 +667,7 @@ export interface EntityDefinition<
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
   TUnremovable extends string = never,
+  TOffload extends OffloadFields = NoOffload,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -685,6 +689,12 @@ export interface EntityDefinition<
    * when the entity offloads nothing.
    */
   readonly offload: ResolvedOffload | undefined
+  /**
+   * @internal Type-only (never set at runtime): the domain names of the fields
+   * this entity offloads, by kind ({@link NoOffload} when none) — what the
+   * runtime's operation types add `BlobStoreError` from (#179, §9.1).
+   */
+  readonly _offloadFields?: TOffload | undefined
 
   /**
    * @internal Normalized vector index definitions keyed by logical name. The
@@ -701,9 +711,10 @@ export interface EntityDefinition<
   readonly _resolveDbName: (domainName: string) => string
 
   /**
-   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
-   * Carries the `TPackedFields` type, which narrows expression path builders:
-   * a packed field can be tested only with `exists` / `notExists` as a whole.
+   * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`) or
+   * External (`storedAs: DynamoModel.External(...)`). Carries the
+   * `TPackedFields` type, which narrows expression path builders: such a field
+   * can be tested only with `exists` / `notExists` as a whole.
    */
   readonly _packedFields: ReadonlyArray<TPackedFields>
   /**
@@ -2021,8 +2032,10 @@ export const make = <
   TTimeSeries,
   TGeneratedId,
   TVectorIndexes,
-  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
-  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+  | ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>["binary"],
+  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>,
+  ExtractOffloadFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
@@ -2079,7 +2092,8 @@ const makeDefinitionImpl = (config: {
     offload: data.offload,
     _vectorIndexes: data.vectorIndexes,
     _resolveDbName: data.resolveDbName,
-    _packedFields: Object.keys(data.packedFields),
+    // Packed and External (binary) fields: both are opaque to expressions (#179, §9.1).
+    _packedFields: [...Object.keys(data.packedFields), ...Object.keys(data.externalFields)],
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
