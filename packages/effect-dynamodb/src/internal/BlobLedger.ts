@@ -137,10 +137,10 @@ export interface UnsettledUpload {
   /** The object key. */
   readonly key: string
   /**
-   * The object version; `undefined` when it is unknown (`completeLost`,
+   * The object version; `Option.none()` when it is unknown (`completeLost`,
    * `interrupted`, `answerRefused`).
    */
-  readonly ref: BlobRef | undefined
+  readonly ref: Option.Option<BlobRef>
   /** The store's `name`. */
   readonly store: string
   /** Why: the failed delete's error, the lost response's, the refused answer's `Rejected` error. */
@@ -1501,7 +1501,7 @@ const unsettledOf = (
   operation: target.operation,
   rowKey: target.rowKey,
   key,
-  ref,
+  ref: Option.fromNullishOr(ref),
   store: store.name,
   ...(cause !== undefined && { cause }),
 })
@@ -1522,8 +1522,10 @@ const report = (upload: UnsettledUpload): Effect.Effect<void> =>
         operation: upload.operation,
         rowKey: upload.rowKey,
         objectKey: upload.key,
-        ...(upload.ref !== undefined &&
-          upload.ref.version !== "" && { version: upload.ref.version }),
+        ...Option.match(upload.ref, {
+          onNone: () => ({}),
+          onSome: (ref) => (ref.version === "" ? {} : { version: ref.version }),
+        }),
         store: upload.store,
       }),
     )

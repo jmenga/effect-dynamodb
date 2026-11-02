@@ -361,7 +361,7 @@ describe("Offload — binary inputs and streaming", () => {
         entityType: "Doc",
         attribute: "scan",
         operation: "Entity.put",
-        ref: undefined,
+        ref: Option.none(),
       })
       // The version the store wrote has no pointer: under the reported key, for gc.sweep.
       const [orphan] = store.inspect().versions
@@ -575,7 +575,7 @@ describe("Offload — binary inputs and streaming", () => {
         reason: "completeLost",
         entityType: "Doc",
         attribute: "scan",
-        ref: undefined,
+        ref: Option.none(),
       })
       // The version it made has no pointer: it is left for gc.sweep.
       const [orphan] = store.inspect().versions
@@ -1101,7 +1101,7 @@ describe("Offload — streaming through the S3 store (stubbed S3Client)", () => 
       // to the interruption, so the version has no pointer: reported by key.
       expect(count(stub, "AbortMultipartUpload")).toBe(0)
       expect(reports.map((report) => report.reason)).toEqual(["interrupted"])
-      expect(reports[0]).toMatchObject({ entityType: "Doc", attribute: "scan", ref: undefined })
+      expect(reports[0]).toMatchObject({ entityType: "Doc", attribute: "scan", ref: Option.none() })
       const [complete] = stub.inputs("CompleteMultipartUpload")
       expect(reports[0]!.key).toBe(complete.Key)
       expect(stub.objects.get(complete.Key)).toHaveLength(1)
@@ -1193,7 +1193,7 @@ describe("Offload — streaming through the S3 store (stubbed S3Client)", () => 
           reason: "completeLost",
           entityType: "Doc",
           attribute: "scan",
-          ref: undefined,
+          ref: Option.none(),
         })
         // S3 completed it: a version no pointer names, under the reported key, for gc.sweep.
         expect(stub.objects.get(reports[0]!.key)).toHaveLength(1)

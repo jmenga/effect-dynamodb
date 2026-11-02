@@ -1134,7 +1134,7 @@ export const makeService = (
       ),
     )
 
-  /** An absent ref: `get` gives `undefined`, `set` / `clear` succeed. */
+  /** An absent ref: `get` gives `Option.none()`, `set` / `clear` succeed. */
   const whenPresent = <A>(
     effect: Effect.Effect<A, BlobStoreFailure>,
     absent: A,
@@ -1154,14 +1154,14 @@ export const makeService = (
   const marks: BlobStoreMarks = {
     get: (ref) =>
       whenPresent(
-        Effect.map(tagsOf(ref), (tags) => {
+        Effect.map(tagsOf(ref), (tags): Option.Option<Date> => {
           const value = tags.find((tag) => tag.Key === MARK_TAG)?.Value
           const at = value === undefined ? Number.NaN : Date.parse(value)
           // An unreadable mark reads as none: the sweep marks the version again,
           // which only defers its deletion.
-          return Number.isNaN(at) ? undefined : new Date(at)
+          return Number.isNaN(at) ? Option.none() : Option.some(new Date(at))
         }),
-        undefined,
+        Option.none(),
       ),
     set: (ref, since) =>
       Effect.suspend(() => {

@@ -2,16 +2,20 @@
  * `Offload.View` and the mode types (#179, design §9.2): a read's result type
  * under every mode, optional and nullable fields kept, exactly the model for a
  * member that offloads nothing, and widened or optional modes resolved so that
- * neither the view nor `ReadBlobErrors` under-reports.
+ * neither the view nor `ReadBlobErrors` under-reports. A value the library
+ * returns that may be absent is an `Option` (an unsettled upload's `ref`, a
+ * store's mark).
  *
  * Compile-time only; checked by `tsc -p tsconfig.test.json` (`pnpm check`).
  */
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
-import { Schema } from "effect"
+import { type Effect, type Option, Schema } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
+import type { BlobStoreFailure, BlobStoreMarks, MemoryBlobVersion } from "../src/BlobStore.js"
 import type {
   BlobHandle,
+  BlobRef,
   DefaultOffloadModes,
   ExtractOffloadFields,
   NoOffload,
@@ -22,6 +26,7 @@ import type {
   OffloadState,
   ReadBlobErrors,
   ResolveModes,
+  UnsettledUpload,
   View,
   ViewOf,
 } from "../src/Offload.js"
@@ -201,5 +206,13 @@ describe("Offload types", () => {
       readonly id: string
       readonly scan: BlobHandle
     }>()
+  })
+
+  it("returns an absent value as an Option", () => {
+    expectTypeOf<UnsettledUpload["ref"]>().toEqualTypeOf<Option.Option<BlobRef>>()
+    expectTypeOf<ReturnType<BlobStoreMarks["get"]>>().toEqualTypeOf<
+      Effect.Effect<Option.Option<Date>, BlobStoreFailure>
+    >()
+    expectTypeOf<MemoryBlobVersion["mark"]>().toEqualTypeOf<Option.Option<Date>>()
   })
 })

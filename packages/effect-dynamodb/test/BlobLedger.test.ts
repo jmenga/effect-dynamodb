@@ -547,7 +547,7 @@ describe("BlobLedger — roots and uploads", () => {
                 operation: "Entity.put",
                 rowKey: { pk: "doc#1", sk: "doc" },
                 key: "p/doc/body",
-                ref: undefined,
+                ref: Option.none(),
                 store: memory.name,
                 cause: error,
               },
@@ -1494,7 +1494,7 @@ describe("BlobLedger — exit", () => {
           operation: "Entity.update",
           rowKey: { pk: "doc#1", sk: "doc" },
           key: "p/doc/body",
-          ref: pointer.ref,
+          ref: Option.some(pointer.ref),
           store: store.name,
         },
       ])

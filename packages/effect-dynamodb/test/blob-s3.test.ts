@@ -1057,14 +1057,14 @@ describe("S3 store — marks as version tags", () => {
       const { stub, store } = setup()
       const version = stub.seed("k", bytesOf(3), { tags: [{ Key: "team", Value: "docs" }] })
       const ref = { key: "k", version: version.versionId }
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       const since = new Date("2026-10-30T12:00:00.000Z")
       yield* store.marks!.set(ref, since)
       expect(version.tags).toEqual([
         { Key: "team", Value: "docs" },
         { Key: MARK_TAG, Value: "2026-10-30T12:00:00.000Z" },
       ])
-      expect(yield* store.marks!.get(ref)).toEqual(since)
+      expect(yield* store.marks!.get(ref)).toEqual(Option.some(since))
       // set again: one mark
       yield* store.marks!.set(ref, new Date("2026-10-31T00:00:00.000Z"))
       expect(version.tags.filter((t) => t.Key === MARK_TAG)).toHaveLength(1)
@@ -1080,11 +1080,11 @@ describe("S3 store — marks as version tags", () => {
     }),
   )
 
-  it.effect("an absent version: get gives undefined, set and clear succeed", () =>
+  it.effect("an absent version: get gives none, set and clear succeed", () =>
     Effect.gen(function* () {
       const { stub, store } = setup()
       const ref = { key: "gone", version: "v1" }
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       yield* store.marks!.set(ref, new Date())
       yield* store.marks!.clear(ref)
       expect(stub.inputs("PutObjectTagging")).toHaveLength(0)
@@ -1096,7 +1096,7 @@ describe("S3 store — marks as version tags", () => {
       const { stub, store } = setup()
       const version = stub.seed("k", bytesOf(1), { tags: [{ Key: MARK_TAG, Value: "garbage" }] })
       const ref = { key: "k", version: version.versionId }
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       const failure = failureOf(yield* Effect.exit(store.marks!.set(ref, new Date(Number.NaN))))
       expect(failure.reason).toBe("Rejected")
     }),

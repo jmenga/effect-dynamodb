@@ -204,6 +204,9 @@ export type ViewOf<O extends OffloadState> = View<O["item"], O["fields"], O["mod
  *   contract (no ref, a ref outside the requested key, a ref it had already
  *   returned) and was refused: the version it wrote, if any, has no pointer.
  *
+ * The last three name the requested `key` with `ref: Option.none()`; the
+ * others carry the version as `Option.some(ref)`.
+ *
  * Each is also logged at `Warning`. Queue the item (`rowKey`) for `gc.sweep`;
  * `gc.sweepStore` finds what no process could report. A failing observer is
  * logged and never changes the operation's result. Off by default.

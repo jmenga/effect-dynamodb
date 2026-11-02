@@ -49,7 +49,7 @@ import type { BlobStoreAction, BlobStoreReason } from "@effect-dynamodb/schema/E
 import type { BlobRef } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { MAX_KEY_BYTES } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
-import { Clock, Duration, Effect, Random, Stream } from "effect"
+import { Clock, Duration, Effect, Option, Random, Stream } from "effect"
 import { MAX_METADATA_BYTES, metadataBytes } from "./BlobMetadata.js"
 import {
   type BlobCopyRequest,
@@ -201,8 +201,8 @@ export interface MemoryBlobVersion {
   readonly metadata: Readonly<Record<string, string>>
   readonly lastModified: Date
   readonly isLatest: boolean
-  /** The unreferenced-since mark, when set. */
-  readonly mark: Date | undefined
+  /** The unreferenced-since mark; `Option.none()` when the version has none. */
+  readonly mark: Option.Option<Date>
 }
 
 /** The multipart calls a memory store served (attempts included), and the uploads still open. */
@@ -949,10 +949,9 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
       call(
         { action: "mark", ref, mark: "get" },
         ref,
-        Effect.sync(() => {
-          const mark = find(ref)?.mark
-          return mark === undefined ? undefined : new Date(mark)
-        }),
+        Effect.sync(() =>
+          Option.map(Option.fromNullishOr(find(ref)?.mark), (mark) => new Date(mark)),
+        ),
       ),
     set: (ref, since) =>
       call(
@@ -1018,7 +1017,7 @@ export const make = (options: MemoryBlobStoreOptions = {}): MemoryBlobStore => {
               metadata: v.metadata,
               lastModified: new Date(v.lastModified),
               isLatest: i === versions.length - 1,
-              mark: v.mark === undefined ? undefined : new Date(v.mark),
+              mark: Option.map(Option.fromNullishOr(v.mark), (mark) => new Date(mark)),
             }),
           )
           .reverse()

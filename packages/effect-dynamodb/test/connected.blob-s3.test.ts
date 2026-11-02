@@ -317,7 +317,7 @@ describeConnected("S3 store (connected) — a versioned bucket", () => {
       expect(copied.size).toBe(1_000)
       expect(sameBytes(yield* collect(store.get(copied.ref)), content)).toBe(true)
       expect(yield* store.head!(copied.ref)).toMatchObject({ "edd-attr": "copied" })
-      expect(yield* store.marks!.get(copied.ref)).toBeUndefined()
+      expect(yield* store.marks!.get(copied.ref)).toEqual(Option.none())
       // Its size from HeadObject when the request gives none.
       const sized = yield* store.copy!(first.ref, {
         key: "basic/doc/d",
@@ -353,10 +353,10 @@ describeConnected("S3 store (connected) — a versioned bucket", () => {
           Tagging: { TagSet: [{ Key: "team", Value: "docs" }] },
         }),
       )
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       const since = new Date("2026-10-31T12:00:00.000Z")
       yield* store.marks!.set(ref, since)
-      expect(yield* store.marks!.get(ref)).toEqual(since)
+      expect(yield* store.marks!.get(ref)).toEqual(Option.some(since))
       const tags = (r: BlobRef) =>
         Effect.map(
           send<{ TagSet?: Array<{ Key?: string; Value?: string }> }>(
@@ -372,10 +372,10 @@ describeConnected("S3 store (connected) — a versioned bucket", () => {
       expect(yield* tags(ref)).toEqual({ team: "docs", [MARK_TAG]: since.toISOString() })
       yield* store.marks!.clear(ref)
       expect(yield* tags(ref)).toEqual({ team: "docs" })
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       // A version already gone: nothing to read, set or clear.
       yield* store.delete([ref])
-      expect(yield* store.marks!.get(ref)).toBeUndefined()
+      expect(yield* store.marks!.get(ref)).toEqual(Option.none())
       yield* store.marks!.set(ref, since)
       yield* store.marks!.clear(ref)
     }),

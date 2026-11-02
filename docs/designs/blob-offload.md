@@ -455,8 +455,8 @@ like `ConsumedCapacity`'s `onOperation`) receives every upload the library could
 in-doubt outcomes, failed rollback deletes, lost multipart completions, (*added in commit
 15*) store uploads an interruption cut short (`interrupted`) and (*added in commit 6*) store
 answers refused as naming no version of the requested key (`answerRefused`, §6.2) — with the
-table, entity type, attribute, row key and ref (§6.2), so an application can queue those items
-for `gc.sweep`.
+table, entity type, attribute, row key and ref (`Option<BlobRef>`: none when the version is
+unknown, §6.2), so an application can queue those items for `gc.sweep`.
 
 ### 3.7 Read modes and result types — `.offloaded(mode)`
 
@@ -1073,7 +1073,8 @@ consumed capacity's `CurrentOperation`:
   (`interrupted`, §7: every interrupted call, since the ledger cannot see whether the store
   wrote) and a store `put` answer refused as naming no version of the requested
   key (`answerRefused`: no ref, a ref outside the key, a ref already returned for another
-  upload), reported by the requested key with no ref — the answer's ref is never deleted. Leaks no process could report
+  upload), reported by the requested key with `ref: Option.none()` — the answer's ref is
+  never deleted. Leaks no process could report
   (a crash between upload and exit) are found by `gc.sweepStore` (§11.5). The library never
   interrupts an upload it has sent (*as built in commit 7*): the uploads of one write run
   concurrently, and a failed one fails the write only once every other has settled, so each
@@ -2093,7 +2094,7 @@ gc.sweepStore(options?: {
 
 type StoreSweepFamily =
   | { readonly _tag: "Swept"; readonly familyPrefix: string; readonly member: string; readonly report: SweepReport }
-  | { readonly _tag: "Foreign"; readonly familyPrefix: string; readonly table: string | undefined }
+  | { readonly _tag: "Foreign"; readonly familyPrefix: string; readonly table: Option<string> }
   | { readonly _tag: "Unattributable"; readonly familyPrefix: string; readonly versions: number; readonly bytes: number }
 ```
 
@@ -2313,9 +2314,10 @@ export interface BlobStoreService {
     Stream.Stream<BlobListing, BlobStoreFailure>
   /** The metadata the library wrote with the version (§4.6). */
   readonly head?: (ref: BlobRef) => Effect.Effect<Readonly<Record<string, string>>, BlobStoreFailure>
-  /** Unreferenced-since marks (§11.4). Absent refs: `get` succeeds with `undefined`, `set` / `clear` succeed. */
+  /** Unreferenced-since marks (§11.4). No mark or an absent ref: `get` succeeds with `Option.none()`.
+   *  An absent ref: `set` / `clear` succeed. */
   readonly marks?: {
-    readonly get: (ref: BlobRef) => Effect.Effect<Date | undefined, BlobStoreFailure>
+    readonly get: (ref: BlobRef) => Effect.Effect<Option.Option<Date>, BlobStoreFailure>
     readonly set: (ref: BlobRef, since: Date) => Effect.Effect<void, BlobStoreFailure>
     readonly clear: (ref: BlobRef) => Effect.Effect<void, BlobStoreFailure>
   }
@@ -2496,8 +2498,8 @@ maxVersionBytes?, maxUploadAge?, clock?, failures?: … })`:
   may depend on a failed upload's `ref` — a failed upload fails the operation and is found by
   the sweeps (§7, §11.5) — and tests that inspect the stored version should use `inspect()`.
 - **`inspect()`** returns `{ versions, calls }`: every version (ref, size, a copy of the bytes,
-  content type, metadata, `lastModified`, `isLatest`, `mark`) in listing order, and the number
-  of calls per action.
+  content type, metadata, `lastModified`, `isLatest`, `mark` — an `Option<Date>` since
+  2026-11-02, §24.1 item 11) in listing order, and the number of calls per action.
 
 *Implementation notes (commit 10):*
 
@@ -4271,10 +4273,11 @@ a write path, deletes the gate.
       version id, size or `LastModified`, or a truncated page without a next marker, is
       `Rejected` (never an invented date). **Marks** merge the version's other tags; an
       unparseable mark reads as none; `clear` writes only when a mark is present; an absent
-      version is `undefined` / success. **Presign** signs a `GetObjectCommand` (with
-      `ResponseContentType` when asked) through the given presigner, `expiresIn` in whole
-      seconds (at least 1); an expiry that is not a positive finite `Duration`, or a presigner
-      that throws, is `Rejected`. A ref whose version is `""` is sent without `VersionId`.
+      version is `Option.none()` (*2026-11-02*, §24.1 item 11; was `undefined`) / success.
+      **Presign** signs a `GetObjectCommand` (with `ResponseContentType` when asked) through
+      the given presigner, `expiresIn` in whole seconds (at least 1); an expiry that is not a
+      positive finite `Duration`, or a presigner that throws, is `Rejected`. A ref whose
+      version is `""` is sent without `VersionId`.
     - **Ledger.** `internal/BlobLedger.ts`'s `completeLost` report is `reportCompleteLost`,
       used by `putCall` and now also by the copy path (deviation below). A store `put` or
       `copy` call whose exit is an interruption only (no failure) is reported at exit as
@@ -4581,6 +4584,24 @@ All confirmed by the user as written on 2026-11-01, including every name and def
 12. **PartiQL** (owner, 2026-11-14): `insert()` offloads, and the ledger settles
     `ExecuteStatement` / `ExecuteTransaction`, `DuplicateItemException` proving non-commit only
     for a statement sent once (§6.2).
+13. **Absent results are `Option`** (*added 2026-11-02 at the owner's direction*, following
+    #171's page-cursor change, which returns `Page.cursor` and the rekey resume token as
+    `Option<string>` while `startFrom(cursor: string)` still takes a plain string). A value
+    the library **returns** that may be absent is an `Option<A>`: `StorageEncoding.pointer`,
+    `OffloadedValue.ref` / `BlobHandle.ref`, `EntityChange.oldItem` / `newItem`,
+    `BlobStoreMarks.get` (`Option<Date>`), `UnsettledUpload.ref` (`Option<BlobRef>`), the
+    memory store's `inspect()` version `mark` (`Option<Date>`), and GC's not-yet-built
+    `StoreSweepFamily` `Foreign` case (`table: Option<string>`, §11.5). Values a caller
+    **passes in** stay plain (`ByteRange.length?`, `BlobPutRequest.contentLength`, `list`'s
+    `startAfter?`, `StoredAttributeValue`, the memory store's `failures` hook and the
+    `MemoryBlobCall` it receives, `gc.sweepStore`'s options). Internals may hold `| undefined`
+    and wrap at the public boundary (the ledger keeps `BlobRef | undefined` and wraps when it
+    builds the report). Two returned shapes keep `?` / `| undefined`, as on `main`: error
+    diagnostic fields (`BlobStoreError.ref?`, `BlobStoreFailure.ref?` / `completeLost?`, like
+    `actualVersion?` / `code?`) and resolved-config introspection (`entity.offload`,
+    `entity.offload.itemBudget`, `stream.offload`, like EventStore's `snapshot: number |
+    undefined`). `ReapReport` and `SweepReport` (§11.3, §11.4) name no member that may be
+    absent; any such member commit 16 adds to a returned shape follows this rule.
 
 ### 24.2 Resolved questions
 

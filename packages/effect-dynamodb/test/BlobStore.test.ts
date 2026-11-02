@@ -193,7 +193,11 @@ describe("BlobStore", () => {
             list: () => Stream.empty,
             head: () => Effect.succeed({}),
             presign: () => Effect.succeed(""),
-            marks: { get: () => Effect.void, set: () => Effect.void, clear: () => Effect.void },
+            marks: {
+              get: () => Effect.succeed(Option.none()),
+              set: () => Effect.void,
+              clear: () => Effect.void,
+            },
             limits: { maxVersionBytes: 0, maxKeySuffixBytes: MAX_KEY_SUFFIX_BYTES },
           }),
         ),
@@ -559,15 +563,18 @@ describe("BlobStore", () => {
           const a = yield* store.put(request("k", bytesOf("a")))
           const b = yield* store.put(request("k", bytesOf("b")))
           const since = new Date("2026-11-01T00:00:00.000Z")
-          expect(yield* store.marks.get(a.ref)).toBeUndefined()
+          expect(yield* store.marks.get(a.ref)).toEqual(Option.none())
           yield* store.marks.set(a.ref, since)
-          expect(yield* store.marks.get(a.ref)).toEqual(since)
-          expect(yield* store.marks.get(b.ref)).toBeUndefined()
-          expect(store.inspect().versions.map((v) => v.mark)).toEqual([undefined, since])
+          expect(yield* store.marks.get(a.ref)).toEqual(Option.some(since))
+          expect(yield* store.marks.get(b.ref)).toEqual(Option.none())
+          expect(store.inspect().versions.map((v) => v.mark)).toEqual([
+            Option.none(),
+            Option.some(since),
+          ])
           yield* store.marks.clear(a.ref)
-          expect(yield* store.marks.get(a.ref)).toBeUndefined()
+          expect(yield* store.marks.get(a.ref)).toEqual(Option.none())
           const absent = { key: "absent", version: "v" }
-          expect(yield* store.marks.get(absent)).toBeUndefined()
+          expect(yield* store.marks.get(absent)).toEqual(Option.none())
           yield* store.marks.set(absent, since)
           yield* store.marks.clear(absent)
           const invalid = yield* Effect.exit(store.marks.set(a.ref, new Date(Number.NaN)))
@@ -644,7 +651,7 @@ describe("BlobStore", () => {
           ])
           expect(yield* collect(store.get(b.ref))).toEqual(bytesOf("b"))
           yield* store.marks.set(a.ref, new Date(0))
-          expect(yield* store.marks.get(a.ref)).toEqual(new Date(0))
+          expect(yield* store.marks.get(a.ref)).toEqual(Option.some(new Date(0)))
           yield* store.delete([a.ref])
           expect(store.inspect().versions.map((v) => v.ref)).toEqual([b.ref])
           const copied = yield* store.copy(b.ref, {

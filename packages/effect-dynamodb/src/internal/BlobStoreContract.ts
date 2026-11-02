@@ -126,11 +126,12 @@ export interface BlobStoreLimits {
 }
 
 /**
- * Unreferenced-since marks (design §11.4). An absent ref: `get` succeeds with
- * `undefined`, `set` and `clear` succeed.
+ * Unreferenced-since marks (design §11.4). `get` succeeds with `Option.none()`
+ * for a version without a mark and for an absent ref; `set` and `clear` succeed
+ * on an absent ref.
  */
 export interface BlobStoreMarks {
-  readonly get: (ref: BlobRef) => Effect.Effect<Date | undefined, BlobStoreFailure>
+  readonly get: (ref: BlobRef) => Effect.Effect<Option.Option<Date>, BlobStoreFailure>
   readonly set: (ref: BlobRef, since: Date) => Effect.Effect<void, BlobStoreFailure>
   readonly clear: (ref: BlobRef) => Effect.Effect<void, BlobStoreFailure>
 }
