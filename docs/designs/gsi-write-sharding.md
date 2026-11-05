@@ -144,7 +144,10 @@ runtime-agnostic. Golden vectors pin it; changing it is a breaking change. Aggre
   never pruned. Every
   read path calls it: `DynamoClient` accessors, `Entity.query.<index>`, `Collections`, the client's
   collection accessors and cascade reads.
-- **`KeyText136` stays unsharded** (§9.3).
+- **`KeyText136` stays unsharded** (§9.3): a shard can hold 1.36 sort key text, never 1.36 partition
+  key text.
+- **A sharded partition key has an attribute of its own** (§10, `EDD-9106`), or composing it would
+  overwrite another key.
 
 So the paths the issue's list omits are covered without a per-site change:
 
@@ -187,7 +190,8 @@ from payload and `keyRecord` and not T / N / R. Empty PK half without `by`: neve
 | 3 | P = drop, otherwise | REMOVE | `sparse` can't-compose, or a removed / explicitly nulled PK composite: the legitimate drop, and it writes no unsharded key |
 | 4 | P = noop, T | **fail `EDD-9100`** | Otherwise the stored shard goes stale |
 | 5 | P = noop, otherwise | noop | `preserve` as today |
-| 6 | P = set, not A | SET sharded, truncated included | The normal case |
+| 6a | P = set, not A, T, and the sort key half would keep its text (a hole, under `preserve`) | **fail `EDD-9100`** | The shard would follow the new value while the sort key stays at the old one, and no pin could reach the row (§17.4) |
+| 6 | P = set, not A, otherwise | SET sharded, truncated included | The normal case |
 | 7 | P = set, A, N and `sparse` | REMOVE | The writer explicitly cleared `by` |
 | 8 | P = set, A, PT or T | **fail `EDD-9100`** | Moves the tenant without `by` (the issue's "silent fallback" scenario), or changes one `by` attribute without another |
 | 9 | P = set, A, otherwise | noop | An unrelated `.set({ status })`, with PK composites from `keyRecord`, must never evict or fail |
@@ -200,7 +204,9 @@ callers that compose from partial knowledge and don't write the result as-is:
 - the move path, which recomposes a stored row with `stored` as both payload and key record, where a
   row without `by` keeps what it has.
 
-The SK half is not affected: it follows its existing rule, independently.
+The SK half's own outcome is not affected: it follows its existing rule, and case 6a only asks what
+that rule would do. Under `keep`, case 6a is a noop on both halves, so the retain and computed
+branches can compose from the whole item.
 
 The existing skip predicate itself changed as well, on every index: one composite in `keyRecord` no
 longer wakes a half (§17.2, shape 10). "Holds" above means the predicate as it is now.
@@ -210,8 +216,8 @@ longer wakes a half (§17.2, shape 10). "Holds" above means the predicate as it 
 ### 6.1 Partitions
 
 A query's partitions, in order: current shards by shard number (one when pruned), the `previous`
-layout's by shard number, and, with `previous: 1` only, a 1.36 key when its text differs (§9.3).
-Each is `{ pkValue, condition, rowCheck }`. `Query.fanOut` (internal) installs them, and the
+layout's by shard number, and, with `previous: 1` only, the 1.36 key when its text differs, with each
+shard read again under the 1.36 condition when that differs (§9.3). Each is `{ pkValue, condition, rowCheck }`. `Query.fanOut` (internal) installs them, and the
 terminals branch on them before any other plan.
 
 ### 6.2 Merge
@@ -226,10 +232,11 @@ an empty buffer and a `LastEvaluatedKey` is read before anything further is emit
 **Order.** `compareUtf8` for `S` and bytes for `B`, numeric for `N` (composed keys are never `N`, but
 the comparator covers it exactly, with no float conversion). `.reverse()` inverts the comparison.
 
-**Ties.** Equal sort keys break by partition index, descending under `.reverse()`, so reverse is the
-exact reversal of forward. The issue's second tie-break (the table key) can never be reached: a tie
-is between heads of *different* partitions, and within one partition DynamoDB's order is already
-fixed. Recorded as a change in §15.
+**Ties.** Equal sort keys on different partitions break by partition index, descending under
+`.reverse()`. So `.reverse()` reverses the forward order up to DynamoDB's unspecified order among
+equal sort keys within one partition, which the merge keeps as read and doesn't assume reverses. The
+issue's second tie-break (the table key) can never be reached: a tie is between heads of *different*
+partitions, and within one partition the order is DynamoDB's. Recorded as a change in §15.
 
 ### 6.3 Terminals
 
@@ -360,7 +367,10 @@ Values past a hole and attributes that aren't composites of this index don't cou
 that query: the fingerprint covers the partitions, so pruned and unpruned cursors refuse each other
 (`EDD-9094`). In v1:
 
-- `.where()` doesn't prune, even with `eq` (a design boundary: pins only).
+- `.where()` doesn't prune, even with `eq` (a design boundary: pins only). On a pinned query, the bound
+  builder's `.where()` is clamped under the pins, so the chosen shard still holds every row it can
+  select. The unbound `Query.where()` replaces the condition, so it **undoes** the pruning and reads
+  every partition again (§17.6).
 - `previous` partitions are read whole either way: the old source isn't recorded. `fanOut.pruned`
   speaks for the current layout, so with `previous` it can be `true` over 1 + `previous` partitions.
 - Collection queries never prune (each member has its own source).
@@ -390,7 +400,7 @@ with `previous` instead (§15).
 
 1. Deploy with `previous`. Writes compose the new key. Reads also read the old layout.
 2. Run `db.tables.<Table>.rekey()`.
-3. Remove `previous`.
+3. Remove `previous`, once a `rekey` run reports no conflicts.
 
 An item has one stored index key, so it is returned once, and the layouts are disjoint (§2.1). A
 cursor from before a step is refused with `EDD-9094`, since the layout differs; the caller restarts
@@ -412,21 +422,87 @@ conflict.
 where #181's rule rewrites only 1.36 text. That also moves rows between a layout's own shards after
 `by` is removed or changed, and it runs with the 1.36 fallback off.
 
+**Sort keys.** A sort key half is judged by the composites its values lead with, as the structural
+rule truncates it, so a row truncated under 1.36 is rewritten like a whole one. #181's rule required
+every composite, on every index, and left those rows behind. The rewrite goes in the same conditional
+update as the partition key's.
+
+**`"legacySortKey"`.** A sort key that is neither what its values compose now nor what they composed
+under 1.36 was kept by an index policy, for composites this row lacks, so `rekey` leaves it, as #181
+did. When its text can only be 1.36's (`isSortKeyText136`: a character 1.37 escapes, a `%` starting
+no escape, a `#` a value held, or a number in 1.36's form), no query reads it once the fallback or
+`previous: 1` goes. So it is the conflict `"legacySortKey"`, on every run until a write names its
+composites. Before this, `rekey` reported `conflicts: []` over such a row. A sort key left in current
+text is no conflict: every query can read it.
+
+**A run that moves a row judges it.** The table key move recomposes index keys as an update would, so
+a half with a hole keeps its text. `rekeyAfterMove` reads the moved row and applies the same checks in
+the same run, so "no conflicts" means the same for moved rows. A dry run reports what would be held
+back.
+
 The guard is narrower than the issue's "the item is unchanged since it was read": a write to an
 attribute that doesn't feed this key can't invalidate the new key, so it shouldn't make `rekey`
 retry. Recorded in §15.
 
 ### 9.3 Rows under 1.36 key text (finding 7)
 
-- Sharded partitions hold no 1.36 text: the sharded layout is new in 1.38. `KeyText136.composePk`
-  stays unsharded.
-- With `previous: 1` and the fallback on, the partitions are: N sharded (no row check), the unsharded
-  current text (the current pass's row check when a 1.36 pass exists), and the 1.36 text when it
-  differs (the 1.36 pass's row check). The checks are `keyPassesPlanner`'s, extracted to be shared,
-  and judged against the unsharded view of the index, since that is where these rows live.
-- With no `previous`, or `previous ≥ 2`, no 1.36 pass runs.
+**A shard can hold 1.36 sort key text.** `KeyText136.composePk` stays unsharded, so no partition key in
+a shard is 1.36's, but the sort key is a separate half. An earlier version of this section said
+sharded partitions hold no 1.36 text, because the sharded layout is new in 1.38. That was wrong: a
+write can move the partition key and leave the sort key, and the same pinned query then returned 1 row
+before and 0 after, which `previous: 1` didn't help, since the row had left that partition.
+
+Every path that can move a row into a shard, under `{ count, previous: 1 }`, over a 1.36 sort key:
+
+| Path | Whole sort key | Truncated sort key |
+|---|---|---|
+| `update` naming the partition key but no sort key composite | Kept: the half isn't touched, and no read is sent | Kept |
+| `Transaction.transactWrite` | Kept, likewise | Kept |
+| `append` whose `appendInput` omits the sort key's composites | Kept, likewise | Kept |
+| Retain path | Current text: it composes from the whole item | Kept: the hole leaves it, under `preserve` |
+| `put`, `Batch.write` | Current text | Not applicable: a `put` is whole or absent |
+| The 1.37 move, on a write to a row under its 1.36 table key | Current text | Current text. A hole (a composite present after a missing one) keeps its text |
+| `rekey` | Current text | Current text (§9.2) |
+| `rekey` moving the row from its 1.36 table key | Current text | Current text. A hole is rewritten to the leading run in the same run (§9.2) |
+
+Each of those rows, in both shapes, is tested on a recording table and on DynamoDB Local
+(`writePaths`): the same pins find it before the write, after it, and after a `rekey` that finishes the
+job with `previous` gone.
+
+**Decision: read both texts, and have `rekey` convert or report.**
+
+- Converting the sort key when the partition key moves would need a read, or composites the update
+  doesn't carry. These updates send no read today.
+- Refusing the move would fail ordinary updates for the length of a migration.
+
+**Reads.** With `previous: 1` and the fallback on, when the pins' text differs, the partitions are:
+every current shard under the current condition, the unsharded current text under it, every current
+shard again under the 1.36 condition, and the 1.36 partition under the 1.36 condition. When the
+condition's text didn't change, no shard is read twice: `keepRow` drops a sibling in the same range, as
+it does on any index (§17.1).
+
+**Each row once.** Each pass has a row check, from `keyPassChecks`. On the unsharded layout they judge
+as `keyPassesPlanner` does. In a shard (`shard: true`) they judge the sort key alone, since a stored
+partition key holds a marker the composed key doesn't. The rule for both: the current read keeps a row
+stored at its key now, or at anything but its own 1.36 text, which is a key an index policy left. The
+1.36 read keeps a row stored elsewhere whose current key the current read selects, unless the current
+read has already returned it.
+
+**Merge order holds.** Each pass of a shard is in stored byte order, and the merge compares stored
+bytes, so a row under 1.36 text comes out where its stored bytes sort, as on the unsharded layout. A
+brute-force check covers both directions, the limit landing anywhere, and projection, on both the
+mock and DynamoDB Local.
+
+**Cost.** The second pass is paid only by pins whose text changed: 18 requests against 9 at `count: 8`,
+and 4 against 2 when pruned. There is none with the same text, with `legacyKeys: false`, with `previous`
+gone, or with `previous ≥ 2`.
+
+**Leaving `previous: 1` needs a `rekey` that reports no conflicts.** 1.36 text enters a shard only from
+the unsharded layout, and nothing reads a 1.36 sort key in a shard after that. So no `previous`, or
+`previous ≥ 2`, runs no 1.36 pass. Removing `previous` early hides those rows, as it hides rows still
+in the old layout. The docs say so.
+
 - The move path recomposes through the composer, so such a row lands sharded.
-- Merge across forms uses the stored sort key bytes, the only order those partitions have.
 - Recommended order in the docs: `rekey` to 1.37's key text first, then adopt sharding. Adopting
   directly works and is tested.
 
@@ -435,12 +511,13 @@ retry. Recorded in §15.
 | Code | When | Raised by |
 |---|---|---|
 | `EDD-9099` | Malformed `shards`: `count` not an integer in 2..256, `previous` not a positive integer or equal to `count`, an unknown key, or `shards` on the primary key | `Entity.make` |
-| `EDD-9100` | The shard source is missing when the half is composed (`ValidationError`) | every write path |
+| `EDD-9100` | The shard source is missing when the half is composed, or an update changes `by` and the sort key half can't be recomposed (`ValidationError`) | every write path |
 | `EDD-9101` | Nothing to spread: every primary key composite is also a PK composite of the index, with or without `by` | `Entity.make` |
 | `EDD-9102` | `by`: empty, duplicated, not a sort key composite of this index, or on a Z-order half | types + `Entity.make` |
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` | the call |
 | `EDD-9105` | `concurrency` not a positive integer | the call |
+| `EDD-9106` | Two key halves stored in one attribute compose different text, sharded or not (§17.3) | types, where the literals say so, + `Entity.make` |
 | `EDD-9094` | Cursor mismatch or tamper (existing) | the terminal |
 
 ### 10.1 The cap on `count` *(proposed)*
@@ -488,6 +565,7 @@ so the spelling doesn't depend on the cap.
 | Logical query | 1+ requests | N+ requests, each billed the per-request minimum |
 | Latency | one round trip | one per round (§6.3). A round takes about its slowest shard. `.fetch()` without `limit` is one round; `.limit(n).fetch()` is one round of every shard, then refills, usually one shard at a time |
 | `.limit(n).fetch()` | reads the page | at least N partial pages, sized from `n / N`, plus the refills |
+| Migrating (`previous: 1`, fallback on), pins whose text changed | 2 requests | 2N + 2 requests, or 4 when pruned (§9.3) |
 
 **Choosing N:** N ≥ peak WCU/s on the logical key ÷ (1,000 × headroom). Small logical partitions pay
 N times the per-request minimum for nothing, so sharding is for keys that need it.
@@ -581,6 +659,17 @@ the direction, and it is still proposed for the owner.
 | D35 | `fanOut.pruned` speaks for the current layout: it can be `true` while a `previous` layout is read whole (§7) | proposed — awaiting owner confirmation |
 | D36 | Removing `by` at an unchanged `count` is a boundary now that full pins prune: such a query misses unmoved rows until `rekey` has moved them (§8) | proposed — awaiting owner confirmation |
 | D37 | Request sizing and refills stay as they are after the AWS measurement (26 requests, 2.1 s p50 for a page of 100 over 20 shards, §12). Whether to tune them is the owner's decision | open — owner to decide |
+| D38 | Two key halves in one attribute must compose the same text for every item: `EDD-9106` at `Entity.make`. **This covers unsharded halves that disagree too**, which already overwrote each other; same-text overlaps (an inverted index, an LSI's partition key) stay legal (§17.3) | proposed — awaiting owner confirmation |
+| D39 | The type level refuses a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`. Two sharded indexes that differ, and non-literal `field`s, are caught at runtime only (§17.3) | proposed — awaiting owner confirmation |
+| D40 | An update that changes `by` when the sort key half can't be recomposed fails with `EDD-9100`, on the standard and `append` paths, **even when the value named is the one already stored**, as no read is sent (§5 case 6a, §17.4) | proposed — awaiting owner confirmation |
+| D41 | An item legitimately lacking a sort key composite can't have its `by` changed until the update includes that composite or `.remove()`s it (§17.4) | proposed — awaiting owner confirmation |
+| D42 | Under `previous: 1` with the fallback on, a shard is read under both texts when the pins' text differs, and only then: twice the requests during the migration (§9.3) | proposed — awaiting owner confirmation |
+| D43 | `rekey` rewrites truncated 1.36 sort keys, on every index, in the same update as the partition key (§9.2) | proposed — awaiting owner confirmation |
+| D44 | A sort key `rekey` can't rewrite and that can only be 1.36 text is the conflict `"legacySortKey"`, on every run, until a write names its composites. So a migration can't be called clean over such a row (§9.2) | proposed — awaiting owner confirmation |
+| D45 | The same `rekey` run judges a row it moved from a 1.36 table key (§9.2) | proposed — awaiting owner confirmation |
+| D46 | Leaving `previous: 1` requires a `rekey` that reports no conflicts: documented, not enforced, since nothing at `make` can know (§9.3) | proposed — awaiting owner confirmation |
+| D47 | Unbound `Query.where()` undoes pruning and reads every partition, including `previous`'s. Internal callers whose condition stays under the pins use `Query.whereUnderPins` (§17.6) | proposed — awaiting owner confirmation |
+| D48 | With the fallback on, on any index, a row whose key an index policy left stays visible to pins whose text changed: the current read rejects a row only at its own 1.36 text (§17.5) | proposed — awaiting owner confirmation |
 
 ## 15. Scoping decisions
 
@@ -634,10 +723,10 @@ Every item in the issue, mapped to **in**, **out** or **changed**.
 | `by` change moves the entry | in | |
 | Docs warning on coarse `by` values | in | Guide |
 | `previous` transition: writes new, reads both, merged | in | |
-| `rekey` pass | in | §9.2; what it leaves alone is listed under boundaries |
+| `rekey` pass | in | §9.2, including truncated sort keys; what it leaves alone is reported, and listed under boundaries |
 | `rekey` keeps dry run, segments, resume, conflicts, capacity | in | |
 | `rekey` moves only index key attributes, conditional on unchanged item | **changed** | Guard covers the key's inputs, not the whole item (§9.2) |
-| Remove `previous` | in | Documented step |
+| Remove `previous` | in | Documented step, after a `rekey` that reports no conflicts (D46) |
 | `count` integer ≥ 2 | in | Plus the cap (§10.1) |
 | Nothing-to-spread rejection, with or without `by` | in | `EDD-9101` |
 | `previous` positive integer ≠ `count` | in | |
@@ -696,7 +785,21 @@ Not in the issue; each one is something a caller could otherwise expect:
 | A default source prunes only where the index's keys hold the whole primary key | Accessor pins are the index's composites, so a composite outside them can't be pinned (§7) |
 | Removing `by` at an unchanged `count` can hide rows from a full primary key pin until `rekey` has moved them | §8, D36 |
 | "`by` is required" means "when the half is composed": a `put` without it is sparse (D26), `.remove(["by"])` drops the half (D7), an unrelated update is a noop (D8), and clearing it under `sparse` removes the half (§5 case 7) | None of them writes an unsharded key |
-| The `rekey` sharding pass covers sharded PK halves; other index keys keep #181's rule | §9.2 |
+| The `rekey` sharding pass covers sharded PK halves; other index keys keep #181's rule, over the composites their values lead with | §9.2 |
+| Two key halves in one attribute must compose the same text, sharded or not | `EDD-9106`, D38: the one written last overwrites the other |
+| `EDD-9106` compares letter case only when both halves spell out their `casing`, and Z-order halves by composite names | `Entity.make` doesn't know the schema's casing, and a Z-order half's bytes need an item (§17.3) |
+| A key `field` equal to a model attribute or a vector index's partition attribute isn't checked | Not part of this fix; not examined further |
+| Type-level refusal stops at what literals show: two sharded indexes that differ, and non-literal `field`s, are runtime only | D39 |
+| Naming the stored `by` value in an update with a hole in the sort key is refused | No read is sent to tell it's the same value (D40) |
+| An item that legitimately lacks a sort key composite can't change `by` until the update includes or removes it | D41 |
+| An `append` with `by` and without the sort key's other composites fails at runtime on every call | Nothing at `make` checks it. A definition check is possible follow-up work (§17.4) |
+| Reads under `previous: 1` double their requests on pins whose text changed | §9.3, D42 |
+| Leaving `previous: 1` needs a `rekey` that reports no conflicts, and nothing enforces it | §9.3, D46 |
+| `{ count }` with no `previous`, over a populated index, reads neither the old layout nor its 1.36 text | As before: `previous` is how old rows stay readable (§9.3) |
+| A value spelled like an escape (`50%25`) can't be told from one when judging `"legacySortKey"` | Its values are gone: only the text is left. It reads as the value that escapes to it (§9.2) |
+| `"legacySortKey"`'s number check applies only when the row still holds that composite as a number | Otherwise nothing says the segment was a number (§9.2) |
+| A truncated partition key half on an unsharded index isn't judged by `rekey` | No query can reach one, then or now |
+| `.where()` bounds other than `eq` and `beginsWith` have no 1.36 pass, and the unbound `Query.where()` drops the 1.36 read | Existing since #181 (`LegacyKeyQueries`), now on shards too |
 | After `rekey`, a row that can't compose a key stays where it is: a conflict when it's in another layout, left alone in the current one | D18, D24. "No stored key stays unsharded" holds for rows that can compose |
 | The move path keeps a row's key when `by` is absent | `onMissingShardSource: "keep"` (§5): the row has nothing to hash |
 
@@ -718,6 +821,15 @@ read against its design section. What that found:
 
 The other "in" rows match their sections: merge, ties, cursors (the integrity boundary was already
 listed), `.maxPages`, `.zorder()` and Z-order `by`.
+
+### Audits behind §17.3 to §17.6
+
+| Question | Where | Finding |
+|---|---|---|
+| Which write paths can leave a 1.36 sort key in a shard? | `update`, `Transaction.transactWrite`, `append`, retain, `put`, `Batch.write`, the 1.37 move, `rekey` | §9.3's table. Each is covered by a test on a recording table and on DynamoDB Local |
+| Which key attributes can a sharded partition key overwrite? | Table `pk` and `sk`; another index's `pk` or `sk`; its own `sk`; a sharded one with another count, source, composites or collection | All refused (§17.3). Identical sharded layouts and same-text unsharded overlaps stay legal |
+| Which combinators can change the sort key condition after pruning? | `skConditions` is written only by `make`, `scan`, `where` and the planner | Only `where` (§17.6). `.within()` and Z-order plans are refused on a sharded index, `planEmpty` drops the fan-out, and collections compose with `prune: false` |
+| Which paths can change `by` with a hole in the sort key? | Standard update, `append`, retain, computed | Standard and `append` refuse. Retain and computed read the item and compose it; a real gap refuses there too (§17.4) |
 
 ## 16. Testing
 
@@ -746,16 +858,43 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
 - **Default-source pruning:** `Shards.test.ts`, `ShardedQuery.test.ts` and `connected.sharding.test.ts`:
   a full pin on every row's shard, a partial pin, inputs in another case, typed composites through real
   puts, a cursor, `.where()` and `previous`.
-- **Each regression test was seen to fail** with its fix reverted: the old gate predicate, `begins_with`
-  for a subtree, and pruning for `by` only.
+- **Key attributes (§17.3):** `Shards.test.ts`, with `FieldNames.types.test.ts` in both packages for
+  the compile errors.
+- **Shape 9d (§17.4):** unit in `Shards.test.ts`, entity level in `IndexPolicyV3.test.ts` (standard,
+  sparse, `.remove`, transaction, retain, retain with a gap, computed, `append`), connected in
+  `connected.sharding.test.ts`.
+- **Shards holding both texts (§9.3, §17.5):** `ShardedLegacyText.test.ts` on a recording table and
+  `connected.sharded-legacy-text.test.ts` on DynamoDB Local, from one set of scenarios in
+  `test/helpers/ShardedLegacyRows.ts`: every write path over whole and truncated rows, foreign rows,
+  each row once, what `rekey` reports, request costs, and a brute-force merge over both texts.
+- **`Query.where` (§17.6):** `ShardedQuery.test.ts` and `connected.sharding.test.ts`.
+- **Merge order:** comparators against independent byte and fixed point orderings, and filtered `fetch`
+  chains across reverse, `maxPages` and projection, in `ShardMerge.test.ts` and `ShardedQuery.test.ts`.
+- **Ties:** across shards only, on the mock and on DynamoDB Local. Order among equal sort keys in one
+  partition is DynamoDB's, and the mock's stable order is no evidence of it, so no test asserts that
+  a reverse read reverses it.
+- **`ChangeFeed.test.ts`:** the sleeps that could fail under load now await the signal they were waiting
+  for, with the same assertions. Three remain that can't fail from load: a slow consumer, a real lease
+  expiry, and a check that a held lease stays waiting.
+- **Each regression test was seen to fail** with its fix reverted. A mutation check over 20 reverts: the
+  old gate predicate, `begins_with` for a subtree, pruning for `by` only, `EDD-9106` absent and ignoring
+  the shard source, a `by` update leaving the sort key, `Query.where` keeping its pruning, the three
+  callers that stay under their pins undoing it, a shard read under one text, no row check in a shard, a
+  shard judged by its partition key, a row in both ranges returned twice, #181's row check, `rekey`
+  requiring every sort key composite, `"legacySortKey"` not reported, `isSortKeyText136` never true, a
+  move not judged, and a tie ignoring `reverse`. Its first run found two survivors, both closed: a count
+  comparison that was dead code, as the marker spells the count, so it's gone; and a row in both ranges,
+  which no test reached, so it has one now.
 - **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
   never throughput.
 
-## 17. Two behaviours fixed in this PR
+## 17. Behaviours fixed in this PR
 
-The first version of this PR reported both as observed and unchanged. Both reproduce identically on
-1.36.0 (`60014d2`), 1.37.0 (`31ec5da`) and 1.38.0 as first pushed (`2fc7bc6`), on unsharded indexes.
-Both are bugs. Neither fix changes stored key text.
+The first version of this PR reported §17.1 and §17.2 as observed and unchanged. Both reproduce
+identically on 1.36.0 (`60014d2`), 1.37.0 (`31ec5da`) and 1.38.0 as first pushed (`2fc7bc6`), on unsharded
+indexes. Both are bugs. Neither fix changes stored key text.
+
+§17.3 to §17.6 came from an independent review of `c5874c0`. Each one reproduced before it was fixed.
 
 ### 17.1 A pin on a truncated row's own level
 
@@ -833,3 +972,88 @@ follow-up (D33).
 recomposes to the key it has, which is idempotent. When both halves of an index are skipped there, the
 existing Put-style fallback recomposes from the new item and drops the entry when a composite is missing,
 so such an item has no entry, as it had none.
+
+### 17.3 Two key halves in one attribute
+
+With `primaryKey.pk: { field: "pk", composite: ["tenant"] }` and an index using
+`pk: { field: "pk", composite: ["tenant"] }, shards: 8`, `composeAllKeys` wrote the sharded text over the
+table's `pk`. `put` succeeded and `get` returned `ItemNotFound`. The unsharded version works, since both
+compose the same text, and both compiled.
+
+**Verdict: a bug.** The siblings were real too: an index's `pk.field` equal to the table's `sk`, its own
+`sk`, or another index's `pk` or `sk`, sharded or not, with a different `count`, source, composites or
+collection.
+
+**Fix: `EDD-9106` at `Entity.make`.** The principle is that two key halves in one attribute must compose
+the same text for every item. Both are composed for one made-up item and compared, and a sharded half
+matches only a half sharded the same way.
+
+**On unsharded indexes:** two unsharded halves that disagree were already overwriting each other, so the
+same check refuses them (D38). No fixture in the repo breaks except one that was overlapping by accident.
+Same-text overlaps stay legal: an inverted index over the table's keys, or an LSI's partition key.
+
+**At the type level:** a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an
+unsharded index's `pk` is a compile error on that entry. Two sharded indexes that differ, and non-literal
+`field`s, can't be told apart from a valid case by the types, so they are runtime only (D39).
+
+### 17.4 A `by` update that leaves the sort key behind
+
+With `pk: [tenant]`, `sk: [region, group]`, `shards: { count: 8, by: ["group"] }`, storing
+`{ tenant, region: "r", group: "a" }` and updating with `{ tenant, group: "b" }` moved the partition key to
+group b's shard while `preserve` kept the sort key at `region_r#group_a`. After that no full pin reached
+the row: a pin on `group: "a"` searches the wrong shard, and a pin on `group: "b"` has the wrong sort key.
+
+**Verdict: a bug.**
+
+**Fix: `EDD-9100`** (§5 case 6a). The shard and the sort key must never disagree, and only the writer can
+supply the missing composite. New canonical fixture **9d**, in the unit, entity-level and connected
+suites.
+
+| Path | Outcome |
+|---|---|
+| Standard update, sort key half can't compose, `preserve` | Refused, nothing sent |
+| `sparse` sort key half | The half drops: the item leaves the index, so nothing disagrees |
+| `.remove(["region"])` | Cascades: the item leaves the index, under both policies |
+| `Transaction.transactWrite`, `append` naming `by` but not the gap | Refused |
+| Retain and computed paths | Read the whole item and compose it. A real gap is refused there too |
+| `update` with no `by` in the payload | Unaffected |
+
+What the owner should weigh: naming the value already stored is refused on the standard path, since
+no read is sent to tell (D40), and an item legitimately lacking the gap composite can't change `by` until
+the update includes it or `.remove()`s it (D41).
+
+An update naming the sort key composites and no partition key is a separate refusal, case 2 or 4.
+
+### 17.5 Rows left with 1.36 sort keys, and what `rekey` said about them
+
+§9.3 has the design: shards are read under both texts while migrating, and `rekey` rewrites or reports
+what's left. Over `{ count: 8, previous: 1 }`, a row with `region_new york`:
+
+| | Before | Now |
+|---|---|---|
+| Same pinned query after `.update(key).set({ tenant })` | 1 row, then **0** | 1 row, then 1 row |
+| `rekey` over a truncated 1.36 sort key | `indexKeysRewritten: 1`, `conflicts: []`, sort key untouched, **unreachable** after `previous` went | Sort key rewritten |
+| `rekey` over a 1.36 sort key an index policy left | `conflicts: []` | `"legacySortKey"`, on every run until written |
+| `rekey` moving a row from its 1.36 table key | Left a sort key for the next run | Judged in the same run |
+
+**Two bugs on unsharded indexes, from #181, found while fixing this.**
+
+- With the fallback on, a sort key an index policy left in current text was dropped from every pin whose
+  text changed, so a pin returned 0 rows, and 1 with `legacyKeys: false`. The current read's row check
+  rejected any row not at its own composed key. It now rejects one only at its own 1.36 text (`composed136`,
+  D48).
+- A sort key truncated under 1.36 was never rewritten by `rekey` on any index (D43).
+
+### 17.6 `Query.where()` kept its pruning
+
+`E.query.byTenant({ tenant, region, group: "a" }).pipe(Query.where(conditionForGroupB))` searched only
+group a's shard, so an existing group b row was silently missed. The bound builder's own rejection didn't
+protect the unbound API.
+
+**Verdict: a bug.**
+
+**Fix.** Public `Query.where` restores what the query would read with no pins, including `previous`'s
+partitions (`ReadFanOut.everyPartition`), and reports `pruned: false`. A pin composed by an accessor or
+`Entity.query`, and a bound `.where()` clamped under those pins, use the internal `Query.whereUnderPins`,
+since they select only rows the chosen shard holds. `where` is the only combinator that can change the sort
+key condition after pruning (audit in §15).

@@ -200,7 +200,7 @@ Both `make` and `definition` check the members against each other. Every member 
 | `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
 | `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
-| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable", key, target, message }` — a row `rekey` left as it is |
+| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable" \| "legacySortKey", key, target, message }` — a row `rekey` left as it is. `legacySortKey`: a sort key holding text from before 1.37 that its values don't compose, which an index policy left, so `rekey` can't rewrite it. Queries stop reading it when the 1.36 fallback or a sharded index's `previous: 1` goes |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
 
 ### Table operations
@@ -473,7 +473,7 @@ import { Query } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
+| `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`). The condition replaces what the accessor pinned, so on a [sharded index](/effect-dynamodb/guides/sharding/#pruning) the query reads every shard again |
 | `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter). Each request's `Limit` is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed |
 | `pageSize(n \| "natural")` | Dual | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips), never adapted. `"natural"`: size requests as 1.36 did (a natural 1 MB page under a filter). Any other string throws `EDD-9095` |
 | `maxPages(n)` | Dual | Limit total number of pages fetched. On a [sharded index](/effect-dynamodb/guides/sharding/#request-sizing): `n` rounds, at most one request per unfinished shard in each |

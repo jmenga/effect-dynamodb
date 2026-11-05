@@ -66,6 +66,8 @@ const Devices = Entity.make({
 
 Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
 
+A sharded partition key needs an attribute of its own. Stored in the table's `pk`, or in another key's attribute, it would overwrite that key, so `Entity.make` refuses it (`EDD-9106`), and the type system refuses the cases it can see. Two sharded indexes may share an attribute only when they're sharded the same way and compose the same text.
+
 ### The stored key
 
 A sharded partition key carries a marker, `!<count>.<shard>`, right after the entity type or collection name. The shard is zero-padded to the width of `count - 1`.
@@ -141,7 +143,7 @@ A round reads every shard that has nothing buffered and more to read, all at onc
 ```typescript region="collect" example="guide-sharding.ts"
 // Reads all 8 shards and merges them into the index's order.
 const all = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).collect()
-// Merging in descending order: exactly the reverse.
+// Merging in descending order.
 const descending = yield* db.entities.Devices.byTenant({ tenantId: TENANT })
   .reverse()
   .collect()
@@ -156,7 +158,7 @@ const total = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).count()
 | `.fetch()` without `limit` | One round of reads: what that round proves in order, and a cursor |
 | `.count()` | Counts each shard and sums them, capped at `limit` |
 
-**Order.** The result is the order one partition would give: UTF-8 bytes for a string key, bytes for a binary one. Rows with equal sort keys on different shards come out by shard, and `.reverse()` is the exact reversal of forward.
+**Order.** The result is the order one partition would give: UTF-8 bytes for a string key, bytes for a binary one. Rows with equal sort keys on different shards come out by shard, and `.reverse()` reverses the shards as well. Within one shard, the order of equal sort keys is DynamoDB's, which it doesn't specify, so `.reverse()` reverses the forward order only up to that.
 
 **Projections.** `.select()` still works. The merge and the cursor need each row's keys, so the query reads them as well and strips them from the results.
 
@@ -285,7 +287,7 @@ const sameGroup = yield* db.entities.Devices.byGroup({
 ```
 
 - `by` names sort key composites of this index. The type system offers exactly those, with completions and a compile error for anything else, and `Entity.make` checks again at runtime (`EDD-9102`).
-- A query prunes when the accessor pins **every** attribute of the source, `by` or the primary key. A primary key composite outside the index's keys can't be pinned, so such an index without `by` never prunes. `.where()` doesn't prune, even with `eq`. A `previous` layout is read whole, and a collection reads every shard.
+- A query prunes when the accessor pins **every** attribute of the source, `by` or the primary key. A primary key composite outside the index's keys can't be pinned, so such an index without `by` never prunes. `.where()` doesn't prune, even with `eq`, and the unbound `Query.where()` replaces what the accessor pinned, so that query reads every shard again. A `previous` layout is read whole, and a collection reads every shard.
 - `by` can't be on a Z-order sort key, since an accessor can't pin a dimension.
 
 <Aside type="caution" title="by concentrates writes">
@@ -313,6 +315,7 @@ yield* db.entities.Devices.update(key).set({ tenantId: TENANT, groupId: "group-b
 | Sets every `by` attribute and the partition key composites | The entry moves to the new shard |
 | Sets `by` only | `EDD-9100`, under both [policies](/effect-dynamodb/guides/index-policy/): the new key can't be composed, and leaving it would make pruned queries miss the item |
 | Sets the partition key composites without `by` | `EDD-9100`: the new key's shard can't be computed |
+| Sets `by` and the partition key composites, with the sort key missing another composite | `EDD-9100` under `preserve`: the sort key would stay at the old value in the new value's shard, where no query could find it. Include the composite, or `.remove()` it to take the item out of the index. This holds even if the value you named is the one already stored, since nothing is read to tell |
 | `.remove(["groupId"])` | The entry is removed, under both policies. No unsharded key is written |
 | A `sparse` partition key half that can't compose | The entry is removed as on any index. No unsharded key is written |
 | A `preserve` half with nothing touched | Left as it is |
@@ -365,9 +368,14 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 // report.conflicts          → []
 ```
 
-A row under another layout whose values can't compose a current key (a `by` attribute cleared under `preserve`) is left where it is and reported as a conflict with reason `"uncomposable"`.
+`rekey` reports what it couldn't finish, so the run to look for is one with no conflicts:
 
-**Step 3: remove `previous`.**
+| Conflict reason | The row | What to do |
+|---|---|---|
+| `"uncomposable"` | It is under another layout, and its values can't compose a current key (a `by` attribute cleared under `preserve`) | Write the attribute, or remove the item from the index, then run `rekey` again |
+| `"legacySortKey"` | Its sort key holds text from before 1.37 that its values don't compose: an index policy left it, so `rekey` can't rewrite it | Write that sort key's composites to the item, then run `rekey` again |
+
+**Step 3: remove `previous`,** once a run reports no conflicts. Nothing reads what's left after that.
 
 ```typescript region="adopt-finish" example="guide-sharding.ts"
 // Step 3: deploy without `previous`. Only the 8 shards are read now.
@@ -386,7 +394,7 @@ Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `re
 
 - **Removing `by`** at the same count: a query that reads every shard keeps finding every row, and `rekey` moves rows to the default source's shards. A query that [pins the whole primary key](#pruning) prunes to the default source's shard, so it can miss a row until `rekey` has moved it. If you have such a query, change the count too.
 - **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
-- **Rows still under 1.36 key text** are read and moved as well: with `previous: 1`, the query also reads the 1.36 key when its text differs, and `rekey` lands those rows sharded. Running `rekey` before adopting is simpler to reason about, but adopting directly works.
+- **Rows still under 1.36 key text** are read and moved as well. With `previous: 1`, the query also reads the 1.36 key when its text differs. A write can move such a row's partition key into a shard and leave its sort key, so a query whose pins' text changed reads each shard under both texts until you remove `previous`: for 8 shards, 18 requests where a query whose text didn't change sends 9. `rekey` converts those sort keys, or reports the ones it can't. Running `rekey` before adopting is simpler to reason about and costs less, but adopting directly works.
 
 ## Collections
 
@@ -411,12 +419,13 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 | Code | When | Raised by |
 |---|---|---|
 | `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256, `previous` not a positive integer or equal to `count`, an unknown option, or `shards` on the primary key | `Entity.make` |
-| `EDD-9100` | A shard source value is missing when the partition key is composed | Every write path, as a `ValidationError` |
+| `EDD-9100` | A shard source value is missing when the partition key is composed, or an update changes `by` and the sort key can't be recomposed | Every write path, as a `ValidationError` |
 | `EDD-9101` | Nothing to spread: every primary key composite is also a partition key composite of the index | `Entity.make` |
 | `EDD-9102` | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order sort key | Types and `Entity.make` |
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
 | `EDD-9105` | `concurrency` isn't a positive integer | The call |
+| `EDD-9106` | Two key halves stored in one attribute compose different text, sharded or not | Types, where they can see it, and `Entity.make` |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
 
 ## What's Next?

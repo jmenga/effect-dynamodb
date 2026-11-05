@@ -208,7 +208,7 @@ const program = Effect.gen(function* () {
   // #region collect
   // Reads all 8 shards and merges them into the index's order.
   const all = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).collect()
-  // Merging in descending order: exactly the reverse.
+  // Merging in descending order.
   const descending = yield* db.entities.Devices.byTenant({ tenantId: TENANT })
     .reverse()
     .collect()
@@ -216,7 +216,7 @@ const program = Effect.gen(function* () {
   const total = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).count()
   // #endregion
   assertEq(idsOf(all), everyId, "collect is in index order")
-  assertEq(idsOf(descending), [...everyId].reverse(), "reverse is the exact reversal")
+  assertEq(idsOf(descending), [...everyId].reverse(), "reverse reverses distinct sort keys")
   assertEq(total, devices.length, "count sums the shards")
   yield* Console.log(`${all.length} devices, first ${all[0]?.deviceId}, last ${all.at(-1)?.deviceId}`)
 

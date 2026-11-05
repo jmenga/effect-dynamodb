@@ -166,8 +166,9 @@ export const compareKeyAttributes = (a: AttributeValue, b: AttributeValue): numb
 /**
  * Consume up to `budget` rows in merged order. Stops at the budget, or as soon as
  * a partition with more to read runs dry: nothing further is proven in order
- * until it is read. Equal sort keys order by partition, descending under
- * `reverse`, so reverse is the exact reversal of forward.
+ * until it is read. Equal sort keys on different partitions order by partition,
+ * descending under `reverse`. Within one partition they stay as read: DynamoDB
+ * doesn't specify their order, so `reverse` reverses forward only up to that.
  */
 export const select = (state: MergeState, budget: number, order: MergeOrder): Selection => {
   if (budget <= 0 || state.some(isDry)) return { state, taken: [], drained: [] }
