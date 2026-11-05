@@ -349,7 +349,7 @@ const MovingDevices = Entity.make({
 })
 ```
 
-**Step 2: run `rekey`.** It scans the table and rewrites the index key attributes of every row whose stored key isn't what its values compose now, conditional on the old key and the values feeding it. A concurrent write wins and is left alone. Dry run, parallel segments, resume tokens and the capacity report all work as usual ([Upgrading](/effect-dynamodb/guides/upgrading/)).
+**Step 2: run `rekey`.** It scans the table and moves the partition key of every row whose stored key on a sharded index isn't what its values compose now, conditional on the old key and the values feeding it, and rewrites any other index key still in the text 1.36 composed for the row's values. A concurrent write wins and is left alone. Dry run, parallel segments, resume tokens and the capacity report all work as usual ([Upgrading](/effect-dynamodb/guides/upgrading/)).
 
 ```typescript region="adopt-rekey" example="guide-sharding.ts"
 const movingDb = yield* DynamoClient.make({
@@ -374,17 +374,17 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 |---|---|---|
 | `"uncomposable"` | It is under another layout, and its values can't compose a current key (a `by` attribute cleared under `preserve`) | Write the attribute, or remove the item from the index, then run `rekey` again |
 
-`rekey` compares. It composes each key from the values a row holds, and rewrites the stored key if it differs, including a key an index policy left on a row that holds all its composites. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
+`rekey` compares. A sharded partition key is composed from the row's values, and rewritten if it differs. Any other key is rewritten only when it is exactly its own 1.36 text, so it never overwrites another accessor's entry in an attribute two of them share. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
 
 A dry run judges each row on its own. A row whose destination is held by a row that can't move may be predicted as moved, and the real run then reports it as a conflict.
 
-:::caution[A composite cleared before `rekey` runs]
-`.set({ x: undefined })` under `preserve` removes the value and keeps the key, and then nothing on the row says what the key's text meant. `rekey` leaves that half alone, with no conflict. If the value's text changed in 1.37 (a number other than a positive integer, or a sort key value holding a character 1.37 escapes), then once `previous: 1` or the 1.36 fallback goes:
+:::caution[A key that no longer matches its row's values]
+`rekey` leaves a key that isn't exactly what 1.36 composed for the values the row holds, with no conflict, as nothing on the row says what its text meant. Under `preserve` there are two ways to get one: `.set({ x: undefined })` removes the value and keeps the key, and an update naming a composite it can't recompose the half from changes the value and keeps the key. If the key's text changed in 1.37 (a number other than a positive integer, or a sort key value holding a character 1.37 escapes), then once `previous: 1` or the 1.36 fallback goes:
 
-- **A sort key:** a broader query finds the row, where its old text sorts. A pin on the cleared value misses it.
+- **A sort key:** a broader query finds the row, where its old text sorts. A pin on the old value misses it, and so does a pin on the value the row holds now.
 - **A partition key on an index with no shards:** a pin on the old value misses it with `legacyKeys: false`. `get` still reads the row.
 
-Writing the composite again puts the row back. To keep such pins working, do that before you leave the fallback.
+Writing the composites again puts the row back. To keep such pins working, do that before you leave the fallback.
 :::
 
 **Step 3: remove `previous`,** once a run reports no conflicts. Don't do it sooner: `previous` is what reads rows still in the old layout and, at `previous: 1`, sort keys still in 1.36 text inside a shard, so leaving it early hides them. Nothing enforces this, since nothing at `make` can know. Nothing reads what's left after that.
@@ -406,7 +406,7 @@ Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `re
 
 - **Removing `by`** at the same count: a query that reads every shard keeps finding every row, and `rekey` moves rows to the default source's shards. A query that [pins the whole primary key](#pruning) prunes to the default source's shard, so it can miss a row until `rekey` has moved it. If you have such a query, change the count too.
 - **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
-- **Rows still under 1.36 key text** are read and moved as well. With `previous: 1`, the query also reads the 1.36 key when its text differs. A write can move such a row's partition key into a shard and leave its sort key, so a query whose pins' text changed reads each shard under both texts until you remove `previous`: for 8 shards, 18 requests where a query whose text didn't change sends 9. `rekey` converts those sort keys, unless the row has cleared one of their composites. Running `rekey` before adopting is simpler to reason about and costs less, but adopting directly works.
+- **Rows still under 1.36 key text** are read and moved as well. With `previous: 1`, the query also reads the 1.36 key when its text differs. A write can move such a row's partition key into a shard and leave its sort key, so a query whose pins' text changed reads each shard under both texts until you remove `previous`: for 8 shards, 18 requests where a query whose text didn't change sends 9. `rekey` converts those sort keys, unless the key no longer matches the row's values. Running `rekey` before adopting is simpler to reason about and costs less, but adopting directly works.
 
 ## Collections
 

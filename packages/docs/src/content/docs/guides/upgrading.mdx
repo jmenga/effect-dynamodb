@@ -183,7 +183,7 @@ A stream appended to without a pause can win every flip: it is reported `contend
 
 Until a conflicting row moves, the fallback keeps reading it, so leave the fallback on.
 
-A row that has cleared one of a key's composites isn't a conflict: nothing on it says what the key's text meant, so `rekey` leaves that half alone. Once the fallback goes, a pin on the cleared value misses the row if that value's text changed, though a broader query or `get` still finds it. Writing the composite again puts it back. See [A composite cleared before `rekey` runs](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index).
+A key that isn't what 1.36 composed for the values its row holds isn't a conflict: a row may have cleared one of the key's composites, or the key may lag them. Nothing on the row says what the key's text meant, so `rekey` leaves it. Once the fallback goes, a pin misses the row if the key's text changed, though a broader query or `get` still finds it. Writing the composites again puts it back. See [A key that no longer matches its row's values](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index).
 
 ## Cost
 

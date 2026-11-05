@@ -1183,23 +1183,26 @@ current layout that can't compose is left alone with no conflict. This is step
 2 of adopting a sharded layout: deploy with `previous`, `rekey`, and remove
 `previous` once a run reports no conflicts.
 
-**Index keys, on every index: compare, don't parse.** `staleIndexKeys` composes each
-half from the row's values and compares the result with the stored key; nothing reads a
-value out of a stored key. A half whose row holds every composite is rewritten when they
-differ, whatever text it held. A sort key missing a composite is one of two things, and
-the same comparison tells them apart: truncated under 1.36 (it is exactly what 1.36
-composed for the composites before the gap, and is rewritten like a whole one), or kept
-for a cleared value (`.set({ x: undefined })` under `preserve`), which is left with no
-conflict, as is a partition key missing a composite. A key the row doesn't have isn't
-written, since under `sparse` its absence can be deliberate. A Z-order half is never
-composed here, a table key attribute is never rewritten, and two indexes sharing an
-attribute resolve as on a write: the later one wins. A run that moves an item from its
-1.36 table key reads the moved row and does the same (`rekeyAfterMove`).
+**Index keys, on every index: compare with what 1.36 composed, don't parse.** Nothing
+reads a value out of a stored key. An unsharded partition key, any sort key and a vector
+partition are rewritten only when the stored key is exactly the text 1.36 composed from
+the row's values, and that isn't the current text. Each half is judged by itself, so a
+half only touches a key that is its own 1.36 text, and which accessor owns an attribute
+two of them share, which a row's values can't say, never comes up. A sort key missing a
+trailing composite is judged by the composites before the gap, which is what a row
+truncated under 1.36 stores. Anything else is left with no conflict: a key an index
+policy kept, one lagging its values, one cleared of them. A key the row doesn't have
+isn't written, since under `sparse` its absence can be deliberate. A Z-order index has no
+1.36 text, so only a sharded one's partition key is rewritten, and a table key attribute
+never is. A run that moves an item from its 1.36 table key reads the moved row and does
+the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would,
+but for an attribute two accessors of unsharded indexes share, which stays as stored.
 
-**The accepted limit.** A row that cleared a composite whose key text changed in 1.37
-keeps its old key. Once the fallback or `previous: 1` goes, a pin on the cleared value
-misses it: under a sort key half a broader query finds it where its old text sorts, and
-under a partition key half `get` still reads it. Writing the composite puts it back.
+**The accepted limit.** A key that isn't its own 1.36 text stays, as when a row cleared a
+composite or the key lags its values. When its text changed in 1.37, once the fallback or
+`previous: 1` goes a pin misses it: under a sort key half a broader query finds it where
+its old text sorts, and under a partition key half `get` still reads it. Writing the
+composites puts it back.
 Telling such text apart from current text would take parsing it, and a value can spell
 anything.
 
@@ -1767,6 +1770,8 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
 
 12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
+
+13. **Two accessors storing their halves in one attribute, on a row holding composites of both** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index. Nothing on the row says which owns the attribute, so `rekey` never asks: a half is rewritten only when the stored key is its own 1.36 text, and a move leaves a shared attribute as stored. **The regression scenario from the first form of `rekey`'s comparison**, in which a sparse put, or an update of one accessor's composites, left `byRegion` for `byGroup`'s partition. Ordinary writes to such a pair aren't safe: an unrelated `.set()` overwrites the sort key of `byGroup`'s entry on the standard path, and flips `byRegion`'s partition key on the retain path. Those predate #183. Scenarios in `test/helpers/RekeyComparison.ts` (`sharedPairScenarios`, `sharedPairMoveScenarios`), on a recording table and DynamoDB Local, and on the composer in `KeyComposer.test.ts`.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 

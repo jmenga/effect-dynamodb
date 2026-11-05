@@ -408,25 +408,30 @@ the listing.
 
 ### 9.2 `rekey`
 
-`rekey` compares, and never parses (D58). `staleIndexKeys` composes each half from the row's values and
-compares the result with the stored key. Nothing reads a value out of a stored key, so no label, spelling or
+`rekey` compares with what 1.36 composed, and never parses (D58). `staleIndexKeys` composes text from the row's
+values and compares it with the stored key. Nothing reads a value out of a stored key, so no label, spelling or
 model kind decides anything.
 
-**A half whose row holds every composite** is rewritten when the two differ, whatever the stored text is:
-1.36's, another layout's, a key an index policy left, or one an old gate truncated. That moves rows between
-a layout's own shards after `by` is removed or changed, and it runs with the 1.36 fallback off. The move is
-an `UpdateItem` on the index key attributes alone, guarded on the old key text and the composites feeding it,
-including `by`. Dry run, segments, resume token and capacity report stay as they are. #181's rule rewrote only
-exact 1.36 text, and required every sort key composite, so a truncated row stayed behind.
+**A sharded partition key** is composed and rewritten when it differs from the stored key, whatever that holds
+(D24): moving rows into the layout is the feature. That also moves rows between a layout's own shards after `by`
+is removed or changed, and it runs with the 1.36 fallback off. `EDD-9106` means no half that composes differently
+shares its attribute, so there's no other accessor's entry to overwrite. The move is an `UpdateItem` on the index
+key attributes alone, guarded on the old key text and the composites feeding it, including `by`. Dry run, segments,
+resume token and capacity report stay as they are.
 
-**A sort key missing a composite** is one of two things, and comparing tells them apart. If it is exactly what
-1.36 composed for the composites before the gap, it was truncated under 1.36, and is rewritten like a whole
-one (D43). Anything else was kept for a cleared value (`.set({ x: undefined })` under `preserve`), and is left
-with no conflict. Composing "the key, including a truncated one" and rewriting on any difference would rewrite
-that kept key too, so the one question asked of a half missing a composite is whether it equals 1.36's text
-for what the row still holds.
+**Every other half** (an unsharded partition key, any sort key, a vector partition) keeps #181's rule: it is
+rewritten only when the stored key is exactly the text 1.36 composed from the row's values, and that differs from
+the current text. Each half is judged by itself, so a half only ever touches a key that is its own 1.36 text. The
+question of which accessor owns an attribute two of them share never comes up, which is as well, since a row's
+values can't answer it (§17.15). Anything else is left with no conflict: a key an index policy kept, one lagging its
+values, one cleared of them, or one an old gate truncated on a row holding all its composites (D33).
 
-**A partition key missing a composite** is left with no conflict: a partition key is never truncated.
+**A sort key missing a trailing composite** is judged by the composites before the gap (D43). A row truncated under
+1.36 stores exactly what 1.36 composed for those, and is rewritten to their current text; #181's rule required every
+composite, so such a row stayed behind. A key kept for a cleared value holds more than that, isn't equal, and stays.
+
+**A partition key missing a composite** composes nothing, and is left with no conflict: a partition key is never
+truncated.
 
 **A sharded partition key that can't compose** (a `by` attribute cleared under `preserve`) is the conflict
 `"uncomposable"` when it's in another layout, tested by prefix (`isCurrentShardLayout`), since no read of the
@@ -434,25 +439,27 @@ current layout would find it. One already in the current layout can't be improve
 it is left alone with no conflict.
 
 **What isn't compared.** A key the row doesn't have isn't written, since under `sparse` its absence can be
-deliberate. A Z-order half isn't composed here, and has no 1.36 text; the text half beside it is compared. A
-table key attribute is the table's to hold, and DynamoDB refuses the write. Two indexes sharing an attribute
-resolve as on a write, the later one winning, or a row holding both composites would flip on every run. A
-vector partition is compared the same way, as a write recomposes it whenever it can.
+deliberate. A Z-order index is new in 1.37, so 1.36 wrote no key for it: neither half is compared, unless it's
+sharded, when its partition key moves like any other. A table key attribute is the table's to hold, and DynamoDB
+refuses the write.
 
-**The accepted limit (D58).** A row that clears a composite whose key text changed in 1.37 keeps its old key,
-and nothing says what that text meant. After `rekey` and removing `previous`:
+**The accepted limit (D58).** A key that isn't its own 1.36 text stays, whatever it reflects. That covers a row that
+clears a composite, and a key lagging its row's values (under `preserve`, an update naming a composite it can't
+recompose the half from), when its text changed in 1.37. The key reflects a value the row no longer holds, and
+nothing says what it meant. After `rekey` and removing `previous`:
 
-- **A sort key half:** a broader query finds the row, where its old text sorts. A pin on the cleared value
-  misses it.
-- **A partition key half on an unsharded index:** a pin on the old value misses it with `legacyKeys: false`,
-  and `get` still reads the row.
+- **A sort key half:** a broader query finds the row, where its old text sorts. A pin on the old value misses it, and
+  so does a pin on the value the row holds now.
+- **A partition key half on an unsharded index:** a pin on the old value misses it with `legacyKeys: false`, and
+  `get` still reads the row.
 
-Writing the composite puts it back. The alternative, tried in this PR, was classifying the stored text as
-1.36's or current: §17.10 has why it's gone.
+Writing the composites puts it back. The alternatives, each tried in this PR, were classifying the stored text as
+1.36's or current (§17.10), and rewriting any key that differs from what the row composes (§17.15).
 
-**A run that moves a row compares it.** The table key move recomposes index keys as an update would, so a half
-with a hole keeps its text. `rekeyAfterMove` reads the moved row and applies the same comparison in the same
-run. A dry run has no moved row to read: it judges the one the move would write (`movedRowOf`, which the move
+**A run that moves a row compares it.** The table key move recomposes index keys as an update would, as it has since
+#181, so a half with a hole keeps its text and a lagging key catches up. An attribute two accessors of unsharded
+indexes share stays as stored, since given the whole row the composer takes the later accessor's (D60).
+`rekeyAfterMove` reads the moved row and applies the same comparison in the same run. A dry run has no moved row to read: it judges the one the move would write (`movedRowOf`, which the move
 itself uses), and reports what the real run would for that row (§17.11).
 
 The guard is narrower than the issue's "the item is unchanged since it was read": a write to an
@@ -515,8 +522,8 @@ gone, or with `previous ≥ 2`.
 **Leaving `previous: 1` needs a `rekey` that reports no conflicts.** 1.36 text enters a shard only from
 the unsharded layout, and nothing reads a 1.36 sort key in a shard after that. So no `previous`, or
 `previous ≥ 2`, runs no 1.36 pass. Removing `previous` early hides those rows, as it hides rows still
-in the old layout. The docs say so. A clean run says nothing of a key whose composite was cleared: `rekey`
-leaves it, and a pin on the cleared value then misses it, which is the accepted limit of §9.2.
+in the old layout. The docs say so. A clean run says nothing of a key that isn't its own 1.36 text, as when a composite was cleared or
+the key lags its values: `rekey` leaves it, and a pin then misses it, which is the accepted limit of §9.2.
 
 - The move path recomposes through the composer, so such a row lands sharded.
 - Recommended order in the docs: `rekey` to 1.37's key text first, then adopt sharding. Adopting
@@ -670,7 +677,7 @@ the direction, and it is still proposed for the owner.
 | D30 | `.where(eq)` on a composite that isn't the last, and `eq` in `.within()`, mean the same as a pin on a secondary index (§17.1) | proposed — awaiting owner confirmation |
 | D31 | While the 1.36 fallback is on, a pin whose text didn't change judges rows by key text (`keepRow`), reading nothing more. `.count()` reads rows at the same RCU; later `Limit`s grow (§17.1) | proposed — awaiting owner confirmation |
 | D32 | A half wakes through `keyRecord` only when `keyRecord` holds **every** composite (shape 10, §17.2) | proposed — awaiting owner confirmation |
-| D33 | Rows the old gate already damaged aren't repaired automatically: a write naming the half's composites, or a re-put, repairs them. `rekey` doesn't look for them: since D58 it repairs a truncated key on a row holding all its composites as a side effect, and writes no missing key. A repair pass is a possible follow-up (§17.2) | proposed — awaiting owner confirmation |
+| D33 | Rows the old gate already damaged aren't repaired automatically: a write naming the half's composites, or a re-put, repairs them. `rekey` doesn't, but for a row truncated under 1.36 whose trailing composites it really lacks (D43). A repair pass is a possible follow-up (§17.2) | proposed — awaiting owner confirmation |
 | D34 | A default source prunes when the accessor pins the whole primary key, as the issue says (§7) | issue; the fix was requested by the owner |
 | D35 | `fanOut.pruned` speaks for the current layout: it can be `true` while a `previous` layout is read whole (§7) | proposed — awaiting owner confirmation |
 | D36 | Removing `by` at an unchanged `count` is a boundary now that full pins prune: such a query misses unmoved rows until `rekey` has moved them (§8) | proposed — awaiting owner confirmation |
@@ -683,7 +690,7 @@ the direction, and it is still proposed for the owner.
 | D43 | `rekey` rewrites truncated 1.36 sort keys, on every index, in the same update as the partition key (§9.2) | proposed — awaiting owner confirmation |
 | D44 | ~~A sort key `rekey` can't rewrite and that can only be 1.36 text is the conflict `"legacySortKey"`~~ **Superseded by D58**, which removes the conflict | superseded |
 | D45 | The same `rekey` run compares a row it moved from a 1.36 table key (§9.2) | proposed — awaiting owner confirmation |
-| D46 | Leaving `previous: 1` requires a `rekey` that reports no conflicts: documented, not enforced, since nothing at `make` can know (§9.3). A clean run doesn't promise a pin on a value a row has cleared (D58) | proposed — awaiting owner confirmation |
+| D46 | Leaving `previous: 1` requires a `rekey` that reports no conflicts: documented, not enforced, since nothing at `make` can know (§9.3). A clean run doesn't promise a pin on a key that isn't its own 1.36 text, as when a row has cleared a composite or the key lags its values (D58) | proposed — awaiting owner confirmation |
 | D47 | Unbound `Query.where()` undoes pruning and reads every partition, including `previous`'s. Internal callers whose condition stays under the pins use `Query.whereUnderPins` (§17.6) | proposed — awaiting owner confirmation |
 | D48 | With the fallback on, on any index, a row whose key an index policy left stays visible to pins whose text changed: the current read rejects a row only at its own 1.36 text (§17.5) | proposed — awaiting owner confirmation |
 | D49 | `EDD-9106` judges only pairs with a sharded index among them. Precision is impossible for two unsharded halves: whether two different texts clash depends on data a definition can't show, and two accessors on one index over composites no item holds together is a working pattern. Refusing them would break definitions in a minor release. Every sharded pair is in a new definition, so refusing one breaks nothing (§17.8) | proposed — awaiting owner confirmation |
@@ -695,8 +702,9 @@ the direction, and it is still proposed for the owner.
 | D55 | A dry run judges each row on its own: the row the move would write, reporting for it what the real run would, a move that would fail included. It doesn't simulate chains, so a row whose destination is held by a row that can't move may be predicted as moved (§17.11) | proposed — awaiting owner confirmation |
 | D56 | ~~A new conflict reason, `"legacyPartitionKey"`~~ **Superseded by D58**, which removes the conflict | superseded |
 | D57 | `rekey` calls a row under both keys only if it's still at the old one when it finds it at the new one (§17.13) | proposed — awaiting owner confirmation |
-| D58 | `rekey` compares and never parses. A half whose row holds every composite is composed and rewritten if it differs, whatever it held, so a key an index policy left on such a row is rewritten too. A sort key missing a composite is rewritten only when it equals 1.36's text for the composites before the gap, and anything else missing a composite is left with no conflict. **The accepted limit:** a row that clears a composite whose text changed keeps its old key, so a pin on the cleared value misses it once the fallback or `previous` goes (§9.2, §17.10) | comparison rule approved by the owner, replacing D44, D54 and D56; how a truncated key is told from a cleared one is proposed — awaiting owner confirmation |
+| D58 | `rekey` compares with what 1.36 composed, and never parses. An unsharded partition key, any sort key and a vector partition are rewritten only when the stored key is exactly their own 1.36 text and that isn't the current text; a sort key missing a trailing composite is judged by the composites before the gap (D43). A sharded partition key stays compose-and-compare (D24). Anything else is left with no conflict. **The accepted limit:** a key that isn't its own 1.36 text stays, so a row that cleared a composite, or whose key lags its values, is missed by a pin once the fallback or `previous` goes, when its text changed in 1.37 (§9.2, §17.10, §17.15) | comparison rule approved by the owner, replacing D44, D54 and D56 |
 | D59 | A retained update leaves an index it skipped as stored, as the standard path does. Its Put-style fallback is gone: an index it reached always lacked a composite, so it only ever deleted, and deleted entries `preserve` had kept (§17.14) | proposed — awaiting owner confirmation |
+| D60 | A move leaves an attribute two accessors of unsharded indexes share as stored, where it composed them from the whole row and the later accessor won. A row's values can't say which owns it, and the same run still rewrites it when it is its own 1.36 text. An attribute nothing else shares is recomposed as before (§17.15) | proposed — awaiting owner confirmation |
 
 ## 15. Scoping decisions
 
@@ -826,8 +834,9 @@ Not in the issue; each one is something a caller could otherwise expect:
 | Reads under `previous: 1` double their requests on pins whose text changed | §9.3, D42 |
 | Leaving `previous: 1` needs a `rekey` that reports no conflicts, and nothing enforces it | §9.3, D46 |
 | `{ count }` with no `previous`, over a populated index, reads neither the old layout nor its 1.36 text | As before: `previous` is how old rows stay readable (§9.3) |
-| A row that clears a composite whose text changed keeps its old key: once the fallback or `previous` goes, a pin on the cleared value misses it, a broader query finds a sort key half where its old text sorts, and `get` reads a partition key half | §9.2, D58: nothing on the row says what the text meant, and reading it from the text is what §17.10 removed |
-| A key an index policy left on a row holding all its composites is rewritten | §9.2, D58: the row's values decide. A writer relying on a key staying behind its own composites has no way to say so to `rekey` |
+| A key that isn't its own 1.36 text stays, as when a row cleared a composite or the key lags its values. When its text changed in 1.37, once the fallback or `previous` goes a pin misses it, a broader query finds a sort key half where its old text sorts, and `get` reads a partition key half | §9.2, D58: nothing on the row says what the text meant, and reading it from the text is what §17.10 removed |
+| A run that moves a row catches a lagging key up, on an attribute no other accessor shares. A run that leaves the row where it is doesn't | §9.2: a move recomposes as an update would, as it has since #181. Only a shared attribute differs (D60) |
+| Two unsharded accessors sharing attributes, on a row holding composites of both, aren't safe under ordinary writes: an unrelated `.set()` overwrites the sort key of the later accessor's entry on the standard path, and flips the partition key of the earlier one's on the retain path | §17.15. Not `rekey`, and it predates this PR, so not changed here. `EDD-9106` doesn't judge an unsharded pair (§17.8). Whether to refuse or document such a pair is the owner's |
 | A dry run judges each row on its own, so a row whose destination is held by a row that can't move may be predicted as moved | §17.11, D55: simulating chains isn't worth what it costs a dry run. The real run reports the conflict |
 | `.where()` bounds other than `eq` and `beginsWith` have no 1.36 pass, and the unbound `Query.where()` drops the 1.36 read | Existing since #181 (`LegacyKeyQueries`), now on shards too |
 | After `rekey`, a row that can't compose a key stays where it is: a conflict when it's in another layout, left alone in the current one | D18, D24. "No stored key stays unsharded" holds for rows that can compose |
@@ -861,6 +870,7 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
 | Which paths write or strip a table key attribute through an index half? | The update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first three did, all fixed (§17.9), and the dropped entry is gone (§17.14). `rekey` never rewrites one, whatever it composes (D58). The move's `current` wins |
 | Which definitions reach a client without `Table.make`? | `_configure` is called only by `Table.make` and `carryConfigure`, which copies its result | None (§17.7) |
 | Which halves can a row lose the value of and keep the text of? | An unsharded index's sort key and partition key; a sharded index's sort key; a sharded partition key; a vector partition | All left with no conflict, and pinned on both tables (D58, §17.10), but for a sharded partition key in another layout, which is `"uncomposable"` |
+| Which paths compose every index from a whole row, where an attribute two accessors share goes to the later one? | `rekey`'s in-place rewrite, the move, the retain path, `put` and its kin | §17.15. `rekey` no longer asks, and the move leaves a shared attribute (D60). A retained update still flips it, listed above. A `put` is the write that decides who owns the attribute |
 | Which `ChangeFeed` tests assert on state a fiber is still on its way to? | All of them, at `MaxOpsBeforeYield` 16 to 2048, five rounds | Two (§16) |
 | Which combinators can change the sort key condition after pruning? | `skConditions` is written only by `make`, `scan`, `where` and the planner | Only `where` (§17.6). `.within()` and Z-order plans are refused on a sharded index, `planEmpty` drops the fan-out, and collections compose with `prune: false` |
 | Which paths can change `by` with a hole in the sort key? | Standard update, `append`, retain, computed | Standard and `append` refuse. Retain and computed read the item and compose it; a real gap refuses there too (§17.4) |
@@ -925,12 +935,19 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   `KeyComposer.test.ts`, there and in `connected.sharding.test.ts`.
 - **Dry run:** `helpers/ShardedLegacyRows.ts` seeds 17 situations on both tables and asserts the report
   equals the real run's, whole; `Rekey.test.ts` does the same over its seeds of every row kind.
-- **What `rekey` compares:** `helpers/RekeyComparison.ts`, on both tables. A composite of every kind in each half
-  and the canonical shapes through every write path, after which `rekey` finds nothing to do; a Z-order index's
-  partition key, two accessors sharing an attribute, a table key attribute, labels that begin alike, and a dry run's
-  chain limit. The accepted limit on both halves is in `helpers/ShardedLegacyRows.ts`, also on both tables: read
-  through the fallback, left with no conflict, missed by a pin once the fallback or `previous` goes, and found by a
-  broader query or `get`, until a write puts it back. A vector partition's comparison is on the recording table.
+- **What `rekey` compares:** `helpers/RekeyComparison.ts`, on both tables. A composite of every kind in each half,
+  and the canonical shapes through `put`, `create`, `Batch.write`, `upsert`, updates naming every composite, none or
+  one, a removal, a clearing, a transaction's update, a retained update and `append`: after each, `rekey` judges every
+  row, skips none, rewrites nothing, and the stored rows are equal to what they were, compared whole. Also a Z-order
+  index, a table key attribute, labels that begin alike, and a dry run's chain limit. On the recording table alone, a
+  vector partition, and a write landing between `rekey`'s read and its write.
+- **Two accessors sharing attributes:** new degenerate fixture **13** (§17.15) on the composer in
+  `KeyComposer.test.ts`, and through `rekey` in `helpers/RekeyComparison.ts` on both tables: a sparse put, an update of
+  one accessor's composites, a put holding every composite, and a shared pair where one half really is its own 1.36
+  text and is rewritten, each with its attributes apart as a control, and the same on a move.
+- **The accepted limit:** in `helpers/ShardedLegacyRows.ts`, on both tables, for a cleared composite on both halves
+  and for a key lagging its values: read through the fallback, left with no conflict, missed by a pin once the
+  fallback or `previous` goes, and found by a broader query or `get`, until a write puts it back.
 - **A false `bothKeys`:** forced with the recording table's request hook (§17.13), since on DynamoDB Local it
   took one run in about eight, then 18 of 18 clean after the fix.
 - **Each regression test was seen to fail** with its fix reverted. A mutation check over 20 reverts: the
@@ -955,6 +972,14 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   one row moved over values that compose no shard always had another key to rewrite, so a move's conflict never
   had to open the gate alone; and no test dropped a half stored in a table key attribute, so the composer's filter
   on `removes` went unchecked.
+  A check of the narrowed rule (§17.15) over 26 reverts, 22 of them on the connected suite too, all fail a test now.
+  Restoring "rewrite if they differ" fails 30 tests on the recording table and 23 on DynamoDB Local. The rest: judging by
+  current text, no D43, a sharded partition key held to the 1.36 rule, a Z-order index's partition key compared, each
+  kind of half left out, a table key attribute rewritten, a missing key written, each guard, a move taking the later
+  accessor's text or writing an attribute the row didn't have, and a move's conflict or rewrite unreported. Its first run
+  found one survivor and one gap, both closed: the shared table key attribute in the fixture was one whose text doesn't
+  change on a move, so restoring it showed nothing, and a sharded partition key moving between layouts had no test on
+  DynamoDB Local.
 - **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
   never throughput.
 
@@ -966,7 +991,8 @@ indexes. Both are bugs. Neither fix changes stored key text.
 
 §17.3 to §17.6 came from an independent review of `c5874c0`, and §17.7 to §17.12 from one of the fixes it
 led to; §17.13 and the partition key half of §17.10 came from writing their tests. §17.14, and the current
-form of §17.10 and §17.11, came from a review of `230e499`. Each one reproduced before it was fixed.
+form of §17.11, came from a review of `230e499`, and §17.15 and the current form of §17.10 from one of `ac79b82`. Each
+one reproduced before it was fixed.
 
 ### 17.1 A pin on a truncated row's own level
 
@@ -1037,9 +1063,9 @@ names the composite. **On stored keys:** the text of a composed key doesn't chan
 
 **Existing rows.** A row the old gate already damaged stays as it is, removed or truncated, until a write
 names the half's composites or the item is put again (`connected.per-half-gate.test.ts` pins this). `rekey`
-doesn't look for these rows, and what it does to them follows from comparing (D58): a key truncated on a row
-holding all its composites is repaired as a side effect, a key the row doesn't have isn't written, and a key
-missing a composite is left. Both tables pin the first two. A repair pass for missing keys is a possible
+doesn't repair them, in either text: a key truncated on a row holding all its composites isn't what 1.36 composed for
+what the row holds, and a key the row doesn't have isn't written. Both tables pin both. A row truncated under 1.36
+whose trailing composites it really lacks is the exception, and is rewritten (D43). A repair pass is a possible
 follow-up (D33).
 
 **Retain path.** Its `keyRecord` holds the whole item, so a mixed half with every composite present
@@ -1102,7 +1128,7 @@ what's left. Over `{ count: 8, previous: 1 }`, a row with `region_new york`:
 |---|---|---|
 | Same pinned query after `.update(key).set({ tenant })` | 1 row, then **0** | 1 row, then 1 row |
 | `rekey` over a truncated 1.36 sort key | `indexKeysRewritten: 1`, `conflicts: []`, sort key untouched, **unreachable** after `previous` went | Sort key rewritten |
-| `rekey` over a 1.36 sort key an index policy left | `conflicts: []`, left | Rewritten when the row holds its composites. Left, with no conflict, when it doesn't (D58) |
+| `rekey` over a 1.36 sort key an index policy left | `conflicts: []`, left | Left, with no conflict: it isn't what 1.36 composed for what the row holds. That's the accepted limit (D58) |
 | `rekey` moving a row from its 1.36 table key | Left a sort key for the next run | Compared in the same run |
 
 **Two bugs on unsharded indexes, from #181, found while fixing this.**
@@ -1226,32 +1252,30 @@ as a string and got none. Those could be patched, but it would still have left a
 (`50%25` is the bytes 1.36 wrote for `50%25` and 1.37 writes for `50%`), a union of kinds, and a partition key
 string holding `#` and a label. A stored key's text can't say what a value was, so nothing should ask it to.
 
-**Decision (D58): compare, don't parse.** §9.2 has the rule. A row holding a half's composites gets what they
-compose. A cleared value isn't judged at all, by its text or by the model, and that half stays as it is with no
-conflict. Neither conflict reason had been released, so removing them breaks nothing. `KeyText136` keeps
-composing 1.36 text from values, which the reads need, and no longer reads any. No read path used the label
-lookup: `keepRow` and the row checks compare whole keys and prefixes (§9.3, §17.1).
+**Decision (D58): compare with what 1.36 composed, and don't parse.** §9.2 has the rule. A half is rewritten only
+when the stored key is exactly its own 1.36 text. A cleared value isn't judged at all, by its text or by the model,
+and that half stays as it is with no conflict. Neither conflict reason had been released, so removing them breaks
+nothing. `KeyText136` keeps composing 1.36 text from values, which the reads need, and no longer reads any. No read
+path used the label lookup: `keepRow` and the row checks compare whole keys and prefixes (§9.3, §17.1).
 
-**The accepted limit, pinned on a recording table and on DynamoDB Local.** After clearing a composite whose text
-changed, running `rekey` and removing `previous`:
+**The accepted limit, pinned on a recording table and on DynamoDB Local.** After `rekey` and removing `previous`:
 
-- **A sort key half** (`clearedSortKeyLimitScenario`): `byTenant({ tenant })` finds the row, where its old text
-  sorts: after a row holding `-1`, though it held `-3`. A pin on `-3` misses it.
-- **A partition key half on an unsharded index** (`clearedPartitionKeyLimitScenario`): a pin on `-3` misses it
-  with `legacyKeys: false`, and `get` reads it. An earlier version of this section pinned the opposite outcome,
-  a conflict, and that test was changed deliberately.
+- **A cleared sort key half** (`clearedSortKeyLimitScenario`): `byTenant({ tenant })` finds the row, where its old
+  text sorts: after a row holding `-1`, though it held `-3`. A pin on `-3` misses it.
+- **A cleared partition key half on an unsharded index** (`clearedPartitionKeyLimitScenario`): a pin on `-3` misses it
+  with `legacyKeys: false`, and `get` reads it. An earlier version of this section pinned the opposite outcome, a
+  conflict, and that test was changed deliberately.
+- **A key lagging its values, in 1.36 text** (`laggingLegacySortKeyScenario`, `laggingPartitionKeyScenario`): the same
+  outcomes, for a pin on the old value and for one on the value the row holds now.
 
-Writing the composite puts the row back, in both. A positive integer's text is the same in both, so a pin on one
-keeps working (`clearedIntegerScenario`).
+Writing the composites puts the row back, in each. A positive integer's text is the same in both, so a pin on one keeps
+working (`clearedIntegerScenario`).
 
-**What the rule now does that the old gate didn't.** A key an index policy left on a row holding all its
-composites is rewritten, where it used to be left: under `preserve`, an update naming one composite of a half
-it can't compose leaves the key behind the value, and `rekey` now catches it up. With every composite held
-there's no multi-writer reason to keep the old text, as a retained write would compose the same. Anything
-systematically composed differently at write time and in `rekey` would now be rewritten rather than left, so
-`RekeyComparison.test.ts` writes a composite of every kind (string, number, bigint, each date encoding, boolean,
-literal, a renamed field, an encoded number) and the canonical shapes through every write path, and checks that
-`rekey` finds nothing to do, on both tables.
+**What's tested of the rule.** `RekeyComparison.test.ts` writes a composite of every kind (string, number, bigint, each
+date encoding, boolean, literal, a renamed field, an encoded number) and the canonical shapes through each write path
+§16 lists, then compares the stored rows whole before and after a run, on both tables. That shows `rekey` leaves what
+those writes stored. It doesn't show that a write and `rekey` compose the same text for every value, which the rule no
+longer depends on: a difference would leave the key alone rather than rewrite it.
 
 ### 17.11 What a dry run predicts
 
@@ -1313,3 +1337,39 @@ an update, a retained update and a transaction's update: a new value moves the e
 the other and an unrelated update each leave it. On a recording table, on DynamoDB Local, and on the composer in
 `KeyComposer.test.ts`. Shapes 9d, 10 and 11 were checked at the same three levels, and shape 10 gained a retained update
 over a kept key.
+
+### 17.15 Accessors sharing an attribute
+
+Two unsharded accessors on one physical index, `byRegion` (`pk: [region], sk: [id]`) and `byGroup`
+(`pk: [group], sk: [extra]`). `put({ id, region, group })` with no `extra` correctly skips `byGroup`, and `rekey` at
+`ac79b82` then replaced `gpk` with the group partition and kept the region sort key. So did `put` with every composite
+followed by `.set({ region })`. Both reported `indexKeysRewritten: 1`, `conflicts: []`, and the row left `byRegion`: one
+row before, none after. **A regression from the first form of the comparison rule**, which composed each half and
+rewrote it on any difference, with the later accessor winning. That doesn't reproduce who wrote the attribute, and a
+row's values can't say.
+
+**Decision (D58, as it stands now): back to #181's rule for everything but a sharded partition key.** At `31ec5da`, a half
+was rewritten only when `stored === text136 && text136 !== text`, each judged by itself, which already compares and
+already never asks who owns an attribute: a half only touches a key that is exactly its own 1.36 text. A sharded
+partition key stays compose-and-compare, since moving rows into the layout is the feature, and `EDD-9106` rules out
+another accessor's entry in its attribute. So a key `preserve` left behind its values is left again, and a truncated key
+on a row holding all its composites isn't repaired (D33). On the recording table, narrowing it failed five tests, all of which pinned the wider
+rule, and nothing the sharding migration needs.
+
+**A move had the same defect, from #181.** A move composes every index from the whole row, so a 1.36 row under a table
+key whose text changed lost its `byRegion` entry the same way, in a `rekey` reporting a clean move, and at `31ec5da` too.
+
+**Decision (D60): a move leaves a shared attribute as stored.** The same run then rewrites it if it's its own 1.36 text.
+An attribute shared with a sharded half isn't counted, since `EDD-9106` proved they compose the same bytes, and nor is a
+table key attribute, which the move has to change. Everything else about a move is as it was.
+
+**Not fixed: ordinary writes.** The same pair isn't safe on a row holding composites of both, with no `rekey` involved.
+On the standard path, a `.set({ note })` on a row whose entry is `byGroup`'s overwrites its sort key with `byRegion`'s,
+as `[id]` composes on every write (#43). On the retain path, which hands the composer the whole row, the same update on a
+sparse row flips `byRegion`'s partition key to `byGroup`'s. Both predate this PR, and neither is `rekey`, so they're
+listed in §15 for the owner rather than changed here.
+
+**New degenerate fixture 13** (`sharedPairScenarios`, `sharedPairMoveScenarios`): a sparse put, an update of one accessor's
+composites, a put holding every composite, and a pair with a half that really is its own 1.36 text, in each half, which is
+rewritten while the other stays. Each with its attributes apart as a control, and the move's own cases. On the composer in
+`KeyComposer.test.ts`, through `rekey` on a recording table, and on DynamoDB Local.
