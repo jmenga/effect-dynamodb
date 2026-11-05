@@ -1,21 +1,11 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import {
-  DynamoError,
-  DynamoValidationError,
-  InternalServerError,
-  isAwsInternalServerError,
-  isAwsResourceNotFound,
-  isAwsThrottling,
-  isAwsValidationError,
-  ResourceNotFoundError,
-  ThrottlingError,
-} from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Config, ConfigProvider, DateTime, Effect, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
-import { DynamoClient } from "../src/DynamoClient.js"
+import { classifyError, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type { SkConditionOps } from "../src/internal/BoundQuery.js"
 import * as Table from "../src/Table.js"
@@ -246,23 +236,6 @@ describe("DynamoClient", () => {
   })
 
   describe("error classification", () => {
-    const classifyError =
-      (operation: string) =>
-      (
-        cause: unknown,
-      ):
-        | DynamoError
-        | ThrottlingError
-        | DynamoValidationError
-        | InternalServerError
-        | ResourceNotFoundError => {
-        if (isAwsThrottling(cause)) return new ThrottlingError({ operation, cause })
-        if (isAwsValidationError(cause)) return new DynamoValidationError({ operation, cause })
-        if (isAwsInternalServerError(cause)) return new InternalServerError({ operation, cause })
-        if (isAwsResourceNotFound(cause)) return new ResourceNotFoundError({ operation, cause })
-        return new DynamoError({ operation, cause })
-      }
-
     const mockClassifiedPutItem = vi.fn()
 
     const ClassifiedDynamoClient = mockDynamoClientLayer({

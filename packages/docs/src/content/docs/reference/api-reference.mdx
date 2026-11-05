@@ -1492,6 +1492,12 @@ import {
 | `StreamSealed` | `"StreamSealed"` | An append's stream is sealed (`streamName`, `streamId`, `sealedVersion`: the sealing event's version, the stream's final one): an append, a nested `appendOp`, or a command handler whose load found the seal. Terminal, never retried. Precedence is per stream: within one stream's items it ranks after `DuplicateCommand` and ahead of that stream's `VersionConflict`; across streams the appending stream's own verdict comes first, then nested `appendOp`s in op order (the first failing op wins), then the other additional items |
 | `CompressorNotRegistered` | `"CompressorNotRegistered"` | Never in an error channel — the `cause` of the `ValidationError` a [packed](/effect-dynamodb/guides/packed-storage/) value fails with when it needs a compression codec that is not registered: writing a value over its threshold, or reading a `B` value whose header names the codec (`codec`, `direction: "compress" \| "decompress"`, `entityType`, `attribute`, `operation`) |
 
+### Credential refusals
+
+AWS's reply to a refused signature or credential can quote the signed request, including the session token, so the `cause` of such an error doesn't keep it. It has AWS's `name`, `$fault` and `$metadata` (with `requestId`), and a fixed `message` and `stack`. This covers `InvalidSignatureException`, `SignatureDoesNotMatch`, `IncompleteSignatureException`, `MissingAuthenticationTokenException`, `UnrecognizedClientException`, `InvalidClientTokenId`, `ExpiredTokenException`, `ExpiredToken` and `RequestExpired` from the DynamoDB and DynamoDB Streams clients, and any other error whose text mentions `x-amz-security-token`.
+
+Every other error's `cause` is the SDK's error, unchanged. Its non-enumerable `$response` reaches the request's headers, session token and `Authorization` included. Traces and logs don't export it, so don't annotate a span with `$response` or log it yourself.
+
 ### Errors by operation
 
 Each operation declares a fixed error union, whatever the entity's configuration. Every union also includes `DynamoClientError`, plus ref and vector errors where the entity has refs or vector indexes. `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.

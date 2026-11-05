@@ -302,6 +302,7 @@ Do NOT:
 - Pagination handled via `Stream.paginate`. Batch retry handled in `batchGet`/`batchWrite`.
 - `ConditionalCheckFailedException` is expected control flow, not exceptional.
 - Transactions: up to 100 items, 2x WCU for writes.
+- AWS's reply to a signature or credential refusal can quote the session token. Anything that keeps an AWS SDK error as a `cause` must pass it through `redactCredentialRefusal` (`internal/CredentialRefusal.ts`) first, including any new SDK client (#186).
 
 **Key Limits:** Max item 400 KB | BatchWrite 25 | BatchGet 100 | Transaction 100 | GSIs 20 | Query/Scan response 1 MB | Per-partition 3,000 RCU / 1,000 WCU
 

@@ -4337,6 +4337,14 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `CompressorNotRegistered` | Never in an error channel: the `cause` of the `ValidationError` a packed value fails with when it needs a compression codec with no registered `Compressor` — a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
 | `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
 
+### Credential Refusal Replies
+
+AWS's reply to a signature or credential refusal can quote the signed request, including `x-amz-security-token`, the caller's session token. A tagged error keeps what the SDK threw as its `cause`, and tracers, loggers and `JSON.stringify` all render a cause's message, so every SDK classifier (`classifyError`, `classifyStreamsError`) passes what it catches through `redactCredentialRefusal` (`internal/CredentialRefusal.ts`, #186).
+
+- **Redacted:** the names listed there, and any error whose text mentions `x-amz-security-token`. The cause becomes a new error with fixed `message` and `stack`, keeping `name`, `$fault`, `$metadata` and the SDK error's prototype, so classification by name, `instanceof` and troubleshooting by request id still work. It is a new error because the SDK's `$response` can't be removed from the original.
+- **Kept whole:** every other error. `internal/WriteDiagnosis.ts` reads request-shape refusals' wording, and `AccessDeniedException`'s names the principal and action.
+- **`$response` on a kept error:** it is non-enumerable and reaches the request's headers, session token and `Authorization` included. It is left in place because exporters don't send it: span exception events copy enumerable fields only, and span attributes and logs format an `Error` by `toString()` and its cause chain. An application that puts `$response` itself on a span does export it. `test/CredentialRefusal.test.ts` guards this against the real SDK and OTLP exporter.
+
 ### Declared Errors per Operation
 
 Each operation declares a fixed error union, whatever the entity's

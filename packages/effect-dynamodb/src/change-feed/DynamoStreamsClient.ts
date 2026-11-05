@@ -33,6 +33,7 @@ import {
   ThrottlingError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Config, Context, Effect, Layer } from "effect"
+import { redactCredentialRefusal } from "../internal/CredentialRefusal.js"
 import { ShardIteratorExpired, StreamDataTrimmed } from "./Errors.js"
 
 /** What a {@link DynamoStreamsClient} operation fails with. */
@@ -75,7 +76,8 @@ const errorName = (cause: unknown): string | undefined =>
  */
 export const classifyStreamsError =
   (operation: string) =>
-  (cause: unknown): DynamoStreamsClientError => {
+  (thrown: unknown): DynamoStreamsClientError => {
+    const cause = redactCredentialRefusal(thrown)
     const name = errorName(cause)
     if (name === "ExpiredIteratorException") return new ShardIteratorExpired({ operation, cause })
     if (name === "TrimmedDataAccessException") return new StreamDataTrimmed({ operation, cause })

@@ -169,6 +169,7 @@ import {
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
 import * as Capacity from "./internal/Capacity.js"
+import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps } from "./internal/Expr.js"
 import {
   codecRequirements,
@@ -2265,9 +2266,10 @@ const waitForVectorIndexReady = (
 }
 
 /** @internal Classify an AWS SDK error into a specific tagged error type. */
-const classifyError =
+export const classifyError =
   (operation: string) =>
-  (cause: unknown): DynamoClientError => {
+  (thrown: unknown): DynamoClientError => {
+    const cause = redactCredentialRefusal(thrown)
     if (isAwsThrottling(cause)) return new ThrottlingError({ operation, cause })
     if (isAwsValidationError(cause)) return new DynamoValidationError({ operation, cause })
     if (isAwsInternalServerError(cause)) return new InternalServerError({ operation, cause })
