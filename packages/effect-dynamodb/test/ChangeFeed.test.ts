@@ -20,7 +20,7 @@ import {
 } from "@aws-sdk/client-dynamodb-streams"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Fiber, Layer, References, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { classifyStreamsError, fromSdkClient } from "../src/change-feed/DynamoStreamsClient.js"
 import {
@@ -920,7 +920,11 @@ describe("changeFeed", () => {
           Effect.provide(layerOf(fake)),
         )
         expect(batches).toHaveLength(8)
-        expect(fake.log.filter((l) => l.startsWith("describe:filter"))).toHaveLength(8)
+        // One per drained shard, but the feed ends once they're all drained: the last
+        // lookups can lose that race.
+        const lookups = fake.log.filter((l) => l.startsWith("describe:filter"))
+        expect(lookups.length).toBeGreaterThan(0)
+        expect(lookups.length).toBeLessThanOrEqual(8)
         // The initial describe plus shared ones — not one per drained shard.
         expect(fullDescribes(fake)).toBeLessThanOrEqual(3)
       }),
@@ -1198,54 +1202,80 @@ describe("changeFeed", () => {
       }),
     )
 
-    it.live("a batch in flight when the lease is lost commits nothing", () =>
-      Effect.gen(function* () {
-        const fake = new FakeStreams().addShard("s1").put("s1", 1)
-        const store = CheckpointStore.makeMemory()
-        const inFlight = yield* Deferred.make<void>()
-        const lost = yield* Deferred.make<void>()
-        const go = yield* Deferred.make<void>()
-        const acknowledged = yield* Deferred.make<Exit.Exit<void, unknown>>()
-        const watched: CheckpointStoreService = {
-          ...store,
-          renewLease: (feed, owner, duration) =>
-            store
-              .renewLease(feed, owner, duration)
-              .pipe(Effect.tapError(() => Deferred.succeed(lost, undefined))),
-        }
-        const fiber = yield* changeFeed({
-          streamArn: STREAM_ARN,
-          ...fast,
-          lease: { owner: "me", duration: "30 seconds", renewEvery: "20 millis" },
-        }).pipe(
-          Stream.mapEffect((batch) =>
-            Effect.uninterruptible(
-              Deferred.succeed(inFlight, undefined).pipe(
-                Effect.andThen(Deferred.await(go)),
-                Effect.andThen(Effect.exit(batch.commit())),
-                Effect.flatMap((exit) => Deferred.succeed(acknowledged, exit)),
+    // Any scheduler budget: the feed records the loss some time after the store reports
+    // it, so the test waits for the record, which only a commit can see.
+    for (const budget of [16, 256, 2048]) {
+      it.live(`a batch in flight when the lease is lost commits nothing (budget ${budget})`, () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1").put("s1", 1)
+          const store = CheckpointStore.makeMemory()
+          const inFlight = yield* Deferred.make<void>()
+          const lost = yield* Deferred.make<void>()
+          const go = yield* Deferred.make<void>()
+          const acknowledged = yield* Deferred.make<Exit.Exit<void, unknown>>()
+          let writes = 0
+          let writesByTheLastCommit = -1
+          const watched: CheckpointStoreService = {
+            ...store,
+            renewLease: (feed, owner, duration) =>
+              store
+                .renewLease(feed, owner, duration)
+                .pipe(Effect.tapError(() => Deferred.succeed(lost, undefined))),
+            // Until the feed has recorded the loss a commit gets this far, and failing here
+            // leaves the batch unsettled, so it can be committed again.
+            commit: () =>
+              Effect.suspend(() => {
+                writes++
+                return Effect.fail(new CheckpointStoreError({ operation: "commit", cause: "down" }))
+              }),
+          }
+          const commitUntilRefused = (batch: ChangeFeedBatch) =>
+            Effect.gen(function* () {
+              for (let attempt = 0; ; attempt++) {
+                const before = writes
+                const exit = yield* Effect.exit(batch.commit())
+                if (attempt === 2000 || !(failureOf(exit) instanceof CheckpointStoreError)) {
+                  writesByTheLastCommit = writes - before
+                  return exit
+                }
+                yield* Effect.sleep("1 millis")
+              }
+            })
+          const fiber = yield* changeFeed({
+            streamArn: STREAM_ARN,
+            ...fast,
+            lease: { owner: "me", duration: "30 seconds", renewEvery: "20 millis" },
+          }).pipe(
+            Stream.mapEffect((batch) =>
+              Effect.uninterruptible(
+                Deferred.succeed(inFlight, undefined).pipe(
+                  Effect.andThen(Deferred.await(go)),
+                  Effect.andThen(commitUntilRefused(batch)),
+                  Effect.flatMap((exit) => Deferred.succeed(acknowledged, exit)),
+                ),
               ),
             ),
-          ),
-          Stream.runDrain,
-          Effect.provide(layerOf(fake, watched)),
-          Effect.exit,
-          Effect.forkChild,
-        )
-        // Another process takes the lease over; the next renewal finds it lost.
-        yield* Deferred.await(inFlight)
-        yield* store.releaseLease(feedId, "me")
-        yield* store.acquireLease(feedId, "other", Duration.seconds(30))
-        yield* Deferred.await(lost)
-        // The renewal fiber is still on its way to recording what the store just said.
-        yield* Effect.yieldNow
-        yield* Deferred.succeed(go, undefined)
-        const exit = yield* Deferred.await(acknowledged)
-        expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
-        expect((yield* store.load(feedId)).size).toBe(0)
-        expect(failureOf(yield* Fiber.join(fiber))).toMatchObject({ _tag: "ChangeFeedLeaseLost" })
-      }),
-    )
+            Stream.runDrain,
+            Effect.provide(layerOf(fake, watched)),
+            Effect.exit,
+            Effect.forkChild,
+          )
+          // Another process takes the lease over; the next renewal finds it lost.
+          yield* Deferred.await(inFlight)
+          yield* store.releaseLease(feedId, "me")
+          yield* store.acquireLease(feedId, "other", Duration.seconds(30))
+          yield* Deferred.await(lost)
+          yield* Deferred.succeed(go, undefined)
+          const exit = yield* Deferred.await(acknowledged)
+          expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
+          expect(writesByTheLastCommit).toBe(0)
+          expect((yield* store.load(feedId)).size).toBe(0)
+          expect(failureOf(yield* Fiber.join(fiber))).toMatchObject({
+            _tag: "ChangeFeedLeaseLost",
+          })
+        }).pipe(Effect.provideService(References.MaxOpsBeforeYield, budget)),
+      )
+    }
 
     it.live("lease: false takes no lease", () =>
       Effect.gen(function* () {
