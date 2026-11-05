@@ -315,12 +315,11 @@ const recording = (store: CheckpointStoreService, fail?: (n: number) => boolean)
 /** Let the fake's promises settle (they run outside the test clock). */
 const flush = Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
 
-/**
- * Waits in real time until `condition` holds. For work that takes a chain of
- * timers to finish: on a loaded machine that chain overruns any fixed sleep.
- */
-const waitUntil = (condition: () => boolean) =>
-  Effect.sleep("1 millis").pipe(Effect.repeat({ until: () => condition() }))
+/** Wait for the feed's own fibers to reach a point, however long that takes under load. */
+const until = (reached: () => boolean) =>
+  Effect.gen(function* () {
+    while (!reached()) yield* Effect.sleep("1 millis")
+  })
 
 /** Advance the test clock, then let the fake's promises settle. */
 const adjust = (duration: Duration.Input) =>
@@ -426,7 +425,7 @@ describe("changeFeed", () => {
           3,
         ).pipe(Effect.provide(layerOf(fake)), Effect.forkChild)
         // The parent closes after the first describe; its child (and grandchild) appear then.
-        yield* Effect.sleep("20 millis")
+        yield* until(() => fake.log.some((line) => line.startsWith("records:p")))
         fake.addShard("c", "p").put("c", 1).addShard("g", "c").put("g", 1)
         fake.close("p").close("c")
         const batches = yield* Fiber.join(run)
@@ -510,7 +509,7 @@ describe("changeFeed", () => {
         { streamArn: STREAM_ARN, startingPosition: "LATEST", ...fast },
         1,
       ).pipe(Effect.provide(layerOf(fake, store)), Effect.forkChild)
-      yield* Effect.sleep("20 millis")
+      yield* until(() => fake.iteratorRequests.length > 0)
       fake.put("s1", 1)
       const batches = yield* Fiber.join(run)
       expect(sequencesOf(batches)).toEqual([5])
@@ -1093,7 +1092,7 @@ describe("changeFeed", () => {
           lease: { owner: "me", duration: "30 seconds", renewEvery: "20 millis" },
         }).pipe(Effect.provide(layerOf(fake, store)), Effect.exit, Effect.forkChild)
         // Another process takes the lease over; the next renewal finds it lost.
-        yield* Effect.sleep("20 millis")
+        yield* until(() => fake.log.length > 0)
         yield* store.releaseLease(feedId, "me")
         yield* store.acquireLease(feedId, "other", Duration.seconds(30))
         const exit = yield* Fiber.join(run)
@@ -1110,21 +1109,33 @@ describe("changeFeed", () => {
         const fake = new FakeStreams().addShard("s1").put("s1", 1)
         const store = CheckpointStore.makeMemory()
         let renewals = 0
+        const renewedAfterTheFailure = yield* Deferred.make<void>()
         const flaky: CheckpointStoreService = {
           ...store,
           renewLease: (feed, owner, duration) =>
-            Effect.suspend(() =>
-              ++renewals === 1
-                ? Effect.fail(new CheckpointStoreError({ operation: "renewLease", cause: "blip" }))
-                : store.renewLease(feed, owner, duration),
-            ),
+            Effect.suspend(() => {
+              const attempt = ++renewals
+              if (attempt === 1) {
+                return Effect.fail(
+                  new CheckpointStoreError({ operation: "renewLease", cause: "blip" }),
+                )
+              }
+              return store
+                .renewLease(feed, owner, duration)
+                .pipe(
+                  Effect.tap(() =>
+                    attempt > 2 ? Deferred.succeed(renewedAfterTheFailure, undefined) : Effect.void,
+                  ),
+                )
+            }),
         }
         const fiber = yield* collect({
           streamArn: STREAM_ARN,
           ...fast,
           lease: { duration: "1 second", renewEvery: "10 millis" },
         }).pipe(Effect.provide(layerOf(fake, flaky)), Effect.exit, Effect.forkChild)
-        yield* waitUntil(() => renewals > 2)
+        yield* Deferred.await(renewedAfterTheFailure)
+        expect(renewals).toBeGreaterThan(2)
         expect(fiber.pollUnsafe()).toBeUndefined()
         yield* Fiber.interrupt(fiber)
       }),
@@ -1191,8 +1202,17 @@ describe("changeFeed", () => {
       Effect.gen(function* () {
         const fake = new FakeStreams().addShard("s1").put("s1", 1)
         const store = CheckpointStore.makeMemory()
+        const inFlight = yield* Deferred.make<void>()
+        const lost = yield* Deferred.make<void>()
         const go = yield* Deferred.make<void>()
         const acknowledged = yield* Deferred.make<Exit.Exit<void, unknown>>()
+        const watched: CheckpointStoreService = {
+          ...store,
+          renewLease: (feed, owner, duration) =>
+            store
+              .renewLease(feed, owner, duration)
+              .pipe(Effect.tapError(() => Deferred.succeed(lost, undefined))),
+        }
         const fiber = yield* changeFeed({
           streamArn: STREAM_ARN,
           ...fast,
@@ -1200,22 +1220,25 @@ describe("changeFeed", () => {
         }).pipe(
           Stream.mapEffect((batch) =>
             Effect.uninterruptible(
-              Deferred.await(go).pipe(
+              Deferred.succeed(inFlight, undefined).pipe(
+                Effect.andThen(Deferred.await(go)),
                 Effect.andThen(Effect.exit(batch.commit())),
                 Effect.flatMap((exit) => Deferred.succeed(acknowledged, exit)),
               ),
             ),
           ),
           Stream.runDrain,
-          Effect.provide(layerOf(fake, store)),
+          Effect.provide(layerOf(fake, watched)),
           Effect.exit,
           Effect.forkChild,
         )
         // Another process takes the lease over; the next renewal finds it lost.
-        yield* Effect.sleep("20 millis")
+        yield* Deferred.await(inFlight)
         yield* store.releaseLease(feedId, "me")
         yield* store.acquireLease(feedId, "other", Duration.seconds(30))
-        yield* Effect.sleep("40 millis")
+        yield* Deferred.await(lost)
+        // The renewal fiber is still on its way to recording what the store just said.
+        yield* Effect.yieldNow
         yield* Deferred.succeed(go, undefined)
         const exit = yield* Deferred.await(acknowledged)
         expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
@@ -1330,19 +1353,21 @@ describe("runChangeFeed", () => {
       )
       const store = CheckpointStore.makeMemory()
       const seen: Array<{ positions: Array<number>; failed: number; owners: Array<string> }> = []
+      const redelivered = yield* Deferred.make<void>()
       const fiber = yield* runChangeFeed(changeFeed({ streamArn: STREAM_ARN, ...fast }), {
         projections: {},
         streams: { Account: Accounts },
         onBatch: (batch, result) =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
             seen.push({
               positions: batch.records.map((r) => Number(r.dynamodb!.SequenceNumber)),
               failed: result.failedRecords.length,
               owners: result.unrouted.map((u) => u.event.data.owner),
             })
+            return seen.length === 2 ? Deferred.succeed(redelivered, undefined) : Effect.void
           }),
       }).pipe(Effect.provide(layerOf(fake, store)), Effect.forkChild)
-      yield* waitUntil(() => seen.length >= 2)
+      yield* Deferred.await(redelivered)
       yield* Fiber.interrupt(fiber)
       // The record that fails to decode is reported: the checkpoint stops before it.
       expect(seen[0]).toEqual({ positions: [1, 2, 3], failed: 1, owners: ["ann", "cy"] })
