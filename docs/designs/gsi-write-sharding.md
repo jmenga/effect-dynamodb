@@ -692,7 +692,7 @@ the direction, and it is still proposed for the owner.
 | D46 | Leaving `previous: 1` requires a `rekey` that reports no conflicts: documented, not enforced, since nothing at `make` can know (§9.3). A clean run doesn't promise a pin on a key that isn't its own 1.36 text, as when a row has cleared a composite or the key lags its values (D58) | proposed — awaiting owner confirmation |
 | D47 | Unbound `Query.where()` undoes pruning and reads every partition, including `previous`'s. Internal callers whose condition stays under the pins use `Query.whereUnderPins` (§17.6) | proposed — awaiting owner confirmation |
 | D48 | With the fallback on, on any index, a row whose key an index policy left stays visible to pins whose text changed: the current read rejects a row only at its own 1.36 text (§17.5) | proposed — awaiting owner confirmation |
-| D49 | `EDD-9106` judges only pairs with a sharded index among them. Precision is impossible for two unsharded halves: whether two different texts clash depends on data a definition can't show, and two accessors on one index over composites no item holds together work for `put` and query, the cases demonstrated, though not for ordinary updates (§15). Refusing them would break definitions in a minor release. Every sharded pair is in a new definition, so refusing one breaks nothing (§17.8) | proposed — awaiting owner confirmation |
+| D49 | `EDD-9106` judges only pairs with a sharded index among them. Precision is impossible for two unsharded halves: whether two different texts clash depends on data a definition can't show, and two accessors on one index over composites no item holds together is a working pattern. Refusing them would break definitions in a minor release. Every sharded pair is in a new definition, so refusing one breaks nothing (§17.8) | proposed — awaiting owner confirmation |
 | D50 | A shared attribute is allowed only when the two halves are provably the same: the text a half composes with a stand-in for each value, from the composers themselves, plus the exact shard count and source, or a Z-order half's full declaration. A probe can't prove it, and the case it let through was destructive (§17.7) | proposed — awaiting owner confirmation |
 | D51 | `Entity.make` refuses what no schema can reconcile; `Table.make` decides a casing left to the schema, before it binds anything. One entity on two tables is judged by each table's schema, so one can accept it and the other refuse, and a refused table leaves its members bound as they were (§17.7) | proposed — awaiting owner confirmation |
 | D52 | A casing or an escape reaches a composite unless the model pins it to `number` or `bigint`. A literal union that happens to be all lowercase counts as text, so a pair over one is refused though its bytes may agree (§17.7) | proposed — awaiting owner confirmation |
@@ -703,7 +703,7 @@ the direction, and it is still proposed for the owner.
 | D57 | `rekey` calls a row under both keys only if it's still at the old one when it finds it at the new one (§17.13) | proposed — awaiting owner confirmation |
 | D58 | `rekey` compares with what 1.36 composed, and never parses. An unsharded partition key, any sort key and a vector partition are rewritten only when the stored key is exactly their own 1.36 text and that isn't the current text; a sort key missing a trailing composite is judged by the composites before the gap (D43). A sharded partition key stays compose-and-compare (D24). Anything else is left with no conflict. **The accepted limit:** a key that isn't its own 1.36 text stays, so a row that cleared a composite, or whose key lags its values, is missed by a pin once the fallback or `previous` goes, when its text changed in 1.37 (§9.2, §17.10, §17.15). The owner approved comparing rather than parsing; this wording of the rule, which replaces D44, D54 and D56, is still to confirm | proposed — awaiting owner confirmation |
 | D59 | A retained update leaves an index it skipped as stored, as the standard path does. Its Put-style fallback is gone: an index it reached always lacked a composite, so it only ever deleted, and deleted entries `preserve` had kept (§17.14) | proposed — awaiting owner confirmation |
-| D60 | ~~A move leaves an attribute two accessors of unsharded indexes share as stored~~ **Rejected:** it regressed ordinary lazy moves, as a plain update on a healthy 1.36 row kept the shared key's 1.36 text beside the other half's current text, and a pin missed the row with the fallback on. The move behaviour stays as at #181 (§17.15) | rejected |
+| D60 | ~~A move leaves an attribute two accessors of unsharded indexes share as stored~~ **Rejected:** it regressed ordinary lazy moves, as a plain update on a healthy 1.36 row kept the shared key's 1.36 text beside the other half's current text, and a pin missed the row with the fallback on. It's reverted, so a move behaves as at #181 (§17.15) | rejected |
 
 ## 15. Scoping decisions
 
@@ -822,7 +822,7 @@ Not in the issue; each one is something a caller could otherwise expect:
 | The `rekey` sharding pass covers sharded PK halves; other index keys keep #181's rule, over the composites their values lead with | §9.2 |
 | A key half on a sharded index shares an attribute only with a half provably composing the same bytes | `EDD-9106`, D50: the one written last overwrites the other |
 | Two accessors on one sharded index over composites no item holds together are refused, though they wouldn't clash | "Provably the same" can't see the data. The unsharded form stays legal (D49); give each its own attribute here |
-| **Two unsharded accessors storing halves in one attribute aren't safe, and unlike this PR's sharded pairs they aren't refused (D49).** Halves composing different text for one item overwrite each other. An ordinary update can replace one half and leave a mismatched pair, including on a row that only ever populated one accessor. A table key move composes from the whole row with the later accessor winning, so a row can lose an entry. `rekey` can't tell a healthy key from another half's 1.36 text when the bytes match, as with a partition key `[name]` and a sparse reverse index's sort key `[name]` on one attribute, and rewrites the healthy key | Existing behaviour, not changed by this PR, and left for a separate issue. Each case measures the same at `31ec5da` (§17.15). §17.8 has why such pairs aren't judged |
+| **Two unsharded accessors storing halves in one attribute aren't safe today, and unlike this PR's sharded pairs they aren't refused (D49).** Halves composing different text for one item overwrite each other. An ordinary update can replace one half and leave a mismatched pair, including on a row that only ever populated one accessor. A table key move composes from the whole row with the later accessor winning, so a row can lose an entry. `rekey` can't tell a healthy key from another half's 1.36 text when the bytes match, as with a partition key `[name]` and a sparse reverse index's sort key `[name]` on one attribute, and rewrites the healthy key | Open in this PR: the design isn't decided yet. Each case measures the same at `31ec5da` (§17.15) |
 | A composite counts as unable to hold cased or escaped text only when the model pins `number` or `bigint` | D52: a false refusal has a clear fix, and a false pass overwrites a key |
 | `Entity.make` passes a definition that only some schemas can take; `Table.make` refuses it under the others | The schema's casing isn't known until then (D51) |
 | A key `field` equal to a model attribute or a vector index's partition attribute isn't checked | Not part of this fix; not examined further |
@@ -993,7 +993,7 @@ indexes. Both are bugs. Neither fix changes stored key text.
 §17.3 to §17.6 came from an independent review of `c5874c0`, and §17.7 to §17.12 from one of the fixes it
 led to; §17.13 and the partition key half of §17.10 came from writing their tests. §17.14, and the current
 form of §17.11, came from a review of `230e499`, and §17.15 and the current form of §17.10 from one of `ac79b82`. D60's rejection,
-and the corrections to §17.8 and §17.10, came from one of `d635f2f`. Each one reproduced before it was fixed.
+and the correction to §17.10, came from one of `d635f2f`. Each one reproduced before it was fixed.
 
 ### 17.1 A pin on a truncated row's own level
 
@@ -1201,24 +1201,19 @@ on `c5874c0` and threw at `dfaad77`.
 
 The structural rule (§17.7) fixes that case, but can't make the unsharded check precise, because the answer
 isn't in the definition. Two accessors on one physical index over composites no item holds together have
-different text and don't clash on `put`, which writes only the one whose composites are present, or on a query of
-that entry. Refusing them at load in a minor release is the harm the check was meant to prevent.
+different text and never clash: `put` writes only the one whose composites are present. Refusing them at
+load in a minor release is the harm the check was meant to prevent.
 
 **Decision: `EDD-9106` judges only pairs with a sharded index among them (D49).** Such a pair can only be in a
 definition written for this release, so refusing it breaks nothing, and a sharded partition key is the case
 that can't be right: its marker differs from everything but an identically sharded partition key. So the
 rule refuses what it can't prove where that costs nothing, including two exclusive accessors on a sharded
-index, and stays out where refusing would break a definition in use.
-
-**"A working pattern" holds for `put` and query, not for ordinary updates.** An earlier version of this section and of
-D49 said it without that limit, and it was wrong. An ordinary `.set({ note })` on a row in one of two exclusive accessors
-can replace one half and leave a mismatched pair, so the row drops out of the index it was in (§17.15). So the reason
-for not refusing such a pair is that refusing would break definitions in a minor release, and not that the pair is safe.
+index, and stays out where it would break a working definition.
 
 **What this leaves:** two unsharded halves that really do compose different text for one item overwrite each
-other, as they always have. That's in §15's shared-attribute boundary, left for a separate issue. Tests pin both
-directions of the check: the numeric Z-order pair passes `Entity.make` and `Table.make`, and two exclusive accessors work
-through real `put` and query on DynamoDB Local. That's all those tests show.
+other, as they always have. It's listed in §15, and a possible follow-up. Tests pin both directions: the
+numeric Z-order pair passes `Entity.make` and `Table.make`, and two exclusive accessors work through real
+`put` and query on DynamoDB Local.
 
 ### 17.9 A half in a table key attribute
 
@@ -1374,13 +1369,13 @@ rule, and nothing the sharding migration needs.
 the table below shows. D60 left a shared attribute as stored on a move, and that regressed ordinary lazy moves. Two
 unsharded indexes share `gpk: [score]` with separate sort keys, on a healthy 1.36 row
 `{ id: "a b", score: -3, label: "x y" }`. A plain `.set({ note })` moved the table key, kept the 1.36 `gpk` and escaped
-`gsk`, so a pin went from one row to none with the fallback on. The move behaviour stays as at #181.
+`gsk`, so a pin went from one row to none with the fallback on. It's reverted, so a move behaves as at #181.
 `sameBytesMoveScenarios` pins that row staying found, on both tables. Its shared halves compose the same bytes, so it
 pins nothing from the table below.
 
-**What stays: the shared-attribute boundary (§15).** Existing behaviour, not changed by this PR, and left for a separate
-issue. Unlike this PR's sharded pairs, these definitions aren't refused (D49). Each case was measured on a recording
-table, and is the same at `31ec5da` and at this PR's head:
+**Open: the shared-attribute boundary (§15).** To be addressed in this PR, and the design isn't decided yet. Unlike this
+PR's sharded pairs, these definitions aren't refused today (D49). Each case was measured on a recording table, and is the
+same at `31ec5da` and at `0150fe2`:
 
 | Case | What happens |
 |---|---|
