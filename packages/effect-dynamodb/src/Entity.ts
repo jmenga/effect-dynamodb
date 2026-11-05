@@ -2123,7 +2123,7 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes>
+  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -12029,7 +12029,7 @@ const makeImpl = <
       // secondary index takes the row truncated at it; a complete key is an exact
       // `=`, or `seq: 3` also matches 3.14.
       const pinned = hasSkComposites
-        ? Query.where(
+        ? Query.whereUnderPins(
             query,
             KeyComposer.composeSortKeyCondition(
               schema,
@@ -13366,7 +13366,7 @@ const makeImpl = <
 
   const rekeyConflict = (
     kind: RowKind,
-    reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable",
+    reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable" | "legacySortKey",
     key: StoredKey,
     target: StoredKey | undefined,
     message: string,
@@ -13673,13 +13673,13 @@ const makeImpl = <
           ownerOf(to),
           true,
         )
-        // The real run goes on to rewrite what the move leaves on the row.
+        // The real run goes on to rewrite or report what the move leaves on the row.
+        const left = staleIndexKeys(predicted.row)
         return Rekey.mergeTallies(
           countMove(ctx, "item", to, room.tally),
           { sentinelsMoved: sentinels.reserves.length },
-          Object.keys(staleIndexKeys(predicted.row).sets).length === 0
-            ? {}
-            : { indexKeysRewritten: 1 },
+          Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
+          heldBackIndexKeys(to, left),
         )
       }
       const moved = yield* moveFrom136Detailed(values, "rekey", { depth, force: true }).pipe(
@@ -13755,6 +13755,13 @@ const makeImpl = <
    * differs from what the values compose now: that is what moves the rows of a
    * `previous` layout. One whose values can't compose a key is left, and reported
    * unless it is already in the current layout.
+   *
+   * A sort key is judged by the composites its values lead with, as the structural
+   * rule truncates it: a row truncated under 1.36 is rewritten like a whole one. One
+   * that is neither what its values compose now nor what they composed under 1.36 is
+   * left, since an index policy kept it for another writer; when its text can only be
+   * 1.36's it goes in `legacySortKeys`, because no query reads it once the fallback
+   * or `previous` goes (design §9.3).
    */
   const staleIndexKeys = (row: StoredRow) => {
     const rowKeyForm = keyForm(
@@ -13789,6 +13796,7 @@ const makeImpl = <
       if (text !== undefined && text !== stored) rewrite(field, text, attrs)
     }
     const uncomposable: Array<string> = []
+    const legacySortKeys: Array<string> = []
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary") continue
       if (index.shards !== undefined) {
@@ -13825,13 +13833,42 @@ const makeImpl = <
         )
       }
       if (KeyComposer.isZOrderHalf(index.sk)) continue
-      consider(
-        index.sk.field,
-        index.sk.composite,
-        () =>
-          KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
-        () => KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
+      const leading = index.sk.composite.findIndex(
+        (attr) => rowKeyForm[attr] === undefined || rowKeyForm[attr] === null,
       )
+      const composedHalf =
+        leading === -1 ? index.sk.composite : index.sk.composite.slice(0, leading)
+      const now = () =>
+        KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm)
+      const then = () =>
+        KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm)
+      consider(index.sk.field, composedHalf, now, then)
+      const storedSk = row[index.sk.field]?.S
+      if (storedSk !== undefined && !(index.sk.field in sets)) {
+        const composing = (compose: () => string): string | undefined => {
+          try {
+            return compose()
+          } catch {
+            // Its values compose no key now: only its text is left to judge.
+            return undefined
+          }
+        }
+        const text = composing(now)
+        if (
+          storedSk !== text &&
+          (text === undefined || storedSk !== composing(then)) &&
+          KeyText136.isSortKeyText136(
+            schema,
+            entityType,
+            entityVersion,
+            index,
+            storedSk,
+            rowKeyForm,
+          )
+        ) {
+          legacySortKeys.push(name)
+        }
+      }
     }
     for (const [, definition] of vectorIndexEntries) {
       consider(
@@ -13841,8 +13878,45 @@ const makeImpl = <
         () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
       )
     }
-    return { sets, olds, composites: [...composites], uncomposable }
+    return { sets, olds, composites: [...composites], uncomposable, legacySortKeys }
   }
+
+  /** The conflicts a row's index keys leave after everything `rekey` could rewrite. */
+  const heldBackIndexKeys = (
+    at: StoredKey,
+    held: {
+      readonly uncomposable: ReadonlyArray<string>
+      readonly legacySortKeys: ReadonlyArray<string>
+    },
+  ): Rekey.RekeyTally =>
+    Rekey.mergeTallies(
+      held.uncomposable.length === 0
+        ? {}
+        : rekeyConflict(
+            "item",
+            "uncomposable",
+            at,
+            at,
+            `Its values no longer compose a key for sharded ${
+              held.uncomposable.length === 1 ? "index" : "indexes"
+            } ${held.uncomposable.map((name) => `"${name}"`).join(", ")}, and its stored key is ` +
+              `from another layout.`,
+          ),
+      held.legacySortKeys.length === 0
+        ? {}
+        : rekeyConflict(
+            "item",
+            "legacySortKey",
+            at,
+            at,
+            `Its sort key on ${held.legacySortKeys.length === 1 ? "index" : "indexes"} ${held.legacySortKeys
+              .map((name) => `"${name}"`)
+              .join(", ")} holds text from before 1.37 that its values don't compose: an index ` +
+              `policy left it, so rekey can't rewrite it. Queries stop reading it when the 1.36 ` +
+              `fallback or a sharded index's previous: 1 goes. Write that sort key's composites ` +
+              `to the item, then run rekey again.`,
+          ),
+    )
 
   /**
    * An item under its current table key: rewrite the index keys {@link staleIndexKeys}
@@ -13859,10 +13933,10 @@ const makeImpl = <
       const client = yield* Capacity.client
       let row = scanned
       let rewritten = false
-      let uncomposable: ReadonlyArray<string> = []
+      let held: ReturnType<typeof staleIndexKeys> | undefined
       for (let attempt = 0; ; attempt++) {
         const stale = staleIndexKeys(row)
-        uncomposable = stale.uncomposable
+        held = stale
         const fields = Object.keys(stale.sets)
         if (fields.length === 0) break
         if (ctx.dryRun) {
@@ -13926,22 +14000,10 @@ const makeImpl = <
         row = fresh
       }
       const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at)
-      const refused =
-        uncomposable.length === 0
-          ? {}
-          : rekeyConflict(
-              "item",
-              "uncomposable",
-              at,
-              at,
-              `Its values no longer compose a key for sharded ${
-                uncomposable.length === 1 ? "index" : "indexes"
-              } ${uncomposable.map((name) => `"${name}"`).join(", ")}, and its stored key is ` +
-                `from another layout.`,
-            )
+      const refused = held === undefined ? {} : heldBackIndexKeys(at, held)
       return Rekey.mergeTallies(
         rewritten ||
-          uncomposable.length > 0 ||
+          (refused.conflicts ?? []).length > 0 ||
           (sentinels.sentinelsMoved ?? 0) > 0 ||
           (sentinels.conflicts ?? []).length > 0
           ? {}
@@ -13953,11 +14015,12 @@ const makeImpl = <
     })
 
   /**
-   * What a move left on an item: it recomposes index keys as an update would, so a half
-   * that can't compose (a sort key truncated under 1.36 before a gap that a later
-   * composite fills) keeps its text. A later run would rewrite it; this one does, so a
-   * second run has nothing to add. It reads the item only when the move, as predicted
-   * from the scanned row ({@link movedRowOf}), leaves such a half.
+   * What a move left on an item (#183): it recomposes index keys as an update would, so a
+   * half that can't compose (a sort key truncated under 1.36 before a gap that a later
+   * composite fills) keeps its text. A later run would rewrite or report it; this one
+   * does, so a run reporting no conflicts leaves nothing behind. It reads the item only
+   * when the move, as predicted from the scanned row ({@link movedRowOf}), leaves such
+   * a half.
    */
   const rekeyAfterMove = (
     ctx: Rekey.RekeyRowContext,
@@ -13968,7 +14031,13 @@ const makeImpl = <
       const predicted = yield* movedRowOf(scanned, at, "rekey").pipe(
         Effect.catchTag("ValidationError", () => Effect.succeed(undefined)),
       )
-      if (predicted === undefined || Object.keys(staleIndexKeys(predicted).sets).length === 0) {
+      if (predicted === undefined) return {}
+      const stale = staleIndexKeys(predicted)
+      if (
+        Object.keys(stale.sets).length === 0 &&
+        stale.uncomposable.length === 0 &&
+        stale.legacySortKeys.length === 0
+      ) {
         return {}
       }
       const client = yield* Capacity.client

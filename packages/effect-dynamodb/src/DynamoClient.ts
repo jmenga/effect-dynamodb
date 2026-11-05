@@ -2653,7 +2653,7 @@ const makeFromConfig = (config: {
           !zorder &&
           indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
         const pinnedQuery = hasSkComposites
-          ? Query.where(
+          ? Query.whereUnderPins(
               query,
               KeyComposer.composeSortKeyCondition(
                 entityLike._schema,

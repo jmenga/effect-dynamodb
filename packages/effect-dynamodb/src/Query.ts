@@ -43,6 +43,7 @@ import {
   JUMP_INITIAL,
   JUMP_MAX_LIMIT,
   type KeyPass,
+  type KeyPassesSpec,
   type KeyRange,
   keyConditionHolds,
   keyPassChecks,
@@ -651,8 +652,39 @@ const encodeCursor = (key: Record<string, AttributeValue>): string => Cursor.enc
 // ---------------------------------------------------------------------------
 
 /**
+ * @internal Install `condition` as the query's one sort key condition. A new
+ * condition is not the pins the 1.36 key was composed for (#171): the caller that
+ * composed it installs the 1.36 key again.
+ */
+const withSortKeyCondition = <A>(state: QueryState, condition: SortKeyCondition): Query<A> =>
+  new QueryImpl<A>({
+    ...state,
+    skConditions: state.skField === undefined ? [] : [{ field: state.skField, condition }],
+    key136: undefined,
+    keepRow: undefined,
+  })
+
+/**
+ * @internal A pruned fan-out (#183) as it reads with no pins: one shard was chosen
+ * for values a replaced condition no longer selects.
+ */
+const withoutPruning = (state: QueryState): QueryState => {
+  const spec = state.fanOut
+  if (spec?.everyPartition === undefined) return state
+  return {
+    ...state,
+    pkValue: spec.everyPartition[0]!,
+    fanOut: { ...spec, partitions: spec.everyPartition, pruned: false, everyPartition: undefined },
+  }
+}
+
+/**
  * Add a sort key condition to the query.
  * Only one SK condition is supported (last one wins if multiple are added).
+ *
+ * The condition replaces what the query's accessor pinned, so on a sharded index
+ * (#183) the query reads every shard again: a row the new condition selects can
+ * be in any of them.
  */
 export const where: {
   (condition: SortKeyCondition): <A>(self: Query<A>) => Query<A>
@@ -660,15 +692,19 @@ export const where: {
 } = Function.dual(2, <A>(self: Query<A>, condition: SortKeyCondition): Query<A> => {
   const state = self._state
   if (!state.skField) return self
-  return new QueryImpl<A>({
-    ...state,
-    skConditions: [{ field: state.skField, condition }],
-    // A new condition is not the pins the 1.36 key was composed for (#171):
-    // the caller that composed it installs the 1.36 key again.
-    key136: undefined,
-    keepRow: undefined,
-  })
+  return withSortKeyCondition(withoutPruning(state), condition)
 })
+
+/**
+ * @internal {@link where} for a condition composed from the query's own pins, or
+ * bounded under them (an accessor's, `.where()` on a bound query): it selects only
+ * rows those pins select, so the shard chosen for them (#183) still holds them all.
+ */
+export const whereUnderPins = <A>(self: Query<A>, condition: SortKeyCondition): Query<A> => {
+  const state = self._state
+  if (!state.skField) return self
+  return withSortKeyCondition(state, condition)
+}
 
 /** @internal Do two sort key conditions select the same keys, operand for operand? */
 const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined): boolean =>
@@ -691,8 +727,9 @@ const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined)
 export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<A> => {
   const state = self._state
   if (key === undefined || state.isScan) return self
-  // On a sharded index (#183) only the unsharded layout can hold 1.36 text, and
-  // only a migration from it (`previous: 1`) reads that layout.
+  // On a sharded index (#183) 1.36 text comes from the unsharded layout, by a
+  // migration from it (`previous: 1`). Leaving that takes a `rekey` that reports no
+  // conflicts, so no later layout holds it.
   if (state.fanOut !== undefined && state.fanOut.unsharded === undefined) return self
   const own = state.skConditions[0]?.condition
   const same =
@@ -3448,34 +3485,49 @@ export const asParams = <A>(
 
 /**
  * @internal The partitions a fan-out reads, in merge order: its layouts', and with
- * `previous: 1` and the fallback on, a 1.36 key whose text differs. The row checks
- * judge the rows of the unsharded layout and the 1.36 key as `keyPassesPlanner`
- * judges them: they are the two keys that can hold rows of both forms.
+ * `previous: 1` and the fallback on, the 1.36 key too when its text differs.
+ *
+ * A write that moves a row out of the unsharded layout composes its partition key
+ * and can leave its sort key: an update that names none of the sort key's composites
+ * sends no read, and `rekey` leaves a key an index policy left. So under `previous: 1`
+ * a shard holds 1.36 sort key text as well, and when the pins' text differs each one
+ * is read under both conditions (design §9.3). The row checks return each row once,
+ * from the pass its key belongs to, and say nothing of the merge: each pass is in
+ * stored byte order, and the merge is on stored bytes.
  */
 const fanOutPartitions = (state: QueryState, spec: FanOutSpec): ReadonlyArray<FanOutPartition> => {
   const own = state.skConditions[0]?.condition
   const legacy = state.key136
   const unsharded = spec.unsharded
-  const checks =
-    legacy === undefined || unsharded === undefined
-      ? undefined
-      : keyPassChecks({
-          entityType: state.entityTypes.join(", ") || "unknown",
-          index: state.indexName ?? "primary",
-          pkField: state.pkField,
-          skField: state.skField,
-          current: { pkValue: unsharded, condition: own },
-          legacy,
-        })
+  if (legacy === undefined || unsharded === undefined) {
+    return spec.partitions.map((pkValue) => ({ pkValue, condition: own, rowCheck: undefined }))
+  }
+  const passes: KeyPassesSpec = {
+    entityType: state.entityTypes.join(", ") || "unknown",
+    index: state.indexName ?? "primary",
+    pkField: state.pkField,
+    skField: state.skField,
+    current: { pkValue: unsharded, condition: own },
+    legacy,
+  }
+  const inLayout = keyPassChecks(passes)
+  const inShard = keyPassChecks({ ...passes, shard: true })
   return [
     ...spec.partitions.map((pkValue) => ({
       pkValue,
       condition: own,
-      rowCheck: pkValue === unsharded ? checks?.current : undefined,
+      rowCheck: pkValue === unsharded ? inLayout.current : inShard.current,
     })),
-    ...(legacy === undefined
+    ...(sameCondition(legacy.condition, own)
       ? []
-      : [{ pkValue: legacy.pkValue, condition: legacy.condition, rowCheck: checks?.legacy }]),
+      : spec.partitions
+          .filter((pkValue) => pkValue !== unsharded)
+          .map((pkValue) => ({
+            pkValue,
+            condition: legacy.condition,
+            rowCheck: inShard.legacy,
+          }))),
+    { pkValue: legacy.pkValue, condition: legacy.condition, rowCheck: inLayout.legacy },
   ]
 }
 

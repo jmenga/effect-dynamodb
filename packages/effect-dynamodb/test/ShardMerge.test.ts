@@ -169,21 +169,47 @@ describe("ties", () => {
     expect(names(ShardMerge.select(state, 9, order))).toEqual(["p0", "p1", "p2", "p3"])
   })
 
-  it("reverse is the exact reversal of forward", () => {
-    const forwardPages = [
-      [rowOf("a", "p0-a"), rowOf("k", "p0-k1"), rowOf("k", "p0-k2")],
-      [rowOf("k", "p1-k"), rowOf("z", "p1-z")],
-      [rowOf("a", "p2-a"), rowOf("k", "p2-k")],
-    ]
-    const forward = names(
-      ShardMerge.select(loaded(...forwardPages.map((p) => [p] as const)), 99, order),
+  it("equal sort keys on different partitions reverse by partition", () => {
+    const state = loaded(
+      [[rowOf("k", "p0")]],
+      [[rowOf("k", "p1")]],
+      [[rowOf("k", "p2")]],
+      [[rowOf("k", "p3")]],
     )
+    expect(names(ShardMerge.select(state, 9, backwards))).toEqual(["p3", "p2", "p1", "p0"])
+  })
+
+  // DynamoDB doesn't specify the order of equal sort keys within one partition, so a
+  // reverse read needn't be the reversal of a forward one there. These pages keep the
+  // same order in both directions, which DynamoDB is free to do.
+  it("equal sort keys in one partition stay in the order they were read, either way", () => {
+    const state = loaded(
+      [[rowOf("k", "p0-first"), rowOf("k", "p0-second")]],
+      [[rowOf("k", "p1-first"), rowOf("k", "p1-second")]],
+    )
+    expect(names(ShardMerge.select(state, 9, order))).toEqual([
+      "p0-first",
+      "p0-second",
+      "p1-first",
+      "p1-second",
+    ])
+    expect(names(ShardMerge.select(state, 9, backwards))).toEqual([
+      "p1-first",
+      "p1-second",
+      "p0-first",
+      "p0-second",
+    ])
+  })
+
+  it("distinct sort keys: reverse is the reversal of forward", () => {
+    const pages = [
+      [rowOf("a", "p0-a"), rowOf("k", "p0-k")],
+      [rowOf("b", "p1-b"), rowOf("z", "p1-z")],
+      [rowOf("c", "p2-c"), rowOf("m", "p2-m")],
+    ]
+    const forward = names(ShardMerge.select(loaded(...pages.map((p) => [p] as const)), 99, order))
     const backward = names(
-      ShardMerge.select(
-        loaded(...forwardPages.map((p) => [[...p].reverse()] as const)),
-        99,
-        backwards,
-      ),
+      ShardMerge.select(loaded(...pages.map((p) => [[...p].reverse()] as const)), 99, backwards),
     )
     expect(backward).toEqual([...forward].reverse())
   })
@@ -231,5 +257,49 @@ describe("the order of a key", () => {
     ["12345678901234567890123456789012345678", "12345678901234567890123456789012345679", -1],
   ])("compareDecimal(%s, %s) is %d", (a, b, expected) => {
     expect(ShardMerge.compareDecimal(a, b)).toBe(expected)
+  })
+
+  it("compareDecimal agrees with fixed point arithmetic, past a double's precision", () => {
+    const samples = Array.from({ length: 121 }, (_, i) => {
+      const units = BigInt(i - 60) * 12345678901234567890123456789n
+      const digits = (units < 0n ? -units : units).toString().padStart(7, "0")
+      const sign = units < 0n ? "-" : ""
+      return { units, text: `${sign}${digits.slice(0, -6)}.${digits.slice(-6)}` }
+    })
+    for (const a of samples) {
+      for (const b of samples) {
+        const expected = a.units < b.units ? -1 : a.units > b.units ? 1 : 0
+        expect(Math.sign(ShardMerge.compareDecimal(a.text, b.text)) || 0).toBe(expected)
+      }
+    }
+  })
+
+  it("compareDecimal orders DynamoDB's extreme exponents", () => {
+    expect(ShardMerge.compareDecimal("1e-130", "0.0001")).toBeLessThan(0)
+    expect(
+      ShardMerge.compareDecimal("9.9999999999999999999999999999999999999e125", "1e125"),
+    ).toBeGreaterThan(0)
+  })
+
+  it("compareKeyAttributes agrees with byte order, for S and B alike", () => {
+    const encoder = new TextEncoder()
+    const byBytes = (a: Uint8Array, b: Uint8Array): number => {
+      const shared = Math.min(a.length, b.length)
+      for (let i = 0; i < shared; i++) {
+        if (a[i] !== b[i]) return Math.sign(a[i]! - b[i]!)
+      }
+      return Math.sign(a.length - b.length)
+    }
+    const texts = ["", "\u0000", "#", "z", "\u00ff", "\ue000", "\uffff", "\u{10000}", "\u{1F600}"]
+    for (const a of [...texts, "\u{10ffff}"]) {
+      for (const b of [...texts, "\u{10ffff}"]) {
+        const [bytesA, bytesB] = [encoder.encode(a), encoder.encode(b)]
+        const expected = byBytes(bytesA, bytesB)
+        expect(Math.sign(ShardMerge.compareKeyAttributes({ S: a }, { S: b })) || 0).toBe(expected)
+        expect(Math.sign(ShardMerge.compareKeyAttributes({ B: bytesA }, { B: bytesB })) || 0).toBe(
+          expected,
+        )
+      }
+    }
   })
 })

@@ -828,7 +828,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     }
     const key136 = this._config.where136?.(condition, targetField())
     return new BoundQueryImpl<Model, never, A>(
-      Query.alsoRead136(Query.where(this._query, finalCondition), key136),
+      Query.alsoRead136(Query.whereUnderPins(this._query, finalCondition), key136),
       this._config,
       "where",
     )

@@ -591,6 +591,13 @@ describe("definition attribute names are typed from the model", () => {
       pk: { field: "gsi7pk", composite: ["region"] },
       sk: { field: "gsi7sk", composite: ["agencyId", "status"] },
     } as const
+    /** `shardedOn` in its own attributes: two key halves can't share one (`EDD-9106`). */
+    const attributes = (n: number) =>
+      ({
+        name: `gsi${n}`,
+        pk: { field: `gsi${n}pk`, composite: shardedOn.pk.composite },
+        sk: { field: `gsi${n}sk`, composite: shardedOn.sk.composite },
+      }) as const
 
     it("names sort key composites of its own index", () => {
       const made = Entity.make({
@@ -599,9 +606,9 @@ describe("definition attribute names are typed from the model", () => {
         primaryKey: byListingId,
         indexes: {
           byRegion: { ...shardedOn, shards: { count: 8, by: ["agencyId"] } },
-          byRegionAll: { ...shardedOn, shards: { count: 8, by: ["agencyId", "status"] } },
-          shorthand: { ...shardedOn, shards: 8 },
-          full: { ...shardedOn, shards: { count: 8, previous: 1 } },
+          byRegionAll: { ...attributes(8), shards: { count: 8, by: ["agencyId", "status"] } },
+          shorthand: { ...attributes(9), shards: 8 },
+          full: { ...attributes(10), shards: { count: 8, previous: 1 } },
         },
       })
       expect(made.indexes.byRegion.shards?.source).toEqual(["agencyId"])

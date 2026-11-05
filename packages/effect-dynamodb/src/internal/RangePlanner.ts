@@ -910,6 +910,12 @@ export interface KeyPassesSpec {
   readonly current: KeyPass
   /** The key 1.36 composed for the same pins; its text differs from `current`'s. */
   readonly legacy: KeyPass
+  /**
+   * Both passes read one shard of a sharded index (#183). A row's stored partition
+   * key holds a marker `rows.composed` doesn't, so only its sort key says where it
+   * is stored; `current.pkValue` is the unsharded text `rows.composed` gives.
+   */
+  readonly shard?: boolean | undefined
 }
 
 /** The key range of a pass's condition: its inclusive forms. */
@@ -937,7 +943,8 @@ export const keyPassChecks = (
 ): { readonly current: RowCheck | undefined; readonly legacy: RowCheck | undefined } => {
   const skField = spec.skField
   const currentCondition = spec.current.condition
-  const samePartition = spec.legacy.pkValue === spec.current.pkValue
+  const shard = spec.shard === true
+  const samePartition = shard || spec.legacy.pkValue === spec.current.pkValue
   /** Does a sort key lie under the current pass's condition? */
   const inCurrent = (key: KeyValue): boolean =>
     currentCondition === undefined || keyConditionHolds(currentCondition, key)
@@ -983,7 +990,8 @@ export const keyPassChecks = (
     row: Record<string, AttributeValue>,
     key: { readonly pk: string; readonly sk: string | undefined },
   ): boolean =>
-    row[spec.pkField]?.S === key.pk && (skField === undefined || row[skField]?.S === key.sk)
+    (shard || row[spec.pkField]?.S === key.pk) &&
+    (skField === undefined || row[skField]?.S === key.sk)
   /** A row the current read keeps: stored at its key now, or at no value's 1.36 text. */
   const currentAccepts = (rows: KeyPassRows, row: Record<string, AttributeValue>): boolean => {
     const composed = rows.composed(row)

@@ -932,12 +932,15 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  *   `message` says why
  * - `uncomposable` — its key on a sharded index is from another layout, and its
  *   values can't compose a current one (a `by` attribute was cleared) (#183)
+ * - `legacySortKey` — its sort key on an index holds text from before 1.37 that its
+ *   values don't compose: an index policy left it, so it can't be rewritten, and
+ *   queries stop reading it when the 1.36 fallback or `previous: 1` goes (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable"
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable" | "legacySortKey"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */

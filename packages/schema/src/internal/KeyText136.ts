@@ -79,6 +79,55 @@ export const firstBelowEscape = (text: string): string | undefined => {
   return undefined
 }
 
+/** A number or bigint's text now (`NumericKey`): anything else is 1.36's. */
+const CURRENT_NUMBER_TEXT = /^(?:\d{16}(?:\.\d+)?|\d{38}|:\d+|-\d+(?:\.\d+)?:|-\*\d+:|;|-\))$/
+
+/** Two hex digits at `at`: what follows `%` in escaped text. */
+const isEscapeAt = (text: string, at: number): boolean =>
+  /^[0-9a-fA-F]{2}/.test(text.slice(at, at + 2))
+
+/**
+ * Is `stored`, a sort key of `index` no value of `record` composes now, spelled as
+ * only 1.36 spelled keys? Its values are gone, so all that's left is its text: a
+ * character 1.37 escapes, a `%` that starts no escape, a `#` a value held (a segment
+ * no composite labels), or a number in 1.36's form. A value spelled like an escape
+ * (`50%25`) can't be told from one, and reads as the value that escapes to it.
+ */
+export const isSortKeyText136 = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  stored: string,
+  record: Record<string, unknown>,
+): boolean => {
+  const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, {})
+  if (!stored.startsWith(prefix)) return false
+  const text = stored.slice(prefix.length)
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (text[i] === KEY_DELIMITER) continue
+    if (code < ESCAPE || (code === ESCAPE && !isEscapeAt(text, i + 1))) return true
+  }
+  const casing = effectiveCasing(schema, index)
+  const labelled = index.sk.composite.map((attr) => ({
+    attr,
+    label: `${applyCasing(attr, casing)}_`,
+  }))
+  for (const segment of text.split(KEY_DELIMITER).slice(1)) {
+    const composite = labelled.find(({ label }) => segment.startsWith(label))
+    if (composite === undefined) return true
+    const value = record[composite.attr]
+    if (
+      (typeof value === "number" || typeof value === "bigint") &&
+      !CURRENT_NUMBER_TEXT.test(segment.slice(composite.label.length))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * 1.36's composite value text: a number zero-padded to 16 characters, a bigint
  * to 38 — `String(n)` padded, so `-3` is `00000000000000-3` and `2.5` is

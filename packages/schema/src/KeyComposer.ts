@@ -804,6 +804,12 @@ export interface ReadFanOut {
   readonly previous: number | undefined
   /** Every attribute of the shard source was pinned, so one current shard is read. */
   readonly pruned: boolean
+  /**
+   * When pruned, what the query would read without those pins: a condition that
+   * replaces them (`Query.where`) has to read it, since a row it selects can be in
+   * any shard.
+   */
+  readonly everyPartition: ReadonlyArray<string> | undefined
   /** The partition of the unsharded layout, when `previous` is `1`. */
   readonly unsharded: string | undefined
 }
@@ -869,6 +875,7 @@ export const composeReadPartitions = (
       source,
       previous: shards.previous,
       pruned,
+      everyPartition: pruned ? [...layout(shards.count), ...previous] : undefined,
       unsharded,
     },
   }
@@ -1321,6 +1328,8 @@ const shardedPkOutcome = (
     readonly byCleared: boolean
     readonly byRemoved: boolean
     readonly onMissing: "fail" | "keep"
+    /** The sort key half keeps its stored text: a hole, under `preserve`. */
+    readonly skKept: boolean
   },
 ): HalfOutcome => {
   const shards = index.shards
@@ -1347,7 +1356,26 @@ const shardedPkOutcome = (
     return update.byTouched && !pkExplicitlyGone ? refuse() : outcome
   }
   if (outcome.kind === "noop") return update.byTouched ? refuse() : outcome
-  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) return outcome
+  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) {
+    // The shard follows `by`, and the sort key would stay at the old value: no pin
+    // could reach the row, since each searches the shard its own value hashes to and
+    // only the old value's text is stored. The update may name the value the row
+    // already holds, but nothing was read to tell.
+    if (update.byTouched && update.skKept) {
+      if (update.onMissing === "keep") return { kind: "noop" }
+      const missing = index.sk.composite.filter((attr) => !hasValue(merged[attr]))
+      throw new ShardSourceError({
+        message:
+          `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
+          `sharded by, and its sort key can't be composed without ` +
+          `${missing.map((attr) => `"${attr}"`).join(", ")}. The stored sort key would stay at ` +
+          `the old value in the new value's shard, where no query could find it, so nothing was ` +
+          `written. Include ${missing.length === 1 ? "it" : "them"} in the update, or .remove() ` +
+          `${missing.length === 1 ? "it" : "them"} to take the item out of the index.`,
+      })
+    }
+    return outcome
+  }
   if (update.byCleared && policy === "sparse") return { kind: "drop" }
   // The source is incomplete: an update changing the partition or part of `by`
   // can't compute the shard; any other leaves the stored key alone.
@@ -1528,6 +1556,11 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
 
     const policy = resolveIndexPolicy(index.indexPolicy)
+    // A Z-order half is never a `by` source, so only a text half can disagree.
+    const skKept =
+      !skipSk &&
+      !isZOrderHalf(index.sk) &&
+      classifyHalf(skComposites, merged, policy.sk, skHasRemoved).kind === "noop"
 
     if (!skipPk) {
       const pkOutcome = shardedPkOutcome(
@@ -1543,6 +1576,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
           byCleared,
           byRemoved,
           onMissing: options?.onMissingShardSource ?? "fail",
+          skKept,
         },
       )
       if (pkOutcome.kind === "drop") {

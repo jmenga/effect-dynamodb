@@ -20,6 +20,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { shardOf } from "@effect-dynamodb/schema/internal/Shards.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Config, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
@@ -27,8 +28,9 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { compareUtf8 } from "../src/internal/RangePlanner.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
-import type * as Query from "../src/Query.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -241,6 +243,77 @@ describeConnected("#183 sharded index — thousands of items over 16 shards", ()
         provide,
       ),
     120_000,
+  )
+})
+
+describeConnected("#183 equal sort keys on a real table", () => {
+  const Devices = Entity.make({
+    model: Device,
+    entityType: "Device",
+    primaryKey: {
+      pk: { field: "pk", composite: ["channel"] },
+      sk: { field: "sk", composite: ["deviceId"] },
+    },
+    indexes: {
+      byTenant: {
+        name: "gsi5",
+        pk: { field: "gsi5pk", composite: ["tenantId"] },
+        sk: { field: "gsi5sk", composite: ["groupId"] },
+        shards: 8,
+      },
+    },
+  } as any) as any
+  const deployment = { Devices, MainTable: Table.make({ schema, entities: { Devices } }) }
+  const items = makeItems(200)
+
+  // The order of equal sort keys within one partition is DynamoDB's: only the order
+  // of sort keys and of partitions is asserted, and every row exactly once.
+  it.live("order by sort key, then partition, and reverse by partition", () =>
+    withTable(
+      deployment.MainTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          yield* writeAll(deployment, items)
+          const rows = yield* scanAll(tableName)
+          const shardOfRow = new Map(
+            rows.map((row) => [row.deviceId!.S!, Number(/#!8\.(\d)#/.exec(row.gsi5pk!.S!)![1])]),
+          )
+          const positions = (found: ReadonlyArray<Device>) =>
+            found.map((row) => ({ group: row.groupId, shard: shardOfRow.get(row.deviceId)! }))
+          const inOrder = (found: ReadonlyArray<Device>, reverse: boolean) =>
+            positions(found).sort((a, b) => {
+              const order = compareUtf8(a.group, b.group) || a.shard - b.shard
+              return reverse ? -order : order
+            })
+          const everyId = ids(items).sort()
+          const db = yield* clientOf(deployment)
+          const query = () => db.entities.Devices.byTenant({ tenantId: "t-123" })
+
+          const forward: ReadonlyArray<Device> = yield* query().collect()
+          expect(positions(forward)).toEqual(inOrder(forward, false))
+          expect(ids(forward).sort()).toEqual(everyId)
+
+          const backward: ReadonlyArray<Device> = yield* query().reverse().collect()
+          expect(positions(backward)).toEqual(inOrder(backward, true))
+          expect(ids(backward).sort()).toEqual(everyId)
+
+          for (const reverse of [false, true]) {
+            const chained: Array<Device> = []
+            let cursor: Option.Option<string> = Option.none()
+            do {
+              const base = (reverse ? query().reverse() : query()).limit(7)
+              const page: Query.Page<Device> = yield* Option.isSome(cursor)
+                ? base.startFrom(cursor.value).fetch()
+                : base.fetch()
+              chained.push(...page.items)
+              cursor = page.cursor
+            } while (Option.isSome(cursor))
+            expect(positions(chained)).toEqual(inOrder(chained, reverse))
+            expect(ids(chained).sort()).toEqual(everyId)
+          }
+        }),
+      (name) => deployment.MainTable.layer({ name }),
+    ),
   )
 })
 
@@ -1069,6 +1142,259 @@ describeConnected("#183 canonical shapes — shape 10, a half mixing key and mut
           `#!8.${keyShard}#channel_channel-a#zone_z`,
         )
       }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shape 9d: `by` after a sort key composite the update can't supply. The
+// shard and the sort key must not disagree, or no pin reaches the row.
+// ---------------------------------------------------------------------------
+
+describeConnected("#183 canonical shapes — shape 9d, `by` after a composite", () => {
+  class Row extends Schema.Class<Row>("Row")({
+    id: Schema.String,
+    tenant: Schema.String,
+    at: Schema.Number,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+    rank: Schema.optional(Schema.Number),
+  }) {}
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const byTenant = {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["tenant"] },
+    sk: { field: "gsi1sk", composite: ["region", "group"] },
+    shards: { count: 8, by: ["group"] },
+  } as const
+
+  const Rows = Entity.make({
+    model: Row,
+    entityType: "Row",
+    primaryKey,
+    indexes: { byTenant },
+  })
+  const Sparse = Entity.make({
+    model: Row,
+    entityType: "Sparse",
+    primaryKey,
+    indexes: { byTenant: { ...byTenant, indexPolicy: { sk: "sparse" } } },
+  })
+  const Retained = Entity.make({
+    model: Row,
+    entityType: "Retained",
+    primaryKey,
+    indexes: { byTenant },
+    versioned: { retain: true },
+  })
+  const Ranked = Entity.make({
+    model: Row,
+    entityType: "Ranked",
+    primaryKey,
+    indexes: {
+      byTenant: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["tenant"] },
+        sk: { field: "gsi1sk", composite: ["region", "rank"] },
+        shards: { count: 8, by: ["rank"] },
+      },
+    },
+  })
+  const Series = Entity.make({
+    model: Row,
+    entityType: "Series",
+    primaryKey,
+    indexes: { byTenant },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({
+        id: Schema.String,
+        tenant: Schema.String,
+        at: Schema.Number,
+        group: Schema.String,
+      }),
+    },
+  })
+  const AgreeTable = Table.make({
+    schema,
+    entities: { Rows, Sparse, Retained, Ranked, Series },
+  })
+
+  const onAgree = <A, E>(body: (db: any, tableName: string) => Effect.Effect<A, E, any>) =>
+    withTable(
+      AgreeTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Rows, Sparse, Retained, Ranked, Series },
+            tables: { AgreeTable },
+          })
+          return yield* body(db, tableName)
+        }),
+      (name) => AgreeTable.layer({ name }),
+    )
+
+  const seed = { id: "1", tenant: "t", at: 1, region: "r", group: "a" }
+  const pinned = (entity: any, region: string, group: string) =>
+    entity.byTenant({ tenant: "t", region, group }).collect()
+  const refusal = (write: Effect.Effect<unknown, any, any>) =>
+    Effect.map(Effect.flip(write), (error: any) => {
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain("[EDD-9100]")
+      expect(String(error.cause)).toContain('"region"')
+    })
+
+  it.live("the standard path refuses, and the row stays where its pin finds it", () =>
+    onAgree((db, tableName) =>
+      Effect.gen(function* () {
+        const rows = db.entities.Rows
+        yield* rows.put(seed).asEffect()
+        const before = yield* scanAll(tableName)
+        yield* refusal(rows.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect())
+        expect(yield* scanAll(tableName)).toEqual(before)
+        expect(yield* pinned(rows, "r", "a")).toHaveLength(1)
+        expect(yield* pinned(rows, "r", "b")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.live("a complete update moves shard and sort key together", () =>
+    onAgree((db) =>
+      Effect.gen(function* () {
+        const rows = db.entities.Rows
+        yield* rows.put(seed).asEffect()
+        yield* rows.update({ id: "1" }).set({ tenant: "t", region: "r", group: "b" }).asEffect()
+        expect(yield* pinned(rows, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(rows, "r", "a")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.live("under `sparse` the entry leaves the index, and a complete update rejoins", () =>
+    onAgree((db) =>
+      Effect.gen(function* () {
+        const sparse = db.entities.Sparse
+        yield* sparse.put(seed).asEffect()
+        yield* sparse.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect()
+        expect(yield* sparse.byTenant({ tenant: "t" }).collect()).toHaveLength(0)
+        yield* sparse.update({ id: "1" }).set({ tenant: "t", region: "r", group: "b" }).asEffect()
+        expect(yield* pinned(sparse, "r", "b")).toHaveLength(1)
+      }),
+    ),
+  )
+
+  it.live("a transaction refuses the same update", () =>
+    onAgree((db, tableName) =>
+      Effect.gen(function* () {
+        yield* db.entities.Rows.put(seed).asEffect()
+        const before = yield* scanAll(tableName)
+        yield* refusal(
+          Transaction.transactWrite([
+            Rows.update({ id: "1" }).pipe(Entity.set({ tenant: "t", group: "b" })),
+          ]),
+        )
+        expect(yield* scanAll(tableName)).toEqual(before)
+      }),
+    ),
+  )
+
+  it.live("the retain path holds the whole item, so a `by`-only update composes both", () =>
+    onAgree((db) =>
+      Effect.gen(function* () {
+        const retained = db.entities.Retained
+        yield* retained.put(seed).asEffect()
+        yield* retained.update({ id: "1" }).set({ group: "b" }).asEffect()
+        expect(yield* pinned(retained, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(retained, "r", "a")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.live("the computed path reads the item, so `.add()` on `by` composes both", () =>
+    onAgree((db) =>
+      Effect.gen(function* () {
+        const ranked = db.entities.Ranked
+        yield* ranked.put({ id: "1", tenant: "t", at: 1, region: "r", rank: 1 }).asEffect()
+        yield* ranked.update({ id: "1" }).add({ rank: 1 }).asEffect()
+        expect(
+          yield* ranked.byTenant({ tenant: "t", region: "r", rank: 2 }).collect(),
+        ).toHaveLength(1)
+        expect(
+          yield* ranked.byTenant({ tenant: "t", region: "r", rank: 1 }).collect(),
+        ).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.live("an appendInput carrying `by` without the gap refuses", () =>
+    onAgree((db) =>
+      Effect.gen(function* () {
+        const series = db.entities.Series
+        yield* series.put(seed).asEffect()
+        yield* refusal(
+          series.append({ id: "1", tenant: "t", at: 2, group: "b" }).skipFollowUp().asEffect(),
+        )
+        expect(yield* pinned(series, "r", "a")).toHaveLength(1)
+      }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// A condition that replaces the pins (`Query.where`) drops the pruning they gave.
+// ---------------------------------------------------------------------------
+
+describeConnected("#183 a condition that replaces the pins", () => {
+  class Row extends Schema.Class<Row>("Row")({
+    id: Schema.String,
+    tenant: Schema.String,
+    region: Schema.String,
+    group: Schema.String,
+  }) {}
+  const Rows = Entity.make({
+    model: Row,
+    entityType: "Row",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byTenant: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["tenant"] },
+        sk: { field: "gsi1sk", composite: ["region", "group"] },
+        shards: { count: 8, by: ["group"] },
+      },
+    },
+  })
+  const WhereTable = Table.make({ schema, entities: { Rows } })
+
+  it.live("`Query.where` finds a row in another shard than the pins chose", () =>
+    withTable(
+      WhereTable,
+      () =>
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { Rows },
+            tables: { WhereTable },
+          })
+          yield* db.entities.Rows.put({ id: "1", tenant: "t", region: "r", group: "b" }).asEffect()
+          const condition = {
+            eq: KeyComposer.composeSk(schema, "Row", 1, Rows.indexes.byTenant, {
+              region: "r",
+              group: "b",
+            }),
+          }
+          const pinned = Rows.query.byTenant({ tenant: "t", region: "r", group: "a" })
+          expect(yield* Query.collect(pinned)).toHaveLength(0)
+          const found = yield* Query.collect(pinned.pipe(Query.where(condition)))
+          expect(found).toHaveLength(1)
+        }),
+      (name) => WhereTable.layer({ name }),
     ),
   )
 })

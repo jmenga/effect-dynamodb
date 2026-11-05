@@ -39,7 +39,9 @@ import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 // ---------------------------------------------------------------------------
 // Mock client capture helpers
@@ -2649,6 +2651,291 @@ describe("Entity writes — shape 10: a half mixing a primary key composite with
         expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixedseries#deviceid_d-1#zone_z")
         expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixedseries#channel_c-1#zone_z")
       }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedSeries"))), Effect.scoped)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shape 9d (#183): `by` after a sort key composite the update can't
+// supply. The shard follows `by`, and `preserve` keeps the sort key: a row there
+// would be out of reach of every pin. Run against a table that stores what's
+// written, so the assertions are about which pins find the row.
+// ---------------------------------------------------------------------------
+
+describe("Entity writes — shape 9d: `by` after a composite the update can't supply", () => {
+  const AgreeSchema = DynamoSchema.make({ name: "agree", version: 1 })
+  const at = DateTime.makeUnsafe("2026-04-30T11:00:00.000Z")
+
+  class Row extends Schema.Class<Row>("Row")({
+    id: Schema.String,
+    tenant: Schema.String,
+    at: Schema.DateTimeUtc,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+    rank: Schema.optional(Schema.Number),
+  }) {}
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const byTenant = {
+    name: "gsi",
+    pk: { field: "gpk", composite: ["tenant"] },
+    sk: { field: "gsk", composite: ["region", "group"] },
+    shards: { count: 8, by: ["group"] },
+  } as const
+
+  const Rows = Entity.make({
+    model: Row,
+    entityType: "Row",
+    primaryKey,
+    indexes: { byTenant },
+  })
+  const Sparse = Entity.make({
+    model: Row,
+    entityType: "Sparse",
+    primaryKey,
+    indexes: { byTenant: { ...byTenant, indexPolicy: { sk: "sparse" } } },
+  })
+  const Retained = Entity.make({
+    model: Row,
+    entityType: "Retained",
+    primaryKey,
+    indexes: { byTenant },
+    versioned: { retain: true },
+  })
+  const Ranked = Entity.make({
+    model: Row,
+    entityType: "Ranked",
+    primaryKey,
+    indexes: {
+      byTenant: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: ["region", "rank"] },
+        shards: { count: 8, by: ["rank"] },
+      },
+    },
+  })
+  const Series = Entity.make({
+    model: Row,
+    entityType: "Series",
+    primaryKey,
+    indexes: { byTenant },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({
+        id: Schema.String,
+        tenant: Schema.String,
+        at: Schema.DateTimeUtc,
+        group: Schema.String,
+      }),
+    },
+  })
+  const WholeSeries = Entity.make({
+    model: Row,
+    entityType: "Series",
+    primaryKey,
+    indexes: { byTenant },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({
+        id: Schema.String,
+        tenant: Schema.String,
+        at: Schema.DateTimeUtc,
+        region: Schema.String,
+        group: Schema.String,
+      }),
+    },
+  })
+  const AgreeTable = Table.make({
+    schema: AgreeSchema,
+    entities: { Rows, Sparse, Retained, Ranked, Series },
+  })
+  const WholeTable = Table.make({ schema: AgreeSchema, entities: { WholeSeries } })
+
+  const on = <A, E>(
+    body: (db: any, table: ReturnType<typeof makeRecordingTable>) => Effect.Effect<A, E, any>,
+  ) => {
+    const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Rows, Sparse, Retained, Ranked, Series },
+        tables: { AgreeTable },
+      })
+      return yield* body(db, table)
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, AgreeTable.layer({ name: "agree" }))),
+    ) as Effect.Effect<A, E>
+  }
+
+  const pinned = (entity: any, region: string, group: string) =>
+    entity.byTenant({ tenant: "t", region, group }).collect()
+  const refusal = (write: Effect.Effect<unknown, any, any>) =>
+    Effect.map(Effect.flip(write), (error: any) => {
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain("[EDD-9100]")
+      expect(String(error.cause)).toContain('"region"')
+    })
+  const seed = { id: "1", tenant: "t", at, region: "r", group: "a" }
+
+  describe("the standard path", () => {
+    it.effect("refuses, and the row stays where its pin finds it", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            db.entities.Rows.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect(),
+          )
+          expect([...table.items.values()]).toEqual(before)
+          expect(yield* pinned(db.entities.Rows, "r", "a")).toHaveLength(1)
+          expect(yield* pinned(db.entities.Rows, "r", "b")).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("a complete update moves shard and sort key together", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          yield* db.entities.Rows.update({ id: "1" })
+            .set({ tenant: "t", region: "r", group: "b" })
+            .asEffect()
+          expect(yield* pinned(db.entities.Rows, "r", "b")).toHaveLength(1)
+          expect(yield* pinned(db.entities.Rows, "r", "a")).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("under `sparse` the entry leaves the index, and a complete update rejoins", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Sparse.put(seed).asEffect()
+          yield* db.entities.Sparse.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect()
+          expect(yield* db.entities.Sparse.byTenant({ tenant: "t" }).collect()).toHaveLength(0)
+          yield* db.entities.Sparse.update({ id: "1" })
+            .set({ tenant: "t", region: "r", group: "b" })
+            .asEffect()
+          expect(yield* pinned(db.entities.Sparse, "r", "b")).toHaveLength(1)
+        }),
+      ),
+    )
+
+    it.effect("`.remove()` of the gap takes the entry out of the index", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          yield* db.entities.Rows.update({ id: "1" })
+            .set({ tenant: "t", group: "b" })
+            .remove(["region"])
+            .asEffect()
+          expect(yield* db.entities.Rows.byTenant({ tenant: "t" }).collect()).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("a transaction refuses the same update", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            Transaction.transactWrite([
+              Rows.update({ id: "1" }).pipe(Entity.set({ tenant: "t", group: "b" })),
+            ]),
+          )
+          expect([...table.items.values()]).toEqual(before)
+        }),
+      ),
+    )
+  })
+
+  it.effect("the retain path holds the whole item, so a `by`-only update composes both", () =>
+    on((db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Retained.put(seed).asEffect()
+        yield* db.entities.Retained.update({ id: "1" }).set({ group: "b" }).asEffect()
+        expect(yield* pinned(db.entities.Retained, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(db.entities.Retained, "r", "a")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.effect("the retain path refuses an item with the gap: nothing can compose it", () =>
+    on((db, table) =>
+      Effect.gen(function* () {
+        yield* db.entities.Retained.put({ id: "1", tenant: "t", at, group: "a" }).asEffect()
+        const before = structuredClone([...table.items.values()])
+        yield* refusal(db.entities.Retained.update({ id: "1" }).set({ group: "b" }).asEffect())
+        expect([...table.items.values()]).toEqual(before)
+      }),
+    ),
+  )
+
+  it.effect("the computed path reads the item, so `.add()` on `by` composes both", () =>
+    on((db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Ranked.put({ id: "1", tenant: "t", at, region: "r", rank: 1 }).asEffect()
+        yield* db.entities.Ranked.update({ id: "1" }).add({ rank: 1 }).asEffect()
+        const found = yield* db.entities.Ranked.byTenant({
+          tenant: "t",
+          region: "r",
+          rank: 2,
+        }).collect()
+        expect(found).toHaveLength(1)
+        expect(
+          yield* db.entities.Ranked.byTenant({ tenant: "t", region: "r", rank: 1 }).collect(),
+        ).toHaveLength(0)
+      }),
+    ),
+  )
+
+  describe("the append path", () => {
+    it.effect("an appendInput carrying `by` without the gap refuses", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Series.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            db.entities.Series.append({
+              id: "1",
+              tenant: "t",
+              at: DateTime.addDuration(at, Duration.seconds(1)),
+              group: "b",
+            })
+              .skipFollowUp()
+              .asEffect(),
+          )
+          expect([...table.items.values()]).toEqual(before)
+          expect(yield* pinned(db.entities.Series, "r", "a")).toHaveLength(1)
+        }),
+      ),
+    )
+
+    it.effect("an appendInput carrying the whole sort key moves both", () => {
+      const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: { WholeSeries },
+          tables: { WholeTable },
+        })
+        yield* db.entities.WholeSeries.put(seed).asEffect()
+        yield* db.entities.WholeSeries.append({
+          id: "1",
+          tenant: "t",
+          at: DateTime.addDuration(at, Duration.seconds(1)),
+          region: "r",
+          group: "b",
+        })
+          .skipFollowUp()
+          .asEffect()
+        expect(yield* pinned(db.entities.WholeSeries, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(db.entities.WholeSeries, "r", "a")).toHaveLength(0)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, WholeTable.layer({ name: "agree" }))),
+      ) as Effect.Effect<void, unknown>
     })
   })
 })

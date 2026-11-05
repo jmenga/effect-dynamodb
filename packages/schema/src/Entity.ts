@@ -34,7 +34,7 @@ import {
   type PackedConfig,
   type SparseConfig,
 } from "./DynamoModel.js"
-import type * as DynamoSchema from "./DynamoSchema.js"
+import * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
 import type {
@@ -87,7 +87,7 @@ import type {
   ZOrderKeyPart,
   ZOrderSkPart,
 } from "./KeyComposer.js"
-import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
+import { composePk, composeSk, isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
@@ -317,11 +317,59 @@ type ShardsByGuard<TEntry> = TEntry extends { readonly shards: { readonly by: un
     }
   : unknown
 
-/** @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name. */
-export type EntityIndexesGuard<TModel extends Schema.Top, TRefs, TIndexes> = ZOrderEntriesGuard<
+/** The attribute a key half is stored in, when the type says which: `Entity.make` checks the rest. */
+type FieldOf<H> = H extends { readonly field: infer F extends string }
+  ? string extends F
+    ? never
+    : F
+  : never
+
+/** A partition key half that holds a shard marker can't share an attribute with these. */
+type AttributesOutsideShardedPks<TIndexes, TPrimaryKey> =
+  | (TPrimaryKey extends { readonly pk: infer P; readonly sk: infer S }
+      ? FieldOf<P> | FieldOf<S>
+      : never)
+  | {
+      readonly [K in keyof TIndexes]:
+        | (TIndexes[K] extends { readonly sk: infer S } ? FieldOf<S> : never)
+        | (TIndexes[K] extends { readonly shards: unknown }
+            ? never
+            : TIndexes[K] extends { readonly pk: infer P }
+              ? FieldOf<P>
+              : never)
+    }[keyof TIndexes]
+
+/**
+ * @internal On a sharded index, a `pk.field` that is the table's `pk` or `sk`, a sort
+ * key's attribute, or an unsharded index's partition key attribute is an error on
+ * that entry: the shard marker would overwrite the other key (#183). `Entity.make`
+ * checks every other overlap at runtime (`EDD-9106`), such as two sharded indexes
+ * with different counts.
+ */
+type ShardedPkFieldsGuard<TIndexes, TPrimaryKey> = {
+  readonly [K in keyof TIndexes]: TIndexes[K] extends {
+    readonly shards: unknown
+    readonly pk: infer P
+  }
+    ? [FieldOf<P>] extends [never]
+      ? unknown
+      : FieldOf<P> extends AttributesOutsideShardedPks<TIndexes, TPrimaryKey>
+        ? { readonly pk: { readonly field: never } }
+        : unknown
+    : unknown
+}
+
+/**
+ * @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name, and
+ * {@link ShardedPkFieldsGuard} over its primary key.
+ */
+export type EntityIndexesGuard<
+  TModel extends Schema.Top,
+  TRefs,
   TIndexes,
-  KeyFields<TModel, RefsOrNone<TRefs>>
->
+  TPrimaryKey,
+> = ZOrderEntriesGuard<TIndexes, KeyFields<TModel, RefsOrNone<TRefs>>> &
+  ShardedPkFieldsGuard<TIndexes, TPrimaryKey>
 
 type ZOrderHalfGuard<SK, TFields> = (SK extends { readonly zorder: infer Z }
   ? {
@@ -658,6 +706,90 @@ const bindShards = (
     )
   }
   return { ...shards, source: by }
+}
+
+/** One half of a key: the attribute it is stored in and what composes it. */
+interface KeyHalf {
+  readonly owner: string
+  readonly half: "pk" | "sk"
+  readonly index: IndexDefinition
+  readonly field: string
+}
+
+/** The namespace {@link storeSameKeyText} composes under: both halves get the same one. */
+const PROBE_SCHEMA = DynamoSchema.make({ name: "probe", version: 1 })
+
+/** What `half` composes for one made-up item; only the comparison means anything. */
+const probeKeyText = (entityType: string, { half, index }: KeyHalf): string => {
+  const composites = half === "pk" ? index.pk.composite : index.sk.composite
+  if (half === "sk" && isZOrderHalf(index.sk)) return `zorder:${composites.join(",")}`
+  const attributes = [...composites, ...(index.shards?.source ?? [])]
+  const record = Object.fromEntries(attributes.map((attr) => [attr, `probe_${attr}`]))
+  return half === "pk"
+    ? composePk(PROBE_SCHEMA, entityType, index, record)
+    : composeSk(PROBE_SCHEMA, entityType, 1, index, record)
+}
+
+/**
+ * Do two key halves compose the same text for every item? A sharded partition key
+ * holds its shard marker, so it matches only a partition key sharded the same way.
+ * Letter case isn't compared unless both spell out their casing: a half that leaves
+ * it to the schema may well agree with one that doesn't, and `Entity.make` doesn't
+ * know the schema.
+ */
+const storeSameKeyText = (entityType: string, a: KeyHalf, b: KeyHalf): boolean => {
+  const shardsA = a.half === "pk" ? a.index.shards : undefined
+  const shardsB = b.half === "pk" ? b.index.shards : undefined
+  if (shardsA !== undefined || shardsB !== undefined) {
+    if (shardsA === undefined || shardsB === undefined) return false
+    // The marker spells the count, but one made-up item can't tell sources apart: it
+    // can hash to the same shard under both.
+    if (shardsA.source!.join("#") !== shardsB.source!.join("#")) return false
+  }
+  if (
+    a.index.casing !== undefined &&
+    b.index.casing !== undefined &&
+    a.index.casing !== b.index.casing
+  ) {
+    return false
+  }
+  return probeKeyText(entityType, a).toLowerCase() === probeKeyText(entityType, b).toLowerCase()
+}
+
+/**
+ * `[EDD-9106]`: two key halves in one attribute must compose the same text for every
+ * item (#183). If they don't, the one written last overwrites the other: a secondary
+ * index over the table's `pk` leaves the item unreachable by its primary key. Halves
+ * that agree are fine, such as an inverted index, or a local index's partition key.
+ */
+const refuseSharedKeyAttribute = (
+  entityType: string,
+  indexes: globalThis.Record<string, IndexDefinition>,
+): void => {
+  const halves: ReadonlyArray<KeyHalf> = Object.entries(indexes).flatMap(([owner, index]) => [
+    { owner, half: "pk" as const, index, field: index.pk.field },
+    { owner, half: "sk" as const, index, field: index.sk.field },
+  ])
+  const describe = ({ owner, half }: KeyHalf): string =>
+    `${owner === "primary" ? "the primary key" : `index "${owner}"`}'s ${
+      half === "pk" ? "partition" : "sort"
+    } key`
+  for (const [i, a] of halves.entries()) {
+    for (const b of halves.slice(i + 1)) {
+      if (a.field !== b.field || storeSameKeyText(entityType, a, b)) continue
+      const sharded = [a, b].find((half) => half.half === "pk" && half.index.shards !== undefined)
+      throw new Error(
+        `[EDD-9106] Entity "${entityType}": ${describe(a)} and ${describe(b)} are both stored ` +
+          `in the attribute "${a.field}", and they compose different text${
+            sharded === undefined
+              ? ""
+              : ` (${describe(sharded)} holds a shard marker, and is sharded differently from ` +
+                `anything else in that attribute)`
+          }. The one written last overwrites the other, so an item would be unreachable through ` +
+          `the other key. Give each its own attribute.`,
+      )
+    }
+  }
 }
 
 export const buildEntityDefinition = (config: {
@@ -1257,6 +1389,7 @@ export const buildEntityDefinition = (config: {
       shards: bindShards(config.entityType, indexName, indexDef, primaryIndex),
     }
   }
+  refuseSharedKeyAttribute(config.entityType, initialIndexes)
 
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
@@ -1459,7 +1592,7 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes>
+  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete

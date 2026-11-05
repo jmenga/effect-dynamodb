@@ -9,7 +9,7 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Fiber, Option, Stream } from "effect"
 import * as Cursor from "../src/internal/Cursor.js"
 import { canonicalJson, fnv1a32 } from "../src/internal/RangePlanner.js"
-import type * as Query from "../src/Query.js"
+import * as Query from "../src/Query.js"
 import {
   type Device,
   idsOf,
@@ -416,6 +416,133 @@ describe("requests", () => {
   })
 })
 
+describe("a condition that replaces the pins", () => {
+  const byGroup = makeDevices({ shards: { count: 8, by: ["groupId"] } })
+  const target = items.find((item) => item.groupId === "group-b")!
+  const otherGroup = "group-a"
+  const conditionFor = (on: typeof byGroup) => ({ eq: on.rowOf(target).gsi5sk!.S! })
+
+  it.effect("`Query.where` reads every shard: the row it selects can be in any of them", () =>
+    run(
+      (_, server) =>
+        Effect.gen(function* () {
+          const pinned = byGroup.Devices.query.byTenant({
+            tenantId: TENANT,
+            groupId: otherGroup,
+          })
+          expect((yield* Query.explain(pinned)).fanOut?.pruned).toBe(true)
+          const replaced = pinned.pipe(Query.where(conditionFor(byGroup)))
+          const explained = yield* Query.explain(replaced)
+          expect(explained.fanOut?.pruned).toBe(false)
+          expect(explained.fanOut?.partitions).toHaveLength(8)
+          const found = yield* Query.collect(replaced)
+          expect(server.inputs).toHaveLength(8)
+          expect(idsOf(found as ReadonlyArray<Device>)).toEqual([target.deviceId])
+        }),
+      {},
+      items,
+      byGroup,
+    ),
+  )
+
+  it.effect("so does a replacement on a default source's whole primary key pin", () =>
+    run((_, server) =>
+      Effect.gen(function* () {
+        const other = items.find(
+          (item) => fixture.shardIndexOf(item) !== fixture.shardIndexOf(target),
+        )!
+        const pinned = fixture.Devices.query.byTenant({
+          tenantId: TENANT,
+          groupId: other.groupId,
+          channel: other.channel,
+          deviceId: other.deviceId,
+        })
+        expect((yield* Query.explain(pinned)).fanOut?.pruned).toBe(true)
+        const found = yield* pinned.pipe(Query.where(conditionFor(fixture)), Query.collect)
+        expect(server.inputs).toHaveLength(8)
+        expect(idsOf(found as ReadonlyArray<Device>)).toEqual([target.deviceId])
+      }),
+    ),
+  )
+
+  it.effect("it reads the `previous` layout as well, as the pins did", () => {
+    const migrating = makeDevices({ shards: { count: 4, by: ["groupId"], previous: 2 } })
+    return run(
+      () =>
+        Effect.gen(function* () {
+          const pinned = migrating.Devices.query.byTenant({
+            tenantId: TENANT,
+            groupId: otherGroup,
+          })
+          const before = yield* Query.explain(pinned)
+          expect(before.fanOut?.partitions).toHaveLength(3)
+          const after = yield* Query.explain(pinned.pipe(Query.where(conditionFor(migrating))))
+          expect(after.fanOut?.partitions).toHaveLength(6)
+          expect(new Set(after.fanOut?.partitions).size).toBe(6)
+        }),
+      {},
+      items,
+      migrating,
+    )
+  })
+
+  it.effect("the accessor's pins and a bound `.where()` under them stay on the one shard", () =>
+    run(
+      (devices, server) =>
+        Effect.gen(function* () {
+          const pins = { tenantId: TENANT, groupId: target.groupId }
+          const unbound = byGroup.Devices.query.byTenant(pins)
+          expect((yield* Query.explain(unbound)).fanOut?.pruned).toBe(true)
+          const narrowed = devices
+            .byTenant(pins)
+            .where((t: any, { eq }: any) => eq(t.channel, target.channel))
+          const explained: Query.QueryExplain = yield* narrowed.explain()
+          expect(explained.fanOut?.pruned).toBe(true)
+          expect(explained.fanOut?.partitions).toHaveLength(1)
+          const found: ReadonlyArray<Device> = yield* narrowed.collect()
+          expect(server.inputs).toHaveLength(1)
+          expect(idsOf(found)).toContain(target.deviceId)
+        }),
+      {},
+      items,
+      byGroup,
+    ),
+  )
+
+  it.effect("a query that wasn't pruned reads what it did", () =>
+    run(
+      () =>
+        Effect.gen(function* () {
+          const unpinned = byGroup.Devices.query.byTenant({ tenantId: TENANT })
+          const before = yield* Query.explain(unpinned)
+          const after = yield* Query.explain(unpinned.pipe(Query.where(conditionFor(byGroup))))
+          expect(after.fanOut?.partitions).toEqual(before.fanOut?.partitions)
+          expect(after.fanOut?.pruned).toBe(false)
+        }),
+      {},
+      items,
+      byGroup,
+    ),
+  )
+
+  it.effect("an index with no shards takes the condition as it always has", () => {
+    const plain = makeDevices({ shards: null })
+    return run(
+      (_, server) =>
+        Effect.gen(function* () {
+          const found = yield* plain.Devices.query
+            .byTenant({ tenantId: TENANT, groupId: otherGroup })
+            .pipe(Query.where(conditionFor(plain)), Query.collect)
+          expect(server.inputs).toHaveLength(1)
+          expect(idsOf(found as ReadonlyArray<Device>)).toEqual([target.deviceId])
+        }),
+      {},
+      items,
+      plain,
+    )
+  })
+})
+
 describe("merged order", () => {
   it.effect("collect is in sort key order across shards", () =>
     run((devices) =>
@@ -426,7 +553,7 @@ describe("merged order", () => {
     ),
   )
 
-  it.effect("reverse is the exact reversal", () =>
+  it.effect("distinct sort keys: reverse is the reversal of forward", () =>
     run((devices) =>
       Effect.gen(function* () {
         const found = yield* devices.byTenant({ tenantId: TENANT }).reverse().collect()
@@ -437,15 +564,33 @@ describe("merged order", () => {
 
   describe("with ties across shards", () => {
     const tied = makeDevices({ shards: 8, sk: ["status"] })
+    const compareStatus = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
-    it.effect("orders by partition; reverse is the exact reversal", () =>
+    // Order within one partition is DynamoDB's, and this mock's isn't evidence of it,
+    // so only the order across partitions is asserted here.
+    it.effect("order by partition, descending under reverse", () =>
       run(
         (devices) =>
           Effect.gen(function* () {
-            const forward = yield* devices.byTenant({ tenantId: TENANT }).collect()
-            const backward = yield* devices.byTenant({ tenantId: TENANT }).reverse().collect()
-            expect(idsOf(forward)).toEqual(idsOf(tied.merged(items)))
-            expect(idsOf(backward)).toEqual(idsOf(forward).reverse())
+            const forward: ReadonlyArray<Device> = yield* devices
+              .byTenant({ tenantId: TENANT })
+              .collect()
+            const backward: ReadonlyArray<Device> = yield* devices
+              .byTenant({ tenantId: TENANT })
+              .reverse()
+              .collect()
+            const positions = (rows: ReadonlyArray<Device>) =>
+              rows.map((row) => ({ status: row.status, shard: tied.shardIndexOf(row) }))
+            const inMergeOrder = (rows: ReadonlyArray<Device>, reverse: boolean) =>
+              positions(rows).sort((a, b) => {
+                const order = compareStatus(a.status, b.status) || a.shard - b.shard
+                return reverse ? -order : order
+              })
+            expect(positions(forward)).toEqual(inMergeOrder(forward, false))
+            expect(positions(backward)).toEqual(inMergeOrder(backward, true))
+            const everyId = idsOf(items).sort()
+            expect(idsOf(forward).sort()).toEqual(everyId)
+            expect(idsOf(backward).sort()).toEqual(everyId)
           }),
         {},
         items,
@@ -605,6 +750,76 @@ describe("fetch", () => {
       }),
     ),
   )
+
+  describe("a chain with filters, one row a page", () => {
+    const rows = Array.from({ length: 48 }, (_, i) => ({
+      channel: "c",
+      deviceId: `id-${String(i).padStart(3, "0")}`,
+      tenantId: TENANT,
+      groupId: `g-${i % 7}`,
+      status: i % 2 === 0 ? "on" : "off",
+      reading: i,
+    }))
+
+    describe.each([
+      { reverse: false, maxPages: undefined, projected: false },
+      { reverse: false, maxPages: undefined, projected: true },
+      { reverse: false, maxPages: 1, projected: false },
+      { reverse: false, maxPages: 1, projected: true },
+      { reverse: true, maxPages: undefined, projected: false },
+      { reverse: true, maxPages: undefined, projected: true },
+      { reverse: true, maxPages: 1, projected: false },
+      { reverse: true, maxPages: 1, projected: true },
+    ])("reverse $reverse, maxPages $maxPages, projected $projected", ({
+      reverse,
+      maxPages,
+      projected,
+    }) => {
+      it.effect("every page in order, whatever its limit", () =>
+        run(
+          (devices) =>
+            Effect.gen(function* () {
+              const expected = idsOf(
+                fixture
+                  .merged(rows, reverse)
+                  .filter((row) => row.status === "on" && (projected || row.reading % 3 === 0)),
+              )
+              const filtered = devices
+                .byTenant({ tenantId: TENANT })
+                .filter({ status: "on" })
+                .pageSize(1)
+              const chosen = projected
+                ? filtered.select(["deviceId", "reading"])
+                : filtered.filterBy((row: Device) => row.reading % 3 === 0)
+              const directed = reverse ? chosen.reverse() : chosen
+              const query = maxPages === undefined ? directed : directed.maxPages(maxPages)
+              const limits = [1, 2, 5, 7]
+              const out: Array<string> = []
+              let cursor: Option.Option<string> = Option.none()
+              let page = 0
+              do {
+                const limited = query.limit(limits[page % limits.length]!)
+                const fetched: Query.Page<Device> = yield* Option.isSome(cursor)
+                  ? limited.startFrom(cursor.value).fetch()
+                  : limited.fetch()
+                if (projected) {
+                  for (const item of fetched.items) {
+                    expect(Object.keys(item).sort()).toEqual(["deviceId", "reading"])
+                  }
+                }
+                out.push(...idsOf(fetched.items))
+                cursor = fetched.cursor
+                page++
+                expect(page).toBeLessThan(100)
+              } while (Option.isSome(cursor))
+              expect(out).toEqual(expected)
+            }),
+          { pageRows: 1 },
+          rows,
+        ),
+      )
+    })
+  })
 
   it.effect("a resumed query may change its limit, page size and concurrency", () =>
     run((devices) =>

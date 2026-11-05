@@ -815,6 +815,198 @@ describe("Entity.make's checks on `shards`", () => {
   })
 })
 
+describe("EDD-9106: two key halves in one attribute", () => {
+  class Row extends Schema.Class<Row>("Row")({
+    tenant: Schema.String,
+    id: Schema.String,
+    region: Schema.String,
+    group: Schema.String,
+  }) {}
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["tenant"] },
+    sk: { field: "sk", composite: ["id"] },
+  }
+  const make = (indexes: Record<string, unknown>, primary: unknown = primaryKey) =>
+    Entity.make({
+      model: Row,
+      entityType: "Row",
+      primaryKey: primary as never,
+      indexes: indexes as never,
+    })
+  const gsi = (overrides: Record<string, unknown> = {}) => ({
+    name: "gsi1",
+    pk: { field: "gpk", composite: ["tenant"] },
+    sk: { field: "gsk", composite: ["region"] },
+    ...overrides,
+  })
+
+  describe("a sharded partition key can't share an attribute", () => {
+    it.each([
+      ["with the table's partition key", { pk: { field: "pk", composite: ["tenant"] } }],
+      ["with the table's sort key", { pk: { field: "sk", composite: ["tenant"] } }],
+      ["with its own sort key", { sk: { field: "gpk", composite: ["region"] } }],
+    ])("%s", (_name, overrides) => {
+      expect(() => make({ byRegion: gsi({ ...overrides, shards: 8 }) })).toThrow("[EDD-9106]")
+      expect(() =>
+        make({ byRegion: gsi({ ...overrides, shards: { count: 8, by: ["region"] } }) }),
+      ).toThrow("[EDD-9106]")
+    })
+
+    it("with another index's partition key, unsharded", () => {
+      expect(() =>
+        make({
+          byRegion: gsi({ shards: 8 }),
+          byGroup: gsi({ name: "gsi2", sk: { field: "gsk2", composite: ["group"] } }),
+        }),
+      ).toThrow("[EDD-9106]")
+    })
+
+    it("with another index's sort key", () => {
+      expect(() =>
+        make({
+          byRegion: gsi({ shards: 8 }),
+          byGroup: gsi({
+            name: "gsi2",
+            pk: { field: "gpk2", composite: ["tenant"] },
+            sk: { field: "gpk", composite: ["group"] },
+          }),
+        }),
+      ).toThrow("[EDD-9106]")
+    })
+
+    it.each([
+      ["a different count", { shards: 16 }],
+      ["a different source", { shards: { count: 8, by: ["group"] } }],
+      ["different composites", { shards: 8, pk: { field: "gpk", composite: ["region"] } }],
+      ["a collection's text", { shards: 8, collection: "things" }],
+    ])("with another sharded index's, under %s", (_name, overrides) => {
+      expect(() =>
+        make({
+          byRegion: gsi({ shards: 8 }),
+          byGroup: gsi({
+            name: "gsi2",
+            sk: { field: "gsk2", composite: ["group"] },
+            ...overrides,
+          }),
+        }),
+      ).toThrow("[EDD-9106]")
+    })
+
+    // Two of any three sources land on one of 2 shards, so one made-up item can't tell
+    // every pair apart: the sources themselves have to be compared.
+    it("with another sharded index's, under a source that hashes the same", () => {
+      const indexes = [
+        gsi({ shards: { count: 2, by: ["region"] } }),
+        gsi({
+          name: "gsi2",
+          sk: { field: "gsk2", composite: ["group"] },
+          shards: { count: 2, by: ["group"] },
+        }),
+        gsi({ name: "gsi3", sk: { field: "gsk3", composite: ["region", "group"] }, shards: 2 }),
+      ]
+      for (const [i, a] of indexes.entries()) {
+        for (const b of indexes.slice(i + 1)) {
+          expect(() => make({ a, b })).toThrow("[EDD-9106]")
+        }
+      }
+    })
+
+    it("names both halves and the attribute", () => {
+      expect(() =>
+        make({ byRegion: gsi({ pk: { field: "pk", composite: ["tenant"] }, shards: 8 }) }),
+      ).toThrow(
+        /the primary key's partition key and index "byRegion"'s partition key .* "pk".*shard marker/,
+      )
+    })
+  })
+
+  describe("what agrees is fine", () => {
+    it("two indexes sharded the same way share a partition key attribute", () => {
+      const made = make({
+        byRegion: gsi({ shards: 8 }),
+        byGroup: gsi({ name: "gsi2", sk: { field: "gsk2", composite: ["group"] }, shards: 8 }),
+      })
+      expect(made.indexes.byRegion?.shards?.count).toBe(8)
+      expect(made.indexes.byGroup?.shards?.count).toBe(8)
+    })
+
+    it("a sharded index's sort key may be the table's when it composes the same text", () => {
+      const made = make({
+        byRegion: gsi({ sk: { field: "sk", composite: ["id"] }, shards: 8 }),
+      })
+      expect(made.indexes.byRegion?.sk.field).toBe("sk")
+    })
+
+    it("an unsharded index on the table's partition key with the same composites", () => {
+      const made = make({ local: gsi({ pk: { field: "pk", composite: ["tenant"] } }) })
+      const keys = KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, {
+        tenant: "t",
+        id: "1",
+        region: "r",
+      })
+      expect(keys.pk).toBe("$fleet-db#v1#row#tenant_t")
+    })
+
+    it("an inverted index, whose halves compose what the table's do", () => {
+      const made = make({
+        inverted: {
+          name: "gsi1",
+          pk: { field: "sk", composite: ["id"] },
+          sk: { field: "pk", composite: ["tenant"] },
+        },
+      })
+      const keys = KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, {
+        tenant: "t",
+        id: "1",
+      })
+      expect(keys).toEqual({ pk: "$fleet-db#v1#row#tenant_t", sk: "$fleet-db#v1#row#id_1" })
+    })
+
+    it("a casing one half leaves to the schema is not held against it", () => {
+      const made = make({
+        local: gsi({ pk: { field: "pk", composite: ["tenant"] }, casing: "preserve" }),
+      })
+      expect(made.indexes.local?.casing).toBe("preserve")
+    })
+  })
+
+  describe("halves that disagree are refused unsharded too", () => {
+    it.each([
+      ["the table's partition key", { pk: { field: "pk", composite: ["region"] } }],
+      ["the table's sort key", { pk: { field: "sk", composite: ["region"] } }],
+      ["the table's sort key, as a sort key", { sk: { field: "sk", composite: ["region"] } }],
+      ["its partition key, by casing", { pk: { field: "gpk", composite: ["tenant"] } }],
+    ])("%s", (name, overrides) => {
+      const indexes = name.includes("casing")
+        ? {
+            byRegion: gsi({ casing: "uppercase" }),
+            byGroup: gsi({
+              name: "gsi2",
+              sk: { field: "gsk2", composite: ["group"] },
+              casing: "lowercase",
+              ...overrides,
+            }),
+          }
+        : { byRegion: gsi(overrides) }
+      expect(() => make(indexes)).toThrow("[EDD-9106]")
+    })
+
+    it("another index's sort key, under a different composite", () => {
+      expect(() =>
+        make({
+          byRegion: gsi(),
+          byGroup: gsi({
+            name: "gsi2",
+            pk: { field: "gpk2", composite: ["tenant"] },
+            sk: { field: "gsk", composite: ["group"] },
+          }),
+        }),
+      ).toThrow("[EDD-9106]")
+    })
+  })
+})
+
 describe("composeGsiKeysForUpdatePolicyAware on a sharded index", () => {
   const compose = (
     def: KeyComposer.IndexDefinition,
@@ -1266,6 +1458,109 @@ describe("composeGsiKeysForUpdatePolicyAware on a sharded index", () => {
       const unknown = compose(def, { status: "on" }, {})
       expect(unknown.sets.gsi9pk).toBeUndefined()
       expect(unknown.removes).toEqual([])
+    })
+
+    describe("9d — a `by` attribute after a composite the update can't supply", () => {
+      const def: KeyComposer.IndexDefinition = {
+        index: "gsi9",
+        pk: { field: "gsi9pk", composite: ["tenant"] },
+        sk: { field: "gsi9sk", composite: ["region", "group"] },
+        shards: { count: 8, by: ["group"], previous: undefined, source: ["group"] },
+      }
+      const skOf = (record: Record<string, unknown>) =>
+        KeyComposer.composeSk(schema, "DeviceState", 1, def, record)
+
+      it("refuses: the shard would move and the sort key stay at the old value", () => {
+        expect(() => compose(def, { tenant: "t", group: "b" }, { deviceId: "d" })).toThrow(
+          /\[EDD-9100\].*its sort key can't be composed without "region"/,
+        )
+      })
+
+      it("a complete update moves both, together", () => {
+        const all = { tenant: "t", region: "r", group: "b" }
+        const { sets, removes } = compose(def, all, { deviceId: "d" })
+        expect(sets.gsi9pk).toBe(pkOf(def, all))
+        expect(sets.gsi9sk).toBe(skOf(all))
+        expect(removes).toEqual([])
+      })
+
+      it("a key record holding the rest composes too", () => {
+        const { sets } = compose(def, { group: "b" }, { tenant: "t", region: "r" })
+        expect(sets.gsi9pk).toBe(pkOf(def, { tenant: "t", group: "b" }))
+        expect(sets.gsi9sk).toBe(skOf({ region: "r", group: "b" }))
+      })
+
+      it("under `sparse` the sort key leaves, so there is nothing to disagree with", () => {
+        const { sets, removes } = compose(
+          { ...def, indexPolicy: { sk: "sparse" } },
+          { tenant: "t", group: "b" },
+          {},
+        )
+        expect(sets.gsi9pk).toBe(pkOf(def, { tenant: "t", group: "b" }))
+        expect(removes).toEqual(["gsi9sk"])
+      })
+
+      it("removing the gap cascades, so there is nothing to disagree with", () => {
+        const { sets, removes } = compose(
+          def,
+          { tenant: "t", group: "b" },
+          {},
+          {
+            removedSet: new Set(["region"]),
+          },
+        )
+        expect(sets.gsi9pk).toBe(pkOf(def, { tenant: "t", group: "b" }))
+        expect(removes).toEqual(["gsi9sk"])
+      })
+
+      it('`onMissingShardSource: "keep"` leaves both halves: a pre-check, or a move', () => {
+        const { sets, removes } = compose(
+          def,
+          { tenant: "t", group: "b" },
+          { tenant: "t", group: "b" },
+          { onMissingShardSource: "keep" },
+        )
+        expect(sets).toEqual({})
+        expect(removes).toEqual([])
+      })
+
+      it("a partition key alone, with no `by` value named, leaves the stored sort key", () => {
+        const { sets } = compose(def, { tenant: "t2" }, { group: "a" })
+        expect(sets.gsi9pk).toBe(pkOf(def, { tenant: "t2", group: "a" }))
+        expect(sets.gsi9sk).toBeUndefined()
+      })
+
+      it("an update of the gap alone truncates, naming no `by` value: the shard stays", () => {
+        const { sets } = compose(def, { region: "r2" }, {})
+        expect(sets.gsi9pk).toBeUndefined()
+        expect(sets.gsi9sk).toBe("$fleet-db#v1#devicestate#region_r2")
+      })
+
+      it("`by` before the gap truncates after it: the sort key still holds its value", () => {
+        const leading: KeyComposer.IndexDefinition = {
+          ...def,
+          sk: { field: "gsi9sk", composite: ["group", "region"] },
+        }
+        const { sets } = compose(leading, { tenant: "t", group: "b" }, {})
+        expect(sets.gsi9pk).toBe(pkOf(leading, { tenant: "t", group: "b" }))
+        expect(sets.gsi9sk).toBe("$fleet-db#v1#devicestate#group_b")
+      })
+
+      it("every `by` attribute named, with a gap between: refused", () => {
+        const several: KeyComposer.IndexDefinition = {
+          ...def,
+          sk: { field: "gsi9sk", composite: ["region", "zone", "group"] },
+          shards: {
+            count: 8,
+            by: ["region", "group"],
+            previous: undefined,
+            source: ["region", "group"],
+          },
+        }
+        expect(() => compose(several, { tenant: "t", region: "r", group: "b" }, {})).toThrow(
+          /\[EDD-9100\].*"zone"/,
+        )
+      })
     })
   })
 
