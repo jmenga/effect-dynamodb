@@ -997,7 +997,8 @@ export const refuseShardedPlan = (self: Query<unknown>): void => {
  * return no items, and `explain()` reports the `empty` plan.
  */
 export const planEmpty = <A>(self: Query<A>): Query<A> =>
-  plan(self, {
+  // Nothing is read, so no partition is: a fan-out has nothing left to merge.
+  plan(new QueryImpl<A>({ ...self._state, fanOut: undefined }), {
     planner: compositePlanner({
       entityType: self._state.entityTypes.join(", ") || "unknown",
       index: self._state.indexName ?? "primary",
