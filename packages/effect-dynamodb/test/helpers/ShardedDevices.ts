@@ -170,7 +170,7 @@ export const makeDevices = (options: DevicesOptions = {}) => {
   const rowOf = (item: Device): Row =>
     toAttributeMap({
       ...item,
-      ...KeyComposer.composeAllKeys(schema, "DeviceState", 1, definition, item),
+      ...KeyComposer.composeAllKeys(schema, "DeviceState", 1, definition, { ...item }),
       __edd_e__: "DeviceState",
     })
 

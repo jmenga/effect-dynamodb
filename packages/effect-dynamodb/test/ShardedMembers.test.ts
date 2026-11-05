@@ -133,7 +133,7 @@ describe("auto-discovered collections", () => {
       for (const pk of server.partitionsRead()) {
         expect(pk).toMatch(/^\$hr#v1#assignments#!4\.\d#employee_dana$/)
       }
-    }).pipe(Effect.provide(server.layer))
+    }).pipe(Effect.provide(server.layer)) as Effect.Effect<void, unknown>
   })
 
   it.effect("fetch chains and `.concurrency()` work through the same builder", () => {
@@ -154,7 +154,7 @@ describe("auto-discovered collections", () => {
       } while (Option.isSome(cursor))
       expect(out).toEqual(tasks.map((task) => task.taskId))
       expect(employees).toBe(1)
-    }).pipe(Effect.provide(server.layer))
+    }).pipe(Effect.provide(server.layer)) as Effect.Effect<void, unknown>
   })
 
   it("members must agree on `count` [EDD-9103]", () => {
@@ -242,7 +242,7 @@ describe("auto-discovered collections", () => {
       Effect.provide(
         Layer.merge(mockDynamoClientLayer({ query: server.query }), MainTable.layer({ name: "t" })),
       ),
-    )
+    ) as Effect.Effect<void, unknown>
   })
 })
 
@@ -272,7 +272,7 @@ describe("Collection.make", () => {
       const found: any = yield* (Assignments as any).Tasks({ employee: "dana" }).pipe(Query.collect)
       expect(ids(found)).toEqual(tasks.map((task) => task.taskId))
       expect(new Set(server.partitionsRead()).size).toBe(SHARDS)
-    }).pipe(Effect.provide(server.layer))
+    }).pipe(Effect.provide(server.layer)) as Effect.Effect<void, unknown>
   })
 
   it("members must agree [EDD-9103]", () => {
@@ -290,7 +290,7 @@ describe("unbound accessors", () => {
         .pipe(Query.collect)
       expect(ids(found)).toEqual(tasks.map((task) => task.taskId))
       expect(server.inputs).toHaveLength(SHARDS)
-    }).pipe(Effect.provide(server.layer))
+    }).pipe(Effect.provide(server.layer)) as Effect.Effect<void, unknown>
   })
 
   it.effect("`Query.concurrency` is dual, and refuses what isn't a positive integer", () => {
@@ -422,7 +422,7 @@ describe("a cascade over a sharded index", () => {
         .filter((row) => row.__edd_e__?.S === "Selection")
         .map((row) => (fromAttributeMap(row) as any).player.displayName)
       expect(names).toEqual(selectionIds.map(() => "New"))
-    }).pipe(Effect.provide(layer))
+    }).pipe(Effect.provide(layer)) as Effect.Effect<void, unknown>
   })
 })
 
@@ -475,7 +475,9 @@ describe("aggregates (design §11)", () => {
         expect(row.gsi1pk).toBeUndefined()
         expect(row.gsi1sk).toBeUndefined()
       }
-    }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))))
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))),
+    ) as Effect.Effect<void, unknown>
   })
 
   it.effect("the same entity on its own shards normally", () => {
@@ -488,7 +490,9 @@ describe("aggregates (design §11)", () => {
       yield* db.entities.Owners.put({ ownerId: "o-1", tenantId: "t-1" })
       const [row] = [...table.items.values()]
       expect(row!.gsi1pk?.S).toMatch(/#!8\.\d#tenantid_t-1$/)
-    }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))))
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))),
+    ) as Effect.Effect<void, unknown>
   })
 })
 

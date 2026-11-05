@@ -95,7 +95,11 @@ const seeded = (deployment: Deployment) =>
   })
 
 const rekey = (deployment: Deployment, table: Recording, options?: Table.RekeyOptions) =>
-  using(deployment, table, (db) => db.tables.MainTable.rekey(options))
+  using(
+    deployment,
+    table,
+    (db) => db.tables.MainTable.rekey(options) as Effect.Effect<Table.RekeyReport>,
+  )
 
 const indexPks = (table: Recording) =>
   [...table.items.values()].flatMap((row) => row.gsi5pk?.S ?? [])
@@ -284,6 +288,27 @@ describe("changing the count", () => {
     }),
   )
 
+  it.effect("removing `by` at the same count: reads find every row, and `rekey` moves them", () =>
+    Effect.gen(function* () {
+      const table = yield* seeded(declared({ count: 8, by: ["groupId"] }))
+      const after = declared(8)
+      // No read prunes now, so a row is found on whichever shard holds it.
+      const read = using(after, table, (db) =>
+        db.entities.Devices.byTenant({ tenantId: "t-123" }).collect(),
+      ) as Effect.Effect<ReadonlyArray<Device>>
+      expect(ids(yield* read)).toEqual(ids(devices))
+      const report: Table.RekeyReport = yield* rekey(after, table)
+      expect(report.conflicts).toEqual([])
+      for (const row of table.items.values()) {
+        const shard = shardOf([row.channel!.S!, row.deviceId!.S!], 8)
+        expect(row.gsi5pk?.S).toContain(`#${shardMarker(8, shard)}#tenantid_`)
+      }
+      expect(ids(yield* read)).toEqual(ids(devices))
+      const again: Table.RekeyReport = yield* rekey(after, table)
+      expect(again.indexKeysRewritten).toBe(0)
+    }),
+  )
+
   it.effect("leaves an entry a sparse write left out", () =>
     Effect.gen(function* () {
       const table = makeTable()
@@ -469,8 +494,10 @@ describe("rows under 1.36 key text", () => {
   it.effect("`rekey` moves the table key and lands the index key sharded", () =>
     Effect.gen(function* () {
       const table = tableWith136(adopting)
-      const report: Table.RekeyReport = yield* useMeters(adopting, table, (db) =>
-        db.tables.MeterTable.rekey(),
+      const report: Table.RekeyReport = yield* useMeters(
+        adopting,
+        table,
+        (db) => db.tables.MeterTable.rekey() as Effect.Effect<Table.RekeyReport>,
       )
       expect(report.moved.item).toBe(1)
       const [row] = [...table.items.values()]

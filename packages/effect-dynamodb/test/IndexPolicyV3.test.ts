@@ -2195,7 +2195,7 @@ describe("Entity update — sharded indexes, canonical shapes (#183)", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String(error.cause)).toContain("[EDD-9100]")
         expect(capture.updateItem).toBeUndefined()
-      }).pipe(Effect.provide(layer), Effect.scoped)
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<void, unknown>
     })
 
     it.effect("moving the tenant without `by` fails rather than go unsharded", () => {
@@ -2215,7 +2215,7 @@ describe("Entity update — sharded indexes, canonical shapes (#183)", () => {
           .pipe(Effect.flip)
         expect(String(error.cause)).toContain("[EDD-9100]")
         expect(capture.updateItem).toBeUndefined()
-      }).pipe(Effect.provide(layer), Effect.scoped)
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<void, unknown>
     })
 
     it.effect("`.remove(['groupId'])` drops the sharded half and writes no unsharded key", () =>
@@ -2344,7 +2344,10 @@ describe("Entity update — sharded indexes, canonical shapes (#183)", () => {
         })
         yield* db.entities.Listings.update({ listingId: "l-1" }).set(payload).asEffect()
         return wireOf(capture.updateItem!)
-      }).pipe(Effect.provide(layer), Effect.scoped)
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<
+        ReturnType<typeof wireOf>,
+        unknown
+      >
     }
 
     it.effect("shape 7: the sharded PK beside the bytes, each half on its own", () =>
