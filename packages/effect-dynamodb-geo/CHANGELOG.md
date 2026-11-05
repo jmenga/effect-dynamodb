@@ -1,5 +1,7 @@
 # @effect-dynamodb/geo
 
+## 1.36.1
+
 ## 1.36.0
 
 ### Minor Changes
