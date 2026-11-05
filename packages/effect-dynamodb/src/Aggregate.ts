@@ -1870,6 +1870,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // Gone since the scan read it: deleted by a write.
         if (allItems.length === 0) return done(0)
 
+        // A write moving the aggregate between the reads of its two partitions shows its
+        // rows under both, and they can't be assembled or placed: with rows in both, read
+        // again, and while a row read under the 1.36 partition has gone from it, retry.
+        const at136 = allItems.filter((item) => item[config.pk.field] === pk136)
+        if (pk136 !== undefined && at136.length > 0 && at136.length < allItems.length) {
+          const again = yield* fetchPartition(key, "rekey", true)
+          const held = new Set(
+            again.allItems
+              .filter((item) => item[config.pk.field] === pk136)
+              .map((item) => String(item.sk)),
+          )
+          if (at136.some((item) => !held.has(String(item.sk)))) continue
+        }
+
         const current = yield* assembleAggregate(
           decodeSchema,
           rootNode,
@@ -1906,6 +1920,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
           (row) => row.placement === "both" || row.placement === "ambiguous",
         )
         if (doubled.length > 0) {
+          // In one partition, a move during the read shows a row at both keys too: it's
+          // only under both while it's still under its 1.36 key.
+          const held = yield* Effect.forEach(doubled, (row) =>
+            client
+              .getItem({
+                TableName: tableConfig.name,
+                Key: toAttributeMap({ [config.pk.field]: row.old.pk, sk: row.old.sk }),
+                ConsistentRead: true,
+              })
+              .pipe(Effect.map(({ Item }) => Item !== undefined)),
+          )
+          if (held.some((still) => !still)) continue
           return {
             conflicts: doubled.map((row) => ({
               member: aggregateName,

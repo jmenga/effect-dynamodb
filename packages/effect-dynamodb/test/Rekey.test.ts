@@ -617,6 +617,27 @@ describe("rekey — conflicts and skips", () => {
     }),
   )
 
+  it.effect("a row moved just as its target is read isn't under both keys", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      const { meter: m } = yield* seed(On, table)
+      let moved = false
+      table.hooks.onRequest = ({ command, input }) => {
+        const old = table.items.get(at(m.old))
+        if (moved || command !== "GetItem" || old === undefined) return
+        if (input.Key.pk.S !== m.current.pk || input.Key.sk.S !== m.current.sk) return
+        moved = true
+        table.items.delete(at(m.old))
+        table.items.set(at(m.current), { ...old, ...toAttributeMap(m.current) })
+      }
+      const report = yield* rekey(On, table)
+      expect(moved).toBe(true)
+      expect(report.conflicts).toEqual([])
+      expect(table.items.has(at(m.old))).toBe(false)
+      expect(table.items.has(at(m.current))).toBe(true)
+    }),
+  )
+
   it.effect("a stream is skipped unless it is passed", () =>
     Effect.gen(function* () {
       const table = makeRecordingTable()

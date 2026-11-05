@@ -13439,6 +13439,17 @@ const makeImpl = <
       const occupant = occupantOf(held, to)
       if (occupant === "same" && copy?.(held) === true) return { cleared: "twin", tally: {} }
       if (occupant === "same") {
+        // A move since the caller's read (another row's in this run, or a write) puts it
+        // here too, and takes it from there: it's only under both if it's still there.
+        const { Item: left } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(from),
+          ConsistentRead: true,
+        })
+        const leftTargets = left === undefined ? undefined : rowTargets(left)
+        if (leftTargets === undefined || !sameStoredKey(leftTargets.current, to)) {
+          return { cleared: false, tally: yield* movedAway(ctx, to) }
+        }
         return {
           cleared: false,
           tally: rekeyConflict(

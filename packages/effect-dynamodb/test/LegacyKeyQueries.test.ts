@@ -659,6 +659,65 @@ describe("legacy key queries — an aggregate under its 1.36 keys", () => {
     }),
   )
 
+  /**
+   * `rekey` while a write moves the route: the hook moves the rows `move` picks to their
+   * current keys just before `rekey` reads the current partition, after it read the 1.36
+   * one, so its first read finds them under both.
+   */
+  const rekeyWhileMoving = (move: (row: Record<string, AttributeValue>) => boolean) =>
+    Effect.gen(function* () {
+      const table = freshTable()
+      yield* seeded(table)
+      // The route's rows as a 1.37 write stores them.
+      const written = freshTable()
+      yield* inTable(On, written, On.Routes.create(route))
+      const now = [...written.items.values()].filter((row) => row.pk?.S === pkNow)
+      const sk136 = (row: Record<string, AttributeValue>) => {
+        const edge = route.stops.find((stop) => stopSk(stop.label) === row.sk!.S)
+        return edge === undefined ? row.sk!.S! : stopSk136(edge.label)
+      }
+      const shift = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
+        for (const row of rows) {
+          table.items.delete(at(pk136, sk136(row)))
+          table.items.set(at(pkNow, row.sk!.S), row)
+        }
+      }
+      // Rows already moved before `rekey` starts.
+      shift(now.filter((row) => !move(row)))
+      let moved = false
+      table.hooks.onRequest = ({ command, input }) => {
+        if (moved || command !== "Query") return
+        const values = Object.values(input.ExpressionAttributeValues as Record<string, any>)
+        if (!values.some((value) => value.S === pkNow)) return
+        moved = true
+        shift(now.filter((row) => move(row)))
+      }
+      const report = yield* inTable(
+        On,
+        table,
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Readings: On.Readings },
+            aggregates: { Routes: On.Routes },
+            tables: { MainTable: On.MainTable },
+          })
+          return yield* db.tables.MainTable.rekey()
+        }),
+      )
+      expect(moved).toBe(true)
+      expect(report.conflicts).toEqual([])
+      expect(rowsUnder(table, pk136)).toEqual([])
+      expect(rowsUnder(table, pkNow)).toHaveLength(3)
+    })
+
+  it.effect("rekey: an aggregate a write moves between its two reads isn't under both keys", () =>
+    rekeyWhileMoving(() => true),
+  )
+
+  it.effect("rekey: edges a write moves between its two reads aren't under both keys", () =>
+    rekeyWhileMoving((row) => row.__edd_e__?.S === "RouteStop"),
+  )
+
   it.effect("list reads the 1.36 list key; delete removes the stored keys", () =>
     Effect.gen(function* () {
       const table = freshTable()
