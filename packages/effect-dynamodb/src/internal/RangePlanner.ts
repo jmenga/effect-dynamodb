@@ -880,6 +880,17 @@ export interface KeyPassRows {
     row: Record<string, AttributeValue>,
   ) => { readonly pk: string; readonly sk: string | undefined } | undefined
   /**
+   * The row's key text as 1.36 composed it. A row stored elsewhere than its key now
+   * is another value's only if it is stored at this: otherwise an index policy left
+   * its key, and it belongs where it is. Without it, every row stored elsewhere than
+   * its key now is another value's.
+   */
+  readonly composed136?:
+    | ((
+        row: Record<string, AttributeValue>,
+      ) => { readonly pk: string; readonly sk: string | undefined } | undefined)
+    | undefined
+  /**
    * Read both passes when the two keys are one: rows of both forms share it
    * (a time-series item's events, whose orderBy text changed) and the passes
    * split them by form.
@@ -970,25 +981,31 @@ export const keyPassesPlanner =
       rows === undefined
         ? []
         : [...new Set([spec.pkField, ...(skField === undefined ? [] : [skField]), ...rows.reads])]
-    /** Is the row stored at the key its values compose now? */
-    const atComposed = (
+    /** Is the row stored at this key? */
+    const storedAt = (
       row: Record<string, AttributeValue>,
-      composed: { readonly pk: string; readonly sk: string | undefined },
+      key: { readonly pk: string; readonly sk: string | undefined },
     ): boolean =>
-      row[spec.pkField]?.S === composed.pk &&
-      (skField === undefined || row[skField]?.S === composed.sk)
-    /** The current read's row check: a row stored at its key now. */
+      row[spec.pkField]?.S === key.pk && (skField === undefined || row[skField]?.S === key.sk)
+    /** A row the current read keeps: stored at its key now, or at no value's 1.36 text. */
+    const currentAccepts = (rows: KeyPassRows, row: Record<string, AttributeValue>): boolean => {
+      const composed = rows.composed(row)
+      if (composed === undefined || storedAt(row, composed)) return true
+      if (rows.composed136 === undefined) return false
+      const own136 = rows.composed136(row)
+      return own136 === undefined || !storedAt(row, own136)
+    }
+    /** Does this row's stored sort key lie under the current pass's condition? */
+    const inCurrentRange = (row: Record<string, AttributeValue>): boolean => {
+      const value = skField === undefined ? undefined : row[skField]
+      const key = value?.S ?? value?.B
+      return key !== undefined && inCurrent(key)
+    }
+    /** The current read's row check: not another value's row under the current key. */
     const currentCheck: RowCheck | undefined =
       rows === undefined
         ? undefined
-        : {
-            fields: [],
-            reads,
-            accepts: (row) => {
-              const composed = rows.composed(row)
-              return composed === undefined || atComposed(row, composed)
-            },
-          }
+        : { fields: [], reads, accepts: (row) => currentAccepts(rows, row) }
     /** The 1.36 read's row check: a row stored elsewhere whose key now the current read selects. */
     const legacyCheck: RowCheck | undefined =
       rows === undefined
@@ -999,7 +1016,9 @@ export const keyPassesPlanner =
             accepts: (row) => {
               const composed = rows.composed(row)
               if (composed === undefined) return dedupe === undefined || dedupe.accepts(row)
-              if (atComposed(row, composed)) return false
+              if (storedAt(row, composed)) return false
+              // Both ranges hold it, in one partition: the current read returned it.
+              if (samePartition && inCurrentRange(row) && currentAccepts(rows, row)) return false
               if (composed.pk !== spec.current.pkValue) return false
               return composed.sk === undefined || inCurrent(composed.sk)
             },

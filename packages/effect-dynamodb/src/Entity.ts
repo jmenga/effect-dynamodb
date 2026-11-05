@@ -4952,6 +4952,19 @@ const makeImpl = <
         return undefined
       }
     },
+    composed136: (row) => {
+      try {
+        const rowKeyForm = keyForm(
+          toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>),
+        )
+        return {
+          pk: KeyText136.composePk(schema, entityType, index, rowKeyForm),
+          sk: KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
+        }
+      } catch {
+        return undefined
+      }
+    },
   })
 
   /**
