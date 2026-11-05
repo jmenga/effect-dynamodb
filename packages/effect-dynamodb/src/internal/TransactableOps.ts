@@ -11,6 +11,7 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
@@ -431,8 +432,9 @@ export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity
  * `ValidationError` for `operation`: a Z-order value (`[EDD-9092]`,
  * `ZOrderValueError`: `NaN`, an unparseable date, a value outside a `literals`
  * list — #171), or a composite with no key text (`[EDD-9096]`,
- * `KeyValueError`: `NaN`, a bigint past 1,000 digits). Every write path that
- * composes an item's keys goes through this, so the failure is typed instead
+ * `KeyValueError`: `NaN`, a bigint past 1,000 digits), or a sharded index's
+ * missing shard source (`[EDD-9100]`, `ShardSourceError`, #183). Every write path
+ * that composes an item's keys goes through this, so the failure is typed instead
  * of a defect. Any other throw stays a defect.
  */
 export const composeKeysOrFail = <A>(
@@ -442,7 +444,7 @@ export const composeKeysOrFail = <A>(
 ): Effect.Effect<A, ValidationError> =>
   Effect.try({ try: compose, catch: (error) => error }).pipe(
     Effect.catch((error) =>
-      isZOrderValueError(error) || isKeyValueError(error)
+      isZOrderValueError(error) || isKeyValueError(error) || isShardSourceError(error)
         ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
         : Effect.die(error),
     ),

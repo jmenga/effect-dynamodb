@@ -14,6 +14,7 @@ import type {
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
@@ -28,14 +29,18 @@ import {
 } from "./internal/Packed.js"
 import { compilePath } from "./internal/PathBuilder.js"
 import {
+  canonicalJson,
   compositePlanner,
   cursorRefusal,
   DEFAULT_MAX_SKIPS,
   displayKeyCondition,
+  fnv1a32,
   JUMP_INITIAL,
   JUMP_MAX_LIMIT,
   type KeyPass,
   type KeyRange,
+  keyConditionHolds,
+  keyPassChecks,
   keyPassesPlanner,
   type PlannerFactory,
   type ProbeStep,
@@ -46,6 +51,7 @@ import {
   type Step,
   toKeyCondition,
 } from "./internal/RangePlanner.js"
+import * as ShardMerge from "./internal/ShardMerge.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 
@@ -140,6 +146,15 @@ export interface QueryExplain {
   }
   /** The skip-scan probe budget, for a plan that probes. */
   readonly maxSkips?: number
+  /** A sharded index's fan-out (#183): one request per partition, merged. */
+  readonly fanOut?: {
+    /** The partition key text of each partition read, in merge order. */
+    readonly partitions: ReadonlyArray<string>
+    /** Every `by` attribute was pinned, so one current shard is read. */
+    readonly pruned: boolean
+    /** Requests in flight at once. */
+    readonly concurrency: number
+  }
 }
 
 /**
@@ -292,6 +307,34 @@ interface QueryState {
    * as every `EventStream.*` operation does, not the stream's discriminator.
    */
   readonly operationTarget: string | undefined
+  /**
+   * @internal A sharded index's layout (#183): the partitions a terminal reads
+   * and merges. `pkValue` is the first of them, which is what `asParams` shows.
+   */
+  readonly fanOut: FanOutSpec | undefined
+  /** @internal Set by {@link prepared}: each partition and where it resumes. */
+  readonly fanOutStart: FanOutStart | undefined
+  /** Requests a fan-out sends at once; unset, one per partition (see {@link concurrency}). */
+  readonly concurrencyValue: number | undefined
+}
+
+/** @internal A sharded index's layout, as {@link fanOut} installs it. */
+interface FanOutSpec extends ReadFanOut {
+  readonly partitions: ReadonlyArray<string>
+}
+
+/** @internal One physical partition a fan-out reads. */
+interface FanOutPartition {
+  readonly pkValue: string
+  readonly condition: KeyCondition | undefined
+  readonly rowCheck: RowCheck | undefined
+}
+
+/** @internal A prepared fan-out: its partitions, and the merge resumed from a cursor. */
+interface FanOutStart {
+  readonly partitions: ReadonlyArray<FanOutPartition>
+  readonly fingerprint: string
+  readonly merge: ShardMerge.MergeState
 }
 
 /** @internal A planner resolved for one terminal call, and where it starts (see {@link prepared}). */
@@ -487,6 +530,9 @@ export const make = <A>(config: {
     hydration: config.hydration,
     keyConditionDiagnosis: config.keyConditionDiagnosis,
     operationTarget: config.operationTarget,
+    fanOut: undefined,
+    fanOutStart: undefined,
+    concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: config.pkField,
@@ -552,6 +598,9 @@ export const makeScan = <A>(config: {
     hydration: undefined,
     keyConditionDiagnosis: undefined,
     operationTarget: undefined,
+    fanOut: undefined,
+    fanOutStart: undefined,
+    concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
     pkField: "",
@@ -634,8 +683,12 @@ const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined)
 export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<A> => {
   const state = self._state
   if (key === undefined || state.isScan) return self
+  // On a sharded index (#183) only the unsharded layout can hold 1.36 text, and
+  // only a migration from it (`previous: 1`) reads that layout.
+  if (state.fanOut !== undefined && state.fanOut.unsharded === undefined) return self
   const own = state.skConditions[0]?.condition
-  const same = key.pkValue === state.pkValue && sameCondition(key.condition, own)
+  const same =
+    key.pkValue === (state.fanOut?.unsharded ?? state.pkValue) && sameCondition(key.condition, own)
   if (same && key.rows?.split !== true) return self
   return new QueryImpl<A>({ ...state, key136: key })
 }
@@ -649,6 +702,46 @@ export const alsoReadPartition136 = <A>(self: Query<A>, pkValue: string | undefi
   pkValue === undefined
     ? self
     : alsoRead136(self, { pkValue, condition: self._state.skConditions[0]?.condition })
+
+/**
+ * @internal Read a sharded index's partitions and merge them (#183): what
+ * {@link KeyComposer.composeReadPartitions} returned for the query's pins. An
+ * unsharded index's query is unchanged.
+ */
+export const fanOut = <A>(self: Query<A>, read: ReadPartitions): Query<A> =>
+  read.fanOut === undefined
+    ? self
+    : new QueryImpl<A>({
+        ...self._state,
+        pkValue: read.partitions[0]!,
+        fanOut: { ...read.fanOut, partitions: read.partitions },
+      })
+
+/** @internal Does this query read a sharded index's partitions (#183)? */
+export const isFanOut = (self: Query<unknown>): boolean => self._state.fanOut !== undefined
+
+/**
+ * How many requests a query of a sharded index sends at once, per round of its
+ * fan-out (#183). The default is one per partition. A query with no fan-out sends
+ * one request at a time whatever this says. Anything but a positive integer
+ * throws `[EDD-9105]`.
+ *
+ * ```ts
+ * query.pipe(Query.concurrency(4), Query.collect)
+ * ```
+ */
+export const concurrency: {
+  (n: number): <A>(self: Query<A>) => Query<A>
+  <A>(self: Query<A>, n: number): Query<A>
+} = Function.dual(2, <A>(self: Query<A>, n: number): Query<A> => {
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(
+      `[EDD-9105] concurrency(${JSON.stringify(n)}) is not a number of requests: pass a ` +
+        `positive integer.`,
+    )
+  }
+  return new QueryImpl<A>({ ...self._state, concurrencyValue: n })
+})
 
 /**
  * Return **at most `n` items** — a contract on results, not on round trips.
@@ -872,12 +965,30 @@ export const plan = <A>(
   install:
     | { readonly planner: PlannerFactory; readonly maxSkips: number | undefined }
     | { readonly zorder: ZOrderOptions },
-): Query<A> =>
-  new QueryImpl<A>(
+): Query<A> => {
+  if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
+  return new QueryImpl<A>(
     "zorder" in install
       ? { ...self._state, zorderOptions: { ...self._state.zorderOptions, ...install.zorder } }
       : { ...self._state, planner: install.planner, maxSkips: install.maxSkips },
   )
+}
+
+/**
+ * @internal `[EDD-9104]`: `.within()`, skip-scan and `.zorder()` plan one
+ * partition's reads, so a sharded index would need a plan per shard. A follow-up.
+ */
+const shardedPlanRefusal = (state: QueryState): Error =>
+  new Error(
+    `[EDD-9104] Index "${state.indexName}" of ${state.entityTypes.join(", ") || "this query"} is ` +
+      `sharded: .within(), skip-scan and .zorder() aren't supported on a sharded index. Use the ` +
+      `accessor's sort key composites or .where(), or .filter() for the rest.`,
+  )
+
+/** @internal {@link shardedPlanRefusal}, for an accessor to raise before it plans. */
+export const refuseShardedPlan = (self: Query<unknown>): void => {
+  if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
+}
 
 /**
  * @internal A query no stored row satisfies (#171) — a `.history()` bound with
@@ -1449,11 +1560,17 @@ const sizingMode = (state: QueryState): SizingMode => {
   if (typeof state.pageSizeValue === "number") return "fixed"
   if (state.pageSizeValue === "natural") return "natural"
   if (state.limitValue === undefined) return "none"
-  // Planned queries (`.within()`) are new, so they adapt under `maxPages` too.
-  if (state.maxPagesValue !== undefined && state.planner === undefined) return "natural"
+  // Planned queries (`.within()`) and fan-outs are new, so they adapt under
+  // `maxPages` too: there is no 1.36 sizing to keep.
+  if (state.maxPagesValue !== undefined && state.planner === undefined && !isFanOutState(state)) {
+    return "natural"
+  }
   if (filtered(state) || dropsRows(state)) return "adaptive"
   return "budget"
 }
+
+/** @internal Does this state read a sharded index's partitions? */
+const isFanOutState = (state: QueryState): boolean => state.fanOut !== undefined
 
 /**
  * @internal Whether rows are filtered — server-side (the caller's filter or a
@@ -1726,6 +1843,13 @@ const prepared = (
   // anything is sent (#133).
   const filterRefusal = refuseEmptyFilterParts(state)
   if (filterRefusal !== undefined) return Effect.fail(filterRefusal)
+  // A sharded index's query reads its partitions (#183), resumed from its cursor.
+  if (state.fanOut !== undefined) {
+    return Effect.flatMap(applyPrepare(state, tableName), (ready) => {
+      const resumed = resumeFanOut(ready, ready.fanOut!)
+      return resumed instanceof ValidationError ? Effect.fail(resumed) : Effect.succeed(resumed)
+    })
+  }
   // A query that also reads its 1.36 key (#171) plans both passes from the
   // prepared state: the prepare step may swap its own condition.
   if (state.key136 !== undefined && state.planner === undefined) {
@@ -1800,6 +1924,9 @@ const resume = (state: QueryState): QueryState | ValidationError => {
   const cursor = state.cursorText === undefined ? undefined : Cursor.decode(state.cursorText)
   if (state.cursorText !== undefined && cursor === undefined) {
     return cursorRefusal(entityType, "it is not a cursor a query returned")
+  }
+  if (cursor?.z !== undefined) {
+    return cursorRefusal(entityType, "it comes from a query of a sharded index, and this isn't one")
   }
   const factory = state.planner ?? keyPasses(state)
   if (factory === undefined) {
@@ -2056,8 +2183,12 @@ const cursorProjectionFields = (
     ...(state.projectionPaths ?? []).map((segments) => String(segments[0])),
   ])
   if (projected.size === 0) return []
+  // A fan-out always reads them: the merge compares each row's sort key, and a
+  // cursor resumes each partition after its last row (#183).
   const borrowed = new Set<string>(
-    !forCursor || state.limitValue === undefined || !state.keyFields ? [] : state.keyFields,
+    (!isFanOutState(state) && (!forCursor || state.limitValue === undefined)) || !state.keyFields
+      ? []
+      : state.keyFields,
   )
   // A query that drops rows reads what it judges them by (#133, #171).
   for (const attr of judgedAttributes(state)) borrowed.add(attr)
@@ -2109,14 +2240,20 @@ const examinePage = <A>(
   budget: number | undefined,
   borrowedFields: ReadonlyArray<string>,
 ): Effect.Effect<
-  { readonly items: Array<A>; readonly stoppedAt: number; readonly accepted: number },
+  {
+    readonly items: Array<A>
+    readonly stoppedAt: number
+    readonly accepted: number
+    /** Each item's row in `returned`. */
+    readonly rows: ReadonlyArray<number>
+  },
   DynamoClientError | ValidationError
 > =>
   Effect.gen(function* () {
     // Nothing left to accept. Without this the loop below never advances
     // (`end` stays at `next`) — or, under a predicate, accepts one row past
     // the budget. No terminal asks; a guard all the same (#171).
-    if (budget === 0) return { items: [], stoppedAt: -1, accepted: 0 }
+    if (budget === 0) return { items: [], stoppedAt: -1, accepted: 0, rows: [] }
     const hasPredicate = state.predicates.length > 0 || dropsRows(state)
     // Borrowed attributes the raw-row hook reads are stripped after it ran:
     // borrowed into the request's projection, or — on a `BatchGet`-hydrated
@@ -2135,6 +2272,7 @@ const examinePage = <A>(
       }
     }
     const items: Array<A> = []
+    const rows: Array<number> = []
     let next = 0
     while (next < returned.length) {
       const end =
@@ -2162,13 +2300,14 @@ const examinePage = <A>(
         for (const field of strippedAfterHook) delete raw[field]
         if (hasPredicate && !accepts(state, item)) continue
         items.push(item)
+        rows.push(positions[k]!)
         if (budget !== undefined && items.length >= budget) {
-          return { items, stoppedAt: positions[k]!, accepted: items.length }
+          return { items, stoppedAt: positions[k]!, accepted: items.length, rows }
         }
       }
       next = end
     }
-    return { items, stoppedAt: -1, accepted: items.length }
+    return { items, stoppedAt: -1, accepted: items.length, rows }
   })
 
 /**
@@ -2351,6 +2490,9 @@ const executeCore = <A>(
 
     if (limitValue !== undefined && limitValue <= 0) {
       return { items: [], cursor: Option.none() } as Page<A>
+    }
+    if (state.fanOutStart !== undefined) {
+      return yield* executeFanOut<A>(client, tableName, state, state.fanOutStart)
     }
     if (state.plan !== undefined)
       return yield* executePlanned<A>(client, tableName, state, state.plan)
@@ -2708,6 +2850,9 @@ const pageStream = <A>(
   if (limitValue !== undefined && limitValue <= 0) {
     return Stream.empty as Stream.Stream<Array<A>, DynamoClientError | ValidationError>
   }
+  if (state.fanOutStart !== undefined) {
+    return fanOutPageStream<A>(client, tableName, state, state.fanOutStart)
+  }
   if (state.plan !== undefined) return plannedPageStream<A>(client, tableName, state, state.plan)
 
   // Cursor and sizing state travel through Stream.paginate rather than a
@@ -3015,6 +3160,10 @@ const countCore = <A>(
       return items.length
     }
 
+    if (state.fanOutStart !== undefined) {
+      return yield* countFanOut(client, tableName, state, state.fanOutStart)
+    }
+
     if (state.plan !== undefined) return yield* countPlanned(client, tableName, state, state.plan)
 
     // Rows that may be history are judged by a few attributes, so only those
@@ -3210,6 +3359,7 @@ const countPlanned = (
 export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, never> =>
   Effect.sync(() => {
     const state = self._state
+    if (state.fanOut !== undefined) return explainFanOut(state, state.fanOut)
     const factory = state.planner ?? keyPasses(state)
     if (factory === undefined) {
       const [lower, upper] = displayKeyCondition(state.skConditions[0]?.condition)
@@ -3270,6 +3420,551 @@ export const asParams = <A>(
     // read of a 1.36 key (#171): these are the query's own key's.
     return buildDynamoCommand(indexQueryState(state), tableName)
   })
+
+// ---------------------------------------------------------------------------
+// Sharded indexes (#183, docs/designs/gsi-write-sharding.md §6)
+// ---------------------------------------------------------------------------
+
+/**
+ * @internal The partitions a fan-out reads, in merge order: its layouts', and with
+ * `previous: 1` and the fallback on, a 1.36 key whose text differs. The row checks
+ * judge the rows of the unsharded layout and the 1.36 key as `keyPassesPlanner`
+ * judges them: they are the two keys that can hold rows of both forms.
+ */
+const fanOutPartitions = (state: QueryState, spec: FanOutSpec): ReadonlyArray<FanOutPartition> => {
+  const own = state.skConditions[0]?.condition
+  const legacy = state.key136
+  const unsharded = spec.unsharded
+  const checks =
+    legacy === undefined || unsharded === undefined
+      ? undefined
+      : keyPassChecks({
+          entityType: state.entityTypes.join(", ") || "unknown",
+          index: state.indexName ?? "primary",
+          pkField: state.pkField,
+          skField: state.skField,
+          current: { pkValue: unsharded, condition: own },
+          legacy,
+        })
+  return [
+    ...spec.partitions.map((pkValue) => ({
+      pkValue,
+      condition: own,
+      rowCheck: pkValue === unsharded ? checks?.current : undefined,
+    })),
+    ...(legacy === undefined
+      ? []
+      : [{ pkValue: legacy.pkValue, condition: legacy.condition, rowCheck: checks?.legacy }]),
+  ]
+}
+
+/** @internal What a sharded query's cursor must have come from. */
+const fanOutFingerprint = (
+  state: QueryState,
+  spec: FanOutSpec,
+  partitions: ReadonlyArray<FanOutPartition>,
+): string =>
+  fnv1a32(
+    canonicalJson({
+      index: state.indexName,
+      entityTypes: state.entityTypes,
+      count: spec.count,
+      source: spec.source,
+      previous: spec.previous,
+      partitions: partitions.map(({ pkValue, condition }) => ({ pkValue, condition })),
+      reverse: !state.scanForward,
+    }),
+  )
+
+/** @internal The checksum of a cursor's positions. */
+const positionsChecksum = (positions: ReadonlyArray<Cursor.ShardPosition>): string =>
+  fnv1a32(canonicalJson(positions))
+
+/**
+ * @internal A fan-out's partitions, resumed from its {@link startFrom} cursor: a
+ * cursor from another layout or query, a position it can't hold or an altered one
+ * is `[EDD-9094]`.
+ */
+const resumeFanOut = (state: QueryState, spec: FanOutSpec): QueryState | ValidationError => {
+  const partitions = fanOutPartitions(state, spec)
+  const fingerprint = fanOutFingerprint(state, spec, partitions)
+  const started = (merge: ShardMerge.MergeState): QueryState => ({
+    ...state,
+    fanOutStart: { partitions, fingerprint, merge },
+  })
+  if (state.cursorText === undefined) return started(ShardMerge.fromStart(partitions.length))
+  const entityType = state.entityTypes.join(", ") || "unknown"
+  const refuse = (why: string) => cursorRefusal(entityType, why)
+  const cursor = Cursor.decode(state.cursorText)
+  if (cursor === undefined) return refuse("it is not a cursor a query returned")
+  if (cursor.z === undefined) {
+    return refuse("this index is sharded, and it comes from a query that wasn't")
+  }
+  if (cursor.f !== fingerprint) {
+    return refuse("its shard layout or its query differs from this one's")
+  }
+  if (cursor.c !== positionsChecksum(cursor.z)) return refuse("its positions were altered")
+  if (cursor.z.length !== partitions.length) {
+    return refuse("it doesn't hold one position per partition")
+  }
+  const keyNames = new Set((state.keyFields ?? []).filter((name) => name !== state.pkField))
+  const boundaries: Array<ShardMerge.Boundary> = []
+  for (let i = 0; i < partitions.length; i++) {
+    const at = cursor.z[i]!
+    if (at === 0) {
+      boundaries.push({ _tag: "Start" })
+      continue
+    }
+    if (at === 1) {
+      boundaries.push({ _tag: "Done" })
+      continue
+    }
+    const names = Object.keys(at)
+    if (names.length !== keyNames.size || !names.every((name) => keyNames.has(name))) {
+      return refuse("a position isn't a key of this index")
+    }
+    const partition = partitions[i]!
+    const sort = state.skField === undefined ? undefined : at[state.skField]
+    const value = sort === undefined ? undefined : Cursor.wireToKeyValue(sort)
+    if (
+      partition.condition !== undefined &&
+      (value === undefined || !keyConditionHolds(partition.condition, value))
+    ) {
+      return refuse("a position is outside the query's key condition")
+    }
+    boundaries.push({
+      _tag: "At",
+      key: Cursor.keyFromWire({ ...at, [state.pkField]: { S: partition.pkValue } }),
+    })
+  }
+  return started(ShardMerge.initial(boundaries))
+}
+
+/** @internal A boundary as a cursor records it. */
+const positionOf = (
+  state: QueryState,
+  boundary: ShardMerge.Boundary,
+): Effect.Effect<Cursor.ShardPosition> => {
+  if (boundary._tag === "Start") return Effect.succeed(0)
+  if (boundary._tag === "Done") return Effect.succeed(1)
+  const key = boundary._tag === "At" ? boundary.key : keyOfItem(boundary.row, state.keyFields)
+  const wire = key === undefined ? undefined : Cursor.keyToWire(key)
+  if (wire === undefined) {
+    return Effect.die(
+      new Error(
+        `[internal] A row read from sharded index "${state.indexName}" lacks a key attribute ` +
+          `of ${JSON.stringify(state.keyFields)}, which the cursor resumes after.`,
+      ),
+    )
+  }
+  const { [state.pkField]: _partition, ...position } = wire
+  return Effect.succeed(position)
+}
+
+/** @internal The cursor of a fan-out at `merge`: v2, or `None` once every partition is done. */
+const fanOutCursor = (
+  state: QueryState,
+  start: FanOutStart,
+  merge: ShardMerge.MergeState,
+): Effect.Effect<Option.Option<string>> =>
+  ShardMerge.isFinished(merge)
+    ? Effect.succeed(Option.none())
+    : Effect.map(
+        Effect.forEach(merge, (partition) => positionOf(state, partition.boundary)),
+        (z) =>
+          Option.some(
+            Cursor.encodeV2({
+              v: 2,
+              f: start.fingerprint,
+              s: "key",
+              z,
+              c: positionsChecksum(z),
+            }),
+          ),
+      )
+
+/** @internal One partition's request, as `state` sends it. */
+const partitionState = (state: QueryState, partition: FanOutPartition): QueryState => ({
+  ...state,
+  pkValue: partition.pkValue,
+  skConditions:
+    partition.condition === undefined || state.skField === undefined
+      ? []
+      : [{ field: state.skField, condition: partition.condition }],
+  rowCheck: partition.rowCheck,
+})
+
+/** @internal The `ExclusiveStartKey` a boundary resumes from. */
+const fanOutStartKey = (
+  state: QueryState,
+  boundary: ShardMerge.Boundary,
+): Record<string, AttributeValue> | undefined =>
+  boundary._tag === "At"
+    ? boundary.key
+    : boundary._tag === "After"
+      ? keyOfItem(boundary.row, state.keyFields)
+      : undefined
+
+/**
+ * @internal The `Limit` of a partition's next request (design §6.5), `remaining`
+ * items still owed and `active` partitions unfinished: the partition's share of
+ * what is owed, growing where it keeps running dry.
+ */
+const fanOutLimit = (
+  sent: QueryState,
+  remaining: number | undefined,
+  active: number,
+  est: Estimator,
+): number | undefined => {
+  const mode = sizingMode(sent)
+  if (remaining === undefined || mode === "none") return legacyRequestLimit(sent, remaining)
+  const share = Math.ceil(remaining / Math.max(active, 1))
+  if (mode === "adaptive") return nextLimit(est, share, filtered(sent))
+  if (mode === "budget") {
+    return Math.min(remaining, Math.max(Math.ceil(share * SAFETY), est.lastLimit * GROWTH))
+  }
+  return legacyRequestLimit(sent, remaining, est.requests + 1)
+}
+
+/** @internal A page read and not yet reported: its rows may be consumed over several rounds. */
+interface FanOutPage {
+  readonly sent: QueryState
+  readonly request: number
+  readonly limitSent: number | undefined
+  readonly counts: { readonly scannedCount: number; readonly count: number }
+  readonly accepted: number
+}
+
+/**
+ * @internal A fan-out in progress. Plain data, so a stream restarts from the
+ * beginning when re-run, and the estimators stay out of the cursor.
+ */
+interface FanOutRun {
+  readonly merge: ShardMerge.MergeState
+  readonly estimators: ReadonlyArray<Estimator>
+  readonly pages: ReadonlyArray<FanOutPage | undefined>
+  readonly requests: number
+  readonly rounds: number
+  readonly emitted: number
+}
+
+const startFanOut = (start: FanOutStart): FanOutRun => ({
+  merge: start.merge,
+  estimators: start.partitions.map(() => emptyEstimator),
+  pages: start.partitions.map(() => undefined),
+  requests: 0,
+  rounds: 0,
+  emitted: 0,
+})
+
+/** @internal How many requests a fan-out's round sends at once. */
+const fanOutConcurrency = (state: QueryState, partitions: number): number =>
+  state.concurrencyValue ?? Math.max(partitions, 1)
+
+/** @internal Are `maxPages` rounds used up? */
+const roundsUsed = (state: QueryState, run: FanOutRun): boolean =>
+  state.maxPagesValue != null && run.rounds >= state.maxPagesValue
+
+/**
+ * @internal One round of a fan-out: read every partition with nothing buffered
+ * and more to read (at most one page each), unless `read` is false, then emit
+ * what is proven in order, up to the `limit`. Any request's failure fails the
+ * round, with the others interrupted. A page is reported to the observers when
+ * its rows are consumed, so `accepted` is exact.
+ */
+const fanOutRound = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  start: FanOutStart,
+  run: FanOutRun,
+): Effect.Effect<
+  { readonly run: FanOutRun; readonly items: Array<A> },
+  DynamoClientError | ValidationError
+> =>
+  Effect.gen(function* () {
+    const limitValue = state.limitValue
+    const remainingBefore = limitValue === undefined ? undefined : limitValue - run.emitted
+    const needing = ShardMerge.needingRead(run.merge)
+    const active = ShardMerge.unfinished(run.merge)
+    let merge = run.merge
+    const estimators = [...run.estimators]
+    const pages = [...run.pages]
+    // The same attributes for every partition: a row check on one borrows what it
+    // judges, and `examinePage` strips the lot.
+    const borrowed = [
+      ...new Set(
+        start.partitions.flatMap((partition) =>
+          cursorProjectionFields(indexQueryState(partitionState(state, partition)), true),
+        ),
+      ),
+    ]
+
+    const report = (i: number): Effect.Effect<void> => {
+      const page = pages[i]
+      if (page === undefined) return Effect.void
+      pages[i] = undefined
+      estimators[i] = observeEstimator(estimators[i]!, {
+        scanned: page.counts.scannedCount,
+        accepted: page.accepted,
+        limitSent: page.limitSent,
+      })
+      return notify(page.sent, {
+        kind: "read",
+        request: page.request,
+        limit: page.limitSent,
+        ...page.counts,
+        accepted: page.accepted,
+      })
+    }
+
+    const responses = yield* Effect.forEach(
+      needing,
+      (i, n) =>
+        Effect.gen(function* () {
+          const sent = partitionState(state, start.partitions[i]!)
+          const limitSent = fanOutLimit(sent, remainingBefore, active, estimators[i]!)
+          const cmd = buildDynamoCommand(
+            indexQueryState(sent),
+            tableName,
+            { ExclusiveStartKey: fanOutStartKey(state, run.merge[i]!.boundary), Limit: limitSent },
+            borrowed,
+          )
+          const result = yield* send(client, sent, cmd)
+          return {
+            i,
+            request: run.requests + n + 1,
+            sent,
+            limitSent,
+            result,
+          }
+        }),
+      { concurrency: fanOutConcurrency(state, needing.length) },
+    )
+    for (const { i, request, sent, limitSent, result } of responses) {
+      const returned = (result.Items ?? []) as Array<ShardMerge.Row>
+      const kept = returned.filter((row) => !isExcludedRow(sent, row))
+      merge = ShardMerge.absorb(
+        merge,
+        i,
+        kept,
+        result.LastEvaluatedKey as ShardMerge.Row | undefined,
+      )
+      pages[i] = { sent, request, limitSent, counts: responseCounts(result), accepted: 0 }
+      // Nothing left in the page: nothing will ever be consumed from it.
+      if (kept.length === 0) yield* report(i)
+    }
+
+    const budget = limitValue === undefined ? Number.POSITIVE_INFINITY : limitValue - run.emitted
+    const selection = yield* Effect.try({
+      try: () =>
+        ShardMerge.select(merge, budget, {
+          skField: state.skField ?? "",
+          reverse: !state.scanForward,
+        }),
+      catch: (error) => error,
+    }).pipe(Effect.orDie)
+    merge = selection.state
+    // Rows dropped at the read aren't examined again; the rest are decoded
+    // together, which is what lets a `BatchGet`-hydrated query fetch them at once.
+    const page = yield* examinePage<A>(
+      client,
+      tableName,
+      { ...state, rowCheck: undefined, keepRow: undefined, liveRows: undefined },
+      selection.taken.map((selected) => selected.row),
+      undefined,
+      borrowed,
+    )
+    for (const at of page.rows) {
+      const i = selection.taken[at]!.partition
+      const accepted = pages[i]
+      if (accepted !== undefined) pages[i] = { ...accepted, accepted: accepted.accepted + 1 }
+    }
+    for (const i of selection.drained) yield* report(i)
+
+    return {
+      run: {
+        merge,
+        estimators,
+        pages,
+        requests: run.requests + needing.length,
+        rounds: needing.length > 0 ? run.rounds + 1 : run.rounds,
+        emitted: run.emitted + page.items.length,
+      },
+      items: page.items,
+    }
+  })
+
+/**
+ * @internal Report the pages a fan-out read and never finished consuming: a page
+ * with no row consumed is `discarded`, and a later call reads what remains again.
+ */
+const reportUnfinished = (run: FanOutRun): Effect.Effect<void> =>
+  Effect.forEach(
+    run.pages.filter((page): page is FanOutPage => page !== undefined),
+    (page) =>
+      notify(page.sent, {
+        kind: "read",
+        request: page.request,
+        limit: page.limitSent,
+        ...page.counts,
+        accepted: page.accepted,
+        discarded: page.accepted === 0,
+      }),
+    { discard: true },
+  )
+
+/**
+ * @internal `execute` for a sharded index. With a `limit`, rounds until `limit`
+ * items are out, every partition is done, or `maxPages` rounds were read. Without
+ * one, a page is one round, as a page without a plan is one request.
+ */
+const executeFanOut = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  start: FanOutStart,
+): Effect.Effect<Page<A>, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const limitValue = state.limitValue
+    const items: Array<A> = []
+    let run = startFanOut(start)
+    while (!ShardMerge.isFinished(run.merge)) {
+      const stepped = yield* fanOutRound<A>(client, tableName, state, start, run)
+      run = stepped.run
+      items.push(...stepped.items)
+      if (limitValue === undefined) break
+      if (run.emitted >= limitValue) break
+      // A partition must be read, and the rounds are up.
+      if (ShardMerge.needingRead(run.merge).length > 0 && roundsUsed(state, run)) break
+    }
+    yield* reportUnfinished(run)
+    return {
+      items,
+      cursor: yield* fanOutCursor(state, start, run.merge),
+    }
+  })
+
+/**
+ * @internal `pageStream` for a sharded index: one array per round. At most one
+ * page per partition is held. The stream ends once `limit` items are out, every
+ * partition is done, or `maxPages` rounds were read.
+ */
+const fanOutPageStream = <A>(
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  start: FanOutStart,
+): Stream.Stream<Array<A>, DynamoClientError | ValidationError> =>
+  Stream.paginate(startFanOut(start), (run: FanOutRun) =>
+    Effect.gen(function* () {
+      if (ShardMerge.isFinished(run.merge)) return [[], Option.none<FanOutRun>()] as const
+      const stepped = yield* fanOutRound<A>(client, tableName, state, start, run)
+      const next = stepped.run
+      const filled = state.limitValue !== undefined && next.emitted >= state.limitValue
+      const stuck = ShardMerge.needingRead(next.merge).length > 0 && roundsUsed(state, next)
+      const more = !filled && !stuck && !ShardMerge.isFinished(next.merge)
+      if (!more) yield* reportUnfinished(next)
+      return [[stepped.items], more ? Option.some(next) : Option.none<FanOutRun>()] as const
+    }),
+  )
+
+/**
+ * @internal `count` for a sharded index: each partition counted from where it
+ * resumes, `Select: COUNT` or the rows a row check judges, summed and capped at the
+ * `limit`. `maxPages` caps each partition's requests. Any failure fails the count.
+ */
+const countFanOut = (
+  client: DynamoClientService,
+  tableName: string,
+  state: QueryState,
+  start: FanOutStart,
+): Effect.Effect<number, DynamoClientError | ValidationError> =>
+  Effect.gen(function* () {
+    const limitValue = state.limitValue
+    let total = 0
+    let requests = 0
+    const reached = () => limitValue !== undefined && total >= limitValue
+    const counting = start.partitions.flatMap((partition, i) =>
+      start.merge[i]!.boundary._tag === "Done" ? [] : [{ partition, i }],
+    )
+    yield* Effect.forEach(
+      counting,
+      ({ partition, i }) =>
+        Effect.gen(function* () {
+          const sent = partitionState(state, partition)
+          const judging = dropsRows(sent)
+          let startKey = fanOutStartKey(state, start.merge[i]!.boundary)
+          let est = emptyEstimator
+          let pages = 0
+          do {
+            if (reached()) return
+            pages++
+            const remaining = limitValue === undefined ? undefined : limitValue - total
+            const limitSent = fanOutLimit(sent, remaining, counting.length, est)
+            const cmd = judging
+              ? buildDynamoCommand(
+                  { ...sent, projection: judgedAttributes(sent), projectionPaths: undefined },
+                  tableName,
+                  { ExclusiveStartKey: startKey, Limit: limitSent },
+                )
+              : buildDynamoCommand(sent, tableName, {
+                  ExclusiveStartKey: startKey,
+                  Select: "COUNT",
+                  Limit: limitSent,
+                })
+            const request = ++requests
+            const result = yield* send(client, sent, cmd)
+            const counts = responseCounts(result)
+            const matched = judging
+              ? ((result.Items ?? []) as Array<ShardMerge.Row>).filter(
+                  (row) => !isExcludedRow(sent, row),
+                ).length
+              : (result.Count ?? 0)
+            const scanned = judging ? counts.scannedCount : (result.ScannedCount ?? matched)
+            total += matched
+            est = observeEstimator(est, { scanned, accepted: matched, limitSent })
+            yield* notify(sent, {
+              kind: "count",
+              request,
+              limit: limitSent,
+              scannedCount: scanned,
+              count: judging ? counts.count : matched,
+              accepted: matched,
+            })
+            startKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined
+            if (state.maxPagesValue != null && pages >= state.maxPagesValue) return
+          } while (startKey != null)
+        }),
+      { concurrency: fanOutConcurrency(state, counting.length), discard: true },
+    )
+    return limitValue !== undefined && total >= limitValue ? limitValue : total
+  })
+
+/** @internal {@link explain} of a sharded index's query: no cursor is read. */
+const explainFanOut = (state: QueryState, spec: FanOutSpec): QueryExplain => {
+  const partitions = fanOutPartitions(state, spec)
+  return {
+    index: state.indexName ?? "primary",
+    plan: "key",
+    reason:
+      spec.pruned && partitions.length === 1
+        ? "every shard source attribute pinned: one shard"
+        : `one key condition on each of ${partitions.length} partitions, merged`,
+    keyConditions: partitions.map(({ condition, rowCheck }) => {
+      const [lower, upper] = displayKeyCondition(condition)
+      return { lower, upper, exact: rowCheck === undefined }
+    }),
+    filter: undefined,
+    rowChecks: [],
+    sizing: explainedSizing(state),
+    fanOut: {
+      partitions: partitions.map(({ pkValue }) => pkValue),
+      pruned: spec.pruned,
+      concurrency: fanOutConcurrency(state, partitions.length),
+    },
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Type guard

@@ -1910,6 +1910,8 @@ export interface CollectionQuery<TResult> {
   readonly startFrom: (cursor: string) => CollectionQuery<TResult>
   /** Stop after `n` DynamoDB requests. */
   readonly maxPages: (n: number) => CollectionQuery<TResult>
+  /** Requests a sharded collection sends at once (#183); default one per partition. */
+  readonly concurrency: (n: number) => CollectionQuery<TResult>
   /**
    * Strongly consistent reads. A collection over a GSI — every auto-discovered
    * one — is refused with a `ValidationError` when it runs: DynamoDB reads a
@@ -2582,13 +2584,15 @@ const makeFromConfig = (config: {
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
         const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
-        const pkValue = KeyComposer.composePk(
+        // One partition, or a sharded index's several (#183).
+        const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
           entityLike.entityType,
           indexDef,
           compositesKeyForm,
         )
-        const query = Query.make({
+        const pkValue = read.partitions[0]!
+        const unpartitioned = Query.make({
           tableName: "",
           indexName: indexDef.index,
           pkField: indexDef.pk.field,
@@ -2613,6 +2617,7 @@ const makeFromConfig = (config: {
             label: `${entityLike.entityType}.${_indexName}`,
           },
         })
+        const query = Query.fanOut(unpartitioned, read)
 
         // Apply the SK condition from the provided composites
         // (`composeSortKeyCondition`): a partial prefix is a `begins_with`
@@ -3010,6 +3015,10 @@ const makeFromConfig = (config: {
         collName,
         members.map((m) => ({ key: m.entityKey, schema: m.entityLike._schema, index: m.indexDef })),
       )
+      KeyComposer.assertCollectionShardsAgreement(
+        collName,
+        members.map((m) => ({ key: m.entityKey, index: m.indexDef })),
+      )
 
       boundCollections[collName] = (composites: Record<string, unknown>) => {
         // Use the first member for PK composition — verified above to agree
@@ -3054,11 +3063,13 @@ const makeFromConfig = (config: {
         // path use — without it `db.collections.window({ takenAt })` composed a
         // different PK from `db.entities.Readings.byWindow({ takenAt })` and
         // returned nothing.
-        const pkValue = KeyComposer.composePk(
+        // Members share the partitions, whatever each hashes: never pruned (#183).
+        const read = KeyComposer.composeReadPartitions(
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
           entityKeyForm(firstMember.entityLike, composites),
+          { prune: false },
         )
 
         // Always isolated — begins_with on collection SK prefix
@@ -3066,7 +3077,7 @@ const makeFromConfig = (config: {
           tableName: "",
           indexName: indexDef.index,
           pkField: indexDef.pk.field,
-          pkValue,
+          pkValue: read.partitions[0]!,
           skField: indexDef.sk.field,
           entityTypes,
           decoder: collDecoder as any,
@@ -3082,6 +3093,7 @@ const makeFromConfig = (config: {
           liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
           keyConditionDiagnosis: { operation: "query", label: `collection "${collName}"` },
         })
+        query = Query.fanOut(query, read)
 
         // Add begins_with on collection SK prefix for clustered collections.
         // For isolated collections (default), each entity has its own entity-type

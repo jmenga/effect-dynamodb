@@ -267,8 +267,18 @@ export interface BoundQueryBase<
     observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
   ) => BoundQuery<Model, SkRemaining, A, W>
 
-  /** Set the maximum number of DynamoDB pages to fetch. */
+  /**
+   * Set the maximum number of DynamoDB pages to fetch. On a sharded index, the
+   * maximum number of rounds: each reads at most one page per partition.
+   */
   readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A, W>
+
+  /**
+   * How many requests a query of a sharded index sends at once (#183). The
+   * default is one per partition. Has no effect on an unsharded index. Anything
+   * but a positive integer throws `[EDD-9105]`.
+   */
+  readonly concurrency: (n: number) => BoundQuery<Model, SkRemaining, A, W>
 
   /** Reverse the sort order (ScanIndexForward = false). */
   readonly reverse: () => BoundQuery<Model, SkRemaining, A, W>
@@ -829,6 +839,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     bounds: Record<string, unknown>,
     options?: WithinOptions,
   ): BoundQueryImpl<Model, never, A> {
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._applied !== undefined) {
       refuseWithin(this._applied === "where" ? "within() after .where()" : "a second .within()")
     }
@@ -850,6 +861,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- zorder ---
   zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._config.zorder !== true) {
       throw new Error(
         `[EDD-9095] .zorder() applies only to a Z-order index accessor: this query's index ` +
@@ -922,6 +934,10 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   maxPages(n: number): BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.maxPages(this._query, n), this._config, this._applied)
+  }
+
+  concurrency(n: number): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.concurrency(this._query, n), this._config, this._applied)
   }
 
   reverse(): BoundQueryImpl<Model, SkRemaining, A> {

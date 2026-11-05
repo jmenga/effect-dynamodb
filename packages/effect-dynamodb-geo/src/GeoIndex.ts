@@ -154,6 +154,12 @@ export const make = <
   if (!indexDef) {
     throw new Error(`GeoIndex: index "${config.index}" not found on entity`)
   }
+  if (indexDef.shards !== undefined) {
+    throw new Error(
+      `[EDD-9104] GeoIndex: index "${config.index}" is sharded, and a GeoIndex over a sharded ` +
+        `index isn't supported: its search plans read one partition per cell and time bucket.`,
+    )
+  }
   const bucketMs = BUCKET_MS[config.fields.timePartition.bucket]
 
   const enrich = (input: A): A => {

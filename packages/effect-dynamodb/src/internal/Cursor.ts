@@ -51,7 +51,19 @@ export interface CursorV2 {
    * pass.
    */
   readonly p?: 0 | 1
+  /**
+   * A sharded index's query (#183): each partition's position, in the query's
+   * partition order. `0` not started, `1` done, or the key to resume after,
+   * without the index partition key: it is recomposed, so a cursor can't name
+   * another partition.
+   */
+  readonly z?: ReadonlyArray<ShardPosition>
+  /** A checksum over `z`: catches a corrupted or hand-edited cursor. */
+  readonly c?: string
 }
+
+/** One partition's position in a {@link CursorV2}'s `z`. */
+export type ShardPosition = 0 | 1 | Record<string, WireValue>
 
 const V2 = "v2."
 
@@ -204,7 +216,7 @@ export const decode = (text: string): CursorV2 | undefined => {
     return legacy ? { v: 2, k: parsed as Record<string, WireValue> } : undefined
   }
   if (!isRecord(parsed) || parsed.v !== 2) return undefined
-  const allowed = new Set(["v", "f", "s", "t", "k", "a", "d", "p"])
+  const allowed = new Set(["v", "f", "s", "t", "k", "a", "d", "p", "z", "c"])
   if (Object.keys(parsed).some((key) => !allowed.has(key))) return undefined
   if (parsed.f !== undefined && typeof parsed.f !== "string") return undefined
   if (parsed.s !== undefined && !(typeof parsed.s === "string" && PLAN_MODES.has(parsed.s))) {
@@ -215,6 +227,14 @@ export const decode = (text: string): CursorV2 | undefined => {
   if (parsed.a !== undefined && !isWireValue(parsed.a)) return undefined
   if (parsed.d !== undefined && parsed.d !== 1) return undefined
   if (parsed.p !== undefined && parsed.p !== 0 && parsed.p !== 1) return undefined
+  if (parsed.c !== undefined && typeof parsed.c !== "string") return undefined
+  if (parsed.z !== undefined) {
+    if (!Array.isArray(parsed.z)) return undefined
+    const valid = parsed.z.every((at) => at === 0 || at === 1 || isWireKey(at))
+    if (!valid) return undefined
+    const elsewhere = [parsed.k, parsed.a, parsed.d, parsed.t, parsed.p]
+    if (elsewhere.some((field) => field !== undefined)) return undefined
+  }
   const positions = [parsed.k, parsed.a, parsed.d].filter((field) => field !== undefined)
   if (positions.length > 1) return undefined
   return parsed as unknown as CursorV2

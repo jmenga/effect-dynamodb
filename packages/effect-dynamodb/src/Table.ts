@@ -930,12 +930,14 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
  *   `message` says why
+ * - `uncomposable` — its key on a sharded index is from another layout, and its
+ *   values can't compose a current one (a `by` attribute was cleared) (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason: "bothKeys" | "taken" | "contended" | "failed"
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */

@@ -4935,11 +4935,12 @@ const makeImpl = <
     ],
     composed: (row) => {
       try {
+        // Rows of both forms live in a sharded index's unsharded layout (#183).
         const keys = KeyComposer.composeIndexKeys(
           schema,
           entityType,
           entityVersion,
-          index,
+          KeyComposer.unshardedView(index),
           keyForm(toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)),
         )
         const pk = keys[index.pk.field]
@@ -5737,7 +5738,8 @@ const makeImpl = <
           allIndexes,
           rowKeyForm,
           rowKeyForm,
-          {},
+          // A row that can't compute its shard keeps the key it has (#183).
+          { onMissingShardSource: "keep" },
         ),
       )
       const moved: globalThis.Record<string, AttributeValue> = {
@@ -6959,14 +6961,15 @@ const makeImpl = <
         const targetPrimary = target.indexes.primary!
         const keyFields = [targetPrimary.pk.field, targetPrimary.sk.field] as const
 
-        // Compose GSI PK for the source entity's ID
+        // Compose GSI PK for the source entity's ID: one partition, or a sharded
+        // index's several (#183). The cascade reads them all.
         const targetSchema = target._schema
-        const gsiPkValue = KeyComposer.composePk(
+        const gsiPartitions = KeyComposer.composeReadPartitions(
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
           keyFormFor(target, { [matchingRef.idFieldName]: sourceIdValue }),
-        )
+        ).partitions
 
         // Build query parameters
         const gsiPkField = cascadeIdx.indexDef.pk.field
@@ -6975,7 +6978,6 @@ const makeImpl = <
           "#et": "__edd_e__",
         }
         const queryValues: globalThis.Record<string, AttributeValue> = {
-          ":pk": { S: gsiPkValue },
           ":et0": { S: target.entityType },
         }
 
@@ -6994,34 +6996,36 @@ const makeImpl = <
           }
         }
 
-        // Paginated query
-        let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
-        do {
-          const queryResult = yield* client.query({
-            TableName: targetTableName,
-            IndexName: cascadeIdx.indexDef.index,
-            KeyConditionExpression: "#pk = :pk",
-            FilterExpression: filterExpression,
-            ExpressionAttributeNames: queryNames,
-            ExpressionAttributeValues: queryValues,
-            ExclusiveStartKey: exclusiveStartKey,
-          })
-
-          for (const item of queryResult.Items ?? []) {
-            allUpdateOps.push({
-              entityType: target.entityType,
-              tableName: targetTableName,
-              key: { [keyFields[0]]: item[keyFields[0]]!, [keyFields[1]]: item[keyFields[1]]! },
-              keyFields,
-              refFieldName: matchingRef.fieldName,
-              refData: toAttributeValue(sourceDomainData),
+        // Paginated query, per partition
+        for (const gsiPkValue of gsiPartitions) {
+          let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
+          do {
+            const queryResult = yield* client.query({
+              TableName: targetTableName,
+              IndexName: cascadeIdx.indexDef.index,
+              KeyConditionExpression: "#pk = :pk",
+              FilterExpression: filterExpression,
+              ExpressionAttributeNames: queryNames,
+              ExpressionAttributeValues: { ...queryValues, ":pk": { S: gsiPkValue } },
+              ExclusiveStartKey: exclusiveStartKey,
             })
-          }
 
-          exclusiveStartKey = queryResult.LastEvaluatedKey as
-            | globalThis.Record<string, AttributeValue>
-            | undefined
-        } while (exclusiveStartKey !== undefined)
+            for (const item of queryResult.Items ?? []) {
+              allUpdateOps.push({
+                entityType: target.entityType,
+                tableName: targetTableName,
+                key: { [keyFields[0]]: item[keyFields[0]]!, [keyFields[1]]: item[keyFields[1]]! },
+                keyFields,
+                refFieldName: matchingRef.fieldName,
+                refData: toAttributeValue(sourceDomainData),
+              })
+            }
+
+            exclusiveStartKey = queryResult.LastEvaluatedKey as
+              | globalThis.Record<string, AttributeValue>
+              | undefined
+          } while (exclusiveStartKey !== undefined)
+        }
       }
 
       if (allUpdateOps.length === 0) return
@@ -7780,7 +7784,12 @@ const makeImpl = <
           allIndexes,
           keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
-          uState.remove === undefined ? {} : { removedSet: new Set(uState.remove) },
+          // The branches below know more: the retain path reads the whole item
+          // first, so a shard it can compute is not refused here (#183).
+          {
+            onMissingShardSource: "keep",
+            ...(uState.remove === undefined ? {} : { removedSet: new Set(uState.remove) }),
+          },
         ),
       )
 
@@ -11981,7 +11990,9 @@ const makeImpl = <
       // Normalise composites to their key form before composing — same rule
       // and same function the write path uses (see `CompositeCodec`).
       const pkKeyForm = keyForm(rawPk)
-      const pkValue = KeyComposer.composePk(schema, entityType, indexDef, pkKeyForm)
+      // One partition, or a sharded index's several (#183).
+      const read = KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
+      const pkValue = read.partitions[0]!
       // A Z-order sort key has no text prefix: its prefix composites and
       // dimensions are bounded through `.within()` on the typed accessor, never
       // passed as accessor composites (EDD-9093).
@@ -12017,7 +12028,7 @@ const makeImpl = <
         ],
         // DynamoDB's rejection of the key condition (#144) names the accessor.
         keyConditionDiagnosis: { operation: "query", label: `${entityType}.query.${indexName}` },
-      })
+      }).pipe((made) => Query.fanOut(made, read))
       // `composeSortKeyCondition`: a partial prefix terminates on a segment
       // boundary, or it matches sibling values that merely start with the
       // supplied one (`status_done` also matching `status_done_archived`,
@@ -13361,7 +13372,7 @@ const makeImpl = <
 
   const rekeyConflict = (
     kind: RowKind,
-    reason: "bothKeys" | "taken" | "contended" | "failed",
+    reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable",
     key: StoredKey,
     target: StoredKey | undefined,
     message: string,
@@ -13745,6 +13756,11 @@ const makeImpl = <
    * values, one cleared of them. So is a key that isn't stored (under `sparse` its
    * absence can be deliberate), and a table key attribute, which is the table's to hold.
    * A Z-order index has no 1.36 text (it is new in 1.37), so neither half is compared.
+   *
+   * A sharded index's partition key (#183) is rewritten whenever its stored text
+   * differs from what the values compose now: that is what moves the rows of a
+   * `previous` layout. One whose values can't compose a key is left, and reported
+   * unless it is already in the current layout.
    */
   const staleIndexKeys = (row: StoredRow) => {
     const rowKeyForm = keyForm(
@@ -13778,14 +13794,43 @@ const makeImpl = <
       const text = composing(now)
       if (text !== undefined && text !== stored) rewrite(field, text, attrs)
     }
+    const uncomposable: Array<string> = []
     for (const [name, index] of Object.entries(allIndexes)) {
-      if (name === "primary" || KeyComposer.isZOrderHalf(index.sk)) continue
-      consider(
-        index.pk.field,
-        index.pk.composite,
-        () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
-        () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
-      )
+      if (name === "primary") continue
+      if (index.shards !== undefined) {
+        const stored = row[index.pk.field]?.S
+        if (stored !== undefined) {
+          const text = (() => {
+            try {
+              return KeyComposer.composeStoredPk(schema, entityType, index, rowKeyForm)
+            } catch {
+              // Its values compose no key now.
+              return undefined
+            }
+          })()
+          if (text === undefined) {
+            if (!KeyComposer.isCurrentShardLayout(schema, entityType, index, stored)) {
+              uncomposable.push(name)
+            }
+          } else if (stored !== text) {
+            sets[index.pk.field] = text
+            olds[index.pk.field] = stored
+            for (const attr of [...index.pk.composite, ...index.shards.source!]) {
+              if (rowKeyForm[attr] !== undefined && rowKeyForm[attr] !== null) {
+                composites.add(resolveDbName(attr))
+              }
+            }
+          }
+        }
+      } else if (!KeyComposer.isZOrderHalf(index.sk)) {
+        consider(
+          index.pk.field,
+          index.pk.composite,
+          () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
+          () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
+        )
+      }
+      if (KeyComposer.isZOrderHalf(index.sk)) continue
       consider(
         index.sk.field,
         index.sk.composite,
@@ -13802,7 +13847,7 @@ const makeImpl = <
         () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
       )
     }
-    return { sets, olds, composites: [...composites] }
+    return { sets, olds, composites: [...composites], uncomposable }
   }
 
   /**
@@ -13820,8 +13865,10 @@ const makeImpl = <
       const client = yield* Capacity.client
       let row = scanned
       let rewritten = false
+      let uncomposable: ReadonlyArray<string> = []
       for (let attempt = 0; ; attempt++) {
         const stale = staleIndexKeys(row)
+        uncomposable = stale.uncomposable
         const fields = Object.keys(stale.sets)
         if (fields.length === 0) break
         if (ctx.dryRun) {
@@ -13885,12 +13932,29 @@ const makeImpl = <
         row = fresh
       }
       const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at)
+      const refused =
+        uncomposable.length === 0
+          ? {}
+          : rekeyConflict(
+              "item",
+              "uncomposable",
+              at,
+              at,
+              `Its values no longer compose a key for sharded ${
+                uncomposable.length === 1 ? "index" : "indexes"
+              } ${uncomposable.map((name) => `"${name}"`).join(", ")}, and its stored key is ` +
+                `from another layout.`,
+            )
       return Rekey.mergeTallies(
-        rewritten || (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
+        rewritten ||
+          uncomposable.length > 0 ||
+          (sentinels.sentinelsMoved ?? 0) > 0 ||
+          (sentinels.conflicts ?? []).length > 0
           ? {}
           : { unchanged: 1 },
         rewritten ? { indexKeysRewritten: 1 } : {},
         sentinels,
+        refused,
       )
     })
 
