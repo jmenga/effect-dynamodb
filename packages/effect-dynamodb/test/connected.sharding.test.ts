@@ -1422,7 +1422,7 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
       ),
   }
 
-  describe("a key a write composed is what `rekey` composes", () => {
+  describe("`rekey` touches no key a write stored", () => {
     for (const scenario of [
       ...RekeyComparison.compositeKindScenarios,
       ...RekeyComparison.writePathScenarios,
@@ -1431,15 +1431,38 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
-  it.live("a Z-order index's partition key, and never its address", () =>
-    RekeyComparison.zOrderPartitionScenario(harness),
+  describe("a Z-order index", () => {
+    for (const scenario of RekeyComparison.zOrderScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  it.live("a sharded partition key moves between layouts, and the sort key beside it stays", () =>
+    RekeyComparison.shardLayoutMoveScenario(harness),
   )
-  it.live("two accessors sharing an attribute: the later one wins, as on a write", () =>
-    RekeyComparison.sharedAttributeScenario(harness),
-  )
-  it.live("never a table key attribute: DynamoDB refuses the write", () =>
-    RekeyComparison.tableKeyAttributeScenario(harness),
-  )
+  describe("never a table key attribute: DynamoDB refuses the write", () => {
+    for (const scenario of RekeyComparison.tableKeyAttributeScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("two accessors sharing attributes (shape 13)", () => {
+    for (const scenario of RekeyComparison.sharedPairScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+    describe("on a move", () => {
+      for (const scenario of RekeyComparison.sharedPairMoveScenarios) {
+        it.live(scenario.name, () => scenario.run(harness))
+      }
+      it.live("and a row with no entry gets none", () =>
+        RekeyComparison.sharedPairMoveNoEntryScenario(harness),
+      )
+      for (const scenario of RekeyComparison.sharedTableKeyMoveScenarios) {
+        it.live(scenario.name, () => scenario.run(harness))
+      }
+      it.live("two accessors over one sharded partition key", () =>
+        RekeyComparison.sharedShardMoveScenario(harness),
+      )
+    })
+  })
   for (const scenario of RekeyComparison.labelScenarios) {
     it.live(scenario.name, () => scenario.run(harness))
   }

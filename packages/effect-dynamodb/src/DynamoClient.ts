@@ -2306,9 +2306,10 @@ export interface TableOperations {
    * items with their unique sentinels, version snapshots, tombstones,
    * time-series events, aggregates, and the event streams passed in
    * `options.streams` (copied, flipped, then deleted, while writers append).
-   * Index keys and vector partitions that differ from what a row's values compose
-   * are rewritten in place. One missing a composite is left, with no conflict, and
-   * a key the row doesn't have isn't written. Scans the table (`segments` in
+   * A sharded index's partition key is rewritten in place when it differs from what
+   * the row's values compose. Any other index key or vector partition is rewritten
+   * only when it is exactly its own 1.36 text: anything else is left, with no conflict,
+   * and a key the row doesn't have isn't written. Scans the table (`segments` in
    * parallel); a row is moved only when it is stored under the key 1.36 composed
    * for its values, so a rerun moves nothing. Conflicts are reported, never
    * overwritten. `dryRun` counts what would move, judging each row on its own: a row

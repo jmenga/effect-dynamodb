@@ -1,8 +1,9 @@
 /**
- * What `rekey` compares (#183, design §9.2, D58): a stored key against what the row's
- * values compose. Nothing reads a value out of a stored key, so the risks are the
- * other way round: a key a write composed that `rekey` composes differently would be
- * rewritten for no reason. These scenarios run on a recording table
+ * What `rekey` compares (#183, design §9.2, D58): a stored key against what 1.36 composed
+ * from the row's values. Nothing reads a value out of a stored key, and a half only ever
+ * touches a key that is its own 1.36 text, so the risk is the other way round: a key a
+ * write stored that `rekey` then touches. After each write here the stored rows must be
+ * exactly what they were. These scenarios run on a recording table
  * (`RekeyComparison.test.ts`) and on DynamoDB Local (`connected.sharding.test.ts`).
  */
 
@@ -12,6 +13,7 @@ import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
 import { expect } from "vitest"
+import * as Batch from "../../src/Batch.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import { toAttributeMap } from "../../src/Marshaller.js"
@@ -60,12 +62,23 @@ const worldOf = (
   return { Rows, MainTable: Table.make({ schema: on, entities: { Rows } }) }
 }
 
-/** A run over what the writes left: nothing differs, so nothing is rewritten or reported. */
-const nothingToDo = (db: any) =>
+const byKey = (rows: ReadonlyArray<StoredRow>) =>
+  [...rows].sort((a, b) => (`${a.pk?.S}|${a.sk?.S}` < `${b.pk?.S}|${b.sk?.S}` ? -1 : 1))
+
+/**
+ * A run over what the writes left: every row is judged, none is touched. It compares the
+ * stored rows whole, which is what makes this more than `rekey` reporting no work.
+ */
+const nothingToDo = (db: any, table: StoredRows) =>
   Effect.gen(function* () {
+    const before = byKey(yield* table.rows())
     const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
     expect(report.conflicts).toEqual([])
     expect(report.indexKeysRewritten).toBe(0)
+    expect(report.skipped).toEqual({ notLibrary: 0, unregistered: 0, unrecognizedKey: 0 })
+    expect(before.length).toBeGreaterThan(0)
+    expect(report.unchanged).toBe(before.length)
+    expect(byKey(yield* table.rows())).toEqual(before)
   })
 
 const key = { tenant: "t", id: "1" }
@@ -158,15 +171,15 @@ export const compositeKindScenarios: ReadonlyArray<{
 ].map(({ name, options }) => ({
   name,
   run: (h: Harness) =>
-    h.on(kindsWorld(options), (db) =>
+    h.on(kindsWorld(options), (db, table) =>
       Effect.gen(function* () {
         yield* db.entities.Rows.put(kindsOf(-2.5)).asEffect()
-        yield* nothingToDo(db)
+        yield* nothingToDo(db, table)
         const { tenant: _tenant, id: _id, ...updates } = kindsOf(123.25)
         yield* db.entities.Rows.update(key).set(updates).asEffect()
-        yield* nothingToDo(db)
+        yield* nothingToDo(db, table)
         yield* db.entities.Rows.update(key).set({ note: "n" }).asEffect()
-        yield* nothingToDo(db)
+        yield* nothingToDo(db, table)
       }),
     ),
 }))
@@ -234,73 +247,114 @@ const shapedWorld = (options: Record<string, unknown> = {}) =>
 
 const WHOLE = { region: "Us East", zone: "Z 1", group: "G%", note: "n", count: -3 }
 
-/** The shapes of `DESIGN.md §7` through every write that leaves their keys true. */
+/** The shapes of `DESIGN.md §7` through every write that can store them. */
 export const writePathScenarios: ReadonlyArray<{
   readonly name: string
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
-}> = [
-  {
-    name: "put",
-    run: (db: any) => db.entities.Rows.put({ ...key, ...WHOLE }).asEffect(),
-  },
-  {
-    name: "put with no optional composite",
-    run: (db: any) => db.entities.Rows.put(key).asEffect(),
-  },
-  {
-    name: "upsert",
-    run: (db: any) =>
-      Effect.gen(function* () {
-        yield* db.entities.Rows.upsert({ ...key, ...WHOLE }).asEffect()
-        yield* db.entities.Rows.upsert({ ...key, ...WHOLE, group: "G2" }).asEffect()
-      }),
-  },
-  {
-    name: "an update naming every composite",
-    run: (db: any) =>
-      Effect.gen(function* () {
-        yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
-        yield* db.entities.Rows.update(key)
-          .set({ ...WHOLE, region: "Elsewhere", count: 4 })
-          .asEffect()
-      }),
-  },
-  {
-    name: "an update naming none",
-    run: (db: any) =>
-      Effect.gen(function* () {
-        yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
-        yield* db.entities.Rows.update(key).set({ extra: "x" }).asEffect()
-      }),
-  },
-  {
-    name: "a composite removed: the structural rule truncates",
-    run: (db: any) =>
-      Effect.gen(function* () {
-        yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
-        yield* db.entities.Rows.update(key).remove(["group", "count"]).asEffect()
-      }),
-  },
-  {
-    name: "a composite cleared: `preserve` keeps the key",
-    run: (db: any) =>
-      Effect.gen(function* () {
-        yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
-        yield* db.entities.Rows.update(key).set({ note: undefined, zone: undefined }).asEffect()
-      }),
-  },
-].map(({ name, run }) => ({
+}> = (
+  [
+    {
+      name: "put",
+      run: (db) => db.entities.Rows.put({ ...key, ...WHOLE }).asEffect(),
+    },
+    {
+      name: "put with no optional composite",
+      run: (db) => db.entities.Rows.put(key).asEffect(),
+    },
+    {
+      name: "create",
+      run: (db) => db.entities.Rows.create({ ...key, ...WHOLE }).asEffect(),
+    },
+    {
+      name: "create with no optional composite",
+      run: (db) => db.entities.Rows.create(key).asEffect(),
+    },
+    {
+      name: "Batch.write",
+      run: (_db, world) => Batch.write([world.Rows.put({ ...key, ...WHOLE })]),
+    },
+    {
+      name: "Batch.write with no optional composite",
+      run: (_db, world) => Batch.write([world.Rows.put(key)]),
+    },
+    {
+      name: "upsert",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.upsert({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.upsert({ ...key, ...WHOLE, group: "G2" }).asEffect()
+        }),
+    },
+    {
+      name: "an update naming every composite",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.update(key)
+            .set({ ...WHOLE, region: "Elsewhere", count: 4 })
+            .asEffect()
+        }),
+    },
+    {
+      name: "an update naming none",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.update(key).set({ extra: "x" }).asEffect()
+        }),
+    },
+    {
+      name: "an update naming one composite: the keys lag the row",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.update(key).set({ zone: "Z 2" }).asEffect()
+        }),
+    },
+    {
+      name: "a composite removed: the structural rule truncates",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.update(key).remove(["group", "count"]).asEffect()
+        }),
+    },
+    {
+      name: "a composite cleared: `preserve` keeps the key",
+      run: (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
+          yield* db.entities.Rows.update(key).set({ note: undefined, zone: undefined }).asEffect()
+        }),
+    },
+  ] as ReadonlyArray<{
+    readonly name: string
+    readonly run: (db: any, world: any) => Effect.Effect<unknown, unknown, any>
+  }>
+).map(({ name, run }) => ({
   name,
-  run: (h: Harness) =>
-    h.on(shapedWorld(), (db) =>
+  run: (h: Harness) => {
+    const world = shapedWorld()
+    return h.on(world, (db, table) =>
       Effect.gen(function* () {
-        yield* run(db)
-        yield* nothingToDo(db)
+        yield* run(db, world)
+        yield* nothingToDo(db, table)
       }),
-    ),
+    )
+  },
 }))
 
-/** A transaction's update and a retained update, the writes with a path of their own. */
+class Appended extends Schema.Class<Appended>("Appended")({
+  tenant: Schema.String,
+  id: Schema.String,
+  at: Schema.Number,
+  region: Schema.optional(Schema.String),
+  zone: Schema.optional(Schema.String),
+  group: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+}) {}
+
+/** A transaction's update, a retained update and `append`: the writes with a path of their own. */
 export const otherWritePathScenarios: ReadonlyArray<{
   readonly name: string
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
@@ -309,13 +363,13 @@ export const otherWritePathScenarios: ReadonlyArray<{
     name: "a transaction's update",
     run: (h: Harness) => {
       const world = shapedWorld()
-      return h.on(world, (db) =>
+      return h.on(world, (db, table) =>
         Effect.gen(function* () {
           yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
           yield* Transaction.transactWrite([
             world.Rows.update(key).pipe(Entity.set({ ...WHOLE, region: "Elsewhere", count: 4 })),
           ])
-          yield* nothingToDo(db)
+          yield* nothingToDo(db, table)
         }),
       )
     },
@@ -323,17 +377,58 @@ export const otherWritePathScenarios: ReadonlyArray<{
   {
     name: "a retained update",
     run: (h: Harness) =>
-      h.on(shapedWorld({ versioned: { retain: true } }), (db) =>
+      h.on(shapedWorld({ versioned: { retain: true } }), (db, table) =>
         Effect.gen(function* () {
           yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
-          yield* nothingToDo(db)
+          yield* nothingToDo(db, table)
           yield* db.entities.Rows.update(key).set({ extra: "x" }).asEffect()
-          yield* nothingToDo(db)
+          yield* nothingToDo(db, table)
           yield* db.entities.Rows.update(key).set({ note: undefined }).asEffect()
-          yield* nothingToDo(db)
+          yield* nothingToDo(db, table)
           yield* db.entities.Rows.update(key).remove(["group"]).asEffect()
-          yield* nothingToDo(db)
+          yield* nothingToDo(db, table)
         }),
+      ),
+  },
+  {
+    name: "append",
+    run: (h: Harness) =>
+      h.on(
+        worldOf(
+          Appended,
+          primaryKey,
+          {
+            hierarchical: { name: "gsi0", ...half(0, ["region", "zone", "group"]) },
+            emptySortKey: { name: "gsi1", ...half(1, []) },
+            sharded: { name: "gsi8", ...half(8, ["region"]), shards: 8 },
+          },
+          {
+            timeSeries: {
+              orderBy: "at",
+              appendInput: Schema.Struct({
+                tenant: Schema.String,
+                id: Schema.String,
+                at: Schema.Number,
+                region: Schema.optional(Schema.String),
+                zone: Schema.optional(Schema.String),
+                group: Schema.optional(Schema.String),
+              }),
+            },
+          },
+        ),
+        (db, table) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.append({ ...key, at: 1, region: "Us East", zone: "Z 1" })
+            yield* nothingToDo(db, table)
+            yield* db.entities.Rows.append({
+              ...key,
+              at: 2,
+              region: "Us East",
+              zone: "Z 2",
+              group: "G%",
+            })
+            yield* nothingToDo(db, table)
+          }),
       ),
   },
 ]
@@ -371,95 +466,522 @@ const rowOf = (world: any, values: Record<string, unknown>, indexKeys: Record<st
 
 const on = DynamoSchema.make({ name: "compared", version: 1 })
 
-/** A Z-order index's text half is compared like any other; its address never is. */
-export const zOrderPartitionScenario = (h: Harness) => {
-  const world = worldOf(Flat, primaryKey, {
-    byCount: {
+/**
+ * An unsharded Z-order index is left whole, even a partition key spelled as 1.36 would
+ * have: the index is new in 1.37, so 1.36 wrote no key for it and there's nothing to
+ * adopt. A sharded one's partition key is still moved into the layout (D24), and its
+ * address stays.
+ */
+export const zOrderScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [
+  {
+    name: "unsharded: neither half, whatever its partition key holds",
+    shards: undefined,
+    rewritten: 0,
+  },
+  {
+    name: "sharded: its partition key, and never its address",
+    shards: 8,
+    rewritten: 1,
+  },
+].map(({ name, shards, rewritten }) => ({
+  name,
+  run: (h: Harness) => {
+    const world = worldOf(Flat, primaryKey, {
+      byCount: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["count"] },
+        sk: { field: "gsk", zorder: [{ field: "status", values: ["open", "closed"] }] },
+        ...(shards === undefined ? {} : { shards }),
+      },
+    })
+    const values = { ...key, status: "open", count: -3 }
+    const index = world.Rows.indexes.byCount
+    const unsharded = KeyComposer.unshardedView(index)
+    const text136 = KeyText136.composePk(on, "Row", unsharded, values)
+    expect(text136).not.toBe(KeyComposer.composePk(on, "Row", unsharded, values))
+    const address = { B: new Uint8Array([1, 2, 3]) }
+    return h.on(world, (db, table) =>
+      Effect.gen(function* () {
+        yield* table.seed({ ...rowOf(world, values, { gpk: text136 }), gsk: address })
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.indexKeysRewritten).toBe(rewritten)
+        expect(report.conflicts).toEqual([])
+        const [row] = yield* table.rows()
+        expect(row!.gpk.S).toBe(
+          shards === undefined ? text136 : KeyComposer.composeStoredPk(on, "Row", index, values),
+        )
+        expect(Array.from(row!.gsk.B as Uint8Array)).toEqual([1, 2, 3])
+      }),
+    )
+  },
+}))
+
+class Paired extends Schema.Class<Paired>("Paired")({
+  tenant: Schema.String,
+  id: Schema.String,
+  region: Schema.String,
+  score: Schema.optional(Schema.Number),
+  group: Schema.optional(Schema.String),
+  extra: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+}) {}
+
+const pairedWorld = (shared: boolean) =>
+  worldOf(Paired, primaryKey, {
+    byRegion: {
       name: "gsi",
-      pk: { field: "gpk", composite: ["status"] },
-      sk: { field: "gsk", zorder: [{ field: "count", min: -100, max: 100 }] },
+      pk: { field: "gpk", composite: ["region"] },
+      sk: { field: "gsk", composite: ["tenant"] },
+    },
+    byGroup: {
+      name: shared ? "gsi" : "gsi2",
+      pk: { field: shared ? "gpk" : "gpk2", composite: ["group"] },
+      sk: { field: shared ? "gsk" : "gsk2", composite: ["extra"] },
     },
   })
-  const values = { ...key, status: "open", count: 3 }
-  const index = world.Rows.indexes.byCount
-  const stale = KeyComposer.composePk(on, "Row", index, { ...values, status: "closed" })
-  const address = { B: new Uint8Array([1, 2, 3]) }
+
+/**
+ * Canonical shape 13: two accessors storing their halves in one attribute, on a row that
+ * holds composites of both. Nothing on the row says which owns the attribute, so `rekey`
+ * never asks: a half is rewritten only when the stored key is its own 1.36 text. Each runs
+ * with the attributes shared and, as a control, with them apart.
+ */
+export const sharedPairScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [true, false].flatMap((shared) => {
+  const suffix = shared ? "" : " (control: attributes apart)"
+  const stays = (
+    name: string,
+    write: (db: any) => Effect.Effect<unknown, unknown, any>,
+    pin: any,
+  ) => ({
+    name: `${name}${suffix}`,
+    run: (h: Harness) =>
+      h.on(pairedWorld(shared), (db, table) =>
+        Effect.gen(function* () {
+          yield* write(db)
+          expect(yield* db.entities.Rows.byRegion(pin).collect()).toHaveLength(1)
+          const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+          expect(dry.indexKeysRewritten).toBe(0)
+          yield* nothingToDo(db, table)
+          expect(yield* db.entities.Rows.byRegion(pin).collect()).toHaveLength(1)
+        }),
+      ),
+  })
+  return [
+    // The write skips `byGroup`, which has no `extra`, though the row holds `group`.
+    stays(
+      "a sparse put",
+      (db) => db.entities.Rows.put({ ...key, region: "west", group: "team" }).asEffect(),
+      { region: "west" },
+    ),
+    // The update wrote `byRegion`'s keys; the row still holds all of `byGroup`'s composites.
+    stays(
+      "an update of one accessor's composites",
+      (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({
+            ...key,
+            region: "west",
+            group: "team",
+            extra: "x",
+          }).asEffect()
+          yield* db.entities.Rows.update(key).set({ region: "east" }).asEffect()
+        }),
+      { region: "east" },
+    ),
+    {
+      name: `a put holding every composite: the later accessor's keys stay${suffix}`,
+      run: (h: Harness) =>
+        h.on(pairedWorld(shared), (db, table) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({
+              ...key,
+              region: "west",
+              group: "team",
+              extra: "x",
+            }).asEffect()
+            yield* nothingToDo(db, table)
+            const found = yield* db.entities.Rows.byGroup({ group: "team", extra: "x" }).collect()
+            expect(found).toHaveLength(1)
+          }),
+        ),
+    },
+    {
+      name: `a sort key that is its own 1.36 text is rewritten, the other half left${suffix}`,
+      run: (h: Harness) => {
+        const world = pairedWorld(shared)
+        const values = { tenant: "a b", id: "1", region: "west", group: "team" }
+        const index = world.Rows.indexes.byRegion
+        const gsk = KeyText136.composeSk(on, "Row", 1, index, values)
+        expect(gsk).not.toBe(KeyComposer.composeSk(on, "Row", 1, index, values))
+        const gpk = KeyText136.composePk(on, "Row", index, values)
+        return h.on(world, (db, table) =>
+          Effect.gen(function* () {
+            yield* table.seed(rowOf(world, values, { gpk, gsk }))
+            const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+            expect(dry.indexKeysRewritten).toBe(1)
+            const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+            expect(report.indexKeysRewritten).toBe(1)
+            expect(report.conflicts).toEqual([])
+            const [row] = yield* table.rows()
+            expect(row!.gpk.S).toBe(gpk)
+            expect(row!.gsk.S).toBe(KeyComposer.composeSk(on, "Row", 1, index, values))
+            const pin = { region: "west", tenant: "a b" }
+            expect(yield* db.entities.Rows.byRegion(pin).collect()).toHaveLength(1)
+          }),
+        )
+      },
+    },
+    {
+      name: `the later accessor's own 1.36 text is rewritten, and only its own${suffix}`,
+      run: (h: Harness) => {
+        const world = pairedWorld(shared)
+        const values = { tenant: "t", id: "1", region: "west", group: "team", extra: "x y" }
+        const index = world.Rows.indexes.byGroup
+        const gsk = KeyText136.composeSk(on, "Row", 1, index, values)
+        expect(gsk).not.toBe(KeyComposer.composeSk(on, "Row", 1, index, values))
+        const gpk = KeyText136.composePk(on, "Row", index, values)
+        return h.on(world, (db, table) =>
+          Effect.gen(function* () {
+            yield* table.seed(
+              rowOf(
+                world,
+                values,
+                shared
+                  ? { gpk, gsk }
+                  : { gpk: "unrelated", gsk: "unrelated", gpk2: gpk, gsk2: gsk },
+              ),
+            )
+            const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+            expect(report.indexKeysRewritten).toBe(1)
+            expect(report.conflicts).toEqual([])
+            const [row] = yield* table.rows()
+            expect(row![shared ? "gpk" : "gpk2"].S).toBe(gpk)
+            expect(row![shared ? "gsk" : "gsk2"].S).toBe(
+              KeyComposer.composeSk(on, "Row", 1, index, values),
+            )
+            if (!shared) expect(row!.gsk.S).toBe("unrelated")
+            const pin = { group: "team", extra: "x y" }
+            expect(yield* db.entities.Rows.byGroup(pin).collect()).toHaveLength(1)
+          }),
+        )
+      },
+    },
+    {
+      name: `a partition key that is its own 1.36 text is rewritten${suffix}`,
+      run: (h: Harness) => {
+        const world = worldOf(Paired, primaryKey, {
+          byScore: {
+            name: "gsi",
+            pk: { field: "gpk", composite: ["score"] },
+            sk: { field: "gsk", composite: ["tenant"] },
+          },
+          byGroup: {
+            name: shared ? "gsi" : "gsi2",
+            pk: { field: shared ? "gpk" : "gpk2", composite: ["group"] },
+            sk: { field: shared ? "gsk" : "gsk2", composite: ["extra"] },
+          },
+        })
+        const values = { ...key, region: "west", score: -3, group: "team" }
+        const index = world.Rows.indexes.byScore
+        const gpk = KeyText136.composePk(on, "Row", index, values)
+        expect(gpk).not.toBe(KeyComposer.composePk(on, "Row", index, values))
+        const gsk = KeyText136.composeSk(on, "Row", 1, index, values)
+        return h.on(world, (db, table) =>
+          Effect.gen(function* () {
+            yield* table.seed(rowOf(world, values, { gpk, gsk }))
+            const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+            expect(report.indexKeysRewritten).toBe(1)
+            const [row] = yield* table.rows()
+            expect(row!.gpk.S).toBe(KeyComposer.composePk(on, "Row", index, values))
+            expect(row!.gsk.S).toBe(gsk)
+            expect(yield* db.entities.Rows.byScore({ score: -3 }).collect()).toHaveLength(1)
+          }),
+        )
+      },
+    },
+  ]
+})
+
+/**
+ * The same on a move (D60), which recomposes as an update would: run over the whole row,
+ * that takes the later accessor's text, whichever entry the row holds. A shared attribute
+ * stays as stored, and the run judges it afterwards, so its own 1.36 text is still
+ * rewritten. A dry run reports the same.
+ */
+export const sharedPairMoveScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [
+  { name: "a row holding `group` with no `extra`", extra: {}, tenant: "t", rewritten: 0 },
+  { name: "a row holding every composite", extra: { extra: "x" }, tenant: "t", rewritten: 0 },
+  { name: "and its own 1.36 sort key is rewritten", extra: {}, tenant: "a b", rewritten: 1 },
+].map(({ name, extra, tenant, rewritten }) => ({
+  name,
+  run: (h: Harness) => {
+    const world = pairedWorld(true)
+    const values = { tenant, id: "a b", region: "west", group: "team", ...extra }
+    const primary = world.Rows.indexes.primary
+    const index = world.Rows.indexes.byRegion
+    const gpk = KeyText136.composePk(on, "Row", index, values)
+    const stored = toAttributeMap({
+      ...values,
+      pk: KeyText136.composePk(on, "Row", primary, values),
+      sk: KeyText136.composeSk(on, "Row", 1, primary, values),
+      gpk,
+      gsk: KeyText136.composeSk(on, "Row", 1, index, values),
+      __edd_e__: "Row",
+    }) as StoredRow
+    return h.on(world, (db, table) =>
+      Effect.gen(function* () {
+        yield* table.seed(stored)
+        const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+        expect(report.moved.item).toBe(1)
+        expect(report.indexKeysRewritten).toBe(rewritten)
+        expect(report.conflicts).toEqual([])
+        const [row] = yield* table.rows()
+        expect(row!.gpk.S).toBe(gpk)
+        expect(row!.gsk.S).toBe(KeyComposer.composeSk(on, "Row", 1, index, values))
+        const pin = { region: "west", tenant }
+        expect(yield* db.entities.Rows.byRegion(pin).collect()).toHaveLength(1)
+      }),
+    )
+  },
+}))
+
+/** And a row with no entry gets none: composing it would pick an owner for the row. */
+export const sharedPairMoveNoEntryScenario = (h: Harness) => {
+  const world = pairedWorld(true)
+  const values = { ...key, id: "a b", region: "west", group: "team" }
+  const primary = world.Rows.indexes.primary
   return h.on(world, (db, table) =>
     Effect.gen(function* () {
-      yield* table.seed({ ...rowOf(world, values, { gpk: stale }), gsk: address })
+      yield* table.seed(
+        toAttributeMap({
+          ...values,
+          pk: KeyText136.composePk(on, "Row", primary, values),
+          sk: KeyText136.composeSk(on, "Row", 1, primary, values),
+          __edd_e__: "Row",
+        }) as StoredRow,
+      )
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(report.moved.item).toBe(1)
+      expect(report.indexKeysRewritten).toBe(0)
+      const [row] = yield* table.rows()
+      expect(row!.gpk).toBeUndefined()
+      expect(row!.gsk).toBeUndefined()
+    }),
+  )
+}
+
+/**
+ * Two accessors over one sharded partition key: `EDD-9106` has proved they compose the
+ * same bytes, so no question of ownership arises, and a move writes the key itself.
+ */
+export const sharedShardMoveScenario = (h: Harness) => {
+  const halves = (i: number) => ({
+    name: `gsi${i}`,
+    pk: { field: "gpk", composite: ["region"] },
+    sk: { field: `gsk${i}`, composite: ["tenant"] },
+    shards: { count: 8, previous: 1 },
+  })
+  const world = worldOf(Paired, primaryKey, { byRegion: halves(0), byRegionAgain: halves(1) })
+  const values = { ...key, id: "a b", region: "west" }
+  const primary = world.Rows.indexes.primary
+  const index = world.Rows.indexes.byRegion
+  const unsharded = KeyComposer.unshardedView(index)
+  return h.on(world, (db, table) =>
+    Effect.gen(function* () {
+      yield* table.seed(
+        toAttributeMap({
+          ...values,
+          pk: KeyText136.composePk(on, "Row", primary, values),
+          sk: KeyText136.composeSk(on, "Row", 1, primary, values),
+          gpk: KeyText136.composePk(on, "Row", unsharded, values),
+          __edd_e__: "Row",
+        }) as StoredRow,
+      )
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(report.moved.item).toBe(1)
+      // In the move's own write: a second one would mean it left the key behind.
+      expect(report.indexKeysRewritten).toBe(0)
+      const [row] = yield* table.rows()
+      expect(row!.gpk.S).toBe(KeyComposer.composeStoredPk(on, "Row", index, values))
+    }),
+  )
+}
+
+/**
+ * Two accessors sharing a table key attribute: it isn't theirs, so a move still takes it to
+ * its new key. Its text has to change for that to show, which a sort key's does.
+ */
+export const sharedTableKeyMoveScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [
+  {
+    name: "two local indexes sharing the table's partition key",
+    indexes: {
+      byRegion: {
+        name: "lsi0",
+        pk: { field: "pk", composite: ["tenant"] },
+        sk: { field: "lsk0", composite: ["region"] },
+      },
+      byGroup: {
+        name: "lsi1",
+        pk: { field: "pk", composite: ["tenant"] },
+        sk: { field: "lsk1", composite: ["group"] },
+      },
+    },
+    keys: (_world: any, _values: any) => ({
+      lsk0: "$compared#v1#row#region_west",
+      lsk1: "$compared#v1#row#group_team",
+    }),
+  },
+  {
+    name: "two indexes sharing the table's sort key",
+    indexes: {
+      byRegion: {
+        name: "gsi0",
+        pk: { field: "gpk0", composite: ["region"] },
+        sk: { field: "sk", composite: ["id"] },
+      },
+      byGroup: {
+        name: "gsi1",
+        pk: { field: "gpk1", composite: ["group"] },
+        sk: { field: "sk", composite: ["id"] },
+      },
+    },
+    keys: (world: any, values: any) => ({
+      gpk0: KeyText136.composePk(on, "Row", world.Rows.indexes.byRegion, values),
+      gpk1: KeyText136.composePk(on, "Row", world.Rows.indexes.byGroup, values),
+    }),
+  },
+].map(({ name, indexes, keys }) => ({
+  name,
+  run: (h: Harness) => {
+    const world = worldOf(Paired, primaryKey, indexes)
+    const values = { ...key, id: "a b", region: "west", group: "team" }
+    const primary = world.Rows.indexes.primary
+    const old = KeyText136.composeSk(on, "Row", 1, primary, values)
+    const current = KeyComposer.composeIndexKeys(on, "Row", 1, primary, values)
+    expect(old).not.toBe(current.sk)
+    return h.on(world, (db, table) =>
+      Effect.gen(function* () {
+        yield* table.seed(
+          toAttributeMap({
+            ...values,
+            pk: KeyText136.composePk(on, "Row", primary, values),
+            sk: old,
+            ...keys(world, values),
+            __edd_e__: "Row",
+          }) as StoredRow,
+        )
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.moved.item).toBe(1)
+        expect(report.conflicts).toEqual([])
+        const rows = yield* table.rows()
+        expect(rows.map((row) => [row.pk.S, row.sk.S])).toEqual([[current.pk, current.sk]])
+      }),
+    )
+  },
+}))
+
+/**
+ * A sharded partition key is composed and compared whatever it holds (D24), which is what
+ * moves a row from one layout to another: neither side of that is ever 1.36 text. The sort
+ * key beside it follows the rule for every other half, so one lagging its values stays.
+ */
+export const shardLayoutMoveScenario = (h: Harness) => {
+  const indexOf = (shards: unknown) => ({
+    name: "gsi",
+    pk: { field: "gpk", composite: ["tenant"] },
+    sk: { field: "gsk", composite: ["region"] },
+    shards,
+  })
+  const from = worldOf(Paired, primaryKey, { byTenant: indexOf(8) })
+  const to = worldOf(Paired, primaryKey, { byTenant: indexOf({ count: 16, previous: 8 }) })
+  const values = { ...key, region: "west" }
+  const before = KeyComposer.composeStoredPk(on, "Row", from.Rows.indexes.byTenant, values)!
+  const after = KeyComposer.composeStoredPk(on, "Row", to.Rows.indexes.byTenant, values)!
+  expect(before).not.toBe(after)
+  const gsk = KeyComposer.composeSk(on, "Row", 1, to.Rows.indexes.byTenant, {
+    ...values,
+    region: "east",
+  })
+  return h.on(to, (db, table) =>
+    Effect.gen(function* () {
+      yield* table.seed(rowOf(to, values, { gpk: before, gsk }))
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+      expect(dry.indexKeysRewritten).toBe(1)
       const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
       expect(report.indexKeysRewritten).toBe(1)
       expect(report.conflicts).toEqual([])
       const [row] = yield* table.rows()
-      expect(row!.gpk.S).toBe(KeyComposer.composePk(on, "Row", index, values))
-      expect(Array.from(row!.gsk.B as Uint8Array)).toEqual([1, 2, 3])
+      expect(row!.gpk.S).toBe(after)
+      expect(row!.gsk.S).toBe(gsk)
+      yield* nothingToDo(db, table)
     }),
   )
 }
 
-const exclusiveWorld = () =>
-  worldOf(Flat, primaryKey, {
-    byRegion: {
-      name: "gsi",
-      pk: { field: "gpk", composite: ["tenant"] },
-      sk: { field: "gsk", composite: ["region"] },
-    },
-    byGroup: {
-      name: "gsi",
-      pk: { field: "gpk", composite: ["tenant"] },
-      sk: { field: "gsk", composite: ["group"] },
-    },
-  })
-
-/**
- * Two accessors sharing an attribute: a write's later index wins, so `rekey`'s must too,
- * or a row holding both composites would flip on every run.
- */
-export const sharedAttributeScenario = (h: Harness) =>
-  h.on(exclusiveWorld(), (db, table) =>
-    Effect.gen(function* () {
-      const both = { ...key, status: "s", count: 1, region: "r", group: "g" }
-      yield* db.entities.Rows.put(both).asEffect()
-      const [written] = yield* table.rows()
-      expect(written!.gsk.S).toContain("group_g")
-      yield* nothingToDo(db)
-      yield* db.entities.Rows.put({
-        ...key,
-        id: "2",
-        status: "s",
-        count: 1,
-        region: "r",
-      }).asEffect()
-      yield* nothingToDo(db)
-    }),
-  )
-
 /**
  * A half stored in a table key attribute is the table's to hold: DynamoDB refuses the
- * update, and the row under its table key isn't stale.
+ * update. An inverted index's sort key in `pk` is the case that gets as far as asking: its
+ * text is its own 1.36 text, as a partition key's value isn't escaped and 1.36's sort
+ * key's wasn't either, and that isn't its current text.
  */
-export const tableKeyAttributeScenario = (h: Harness) => {
-  const world = worldOf(Flat, primaryKey, {
-    byNote: {
+export const tableKeyAttributeScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [
+  {
+    name: "another accessor's half",
+    index: {
       name: "gsi",
       pk: { field: "gpk", composite: ["note"] },
       sk: { field: "sk", composite: ["note"] },
     },
-  })
-  const values = { ...key, status: "s", count: 1, note: "n" }
-  const gpk = KeyComposer.composePk(on, "Row", world.Rows.indexes.byNote, values)
-  return h.on(world, (db, table) =>
-    Effect.gen(function* () {
-      const row = rowOf(world, values, { gpk })
-      yield* table.seed(row)
-      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
-      expect(report.conflicts).toEqual([])
-      expect(report.indexKeysRewritten).toBe(0)
-      const [after] = yield* table.rows()
-      expect(after!.sk).toEqual(row.sk)
-    }),
-  )
-}
+    values: { ...key, status: "s", count: 1, note: "n" },
+    keys: { gpk: "$compared#v1#row#note_n" },
+    own136: false,
+  },
+  {
+    name: "an inverted index's sort key, its own 1.36 text",
+    index: {
+      name: "gsi",
+      pk: { field: "sk", composite: ["id"] },
+      sk: { field: "pk", composite: ["tenant"] },
+    },
+    values: { ...key, tenant: "a b", status: "s", count: 1 },
+    keys: {},
+    own136: true,
+  },
+].map(({ name, index, values, keys, own136 }) => ({
+  name,
+  run: (h: Harness) => {
+    const world = worldOf(Flat, primaryKey, { byNote: index })
+    const row = rowOf(world, values, keys)
+    const half = world.Rows.indexes.byNote
+    if (own136) {
+      expect(KeyText136.composeSk(on, "Row", 1, half, values)).toBe(row.pk.S)
+      expect(KeyComposer.composeSk(on, "Row", 1, half, values)).not.toBe(row.pk.S)
+    }
+    return h.on(world, (db, table) =>
+      Effect.gen(function* () {
+        yield* table.seed(row)
+        yield* nothingToDo(db, table)
+      }),
+    )
+  },
+}))
 
 /** Labels that begin alike mean nothing to a comparison. */
 export const labelScenarios: ReadonlyArray<{
@@ -497,7 +1019,7 @@ export const labelScenarios: ReadonlyArray<{
               yield* db.entities.Rows.put({ ...key, code: "c", score: 3, score_label: "abc" })
               const [before] = yield* table.rows()
               yield* db.entities.Rows.update(key).set({ score: undefined }).asEffect()
-              yield* nothingToDo(db)
+              yield* nothingToDo(db, table)
               const [after] = yield* table.rows()
               expect(after![field]).toEqual(before![field])
               const found = yield* db.entities.Rows.byIt({
@@ -531,7 +1053,7 @@ export const labelScenarios: ReadonlyArray<{
         return h.on(world, (db, table) =>
           Effect.gen(function* () {
             yield* table.seed(rowOf(world, held, stored))
-            yield* nothingToDo(db)
+            yield* nothingToDo(db, table)
             const [after] = yield* table.rows()
             expect(after![field]!.S).toBe(stored[field])
           }),

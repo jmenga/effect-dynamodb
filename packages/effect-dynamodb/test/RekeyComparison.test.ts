@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -21,10 +22,15 @@ import {
   type Harness,
   labelScenarios,
   otherWritePathScenarios,
-  sharedAttributeScenario,
-  tableKeyAttributeScenario,
+  shardLayoutMoveScenario,
+  sharedPairMoveNoEntryScenario,
+  sharedPairMoveScenarios,
+  sharedPairScenarios,
+  sharedShardMoveScenario,
+  sharedTableKeyMoveScenarios,
+  tableKeyAttributeScenarios,
   writePathScenarios,
-  zOrderPartitionScenario,
+  zOrderScenarios,
 } from "./helpers/RekeyComparison.js"
 
 const harness: Harness = {
@@ -51,7 +57,7 @@ const harness: Harness = {
   },
 }
 
-describe("a key a write composed is what `rekey` composes", () => {
+describe("`rekey` touches no key a write stored", () => {
   describe("every kind of composite", () => {
     for (const scenario of compositeKindScenarios) {
       it.effect(scenario.name, () => scenario.run(harness))
@@ -65,16 +71,40 @@ describe("a key a write composed is what `rekey` composes", () => {
 })
 
 describe("what `rekey` compares", () => {
-  it.effect("a Z-order index's partition key, and never its address", () =>
-    zOrderPartitionScenario(harness),
+  describe("a Z-order index", () => {
+    for (const scenario of zOrderScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  it.effect("a sharded partition key moves between layouts, and the sort key beside it stays", () =>
+    shardLayoutMoveScenario(harness),
   )
-  it.effect("two accessors sharing an attribute: the later one wins, as on a write", () =>
-    sharedAttributeScenario(harness),
-  )
-  it.effect("never a table key attribute", () => tableKeyAttributeScenario(harness))
+  describe("never a table key attribute", () => {
+    for (const scenario of tableKeyAttributeScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
   for (const scenario of labelScenarios) {
     it.effect(scenario.name, () => scenario.run(harness))
   }
+})
+
+describe("two accessors sharing attributes (shape 13)", () => {
+  for (const scenario of sharedPairScenarios) {
+    it.effect(scenario.name, () => scenario.run(harness))
+  }
+  describe("on a move", () => {
+    for (const scenario of sharedPairMoveScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+    it.effect("and a row with no entry gets none", () => sharedPairMoveNoEntryScenario(harness))
+    for (const scenario of sharedTableKeyMoveScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+    it.effect("two accessors over one sharded partition key", () =>
+      sharedShardMoveScenario(harness),
+    )
+  })
 })
 
 describe("a vector index's partition", () => {
@@ -125,15 +155,18 @@ describe("a vector index's partition", () => {
   const text136 = (tenant: number) =>
     KeyText136.tryComposeVectorPartition(on, "Doc", definition, { tenant })
 
-  it.effect("a row's values decide, as for any half", () =>
+  it.effect("rewritten only when it's exactly its own 1.36 text, as for any half", () =>
     Effect.gen(function* () {
       expect(text136(-3)).not.toBe(now(-3))
       const legacy = yield* run({ tenant: -3 }, text136(-3))
       expect(legacy.report.indexKeysRewritten).toBe(1)
       expect(legacy.after).toBe(now(-3))
-      const stale = yield* run({ tenant: 5 }, now(4))
-      expect(stale.report.indexKeysRewritten).toBe(1)
-      expect(stale.after).toBe(now(5))
+      const lagging = yield* run({ tenant: 5 }, now(4))
+      expect(lagging.report.indexKeysRewritten).toBe(0)
+      expect(lagging.after).toBe(now(4))
+      const lagging136 = yield* run({ tenant: 5 }, text136(-3))
+      expect(lagging136.report.indexKeysRewritten).toBe(0)
+      expect(lagging136.after).toBe(text136(-3))
       const same = yield* run({ tenant: 5 }, now(5))
       expect(same.report.indexKeysRewritten).toBe(0)
     }),
@@ -149,6 +182,98 @@ describe("a vector index's partition", () => {
       expect(missing.after).toBeUndefined()
     }),
   )
+})
+
+// The guard, on a key `rekey` really rewrites. Only a recording table can step in between
+// its read and its write.
+describe("a write between `rekey`'s read and its write wins", () => {
+  const on = DynamoSchema.make({ name: "guarded", version: 1 })
+  const worldWith = (shards: number | undefined) => {
+    const Rows = Entity.make({
+      model: DynamoModel.configure(
+        Schema.Struct({
+          id: Schema.String,
+          tenant: Schema.String,
+          region: Schema.String,
+          zone: Schema.String,
+          note: Schema.optional(Schema.String),
+        }),
+        { region: { field: "r" } },
+      ),
+      entityType: "Row",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      indexes: {
+        byTenant: {
+          name: "gsi",
+          pk: { field: "gpk", composite: ["tenant"] },
+          sk: { field: "gsk", composite: ["region", "zone", "id"] },
+          ...(shards === undefined ? {} : { shards }),
+        },
+      },
+    } as never) as any
+    return { Rows, MainTable: Table.make({ schema: on, entities: { Rows } }) }
+  }
+  const values = { id: "1", tenant: "t", region: "a b", zone: "z" }
+
+  for (const shards of [undefined, 8]) {
+    for (const { name, changes, rewritten } of [
+      {
+        name: "a composite changing: the key is left",
+        changes: { zone: { S: "y" } },
+        rewritten: 0,
+      },
+      {
+        name: "a renamed composite changing: the key is left",
+        changes: { r: { S: "c d" } },
+        rewritten: 0,
+      },
+      {
+        name: "another attribute changing: the key is rewritten, and the write kept",
+        changes: { note: { S: "new" } },
+        rewritten: 1,
+      },
+    ]) {
+      it.effect(`${name}, shards=${shards}`, () => {
+        const world = worldWith(shards)
+        const index = world.Rows.indexes.byTenant
+        const unsharded = KeyComposer.unshardedView(index)
+        const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+        const { region, ...rest } = values
+        const stored = toAttributeMap({
+          ...rest,
+          r: region,
+          ...KeyComposer.composeIndexKeys(on, "Row", 1, world.Rows.indexes.primary, values),
+          gpk: KeyText136.composePk(on, "Row", unsharded, values),
+          gsk: KeyText136.composeSk(on, "Row", 1, index, values),
+          __edd_e__: "Row",
+        }) as Record<string, any>
+        const at = `${stored.pk.S}|${stored.sk.S}`
+        table.items.set(at, stored)
+        let writes = 0
+        table.hooks.onRequest = ({ command }) => {
+          if (command === "UpdateItem" && writes++ === 0) {
+            table.items.set(at, { ...table.items.get(at)!, ...changes })
+          }
+        }
+        return Effect.gen(function* () {
+          const db = yield* clientOf(world)
+          const report = yield* db.tables.MainTable.rekey()
+          expect(report.conflicts).toEqual([])
+          const row = table.items.get(at)!
+          for (const [attr, value] of Object.entries(changes)) expect(row[attr]).toEqual(value)
+          expect(row.gsk!.S).toBe(
+            rewritten === 1 ? KeyComposer.composeSk(on, "Row", 1, index, values) : stored.gsk.S,
+          )
+          // A sharded partition key is moved whatever holds its composites: it isn't one.
+          if (shards !== undefined) {
+            expect(row.gpk!.S).toBe(KeyComposer.composeStoredPk(on, "Row", index, values))
+          }
+        }).pipe(
+          Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "guarded" }))),
+        ) as never
+      })
+    }
+  }
 })
 
 describe("a dry run judges each row on its own", () => {

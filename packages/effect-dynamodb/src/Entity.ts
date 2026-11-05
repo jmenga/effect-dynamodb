@@ -3583,6 +3583,25 @@ const makeImpl = <
   const isTableKeyField = (field: string): boolean =>
     field === allIndexes.primary?.pk.field || field === allIndexes.primary?.sk.field
 
+  /**
+   * The attributes two accessors of unsharded indexes store a half in. Nothing on a row
+   * says which of them owns one, so a pass that composes every index from the whole row
+   * can't tell a healthy entry from another accessor's. On a sharded index `EDD-9106`
+   * has already proved the halves compose the same bytes, so it doesn't matter there.
+   */
+  const sharedIndexFields = (): ReadonlyArray<string> => {
+    const seen = new Set<string>()
+    const shared = new Set<string>()
+    for (const [name, index] of Object.entries(allIndexes)) {
+      if (name === "primary" || index.shards !== undefined) continue
+      for (const field of [index.pk.field, index.sk.field]) {
+        if (seen.has(field) && !isTableKeyField(field)) shared.add(field)
+        seen.add(field)
+      }
+    }
+    return [...shared]
+  }
+
   // ---------------------------------------------------------------------------
   // Vector search — write-path helpers (see `DESIGN.md §14`)
   // ---------------------------------------------------------------------------
@@ -5715,8 +5734,9 @@ const makeImpl = <
 
   /**
    * What a move writes for `read` at its current key `current`: index keys recomposed as
-   * an update would, so a half that can't compose keeps its text. Reads nothing and
-   * writes nothing, so a dry run judges what the real run would leave.
+   * an update would, so a half that can't compose keeps its text, and an attribute two
+   * accessors share stays as stored. Reads nothing and writes nothing, so a dry run
+   * judges what the real run would leave.
    */
   const movedRowOf = (
     read: globalThis.Record<string, AttributeValue>,
@@ -5744,6 +5764,13 @@ const makeImpl = <
         ...toAttributeMap({ ...current, ...gsi.sets }),
       }
       for (const field of gsi.removes) delete moved[field]
+      // The composer above takes the later accessor's text for a shared attribute, which
+      // may not be the entry this row holds (D60). A run judges it afterwards, by itself.
+      for (const field of sharedIndexFields()) {
+        const stored = read[field]
+        if (stored === undefined) delete moved[field]
+        else moved[field] = stored
+      }
       for (const [, definition] of vectorIndexEntries) {
         if (read[definition.vectorField] === undefined) continue
         const partition = KeyComposer.tryComposeVectorPartition(
@@ -13712,22 +13739,27 @@ const makeImpl = <
     })
 
   /**
-   * The index keys and vector partitions of an item under its current table key
-   * that differ from what its values compose (design §9.2, D58). `rekey` compares
-   * composed text with stored text, and never reads a value out of a stored key.
+   * The index keys and vector partitions of an item under its current table key that
+   * `rekey` rewrites (design §9.2, D58). It compares a stored key with what 1.36
+   * composed from the row's values, and never reads a value out of a stored key.
    *
-   * A half whose row holds every composite is composed and compared, whatever text
-   * it holds: 1.36's, a `previous` layout's, or a key an index policy left. A sort key
-   * missing a composite is one of two things, and the same comparison tells them apart:
-   * a row truncated under 1.36 stores exactly what 1.36 composed for the composites
-   * leading up to the gap, and is rewritten like a whole one (D43). Anything else was
-   * kept for a cleared value (`.set({ x: undefined })` under `preserve`) and is left
-   * as it is, with no conflict, as is a partition key missing a composite.
+   * An unsharded partition key, a sort key or a vector partition is rewritten only when
+   * it is exactly its own 1.36 text and that isn't the current text. Each half is judged
+   * by itself, so the question of which accessor owns an attribute two of them share
+   * never comes up, and a row's values couldn't answer it: a half only touches a key
+   * that is its own. A sort key missing a trailing composite is judged by the composites
+   * before the gap, which is what a row truncated under 1.36 stores (D43). Anything else
+   * is left, with no conflict: a key an index policy kept, one lagging its values, one
+   * cleared of them. So is a key that isn't stored (under `sparse` its absence can be
+   * deliberate), and a table key attribute, which is the table's to hold.
    *
-   * A sharded index's partition key whose values can't compose one is left too, and
-   * reported unless it is already in the current layout. A key that isn't stored stays
-   * that way (under `sparse` its absence can be deliberate), a Z-order half is never
-   * composed here, and a table key attribute is the table's to hold.
+   * A sharded index's partition key is the exception (D24): moving rows into the layout
+   * is the feature, so it is composed and compared whatever it holds, and `EDD-9106`
+   * means no half that composes differently shares its attribute. One whose values can't
+   * compose it is left too, and reported unless it is already in the current layout.
+   *
+   * A Z-order index has no 1.36 text (it is new in 1.37), so only the partition key of a
+   * sharded one is ever rewritten.
    */
   const staleIndexKeys = (row: StoredRow) => {
     const rowKeyForm = keyForm(
@@ -13741,71 +13773,68 @@ const makeImpl = <
         return undefined
       }
     }
-    // Two indexes sharing an attribute: the later one wins, as on a write.
-    const wanted = new Map<
-      string,
-      { readonly text: string; readonly attrs: ReadonlyArray<string> }
-    >()
-    const want = (field: string, attrs: ReadonlyArray<string>, text: string | undefined) => {
-      if (text !== undefined) wanted.set(field, { text, attrs })
+    const sets: globalThis.Record<string, string> = {}
+    const olds: globalThis.Record<string, string> = {}
+    const composites = new Set<string>()
+    const rewrite = (field: string, text: string, attrs: ReadonlyArray<string>) => {
+      if (isTableKeyField(field)) return
+      sets[field] = text
+      olds[field] = row[field]!.S!
+      for (const attr of attrs) composites.add(resolveDbName(attr))
+    }
+    const consider = (
+      field: string,
+      attrs: ReadonlyArray<string>,
+      now: () => string | undefined,
+      then: () => string | undefined,
+    ) => {
+      const stored = row[field]?.S
+      if (stored === undefined || stored !== composing(then)) return
+      const text = composing(now)
+      if (text !== undefined && text !== stored) rewrite(field, text, attrs)
     }
     const uncomposable: Array<string> = []
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary") continue
       if (index.shards !== undefined) {
         const stored = row[index.pk.field]?.S
-        const text = composing(() =>
-          KeyComposer.composeStoredPk(schema, entityType, index, rowKeyForm),
-        )
-        if (text !== undefined) {
-          want(index.pk.field, [...index.pk.composite, ...index.shards.source!], text)
-        } else if (
-          stored !== undefined &&
-          !KeyComposer.isCurrentShardLayout(schema, entityType, index, stored)
-        ) {
-          uncomposable.push(name)
+        if (stored !== undefined) {
+          const text = composing(() =>
+            KeyComposer.composeStoredPk(schema, entityType, index, rowKeyForm),
+          )
+          if (text === undefined) {
+            if (!KeyComposer.isCurrentShardLayout(schema, entityType, index, stored)) {
+              uncomposable.push(name)
+            }
+          } else if (text !== stored) {
+            rewrite(index.pk.field, text, [...index.pk.composite, ...index.shards.source!])
+          }
         }
-      } else {
-        want(
-          index.pk.field,
-          index.pk.composite,
-          composing(() => KeyComposer.composePk(schema, entityType, index, rowKeyForm)),
-        )
       }
       if (KeyComposer.isZOrderHalf(index.sk)) continue
-      const whole = index.sk.composite.every(
-        (attr) => rowKeyForm[attr] !== undefined && rowKeyForm[attr] !== null,
-      )
-      const truncated136 = () =>
-        KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm)
-      if (whole || row[index.sk.field]?.S === composing(truncated136)) {
-        want(
-          index.sk.field,
-          index.sk.composite,
-          composing(() =>
-            KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
-          ),
+      if (index.shards === undefined) {
+        consider(
+          index.pk.field,
+          index.pk.composite,
+          () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
+          () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
         )
       }
-    }
-    for (const [, definition] of vectorIndexEntries) {
-      want(
-        definition.partitionField,
-        definition.partition,
-        composing(() =>
-          KeyComposer.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
-        ),
+      consider(
+        index.sk.field,
+        index.sk.composite,
+        () =>
+          KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
+        () => KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
       )
     }
-    const sets: globalThis.Record<string, string> = {}
-    const olds: globalThis.Record<string, string> = {}
-    const composites = new Set<string>()
-    for (const [field, { text, attrs }] of wanted) {
-      const stored = row[field]?.S
-      if (stored === undefined || stored === text || isTableKeyField(field)) continue
-      sets[field] = text
-      olds[field] = stored
-      for (const attr of attrs) composites.add(resolveDbName(attr))
+    for (const [, definition] of vectorIndexEntries) {
+      consider(
+        definition.partitionField,
+        definition.partition,
+        () => KeyComposer.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
+        () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
+      )
     }
     return { sets, olds, composites: [...composites], uncomposable }
   }

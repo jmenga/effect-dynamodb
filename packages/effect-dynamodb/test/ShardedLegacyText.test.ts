@@ -28,6 +28,9 @@ import {
   Finished,
   foreignRowScenarios,
   type Harness,
+  laggingLegacySortKeyScenario,
+  laggingPartitionKeyScenario,
+  leftCurrentSortKeyScenario,
   Migrating,
   missingKeyScenario,
   moved,
@@ -38,8 +41,6 @@ import {
   rowNow,
   type StoredRow,
   schema,
-  staleCurrentSortKeyScenario,
-  staleLegacySortKeyScenario,
   TENANT,
   truncatedHeldScenario,
   truncatedUnshardedScenario,
@@ -89,11 +90,11 @@ describe("each row once, by its own pins", () => {
 })
 
 describe("what `rekey` does to a row that holds a half's composites", () => {
-  it.effect("rewrites a 1.36 sort key they no longer compose", () =>
-    staleLegacySortKeyScenario(harness().h),
+  it.effect("leaves a 1.36 sort key lagging them: the accepted limit", () =>
+    laggingLegacySortKeyScenario(harness().h),
   )
   it.effect("and a key an index policy left in current text", () =>
-    staleCurrentSortKeyScenario(harness().h),
+    leftCurrentSortKeyScenario(harness().h),
   )
   it.effect("and one an old gate truncated", () => truncatedHeldScenario(harness().h))
   it.effect("and writes no key the row doesn't have", () => missingKeyScenario(harness().h))
@@ -114,6 +115,9 @@ describe("what `rekey` does to a half missing a composite", () => {
   )
   it.effect("the accepted limit: a pin misses a partition key's cleared number, `get` reads", () =>
     clearedPartitionKeyLimitScenario(harness().h),
+  )
+  it.effect("the accepted limit: a partition key lagging its values", () =>
+    laggingPartitionKeyScenario(harness().h),
   )
   it.effect("a positive integer whose value went kept its text, and is still pinned", () =>
     clearedIntegerScenario(harness().h),

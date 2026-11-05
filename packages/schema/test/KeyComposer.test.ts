@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
+import * as KeyText136 from "../src/internal/KeyText136.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
 describe("KeyComposer", () => {
@@ -1703,6 +1704,72 @@ describe("KeyComposer", () => {
           { ...key, note: "n" },
         )
         expect(Object.keys(result.sets).sort()).toEqual(["gsi2pk", "lsk", "pk", "sk"])
+      })
+    })
+
+    // A new degenerate shape (#183): two accessors storing their halves in one attribute,
+    // on a row holding composites of both. Nothing on the row says which owns it.
+    describe("two accessors sharing attributes (shape 13)", () => {
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["tenant"] },
+          sk: { field: "sk", composite: ["id"] },
+        },
+        byRegion: {
+          index: "gsi",
+          pk: { field: "gpk", composite: ["region"] },
+          sk: { field: "gsk", composite: ["id"] },
+        },
+        byGroup: {
+          index: "gsi",
+          pk: { field: "gpk", composite: ["group"] },
+          sk: { field: "gsk", composite: ["extra"] },
+        },
+      }
+      const key = { tenant: "t", id: "1" }
+      const whole = { ...key, region: "east", group: "team", extra: "x" }
+      const byRegion = indexes.byRegion!
+      const byGroup = indexes.byGroup!
+
+      it("an update naming one accessor's composite writes that accessor's keys", () => {
+        expect(
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Row",
+            1,
+            indexes,
+            { region: "east" },
+            key,
+          ),
+        ).toEqual({
+          sets: {
+            gpk: KeyComposer.composePk(schema, "Row", byRegion, whole),
+            gsk: KeyComposer.composeSk(schema, "Row", 1, byRegion, whole),
+          },
+          removes: [],
+        })
+      })
+
+      it("given the whole row, the later accessor takes the attribute: why a move can't ask", () => {
+        const { sets } = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          indexes,
+          whole,
+          whole,
+        )
+        expect(sets.gpk).toBe(KeyComposer.composePk(schema, "Row", byGroup, whole))
+        expect(sets.gsk).toBe(KeyComposer.composeSk(schema, "Row", 1, byGroup, whole))
+      })
+
+      it("each accessor's 1.36 text is its own: a half can't mistake the other's for it", () => {
+        expect(KeyText136.composePk(schema, "Row", byRegion, whole)).not.toBe(
+          KeyText136.composePk(schema, "Row", byGroup, whole),
+        )
+        expect(KeyText136.composeSortKeyPrefix(schema, "Row", 1, byRegion, whole)).not.toBe(
+          KeyText136.composeSortKeyPrefix(schema, "Row", 1, byGroup, whole),
+        )
       })
     })
 

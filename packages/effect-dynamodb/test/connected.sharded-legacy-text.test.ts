@@ -22,6 +22,9 @@ import {
   dryRunScenarios,
   foreignRowScenarios,
   type Harness,
+  laggingLegacySortKeyScenario,
+  laggingPartitionKeyScenario,
+  leftCurrentSortKeyScenario,
   Migrating,
   missingKeyScenario,
   moved,
@@ -30,8 +33,6 @@ import {
   pathScenario,
   rowNow,
   type StoredRow,
-  staleCurrentSortKeyScenario,
-  staleLegacySortKeyScenario,
   TENANT,
   truncatedHeldScenario,
   truncatedUnshardedScenario,
@@ -129,11 +130,11 @@ describeConnected("#183 a dry run reports what the real run does", () => {
 })
 
 describeConnected("#183 what `rekey` does to a row that holds a half's composites", () => {
-  it.live("rewrites a 1.36 sort key they no longer compose", () =>
-    onTable(staleLegacySortKeyScenario),
+  it.live("leaves a 1.36 sort key lagging them: the accepted limit", () =>
+    onTable(laggingLegacySortKeyScenario),
   )
   it.live("and a key an index policy left in current text", () =>
-    onTable(staleCurrentSortKeyScenario),
+    onTable(leftCurrentSortKeyScenario),
   )
   it.live("and one an old gate truncated", () => onTable(truncatedHeldScenario))
   it.live("and writes no key the row doesn't have", () => onTable(missingKeyScenario))
@@ -154,6 +155,9 @@ describeConnected("#183 what `rekey` does to a half missing a composite", () => 
   )
   it.live("the accepted limit: a pin misses a partition key's cleared number, `get` reads", () =>
     onTable(clearedPartitionKeyLimitScenario),
+  )
+  it.live("the accepted limit: a partition key lagging its values", () =>
+    onTable(laggingPartitionKeyScenario),
   )
   it.live("a positive integer whose value went kept its text, and is still pinned", () =>
     onTable(clearedIntegerScenario),
