@@ -3583,25 +3583,6 @@ const makeImpl = <
   const isTableKeyField = (field: string): boolean =>
     field === allIndexes.primary?.pk.field || field === allIndexes.primary?.sk.field
 
-  /**
-   * The attributes two accessors of unsharded indexes store a half in. Nothing on a row
-   * says which of them owns one, so a pass that composes every index from the whole row
-   * can't tell a healthy entry from another accessor's. On a sharded index `EDD-9106`
-   * has already proved the halves compose the same bytes, so it doesn't matter there.
-   */
-  const sharedIndexFields = (): ReadonlyArray<string> => {
-    const seen = new Set<string>()
-    const shared = new Set<string>()
-    for (const [name, index] of Object.entries(allIndexes)) {
-      if (name === "primary" || index.shards !== undefined) continue
-      for (const field of [index.pk.field, index.sk.field]) {
-        if (seen.has(field) && !isTableKeyField(field)) shared.add(field)
-        seen.add(field)
-      }
-    }
-    return [...shared]
-  }
-
   // ---------------------------------------------------------------------------
   // Vector search — write-path helpers (see `DESIGN.md §14`)
   // ---------------------------------------------------------------------------
@@ -5734,9 +5715,8 @@ const makeImpl = <
 
   /**
    * What a move writes for `read` at its current key `current`: index keys recomposed as
-   * an update would, so a half that can't compose keeps its text, and an attribute two
-   * accessors share stays as stored. Reads nothing and writes nothing, so a dry run
-   * judges what the real run would leave.
+   * an update would, so a half that can't compose keeps its text. Reads nothing and
+   * writes nothing, so a dry run judges what the real run would leave.
    */
   const movedRowOf = (
     read: globalThis.Record<string, AttributeValue>,
@@ -5764,13 +5744,6 @@ const makeImpl = <
         ...toAttributeMap({ ...current, ...gsi.sets }),
       }
       for (const field of gsi.removes) delete moved[field]
-      // The composer above takes the later accessor's text for a shared attribute, which
-      // may not be the entry this row holds (D60). A run judges it afterwards, by itself.
-      for (const field of sharedIndexFields()) {
-        const stored = read[field]
-        if (stored === undefined) delete moved[field]
-        else moved[field] = stored
-      }
       for (const [, definition] of vectorIndexEntries) {
         if (read[definition.vectorField] === undefined) continue
         const partition = KeyComposer.tryComposeVectorPartition(
@@ -13745,13 +13718,14 @@ const makeImpl = <
    *
    * An unsharded partition key, a sort key or a vector partition is rewritten only when
    * it is exactly its own 1.36 text and that isn't the current text. Each half is judged
-   * by itself, so the question of which accessor owns an attribute two of them share
-   * never comes up, and a row's values couldn't answer it: a half only touches a key
-   * that is its own. A sort key missing a trailing composite is judged by the composites
-   * before the gap, which is what a row truncated under 1.36 stores (D43). Anything else
-   * is left, with no conflict: a key an index policy kept, one lagging its values, one
-   * cleared of them. So is a key that isn't stored (under `sparse` its absence can be
-   * deliberate), and a table key attribute, which is the table's to hold.
+   * by itself and by its bytes, with no question of which accessor owns an attribute two
+   * of them share, which a row's values couldn't answer. So it can't tell a healthy key
+   * from another half's 1.36 text when the bytes match (design §15). A sort key missing
+   * a trailing composite is judged by the composites before the gap, which is what a row
+   * truncated under 1.36 stores (D43). Anything else is left, with no conflict: a key an
+   * index policy kept, one lagging its values, one cleared of them. So is a key that
+   * isn't stored (under `sparse` its absence can be deliberate), and a table key
+   * attribute, which is the table's to hold.
    *
    * A sharded index's partition key is the exception (D24): moving rows into the layout
    * is the feature, so it is composed and compared whatever it holds, and `EDD-9106`

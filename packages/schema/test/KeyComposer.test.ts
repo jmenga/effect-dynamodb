@@ -1750,20 +1750,7 @@ describe("KeyComposer", () => {
         })
       })
 
-      it("given the whole row, the later accessor takes the attribute: why a move can't ask", () => {
-        const { sets } = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
-          "Row",
-          1,
-          indexes,
-          whole,
-          whole,
-        )
-        expect(sets.gpk).toBe(KeyComposer.composePk(schema, "Row", byGroup, whole))
-        expect(sets.gsk).toBe(KeyComposer.composeSk(schema, "Row", 1, byGroup, whole))
-      })
-
-      it("each accessor's 1.36 text is its own: a half can't mistake the other's for it", () => {
+      it("accessors over different composites compose different 1.36 text in each half", () => {
         expect(KeyText136.composePk(schema, "Row", byRegion, whole)).not.toBe(
           KeyText136.composePk(schema, "Row", byGroup, whole),
         )

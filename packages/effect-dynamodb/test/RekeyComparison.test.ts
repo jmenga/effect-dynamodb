@@ -22,9 +22,8 @@ import {
   type Harness,
   labelScenarios,
   otherWritePathScenarios,
+  sameBytesMoveScenarios,
   shardLayoutMoveScenario,
-  sharedPairMoveNoEntryScenario,
-  sharedPairMoveScenarios,
   sharedPairScenarios,
   sharedShardMoveScenario,
   sharedTableKeyMoveScenarios,
@@ -58,12 +57,12 @@ const harness: Harness = {
 }
 
 describe("`rekey` touches no key a write stored", () => {
-  describe("every kind of composite", () => {
+  describe("the composites in the fixture's model", () => {
     for (const scenario of compositeKindScenarios) {
       it.effect(scenario.name, () => scenario.run(harness))
     }
   })
-  describe("every shape, through every write", () => {
+  describe("the fixture's shapes, through the writes it lists", () => {
     for (const scenario of [...writePathScenarios, ...otherWritePathScenarios]) {
       it.effect(scenario.name, () => scenario.run(harness))
     }
@@ -93,18 +92,16 @@ describe("two accessors sharing attributes (shape 13)", () => {
   for (const scenario of sharedPairScenarios) {
     it.effect(scenario.name, () => scenario.run(harness))
   }
-  describe("on a move", () => {
-    for (const scenario of sharedPairMoveScenarios) {
-      it.effect(scenario.name, () => scenario.run(harness))
-    }
-    it.effect("and a row with no entry gets none", () => sharedPairMoveNoEntryScenario(harness))
-    for (const scenario of sharedTableKeyMoveScenarios) {
-      it.effect(scenario.name, () => scenario.run(harness))
-    }
-    it.effect("two accessors over one sharded partition key", () =>
-      sharedShardMoveScenario(harness),
-    )
-  })
+})
+
+describe("a move, where accessors sharing an attribute compose the same bytes", () => {
+  for (const scenario of sameBytesMoveScenarios) {
+    it.effect(scenario.name, () => scenario.run(harness))
+  }
+  for (const scenario of sharedTableKeyMoveScenarios) {
+    it.effect(scenario.name, () => scenario.run(harness))
+  }
+  it.effect("two accessors over one sharded partition key", () => sharedShardMoveScenario(harness))
 })
 
 describe("a vector index's partition", () => {

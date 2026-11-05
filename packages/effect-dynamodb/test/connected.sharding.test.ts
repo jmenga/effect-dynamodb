@@ -1448,20 +1448,17 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
     for (const scenario of RekeyComparison.sharedPairScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
-    describe("on a move", () => {
-      for (const scenario of RekeyComparison.sharedPairMoveScenarios) {
-        it.live(scenario.name, () => scenario.run(harness))
-      }
-      it.live("and a row with no entry gets none", () =>
-        RekeyComparison.sharedPairMoveNoEntryScenario(harness),
-      )
-      for (const scenario of RekeyComparison.sharedTableKeyMoveScenarios) {
-        it.live(scenario.name, () => scenario.run(harness))
-      }
-      it.live("two accessors over one sharded partition key", () =>
-        RekeyComparison.sharedShardMoveScenario(harness),
-      )
-    })
+  })
+  describe("a move, where accessors sharing an attribute compose the same bytes", () => {
+    for (const scenario of RekeyComparison.sameBytesMoveScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+    for (const scenario of RekeyComparison.sharedTableKeyMoveScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+    it.live("two accessors over one sharded partition key", () =>
+      RekeyComparison.sharedShardMoveScenario(harness),
+    )
   })
   for (const scenario of RekeyComparison.labelScenarios) {
     it.live(scenario.name, () => scenario.run(harness))
