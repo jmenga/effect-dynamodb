@@ -500,6 +500,16 @@ yield* users.purge({ userId: "u-1" })
 
 ---
 
+### "AWS's reply was removed"
+
+**Symptom:** A `DynamoError` whose `cause` is named `InvalidSignatureException`, `UnrecognizedClientException`, `ExpiredTokenException` or similar, and whose message says AWS's reply was removed.
+
+**Cause:** AWS refused the request's signature or credentials. Its reply can quote the signed request, including the session token, so effect-dynamodb removes the wording before the error can reach a trace or a log. See [Credential refusals](/effect-dynamodb/reference/api-reference/#credential-refusals).
+
+**Solution:** Go by the `cause`'s `name`. Check that the credentials are the ones you expect and haven't expired, that the system clock is correct, and that nothing between the client and AWS rewrites the request. `cause.$metadata.requestId` identifies the request if you need to raise it with AWS.
+
+---
+
 ### Common type errors with entity operations
 
 **"Type 'EntityUpdate\<...>' is not assignable to type 'Effect.Effect\<...>'"**
