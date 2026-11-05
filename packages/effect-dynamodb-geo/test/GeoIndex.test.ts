@@ -201,7 +201,7 @@ describe("a sharded index (#183)", () => {
       GeoIndex.make({
         entity: Spots,
         index: "byCell",
-        coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+        coordinates: (item: Spot) => ({ latitude: item.latitude, longitude: item.longitude }),
         fields: {
           cell: { field: "cell", resolution: 8 },
           timePartition: { field: "timePartition" },
