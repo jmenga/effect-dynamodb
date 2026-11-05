@@ -971,6 +971,18 @@ did not change plans no pass and sends exactly what it sent without the
 fallback. `asParams()` and `explain()` show the current key's request;
 `explain()` lists both key conditions.
 
+One exception, in what the read does with the answer rather than what it sends (#183): a
+partial pin on a secondary index selects a range that, under 1.36's unescaped text, also
+holds a longer sibling (`city_new york` under a pin on `new`). The pin's text is the same
+under both forms, so no second pass runs, and `Query.alsoRead136` adds a key-text check
+that keeps `<prefix>` and `<prefix>#…` only (`keepRow`). It reads nothing more and doesn't
+mark the query as filtered, so the first `Limit` is the one sent with the fallback off.
+What differs while the fallback is on: `.count()` reads the rows instead of `Select: COUNT`
+(the same RCU), a `.limit(n)` read's later requests grow as a filtered read's do, and an
+`eq` in `.within()` reports a row check in `explain().rowChecks`. `legacyKeys: false` has
+none of this. Where a pass does run, `keyPassChecks` judges a row with no composable values
+by its text the same way.
+
 **History.** `.history(key)` reads the 1.36 event prefix (the 1.36 partition and
 current sort key, then `#e#`) and the current one. An append moves the current
 item first (above), so its events from then on are under the current prefix
@@ -1341,7 +1353,7 @@ byTenant: {
 - **Key text.** `!<count>.<shard>` right after the entity type or collection name, the shard zero-padded to the width of `count - 1`: `$fleet-db#v1#devicestate#!20.07#tenantid_t-123`, or `$fleet-db#v1#devicestate#!20.07` on an empty half. Partition key values aren't escaped, so no final segment could be safe: the unsharded key for tenant `t-123#07` would equal shard 07 of tenant `t-123`. An unsharded key's fourth segment always holds `<label>_`, which a marker can't spell, and the count keeps two sharded layouts apart. So reading both needs no filter and no dedupe. Compact keys (#182) will carry the same marker in the same place; nothing is built for them yet.
 - **Shard function** (`schema/src/internal/Shards.ts`). `FNV-1a-32(F(text(v1)) ‖ 0xFF ‖ F(text(v2)) ‖ …) mod count`, with `text` = `KeyComposer.serializeValue` over key-form values and `F(s) = s.toLowerCase().toUpperCase()` in UTF-8. Golden vectors pin it; changing it is a breaking change. The fold is fixed, whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under `lowercase` and must reach one shard. `L∘U` would fail on `ß` / `ẞ`, which lowercase to one key but fold apart. `0xFF` never occurs in UTF-8, so `("ab", "c")` and `("a", "bc")` differ. `TextEncoder` and `Math.imul` keep it runtime-agnostic.
 - **Composing is structural.** `composePk` and the truncating composer always add the marker and throw `ShardSourceError` (`EDD-9100`) when a source value is absent, which the error boundaries turn into a `ValidationError`; an index never bound to an entity throws, as an unbound Z-order half does. So `put`, `create`, `upsert`, `restore`, `Batch`, `Transaction`, `update`, `patch`, retain, `append` and the 1.37 move path need no per-site change. A key for a sharded index can't be composed unsharded. Soft-deleted items, version snapshots and time-series events strip GSI keys; unique sentinels hold none; EventStore projection rows are entity writes; aggregates compose their own attributes and read no `entity.indexes`.
-- **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when every `by` attribute is pinned), then the `previous` layout's, never pruned. Query behaviour: §10 "Fan-out Queries".
+- **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when the accessor pins every attribute of the shard source, whether that source is `by` or the primary key), then the `previous` layout's, never pruned. The pins are a leading sort key prefix, so a default source prunes only when the sort key holds the whole primary key. Query behaviour: §10 "Fan-out Queries".
 - **Collections.** Every member must declare the same `count` and `previous` (`EDD-9103`), since the partitions read are shared. `by` may differ. A collection query always reads every shard.
 - **Refused** (`EDD-9104`): `.within()`, skip-scan and `.zorder()` on a sharded accessor, and a `GeoIndex` over a sharded index. A Z-order sort key without `by` is allowed: the merge compares bytes.
 
@@ -1476,13 +1488,16 @@ indexes: {
 // Skip evaluation only when multi-writer protection actually applies:
 // composites exist (otherwise the half value is a constant prefix and
 // nothing to multi-writer-clobber); no explicit removal of one of the
-// half's composites; AND every composite is absent from both
-// `updatePayload` and `keyRecord` (so this writer is genuinely not
-// claiming ownership of this half on this call).
+// half's composites; no composite is in `updatePayload`; AND at least one
+// composite is unknown to `keyRecord` (#183). A half wholly known from the
+// key record recomposes to what it already is. One composite in the key
+// record is no claim on the half: the others can change, and this writer
+// didn't name them.
 const shouldSkip =
   halfComposites.length > 0 &&
   !halfHasRemoved &&
-  halfComposites.every((c) => !(c in updatePayload) && !(c in keyRecord))
+  halfComposites.every((c) => !(c in updatePayload)) &&
+  halfComposites.some((c) => !hasValue(keyRecord[c]))
 if (shouldSkip) continue  // leave this half's key attribute alone
 ```
 
@@ -1493,21 +1508,23 @@ if (shouldSkip) continue  // leave this half's key attribute alone
 | Half shape | Skip-predicate evaluates to | Outcome |
 |---|---|---|
 | Empty composite list (`composite: []`) | `length > 0` is false → not skipped | Evaluate (constant entity prefix) — **closes #46** |
-| PK-composites-only (composite ∈ keyRecord) | `every(NOT in keyRecord)` is false → not skipped | Evaluate (idempotent SET) — preserves v1.7.2 #43 fix |
-| Multi-writer not touching this half | `every()` true, length > 0, !hasRemoved → **skipped** | Skip — preserves v1.7.1 #41 fix |
+| PK-composites-only (composite ∈ keyRecord) | `some(NOT in keyRecord)` is false → not skipped | Evaluate (idempotent SET) — preserves v1.7.2 #43 fix |
+| Mixed: a primary key composite and a mutable one, neither in the payload (shape 10) | `some(NOT in keyRecord)` is true → **skipped** | Skip — the stored key stays byte for byte (#183) |
+| Multi-writer not touching this half | `every()` and `some()` true, length > 0, !hasRemoved → **skipped** | Skip — preserves v1.7.1 #41 fix |
 | Caller asserts authority via payload | `every(NOT in payload)` is false → not skipped | Evaluate |
 | Caller invalidates via `Entity.remove([...])` | `!halfHasRemoved` is false → not skipped | Evaluate (cascade override may apply under preserve) |
 
-**Why two input sources are checked, not one** (preserved from v1.7.2). Composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The skip-predicate's `every(NOT in keyRecord)` clause keeps these halves un-skipped on every write, and the structural rule composes them from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression (see issue #43).
+**Why two input sources are checked, not one** (preserved from v1.7.2). Composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The skip-predicate's `some(NOT in keyRecord)` clause keeps these halves un-skipped on every write, and the structural rule composes them from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression (see issue #43). That argument covers a half **every** composite of which is in `keyRecord`, and only those: from v1.7.2 through 1.37 the clause was `every(NOT in payload AND NOT in keyRecord)`, so one primary key composite was enough to wake a half whose other composites were mutable. An unrelated update then composed from what it had: a leading hole REMOVEd the key under `'sparse'` (the item left the index) and a trailing absence truncated it under `'preserve'` (`[channel, zone]` lost `zone`, moving the item to another partition). Shape 10 pins the fix.
 
 **Why empty composite lists are always evaluated** (NEW in v1.7.3). For a half with `composite: []`, the value is a *constant* (the bare entity / collection prefix). There is nothing for another writer to clobber, no per-call decision to make. The pre-v1.7.3 touched-predicate's `.some(...)` clauses all returned `false` for an empty array, classifying the half as untouched and skipping it — leaving items with one half SET and the other missing, invisible to the GSI (#46). The skip-predicate's leading `length > 0` guard short-circuits before `every()` is ever asked, and `classifyHalf` (which already correctly handled empty composites as `{ kind: 'set', length: 0 }`) is finally reached.
 
-**Why `'sparse'` still works.** `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites — neither in payload, nor through the key-addressed structural inputs — they aren't claiming ownership of this half on this call, and the skip-predicate skips the half exactly as before. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
+**Why `'sparse'` still works.** `'sparse'`'s contract is *with the half's owner*. If the writer names none of the half's composites in the payload, and the key doesn't supply all of them, they aren't claiming ownership of this half on this call, and the skip-predicate skips the half. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
 
 **Design history.** The gate has been progressively reframed:
 - **v1.7.0** introduced the touched-predicate (`updatePayload`-only) to fix the v1.6 GSI-wide cascade. Closed the original GSI-blast bug but introduced the multi-writer leak.
 - **v1.7.1** added the `removedSet` arm to the touched-predicate (multi-writer leak fix — #41).
 - **v1.7.2** added the `keyRecord` arm to the touched-predicate (PK-composites-only fix — #43).
+- **1.38** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites.
 - **v1.7.3** reframed the predicate from "list cases for which to evaluate" to "list the single condition for which it is safe to skip." Closes the empty-composite-half regression (#46) and any future degenerate-case gap of the same shape — the skip predicate's negation is the cumulative `||`-chain of all prior tactical fixes plus the structural `length === 0` short-circuit.
 
 End-to-end consequences for the canonical multi-writer scenarios:
@@ -1533,7 +1550,7 @@ When the structural rule **can compose** (leading prefix is non-empty and there'
 
 | Outcome for this half's key attribute | Conditions |
 |---|---|
-| **noop** (leave key alone) | No composite of this half is in the payload AND none in `Entity.remove([...])` (per-half evaluation gate) |
+| **noop** (leave key alone) | No composite of this half is in the payload, none in `Entity.remove([...])`, AND the key record doesn't hold every composite (per-half evaluation gate) |
 | **SET full** | Half touched + all composites have values supplied in payload (or available from primary key) |
 | **SET truncated** to leading prefix | Half touched + some leading composites have values, trailing absent, no hole |
 | **REMOVE** this half's key | Half touched + can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override) |
@@ -1581,7 +1598,7 @@ Naming any one composite of a half is enough — `Entity.remove` doesn't require
 
 For each half (PK then SK), independently:
 
-1. **Evaluation gate (skip-predicate, v1.7.3).** If the half's composite list is non-empty AND no composite is in `removedSet` AND every composite is absent from both `payload` AND `keyRecord` → `noop` (skip — leave the stored key untouched, multi-writer protection applies). Otherwise the half is **evaluated**, continue. (Halves with empty composite lists short-circuit on the leading `length > 0` guard and are always evaluated — the value is a constant prefix; closes #46. Halves whose composites are entity-PK composites fail the `every(NOT in keyRecord)` clause and are always evaluated — the structural rule composes idempotently from the immutable PK values; closes #43.)
+1. **Evaluation gate (skip-predicate, v1.7.3).** If the half's composite list is non-empty AND no composite is in `removedSet` AND no composite is in `payload` AND at least one composite is absent from `keyRecord` → `noop` (skip — leave the stored key untouched, multi-writer protection applies). Otherwise the half is **evaluated**, continue. (Halves with empty composite lists short-circuit on the leading `length > 0` guard and are always evaluated — the value is a constant prefix; closes #46. Halves whose composites are all entity-PK composites fail the `some(NOT in keyRecord)` clause and are always evaluated — the structural rule composes idempotently from the immutable PK values; closes #43. A half mixing a PK composite with a mutable one passes the clause and is skipped; shape 10.)
 2. **Structural rule.** Walk the half's composite list left-to-right. Find the longest leading prefix of present values in `M`.
 3. **Classify the outcome:**
    - **Compose succeeded** (leading prefix is non-empty AND no hole — i.e. all absent composites are at trailing positions): SET this half's key from the leading prefix. Done.
@@ -1594,9 +1611,9 @@ The two halves' outcomes are emitted independently — each affects only its own
 
 **`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
 
-**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with the encoded append input passed as both `updatePayload` and `keyRecord` (v1.7.2 — see #43; the v1.7.1 path filtered PK composites out of the payload, which combined with the gate-only-checks-payload bug to skip GSI evaluation for any half whose composites are entirely entity-PK composites). Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — halves whose composites are entirely outside `appendInput` AND outside the entity primary key are untouched and follow the noop branch.
+**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with the encoded append input passed as both `updatePayload` and `keyRecord` (v1.7.2 — see #43; the v1.7.1 path filtered PK composites out of the payload, which combined with the gate-only-checks-payload bug to skip GSI evaluation for any half whose composites are entirely entity-PK composites). Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — a half with a composite that neither `appendInput` nor the entity primary key supplies is untouched and follows the noop branch, even when another of its composites is a primary key composite (shape 10), since `appendInput` always repeats the primary key.
 
-For sparse GSIs whose composites are entirely outside `appendInput` *and* outside the entity primary key, the half is untouched → noop. Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
+For sparse GSIs with a composite outside both `appendInput` and the entity primary key, the half is untouched → noop. Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
 
 For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on a Telemetry entity with `primaryKey: [channel, deviceId]`), the half is always touched (PK composites are always in `keyRecord`), the structural rule always composes from the immutable PK values, and the resulting SET is idempotent — every write re-emits the same composed key. This is the correct behavior; v1.7.0 / v1.7.1 silently skipped these GSIs, leaving items invisible to channel-scoped queries.
 
@@ -1707,6 +1724,10 @@ Shapes 1 to 8 hold on a sharded index as well (#183). The gate's new dependency 
 - **9a (shape 6 analogue)** — an empty PK half with `by`: the half's value is no longer constant, and it is skipped unless `by` is touched or known.
 - **9b (#43 analogue)** — a `by` attribute that is also a primary-key composite: it arrives through `keyRecord` on every write, which is not a touched dependency.
 - **9c (shape 6 analogue)** — a default source with an empty PK half: the value differs per item though the half has no composites, and is always evaluated.
+
+10. **A half mixing a primary key composite with a mutable one** (#183) — `sk: [zone, deviceId]`, `sk: [deviceId, zone]` or `pk: [channel, zone]` on `primaryKey: [channel, deviceId]`. An update naming neither composite leaves the stored key byte for byte under both policies, on the standard, retain and append paths; naming the mutable composite composes the half; `.remove(["zone"])` cascades as ever. The composites in the key record alone never wake it, whichever position they hold. **This is the regression scenario from v1.7.2 through 1.37**, reachable on an unsharded index: the half woke through `keyRecord`, so an unrelated update removed the key under `'sparse'` or truncated it under `'preserve'`.
+
+The retain path holds the whole item in `keyRecord`, so a mixed half whose composites are all present recomposes to the key it already has. When every half of an index is skipped there, the existing Put-style fallback recomposes the entry from the new item: an item lacking a composite has no entry, as it had none.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -2017,7 +2038,7 @@ indexes: {
 yield* db.entities.Assets.update(key).set({ country: 'us', city: 'sf' }).remove(['site'])
 // gsi1pk unchanged (region untouched — pk half is not in the payload).
 // gsi1sk truncated to "$app#v1#asset#country_us#city_sf"
-// begins_with(gsi1sk, "$app#v1#asset#country_us#city_sf") still finds this asset.
+// A pin on `city` (`gsi1sk BETWEEN K AND K#U+FFFF`, K the key above) still finds this asset.
 
 // Asset leaves the datacenter — *evict* (drop the whole half).
 // Without surviving composites in `set`, the library can't compose anything;
@@ -2410,7 +2431,8 @@ sibling:
 
 | Pinned | Condition |
 |---|---|
-| some composites | `begins_with(sk, <prefix>#)` — the delimiter ends the last value, so `done` never matches `done_archived` |
+| some composites, primary key | `begins_with(sk, <prefix>#)` — the delimiter ends the last value, so `done` never matches `done_archived` |
+| some composites, secondary index | `sk BETWEEN <prefix> AND <prefix>#U+FFFF` — the row truncated at the last pinned composite and everything under it, and still no longer sibling (#183) |
 | every composite | `sk = <key>` — the stored key ends at the last value, so there is no delimiter to stop on; `seq: 3` never matches `3.14` / `3.5`, `ship` never `shipped` |
 
 Up to 1.36 a complete key was still `begins_with(<key>)` and matched those
@@ -2423,6 +2445,32 @@ only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
 the history rows that extend the live key are dropped as rows (`liveRows`).
+
+**A pin on a truncated row's own level (#183).** An update can truncate a secondary
+index sort key at its last present composite (§7, shape 3), so `city_sf` is a row of
+its own as well as the parent of `city_sf#block_1`. A condition on `begins_with(city_sf#)`
+missed that row, and `begins_with(city_sf)` would catch the sibling `city_sfx`. So a
+partial pin on a secondary index sends `BETWEEN <prefix> AND <prefix>#U+FFFF`: after a
+complete value the next byte is the end of the key, `#`, or a longer sibling's next
+character, and composite text escapes everything up to `%` (§7 "Sort key text"), so a
+sibling's next byte is above `#` and outside the range. `.where(eq)` on a composite that
+isn't the last, and an `eq` in `.within()`, mean the same.
+
+- **Why on the read side.** Stored key text doesn't change, so rows already truncated are
+  found the moment the reader upgrades. A trailing `#` on truncated keys would need a
+  migration of every such row and would no longer be "the key as far as it goes".
+- **The primary key stays `begins_with(<prefix>#)`.** Its rows are never truncated: a
+  primary key can't lose a composite. So do `Aggregate.list` (aggregates don't truncate),
+  and clustered collection prefixes, event, version and tombstone prefixes, whose segments
+  are names rather than values.
+- **Request size.** The high operand is four bytes past the prefix where `begins_with` was
+  one, so a prefix within three bytes of DynamoDB's 1,024-byte sort key limit is now refused
+  by DynamoDB. There's no client check, as for any other limit DynamoDB enforces.
+- **1.36 text wasn't escaped.** `city_new york` sorts between `city_new` and `city_new#`, so
+  it lies inside the range of a pin on `new`. See "Queries" under the 1.36 fallback: while
+  the fallback is on, the read judges those rows by their key text.
+- **`.within()` on a sharded index** stays refused (`EDD-9104`), and the pin's condition is
+  the one each partition reads.
 
 **`beginsWith` on a numeric composite is `eq`.** Numeric key text has no textual
 prefix by value (`3` is not a prefix of `35`), so `.where(beginsWith)` with a
@@ -2440,7 +2488,7 @@ the values hold:
 
 | Bound | Unclamped | Clamped under pinned composites, prefix `P` |
 |---|---|---|
-| `eq v` | `begins_with(K(v)#)`; `sk = K(v)` on the last composite | the same |
+| `eq v` | `sk = K(v)` on the last composite; on any other, `begins_with(K(v)#)` on the primary key and `BETWEEN K(v) AND K(v)#U+FFFF` on a secondary index | the same |
 | `beginsWith v` | `begins_with(K(v))`; `eq` for a numeric operand | the same |
 | `lt v` | `< K(v)` | `BETWEEN P AND K(v)`; `BETWEEN P AND keyJustBelow(K(v))` on the last composite |
 | `lte v` | `<= K(v)#U+FFFF`; `<= K(v)` on the last | `BETWEEN P AND` the same end |
@@ -2581,11 +2629,13 @@ A query on a sharded index reads its partitions (§7 "Write Sharding") and merge
 | Terminal | Behaviour |
 |---|---|
 | `.collect()` / `.paginate()` | Streams the merge: each pull reads every unfinished partition whose buffer is empty, then emits what is proven in order |
-| `.limit(n).fetch()` | `n` merged items and a cursor; rows read beyond the page are dropped and read again |
+| `.limit(n).fetch()` | `n` merged items and a cursor, over as many rounds as it takes; rows read beyond the page are dropped and read again |
 | `.fetch()` without `limit` | One round of reads: what it proves in order, and a cursor |
 | `.count()` | Each partition counted (`Select: COUNT`, or the rows read where a row check judges them), summed, capped at `limit` |
 
 There is no `.stream()` terminal.
+
+**Rounds and refills.** A round reads every partition that has nothing buffered and more to read, all at once, and takes about as long as the slowest of them. The first round is every partition. The merge then emits until it reaches the budget or the first partition with more to read runs dry, and stops: nothing further is proven in order until that partition is read. So later rounds usually read one partition, one after another, and a `.limit(n).fetch()` takes one round trip per round, not one overall. Rows spread evenly over `N` partitions with each `Limit` near `n / N` run dry often. A measured 20-shard page of 100 took 26 requests over about 7 round trips, where the same page unsharded took 1 (`docs/designs/gsi-write-sharding.md` §12).
 
 **Request sizing.** One estimator per partition, kept in the terminal's loop and never in a cursor. `active` = partitions not finished, `remaining` = items still owed. `none`: no `Limit`. `fixed`: `pageSize(n)` as given (`min(n, remaining)` when nothing filters). `natural`: 1.36's sizing with `remaining`. `budget`: `min(remaining, max(⌈remaining / active × 1.25⌉, last × 2))`. `adaptive`: `nextLimit(estimator, ⌈remaining / active⌉, filtered)`.
 
@@ -5352,7 +5402,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
 | `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
-| `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's `begins_with`, so the condition would discard the pin and return rows outside it rather than narrowing within it |
+| `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's sort key condition, so the condition would discard the pin and return rows outside it rather than narrowing within it |
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |

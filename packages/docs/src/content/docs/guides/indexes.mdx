@@ -67,7 +67,7 @@ const allMembers = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 }).collect()
 
-// Narrow by partial SK composite (begins_with prefix match)
+// Narrow by partial SK composite (prefix match on a segment boundary)
 const acmeAdmins = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 })
@@ -131,7 +131,7 @@ byTenant: {
 },
 ```
 
-Writes hash the item to pick a shard, and the accessor reads every shard and merges them into index order, so no caller names a shard. Every query pays for it, with at least one request per shard. The [Write Sharding guide](/effect-dynamodb/guides/sharding/) covers choosing the count, pruning with `by`, cursors, and adopting sharding on a populated index.
+Writes hash the item to pick a shard, and the accessor reads every shard and merges them into index order, so no caller names a shard. Every query pays for it, with at least one request per shard. The [Write Sharding guide](/effect-dynamodb/guides/sharding/) covers choosing the count, pruning, cursors, and adopting sharding on a populated index.
 
 ### Logical Names as API Surface
 

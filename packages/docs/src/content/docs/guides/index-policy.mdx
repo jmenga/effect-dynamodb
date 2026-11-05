@@ -83,7 +83,7 @@ Truncation on PK is the same hierarchical demotion as truncation on SK. An item 
 
 Before the structural rule even runs, each half is asked one question: *can this half be safely skipped?* The gate exists for one reason — **multi-writer protection**: prevent writer A from clobbering keys for halves it doesn't own when writer B does own them. The skip-predicate states that purpose directly:
 
-> A half is **skipped** iff multi-writer protection actually applies — composites exist (otherwise the half value is a constant prefix and there's nothing to multi-writer-clobber), no composite was explicitly removed via `Entity.remove([...])`, AND every composite is absent from BOTH the update payload AND the `keyRecord` (the entity primary-key attributes carried alongside the payload). If the half cannot be safely skipped, it is **evaluated** — SET / REMOVE / noop per the structural rule below.
+> A half is **skipped** iff multi-writer protection actually applies — composites exist (otherwise the half value is a constant prefix and there's nothing to multi-writer-clobber), no composite was explicitly removed via `Entity.remove([...])`, no composite is in the update payload, AND the `keyRecord` (the entity primary-key attributes carried alongside the payload) doesn't hold them all. If the half cannot be safely skipped, it is **evaluated** — SET / REMOVE / noop per the structural rule below.
 
 This is what makes the multi-writer story work end-to-end:
 
@@ -97,7 +97,9 @@ The skip-predicate has three structural conditions, each closing a different cla
 
 1. **`composites.length > 0`** — empty-composite halves (e.g. `sk: { composite: [] }`) are always evaluated. The half value is a constant prefix; multi-writer protection doesn't apply, and skipping would leave the key permanently missing. Closes [#46](https://github.com/jmenga/effect-dynamodb/issues/46) — see the *empty-composite half* pitfall below.
 2. **`!hasRemoved`** — halves with any composite in `Entity.remove([...])` are always evaluated. Removal intent must run the structural rule (which may then SET-truncate, REMOVE under sparse, or REMOVE under preserve via the cascade override).
-3. **`every(composite NOT in updatePayload AND NOT in keyRecord)`** — only writers genuinely not claiming ownership of the half (composites absent from both input sources) get the skip. Closes [#41](https://github.com/jmenga/effect-dynamodb/issues/41) (multi-writer leak — composites in payload mean ownership) and [#43](https://github.com/jmenga/effect-dynamodb/issues/43) (PK-composites-only — entity-PK composites arrive via `keyRecord`, never via payload, so they correctly fail this clause and are always evaluated). The resulting SET for PK-composites-only halves is idempotent because PK composites are immutable.
+3. **`every(composite NOT in updatePayload)` AND `some(composite NOT in keyRecord)`** — a writer that names none of the half's composites gets the skip, unless the key alone supplies them all. Closes [#41](https://github.com/jmenga/effect-dynamodb/issues/41) (multi-writer leak — composites in payload mean ownership) and [#43](https://github.com/jmenga/effect-dynamodb/issues/43) (PK-composites-only — entity-PK composites arrive via `keyRecord`, never via payload, so they correctly fail this clause and are always evaluated). The resulting SET for PK-composites-only halves is idempotent because PK composites are immutable.
+
+**A half mixing a primary key composite with a mutable one** isn't idempotent that way, so one composite in the `keyRecord` doesn't wake it. On `primaryKey: [channel, deviceId]`, an update that names no composite of `sk: [zone, deviceId]`, `sk: [deviceId, zone]` or `pk: [channel, zone]` leaves the stored key byte for byte, under both policies and on the retain and append paths. An update naming `zone` composes the half, and `.remove(["zone"])` cascades as ever. From v1.7.2 through 1.37 the half woke through the `keyRecord`, so an unrelated `.set({ status })` removed the key under `'sparse'`, taking the item out of the index, and truncated it under `'preserve'`, which on a partition key half moved the item to another partition. Rows already damaged that way stay as they are until a write names the half's composites: re-run them with an update that sets `zone`, or a `put`.
 
 The skip-predicate's negation is observably equivalent to the touched-predicate `||`-chain that v1.7.0 → v1.7.2 progressively built up — same SET/REMOVE outcomes for every input. v1.7.3 reframes the gate to make its purpose (multi-writer protection) the *only* thing the predicate checks, so future degenerate-case shapes fall out automatically instead of requiring another `||` arm.
 
@@ -107,7 +109,7 @@ The roll-up is **per-key** — each half's outcome applies to its own key attrib
 
 | Outcome for this half's key attribute | Conditions |
 |---|---|
-| **noop** (leave key alone) | Half is **skipped** by the gate (multi-writer protection applies — has composites, no removal, every composite absent from payload AND keyRecord) |
+| **noop** (leave key alone) | Half is **skipped** by the gate (multi-writer protection applies — has composites, no removal, no composite in the payload, and the keyRecord doesn't hold them all) |
 | **SET full** | Half evaluated, all composites composable |
 | **SET truncated** to leading prefix | Half evaluated, leading prefix non-empty, no hole |
 | **REMOVE** this half's key | Half evaluated, can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override under preserve) |
@@ -216,7 +218,12 @@ yield* db.entities.Assets.update({ assetId: "rack-42" })
   .set({ country: "us", city: "sf" })
   .remove(["site"])
 // gsi1sk = "$indexpolicy-demo#v1#asset#country_us#city_sf"
-// Asset still queryable at city level via begins_with.
+// A query pinning the city finds it: the row that stops there, and anything under it.
+const atCity = yield* db.entities.Assets.byLocation({
+  region: "americas",
+  country: "us",
+  city: "sf",
+}).collect()
 ```
 
 ## 8. The two drop triggers (recap)
@@ -387,13 +394,14 @@ Per the [per-half evaluation gate](#per-half-evaluation-gate-reframed-as-a-skip-
 
 - the half has composites (`composites.length > 0`) — empty-composite halves are always evaluated ([#46](https://github.com/jmenga/effect-dynamodb/issues/46)), AND
 - no composite is in `Entity.remove([...])` (cascade intent always evaluates), AND
-- every composite is absent from BOTH the update payload AND the `keyRecord` (the entity primary-key attributes used to address the row).
+- every composite is absent from the update payload, AND
+- at least one composite is absent from the `keyRecord` (the entity primary-key attributes used to address the row).
 
 Equivalently, a half is **evaluated** when ANY of these holds:
 - the half has no composites (constant prefix — always SET), OR
 - a composite is in `Entity.remove([attr])`, OR
 - a composite is in the update payload (the writer is asserting ownership), OR
-- a composite is in `keyRecord` (entity-PK composites — added to the gate in **v1.7.2**, [#43](https://github.com/jmenga/effect-dynamodb/issues/43)).
+- **every** composite is in `keyRecord` (entity-PK composites — added to the gate in **v1.7.2**, [#43](https://github.com/jmenga/effect-dynamodb/issues/43); until 1.38 one composite was enough).
 
 The presence of an `indexPolicy` declaration does **not** force evaluation of every update under v1.7.1+ (this is a behavior change from v1.7.0). The per-half gate is the same regardless of whether `indexPolicy` is declared.
 
@@ -403,7 +411,7 @@ The presence of an `indexPolicy` declaration does **not** force evaluation of ev
 
 ## Interaction with time-series `.append()`
 
-v1.7.x unifies `.append()` with `.update()` — both call the same composer with the same per-half evaluation gate. Composites outside `appendInput` are absent under the structural rule, AND the half is untouched per the gate (composite name is not in payload, not in keyRecord, not in removedSet). Halves whose composites are entirely outside `appendInput` *and* entirely outside the entity primary key are skipped.
+v1.7.x unifies `.append()` with `.update()` — both call the same composer with the same per-half evaluation gate. Composites outside `appendInput` are absent under the structural rule, AND the half is untouched per the gate (no composite in removedSet, and the input doesn't supply them all). A half with any composite outside both `appendInput` and the entity primary key is skipped, even when another of its composites is in the primary key, since `appendInput` always repeats that.
 
 For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`), the half is always touched via keyRecord membership and the structural rule composes from the immutable PK values on every append. The resulting SET is idempotent. (v1.7.0 / v1.7.1 silently skipped these GSIs — see the *byChannel* pitfall above; closes [#43](https://github.com/jmenga/effect-dynamodb/issues/43).)
 
@@ -430,7 +438,7 @@ A [Z-order sort key half](/effect-dynamodb/guides/zorder/) (`sk: { prefix?, zord
 - **Every field is key material.** Moving a dimension by at least one quantization level, or changing a prefix composite, moves the entry: a delete plus a put in the GSI. A change within one level writes the same bytes.
 - **Hierarchical prefixes don't truncate.** For a string half, `set({ agencyId }).remove(["officeId"])` truncates the key to the parent ([§7.3](#73-hierarchical-truncation-via-setremove)). For `prefix: ["agencyId", "officeId"]` the same update REMOVEs the half under both policies, and the item leaves the index. The hierarchy is a query feature: `.within()` can bound the agency alone, or the agency and the office.
 - **Split ownership leaves the address stale or gone.** A writer that owns `price` but not `listedAt` can't recompose the address: under `'preserve'` it goes stale, under `'sparse'` the item leaves the index. Give one writer every field of a Z-order half ([multi-writer design rule](#multi-writer-entity-design-rule)).
-- **Primary-key composites recompose on every write.** A prefix composite or dimension that is also a primary-key composite arrives through the `keyRecord`, so the half is evaluated, and SET when the rest are present, on every update, as for [PK-composites-only halves](#bychannel-gsi-returns-0-items-in-v170--v171-pk-composites-only-regression-fixed-in-v172).
+- **Primary-key composites recompose on every write.** A half whose prefix composites and dimensions are all primary-key composites arrives whole through the `keyRecord`, so it is evaluated and SET on every update, as for [PK-composites-only halves](#bychannel-gsi-returns-0-items-in-v170--v171-pk-composites-only-regression-fixed-in-v172).
 - **An empty partition key half is still SET.** With `pk: { composite: [] }`, the constant partition key is SET on every write. Under `'sparse'`, a partial dimension payload SETs the partition key and REMOVEs the sort key, so the item leaves the index; under `'preserve'` the sort key is left alone.
 - **`put()` is all-or-nothing too.** A put missing any prefix composite or dimension writes no Z-order key: the item is not in that index, as for any sparse GSI.
 - **`.append()`** recomposes a Z-order half only when `appendInput` carries every prefix composite and dimension (or the primary key does). Otherwise the half is skipped, or decided by its policy as above.

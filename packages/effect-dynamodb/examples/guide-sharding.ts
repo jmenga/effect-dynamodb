@@ -77,6 +77,13 @@ const Devices = Entity.make({
       sk: { field: "gsi2sk", composite: ["groupId", "deviceId"] },
       shards: { count: 8, by: ["groupId"] },
     },
+    // This sort key holds the whole primary key, so a query can pin all of it.
+    byDevice: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["tenantId"] },
+      sk: { field: "gsi3sk", composite: ["groupId", "channel", "deviceId"] },
+      shards: 8,
+    },
   },
 })
 // #endregion
@@ -272,7 +279,7 @@ const program = Effect.gen(function* () {
   // accepted → 10: rows beyond the limit were read and dropped
   // #endregion
   assertEq(explained.fanOut?.partitions.length, 8, "one partition per shard")
-  assertEq(explained.fanOut?.pruned, false, "the default source never prunes")
+  assertEq(explained.fanOut?.pruned, false, "a query that doesn't pin the source reads every shard")
   assertEq(explained.fanOut?.concurrency, 2, "concurrency")
   assertEq(explained.keyConditions.length, 8, "one key condition per shard")
   assertEq(requests >= 8, true, "at least one request per shard")
@@ -282,7 +289,34 @@ const program = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   // `by`
   // -------------------------------------------------------------------------
-  yield* Console.log("=== by ===\n")
+  yield* Console.log("=== Pruning ===\n")
+
+  // #region key-prune
+  // The default source is the primary key. Pin all of it, and the query knows the shard.
+  const oneDevice = db.entities.Devices.byDevice({
+    tenantId: TENANT,
+    groupId: "group-a",
+    channel: "channel-0",
+    deviceId: "d-000",
+  })
+  const onePin = yield* oneDevice.explain()
+  // onePin.fanOut?.pruned            → true
+  // onePin.fanOut?.partitions.length → 1
+  const found = yield* oneDevice.collect()
+
+  // `channel` and `deviceId` aren't known, so the shard isn't: all 8.
+  const wholeGroup = yield* db.entities.Devices.byDevice({
+    tenantId: TENANT,
+    groupId: "group-a",
+  }).explain()
+  // wholeGroup.fanOut?.pruned            → false
+  // wholeGroup.fanOut?.partitions.length → 8
+  // #endregion
+  assertEq(onePin.fanOut?.partitions.length, 1, "a full primary key pin reads one shard")
+  assertEq(onePin.fanOut?.pruned, true, "pruned")
+  assertEq(found.length, 1, "a full primary key pin finds the row")
+  assertEq(wholeGroup.fanOut?.partitions.length, 8, "a partial pin reads every shard")
+  yield* Console.log(`Whole key pinned: ${onePin.fanOut?.partitions.length} shard`)
 
   // #region by-prune
   // Every `by` attribute is pinned: one shard, one request.

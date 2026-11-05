@@ -45,6 +45,13 @@ const Devices = Entity.make({
       sk: { field: "gsi2sk", composite: ["groupId", "deviceId"] },
       shards: { count: 8, by: ["groupId"] },
     },
+    // This sort key holds the whole primary key, so a query can pin all of it.
+    byDevice: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["tenantId"] },
+      sk: { field: "gsi3sk", composite: ["groupId", "channel", "deviceId"] },
+      shards: 8,
+    },
   },
 })
 ```
@@ -54,7 +61,7 @@ const Devices = Entity.make({
 | Option | Meaning |
 |---|---|
 | `count` | The number of shards, an integer from 2 to 256 |
-| `by` | The sort key composites to hash in place of the primary key composites. See [Pruning with `by`](#pruning-with-by) |
+| `by` | The sort key composites to hash in place of the primary key composites. See [Pruning](#pruning) |
 | `previous` | The count of the layout being moved away from: `1` for an unsharded index. See [Adopting sharding](#adopting-sharding-on-a-populated-index) |
 
 Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
@@ -90,12 +97,24 @@ N ≥ peak WCU/s on the logical key ÷ (1,000 × headroom)
 |---|---|---|
 | Write | 1 index write | 1 index write |
 | Logical query | 1 or more requests | N or more requests, each billed the per-request minimum |
-| Latency | One partition | About the slowest shard |
-| `fetch` page | Reads the page | Up to N partial pages, sized from `n / N` |
+| Latency | One round trip | One per [round of reads](#rounds-and-latency). `.limit(n).fetch()` usually takes several |
+| `.limit(n).fetch()` | Reads the page | At least N partial pages, sized from `n / N`, plus refills |
 
 Sharding costs on the read side, and it costs on every query, including those of the smallest tenants. A partition that never approaches the limit pays N times the per-request minimum for nothing, so shard the indexes that need it and leave the rest alone.
 
 `count` is capped at 256. DynamoDB has no such limit: the cap exists because each query sends at least N requests, a cursor holds one position per shard, and a typo like `shards: 2000` would otherwise deploy, with a migration to undo it. 256 shards take more than six times the default per-table quota of 40,000 WCU/s on one logical key.
+
+### What a real table showed
+
+A one-off run, not a CI check, on an on-demand table in us-east-1: one logical key, 20 shards, `ALL` projection, 1.3 KB rows at 2 WCU per index write, 50,000 items, written with `Batch.write` from outside the region.
+
+| Offered on the logical key | Result |
+|---|---|
+| 2,000 WCU/s, sharded, for 6 minutes | No throttle events, no failed batches |
+| 2,000 WCU/s, unsharded, for 5 minutes | The index stayed at about 1,000 WCU/s, 7,255 of 10,762 batches failed, and the base table was held to the same 1,000 WCU/s |
+| Stepping up to 3,000 WCU/s, sharded | About 2 minutes of throttling on both the index and the base table, 1,272 batches out of retries, then clean for the remaining 2 minutes or so |
+
+The base table's keys aren't sharded and it throttled at the same moment, which suggests the table scaling on a fresh table rather than the shard keys, though that cause is inferred, not proven. A new table may need the same warm-up. Items spread evenly, from 2,444 to 2,567 per shard.
 
 ## How an item picks its shard
 
@@ -112,6 +131,12 @@ There is no unsharded fallback. When a write has to compose the partition key an
 ## Reading
 
 Every terminal reads the shards and merges them. Each shard is sorted by the index's sort key, so a row is emitted only once every unfinished shard has a row to compare it with. That is what makes the order right, and it means at most one page per shard is held in memory.
+
+### Rounds and latency
+
+A round reads every shard that has nothing buffered and more to read, all at once, and takes about as long as the slowest of them. The first round is every shard. The merge then emits until it has what it owes or the first shard with more to read runs dry, and it stops there, since nothing further is proven in order until that shard answers. So later rounds usually read one shard each, one after another.
+
+`.fetch()` without a `limit` is one round. `.limit(n).fetch()` takes as many as the page needs, because each shard's first `Limit` is near `n / N`, so a shard running dry before the page is full is the ordinary case. On the table above, `.limit(100).fetch()` over 20 shards took 26 requests per page and a p50 of 2.1 s from outside the region, about 7 round trips at 265 ms, against 1 request and 264 ms unsharded. The cost is in round trips, so it scales with the round trip to the table. `.pageSize(n)` at the page's size makes it one round, and every shard then reads up to `n` rows.
 
 ```typescript region="collect" example="guide-sharding.ts"
 // Reads all 8 shards and merges them into the index's order.
@@ -212,9 +237,35 @@ yield* gentle
 
 Any shard's failure fails the terminal. `fetch` and `collect` return no partial result and interrupt the requests in flight: a page's order can only be proven with every shard's answer. A `paginate` stream fails at that point, having delivered only what was already proven in order.
 
-## Pruning with `by`
+## Pruning
 
-With the default source, a query can't know which shard an item is on, so it reads them all. `by` hashes sort key composites instead, so a query that pins those composites knows the shard and reads one.
+A query that knows every value of the shard source can compute the shard and read one. What it knows is what the accessor pins: the partition key composites and a leading run of sort key composites.
+
+The default source is the primary key, so this happens when the index's keys hold the whole primary key and the query pins all of it. That's a lookup of one row, and it costs one request instead of N:
+
+```typescript region="key-prune" example="guide-sharding.ts"
+// The default source is the primary key. Pin all of it, and the query knows the shard.
+const oneDevice = db.entities.Devices.byDevice({
+  tenantId: TENANT,
+  groupId: "group-a",
+  channel: "channel-0",
+  deviceId: "d-000",
+})
+const onePin = yield* oneDevice.explain()
+// onePin.fanOut?.pruned            → true
+// onePin.fanOut?.partitions.length → 1
+const found = yield* oneDevice.collect()
+
+// `channel` and `deviceId` aren't known, so the shard isn't: all 8.
+const wholeGroup = yield* db.entities.Devices.byDevice({
+  tenantId: TENANT,
+  groupId: "group-a",
+}).explain()
+// wholeGroup.fanOut?.pruned            → false
+// wholeGroup.fanOut?.partitions.length → 8
+```
+
+To prune a listing rather than a lookup, use `by`. It hashes sort key composites instead, so a query that pins those composites knows the shard and reads one.
 
 ```typescript region="by-prune" example="guide-sharding.ts"
 // Every `by` attribute is pinned: one shard, one request.
@@ -234,7 +285,7 @@ const sameGroup = yield* db.entities.Devices.byGroup({
 ```
 
 - `by` names sort key composites of this index. The type system offers exactly those, with completions and a compile error for anything else, and `Entity.make` checks again at runtime (`EDD-9102`).
-- A query prunes when the accessor pins **every** `by` attribute. `.where()` doesn't prune, even with `eq`. A `previous` layout is never pruned, and neither is a collection.
+- A query prunes when the accessor pins **every** attribute of the source, `by` or the primary key. A primary key composite outside the index's keys can't be pinned, so such an index without `by` never prunes. `.where()` doesn't prune, even with `eq`. A `previous` layout is read whole, and a collection reads every shard.
 - `by` can't be on a Z-order sort key, since an accessor can't pin a dimension.
 
 <Aside type="caution" title="by concentrates writes">
@@ -333,7 +384,7 @@ Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `re
 
 ### What else can change
 
-- **Removing `by`** at the same count is safe: reads go back to reading every shard, and items keep working. `rekey` moves them to the default source's shards.
+- **Removing `by`** at the same count: a query that reads every shard keeps finding every row, and `rekey` moves rows to the default source's shards. A query that [pins the whole primary key](#pruning) prunes to the default source's shard, so it can miss a row until `rekey` has moved it. If you have such a query, change the count too.
 - **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
 - **Rows still under 1.36 key text** are read and moved as well: with `previous: 1`, the query also reads the 1.36 key when its text differs, and `rekey` lands those rows sharded. Running `rekey` before adopting is simpler to reason about, but adopting directly works.
 

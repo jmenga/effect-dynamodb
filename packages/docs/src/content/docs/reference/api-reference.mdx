@@ -1036,7 +1036,7 @@ import { KeyComposer } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `composePk` | `(schema, entity, index, record) => string` | Compose partition key value. On a [sharded index](/effect-dynamodb/guides/sharding/) it adds the shard marker, and throws `EDD-9100` when a source value is missing |
-| `composeReadPartitions` | `(schema, entity, index, record, { prune? }?) => { partitions, fanOut }` | The partition keys a query on this index reads, in merge order: the current shards (one when every `by` attribute is pinned), then a `previous` layout's. One partition on an unsharded index, with `fanOut: undefined` |
+| `composeReadPartitions` | `(schema, entity, index, record, { prune? }?) => { partitions, fanOut }` | The partition keys a query on this index reads, in merge order: the current shards (one when every attribute of the shard source is pinned, `by` or the primary key alike), then a `previous` layout's. One partition on an unsharded index, with `fanOut: undefined` |
 | `assertCollectionShardsAgreement` | `(collectionName, members) => void` | Throw `EDD-9103` when a collection's members disagree on `shards.count` or `shards.previous` |
 | `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
 | `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
@@ -1047,7 +1047,11 @@ import { KeyComposer } from "effect-dynamodb"
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
 | `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append. Implements v3 per-half structural composition + policy-aware hole detection (see `indexPolicy` guide). |
 | `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | The composed SK up to the last composite supplied, with no trailing delimiter |
-| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied, else `{ beginsWith: prefix + "#" }`, so a value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
+| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith } \| { between }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied; else, on a secondary index, `subtreeCondition(prefix)`, and on the primary key `{ beginsWith: prefix + "#" }`. A value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
+| `subtreeCondition` | `(prefix) => { between: [prefix, prefix + "#\uFFFF"] }` | A composite value's row and everything under it: the row truncated at that level and its subtree, and no longer sibling |
+| `subtreePrefix` | `(condition) => string \| undefined` | The prefix a `subtreeCondition` selects; `undefined` for any other condition |
+| `SORT_KEY_MAX` | `"\uFFFF"` | The character above any composed key text, used as a range's upper end |
+| `tryComposeStructuralKeys` | `(schema, entityType, entityVersion, index, record) => { pk, sk } \| undefined` | The keys an update's structural rule composes from `record`, truncated at the last present composite; `undefined` when a hole or an absent leading composite leaves nothing to compose |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
 | `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |

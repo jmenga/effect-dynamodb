@@ -15,8 +15,10 @@ order and cursors); v1.7.x policy-aware GSI composition (#41 / #43 / #46); #171'
 `internal/RangePlanner`, `internal/BoundQuery`, `DynamoClient`, `Collection`, `Entity`, `Table`,
 `internal/TransactableOps`), `packages/effect-dynamodb-geo` (rejection only),
 `packages/language-service`, `packages/docs`, `packages/doctest` (no code change).
-**Semver impact:** `minor`, 1.38.0 in lockstep. Purely additive for an index without `shards`:
-no key text, request, cursor or result changes.
+**Semver impact:** `minor`, 1.38.0 in lockstep. Additive for an index without `shards`, with no
+stored key text or cursor format change, except two bug fixes that reach every secondary index
+(§17): a partial pin now finds the row truncated at that level, and an unrelated update no longer
+touches a half mixing a primary key composite with a mutable one.
 
 ## 1. Summary
 
@@ -138,7 +140,8 @@ runtime-agnostic. Golden vectors pin it; changing it is a breaking change. Aggre
   error boundaries turn it into a `ValidationError`, and no write is sent.
 - **An index never bound to an entity throws**, as an unbound Z-order half does.
 - **`composeReadPartitions`** is the only function reads use. It returns the current shards (pruned
-  when every `by` attribute is pinned), then the `previous` layout's partitions, never pruned. Every
+  when every attribute of the shard source is pinned, §7), then the `previous` layout's partitions,
+  never pruned. Every
   read path calls it: `DynamoClient` accessors, `Entity.query.<index>`, `Collections`, the client's
   collection accessors and cascade reads.
 - **`KeyText136` stays unsharded** (§9.3).
@@ -199,6 +202,9 @@ callers that compose from partial knowledge and don't write the result as-is:
 
 The SK half is not affected: it follows its existing rule, independently.
 
+The existing skip predicate itself changed as well, on every index: one composite in `keyRecord` no
+longer wakes a half (§17.2, shape 10). "Holds" above means the predicate as it is now.
+
 ## 6. Reads
 
 ### 6.1 Partitions
@@ -240,6 +246,15 @@ There is no `.stream()` terminal on this branch (finding 4); the issue's `.strea
 
 Pruned queries still take this path, with one partition. That keeps one code path and one cursor
 format per index, so a cursor can't change format because of a query's pins.
+
+**Rounds and refills.** A round reads every partition with nothing buffered and more to read, at
+once, and takes about as long as the slowest of them. The first round is every partition. The merge
+then emits until it reaches the budget or the first partition with more to read runs dry, and it
+stops there, because nothing further is proven in order until that partition answers. So later
+rounds usually read one partition each, one after another. `.fetch()` without `limit` is one round;
+`.limit(n).fetch()` is as many as the page takes, which is why it isn't "about the slowest shard"
+(§12 has the measurement). Each `Limit` starts near `n / N`, so a partition running dry before the
+page is full is the ordinary case, not the exception. Rows read past the page are dropped.
 
 ### 6.4 `.maxPages(n)` (finding 8)
 
@@ -327,13 +342,33 @@ pruned, concurrency }`. `asParams` reports the first partition's request.
 
 ## 7. Pruning
 
-A query reads one current shard when every `by` attribute is pinned by the accessor's composites.
-Accessor pins are a leading prefix of the sort key (`EDD-9004` rejects a hole), so this is exactly
-"every `by` value is known". In v1:
+A query reads one current shard when the accessor pins every attribute of the shard source, whether
+that source is `by` or the primary key. The write hashed those values, and the query hashes its pins
+through the same key form and the same fold (§3), so the two agree in any case and for any type.
+
+Accessor pins are the partition key composites and a leading prefix of the sort key (`EDD-9004`
+rejects a hole). So:
+
+- **`by`** prunes when the pinned prefix holds every `by` attribute.
+- **The default source** prunes when the index's keys hold the whole primary key and the query pins
+  all of it: `sk: [groupId, channel, deviceId]` on `primaryKey: [channel, deviceId]`. Where a primary
+  key composite is outside the index's keys it never fires, and the query fans out. A query that does
+  fire is a lookup of one row, so its cost drops from N requests to one.
+
+Values past a hole and attributes that aren't composites of this index don't count, which also makes
+`Entity.query.<index>` sound, as it has no hole check of its own. A pruned query's cursor belongs to
+that query: the fingerprint covers the partitions, so pruned and unpruned cursors refuse each other
+(`EDD-9094`). In v1:
 
 - `.where()` doesn't prune, even with `eq` (a design boundary: pins only).
-- The default source never prunes, since the query would have to pin the whole primary key.
+- `previous` partitions are read whole either way: the old source isn't recorded. `fanOut.pruned`
+  speaks for the current layout, so with `previous` it can be `true` over 1 + `previous` partitions.
 - Collection queries never prune (each member has its own source).
+
+An earlier draft said "the default source never prunes, since the query would have to pin the whole
+primary key". The issue has no such exception, and a query can pin it. The narrowing was marked "in"
+in §15 without a boundary; it was found on a real table, where such a pin returned the right row but
+read all 20 shards. It is implemented now (D34). §15 has the audit it prompted.
 
 ## 8. `by`
 
@@ -342,9 +377,12 @@ Accessor pins are a leading prefix of the sort key (`EDD-9004` rejects a hole), 
 duplicates. A Z-order half can't take `by`, since an accessor can't pin its dimensions. A Z-order
 sort key **without** `by` is fine: the merge compares bytes, and `.within()` is what's refused.
 
-Changing `by` at an unchanged `count`: `previous` can't equal `count`, so this is a boundary.
-Removing `by` is safe (all shards are read). Adding `by` at the same count is not, because pruned
-queries would miss rows that have not moved. Change `count` with `previous` instead (§15).
+Changing `by` at an unchanged `count`: `previous` can't equal `count`, so this is a boundary, and
+neither direction is safe for every query. Adding `by`: pruned queries would miss rows that have not
+moved. Removing `by`: a query that reads every shard still finds every row, and `rekey` moves rows to
+the default source's shards, but a query pinning the whole primary key now prunes to the default
+source's shard and misses a row still on its `by` shard until `rekey` has moved it. Change `count`
+with `previous` instead (§15).
 
 ## 9. Adoption and `previous`
 
@@ -434,7 +472,7 @@ so the spelling doesn't depend on the cap.
 | Aggregates and edge entities | No interaction, so nothing to reject: an aggregate's collection config is its own and has no `shards`; aggregate writes compose their own attributes and never read `entity.indexes`, so they write no GSI key of an edge entity's sharded index. A test pins this. A standalone entity's ops on the same entity shard normally |
 | EventStore projection rows | Entity operations, so sharded through the composer |
 | Cascade reads | Fan out: `Entity.ts`'s cascade query reads every partition of a sharded cascade index |
-| `Entity.query.<index>` | Fans out |
+| `Entity.query.<index>` | Reads what the accessor reads: prunes on the same pins (§7), otherwise fans out |
 | Time-series events | Strip GSI keys, unchanged. `append` composes the current item's keys through the update composer |
 | Unique sentinels | Unaffected |
 | `GeoIndex`, `.within()`, skip-scan, `.zorder()` | `EDD-9104` |
@@ -448,11 +486,43 @@ so the spelling doesn't depend on the cap.
 |---|---|---|
 | Write | 1 index write | 1 index write |
 | Logical query | 1+ requests | N+ requests, each billed the per-request minimum |
-| Latency | one partition | about the slowest shard |
-| `fetch` page | reads the page | up to N partial pages, sized from `n / N` |
+| Latency | one round trip | one per round (§6.3). A round takes about its slowest shard. `.fetch()` without `limit` is one round; `.limit(n).fetch()` is one round of every shard, then refills, usually one shard at a time |
+| `.limit(n).fetch()` | reads the page | at least N partial pages, sized from `n / N`, plus the refills |
 
 **Choosing N:** N ≥ peak WCU/s on the logical key ÷ (1,000 × headroom). Small logical partitions pay
 N times the per-request minimum for nothing, so sharding is for keys that need it.
+
+### Measured on a real table
+
+A one-off run against a real on-demand table in us-east-1, at `2fc7bc6`, not a CI check. One logical
+key, 20 shards, `ALL` projection, 1.3 KB rows (2 WCU per index write), 50,000 items, written with
+`Batch.write` from outside the region (about 265 ms round trip).
+
+| Run | Offered on the logical key | Result |
+|---|---|---|
+| Sharded | 2,000 WCU/s for 6 minutes | No throttle events, no failed batches |
+| Sharded, stepping up | 3,000 WCU/s | For about 2 minutes, partition-limit throttle events on both the GSI and the base table, and 1,272 batches exhausted `Batch.write`'s default retries. Then clean at 3,000 WCU/s for the remaining 2 minutes or so |
+| Unsharded control | 2,000 WCU/s for 5 minutes | The GSI stayed at about 1,000 WCU/s throughout: 358,566 write throttle events, 7,255 of 10,762 batches failed. The base table was held to the same 1,000 WCU/s, which confirms the back-pressure the issue describes |
+
+The base table's keys aren't sharded and it throttled at the same moment as the GSI during the step to
+3,000 WCU/s. That suggests the table scaling on a fresh table rather than the shard keys, but that
+cause is inferred, not proven.
+
+**Spread:** 2,444 to 2,567 items per shard, against an even share of 2,500.
+
+**Reads, against known answers on the sharded table.** `collect`, `count`, a `fetch` chain of 50 pages
+and `reverse` were all correct, with no duplicates. 200 pinned lookups with upper-cased inputs all
+found the right row. All of these reads fanned out: the run predates default-source pruning (§7), so
+pruned reads have not been measured on AWS.
+
+| `.limit(100).fetch()` | Requests per page | p50 |
+|---|---|---|
+| Unsharded | 1 | 264 ms |
+| 20 shards | 26 | 2.1 s |
+
+That is about 7 round trips, which fits 20 parallel requests followed by shards refilling one at a
+time (§6.3). Request sizing and refills are unchanged by this: whether to tune them is an open
+decision for the owner (§14).
 
 ## 13. Findings from the pre-implementation review
 
@@ -502,6 +572,15 @@ the direction, and it is still proposed for the owner.
 | D26 | A `put` with no value for a `by` attribute is sparse: no index entry, no unsharded key. `EDD-9100` is for a half being composed (§5) | proposed — awaiting owner confirmation |
 | D27 | `Query.planEmpty` reads no partition and drops the fan-out, as a query with a known-empty result has nothing to merge | proposed — awaiting owner confirmation |
 | D28 | The language service renders the shard as a `{shard}` placeholder, because a hover has no item to hash | proposed — awaiting owner confirmation |
+| D29 | A partial pin on a secondary index selects the row truncated there and its subtree (`BETWEEN <prefix> AND <prefix>#U+FFFF`). Fixed on the read side, so no stored key changes; the primary key stays `begins_with` (§17.1) | proposed — awaiting owner confirmation |
+| D30 | `.where(eq)` on a composite that isn't the last, and `eq` in `.within()`, mean the same as a pin on a secondary index (§17.1) | proposed — awaiting owner confirmation |
+| D31 | While the 1.36 fallback is on, a pin whose text didn't change judges rows by key text (`keepRow`), reading nothing more. `.count()` reads rows at the same RCU; later `Limit`s grow (§17.1) | proposed — awaiting owner confirmation |
+| D32 | A half wakes through `keyRecord` only when `keyRecord` holds **every** composite (shape 10, §17.2) | proposed — awaiting owner confirmation |
+| D33 | Rows the old gate already damaged aren't repaired automatically: a write naming the half's composites, or a re-put, repairs them. `rekey` doesn't. A repair pass is a possible follow-up (§17.2) | proposed — awaiting owner confirmation |
+| D34 | A default source prunes when the accessor pins the whole primary key, as the issue says (§7) | issue; the fix was requested by the owner |
+| D35 | `fanOut.pruned` speaks for the current layout: it can be `true` while a `previous` layout is read whole (§7) | proposed — awaiting owner confirmation |
+| D36 | Removing `by` at an unchanged `count` is a boundary now that full pins prune: such a query misses unmoved rows until `rekey` has moved them (§8) | proposed — awaiting owner confirmation |
+| D37 | Request sizing and refills stay as they are after the AWS measurement (26 requests, 2.1 s p50 for a page of 100 over 20 shards, §12). Whether to tune them is the owner's decision | open — owner to decide |
 
 ## 15. Scoping decisions
 
@@ -543,7 +622,7 @@ Every item in the issue, mapped to **in**, **out** or **changed**.
 | Adaptive sizing from `n / count` | in | Per partition (§6.5) |
 | `.count()` sums | in | |
 | Cursor: positions + layout fingerprint, `EDD-9094`, `Option<string>` | in | |
-| Pruning when every source attribute is pinned | in | Pins only (§7) |
+| Pruning when every source attribute is pinned | in | `by` and the default source alike (§7, D34). Pins only: boundaries below |
 
 ### Proposal: `by`, adoption, validation
 
@@ -551,11 +630,11 @@ Every item in the issue, mapped to **in**, **out** or **changed**.
 |---|---|---|
 | `by` replaces the source | in | |
 | `by` must be sort key composites, checked by type and `Entity.make` | in | `EDD-9102` |
-| `by` required when the half is composed | in | §5, with the policy interactions decided |
+| `by` required when the half is composed | in | §5, with the policy interactions decided; the cases that write no key are listed under boundaries |
 | `by` change moves the entry | in | |
 | Docs warning on coarse `by` values | in | Guide |
 | `previous` transition: writes new, reads both, merged | in | |
-| `rekey` pass | in | §9.2 |
+| `rekey` pass | in | §9.2; what it leaves alone is listed under boundaries |
 | `rekey` keeps dry run, segments, resume, conflicts, capacity | in | |
 | `rekey` moves only index key attributes, conditional on unchanged item | **changed** | Guard covers the key's inputs, not the whole item (§9.2) |
 | Remove `previous` | in | Documented step |
@@ -564,7 +643,7 @@ Every item in the issue, mapped to **in**, **out** or **changed**.
 | `previous` positive integer ≠ `count` | in | |
 | Collections agree on `count` | in | Plus `previous` (§11) |
 | v1 rejects `GeoIndex`, `.within()`, skip-scan | in | Plus `.zorder()` (`EDD-9104`) |
-| Cost table and N rule in docs | in | |
+| Cost table and N rule in docs | in | Latency row corrected by the AWS measurement (§12) |
 
 ### Testing
 
@@ -574,7 +653,7 @@ Every item in the issue, mapped to **in**, **out** or **changed**.
 | Mocked client: request counts, merge order and ties, `fetch` chains, cursors, pruning, `previous`, `concurrency` | in | Plus a randomised brute-force check |
 | Connected: thousands of items over 16 shards | in | |
 | Connected: adoption on a populated index | in | |
-| **On AWS throughput check** | **out** | Not part of this run; not done. DynamoDB Local can't show throughput |
+| **On AWS throughput check** | in, once | A one-off run at `2fc7bc6` on a real on-demand table in us-east-1, not CI: 2,000 WCU/s on one logical key over 20 shards for 6 minutes with no throttling, against about 1,000 WCU/s and heavy throttling unsharded. §12 has the results, including the throttling during the step to 3,000 WCU/s |
 
 ### Out of scope in the issue, and staying out
 
@@ -613,6 +692,32 @@ Not in the issue; each one is something a caller could otherwise expect:
 | The cursor checksum is integrity, not authentication | §6.6 |
 | A `paginate` stream may have delivered rows before a failure | §6.8 |
 | Cursor size grows with N | §6.6 |
+| Collections never prune | Each member has its own source (§7, D10) |
+| A default source prunes only where the index's keys hold the whole primary key | Accessor pins are the index's composites, so a composite outside them can't be pinned (§7) |
+| Removing `by` at an unchanged `count` can hide rows from a full primary key pin until `rekey` has moved them | §8, D36 |
+| "`by` is required" means "when the half is composed": a `put` without it is sparse (D26), `.remove(["by"])` drops the half (D7), an unrelated update is a noop (D8), and clearing it under `sparse` removes the half (§5 case 7) | None of them writes an unsharded key |
+| The `rekey` sharding pass covers sharded PK halves; other index keys keep #181's rule | §9.2 |
+| After `rekey`, a row that can't compose a key stays where it is: a conflict when it's in another layout, left alone in the current one | D18, D24. "No stored key stays unsharded" holds for rows that can compose |
+| The move path keeps a row's key when `by` is absent | `onMissingShardSource: "keep"` (§5): the row has nothing to hash |
+
+### Audit of the "in" rows
+
+The default-source narrowing (§7) was marked "in" with nothing listing it, so every "in" row above was
+read against its design section. What that found:
+
+| Row | The design said | Outcome |
+|---|---|---|
+| Pruning | The default source never prunes | **Implemented** (§7, D34) |
+| Pruning | Collections never prune (D10, §7, §11), not in the boundaries table | Listed above |
+| `by` required | D26, D7, D8 and §5 case 7 each write no key where the issue reads as a failure | Listed above. Each writes no unsharded key, which is what the rule protects |
+| `rekey` pass | Sharded PK halves only; uncomposable rows stay (D18, D24), so "no stored key stays unsharded" has an exception | Listed above |
+| No unsharded fallback | The move path's `onMissingShardSource: "keep"` can keep a row's key when `by` is absent | Listed above |
+| `Entity.query.<index>` (§11) | "Fans out", which the fix made wrong | Corrected: it prunes like the accessor |
+| Removing `by` (§8) | "Safe", which the fix made wrong | Corrected, and listed above (D36) |
+| Cost table (§12) | Latency "about the slowest shard" and "up to N partial pages", which the AWS measurement contradicts | Corrected (§6.3, §12) |
+
+The other "in" rows match their sections: merge, ties, cursors (the integrity boundary was already
+listed), `.maxPages`, `.zorder()` and Z-order `by`.
 
 ## 16. Testing
 
@@ -632,3 +737,99 @@ Not in the issue; each one is something a caller could otherwise expect:
   distributions, duplicates across shards, filters and page sizes, with `fetch` chains whose limits
   land anywhere; concatenated pages equal `collect()` equal a brute-force sort, forward and reverse.
 - **Connected:** per the issue, and the canonical shapes.
+- **Shape 10:** unit in `KeyComposer.test.ts`, entity level in `IndexPolicyV3.test.ts` (standard, retain,
+  append), connected in `connected.per-half-gate.test.ts` (with shapes 1 to 6 unsharded) and
+  `connected.sharding.test.ts`.
+- **Truncated rows:** `connected.truncated-pins.test.ts`, with the fallback on and off and over 1.36
+  key text, alongside `KeyComposer.test.ts`, `KeyText136.test.ts`, `LegacyKeyQueries.test.ts` and the
+  language service's `KeyParity.test.ts`.
+- **Default-source pruning:** `Shards.test.ts`, `ShardedQuery.test.ts` and `connected.sharding.test.ts`:
+  a full pin on every row's shard, a partial pin, inputs in another case, typed composites through real
+  puts, a cursor, `.where()` and `previous`.
+- **Each regression test was seen to fail** with its fix reverted: the old gate predicate, `begins_with`
+  for a subtree, and pruning for `by` only.
+- **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
+  never throughput.
+
+## 17. Two behaviours fixed in this PR
+
+The first version of this PR reported both as observed and unchanged. Both reproduce identically on
+1.36.0 (`60014d2`), 1.37.0 (`31ec5da`) and 1.38.0 as first pushed (`2fc7bc6`), on unsharded indexes.
+Both are bugs. Neither fix changes stored key text.
+
+### 17.1 A pin on a truncated row's own level
+
+`DESIGN.md` §7's structural rule stops a key at its last present composite, so
+`update(key).set({ region, country, city }).remove(["block"])` stores
+`gsi1sk = …#country_us#city_sf`.
+
+| Query | Up to `2fc7bc6` | Now |
+|---|---|---|
+| `{ region }` | found | found |
+| `{ region, country }` | found | found |
+| `{ region, country, city: "sf" }` (its own level) | **`[]`** | found, with everything under it |
+| `{ region, country }.where(eq(city, "sf"))` | **`[]`** | found, with everything under it |
+| `{ region, country, city: "sfx" }` | only the sibling | only the sibling |
+
+**Verdict: a bug.** It dates from 1.15.0 (#115), when a partial pin gained its trailing `#` to stop
+matching `sfx`. No documented rule asks for it: the guide, connected scenario 9 and `DESIGN.md` all say
+a demoted asset is "still queryable at city level via begins_with", but each asserted only at region
+level. And `.where(between("sf", "sf"))` always included the row while `eq` didn't.
+
+**Fix: the read side.** `BETWEEN <prefix> AND <prefix>#U+FFFF` selects exactly the row and its subtree.
+Rejected: a trailing `#` on truncated keys, which would change stored text and need a migration.
+
+**On unsharded indexes:** a partial pin, `.where(eq)` on a composite that isn't the last, and an `eq`
+in `.within()` send `BETWEEN` instead of `begins_with` on a secondary index, and return truncated rows
+they used to miss. The primary key is unchanged. **On stored keys:** none change, so rows already
+truncated are found as soon as the reader upgrades.
+
+**Under the 1.36 fallback.** 1.36 text wasn't escaped, so `city_new york` lies inside the range of a pin
+on `new`. Where the pin's text is the same under both forms, `keepRow` drops such a row by its key
+text, reading nothing more: the first `Limit` is unchanged, later ones grow, and `.count()` reads rows
+at the same RCU. An `eq` in `.within()` reports a row check while the fallback is on. With
+`legacyKeys: false` there is none of this (D31).
+
+**Cursors.** A 1.37 v2 cursor on a pinned query with a 1.36 pass is refused (`EDD-9094`), since its
+fingerprint covers the conditions, but 1.37 is unreleased. A plain `{ k }` cursor from 1.36 still works.
+**Limit.** The high operand is four bytes past the prefix where `begins_with` was one, so a prefix
+within three bytes of the 1,024-byte sort key limit is refused by DynamoDB. There's no client check.
+
+### 17.2 A half waking through `keyRecord`
+
+On `primaryKey: [channel, deviceId]`, after an unrelated `.set({ status })`, with no composite of these
+halves in the payload:
+
+| Half | Up to `2fc7bc6` | Now |
+|---|---|---|
+| `sk: [zone, deviceId]`, `'sparse'` | key **REMOVED**, item gone from the index | unchanged |
+| `sk: [zone, deviceId]`, `'preserve'` | unchanged | unchanged |
+| `sk: [deviceId, zone]`, `'preserve'` | key **truncated** | unchanged |
+| `pk: [channel, zone]`, `'preserve'` | key **truncated**, item moved to another partition | unchanged |
+
+`.append` does the same, because `appendInput` repeats the primary key.
+
+**Verdict: a bug**, reported narrower than it is: it isn't limited to `sparse` or to sort keys. It dates
+from v1.7.2 (#43), whose fix asked "is any composite in `keyRecord`?" The literal predicate and "Why
+sparse still works" in `DESIGN.md` describe that, which is why it looked deliberate. But §7's own table
+says "noop: no composite of this half is in the payload" and "Stamp → both halves preserved"; "sparse
+only fires when the writer touches the half"; #43's title and shape 2 say "entirely"; and the idempotence
+rationale holds only for a half whose every composite is immutable. Nothing pinned the overshoot: after
+the change, no existing fixture depended on it.
+
+**Fix: the predicate.** A half is skipped iff it has composites, none is removed, none is in the payload,
+and at least one is unknown to `keyRecord`. Shape 10 is the new degenerate fixture.
+
+**On unsharded indexes:** an update naming no composite of a mixed half leaves its key alone. An item
+lacking the mutable composite no longer joins that index on an unrelated write: it joins when a write
+names the composite. **On stored keys:** the text of a composed key doesn't change.
+
+**Existing rows.** A row the old gate already damaged stays as it is, removed or truncated, until a write
+names the half's composites or the item is put again (`connected.per-half-gate.test.ts` pins this). `rekey`
+doesn't repair it: `rekey` compares 1.36 text and sharded layouts, not this. A repair pass is a possible
+follow-up (D33).
+
+**Retain path.** Its `keyRecord` holds the whole item, so a mixed half with every composite present
+recomposes to the key it has, which is idempotent. When both halves of an index are skipped there, the
+existing Put-style fallback recomposes from the new item and drops the entry when a composite is missing,
+so such an item has no entry, as it had none.
