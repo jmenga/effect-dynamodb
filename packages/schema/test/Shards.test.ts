@@ -21,6 +21,10 @@ import {
   shardMarker,
   shardOf,
 } from "../src/internal/Shards.js"
+import {
+  refuseSharedKeyAttribute,
+  refuseSharedKeyAttributeOnEverySchema,
+} from "../src/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
 const schema = DynamoSchema.make({ name: "fleet-db", version: 1 })
@@ -971,39 +975,395 @@ describe("EDD-9106: two key halves in one attribute", () => {
     })
   })
 
-  describe("halves that disagree are refused unsharded too", () => {
+  describe("a pair with nothing sharded isn't judged", () => {
+    // What two different texts do depends on data a definition can't show, and these
+    // all predate sharding: refusing them at load would break working definitions.
     it.each([
       ["the table's partition key", { pk: { field: "pk", composite: ["region"] } }],
       ["the table's sort key", { pk: { field: "sk", composite: ["region"] } }],
       ["the table's sort key, as a sort key", { sk: { field: "sk", composite: ["region"] } }],
-      ["its partition key, by casing", { pk: { field: "gpk", composite: ["tenant"] } }],
-    ])("%s", (name, overrides) => {
-      const indexes = name.includes("casing")
-        ? {
-            byRegion: gsi({ casing: "uppercase" }),
-            byGroup: gsi({
-              name: "gsi2",
-              sk: { field: "gsk2", composite: ["group"] },
-              casing: "lowercase",
-              ...overrides,
-            }),
-          }
-        : { byRegion: gsi(overrides) }
-      expect(() => make(indexes)).toThrow("[EDD-9106]")
+    ])("%s", (_name, overrides) => {
+      expect(() => make({ byRegion: gsi(overrides) })).not.toThrow()
     })
 
-    it("another index's sort key, under a different composite", () => {
+    it("two accessors on one index, whichever composites an item holds", () => {
       expect(() =>
         make({
           byRegion: gsi(),
+          byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
+        }),
+      ).not.toThrow()
+    })
+
+    it("a difference of casing", () => {
+      expect(() =>
+        make({
+          byRegion: gsi({ casing: "uppercase" }),
           byGroup: gsi({
             name: "gsi2",
-            pk: { field: "gpk2", composite: ["tenant"] },
-            sk: { field: "gsk", composite: ["group"] },
+            sk: { field: "gsk2", composite: ["group"] },
+            casing: "lowercase",
           }),
+        }),
+      ).not.toThrow()
+    })
+
+    it("a sharded index elsewhere doesn't bring them in", () => {
+      expect(() =>
+        make({
+          sharded: gsi({ name: "gsi3", pk: { field: "spk", composite: ["tenant"] }, shards: 8 }),
+          byRegion: gsi(),
+          byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
+        }),
+      ).toThrow("[EDD-9106]")
+      expect(() =>
+        make({
+          sharded: gsi({
+            name: "gsi3",
+            pk: { field: "spk", composite: ["tenant"] },
+            sk: { field: "ssk", composite: ["region"] },
+            shards: 8,
+          }),
+          byRegion: gsi(),
+          byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
+        }),
+      ).not.toThrow()
+    })
+  })
+})
+
+describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
+  class Item extends Schema.Class<Item>("Item")({
+    id: Schema.String,
+    tenant: Schema.String,
+    Tenant: Schema.String,
+    region: Schema.String,
+    n: Schema.Number,
+    big: Schema.BigInt,
+    x: Schema.Number,
+    y: Schema.Number,
+    at: DynamoModel.DateString,
+  }) {}
+
+  /** One half under test: what it is, and whether its index is sharded. */
+  type Half = { readonly half: "pk" | "sk"; readonly def: Record<string, unknown> }
+  const sk = (part: Record<string, unknown>, rest: Record<string, unknown> = {}): Half => ({
+    half: "sk",
+    def: { sk: part, shards: 8, ...rest },
+  })
+  const pk = (composite: ReadonlyArray<string>, rest: Record<string, unknown> = {}): Half => ({
+    half: "pk",
+    def: { pk: { composite }, shards: 8, ...rest },
+  })
+  const X100 = [{ field: "x", min: 0, max: 100 }]
+
+  const HALVES: Record<string, Half> = {
+    "sk region": sk({ composite: ["region"] }),
+    "sk region, uppercase": sk({ composite: ["region"] }, { casing: "uppercase" }),
+    "sk region, preserve": sk({ composite: ["region"] }, { casing: "preserve" }),
+    "sk region, a collection": sk({ composite: ["region"] }, { collection: "things" }),
+    "sk region, clustered": sk(
+      { composite: ["region"] },
+      { collection: "things", type: "clustered" },
+    ),
+    "sk tenant": sk({ composite: ["tenant"] }),
+    "sk Tenant": sk({ composite: ["Tenant"] }),
+    "sk n": sk({ composite: ["n"] }),
+    "sk n, preserve": sk({ composite: ["n"] }, { casing: "preserve" }),
+    "sk n, uppercase": sk({ composite: ["n"] }, { casing: "uppercase" }),
+    "sk big, preserve": sk({ composite: ["big"] }, { casing: "preserve" }),
+    "sk big": sk({ composite: ["big"] }),
+    "sk n region": sk({ composite: ["n", "region"] }),
+    "sk region n": sk({ composite: ["region", "n"] }),
+    "pk n": pk(["n"]),
+    "pk n, unsharded": pk(["n"], { shards: undefined }),
+    "pk region, unsharded": pk(["region"], { shards: undefined }),
+    "pk tenant": pk(["tenant"]),
+    "pk Tenant": pk(["Tenant"]),
+    "pk tenant, by count": pk(["tenant"], { shards: 16 }),
+    "pk tenant, previous": pk(["tenant"], { shards: { count: 8, previous: 4 } }),
+    "pk tenant, uppercase": pk(["tenant"], { casing: "uppercase" }),
+    "pk tenant, a collection": pk(["tenant"], { collection: "things" }),
+    "z x 0..100": sk({ zorder: X100 }),
+    "z x 0..100 again": sk({ zorder: [{ field: "x", min: 0, max: 100, step: 1 }] }),
+    "z x 0..100, uppercase": sk({ zorder: X100 }, { casing: "uppercase" }),
+    "z x 0..1000": sk({ zorder: [{ field: "x", min: 0, max: 1000 }] }),
+    "z x 0..100 step 5": sk({ zorder: [{ field: "x", min: 0, max: 100, step: 5 }] }),
+    "z y 0..100": sk({ zorder: [{ field: "y", min: 0, max: 100 }] }),
+    "z x y": sk({
+      zorder: [
+        { field: "x", min: 0, max: 100 },
+        { field: "y", min: 0, max: 100 },
+      ],
+    }),
+    "z y x": sk({
+      zorder: [
+        { field: "y", min: 0, max: 100 },
+        { field: "x", min: 0, max: 100 },
+      ],
+    }),
+    "z string": sk({ zorder: [{ field: "region", bytes: 4 }] }),
+    "z string, uppercase": sk({ zorder: [{ field: "region", bytes: 4 }] }, { casing: "uppercase" }),
+    "z string longer": sk({ zorder: [{ field: "region", bytes: 5 }] }),
+    "z date": sk({ zorder: [{ field: "at", from: "2024-01-01", unit: "days", bits: 12 }] }),
+    "z date, spelled out": sk({
+      zorder: [{ field: "at", from: "2024-01-01T00:00:00.000Z", unit: "days", bits: 12 }],
+    }),
+    "z date, another day": sk({
+      zorder: [{ field: "at", from: "2024-01-02", unit: "days", bits: 12 }],
+    }),
+    "z prefix tenant": sk({ prefix: ["tenant"], zorder: X100 }),
+    "z prefix tenant, uppercase": sk({ prefix: ["tenant"], zorder: X100 }, { casing: "uppercase" }),
+    "z prefix Tenant": sk({ prefix: ["Tenant"], zorder: X100 }),
+    "z prefix hashed": sk({ prefix: [{ field: "tenant", hash: 4 }], zorder: X100 }),
+    "z prefix n": sk({ prefix: ["n"], zorder: X100 }),
+    "z prefix n, uppercase": sk({ prefix: ["n"], zorder: X100 }, { casing: "uppercase" }),
+  }
+
+  /** The index a half sits on, every other attribute its own: it can be composed alone. */
+  const indexOf = (name: string, { half, def }: Half) => {
+    const {
+      pk: pkPart,
+      sk: skPart,
+      ...rest
+    } = def as {
+      readonly pk?: Record<string, unknown>
+      readonly sk?: Record<string, unknown>
+    }
+    return {
+      name,
+      pk: { field: `${name}pk`, composite: ["id"], ...(half === "pk" ? pkPart : {}) },
+      sk: { field: `${name}sk`, ...(half === "sk" ? skPart : { composite: ["id"] }) },
+      ...Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined)),
+    }
+  }
+
+  const definitionOf = (a: Half, b: Half) =>
+    Entity.make({
+      model: Item,
+      entityType: "row",
+      primaryKey: {
+        pk: { field: "pk", composite: ["tenant"] },
+        sk: { field: "sk", composite: ["id"] },
+      },
+      indexes: { a: indexOf("a", a), b: indexOf("b", b) } as never,
+    })
+
+  const RECORDS = ["x", "y", "z", "w"].flatMap((id, i) =>
+    [-3, 0, 2.5, 1e21].map((n, j) => ({
+      id: `${id}${j}`,
+      tenant: `Mixed Case %${i}`,
+      Tenant: `Other ${j}`,
+      region: `Region ${String.fromCharCode(65 + i)}${j} `,
+      n,
+      big: BigInt(i * 10 - 15),
+      x: i * 7 + j,
+      y: i + j * 11,
+      at: `2024-02-0${i + 1}T00:00:00.000Z`,
+    })),
+  )
+
+  const text = (value: KeyComposer.KeyValue): string =>
+    typeof value === "string" ? value : [...value].join(",")
+
+  /** The bytes each half really composes, for a spread of items. */
+  const composed = (
+    on: DynamoSchema.DynamoSchema,
+    definition: ReturnType<typeof definitionOf>,
+    name: "a" | "b",
+    half: Half,
+  ) =>
+    RECORDS.map((record) => {
+      const index = definition.indexes[name]!
+      return text(
+        half.half === "pk"
+          ? KeyComposer.composePk(on, "row", index, record)
+          : KeyComposer.composeSkValue(on, "row", 1, index, record),
+      )
+    })
+
+  /** Both halves of a pair moved into one attribute, as a definition would have them. */
+  const sharing = (definition: ReturnType<typeof definitionOf>, a: Half, b: Half) => {
+    const moved = (index: KeyComposer.IndexDefinition, half: Half) =>
+      half.half === "pk"
+        ? { ...index, pk: { ...index.pk, field: "shared" } }
+        : { ...index, sk: { ...index.sk, field: "shared" } }
+    return {
+      primary: definition.indexes.primary!,
+      a: moved(definition.indexes.a!, a),
+      b: moved(definition.indexes.b!, b),
+    } as Record<string, KeyComposer.IndexDefinition>
+  }
+
+  const fields = Item.fields as unknown as Record<string, Schema.Top>
+  const names = Object.keys(HALVES)
+  const pairs = names.flatMap((a, i) => names.slice(i + 1).map((b) => [a, b] as const))
+
+  // The rule against its own truth: compose real items, and the decision must match what
+  // happened. So it can't refuse what is the same, or pass what differs, for these shapes.
+  it.each([
+    "lowercase",
+    "uppercase",
+    "preserve",
+  ] as const)("under a %s schema, every pair is refused exactly when the real bytes differ", (casing) => {
+    const on = DynamoSchema.make({ name: "truth", version: 1, casing })
+    const wrong: Array<string> = []
+    for (const [nameA, nameB] of pairs) {
+      const a = HALVES[nameA]!
+      const b = HALVES[nameB]!
+      const definition = definitionOf(a, b)
+      const same =
+        JSON.stringify(composed(on, definition, "a", a)) ===
+        JSON.stringify(composed(on, definition, "b", b))
+      let refused = false
+      try {
+        refuseSharedKeyAttribute(on, "row", sharing(definition, a, b), fields)
+      } catch (error) {
+        expect(String(error)).toContain("[EDD-9106]")
+        refused = true
+      }
+      const judged = a.def.shards !== undefined || b.def.shards !== undefined
+      if (refused !== (judged && !same)) wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
+    }
+    expect(wrong).toEqual([])
+  })
+
+  it("Entity.make refuses only what no schema's casing can reconcile", () => {
+    const wrong: Array<string> = []
+    for (const [nameA, nameB] of pairs) {
+      const a = HALVES[nameA]!
+      const b = HALVES[nameB]!
+      const definition = definitionOf(a, b)
+      const indexes = sharing(definition, a, b)
+      const refusedBy = (casing: DynamoSchema.Casing) => {
+        try {
+          refuseSharedKeyAttribute(
+            DynamoSchema.make({ name: "any", version: 1, casing }),
+            "row",
+            indexes,
+            fields,
+          )
+          return false
+        } catch {
+          return true
+        }
+      }
+      let refused = false
+      try {
+        refuseSharedKeyAttributeOnEverySchema("row", indexes, fields)
+      } catch {
+        refused = true
+      }
+      const everywhere = refusedBy("lowercase") && refusedBy("uppercase") && refusedBy("preserve")
+      if (refused !== everywhere) wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
+    }
+    expect(wrong).toEqual([])
+  })
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["tenant"] },
+    sk: { field: "sk", composite: ["id"] },
+  }
+  const entity = (indexes: Record<string, unknown>, primary: unknown = primaryKey) =>
+    Entity.make({
+      model: Item,
+      entityType: "Row",
+      primaryKey: primary as never,
+      indexes: indexes as never,
+    })
+  const gsi = (name: string, overrides: Record<string, unknown>) => ({
+    name,
+    pk: { field: `${name}pk`, composite: ["tenant"] },
+    sk: { field: `${name}sk`, composite: ["id"] },
+    shards: 8,
+    ...overrides,
+  })
+
+  describe("the shapes that came through a probe", () => {
+    it("two composites told apart only by case: one label, two values", () => {
+      expect(() =>
+        entity({
+          a: gsi("a", { pk: { field: "gpk", composite: ["tenant"] } }),
+          b: gsi("b", { pk: { field: "gpk", composite: ["Tenant"] } }),
         }),
       ).toThrow("[EDD-9106]")
     })
+
+    it("the same Z-order composite over different ranges", () => {
+      expect(() =>
+        entity({
+          a: gsi("a", { sk: { field: "zsk", zorder: [{ field: "x", min: 0, max: 100 }] } }),
+          b: gsi("b", { sk: { field: "zsk", zorder: [{ field: "x", min: 0, max: 1000 }] } }),
+        }),
+      ).toThrow(/\[EDD-9106\].*Z-order layouts differ/)
+    })
+
+    it("a casing one half leaves to the schema: only the table can say", () => {
+      const made = entity({
+        byTenant: gsi("gsi", { sk: { field: "sk", composite: ["id"] }, casing: "uppercase" }),
+      })
+      const fieldsOf = Item.fields as unknown as Record<string, Schema.Top>
+      expect(() =>
+        refuseSharedKeyAttribute(
+          DynamoSchema.make({ name: "s", version: 1 }),
+          "Row",
+          made.indexes,
+          fieldsOf,
+        ),
+      ).toThrow(/\[EDD-9106\].*"lowercase" and "uppercase"/)
+      expect(() =>
+        refuseSharedKeyAttribute(
+          DynamoSchema.make({ name: "s", version: 1, casing: "uppercase" }),
+          "Row",
+          made.indexes,
+          fieldsOf,
+        ),
+      ).not.toThrow()
+    })
+  })
+
+  describe("where casing reaches nothing, it's no difference", () => {
+    it("identical numeric Z-order halves, separate partition keys", () => {
+      const zorder = [{ field: "x", min: 0, max: 100 }]
+      const made = entity({
+        a: gsi("a", { sk: { field: "zsk", zorder }, casing: "lowercase" }),
+        b: gsi("b", { sk: { field: "zsk", zorder }, casing: "uppercase" }),
+      })
+      expect(made.indexes.b?.casing).toBe("uppercase")
+    })
+
+    it("a numeric prefix too, but not a text one", () => {
+      const half = (prefix: string, casing: string) =>
+        gsi(casing, {
+          sk: { field: "zsk", prefix: [prefix], zorder: [{ field: "x", min: 0, max: 100 }] },
+          casing,
+        })
+      expect(() => entity({ a: half("n", "lowercase"), b: half("n", "uppercase") })).not.toThrow()
+      expect(() =>
+        entity({ a: half("tenant", "lowercase"), b: half("tenant", "uppercase") }),
+      ).toThrow("[EDD-9106]")
+    })
+
+    it("a sort key half and a partition key half, when the value can't hold what's escaped", () => {
+      const onN = { pk: { field: "pk", composite: ["n"] }, sk: { field: "sk", composite: ["id"] } }
+      expect(() =>
+        entity({ a: gsi("a", { sk: { field: "pk", composite: ["n"] } }) }, onN),
+      ).not.toThrow()
+      const onTenant = primaryKey
+      expect(() =>
+        entity({ a: gsi("a", { sk: { field: "pk", composite: ["tenant"] } }) }, onTenant),
+      ).toThrow("[EDD-9106]")
+    })
+  })
+
+  it("two partition keys that write the same text may disagree on what they read", () => {
+    const shared = { pk: { field: "gpk", composite: ["tenant"] } }
+    expect(() =>
+      entity({
+        a: gsi("a", { ...shared, shards: { count: 8, previous: 4 } }),
+        b: gsi("b", { ...shared, shards: 8 }),
+      }),
+    ).not.toThrow()
   })
 })
 

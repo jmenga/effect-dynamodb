@@ -10,10 +10,12 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { refuseSharedKeyAttribute } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
-import { type Config, Context, Effect, Layer, type Option } from "effect"
+import { type Config, Context, Effect, Layer, type Option, type Schema } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 import type { BoundEventStream, EventStream } from "./EventStore.js"
 import type { CapacityTotals } from "./internal/Capacity.js"
@@ -52,6 +54,8 @@ interface EntityLike {
   readonly _tag: "Entity"
   readonly entityType?: string | undefined
   readonly indexes: Record<string, IndexDefinition>
+  /** What says which key composites hold only numbers (`EDD-9106`). */
+  readonly inputSchema?: Schema.Top | undefined
   /** Normalized vector index definitions (absent on entities without any). */
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
   /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
@@ -176,6 +180,17 @@ export const make = <
   // can't share its attribute with a string key half or a vector filter
   // attribute of another type (EDD-9091).
   resolveKeyAttributeTypes(entities, aggregates, primary)
+  // Two key halves in one attribute, one of them on a sharded index, must compose the
+  // same bytes (EDD-9106). `Entity.make` refused what no schema can reconcile; a casing
+  // an index leaves to the schema resolves only here.
+  for (const entity of Object.values(entities)) {
+    refuseSharedKeyAttribute(
+      config.schema,
+      entity.entityType ?? "(unnamed)",
+      entity.indexes,
+      entity.inputSchema === undefined ? undefined : getSchemaFields(entity.inputSchema),
+    )
+  }
 
   // Configure all entities with this table's schema and tag — only once the
   // table is valid, so a rejected `Table.make` leaves its members bound to
@@ -935,12 +950,21 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  * - `legacySortKey` — its sort key on an index holds text from before 1.37 that its
  *   values don't compose: an index policy left it, so it can't be rewritten, and
  *   queries stop reading it when the 1.36 fallback or `previous: 1` goes (#183)
+ * - `legacyPartitionKey` — the same of its partition key on an unsharded index, which
+ *   queries stop reading when the 1.36 fallback goes (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable" | "legacySortKey"
+  readonly reason:
+    | "bothKeys"
+    | "taken"
+    | "contended"
+    | "failed"
+    | "uncomposable"
+    | "legacySortKey"
+    | "legacyPartitionKey"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */

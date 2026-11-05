@@ -31,6 +31,7 @@ import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as SharedKeys from "./helpers/SharedKeyAttributes.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -1396,5 +1397,42 @@ describeConnected("#183 a condition that replaces the pins", () => {
         }),
       (name) => WhereTable.layer({ name }),
     ),
+  )
+})
+
+describeConnected("#183 key halves sharing an attribute, on real writes", () => {
+  const harness: SharedKeys.Harness = {
+    on: (world, body) =>
+      withTable(
+        world.MainTable,
+        () =>
+          Effect.gen(function* () {
+            const db = yield* SharedKeys.clientOf(world)
+            return yield* body(db)
+          }),
+        (tableName) => world.MainTable.layer({ name: tableName }),
+      ),
+  }
+
+  // DynamoDB refuses `SET sk`, so each of these is an end-to-end check of what the
+  // recording table can only see in the expression.
+  describe("a half stored in a table key attribute", () => {
+    for (const scenario of SharedKeys.tableKeyScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+    for (const scenario of SharedKeys.leavingIndexScenarios) {
+      it.live(`leaving the index: ${scenario.name}`, () => scenario.run(harness))
+    }
+    for (const scenario of SharedKeys.offIndexScenarios) {
+      it.live(`on no index, with retained versions: ${scenario.name}`, () => scenario.run(harness))
+    }
+  })
+
+  it.live("a casing the table's schema agrees with: every read finds the row", () =>
+    SharedKeys.agreeingCasingScenario(harness),
+  )
+
+  it.live("two unsharded accessors over composites no item holds together", () =>
+    SharedKeys.exclusiveAccessorsScenario(harness),
   )
 })

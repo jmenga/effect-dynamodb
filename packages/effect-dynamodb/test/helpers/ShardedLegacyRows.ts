@@ -18,6 +18,7 @@ import * as Entity from "../../src/Entity.js"
 import { toAttributeMap } from "../../src/Marshaller.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
+import { rekeyOutcome } from "./RekeyOutcome.js"
 
 export const schema = DynamoSchema.make({ name: "migrating", version: 1 })
 export const TENANT = "t"
@@ -31,6 +32,7 @@ class Row extends Schema.Class<Row>("Row")({
   zone: Schema.optional(Schema.String),
   group: Schema.optional(Schema.String),
   status: Schema.optional(Schema.String),
+  score: Schema.optional(Schema.Number),
 }) {}
 
 const primaryKey = {
@@ -38,11 +40,16 @@ const primaryKey = {
   sk: { field: "sk", composite: ["name"] },
 } as const
 
-export const worldOf = (shards: unknown, on: DynamoSchema.DynamoSchema = schema) => {
+export const worldOf = (
+  shards: unknown,
+  on: DynamoSchema.DynamoSchema = schema,
+  sortKey: ReadonlyArray<string> = ["region", "zone", "group"],
+  partitionKey: ReadonlyArray<string> = ["tenant"],
+) => {
   const byTenant = {
     name: "gsi",
-    pk: { field: "gpk", composite: ["tenant"] },
-    sk: { field: "gsk", composite: ["region", "zone", "group"] },
+    pk: { field: "gpk", composite: partitionKey },
+    sk: { field: "gsk", composite: sortKey },
     ...(shards === undefined ? {} : { shards }),
   } as never
   const Rows = Entity.make({
@@ -83,6 +90,18 @@ export const Migrating = worldOf({ count: 8, previous: 1 })
 export const Finished = worldOf(8)
 /** The same table with the index left unsharded. */
 export const Unsharded = worldOf(undefined)
+/** The sort key is one optional number. */
+export const ScoredMigrating = worldOf({ count: 8, previous: 1 }, schema, ["score"])
+export const ScoredFinished = worldOf(8, schema, ["score"])
+export const ScoredUnsharded = worldOf(undefined, schema, ["score"])
+/** The partition key is one optional number, on an index with no shards. */
+export const ScoredPartition = worldOf(undefined, schema, ["id"], ["score"])
+const ScoredPartitionOff = worldOf(
+  undefined,
+  DynamoSchema.make({ name: "migrating", version: 1, legacyKeys: false }),
+  ["id"],
+  ["score"],
+)
 export type World = typeof Migrating
 
 /** What a scenario needs of a table. */
@@ -115,6 +134,7 @@ export interface Values {
   readonly zone?: string | undefined
   readonly group?: string | undefined
   readonly status?: string | undefined
+  readonly score?: number | undefined
 }
 
 /** A row exactly as 1.36 wrote it: unsharded, its key text not escaped. */
@@ -563,3 +583,296 @@ export const truncatedUnshardedScenario = (h: Harness) =>
     const [after] = yield* h.rows()
     expect(after!.gsk?.S).toBe("$migrating#v1#row#region_new%20york")
   })
+
+/** A row under its current table key, its index keys as 1.36 composed `score`. */
+const scored136 = (id: string, score: number): StoredRow => {
+  const item = { id, name: "n", tenant: TENANT, at: 1, score }
+  const index = KeyComposer.unshardedView(ScoredMigrating.Rows.indexes.byTenant)
+  return toAttributeMap({
+    ...item,
+    ...keysOf(id),
+    gpk: KeyText136.composePk(schema, "Row", index, item),
+    gsk: KeyText136.composeSk(schema, "Row", 1, index, item),
+    __edd_e__: "Row",
+  }) as StoredRow
+}
+
+/**
+ * The value goes and the sort key stays: `.set({ score: undefined })` is legal. The
+ * model says the composite is a number, so its 1.36 text can still be told, and a run
+ * that reports nothing would strand the row when `previous` goes.
+ */
+export const clearedNumberScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    yield* h.seed(scored136("1", -3))
+    const pins = { tenant: TENANT, score: -3 }
+    yield* h.inWorld(ScoredMigrating, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: undefined }).asEffect()
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+        const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
+        expect(dry.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+      }),
+    )
+    // What that report is warning of.
+    yield* h.inWorld(ScoredFinished, (db) =>
+      Effect.gen(function* () {
+        expect(yield* db.entities.Rows.byTenant(pins).collect()).toEqual([])
+      }),
+    )
+    // Writing the composite resolves it.
+    yield* h.inWorld(ScoredMigrating, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: -3 }).asEffect()
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts).toEqual([])
+      }),
+    )
+    yield* h.inWorld(ScoredFinished, (db) =>
+      Effect.gen(function* () {
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+      }),
+    )
+  })
+
+/** A row whose partition key is 1.36's text for `score`, the value gone. */
+const scoredPartition136 = (name: string, score: number): StoredRow => {
+  const item = { id: "1", name, tenant: TENANT, at: 1, score }
+  const index = ScoredPartition.Rows.indexes.byTenant
+  const primary = ScoredPartition.Rows.indexes.primary
+  const { score: _score, ...row } = toAttributeMap({
+    ...item,
+    pk: KeyText136.composePk(schema, "Row", primary, item),
+    sk: KeyText136.composeSk(schema, "Row", 1, primary, item),
+    gpk: KeyText136.composePk(schema, "Row", index, item),
+    gsk: KeyText136.composeSk(schema, "Row", 1, index, item),
+    __edd_e__: "Row",
+  }) as StoredRow
+  return row
+}
+
+/**
+ * The same on a partition key: a pin reads the row through the fallback, and only there.
+ * A run that reports nothing would strand it when `legacyKeys` goes.
+ */
+export const clearedPartitionNumberScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    yield* h.seed(scoredPartition136("n", -3))
+    const pins = { score: -3 }
+    yield* h.inWorld(ScoredPartition, (db) =>
+      Effect.gen(function* () {
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts.map((conflict) => conflict.reason)).toEqual(["legacyPartitionKey"])
+        expect(report.conflicts[0]?.message).toContain('partition key on index "byTenant"')
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+      }),
+    )
+    // What that report is warning of.
+    yield* h.inWorld(ScoredPartitionOff, (db) =>
+      Effect.gen(function* () {
+        expect(yield* db.entities.Rows.byTenant(pins).collect()).toEqual([])
+      }),
+    )
+    // Writing the composite resolves it.
+    yield* h.inWorld(ScoredPartition, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: -3 }).asEffect()
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts).toEqual([])
+      }),
+    )
+    yield* h.inWorld(ScoredPartitionOff, (db) =>
+      Effect.gen(function* () {
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+      }),
+    )
+  })
+
+/** A positive integer's text didn't change: the row stays reachable, and nothing's reported. */
+export const clearedIntegerScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    yield* h.seed(scored136("1", 42))
+    const pins = { tenant: TENANT, score: 42 }
+    yield* h.inWorld(ScoredMigrating, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: undefined }).asEffect()
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts).toEqual([])
+      }),
+    )
+    yield* h.inWorld(ScoredFinished, (db) =>
+      Effect.gen(function* () {
+        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+      }),
+    )
+  })
+
+const withoutTenant = (row: StoredRow): StoredRow => {
+  const { tenant: _tenant, ...rest } = row
+  return rest
+}
+
+/** What each of these seeds leaves `rekey` to do: a dry run must report exactly that. */
+export const dryRunScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly world: World
+  readonly seed: ReadonlyArray<StoredRow>
+  /** What the real run reports, so a scenario can't drift into covering nothing. */
+  readonly reasons: ReadonlyArray<string>
+}> = [
+  {
+    name: "a move recomposes a sort key an earlier run would have called stale",
+    world: Migrating,
+    seed: [
+      {
+        ...row136("Row", { id: "1", name: "a b", region: REGION, zone: "z", group: "a" }),
+        group: { S: "b" },
+      },
+    ],
+    reasons: [],
+  },
+  {
+    name: "a move leaves a gap's 1.36 text to rewrite",
+    world: Migrating,
+    seed: [row136("Row", { id: "1", name: "a b", region: REGION, group: "g" })],
+    reasons: [],
+  },
+  {
+    name: "a move leaves a 1.36 sort key it can't rewrite",
+    world: Migrating,
+    seed: [
+      {
+        ...row136("Row", { id: "1", name: "a b", region: REGION, zone: "z", group: "a" }),
+        group: { S: "b" },
+        zone: { NULL: true },
+      },
+    ],
+    reasons: ["legacySortKey"],
+  },
+  {
+    name: "a move over values that compose no shard",
+    world: Migrating,
+    seed: [withoutTenant(row136("Row", { id: "1", name: "a b", region: REGION }))],
+    reasons: ["uncomposable"],
+  },
+  {
+    name: "in place: a key to rewrite",
+    world: Migrating,
+    seed: [row136("Row", { id: "1", region: REGION, zone: "z", group: "g" }, keysOf("1"))],
+    reasons: [],
+  },
+  {
+    name: "in place: a sort key it can't rewrite",
+    world: Migrating,
+    seed: [
+      {
+        ...row136("Row", { id: "1", region: REGION, zone: "z", group: "a" }, keysOf("1")),
+        group: { S: "b" },
+      },
+    ],
+    reasons: ["legacySortKey"],
+  },
+  {
+    name: "in place: a number the row no longer holds",
+    world: ScoredMigrating,
+    seed: [
+      (() => {
+        const { score: _score, ...row } = scored136("1", -3)
+        return row
+      })(),
+    ],
+    reasons: ["legacySortKey"],
+  },
+  {
+    name: "in place: a number the row no longer holds, on an unsharded index",
+    world: ScoredUnsharded,
+    seed: [
+      (() => {
+        const { score: _score, ...row } = scored136("1", -3)
+        return row
+      })(),
+    ],
+    reasons: ["legacySortKey"],
+  },
+  {
+    name: "in place: values that compose no shard",
+    world: Migrating,
+    seed: [withoutTenant(row136("Row", { id: "1", region: REGION }, keysOf("1")))],
+    reasons: ["uncomposable"],
+  },
+  {
+    name: "in place: a partition key number to rewrite",
+    world: ScoredPartition,
+    seed: [{ ...scoredPartition136("n", -3), score: { N: "-3" } }],
+    reasons: [],
+  },
+  {
+    name: "in place: a partition key number the row no longer holds",
+    world: ScoredPartition,
+    seed: [scoredPartition136("n", -3)],
+    reasons: ["legacyPartitionKey"],
+  },
+  {
+    name: "in place: a partition key integer the row no longer holds keeps its text",
+    world: ScoredPartition,
+    seed: [scoredPartition136("n", 42)],
+    reasons: [],
+  },
+  {
+    name: "a move leaves a 1.36 partition key it can't rewrite",
+    world: ScoredPartition,
+    seed: [scoredPartition136("a b", -3)],
+    reasons: ["legacyPartitionKey"],
+  },
+  {
+    // `50%` escapes to what 1.36 wrote for `50%25`, so the first row's target holds the
+    // second, stale itself. Nothing moved, so a dry run has nothing there to judge.
+    name: "a move onto a key a stale row holds",
+    world: Migrating,
+    seed: [
+      row136("Row", { id: "1", name: "50%", region: REGION, group: "g" }),
+      row136("Row", { id: "1", name: "50%25", region: REGION, group: "g" }),
+    ],
+    reasons: [],
+  },
+  {
+    name: "a retained row's move",
+    world: Migrating,
+    seed: [row136("Retained", { id: "1", name: "a b", region: REGION }, { version: 1 })],
+    reasons: [],
+  },
+  {
+    name: "rows of each kind at once",
+    world: Migrating,
+    seed: [
+      row136("Row", { id: "1", name: "a b", region: REGION, zone: "z", group: "g" }),
+      row136("Row", { id: "2", region: REGION, zone: "z", group: "g" }, keysOf("2")),
+      {
+        ...row136("Row", { id: "3", region: REGION, zone: "z", group: "a" }, keysOf("3")),
+        group: { S: "b" },
+      },
+      rowNow("Row", { id: "4", region: "r" }),
+    ],
+    reasons: ["legacySortKey"],
+  },
+]
+
+/** A dry run, then the real thing: the same report but for what a dry run can't measure. */
+export const dryRunPredictsScenario =
+  (scenario: (typeof dryRunScenarios)[number]) => (h: Harness) =>
+    Effect.gen(function* () {
+      for (const row of scenario.seed) yield* h.seed(row)
+      const { dry, real } = yield* h.inWorld(scenario.world, (db) =>
+        Effect.gen(function* () {
+          const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
+          const real = (yield* db.tables.MainTable.rekey()) as Table.RekeyReport
+          return { dry, real }
+        }),
+      )
+      expect(real.conflicts.map((conflict) => conflict.reason)).toEqual(scenario.reasons)
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
+    })

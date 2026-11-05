@@ -3575,7 +3575,8 @@ const makeImpl = <
       if (indexName === "primary") continue
       fields.push(indexDef.pk.field, indexDef.sk.field)
     }
-    return fields
+    // A half stored in a key attribute of the table isn't this index's to take away.
+    return fields.filter((field) => !isTableKeyField(field))
   }
 
   /** Is `field` a key attribute of the table? It is the table's to hold. */
@@ -5548,6 +5549,13 @@ const makeImpl = <
     }
     return kinds
   })()
+
+  /** The kind of value an index composite's key form is, by its schema. */
+  const indexCompositeKind = (attr: string): KeyText136.ValueKind => {
+    const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
+    const fieldSchema = fields?.[attr]
+    return fieldSchema === undefined ? undefined : keyFormValueKind(fieldSchema)
+  }
 
   /**
    * Where the row 1.36 wrote at `stored` belongs now, for a row that holds no
@@ -8102,8 +8110,8 @@ const makeImpl = <
           if (keys) {
             Object.assign(newItem, keys)
           } else {
-            delete newItem[indexDef.pk.field]
-            delete newItem[indexDef.sk.field]
+            if (!isTableKeyField(indexDef.pk.field)) delete newItem[indexDef.pk.field]
+            if (!isTableKeyField(indexDef.sk.field)) delete newItem[indexDef.sk.field]
           }
         }
 
@@ -13366,7 +13374,14 @@ const makeImpl = <
 
   const rekeyConflict = (
     kind: RowKind,
-    reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable" | "legacySortKey",
+    reason:
+      | "bothKeys"
+      | "taken"
+      | "contended"
+      | "failed"
+      | "uncomposable"
+      | "legacySortKey"
+      | "legacyPartitionKey",
     key: StoredKey,
     target: StoredKey | undefined,
     message: string,
@@ -13761,7 +13776,8 @@ const makeImpl = <
    * that is neither what its values compose now nor what they composed under 1.36 is
    * left, since an index policy kept it for another writer; when its text can only be
    * 1.36's it goes in `legacySortKeys`, because no query reads it once the fallback
-   * or `previous` goes (design §9.3).
+   * or `previous` goes (design §9.3). An unsharded partition key the same way goes in
+   * `legacyPartitionKeys`.
    */
   const staleIndexKeys = (row: StoredRow) => {
     const rowKeyForm = keyForm(
@@ -13797,6 +13813,7 @@ const makeImpl = <
     }
     const uncomposable: Array<string> = []
     const legacySortKeys: Array<string> = []
+    const legacyPartitionKeys: Array<string> = []
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary") continue
       if (index.shards !== undefined) {
@@ -13825,12 +13842,25 @@ const makeImpl = <
           }
         }
       } else if (!KeyComposer.isZOrderHalf(index.sk)) {
-        consider(
-          index.pk.field,
-          index.pk.composite,
-          () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
-          () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
-        )
+        const now = () => KeyComposer.composePk(schema, entityType, index, rowKeyForm)
+        const then = () => KeyText136.composePk(schema, entityType, index, rowKeyForm)
+        consider(index.pk.field, index.pk.composite, now, then)
+        const storedPk = row[index.pk.field]?.S
+        if (storedPk !== undefined && !(index.pk.field in sets)) {
+          if (
+            storedPk !== composing(now) &&
+            KeyText136.isPartitionKeyText136(
+              schema,
+              entityType,
+              index,
+              storedPk,
+              rowKeyForm,
+              indexCompositeKind,
+            )
+          ) {
+            legacyPartitionKeys.push(name)
+          }
+        }
       }
       if (KeyComposer.isZOrderHalf(index.sk)) continue
       const leading = index.sk.composite.findIndex(
@@ -13845,14 +13875,6 @@ const makeImpl = <
       consider(index.sk.field, composedHalf, now, then)
       const storedSk = row[index.sk.field]?.S
       if (storedSk !== undefined && !(index.sk.field in sets)) {
-        const composing = (compose: () => string): string | undefined => {
-          try {
-            return compose()
-          } catch {
-            // Its values compose no key now: only its text is left to judge.
-            return undefined
-          }
-        }
         const text = composing(now)
         if (
           storedSk !== text &&
@@ -13864,6 +13886,7 @@ const makeImpl = <
             index,
             storedSk,
             rowKeyForm,
+            indexCompositeKind,
           )
         ) {
           legacySortKeys.push(name)
@@ -13878,7 +13901,14 @@ const makeImpl = <
         () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
       )
     }
-    return { sets, olds, composites: [...composites], uncomposable, legacySortKeys }
+    return {
+      sets,
+      olds,
+      composites: [...composites],
+      uncomposable,
+      legacySortKeys,
+      legacyPartitionKeys,
+    }
   }
 
   /** The conflicts a row's index keys leave after everything `rekey` could rewrite. */
@@ -13887,6 +13917,7 @@ const makeImpl = <
     held: {
       readonly uncomposable: ReadonlyArray<string>
       readonly legacySortKeys: ReadonlyArray<string>
+      readonly legacyPartitionKeys: ReadonlyArray<string>
     },
   ): Rekey.RekeyTally =>
     Rekey.mergeTallies(
@@ -13915,6 +13946,20 @@ const makeImpl = <
               `policy left it, so rekey can't rewrite it. Queries stop reading it when the 1.36 ` +
               `fallback or a sharded index's previous: 1 goes. Write that sort key's composites ` +
               `to the item, then run rekey again.`,
+          ),
+      held.legacyPartitionKeys.length === 0
+        ? {}
+        : rekeyConflict(
+            "item",
+            "legacyPartitionKey",
+            at,
+            at,
+            `Its partition key on ${held.legacyPartitionKeys.length === 1 ? "index" : "indexes"} ${held.legacyPartitionKeys
+              .map((name) => `"${name}"`)
+              .join(", ")} holds text from before 1.37 that its values don't compose: an index ` +
+              `policy left it, so rekey can't rewrite it. Queries stop reading it when the 1.36 ` +
+              `fallback goes. Write that partition key's composites to the item, then run rekey ` +
+              `again.`,
           ),
     )
 
@@ -14036,7 +14081,8 @@ const makeImpl = <
       if (
         Object.keys(stale.sets).length === 0 &&
         stale.uncomposable.length === 0 &&
-        stale.legacySortKeys.length === 0
+        stale.legacySortKeys.length === 0 &&
+        stale.legacyPartitionKeys.length === 0
       ) {
         return {}
       }

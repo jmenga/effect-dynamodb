@@ -1574,6 +1574,73 @@ describe("KeyComposer", () => {
       })
     })
 
+    // A new degenerate shape (#183): DynamoDB refuses an update that writes a table key
+    // attribute, whatever it writes, so a half stored in one is never in the result.
+    describe("a half stored in a table key attribute", () => {
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["tenant"] },
+          sk: { field: "sk", composite: ["id"] },
+        },
+        local: {
+          index: "lsi",
+          pk: { field: "pk", composite: ["tenant"] },
+          sk: { field: "lsk", composite: ["id"] },
+        },
+        inverted: {
+          index: "gsi1",
+          pk: { field: "sk", composite: ["id"] },
+          sk: { field: "pk", composite: ["tenant"] },
+        },
+        byNote: {
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["note"] },
+          sk: { field: "sk", composite: ["id"] },
+        },
+      }
+      const key = { tenant: "t", id: "1" }
+
+      it("isn't set: a write names what's left", () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          indexes,
+          { note: "n" },
+          { ...key, note: "n" },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(["gsi2pk", "lsk"])
+        expect(result.removes).toEqual([])
+      })
+
+      it("isn't removed: dropping the entry takes the other half", () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          indexes,
+          {},
+          key,
+          { removedSet: new Set(["note"]) },
+        )
+        expect(result.removes).toEqual(["gsi2pk"])
+        expect(Object.keys(result.sets).sort()).toEqual(["lsk"])
+      })
+
+      it("every other shape is untouched when the map holds no primary index", () => {
+        const { primary: _primary, ...secondary } = indexes
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          secondary,
+          { note: "n" },
+          { ...key, note: "n" },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(["gsi2pk", "lsk", "pk", "sk"])
+      })
+    })
+
     describe("empty-composite halves are always evaluated (issue #46)", () => {
       const emptySkIndexes = (
         indexPolicy?: KeyComposer.IndexPolicy,

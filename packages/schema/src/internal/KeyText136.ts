@@ -90,8 +90,16 @@ const isEscapeAt = (text: string, at: number): boolean =>
  * Is `stored`, a sort key of `index` no value of `record` composes now, spelled as
  * only 1.36 spelled keys? Its values are gone, so all that's left is its text: a
  * character 1.37 escapes, a `%` that starts no escape, a `#` a value held (a segment
- * no composite labels), or a number in 1.36's form. A value spelled like an escape
- * (`50%25`) can't be told from one, and reads as the value that escapes to it.
+ * no composite labels), or a number in 1.36's form.
+ *
+ * What a composite holds comes from `kindOf`, the model's word, since the row may
+ * have lost the value; `record` answers only for a composite whose schema doesn't pin
+ * one kind. A positive integer's text is the same in both, and so is reachable in both.
+ *
+ * Two things can't be told from the text, and read as current. A value spelled like an
+ * escape: `50%25` is the bytes 1.36 wrote for `50%25` and 1.37 writes for `50%`, and
+ * nothing else on the item says which. And a composite the model types as a union of
+ * kinds whose value is gone: `00000000000000-3` may be 1.36's `-3`, or a string.
  */
 export const isSortKeyText136 = (
   schema: DynamoSchema.DynamoSchema,
@@ -100,6 +108,7 @@ export const isSortKeyText136 = (
   index: IndexDefinition,
   stored: string,
   record: Record<string, unknown>,
+  kindOf: (attr: string) => ValueKind,
 ): boolean => {
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, {})
   if (!stored.startsWith(prefix)) return false
@@ -117,9 +126,8 @@ export const isSortKeyText136 = (
   for (const segment of text.split(KEY_DELIMITER).slice(1)) {
     const composite = labelled.find(({ label }) => segment.startsWith(label))
     if (composite === undefined) return true
-    const value = record[composite.attr]
     if (
-      (typeof value === "number" || typeof value === "bigint") &&
+      holdsNumber(kindOf(composite.attr), record[composite.attr]) &&
       !CURRENT_NUMBER_TEXT.test(segment.slice(composite.label.length))
     ) {
       return true
@@ -127,6 +135,46 @@ export const isSortKeyText136 = (
   }
   return false
 }
+
+/**
+ * {@link isSortKeyText136}, for a partition key. Partition keys aren't escaped, so only a
+ * number's text changed, and the same two things can't be told. A string that holds `#`
+ * and a number's label reads as that number, which is reported rather than lost.
+ */
+export const isPartitionKeyText136 = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  stored: string,
+  record: Record<string, unknown>,
+  kindOf: (attr: string) => ValueKind,
+): boolean => {
+  const prefix = composePk(schema, entityType, { ...index, pk: { ...index.pk, composite: [] } }, {})
+  if (!stored.startsWith(prefix)) return false
+  const casing = effectiveCasing(schema, index)
+  const labelled = index.pk.composite.map((attr) => ({
+    attr,
+    label: `${applyCasing(attr, casing)}_`,
+  }))
+  return stored
+    .slice(prefix.length)
+    .split(KEY_DELIMITER)
+    .slice(1)
+    .some((segment) => {
+      const composite = labelled.find(({ label }) => segment.startsWith(label))
+      return (
+        composite !== undefined &&
+        holdsNumber(kindOf(composite.attr), record[composite.attr]) &&
+        !CURRENT_NUMBER_TEXT.test(segment.slice(composite.label.length))
+      )
+    })
+}
+
+/** Is this composite a number? The model says; a row's value only where it doesn't. */
+const holdsNumber = (kind: ValueKind, value: unknown): boolean =>
+  kind === "number" ||
+  kind === "bigint" ||
+  (kind === undefined && (typeof value === "number" || typeof value === "bigint"))
 
 /**
  * 1.36's composite value text: a number zero-padded to 16 characters, a bigint

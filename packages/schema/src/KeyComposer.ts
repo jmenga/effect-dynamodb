@@ -1617,7 +1617,17 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
   }
 
-  return { sets, removes }
+  // DynamoDB refuses an update that writes one of the table's key attributes. A half
+  // stored in one (a local index's partition key, an inverted index, a sort key shared
+  // with the table) holds what the table key does, composed of what an update can't
+  // change, so there is nothing to write; dropping the entry takes only the other half.
+  const primary = indexes.primary
+  if (primary === undefined) return { sets, removes }
+  const tableKey = new Set([primary.pk.field, primary.sk.field])
+  return {
+    sets: Object.fromEntries(Object.entries(sets).filter(([field]) => !tableKey.has(field))),
+    removes: removes.filter((field) => !tableKey.has(field)),
+  }
 }
 
 // ---------------------------------------------------------------------------

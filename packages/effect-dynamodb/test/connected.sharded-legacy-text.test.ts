@@ -13,8 +13,13 @@ import { Config, Effect, Layer } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import {
+  clearedIntegerScenario,
+  clearedNumberScenario,
+  clearedPartitionNumberScenario,
   clientOf,
   currentTextLeftScenario,
+  dryRunPredictsScenario,
+  dryRunScenarios,
   foreignRowScenarios,
   type Harness,
   legacySortKeyScenario,
@@ -114,6 +119,12 @@ describeConnected("#183 each row once, by its own pins", () => {
   }
 })
 
+describeConnected("#183 a dry run reports what the real run does", () => {
+  for (const scenario of dryRunScenarios) {
+    it.live(scenario.name, () => onTable(dryRunPredictsScenario(scenario)))
+  }
+})
+
 describeConnected("#183 what `rekey` reports", () => {
   it.live("a 1.36 sort key it can't rewrite is a conflict, every run, until it's written", () =>
     onTable(legacySortKeyScenario),
@@ -126,6 +137,15 @@ describeConnected("#183 what `rekey` reports", () => {
   )
   it.live("and a move that leaves a 1.36 sort key it can't rewrite says so", () =>
     onTable(moveLeavesLegacySortKeyScenario),
+  )
+  it.live("a number the row no longer holds is judged by the model", () =>
+    onTable(clearedNumberScenario),
+  )
+  it.live("and on an unsharded partition key, which only the fallback still reads", () =>
+    onTable(clearedPartitionNumberScenario),
+  )
+  it.live("a positive integer whose value went kept its text, and is no conflict", () =>
+    onTable(clearedIntegerScenario),
   )
   it.live("a sort key truncated under 1.36 is rewritten on an unsharded index", () =>
     onTable(truncatedUnshardedScenario),
