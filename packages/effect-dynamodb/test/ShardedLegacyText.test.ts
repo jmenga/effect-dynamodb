@@ -9,7 +9,6 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import { encodeBigInt, encodeNumber } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Option, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -19,27 +18,30 @@ import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import {
+  clearedHalfLeftScenario,
   clearedIntegerScenario,
-  clearedNumberScenario,
-  clearedPartitionNumberScenario,
+  clearedPartitionKeyLimitScenario,
+  clearedSortKeyLimitScenario,
   clientOf,
-  currentTextLeftScenario,
   dryRunPredictsScenario,
   dryRunScenarios,
   Finished,
   foreignRowScenarios,
   type Harness,
-  legacySortKeyScenario,
   Migrating,
+  missingKeyScenario,
   moved,
   moveJudgedScenario,
-  moveLeavesLegacySortKeyScenario,
+  moveLeavesClearedHalfScenario,
   pathScenario,
   row136,
   rowNow,
   type StoredRow,
   schema,
+  staleCurrentSortKeyScenario,
+  staleLegacySortKeyScenario,
   TENANT,
+  truncatedHeldScenario,
   truncatedUnshardedScenario,
   Unsharded,
   type World,
@@ -86,30 +88,34 @@ describe("each row once, by its own pins", () => {
   }
 })
 
-describe("what `rekey` reports", () => {
-  it.effect("a 1.36 sort key it can't rewrite is a conflict, every run, until it's written", () =>
-    legacySortKeyScenario(harness().h),
+describe("what `rekey` does to a row that holds a half's composites", () => {
+  it.effect("rewrites a 1.36 sort key they no longer compose", () =>
+    staleLegacySortKeyScenario(harness().h),
   )
-  it.effect("a key an index policy left in current text is not", () =>
-    currentTextLeftScenario(harness().h),
+  it.effect("and a key an index policy left in current text", () =>
+    staleCurrentSortKeyScenario(harness().h),
   )
+  it.effect("and one an old gate truncated", () => truncatedHeldScenario(harness().h))
+  it.effect("and writes no key the row doesn't have", () => missingKeyScenario(harness().h))
   it.effect("a sort key truncated under 1.36 is rewritten on an unsharded index", () =>
     truncatedUnshardedScenario(harness().h),
   )
-
-  it.effect("a move leaves nothing unreported: the same run judges the row it moved", () =>
+  it.effect("a move leaves nothing to rewrite: the same run judges the row it moved", () =>
     moveJudgedScenario(harness().h),
   )
-  it.effect("and a move that leaves a 1.36 sort key it can't rewrite says so", () =>
-    moveLeavesLegacySortKeyScenario(harness().h),
+})
+
+describe("what `rekey` does to a half missing a composite", () => {
+  it.effect("leaves it, with no conflict", () => clearedHalfLeftScenario(harness().h))
+  it.effect("and a move leaves it too", () => moveLeavesClearedHalfScenario(harness().h))
+  it.effect(
+    "the accepted limit: a pin misses a sort key's cleared value, a broader query finds",
+    () => clearedSortKeyLimitScenario(harness().h),
   )
-  it.effect("a number the row no longer holds is judged by the model", () =>
-    clearedNumberScenario(harness().h),
+  it.effect("the accepted limit: a pin misses a partition key's cleared number, `get` reads", () =>
+    clearedPartitionKeyLimitScenario(harness().h),
   )
-  it.effect("and on an unsharded partition key, which only the fallback still reads", () =>
-    clearedPartitionNumberScenario(harness().h),
-  )
-  it.effect("a positive integer whose value went kept its text, and is no conflict", () =>
+  it.effect("a positive integer whose value went kept its text, and is still pinned", () =>
     clearedIntegerScenario(harness().h),
   )
 })
@@ -483,212 +489,6 @@ describe("a row moved just as `rekey` reads its target", () => {
       expect(raced).toBe(true)
       expect((report as Table.RekeyReport).conflicts).toEqual([])
     })
-  })
-})
-
-describe("isPartitionKeyText136: the same judgement on a partition key", () => {
-  const index = worldOf(undefined, schema, ["id"], ["tenant", "score"]).Rows.indexes.byTenant
-  const judged = (
-    stored: string,
-    record: Record<string, unknown> = {},
-    kind: KeyText136.ValueKind = undefined,
-  ) =>
-    KeyText136.isPartitionKeyText136(schema, "Row", index, stored, record, (attr) =>
-      attr === "score" ? kind : "string",
-    )
-  const prefix = "$migrating#v1#row#tenant_t"
-
-  it("a number in 1.36's form, by the model or by the row", () => {
-    expect(judged(`${prefix}#score_00000000000000-3`, {}, "number")).toBe(true)
-    expect(judged(`${prefix}#score_00000000000002.5`, {}, "bigint")).toBe(true)
-    expect(judged(`${prefix}#score_00000000000000-3`, { score: -3 })).toBe(true)
-  })
-
-  it("current text, and a positive integer's, which is the same in both, are not", () => {
-    expect(judged(`${prefix}#score_0000000000000042`, {}, "number")).toBe(false)
-    expect(judged(`${prefix}#score_${encodeNumber(-3)}`, {}, "number")).toBe(false)
-    expect(judged(`${prefix}#score_${encodeBigInt(-3n)}`, {}, "bigint")).toBe(false)
-    expect(judged(`${prefix}#score_${encodeNumber(2.5)}`, {}, "number")).toBe(false)
-  })
-
-  it("nothing else changed: partition keys aren't escaped, then or now", () => {
-    expect(judged("$migrating#v1#row#tenant_a b#score_0000000000000042", {}, "number")).toBe(false)
-    expect(judged("$migrating#v1#row#tenant_50%#score_0000000000000042", {}, "number")).toBe(false)
-    expect(judged("$migrating#v1#row#tenant_a#b", {}, "number")).toBe(false)
-  })
-
-  it("a string, or a union of kinds with its value gone, can't be told", () => {
-    expect(judged(`${prefix}#score_00000000000000-3`, {}, "string")).toBe(false)
-    expect(judged(`${prefix}#score_00000000000000-3`, {}, undefined)).toBe(false)
-  })
-
-  it("another entity's text is not this index's", () => {
-    expect(judged("$migrating#v1#other#score_00000000000000-3", {}, "number")).toBe(false)
-  })
-
-  it("reads the labels the index's casing writes", () => {
-    const upper = { ...index, casing: "uppercase" as const }
-    const of = (stored: string) =>
-      KeyText136.isPartitionKeyText136(schema, "Row", upper, stored, {}, () => "number")
-    expect(of("$migrating#v1#ROW#SCORE_00000000000000-3")).toBe(true)
-    expect(of("$migrating#v1#ROW#SCORE_0000000000000042")).toBe(false)
-  })
-})
-
-describe("isSortKeyText136: judging text with no values to compose it from", () => {
-  const index = Migrating.Rows.indexes.byTenant
-  const judged = (
-    stored: string,
-    record: Record<string, unknown> = {},
-    kind: KeyText136.ValueKind = undefined,
-  ) => KeyText136.isSortKeyText136(schema, "Row", 1, index, stored, record, () => kind)
-  const prefix = "$migrating#v1#row"
-
-  it("current text is not", () => {
-    expect(judged(`${prefix}#region_a%20b#zone_z#group_g`)).toBe(false)
-    expect(judged(`${prefix}#region_a`)).toBe(false)
-    expect(judged(prefix)).toBe(false)
-  })
-
-  it("a character 1.37 escapes", () => {
-    expect(judged(`${prefix}#region_a b`)).toBe(true)
-    expect(judged(`${prefix}#region_a!b`)).toBe(true)
-    expect(judged(`${prefix}#region_a$b`)).toBe(true)
-  })
-
-  it("a `%` that starts no escape", () => {
-    expect(judged(`${prefix}#region_50%`)).toBe(true)
-    expect(judged(`${prefix}#region_50%2`)).toBe(true)
-    expect(judged(`${prefix}#region_50%zz`)).toBe(true)
-  })
-
-  it("a `#` a value held: a segment no composite labels", () => {
-    expect(judged(`${prefix}#region_a#b`)).toBe(true)
-  })
-
-  it("a number in 1.36's form, for a composite the row holds as a number", () => {
-    const num = { region: 1 }
-    expect(judged(`${prefix}#region_00000000000002.5`, num)).toBe(true)
-    expect(judged(`${prefix}#region_00000000000000-3`, num)).toBe(true)
-    expect(judged(`${prefix}#region_12345678901234567`, num)).toBe(true)
-    expect(judged(`${prefix}#region_0000000000000042`, num)).toBe(false)
-    expect(judged(`${prefix}#region_0000000000000002.5`, num)).toBe(false)
-    expect(judged(`${prefix}#region_:0161`, num)).toBe(false)
-    expect(judged(`${prefix}#region_-9999999999999996.85:`, num)).toBe(false)
-    expect(judged(`${prefix}#region_${"0".repeat(38)}`, { region: 1n })).toBe(false)
-  })
-
-  describe("a composite the model declares numeric, whatever the row holds", () => {
-    it.each(["number", "bigint"] as const)("%s: no value at all", (kind) => {
-      expect(judged(`${prefix}#region_00000000000000-3`, {}, kind)).toBe(true)
-      expect(judged(`${prefix}#region_00000000000002.5`, {}, kind)).toBe(true)
-      expect(judged(`${prefix}#region_0000000000000042`, {}, kind)).toBe(false)
-    })
-
-    it("a value of another type doesn't change that, nor does a declared string read one", () => {
-      expect(judged(`${prefix}#region_00000000000000-3`, { region: "x" }, "number")).toBe(true)
-      expect(judged(`${prefix}#region_00000000000000-3`, { region: 1 }, "string")).toBe(false)
-      expect(judged(`${prefix}#region_00000000000000-3`, {}, "string")).toBe(false)
-      expect(judged(`${prefix}#region_00000000000000-3`, {}, "boolean")).toBe(false)
-    })
-
-    it("a union of kinds with its value gone can't be told", () => {
-      expect(judged(`${prefix}#region_00000000000000-3`, {}, undefined)).toBe(false)
-    })
-
-    it("a value spelled like an escape can't be told: the bytes are the same", () => {
-      const value136 = "50%25"
-      const valueNow = "50%"
-      const on = KeyComposer.unshardedView(index)
-      const record = { tenant: TENANT, region: value136 }
-      const text136 = KeyText136.composeSortKeyPrefix(schema, "Row", 1, on, record)
-      const textNow = KeyComposer.composeSortKeyPrefix(schema, "Row", 1, on, {
-        ...record,
-        region: valueNow,
-      })
-      expect(text136).toBe(textNow)
-      expect(judged(text136)).toBe(false)
-    })
-
-    it("every number, as a brute force: current text never reads as 1.36's", () => {
-      const next = (() => {
-        let a = 183
-        return () => {
-          a = (a + 0x6d2b79f5) >>> 0
-          let t = a
-          t = Math.imul(t ^ (t >>> 15), t | 1)
-          t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-          return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-        }
-      })()
-      const edges = [
-        0,
-        -0,
-        1,
-        -1,
-        2.5,
-        -2.5,
-        42,
-        -3,
-        1e15,
-        1e16,
-        -1e16,
-        9007199254740991,
-        -9007199254740991,
-        1e21,
-        -1e21,
-        1e-7,
-        -1e-7,
-        Number.MIN_VALUE,
-        -Number.MIN_VALUE,
-        Number.MAX_VALUE,
-        -Number.MAX_VALUE,
-        Number.POSITIVE_INFINITY,
-        Number.NEGATIVE_INFINITY,
-      ]
-      const random = Array.from({ length: 3000 }, () => {
-        const magnitude = (next() * 2 - 1) * 10 ** Math.floor(next() * 60 - 30)
-        return next() < 0.3 ? Math.trunc(magnitude) : magnitude
-      })
-      for (const n of [...edges, ...random]) {
-        const now = encodeNumber(n)
-        const then = KeyText136.serializeValue(n).toLowerCase()
-        expect(judged(`${prefix}#region_${now}`, {}, "number"), `${n} now: ${now}`).toBe(false)
-        expect(judged(`${prefix}#region_${then}`, {}, "number"), `${n} then: ${then}`).toBe(
-          then !== now,
-        )
-      }
-      const bigints = [
-        0n,
-        1n,
-        -1n,
-        -3n,
-        10n ** 37n,
-        10n ** 38n,
-        -(10n ** 38n),
-        10n ** 60n,
-        ...Array.from({ length: 1000 }, () => {
-          const digits = BigInt(Math.floor(next() * 2 ** 53)) ** BigInt(1 + Math.floor(next() * 4))
-          return next() < 0.5 ? digits : -digits
-        }),
-      ]
-      for (const n of bigints) {
-        const now = encodeBigInt(n)
-        const then = KeyText136.serializeValue(n)
-        expect(judged(`${prefix}#region_${now}`, {}, "bigint"), `${n} now: ${now}`).toBe(false)
-        expect(judged(`${prefix}#region_${then}`, {}, "bigint"), `${n} then: ${then}`).toBe(
-          then !== now,
-        )
-      }
-    })
-  })
-
-  it("text under another prefix is no key of this index", () => {
-    expect(judged("$other#v1#row#region_a b")).toBe(false)
-  })
-
-  it("a value spelled like an escape can't be told from one", () => {
-    expect(judged(`${prefix}#region_50%25`)).toBe(false)
   })
 })
 

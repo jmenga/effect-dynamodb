@@ -2306,11 +2306,14 @@ export interface TableOperations {
    * items with their unique sentinels, version snapshots, tombstones,
    * time-series events, aggregates, and the event streams passed in
    * `options.streams` (copied, flipped, then deleted, while writers append).
-   * Index keys and vector partitions still holding 1.36 text are rewritten in
-   * place. Scans the table (`segments` in parallel); a row is moved only when
-   * it is stored under the key 1.36 composed for its values, so a rerun moves
-   * nothing. Conflicts are reported, never overwritten. `dryRun` counts what
-   * would move. See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
+   * Index keys and vector partitions that differ from what a row's values compose
+   * are rewritten in place. One missing a composite is left, with no conflict, and
+   * a key the row doesn't have isn't written. Scans the table (`segments` in
+   * parallel); a row is moved only when it is stored under the key 1.36 composed
+   * for its values, so a rerun moves nothing. Conflicts are reported, never
+   * overwritten. `dryRun` counts what would move, judging each row on its own: a row
+   * whose destination is held by a row that can't move may be predicted as moved.
+   * See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
    *
    * Fails with `ValidationError` (`EDD-9098`) for a bad option or resume
    * token, and with the `DynamoClientError` of a request that failed — resume

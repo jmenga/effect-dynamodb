@@ -18,8 +18,10 @@ import {
   clientOf,
   exclusiveAccessorsScenario,
   type Harness,
+  keptEntryScenarios,
   leavingIndexScenarios,
   offIndexScenarios,
+  removedCompositeScenarios,
   tableKeyScenarios,
 } from "./helpers/SharedKeyAttributes.js"
 
@@ -219,9 +221,34 @@ describe("a half stored in a table key attribute", () => {
     }
   })
 
+  describe("an entry `preserve` keeps", () => {
+    for (const scenario of keptEntryScenarios) {
+      it.effect(scenario.name, () => {
+        const { h, written } = harness()
+        return Effect.gen(function* () {
+          yield* scenario.run(h)
+          expect(written()).not.toContain("pk")
+          expect(written()).not.toContain("sk")
+        })
+      })
+    }
+  })
+
   describe("on no index, with retained versions", () => {
     for (const scenario of offIndexScenarios) {
       it.effect(scenario.name, () => scenario.run(harness().h))
+    }
+  })
+
+  describe("removing a composite of one", () => {
+    for (const scenario of removedCompositeScenarios) {
+      it.effect(scenario.name, () => {
+        const { h, written } = harness()
+        return Effect.gen(function* () {
+          yield* scenario.run(h)
+          expect(written()).not.toContain("sk")
+        })
+      })
     }
   })
 

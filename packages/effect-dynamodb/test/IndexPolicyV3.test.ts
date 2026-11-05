@@ -2573,9 +2573,9 @@ describe("Entity writes — shape 10: a half mixing a primary key composite with
   })
 
   describe("the retain path", () => {
-    const retained = (zone?: string) => {
+    const retained = (zone?: string, keys: Record<string, AttributeValue> = {}) => {
       const capture: Capture = {}
-      const stored = mixedStored("MixedRetained", zone)
+      const stored = { ...mixedStored("MixedRetained", zone), ...keys }
       return Effect.gen(function* () {
         const db = yield* mixedClient
         yield* db.entities.MixedRetained.update({ channel: "c-1", deviceId: "d-1" }).set({
@@ -2592,6 +2592,20 @@ describe("Entity writes — shape 10: a half mixing a primary key composite with
       Effect.gen(function* () {
         const wire = yield* retained()
         for (const half of MIXED_HALVES) expect(wire.sets, half).not.toHaveProperty(half)
+      }),
+    )
+
+    it.effect("an item lacking it with a kept key leaves the key: a skip isn't a drop", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained(undefined, {
+          gsi1pk: { S: "$mixed#v1#mixedretained#channel_c-1" },
+          gsi1sk: { S: "$mixed#v1#mixedretained#zone_z#deviceid_d-1" },
+          gsi4pk: { S: "$mixed#v1#mixedretained#channel_c-1#zone_z" },
+        })
+        for (const half of MIXED_HALVES) {
+          expect(wire.removes.has(half), half).toBe(false)
+          expect(wire.sets, half).not.toHaveProperty(half)
+        }
       }),
     )
 

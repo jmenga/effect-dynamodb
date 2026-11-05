@@ -13,24 +13,27 @@ import { Config, Effect, Layer } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import {
+  clearedHalfLeftScenario,
   clearedIntegerScenario,
-  clearedNumberScenario,
-  clearedPartitionNumberScenario,
+  clearedPartitionKeyLimitScenario,
+  clearedSortKeyLimitScenario,
   clientOf,
-  currentTextLeftScenario,
   dryRunPredictsScenario,
   dryRunScenarios,
   foreignRowScenarios,
   type Harness,
-  legacySortKeyScenario,
   Migrating,
+  missingKeyScenario,
   moved,
   moveJudgedScenario,
-  moveLeavesLegacySortKeyScenario,
+  moveLeavesClearedHalfScenario,
   pathScenario,
   rowNow,
   type StoredRow,
+  staleCurrentSortKeyScenario,
+  staleLegacySortKeyScenario,
   TENANT,
+  truncatedHeldScenario,
   truncatedUnshardedScenario,
   writePaths,
 } from "./helpers/ShardedLegacyRows.js"
@@ -125,30 +128,35 @@ describeConnected("#183 a dry run reports what the real run does", () => {
   }
 })
 
-describeConnected("#183 what `rekey` reports", () => {
-  it.live("a 1.36 sort key it can't rewrite is a conflict, every run, until it's written", () =>
-    onTable(legacySortKeyScenario),
+describeConnected("#183 what `rekey` does to a row that holds a half's composites", () => {
+  it.live("rewrites a 1.36 sort key they no longer compose", () =>
+    onTable(staleLegacySortKeyScenario),
   )
-  it.live("a key an index policy left in current text is not", () =>
-    onTable(currentTextLeftScenario),
+  it.live("and a key an index policy left in current text", () =>
+    onTable(staleCurrentSortKeyScenario),
   )
-  it.live("a move leaves nothing unreported: the same run judges the row it moved", () =>
-    onTable(moveJudgedScenario),
-  )
-  it.live("and a move that leaves a 1.36 sort key it can't rewrite says so", () =>
-    onTable(moveLeavesLegacySortKeyScenario),
-  )
-  it.live("a number the row no longer holds is judged by the model", () =>
-    onTable(clearedNumberScenario),
-  )
-  it.live("and on an unsharded partition key, which only the fallback still reads", () =>
-    onTable(clearedPartitionNumberScenario),
-  )
-  it.live("a positive integer whose value went kept its text, and is no conflict", () =>
-    onTable(clearedIntegerScenario),
-  )
+  it.live("and one an old gate truncated", () => onTable(truncatedHeldScenario))
+  it.live("and writes no key the row doesn't have", () => onTable(missingKeyScenario))
   it.live("a sort key truncated under 1.36 is rewritten on an unsharded index", () =>
     onTable(truncatedUnshardedScenario),
+  )
+  it.live("a move leaves nothing to rewrite: the same run judges the row it moved", () =>
+    onTable(moveJudgedScenario),
+  )
+})
+
+describeConnected("#183 what `rekey` does to a half missing a composite", () => {
+  it.live("leaves it, with no conflict", () => onTable(clearedHalfLeftScenario))
+  it.live("and a move leaves it too", () => onTable(moveLeavesClearedHalfScenario))
+  it.live(
+    "the accepted limit: a pin misses a sort key's cleared value, a broader query finds",
+    () => onTable(clearedSortKeyLimitScenario),
+  )
+  it.live("the accepted limit: a pin misses a partition key's cleared number, `get` reads", () =>
+    onTable(clearedPartitionKeyLimitScenario),
+  )
+  it.live("a positive integer whose value went kept its text, and is still pinned", () =>
+    onTable(clearedIntegerScenario),
   )
 })
 

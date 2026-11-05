@@ -31,6 +31,7 @@ import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as RekeyComparison from "./helpers/RekeyComparison.js"
 import * as SharedKeys from "./helpers/SharedKeyAttributes.js"
 
 const ENDPOINT = Effect.runSync(
@@ -1400,6 +1401,55 @@ describeConnected("#183 a condition that replaces the pins", () => {
   )
 })
 
+describeConnected("#183 what `rekey` compares, on real writes", () => {
+  const harness: RekeyComparison.Harness = {
+    on: (world, body) =>
+      withTable(
+        world.MainTable,
+        (tableName) =>
+          Effect.gen(function* () {
+            const db = yield* RekeyComparison.clientOf(world)
+            return yield* body(db, {
+              seed: (row) =>
+                Effect.gen(function* () {
+                  const client = yield* DynamoClient
+                  yield* client.putItem({ TableName: tableName, Item: row })
+                }),
+              rows: () => scanAll(tableName),
+            })
+          }),
+        (tableName) => world.MainTable.layer({ name: tableName }),
+      ),
+  }
+
+  describe("a key a write composed is what `rekey` composes", () => {
+    for (const scenario of [
+      ...RekeyComparison.compositeKindScenarios,
+      ...RekeyComparison.writePathScenarios,
+      ...RekeyComparison.otherWritePathScenarios,
+    ]) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  it.live("a Z-order index's partition key, and never its address", () =>
+    RekeyComparison.zOrderPartitionScenario(harness),
+  )
+  it.live("two accessors sharing an attribute: the later one wins, as on a write", () =>
+    RekeyComparison.sharedAttributeScenario(harness),
+  )
+  it.live("never a table key attribute: DynamoDB refuses the write", () =>
+    RekeyComparison.tableKeyAttributeScenario(harness),
+  )
+  for (const scenario of RekeyComparison.labelScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+  describe("a dry run judges each row on its own", () => {
+    for (const scenario of RekeyComparison.dryRunChainScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+})
+
 describeConnected("#183 key halves sharing an attribute, on real writes", () => {
   const harness: SharedKeys.Harness = {
     on: (world, body) =>
@@ -1425,6 +1475,12 @@ describeConnected("#183 key halves sharing an attribute, on real writes", () => 
     }
     for (const scenario of SharedKeys.offIndexScenarios) {
       it.live(`on no index, with retained versions: ${scenario.name}`, () => scenario.run(harness))
+    }
+    for (const scenario of SharedKeys.keptEntryScenarios) {
+      it.live(`an entry \`preserve\` keeps: ${scenario.name}`, () => scenario.run(harness))
+    }
+    for (const scenario of SharedKeys.removedCompositeScenarios) {
+      it.live(`removing a composite of one: ${scenario.name}`, () => scenario.run(harness))
     }
   })
 

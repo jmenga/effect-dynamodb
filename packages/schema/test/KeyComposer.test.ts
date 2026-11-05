@@ -1613,6 +1613,51 @@ describe("KeyComposer", () => {
         expect(result.removes).toEqual([])
       })
 
+      it("a kept half beside one says nothing, which isn't a drop (shape 12)", () => {
+        const shared = { primary: indexes.primary!, byNote: indexes.byNote! }
+        const kept = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          shared,
+          { note: undefined },
+          key,
+        )
+        expect(kept).toEqual({ sets: {}, removes: [] })
+        const local = {
+          primary: indexes.primary!,
+          byNote: {
+            index: "lsi",
+            pk: { field: "pk", composite: ["tenant"] },
+            sk: { field: "lsk", composite: ["note"] },
+          },
+        }
+        expect(
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Row",
+            1,
+            local,
+            { note: undefined },
+            key,
+          ),
+        ).toEqual({ sets: {}, removes: [] })
+        const sparse = {
+          primary: indexes.primary!,
+          byNote: { ...indexes.byNote!, indexPolicy: { pk: "sparse" as const } },
+        }
+        expect(
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Row",
+            1,
+            sparse,
+            { note: undefined },
+            key,
+          ),
+        ).toEqual({ sets: {}, removes: ["gsi2pk"] })
+      })
+
       it("isn't removed: dropping the entry takes the other half", () => {
         const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
@@ -1625,6 +1670,26 @@ describe("KeyComposer", () => {
         )
         expect(result.removes).toEqual(["gsi2pk"])
         expect(Object.keys(result.sets).sort()).toEqual(["lsk"])
+      })
+
+      it("isn't removed with a composite of its own", () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          {
+            primary: indexes.primary!,
+            byNote: {
+              index: "gsi2",
+              pk: { field: "gsi2pk", composite: ["note"] },
+              sk: { field: "sk", composite: ["note"] },
+            },
+          },
+          {},
+          key,
+          { removedSet: new Set(["note"]) },
+        )
+        expect(result).toEqual({ sets: {}, removes: ["gsi2pk"] })
       })
 
       it("every other shape is untouched when the map holds no primary index", () => {

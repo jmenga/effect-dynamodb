@@ -11,6 +11,7 @@ import { expect } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
+import * as Transaction from "../../src/Transaction.js"
 
 export const schema = DynamoSchema.make({ name: "shared-keys", version: 1 })
 
@@ -226,8 +227,8 @@ export const leavingIndexScenarios: ReadonlyArray<{
 }))
 
 /**
- * A row an index can't hold, on the retain path: an update recomposes the entry from the
- * whole item, finds a composite missing and drops it, which must leave the table's key.
+ * A row an index can't hold, on the retain path: an update has no entry to keep or drop,
+ * and must leave the table's key.
  */
 export const offIndexScenarios: ReadonlyArray<{
   readonly name: string
@@ -256,6 +257,17 @@ export const offIndexScenarios: ReadonlyArray<{
       },
     },
   },
+  {
+    name: "a half in the table's, of a composite the row lacks",
+    pin: { note: "n" },
+    indexes: {
+      byNote: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["note"] },
+        sk: { field: "sk", composite: ["note"] },
+      },
+    },
+  },
 ].map(({ name, pin, indexes }) => ({
   name,
   run: (h: Harness) =>
@@ -268,6 +280,164 @@ export const offIndexScenarios: ReadonlyArray<{
       }),
     ),
 }))
+
+/**
+ * Removing a composite of a half stored in a table key attribute drops the entry, which
+ * takes the other half: the attribute stays, as DynamoDB refuses to remove it and the row
+ * can't be found without it.
+ */
+export const removedCompositeScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = [
+  { name: "an update", options: {} },
+  { name: "a retained update", options: { versioned: { retain: true } } },
+].map(({ name, options }) => ({
+  name,
+  run: (h: Harness) =>
+    h.on(
+      worldOf(
+        {
+          byNote: {
+            name: "gsi",
+            pk: { field: "gpk", composite: ["note"] },
+            sk: { field: "sk", composite: ["note"] },
+          },
+        },
+        options,
+      ),
+      (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(key).asEffect()
+          yield* db.entities.Rows.update(key).set({ extra: "x" }).remove(["note"]).asEffect()
+          expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "x" })
+        }),
+    ),
+}))
+
+/**
+ * Canonical shape 12: a mutable half beside one that writes nothing, because it's stored
+ * in a table key attribute or the row lacks its composites. An update clearing the
+ * mutable composite composes nothing for the index at all, and that silence isn't a drop:
+ * `preserve` keeps the entry through it and through any later update, as it does on an
+ * index of the row's own attributes. The regression scenario from D53, on the retain path.
+ */
+const MUTABLE_HALVES: Record<
+  string,
+  { readonly pin: (note: string) => Record<string, string>; readonly index: unknown }
+> = {
+  "a sharded index's sort key in the table's": {
+    pin: (note) => ({ note }),
+    index: {
+      name: "gsi",
+      pk: { field: "gpk", composite: ["note"] },
+      sk: { field: "sk", composite: ["id"] },
+      shards: 8,
+    },
+  },
+  "an unsharded index's sort key in the table's": {
+    pin: (note) => ({ note }),
+    index: {
+      name: "gsi",
+      pk: { field: "gpk", composite: ["note"] },
+      sk: { field: "sk", composite: ["id"] },
+    },
+  },
+  "a local index": {
+    pin: (note) => ({ tenant: "t", note }),
+    index: {
+      name: "lsi",
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "lsk", composite: ["note"] },
+    },
+  },
+  "an inverted index": {
+    pin: (note) => ({ id: "1", note }),
+    index: {
+      name: "gsi",
+      pk: { field: "sk", composite: ["id"] },
+      sk: { field: "gsk", composite: ["note"] },
+    },
+  },
+  "an index of the row's own attributes": {
+    pin: (note) => ({ note }),
+    index: {
+      name: "gsi",
+      pk: { field: "gpk", composite: ["note"] },
+      sk: { field: "gsk", composite: ["id"] },
+    },
+  },
+  "a sort key whose composite the row no longer holds": {
+    pin: (note) => ({ note }),
+    index: {
+      name: "gsi",
+      pk: { field: "gpk", composite: ["note"] },
+      sk: { field: "gsk", composite: ["group"] },
+    },
+  },
+}
+
+const WRITE_PATHS: ReadonlyArray<{
+  readonly name: string
+  readonly options: Record<string, unknown>
+  readonly write: (
+    db: any,
+    Rows: any,
+    updates: Record<string, unknown>,
+  ) => Effect.Effect<unknown, unknown, any>
+}> = [
+  {
+    name: "an update",
+    options: {},
+    write: (db, _Rows, updates) => db.entities.Rows.update(key).set(updates).asEffect(),
+  },
+  {
+    name: "a retained update",
+    options: { versioned: { retain: true } },
+    write: (db, _Rows, updates) => db.entities.Rows.update(key).set(updates).asEffect(),
+  },
+  {
+    name: "a transaction's update",
+    options: {},
+    write: (_db, Rows, updates) =>
+      Transaction.transactWrite([Rows.update(key).pipe(Entity.set(updates))]),
+  },
+]
+
+export const keptEntryScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly run: (h: Harness) => Effect.Effect<void, unknown>
+}> = Object.entries(MUTABLE_HALVES).flatMap(([variant, { pin, index }]) =>
+  WRITE_PATHS.map(({ name, options, write }) => ({
+    name: `${variant}: ${name}`,
+    run: (h: Harness) => {
+      const world = worldOf({ byNote: index }, options)
+      return h.on(world, (db) =>
+        Effect.gen(function* () {
+          const found = (note: string) =>
+            Effect.map(db.entities.Rows.byNote(pin(note)).collect(), (rows: any) => rows.length)
+          const update = (updates: Record<string, unknown>) => write(db, world.Rows, updates)
+          yield* db.entities.Rows.put({ ...key, note: "old", group: "g" }).asEffect()
+
+          // A new value moves the entry.
+          yield* update({ note: "new" })
+          expect(yield* found("old")).toBe(0)
+          expect(yield* found("new")).toBe(1)
+
+          // Clearing keeps it, and so does whatever comes after.
+          yield* update({ group: undefined })
+          expect(yield* found("new")).toBe(1)
+          yield* update({ note: undefined })
+          expect(yield* found("new")).toBe(1)
+          expect((yield* db.entities.Rows.get(key).asEffect()).note).toBeUndefined()
+          yield* update({ extra: "x" })
+          expect(yield* found("new")).toBe(1)
+          expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "x" })
+        }),
+      )
+    },
+  })),
+)
 
 /** A casing an index spells out, on a table whose schema agrees: every read finds the row. */
 export const agreeingCasingScenario = (h: Harness) => {

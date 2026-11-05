@@ -947,24 +947,12 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  *   `message` says why
  * - `uncomposable` — its key on a sharded index is from another layout, and its
  *   values can't compose a current one (a `by` attribute was cleared) (#183)
- * - `legacySortKey` — its sort key on an index holds text from before 1.37 that its
- *   values don't compose: an index policy left it, so it can't be rewritten, and
- *   queries stop reading it when the 1.36 fallback or `previous: 1` goes (#183)
- * - `legacyPartitionKey` — the same of its partition key on an unsharded index, which
- *   queries stop reading when the 1.36 fallback goes (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason:
-    | "bothKeys"
-    | "taken"
-    | "contended"
-    | "failed"
-    | "uncomposable"
-    | "legacySortKey"
-    | "legacyPartitionKey"
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */
@@ -1021,7 +1009,11 @@ export interface RekeyReport {
 
 /** Options for `db.tables.<Table>.rekey()`. */
 export interface RekeyOptions {
-  /** Count what would move, reading but writing nothing. Default `false`. */
+  /**
+   * Count what would move, reading but writing nothing. Default `false`. Each row is
+   * judged on its own, so a row whose destination is held by a row that can't move
+   * may be predicted as moved.
+   */
   readonly dryRun?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
   readonly segments?: number | undefined

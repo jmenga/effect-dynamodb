@@ -473,64 +473,123 @@ export const moved = (entityType: string, values: Values): StoredRow => {
   return { ...row136(entityType, values), pk: now.pk!, sk: now.sk!, gpk: now.gpk! }
 }
 
-/** `rekey` tells the truth about a sort key it can't rewrite. */
-export const legacySortKeyScenario = (h: Harness) =>
+/**
+ * A row holding a half's composites gets the key they compose (D58), whatever text the
+ * half held. 1.36 wrote `group_a`; a writer with no `region` then changed `group`, and
+ * `preserve` kept the sort key.
+ */
+export const staleLegacySortKeyScenario = (h: Harness) =>
   Effect.gen(function* () {
-    // 1.36 wrote `group_a`; a writer with no `region` then changed `group`, and
-    // `preserve` kept the sort key. No value of the row composes that text now.
     const row = row136("Row", { id: "1", region: REGION, zone: "z", group: "a" }, keysOf("1"))
     yield* h.seed({ ...row, group: { S: "b" } })
-    const pins = { tenant: TENANT, region: REGION }
     yield* h.inWorld(Migrating, (db) =>
       Effect.gen(function* () {
-        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
         const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
-        expect(dry.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+        expect(dry.indexKeysRewritten).toBe(1)
+        expect(dry.conflicts).toEqual([])
 
         const first: Table.RekeyReport = yield* db.tables.MainTable.rekey()
         expect(first.indexKeysRewritten).toBe(1)
-        expect(first.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
-        expect(first.conflicts[0]!.message).toContain('"byTenant"')
-        expect(first.unchanged).toBe(0)
-        // Still reachable where the row now is, through the 1.36 read of its shard.
-        expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+        expect(first.conflicts).toEqual([])
 
         const again: Table.RekeyReport = yield* db.tables.MainTable.rekey()
         expect(again.indexKeysRewritten).toBe(0)
-        expect(again.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
-
-        // Writing its composites resolves it.
-        yield* db.entities.Rows.update({ id: "1", name: "n" })
-          .set({ region: REGION, zone: "z", group: "b" })
-          .asEffect()
-        const clean: Table.RekeyReport = yield* db.tables.MainTable.rekey()
-        expect(clean.conflicts).toEqual([])
+        expect(again.unchanged).toBe(1)
       }),
     )
+    const pinned = (group: string) => ({ tenant: TENANT, region: REGION, zone: "z", group })
     yield* h.inWorld(Finished, (db) =>
       Effect.gen(function* () {
-        const found = yield* db.entities.Rows.byTenant({
-          tenant: TENANT,
-          region: REGION,
-          zone: "z",
-          group: "b",
-        }).collect()
-        expect(idsOf(found)).toEqual(["1"])
+        expect(idsOf(yield* db.entities.Rows.byTenant(pinned("b")).collect())).toEqual(["1"])
+        expect(yield* db.entities.Rows.byTenant(pinned("a")).collect()).toEqual([])
       }),
     )
   })
 
-/** A sort key an index policy left in current text is not a conflict: another writer owns it. */
-export const currentTextLeftScenario = (h: Harness) =>
+/** The same of a key an index policy left in current text: the row's values decide. */
+export const staleCurrentSortKeyScenario = (h: Harness) =>
   Effect.gen(function* () {
-    const row = rowNow("Row", { id: "1", region: REGION, zone: "z", group: "a" })
-    yield* h.seed({ ...row, group: { S: "b" } })
+    const values = { id: "1", region: REGION, zone: "z" }
+    yield* h.seed({ ...rowNow("Row", { ...values, group: "a" }), group: { S: "b" } })
+    yield* h.inWorld(Migrating, (db) =>
+      Effect.gen(function* () {
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts).toEqual([])
+        expect(report.indexKeysRewritten).toBe(1)
+      }),
+    )
+    const [after] = yield* h.rows()
+    expect(after!.gsk?.S).toBe(rowNow("Row", { ...values, group: "b" }).gsk!.S)
+  })
+
+/**
+ * Rows an old gate truncated though they hold every composite (D33): comparing repairs
+ * them, as a side effect of `rekey` rewriting what differs. Nothing looks for them.
+ */
+export const truncatedHeldScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    const whole = rowNow("Row", { id: "1", region: REGION, zone: "z", group: "g" })
+    const truncated = rowNow("Row", { id: "1", region: REGION }).gsk!
+    expect(truncated.S).not.toBe(whole.gsk!.S)
+    yield* h.seed({ ...whole, gsk: truncated })
+    yield* h.inWorld(Migrating, (db) =>
+      Effect.gen(function* () {
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.indexKeysRewritten).toBe(1)
+        expect(report.conflicts).toEqual([])
+      }),
+    )
+    const [after] = yield* h.rows()
+    expect(after!.gsk?.S).toBe(whole.gsk!.S)
+  })
+
+/**
+ * And a row with no key stays that way, however much it holds: `rekey` compares what's
+ * stored, and under `sparse` an absent key can be deliberate (D33).
+ */
+export const missingKeyScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    const values = { region: REGION, zone: "z", group: "g" }
+    const { gpk: _gpk, gsk: _gsk, ...noKeys } = rowNow("Row", { id: "1", ...values })
+    const { gsk: _sortKey, ...noSortKey } = rowNow("Row", { id: "2", ...values })
+    yield* h.seed(noKeys)
+    yield* h.seed(noSortKey)
+    yield* h.inWorld(Migrating, (db) =>
+      Effect.gen(function* () {
+        const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
+        expect(dry.indexKeysRewritten).toBe(0)
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.indexKeysRewritten).toBe(0)
+        expect(report.unchanged).toBe(2)
+        expect(report.conflicts).toEqual([])
+      }),
+    )
+    const rows = yield* h.rows()
+    expect(rows.map((row) => row.gsk)).toEqual([undefined])
+    yield* h.inWorld(Finished, (db) =>
+      Effect.gen(function* () {
+        expect(yield* db.entities.Rows.byTenant({ tenant: TENANT }).collect()).toEqual([])
+      }),
+    )
+  })
+
+/**
+ * A sort key missing a composite is left alone with no conflict, whatever it holds and
+ * whatever the composites before the gap hold now: nothing says what its text meant.
+ */
+export const clearedHalfLeftScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    const { group: _group, ...row } = row136(
+      "Row",
+      { id: "1", region: REGION, zone: "z", group: "g" },
+      keysOf("1"),
+    )
+    yield* h.seed({ ...row, region: { S: "elsewhere" } })
     const stored = row.gsk!.S
     yield* h.inWorld(Migrating, (db) =>
       Effect.gen(function* () {
         const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
         expect(report.conflicts).toEqual([])
-        expect(report.indexKeysRewritten).toBe(0)
       }),
     )
     const [after] = yield* h.rows()
@@ -553,20 +612,22 @@ export const moveJudgedScenario = (h: Harness) =>
     expect(row!.gpk?.S).toMatch(SHARD)
   })
 
-/** And a move that leaves a 1.36 sort key it can't rewrite says so, in a dry run too. */
-export const moveLeavesLegacySortKeyScenario = (h: Harness) =>
+/** And a move leaves a half it can't compose as it found it, in a dry run too. */
+export const moveLeavesClearedHalfScenario = (h: Harness) =>
   Effect.gen(function* () {
     const row = row136("Row", { id: "1", name: "a b", region: REGION, zone: "z", group: "a" })
     yield* h.seed({ ...row, group: { S: "b" }, zone: { NULL: true } })
     const dry = (yield* h.inWorld(Migrating, (db) =>
       db.tables.MainTable.rekey({ dryRun: true }),
     )) as Table.RekeyReport
-    expect(dry.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+    expect(dry.conflicts).toEqual([])
     const report = (yield* h.inWorld(Migrating, (db) =>
       db.tables.MainTable.rekey(),
     )) as Table.RekeyReport
     expect(report.moved.item).toBe(1)
-    expect(report.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+    expect(report.conflicts).toEqual([])
+    const [after] = yield* h.rows()
+    expect(after!.gsk?.S).toBe(row.gsk!.S)
   })
 
 /** A sort key truncated under 1.36 is rewritten on an unsharded index too. */
@@ -598,32 +659,38 @@ const scored136 = (id: string, score: number): StoredRow => {
 }
 
 /**
- * The value goes and the sort key stays: `.set({ score: undefined })` is legal. The
- * model says the composite is a number, so its 1.36 text can still be told, and a run
- * that reports nothing would strand the row when `previous` goes.
+ * The accepted limit on a sort key half (D58). The value goes and the sort key stays:
+ * `.set({ score: undefined })` is legal, and nothing left says what the text meant. So
+ * `rekey` leaves it, with no conflict, and once `previous` goes a broader query finds the
+ * row where its old text sorts, while a pin on the cleared value misses it.
  */
-export const clearedNumberScenario = (h: Harness) =>
+export const clearedSortKeyLimitScenario = (h: Harness) =>
   Effect.gen(function* () {
     yield* h.seed(scored136("1", -3))
     const pins = { tenant: TENANT, score: -3 }
+    const broader = { tenant: TENANT }
     yield* h.inWorld(ScoredMigrating, (db) =>
       Effect.gen(function* () {
+        yield* db.entities.Rows.put({ id: "2", name: "n", tenant: TENANT, at: 1, score: -1 })
         yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: undefined }).asEffect()
+        // The fallback still reads it.
         expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
         const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
-        expect(dry.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+        expect(dry.conflicts).toEqual([])
         const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
-        expect(report.conflicts.map((conflict) => conflict.reason)).toEqual(["legacySortKey"])
+        expect(report.conflicts).toEqual([])
         expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
       }),
     )
-    // What that report is warning of.
     yield* h.inWorld(ScoredFinished, (db) =>
       Effect.gen(function* () {
         expect(yield* db.entities.Rows.byTenant(pins).collect()).toEqual([])
+        // By its old text, after -1 though it held -3. In numeric order it came first.
+        const found = yield* db.entities.Rows.byTenant(broader).collect()
+        expect(found.map((row: { readonly id: string }) => row.id)).toEqual(["2", "1"])
       }),
     )
-    // Writing the composite resolves it.
+    // Writing the composite puts it back.
     yield* h.inWorld(ScoredMigrating, (db) =>
       Effect.gen(function* () {
         yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: -3 }).asEffect()
@@ -634,6 +701,8 @@ export const clearedNumberScenario = (h: Harness) =>
     yield* h.inWorld(ScoredFinished, (db) =>
       Effect.gen(function* () {
         expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+        const found = yield* db.entities.Rows.byTenant(broader).collect()
+        expect(found.map((row: { readonly id: string }) => row.id)).toEqual(["1", "2"])
       }),
     )
   })
@@ -655,32 +724,36 @@ const scoredPartition136 = (name: string, score: number): StoredRow => {
 }
 
 /**
- * The same on a partition key: a pin reads the row through the fallback, and only there.
- * A run that reports nothing would strand it when `legacyKeys` goes.
+ * The accepted limit on a partition key half (D58): a pin on the old value reads the row
+ * through the fallback, and only there. `rekey` leaves it, with no conflict, so with
+ * `legacyKeys: false` that pin misses it, and `get` still reads the row.
  */
-export const clearedPartitionNumberScenario = (h: Harness) =>
+export const clearedPartitionKeyLimitScenario = (h: Harness) =>
   Effect.gen(function* () {
     yield* h.seed(scoredPartition136("n", -3))
     const pins = { score: -3 }
+    const key = { id: "1", name: "n" }
     yield* h.inWorld(ScoredPartition, (db) =>
       Effect.gen(function* () {
         expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
+        const dry = (yield* db.tables.MainTable.rekey({ dryRun: true })) as Table.RekeyReport
+        expect(dry.conflicts).toEqual([])
         const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
-        expect(report.conflicts.map((conflict) => conflict.reason)).toEqual(["legacyPartitionKey"])
-        expect(report.conflicts[0]?.message).toContain('partition key on index "byTenant"')
+        expect(report.conflicts).toEqual([])
+        expect(report.indexKeysRewritten).toBe(0)
         expect(idsOf(yield* db.entities.Rows.byTenant(pins).collect())).toEqual(["1"])
       }),
     )
-    // What that report is warning of.
     yield* h.inWorld(ScoredPartitionOff, (db) =>
       Effect.gen(function* () {
         expect(yield* db.entities.Rows.byTenant(pins).collect()).toEqual([])
+        expect((yield* db.entities.Rows.get(key).asEffect()).id).toBe("1")
       }),
     )
-    // Writing the composite resolves it.
+    // Writing the composite puts it back.
     yield* h.inWorld(ScoredPartition, (db) =>
       Effect.gen(function* () {
-        yield* db.entities.Rows.update({ id: "1", name: "n" }).set({ score: -3 }).asEffect()
+        yield* db.entities.Rows.update(key).set({ score: -3 }).asEffect()
         const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
         expect(report.conflicts).toEqual([])
       }),
@@ -742,7 +815,7 @@ export const dryRunScenarios: ReadonlyArray<{
     reasons: [],
   },
   {
-    name: "a move leaves a 1.36 sort key it can't rewrite",
+    name: "a move leaves a half it can't compose",
     world: Migrating,
     seed: [
       {
@@ -751,12 +824,19 @@ export const dryRunScenarios: ReadonlyArray<{
         zone: { NULL: true },
       },
     ],
-    reasons: ["legacySortKey"],
+    reasons: [],
   },
   {
     name: "a move over values that compose no shard",
     world: Migrating,
     seed: [withoutTenant(row136("Row", { id: "1", name: "a b", region: REGION }))],
+    reasons: ["uncomposable"],
+  },
+  {
+    // The conflict is all the move leaves: no other key differs.
+    name: "a move over values that compose no shard, with nothing to rewrite",
+    world: Migrating,
+    seed: [withoutTenant(row136("Row", { id: "1", name: "a b" }))],
     reasons: ["uncomposable"],
   },
   {
@@ -766,7 +846,7 @@ export const dryRunScenarios: ReadonlyArray<{
     reasons: [],
   },
   {
-    name: "in place: a sort key it can't rewrite",
+    name: "in place: a sort key its values no longer compose",
     world: Migrating,
     seed: [
       {
@@ -774,7 +854,7 @@ export const dryRunScenarios: ReadonlyArray<{
         group: { S: "b" },
       },
     ],
-    reasons: ["legacySortKey"],
+    reasons: [],
   },
   {
     name: "in place: a number the row no longer holds",
@@ -785,7 +865,7 @@ export const dryRunScenarios: ReadonlyArray<{
         return row
       })(),
     ],
-    reasons: ["legacySortKey"],
+    reasons: [],
   },
   {
     name: "in place: a number the row no longer holds, on an unsharded index",
@@ -796,7 +876,7 @@ export const dryRunScenarios: ReadonlyArray<{
         return row
       })(),
     ],
-    reasons: ["legacySortKey"],
+    reasons: [],
   },
   {
     name: "in place: values that compose no shard",
@@ -814,7 +894,7 @@ export const dryRunScenarios: ReadonlyArray<{
     name: "in place: a partition key number the row no longer holds",
     world: ScoredPartition,
     seed: [scoredPartition136("n", -3)],
-    reasons: ["legacyPartitionKey"],
+    reasons: [],
   },
   {
     name: "in place: a partition key integer the row no longer holds keeps its text",
@@ -823,10 +903,10 @@ export const dryRunScenarios: ReadonlyArray<{
     reasons: [],
   },
   {
-    name: "a move leaves a 1.36 partition key it can't rewrite",
+    name: "a move leaves a partition key whose number the row no longer holds",
     world: ScoredPartition,
     seed: [scoredPartition136("a b", -3)],
-    reasons: ["legacyPartitionKey"],
+    reasons: [],
   },
   {
     // `50%` escapes to what 1.36 wrote for `50%25`, so the first row's target holds the
@@ -857,7 +937,7 @@ export const dryRunScenarios: ReadonlyArray<{
       },
       rowNow("Row", { id: "4", region: "r" }),
     ],
-    reasons: ["legacySortKey"],
+    reasons: [],
   },
 ]
 
