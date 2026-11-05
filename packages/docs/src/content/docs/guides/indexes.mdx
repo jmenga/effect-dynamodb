@@ -117,6 +117,22 @@ const Listings = Entity.make({
 
 `zorder` belongs on a secondary index's sort key half: not on the primary key, not on a partition key half, and never together with `composite` (`[EDD-9086]`). The physical attribute is declared `B` in the table definition; the partition key half stays an ordinary string key. The [Z-order Indexes guide](/effect-dynamodb/guides/zorder/) covers the dimensions, the key layout, the read strategies, and when Z-order pays; [indexPolicy](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) covers how writes keep the address current.
 
+
+### Write Sharding
+
+A partition takes about 1,000 write units a second. An index key that takes more than that can be spread over several physical partitions with `shards`:
+
+```typescript
+byTenant: {
+  name: "gsi1",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk", composite: ["deviceId"] },
+  shards: 8, // or { count: 8, by: ["groupId"], previous: 1 }
+},
+```
+
+Writes hash the item to pick a shard, and the accessor reads every shard and merges them into index order, so no caller names a shard. Every query pays for it, with at least one request per shard. The [Write Sharding guide](/effect-dynamodb/guides/sharding/) covers choosing the count, pruning with `by`, cursors, and adopting sharding on a populated index.
+
 ### Logical Names as API Surface
 
 Collection names become query accessors on the typed client:
@@ -600,6 +616,7 @@ Each composite value in a key is prefixed with its attribute name (e.g., `employ
 
 - [indexPolicy — Per-Half GSI Membership Rules](/effect-dynamodb/guides/index-policy/) -- Per-half sparse/preserve declaration, per-half evaluation gate, structural composition with the unified per-half can't-compose rule, set/remove asymmetry, per-half cascade, EDD-9025 invariant
 - [Z-order Indexes](/effect-dynamodb/guides/zorder/) -- Bound several attributes in one query with an interleaved binary sort key
+- [Write Sharding](/effect-dynamodb/guides/sharding/) -- Spread one logical partition over several physical ones
 - [Queries](/effect-dynamodb/guides/queries/) -- Query by index, filter by sort key composites, paginate results
 - [Data Integrity](/effect-dynamodb/guides/data-integrity/) -- Unique constraints and optimistic concurrency
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete and version retention

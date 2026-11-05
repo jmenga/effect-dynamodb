@@ -1157,6 +1157,17 @@ an interrupted run resumes redoing at most the pages in flight. The token's
 segment count wins; a different `segments`, another table's token or a
 malformed one is `EDD-9098`.
 
+**Sharded indexes (#183).** `staleIndexKeys` has a sharded branch for the PK
+half, which is not gated on 1.36 text and so runs with the fallback off. When
+the stored key differs from what the values compose now and the PK composites
+and source are present, the item is rewritten in place (`indexKeysRewritten`):
+an `UpdateItem` on the index key attribute alone, guarded on the old key text
+and the composites feeding it, including `by`. A write to an attribute feeding
+no key doesn't make it retry. A stored key under another layout whose values
+can't compose a current one is the conflict `uncomposable`; a row already in the
+current layout that can't compose is left alone with no conflict. This is step
+2 of adopting a sharded layout: deploy with `previous`, `rekey`, remove `previous`.
+
 **Per row kind.** Every write is conditioned on what the move read: a Put
 lands only where nothing is (a stream's snapshot: over an older one; a stream
 row: over one whose TTL has passed), a Delete or in-place rewrite only while
@@ -1312,6 +1323,27 @@ gsiNsk (B) = seg(prefix_1) ‖ … ‖ seg(prefix_k) ‖ toBytes(interleave(q(di
 | any in `removedSet` | REMOVE | REMOVE (cascade override) |
 
 A hierarchical prefix therefore does not truncate on the write side: `set({ agencyId }).remove(["officeId"])` on `prefix: [agencyId, officeId]` REMOVEs the half under both policies (the hierarchy is a query feature). `put` writes the half only when every field is present (sparse, as for string halves); `append` recomposes it only when `appendInput` (or the primary key) carries every field. A change within one quantization level writes identical bytes; a change of at least one level, or of a prefix composite, moves the entry (2 GSI writes on the shared GSI partition).
+
+### Write Sharding (#183)
+
+A secondary index's `shards` option stores one logical partition in N physical ones. A partition takes about 1,000 WCU/s, and a GSI that falls behind throttles writes to the table. Full design, reasoning and scoping: `docs/designs/gsi-write-sharding.md`. Guide: [Write Sharding](/effect-dynamodb/guides/sharding/).
+
+```typescript
+byTenant: {
+  name: "gsi5",
+  pk: { field: "gsi5pk", composite: ["tenantId"] },
+  sk: { field: "gsi5sk", composite: ["groupId", "deviceId"] },
+  shards: 20, // or { count: 20, by: ["groupId"], previous: 1 }
+},
+```
+
+- **`count`**: an integer from 2 to 256. **`by`**: string-half sort key composites of this index, hashed in place of the primary key composites; checked by type and by `Entity.make`. **`previous`**: migration only, the old layout's count, `1` for the unsharded key; a positive integer, not `count`. Definition errors: `EDD-9099`, `EDD-9101`, `EDD-9102`.
+- **Key text.** `!<count>.<shard>` right after the entity type or collection name, the shard zero-padded to the width of `count - 1`: `$fleet-db#v1#devicestate#!20.07#tenantid_t-123`, or `$fleet-db#v1#devicestate#!20.07` on an empty half. Partition key values aren't escaped, so no final segment could be safe: the unsharded key for tenant `t-123#07` would equal shard 07 of tenant `t-123`. An unsharded key's fourth segment always holds `<label>_`, which a marker can't spell, and the count keeps two sharded layouts apart. So reading both needs no filter and no dedupe. Compact keys (#182) will carry the same marker in the same place; nothing is built for them yet.
+- **Shard function** (`schema/src/internal/Shards.ts`). `FNV-1a-32(F(text(v1)) ‖ 0xFF ‖ F(text(v2)) ‖ …) mod count`, with `text` = `KeyComposer.serializeValue` over key-form values and `F(s) = s.toLowerCase().toUpperCase()` in UTF-8. Golden vectors pin it; changing it is a breaking change. The fold is fixed, whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under `lowercase` and must reach one shard. `L∘U` would fail on `ß` / `ẞ`, which lowercase to one key but fold apart. `0xFF` never occurs in UTF-8, so `("ab", "c")` and `("a", "bc")` differ. `TextEncoder` and `Math.imul` keep it runtime-agnostic.
+- **Composing is structural.** `composePk` and the truncating composer always add the marker and throw `ShardSourceError` (`EDD-9100`) when a source value is absent, which the error boundaries turn into a `ValidationError`; an index never bound to an entity throws, as an unbound Z-order half does. So `put`, `create`, `upsert`, `restore`, `Batch`, `Transaction`, `update`, `patch`, retain, `append` and the 1.37 move path need no per-site change. A key for a sharded index can't be composed unsharded. Soft-deleted items, version snapshots and time-series events strip GSI keys; unique sentinels hold none; EventStore projection rows are entity writes; aggregates compose their own attributes and read no `entity.indexes`.
+- **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when every `by` attribute is pinned), then the `previous` layout's, never pruned. Query behaviour: §10 "Fan-out Queries".
+- **Collections.** Every member must declare the same `count` and `previous` (`EDD-9103`), since the partitions read are shared. `by` may differ. A collection query always reads every shard.
+- **Refused** (`EDD-9104`): `.within()`, skip-scan and `.zorder()` on a sharded accessor, and a `GeoIndex` over a sharded index. A Z-order sort key without `by` is allowed: the merge compares bytes.
 
 ### Special Key Patterns
 
@@ -1620,6 +1652,32 @@ entity.update(key).remove(['alertState']).asEffect()
 
 **v1.7.0 / v1.7.1 / v1.7.2 → v1.7.3 empty-composite-half regression callout (closes #46).** The v1.7.2 per-half gate, even after the `keyRecord` broadening, still classified halves with **empty composite lists** as untouched. For an empty composite array, every `.some(...)` clause in the touched-predicate trivially returned `false`, so `Entity.update()` would skip composing the half entirely — leaving items with one half SET and the other missing, invisible to the GSI. The shape is common in single-table designs: a sparse "lookup" GSI like `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }` writes the SK as a constant entity prefix on every visible item, but the v1.7.0–v1.7.2 gate skipped the SK because no composite of an empty list can be "in" anything. v1.7.3 reframes the gate as a skip-predicate keyed on the gate's actual purpose (multi-writer protection); the leading `length > 0` guard short-circuits empty-composite halves to *always evaluated*, and `classifyHalf` (which already handled empty composites correctly as `{ kind: 'set', length: 0 }`) is finally reached. Affected items repair on the next `Entity.update()` — the next write composes the missing half from the constant prefix and the item rejoins the GSI. No data migration needed.
 
+#### Sharded partition key halves (#183)
+
+`by` attributes are sort key composites, and the skip-predicate looks only at a half's own composites, so an update setting only `groupId` would leave the stored shard stale and pruned queries would miss the item. **`by` attributes are therefore dependencies of the PK half, but only when the writer touches them.** `keyRecord` membership doesn't count: the retain path's `keyRecord` holds the whole item, and a default source is immutable, so neither is evidence of a change.
+
+Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` / `undefined` in the payload; **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
+
+**Gate.** The PK half is skipped iff the existing skip-predicate holds and not (T or N or R). An empty PK half with `by` is no longer a constant, so it is skipped when `by` is absent from payload and `keyRecord` and not T / N / R. An empty PK half without `by` is never skipped, as before.
+
+**Outcome**, where P = `classifyHalf(pk composites, merged, policy.pk, hasRemoved)`:
+
+| Case | Condition | Outcome |
+|---|---|---|
+| 1 | R | REMOVE, both policies |
+| 2 | P = drop, T, PK composites merely omitted | Fail `EDD-9100`, both policies: a `by`-only update can't compute the new shard, and evicting the item isn't what the writer asked for |
+| 3 | P = drop, otherwise | REMOVE: `sparse` can't-compose, or a removed or explicitly nulled PK composite. No unsharded key is written |
+| 4 | P = noop, T | Fail `EDD-9100`: the stored shard would go stale |
+| 5 | P = noop, otherwise | noop |
+| 6 | P = set, not A | SET sharded, truncated included |
+| 7 | P = set, A, N and `sparse` | REMOVE |
+| 8 | P = set, A, PT or T | Fail `EDD-9100`: moves the tenant without `by`, or changes one `by` attribute without another |
+| 9 | P = set, A, otherwise | noop: an unrelated `.set({ status })` must never evict or fail |
+
+Composer option `onMissingShardSource: "keep"` turns the failing cases into a noop for the two callers that compose from partial knowledge and don't write the result as-is: the pre-check at the retain branch point (the retain and computed branches then read the full item and compose again) and the move path, which recomposes a stored row. So a `by`-only update fails on the standard path and succeeds on the retain path, which has the composites. The SK half is unaffected.
+
+A `put` missing a `by` value writes no index entry at all (`tryComposeIndexKeys`, sparse as ever), never an unsharded key.
+
 #### Canonical GSI-composite test-fixture shapes
 
 Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only, and as the v1.7.2 matrix did with empty-composite halves) leads to consumer-facing regressions. Future work in this area must verify each shape:
@@ -1641,6 +1699,14 @@ Degenerate fixtures for shapes 7 and 8 (audited against the existing shapes, not
 - **8a (#43 analogue)** — every prefix composite and dimension is also a primary-key composite: recomposed from `keyRecord` on every write, including an update that touches none of them.
 - **8b (#41 analogue)** — prefix owned by one writer, dimensions by another: writer A's prefix-only update must not SET (`'preserve'` noop); writer B's full-dimension update SETs only if the prefix is also present (from `keyRecord` or payload), else policy.
 - **8c (shape 3 analogue)** — hierarchical `prefix: [agencyId, officeId]`; `set({ agencyId }).remove(["officeId"])` → REMOVE under `'sparse'` and under `'preserve'` (cascade override), never a truncated SET.
+
+Shapes 1 to 8 hold on a sharded index as well (#183). The gate's new dependency adds:
+
+9. **Sharded half with `by`** — `pk: [tenantId], sk: [groupId, deviceId], shards: { count, by: [groupId] }`. A `by` attribute touched in the payload wakes the PK half; with the PK composites too it moves the entry, without them it fails `EDD-9100`.
+
+- **9a (shape 6 analogue)** — an empty PK half with `by`: the half's value is no longer constant, and it is skipped unless `by` is touched or known.
+- **9b (#43 analogue)** — a `by` attribute that is also a primary-key composite: it arrives through `keyRecord` on every write, which is not a touched dependency.
+- **9c (shape 6 analogue)** — a default source with an empty PK half: the value differs per item though the half has no composites, and is always evaluated.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -2506,9 +2572,40 @@ On a Z-order accessor, `.within()` bounds dimensions (a `RangeBound` in the fiel
 
 `concurrency` defaults to 4 for reads with a `limit` and 1 for drains (natural 1 MB pages against one partition). Plans are cached (LRU, 64). Results arrive in address order (prefix order, then Z-order), never sorted by any one dimension. An empty box plans `empty` and sends nothing.
 
+### Fan-out Queries (#183)
+
+A query on a sharded index reads its partitions (§7 "Write Sharding") and merges them, on every terminal. `Query.fanOut` (internal) installs them, and the terminals branch on them before any other plan. A pruned query takes the same path with one partition, so a cursor can't change format because of a query's pins.
+
+**Merge** (`internal/ShardMerge.ts`, pure: `Query.ts` sends the requests). A row is emitted only when every unfinished partition has a buffered row to compare it with, which is what makes the order correct and bounds memory at one page per partition. `compareUtf8` for `S`, bytes for `B`, numeric for `N` with no float conversion. Equal sort keys break by partition index, descending under `.reverse()`, so reverse is the exact reversal of forward; the table key can't be reached, since a tie is between heads of different partitions.
+
+| Terminal | Behaviour |
+|---|---|
+| `.collect()` / `.paginate()` | Streams the merge: each pull reads every unfinished partition whose buffer is empty, then emits what is proven in order |
+| `.limit(n).fetch()` | `n` merged items and a cursor; rows read beyond the page are dropped and read again |
+| `.fetch()` without `limit` | One round of reads: what it proves in order, and a cursor |
+| `.count()` | Each partition counted (`Select: COUNT`, or the rows read where a row check judges them), summed, capped at `limit` |
+
+There is no `.stream()` terminal.
+
+**Request sizing.** One estimator per partition, kept in the terminal's loop and never in a cursor. `active` = partitions not finished, `remaining` = items still owed. `none`: no `Limit`. `fixed`: `pageSize(n)` as given (`min(n, remaining)` when nothing filters). `natural`: 1.36's sizing with `remaining`. `budget`: `min(remaining, max(⌈remaining / active × 1.25⌉, last × 2))`. `adaptive`: `nextLimit(estimator, ⌈remaining / active⌉, filtered)`.
+
+**`.maxPages(n)`** is `n` rounds: at most one request per unfinished partition per round. It does not force natural sizing here, since fan-out has no 1.36 sizing to preserve. Rows that can't be proven in order when the rounds run out are dropped; `fetch`'s cursor reads them again, and `collect` stops short.
+
+**`.concurrency(n)`** (`Query.concurrency`, `Function.dual`, and `BoundQuery`): requests in flight, default every partition. A value that isn't a positive integer throws `EDD-9105`. No effect on any other query.
+
+**Projections.** `cursorProjectionFields` always borrows the keys the merge and cursor need, across every partition's key fields, and `examinePage` strips them.
+
+**Failure.** Any partition's failure fails the terminal. `fetch` and `collect` return no partial result and interrupt requests in flight; a `paginate` stream fails at that point, having delivered only what was already proven in order.
+
+**Capacity.** Every request runs on `Capacity.client` inside the terminal's one operation.
+
+**`previous` and 1.36 rows.** With `previous: 1` and the fallback on, the partitions are the N shards (no row check), the unsharded current text (the current pass's row check when a 1.36 pass exists) and the 1.36 text when it differs (the 1.36 pass's row check). With no `previous`, or `previous ≥ 2`, no 1.36 pass runs: sharded partitions hold no 1.36 text, and `KeyText136.composePk` stays unsharded. Rows of those forms merge by their stored sort key bytes.
+
 ### Inspection: `explain()` and `onRequest()` (#171)
 
 `explain()` returns a `QueryExplain` — `index`, `plan` (`PlanMode`: `key`, `skip-scan`, `filter`, `naive`, `jump`, `precise`, `empty`), `reason`, `keyConditions` (`{ lower, upper, exact }`), `filter`, `rowChecks`, `sizing`, `zorder?` (`bits`, per-dimension `box`, `fill`, `exactRanges`), `maxSkips?` — with no I/O; a `startFrom` cursor is not read. `onRequest(observer)` runs each observer, in order, in the terminal's fiber after every request with a `QueryRequestEvent` (`kind: "read" | "probe" | "count"`, `request`, `lower`, `upper`, `limit`, `scannedCount`, `count`, `accepted`, `discarded`); a failure is a defect, and DynamoDB calls an observer makes run under `Capacity.detached`, outside the query's report. `asParams` with a planner reports the first request the terminal would send.
+
+On a fan-out, `explain()` keeps plan `key`, lists one key condition per partition and adds `fanOut: { partitions, pruned, concurrency }`; `asParams` reports the first partition's request. `onRequest` reports one event per request. A row's acceptance is known only when it is emitted, so an event fires when its page drains or at the end of the terminal, and events may arrive out of `request` order. `accepted` counts that page's rows that became items, and a page read and never used reports `discarded: true`.
 
 ### Cursors (#171)
 
@@ -2520,6 +2617,8 @@ Two formats (`internal/Cursor.ts`):
 A page hands its cursor out as an `Option<string>`: `Query.Page.cursor` (every `fetch()` / `Query.execute`), a collection's `fetch()` and an aggregate `ListResult.cursor` are `Some(text)` while there is more and `None` once the range is exhausted. The inputs take the text: `startFrom(cursor: string)` and `list({ cursor })`, so `None` never stands for "start again". Internally the loops keep `string | null` and wrap it at the terminal.
 
 `startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
+
+A sharded query's v2 cursor adds `z`, one position per partition (`0` not started, `1` done, or the key to resume after, without the index partition key, which is recomposed), and `c`, an FNV checksum over them. Its fingerprint covers the index, entity types, partition texts, source, `previous`, conditions and direction, not `concurrency`, `pageSize` or `limit`. A fully consumed page with a `LastEvaluatedKey` positions at that key; a fully consumed page without one is done; a partly consumed page positions at its last consumed row; an untouched page keeps the previous position. `EDD-9094` also covers a wrong position count or shape, an unexpected attribute in a position, a position outside the query's key condition, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query. The checksum is an integrity check, not authentication; the security-relevant property is that the cursor doesn't carry its partitions, so it can't leave them.
 
 ### Entity Operations (via typed client)
 
@@ -5294,13 +5393,21 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9091` | `Table.ts` (`Table.make`, `Table.definition`) | One physical attribute is declared with two types across table members: a Z-order (`B`) half and a string (`S`) key half, or a key attribute and a vector filter attribute |
 | `EDD-9092` | `internal/ZOrderCurve.ts`: through the write paths as a `ValidationError` (put, update, upsert, restore, append, transactional and batch writes); thrown at `.within()` (`DynamoClient.ts`) for a query bound | A value a Z-order dimension can't place: `NaN`, an unparseable date, a value outside a `literals` list |
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
-| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
+| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). On a sharded index (#183): also a wrong position count or shape, an unexpected attribute in a position, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query (`docs/designs/gsi-write-sharding.md` §6.6). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
 | `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`): a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text") | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
 | `EDD-9097` | `Errors.ts` (schema): `ItemNotMoved`, from `internal/TransactWriteOps.ts` (a `Transaction.transactWrite` or `EventStore` `additionalItems` put / delete / check) and `Entity.ts` (`planned`: a transactional update, patch or planned delete) | An op inside a transaction whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row (#171, "Aliasing"): a transaction can't move either. Write the item named once through the entity (or run `rekey`), then run the transaction again. Nothing is written |
 | `EDD-9098` | `internal/Rekey.ts` (`ValidationError`, `entityType: "Table"`, `operation: "rekey"`) | A `rekey` option that is not a positive integer (`segments`, `concurrency`, `pageSize`, `maxPages`), a malformed resume token, a token of another table, or a `segments` other than the token's. Nothing is read |
 
-Next free code: **`EDD-9099`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9099` | `KeyComposer.ts` (schema, `normalizeGsiConfig`), through `Entity.make` | Malformed `shards` (#183): `count` not an integer from 2 to 256, `previous` not a positive integer or equal to `count`, an unknown key, or `shards` on the primary key |
+| `EDD-9100` | `KeyComposer.ts` (schema, `ShardSourceError` from `composePk`, the truncating composer and the update gate): a `ValidationError` on every write path; nothing is sent | A shard source value is missing when a sharded partition key half is composed. There is no unsharded fallback (§7 "Sharded partition key halves") |
+| `EDD-9101` | `Entity.ts` (schema, `bindShards`) | Nothing to spread: every primary key composite is also a PK composite of the sharded index, with or without `by` |
+| `EDD-9102` | `Entity.ts` (schema, `bindShards`), and the type-level guard | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order half |
+| `EDD-9103` | `KeyComposer.ts` (schema, `assertCollectionShardsAgreement`), through `DynamoClient.make` and `Collections.make` | Collection members disagree on `count` or `previous`; undeclared differs from declared |
+| `EDD-9104` | `Query.ts` (`refuseShardedPlan`, thrown at the call), `effect-dynamodb-geo`'s `GeoIndex.make` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` |
+| `EDD-9105` | `Query.ts` (`Query.concurrency`, thrown at the call) | `concurrency` not a positive integer |
+
+Next free code: **`EDD-9106`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 
 ## 16. Consumed Capacity
 

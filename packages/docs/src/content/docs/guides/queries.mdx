@@ -190,6 +190,8 @@ A bound the key condition can't express is checked on each row, with the same ca
 
 On a [Z-order index](/effect-dynamodb/guides/zorder/), `.within()` bounds a box over the interleaved dimensions instead.
 
+On a [sharded index](/effect-dynamodb/guides/sharding/), `.within()` fails with `EDD-9104`.
+
 ## Post-Query Filtering
 
 `.filter()` applies a `FilterExpression` after items are read from the index -- it does **not** reduce read capacity, only network transfer. Use it for conditions on non-key attributes.
@@ -419,6 +421,8 @@ const page2 = yield* Option.match(page1.cursor, {
 
 To read every page by cursor, `Stream.paginate` takes the cursor as its stop signal: see [Z-order cursors](/effect-dynamodb/guides/zorder/#cursors). To stream every item in one process, use `.paginate()`.
 
+A query on a [sharded index](/effect-dynamodb/guides/sharding/#cursors) has a cursor with one position per shard, under the same contract.
+
 A cursor is opaque and belongs to the query that produced it: resume with the same accessor, bounds, `.within()` and direction. It is read when the terminal runs, not by `.startFrom()`, so the order of `.startFrom()` and `.within()` in the chain doesn't matter.
 
 A malformed cursor fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`). So does a cursor that only a `.within()` query could have written, given to a query without `.within()`. A `.within()` query also checks the cursor against its plan, and fails the same way for a cursor from a `.within()` query with other bounds, another partition, the other direction or another index declaration, or one whose position lies outside the plan. A query without `.within()` can't tell another query's well-formed cursor from its own: its cursors are the same as in earlier releases, with nothing to check. DynamoDB may reject that cursor, failing the query with a `DynamoValidationError`, or the query resumes from wherever the cursor points.
@@ -538,6 +542,7 @@ const plan = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }
 | `rowChecks` | The fields checked on each row in the client |
 | `sizing` | `"adaptive"`, `"budget"` (the items still owed), `"fixed"` (`pageSize(n)`) or `"natural"` |
 | `zorder`, `maxSkips` | The Z-order box and address width; the skip-scan probe budget |
+| `fanOut` | A [sharded index's](/effect-dynamodb/guides/sharding/#concurrency-and-inspection) partitions, whether `by` pruned them, and the requests in flight at once |
 
 `.onRequest(observer)` runs `observer` after every request a terminal sends, probes included, in the terminal's fiber and in the order the observers were added. Each event carries:
 

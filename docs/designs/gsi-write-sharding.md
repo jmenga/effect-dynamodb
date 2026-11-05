@@ -365,8 +365,14 @@ values compose now, and the PK composites and source are present, the item moves
 the index key attribute alone, guarded on the old key text and the composites feeding it, including
 `by`. Dry run, segments, resume token and capacity report stay as they are.
 
-A stored key whose values can no longer compose (a `by` attribute cleared under `preserve`) is
-reported as a conflict with a new reason `"uncomposable"`, never silently left.
+A stored key from another layout whose values can no longer compose (a `by` attribute cleared under
+`preserve`) is reported as a conflict with a new reason `"uncomposable"`, never silently left. One
+already in the current layout can't be improved on, and a read finds it, so it is left alone with no
+conflict.
+
+`rekey` rewrites whenever the stored key differs from what the values compose on a sharded PK half,
+where #181's rule rewrites only 1.36 text. That also moves rows between a layout's own shards after
+`by` is removed or changed, and it runs with the 1.36 fallback off.
 
 The guard is narrower than the issue's "the item is unchanged since it was read": a write to an
 attribute that doesn't feed this key can't invalidate the new key, so it shouldn't make `rekey`
@@ -491,6 +497,11 @@ the direction, and it is still proposed for the owner.
 | D21 | `maxPages` doesn't force natural sizing on a fan-out | proposed — awaiting owner confirmation |
 | D22 | Z-order sort key allowed on a sharded index without `by`; `.within()` refused | proposed — awaiting owner confirmation |
 | D23 | `.concurrency()` is ignored on a query with no fan-out | proposed — awaiting owner confirmation |
+| D24 | `rekey` rewrites whenever stored ≠ composed on a sharded PK half, not only for 1.36 text; an uncomposable row already in the current layout is left alone with no conflict (§9.2) | proposed — awaiting owner confirmation |
+| D25 | A `by`-only update fails on the standard path but succeeds on the retain and computed paths, which read the whole item (§5) | proposed — awaiting owner confirmation |
+| D26 | A `put` with no value for a `by` attribute is sparse: no index entry, no unsharded key. `EDD-9100` is for a half being composed (§5) | proposed — awaiting owner confirmation |
+| D27 | `Query.planEmpty` reads no partition and drops the fan-out, as a query with a known-empty result has nothing to merge | proposed — awaiting owner confirmation |
+| D28 | The language service renders the shard as a `{shard}` placeholder, because a hover has no item to hash | proposed — awaiting owner confirmation |
 
 ## 15. Scoping decisions
 
@@ -611,6 +622,9 @@ Not in the issue; each one is something a caller could otherwise expect:
 - **Entity level (`packages/effect-dynamodb/test`):** the sharded key on `put`, `create`, `upsert`,
   `update`, `patch`, retain, `append`, `restore`, `Batch`, `Transaction`, move, `rekey`; missing
   source fails with nothing sent; the six original canonical shapes plus Z-order shapes 7 and 8.
+- **Where the shapes live:** unit in `packages/schema/test/Shards.test.ts`, entity level in
+  `packages/effect-dynamodb/test/IndexPolicyV3.test.ts`, connected in
+  `packages/effect-dynamodb/test/connected.sharding.test.ts`.
 - **New degenerate fixtures:** 9a, an empty PK half with `by`; 9b, a `by` attribute in the primary
   key as well, so it arrives through `keyRecord` but is not a touched dependency; 9c, a default source
   with an empty PK half, whose value differs per item though the half has no composites.

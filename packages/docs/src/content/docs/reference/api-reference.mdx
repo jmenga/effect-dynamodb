@@ -200,7 +200,7 @@ Both `make` and `definition` check the members against each other. Every member 
 | `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
 | `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
-| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed", key, target, message }` — a row `rekey` left as it is |
+| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable", key, target, message }` — a row `rekey` left as it is |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
 
 ### Table operations
@@ -215,7 +215,7 @@ The typed client's `db.tables.<Table>` binds the table's operations:
 | `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
 | `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
 | `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
-| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row 1.36 wrote whose key text changed to its current key: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, so a concurrent write wins, and conflicts are reported and left; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row 1.36 wrote whose key text changed to its current key: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, so a concurrent write wins, and conflicts are reported and left; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 
@@ -258,7 +258,7 @@ import { Entity } from "effect-dynamodb"
 | `model` | `Schema.Class \| Schema.Struct \| ConfiguredModel` | Yes | Domain model schema (or configured model with field overrides) |
 | `entityType` | `string` | Yes | Discriminator stored as `__edd_e__` |
 | `primaryKey` | `{ pk: KeyDef, sk: KeyDef, casing? }` | Yes | Primary key composition rules. Optional `casing` overrides the schema's for the primary key |
-| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection`, `type`, `casing` (overrides the schema's for that index — collection members must agree, `EDD-9055`) and `indexPolicy` |
+| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection`, `type`, `casing` (overrides the schema's for that index — collection members must agree, `EDD-9055`), `indexPolicy` and `shards` (`n` or `{ count, by?, previous? }`, see [Write Sharding](/effect-dynamodb/guides/sharding/)) |
 | `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt`. Each slot takes a field name, a `DynamoModel` date schema (storage only), or `{ field?, schema? }`. A `schema` without a `DynamoEncoding` annotation throws `EDD-9044` at make() time |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
@@ -476,12 +476,13 @@ import { Query } from "effect-dynamodb"
 | `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
 | `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter). Each request's `Limit` is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed |
 | `pageSize(n \| "natural")` | Dual | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips), never adapted. `"natural"`: size requests as 1.36 did (a natural 1 MB page under a filter). Any other string throws `EDD-9095` |
-| `maxPages(n)` | Dual | Limit total number of pages fetched |
+| `maxPages(n)` | Dual | Limit total number of pages fetched. On a [sharded index](/effect-dynamodb/guides/sharding/#request-sizing): `n` rounds, at most one request per unfinished shard in each |
+| `concurrency(n)` | Dual | On a [sharded index](/effect-dynamodb/guides/sharding/#concurrency-and-inspection): the requests in flight at once. Default: every shard. No effect on any other query. A value that isn't a positive integer throws `EDD-9105` |
 | `onRequest(observer)` | Dual | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. Observers run in the order added; a failure is a defect |
 | `reverse` | Combinator | Reverse sort order (descending) |
 | `consistentRead` | Combinator | Enable strongly consistent reads (the table, or an LSI). DynamoDB rejects a consistent read of a GSI: the query fails with a `ValidationError` (`operation: "query.consistentRead"`) naming the index, DynamoDB's error as its `cause` |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
-| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor. The cursor is decoded by the terminal: a malformed one fails it with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it |
+| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor. The cursor is decoded by the terminal: a malformed one fails it with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it. A query on a [sharded index](/effect-dynamodb/guides/sharding/#cursors) refuses any cursor but one of its own query and layout |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
 | `filterExpr(expr)` | Dual | Add an `Expr` ADT filter (from callback API) |
 | `selectPaths(paths)` | Dual | Project path segments (from callback API) |
@@ -527,7 +528,7 @@ Used in entity-level `filter()`:
 |------|-------------|
 | `Page<A>` | `{ items: Array<A>, cursor: Option<string> }` — `cursor` is `None` on the last page; `startFrom` takes the string inside a `Some` |
 | `PlanMode` | `"key" \| "skip-scan" \| "filter" \| "naive" \| "jump" \| "precise" \| "empty"` |
-| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, maxSkips? }` |
+| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, fanOut?: { partitions, pruned, concurrency }, maxSkips? }` |
 | `QueryRequestEvent` | `{ kind: "read" \| "probe" \| "count", request, lower, upper, limit, scannedCount, count, accepted, discarded }` |
 | `ZOrderOptions` | `{ strategy?: "auto" \| "naive" \| "jump" \| "precise", maxRanges?, pageSize?, concurrency? }` — see [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies) |
 
@@ -576,9 +577,10 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | `.zorder(options)` | Z-order accessors only: how the `.within()` box is read — `ZOrderOptions` (`strategy`, `maxRanges`, `pageSize`, `concurrency`). Later calls merge over earlier ones. See [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies). |
 | `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. Each request is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed. |
 | `.pageSize(n \| "natural")` | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit`, never adapted. A contract on round trips, not on what comes back. `"natural"`: size requests as 1.36 did. |
-| `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
+| `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. On a [sharded index](/effect-dynamodb/guides/sharding/#request-sizing): `n` rounds, at most one request per unfinished shard in each. |
+| `.concurrency(n)` | On a [sharded index](/effect-dynamodb/guides/sharding/#concurrency-and-inspection): the requests in flight at once. Default: every shard. No effect on any other query. A value that isn't a positive integer throws `EDD-9105`. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
-| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. Decoded by the terminal: a malformed cursor fails it with a `ValidationError` (`EDD-9094`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it. See [Cursor-Based Pagination](/effect-dynamodb/guides/queries/#cursor-based-pagination). |
+| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. Decoded by the terminal: a malformed cursor fails it with a `ValidationError` (`EDD-9094`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it. A query on a [sharded index](/effect-dynamodb/guides/sharding/#cursors) refuses any cursor but one of its own query and layout. See [Cursor-Based Pagination](/effect-dynamodb/guides/queries/#cursor-based-pagination). |
 | `.onRequest(observer)` | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. See [Inspecting a query](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest). |
 | `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, DynamoDB rejects the query and it fails with a `ValidationError` naming the index. An entity's indexes are GSIs when `db.tables.*.create()` creates them. |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
@@ -1033,7 +1035,9 @@ import { KeyComposer } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `composePk` | `(schema, entity, index, record) => string` | Compose partition key value |
+| `composePk` | `(schema, entity, index, record) => string` | Compose partition key value. On a [sharded index](/effect-dynamodb/guides/sharding/) it adds the shard marker, and throws `EDD-9100` when a source value is missing |
+| `composeReadPartitions` | `(schema, entity, index, record, { prune? }?) => { partitions, fanOut }` | The partition keys a query on this index reads, in merge order: the current shards (one when every `by` attribute is pinned), then a `previous` layout's. One partition on an unsharded index, with `fanOut: undefined` |
+| `assertCollectionShardsAgreement` | `(collectionName, members) => void` | Throw `EDD-9103` when a collection's members disagree on `shards.count` or `shards.previous` |
 | `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
 | `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
 | `composeSkValue` | `(schema, entityType, entityVersion, index, record) => KeyValue` | `composeSk` for a string half, `composeZOrderSk` for a Z-order half |
@@ -1060,7 +1064,10 @@ import { KeyComposer } from "effect-dynamodb"
 | `ZOrderKeyPart` | `{ field: string, prefix?: PrefixPart[], zorder: Dimension[] }` — a Z-order sort key as declared |
 | `ZOrderSkPart` | A normalised Z-order sort key half: `{ field, composite, zorderHalf }`, where `composite` is derived (prefix composites, then dimension fields) |
 | `KeyValue` | `string \| Uint8Array` — text for a string half, bytes for a Z-order half |
-| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart \| ZOrderSkPart, index?, collection?, type?, casing?, indexPolicy? }` |
+| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart \| ZOrderSkPart, index?, collection?, type?, casing?, indexPolicy?, shards? }` |
+| `ShardsConfig` | `{ count: number, by?: F[], previous?: number }` — write sharding as declared on a secondary index |
+| `IndexShards` | A normalised `ShardsConfig`: `{ count, by, previous, source }`, where `source` is `by` or, once `Entity.make` binds it, the primary key composites |
+| `ReadPartitions` | `{ partitions: string[], fanOut: ReadFanOut \| undefined }` — what `composeReadPartitions` returns |
 | `IndexPolicyKey` | `"sparse" \| "preserve"` |
 | `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
 | `GsiUpdateResult` | `{ sets: Record<string, KeyValue>, removes: ReadonlyArray<string> }` |

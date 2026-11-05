@@ -97,6 +97,8 @@ const report = yield* db.tables.MainTable.rekey({
 
 A request that fails fails the run with its `DynamoClientError` (a throttled request is retried by the AWS SDK first). Resume from the last token `onProgress` delivered: the run redoes at most the pages that were in flight, and redoing a page moves nothing twice.
 
+`rekey` also moves rows between layouts of a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index), counted in `indexKeysRewritten`.
+
 ## Bounded runs and resuming
 
 `maxPages` bounds a run, so a large table can move over several time slots. A run that stops early returns `resume`; pass it to the next:
@@ -177,6 +179,7 @@ A stream appended to without a pause can win every flip: it is reported `contend
 | `taken` | Another row holds its current key | Look at the row that holds it. A row `rekey` can identify as another value's 1.36 row is moved out of the way first, so this is a row it doesn't recognize |
 | `contended` | Concurrent writes changed it on every attempt, or a drainer is delivering an outbox item | Run `rekey` again |
 | `failed` | It can't be moved as stored: its values no longer decode, a stream id reads as two different ids, or a write was refused | `message` says why: fix the row, then run `rekey` again |
+| `uncomposable` | Its key on a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) is from another layout, and its values can't compose a current one (a `by` attribute was cleared) | Give it the missing values, or remove them from the index with `.remove()`, then run `rekey` again |
 
 Until a conflicting row moves, the fallback keeps reading it, so leave the fallback on.
 

@@ -1,0 +1,377 @@
+---
+title: "Write Sharding"
+description: "Spread one logical GSI partition over N physical ones: the shards option, merged reads, per-shard cursors, pruning with by, and adopting sharding on a populated index"
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+A DynamoDB partition takes about 1,000 write units a second, and a GSI partition is no exception. Every item under one index key goes to one partition, so a logical key that takes more writes than that (a busy tenant, today's date, a popular status) throttles however much capacity the table has. A GSI that falls behind also throttles writes to the table itself.
+
+**Write sharding** stores one logical partition in N physical ones. A write hashes the item to pick a shard. A query reads every shard and merges them into the order one partition would give. No caller names a shard.
+
+## Declaring a sharded index
+
+```typescript region="model" example="guide-sharding.ts"
+class Device extends Schema.Class<Device>("Device")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  tenantId: Schema.String,
+  groupId: Schema.String,
+  status: Schema.String,
+}) {}
+```
+
+```typescript region="entity" example="guide-sharding.ts"
+const Devices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  },
+  indexes: {
+    // One logical partition per tenant, stored in 8 physical ones. Each write
+    // hashes the item's primary key composites to choose its shard.
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      shards: 8,
+    },
+    // Each group stays on one shard, so a query that pins `groupId` reads one.
+    byGroup: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["tenantId"] },
+      sk: { field: "gsi2sk", composite: ["groupId", "deviceId"] },
+      shards: { count: 8, by: ["groupId"] },
+    },
+  },
+})
+```
+
+`shards` goes on a secondary index. `shards: 8` is shorthand for `{ count: 8 }`.
+
+| Option | Meaning |
+|---|---|
+| `count` | The number of shards, an integer from 2 to 256 |
+| `by` | The sort key composites to hash in place of the primary key composites. See [Pruning with `by`](#pruning-with-by) |
+| `previous` | The count of the layout being moved away from: `1` for an unsharded index. See [Adopting sharding](#adopting-sharding-on-a-populated-index) |
+
+Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
+
+### The stored key
+
+A sharded partition key carries a marker, `!<count>.<shard>`, right after the entity type or collection name. The shard is zero-padded to the width of `count - 1`.
+
+```typescript region="stored-key" example="guide-sharding.ts"
+const { Items: stored } = yield* raw.scan({ TableName: tableName, Limit: 1 })
+// stored[0].gsi1pk → { S: "$guide-sharding#v1#device#!8.3#tenantid_t-123" }
+// stored[0].gsi1sk → { S: "$guide-sharding#v1#device#deviceid_d-…" }
+```
+
+| Index | Partition key |
+|---|---|
+| Unsharded | `$fleet-db#v1#devicestate#tenantid_t-123` |
+| Shard 7 of 20 | `$fleet-db#v1#devicestate#!20.07#tenantid_t-123` |
+| Shard 7 of 20, no partition key composites | `$fleet-db#v1#devicestate#!20.07` |
+| Shard 7 of 20, in a collection | `$fleet-db#v1#assignments#!20.07#employee_x` |
+
+Key values aren't escaped, so the marker comes before all of them. An unsharded key's next segment always holds `<label>_`, which a marker can't spell, so an unsharded key for tenant `t-123#07` can't equal a sharded key for tenant `t-123`. The count separates two sharded layouts in the same way, which is why reading both during a migration needs no filter and no dedupe.
+
+## Choosing N
+
+```
+N ≥ peak WCU/s on the logical key ÷ (1,000 × headroom)
+```
+
+`headroom` is the share of each partition's limit you are willing to use, so 8,000 WCU/s at peak at 0.5 needs 16 shards. Measure the key, not the table: a table with thousands of evenly loaded tenants doesn't need this.
+
+| | Unsharded | Sharded (N) |
+|---|---|---|
+| Write | 1 index write | 1 index write |
+| Logical query | 1 or more requests | N or more requests, each billed the per-request minimum |
+| Latency | One partition | About the slowest shard |
+| `fetch` page | Reads the page | Up to N partial pages, sized from `n / N` |
+
+Sharding costs on the read side, and it costs on every query, including those of the smallest tenants. A partition that never approaches the limit pays N times the per-request minimum for nothing, so shard the indexes that need it and leave the rest alone.
+
+`count` is capped at 256. DynamoDB has no such limit: the cap exists because each query sends at least N requests, a cursor holds one position per shard, and a typo like `shards: 2000` would otherwise deploy, with a migration to undo it. 256 shards take more than six times the default per-table quota of 40,000 WCU/s on one logical key.
+
+## How an item picks its shard
+
+```
+shard = FNV-1a-32(source values, as key text, case-folded) mod count
+```
+
+- **The source** is the primary key composites unless `by` says otherwise. They never change, so an item stays on its shard, and every item spreads independently.
+- **The fold** is the same whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under the default `lowercase` casing and must reach one shard. Under `preserve` casing it merges a few values into one hash input, which adds a slight bias and nothing else.
+- **The hash is stable.** It uses no platform API, and stored keys depend on it: changing it would be a breaking change.
+
+There is no unsharded fallback. When a write has to compose the partition key and a source value is missing, the write fails with a `ValidationError` (`EDD-9100`) and nothing is sent. See [Updates](#updates).
+
+## Reading
+
+Every terminal reads the shards and merges them. Each shard is sorted by the index's sort key, so a row is emitted only once every unfinished shard has a row to compare it with. That is what makes the order right, and it means at most one page per shard is held in memory.
+
+```typescript region="collect" example="guide-sharding.ts"
+// Reads all 8 shards and merges them into the index's order.
+const all = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+// Merging in descending order: exactly the reverse.
+const descending = yield* db.entities.Devices.byTenant({ tenantId: TENANT })
+  .reverse()
+  .collect()
+// Each shard is counted, and the counts summed.
+const total = yield* db.entities.Devices.byTenant({ tenantId: TENANT }).count()
+```
+
+| Terminal | What it does |
+|---|---|
+| `.collect()`, `.paginate()` | Streams the merge: reads every shard whose buffer is empty, then emits what is proven in order |
+| `.limit(n).fetch()` | `n` merged items and a cursor. Rows read past the page are dropped, and the next page reads them again |
+| `.fetch()` without `limit` | One round of reads: what that round proves in order, and a cursor |
+| `.count()` | Counts each shard and sums them, capped at `limit` |
+
+**Order.** The result is the order one partition would give: UTF-8 bytes for a string key, bytes for a binary one. Rows with equal sort keys on different shards come out by shard, and `.reverse()` is the exact reversal of forward.
+
+**Projections.** `.select()` still works. The merge and the cursor need each row's keys, so the query reads them as well and strips them from the results.
+
+```typescript region="select" example="guide-sharding.ts"
+// The merge needs each row's keys, so the query reads them and strips them again.
+const statuses = yield* db.entities.Devices.byTenant({ tenantId: TENANT })
+  .select(["deviceId", "status"])
+  .limit(2)
+  .collect()
+// statuses → [{ deviceId: "d-000", status: "online" }, { deviceId: "d-001", status: "offline" }]
+```
+
+`.where()`, `.filter()`, `.pageSize()` and the other combinators apply to each shard's request as they would to one partition's.
+
+### Cursors
+
+```typescript region="fetch-chain" example="guide-sharding.ts"
+// Each page's cursor holds every shard's position; the stream ends at the page
+// without one. Rows read past the page are dropped and read again.
+const firstPages = db.entities.Devices.byTenant({ tenantId: TENANT }).limit(30)
+
+const paged = yield* Stream.paginate(firstPages, (query) =>
+  query.fetch().pipe(
+    Effect.map((page) =>
+      [page.items, Option.map(page.cursor, (cursor) => firstPages.startFrom(cursor))] as const,
+    ),
+  ),
+).pipe(Stream.runCollect)
+```
+
+`page.cursor` is an `Option<string>` as usual, and `None` means every shard is done. The cursor is opaque, and it differs from an unsharded query's in a few ways:
+
+- **It grows with N**, at about one key's text per shard still in progress. Keep that in mind if cursors travel in URLs.
+- **It belongs to its layout.** A cursor from another query, another `count`, or from before an [adoption step](#adopting-sharding-on-a-populated-index) fails the terminal with `EDD-9094`. Restart the listing.
+- **It can't leave its partitions.** It holds positions and not partition keys, which the query recomposes. Its checksum catches a corrupted or hand-edited cursor, but it is an integrity check, not authentication.
+- **`limit`, `pageSize` and `concurrency` can change** between pages.
+
+### Request sizing
+
+Each shard keeps its own estimate, from the items still owed divided by the shards not finished. A query with a `limit` and no filter asks each shard for a share of what's owed, with some margin. Under a filter, each shard's `Limit` follows its own acceptance rate, as on [an unsharded index](/effect-dynamodb/guides/queries/#request-sizing). `.pageSize(n)` is sent as given to every shard.
+
+`.maxPages(n)` means `n` **rounds**, each at most one request per unfinished shard, so at most `n × shards` requests. Rows that can't be proven in order when the rounds run out are dropped: `fetch`'s cursor reads them again, and `collect` stops short, as it does on an unsharded index.
+
+### Concurrency and inspection
+
+```typescript region="inspect" example="guide-sharding.ts"
+// Default: every shard at once. A resumed query may change this.
+const gentle = db.entities.Devices.byTenant({ tenantId: TENANT }).concurrency(2).limit(10)
+
+const explained = yield* gentle.explain()
+// explained.plan             → "key"
+// explained.keyConditions    → one per shard
+// explained.fanOut?.pruned   → false
+// explained.fanOut?.concurrency → 2
+// explained.fanOut?.partitions  → ["$guide-sharding#v1#device#!8.0#tenantid_t-123", ...]
+
+// One event per request, with what that request contributed.
+let requests = 0
+let accepted = 0
+yield* gentle
+  .onRequest((event) =>
+    Effect.sync(() => {
+      requests += 1
+      accepted += event.accepted
+    }),
+  )
+  .collect()
+// requests → at least 8: one per shard, more where a short page ran dry
+// accepted → 10: rows beyond the limit were read and dropped
+```
+
+- `.concurrency(n)` (or `Query.concurrency(n)`) caps the requests in flight. The default is every shard at once. A value that isn't a positive integer throws `EDD-9105`.
+- `.explain()` lists one key condition per shard and adds `fanOut: { partitions, pruned, concurrency }`.
+- `.onRequest()` reports one event per request. Whether a row becomes an item is known only when the merge emits it, so an event fires when its page drains or when the terminal ends, and events can arrive out of `request` order. `accepted` adds up to what the terminal returned. A page read and never used reports `discarded: true`.
+- [Consumed capacity](/effect-dynamodb/guides/consumed-capacity/) reports the terminal as one operation with its total, as it does for a multi-page query.
+
+### Failures
+
+Any shard's failure fails the terminal. `fetch` and `collect` return no partial result and interrupt the requests in flight: a page's order can only be proven with every shard's answer. A `paginate` stream fails at that point, having delivered only what was already proven in order.
+
+## Pruning with `by`
+
+With the default source, a query can't know which shard an item is on, so it reads them all. `by` hashes sort key composites instead, so a query that pins those composites knows the shard and reads one.
+
+```typescript region="by-prune" example="guide-sharding.ts"
+// Every `by` attribute is pinned: one shard, one request.
+const pruned = yield* db.entities.Devices.byGroup({ tenantId: TENANT, groupId: "group-a" }).explain()
+// pruned.fanOut?.partitions.length → 1
+// pruned.fanOut?.pruned            → true
+
+// `groupId` isn't known: all 8.
+const tenantWide = yield* db.entities.Devices.byGroup({ tenantId: TENANT }).explain()
+// tenantWide.fanOut?.partitions.length → 8
+
+// The hash folds case, as the default key text does: this finds the same rows.
+const sameGroup = yield* db.entities.Devices.byGroup({
+  tenantId: TENANT,
+  groupId: "GROUP-A",
+}).collect()
+```
+
+- `by` names sort key composites of this index. The type system offers exactly those, with completions and a compile error for anything else, and `Entity.make` checks again at runtime (`EDD-9102`).
+- A query prunes when the accessor pins **every** `by` attribute. `.where()` doesn't prune, even with `eq`. A `previous` layout is never pruned, and neither is a collection.
+- `by` can't be on a Z-order sort key, since an accessor can't pin a dimension.
+
+<Aside type="caution" title="by concentrates writes">
+Every item with one `by` value lands on one shard. A coarse value (a few statuses, one huge group) puts that value's whole write rate on one partition, which is the problem sharding was meant to solve. Choose `by` so that no single value comes near 1,000 WCU/s, or keep the default source and read all the shards.
+</Aside>
+
+### Updates
+
+A `by` attribute feeds the partition key, so an update that changes one moves the entry to another shard. The new key needs the partition key composites as well as the new value:
+
+```typescript region="by-update" example="guide-sharding.ts"
+// The new shard needs the partition key composites as well: without `tenantId` in
+// the update the key can't be composed, so nothing is written (EDD-9100).
+const refused = yield* db.entities.Devices.update(key)
+  .set({ groupId: "group-b" })
+  .asEffect()
+  .pipe(Effect.flip)
+
+// With them, the entry moves to the new group's shard.
+yield* db.entities.Devices.update(key).set({ tenantId: TENANT, groupId: "group-b" })
+```
+
+| Update | Result |
+|---|---|
+| Sets every `by` attribute and the partition key composites | The entry moves to the new shard |
+| Sets `by` only | `EDD-9100`, under both [policies](/effect-dynamodb/guides/index-policy/): the new key can't be composed, and leaving it would make pruned queries miss the item |
+| Sets the partition key composites without `by` | `EDD-9100`: the new key's shard can't be computed |
+| `.remove(["groupId"])` | The entry is removed, under both policies. No unsharded key is written |
+| A `sparse` partition key half that can't compose | The entry is removed as on any index. No unsharded key is written |
+| A `preserve` half with nothing touched | Left as it is |
+| An unrelated `.set({ status })` | Touches no key, even if `by` is unknown to this writer |
+
+An entity that reads the item before it writes (`versioned: { retain: true }`, computed updates) has the composites, so it can compose the new key from a `by`-only update.
+
+The default source is immutable, so an index without `by` follows the ordinary update rules. A `put` without a value for a `by` attribute writes no index entry, as any sparse index does: an unsharded key is never written.
+
+## Adopting sharding on a populated index
+
+An existing index's rows are all in one partition. To move them without a gap in reads, take three steps.
+
+**Step 1: deploy with `previous`.** New writes compose the sharded key. Reads read the N shards and the old layout, and merge them.
+
+```typescript region="adopt-deploy" example="guide-sharding.ts"
+// Step 1: the live deployment. Writes compose the new layout; reads also read the
+// old one (`previous: 1`: the single unsharded partition).
+const MovingDevices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: deviceKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      shards: { count: 8, previous: 1 },
+    },
+  },
+})
+```
+
+**Step 2: run `rekey`.** It scans the table and rewrites the index key attributes of every row whose stored key isn't what its values compose now, conditional on the old key and the values feeding it. A concurrent write wins and is left alone. Dry run, parallel segments, resume tokens and the capacity report all work as usual ([Upgrading](/effect-dynamodb/guides/upgrading/)).
+
+```typescript region="adopt-rekey" example="guide-sharding.ts"
+const movingDb = yield* DynamoClient.make({
+  entities: { Devices: MovingDevices },
+  tables: { MainTable: MovingTable },
+})
+
+// Reads see every row in both layouts, each once.
+const during = yield* movingDb.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+
+// Step 2: move the rows that are left. A dry run counts them first.
+const dryRun = yield* movingDb.tables.MainTable.rekey({ dryRun: true })
+const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
+// dryRun.indexKeysRewritten → 200
+// report.indexKeysRewritten → 200
+// report.conflicts          → []
+```
+
+A row under another layout whose values can't compose a current key (a `by` attribute cleared under `preserve`) is left where it is and reported as a conflict with reason `"uncomposable"`.
+
+**Step 3: remove `previous`.**
+
+```typescript region="adopt-finish" example="guide-sharding.ts"
+// Step 3: deploy without `previous`. Only the 8 shards are read now.
+const movedDb = yield* DynamoClient.make({
+  entities: { Devices: MovedDevices },
+  tables: { MainTable: MovedTable },
+})
+const after = yield* movedDb.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+```
+
+An item has one stored index key, so it is returned once at every step, and the layouts can't overlap. Cursors taken before a step fail with `EDD-9094` after it, so restart any listing that is in flight.
+
+Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `rekey`, then `shards: 40`.
+
+### What else can change
+
+- **Removing `by`** at the same count is safe: reads go back to reading every shard, and items keep working. `rekey` moves them to the default source's shards.
+- **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
+- **Rows still under 1.36 key text** are read and moved as well: with `previous: 1`, the query also reads the 1.36 key when its text differs, and `rekey` lands those rows sharded. Running `rekey` before adopting is simpler to reason about, but adopting directly works.
+
+## Collections
+
+Members of a collection on a sharded index must agree on `count` and `previous` (`EDD-9103`), since the partitions read are shared. They may differ on `by`, since each member hashes its own source. Collection queries always read every shard.
+
+## What isn't supported
+
+| | |
+|---|---|
+| `.within()` and skip-scan on a sharded accessor | `EDD-9104`. So is `.zorder()`, which only configures a `.within()` read |
+| A `GeoIndex` over a sharded index | `EDD-9104` |
+| `shards` on the primary key | `EDD-9099` |
+| An index with nothing to spread: every primary key composite is also a partition key composite of the index | `EDD-9101` |
+| A hot read key, or one hot item | Not what this solves: a single item is on one partition, sharded or not |
+
+A Z-order sort key **can** be sharded (without `by`): the merge compares bytes. Its `.within()` read is what's refused, for now.
+
+Aggregates compose their own attributes and write no index keys of an entity's indexes, so they don't interact with `shards`. Time-series events and version snapshots strip index keys, and unique sentinels hold none, so none of them is affected. EventStore projection rows go through entity writes, so they shard normally.
+
+## Error codes
+
+| Code | When | Raised by |
+|---|---|---|
+| `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256, `previous` not a positive integer or equal to `count`, an unknown option, or `shards` on the primary key | `Entity.make` |
+| `EDD-9100` | A shard source value is missing when the partition key is composed | Every write path, as a `ValidationError` |
+| `EDD-9101` | Nothing to spread: every primary key composite is also a partition key composite of the index | `Entity.make` |
+| `EDD-9102` | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order sort key | Types and `Entity.make` |
+| `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
+| `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
+| `EDD-9105` | `concurrency` isn't a positive integer | The call |
+| `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
+
+## What's Next?
+
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Index declarations and collections
+- [indexPolicy](/effect-dynamodb/guides/index-policy/) -- How updates treat each half of an index key
+- [Queries](/effect-dynamodb/guides/queries/) -- Request sizing, cursors, `explain()` and `onRequest()`
+- [Upgrading](/effect-dynamodb/guides/upgrading/) -- `rekey` in full
+- [Consumed Capacity](/effect-dynamodb/guides/consumed-capacity/) -- What each query cost
