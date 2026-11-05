@@ -146,8 +146,8 @@ runtime-agnostic. Golden vectors pin it; changing it is a breaking change. Aggre
   collection accessors and cascade reads.
 - **`KeyText136` stays unsharded** (§9.3): a shard can hold 1.36 sort key text, never 1.36 partition
   key text.
-- **A sharded partition key has an attribute of its own** (§10, `EDD-9106`), or composing it would
-  overwrite another key.
+- **A sharded partition key has an attribute of its own,** or shares it only with a partition key provably
+  composing the same bytes (§10, `EDD-9106`). Otherwise composing it would overwrite another key.
 
 So the paths the issue's list omits are covered without a per-site change:
 
@@ -155,7 +155,7 @@ So the paths the issue's list omits are covered without a per-site change:
 |---|---|
 | `put`, `create`, `upsert`, `restore`, `Batch.write`, `Transaction.transactWrite` | `composeAllKeys` → `composeIndexKeys` → `composePk` |
 | `update`, `patch`, retain path, `append`, the 1.37 move path | `composeGsiKeysForUpdatePolicyAware` (§5) |
-| Soft delete, version snapshots, time-series events | They strip GSI keys; nothing is composed |
+| Soft delete, version snapshots, time-series events | They strip GSI keys, never a table key attribute (§17.9); nothing is composed |
 | Unique-constraint sentinels | They hold no GSI keys |
 | EventStore projection rows | They go through entity operations |
 | Aggregate edges | Aggregates compose only their own attributes; they never read `entity.indexes` (§11) |
@@ -433,12 +433,18 @@ did. When its text can only be 1.36's (`isSortKeyText136`: a character 1.37 esca
 no escape, a `#` a value held, or a number in 1.36's form), no query reads it once the fallback or
 `previous: 1` goes. So it is the conflict `"legacySortKey"`, on every run until a write names its
 composites. Before this, `rekey` reported `conflicts: []` over such a row. A sort key left in current
-text is no conflict: every query can read it.
+text is no conflict: every query can read it. Whether a segment holds a number is the model's word, since
+the row may have lost the value (§17.10).
+
+**`"legacyPartitionKey"`.** The same of an unsharded index's partition key. Partition keys aren't escaped, so
+only a number's text changed (`isPartitionKeyText136`), and only the 1.36 fallback reads it: `previous` is
+about shards. A sharded partition key has no such case: it is rewritten, or `"uncomposable"`.
 
 **A run that moves a row judges it.** The table key move recomposes index keys as an update would, so
 a half with a hole keeps its text. `rekeyAfterMove` reads the moved row and applies the same checks in
-the same run, so "no conflicts" means the same for moved rows. A dry run reports what would be held
-back.
+the same run, so "no conflicts" means the same for moved rows. A dry run has no moved row to read: it
+judges the one the move would write (`movedRowOf`, which the move itself uses), and reports what the real
+run would (§17.11).
 
 The guard is narrower than the issue's "the item is unchanged since it was read": a write to an
 attribute that doesn't feed this key can't invalidate the new key, so it shouldn't make `rekey`
@@ -517,7 +523,7 @@ in the old layout. The docs say so.
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` | the call |
 | `EDD-9105` | `concurrency` not a positive integer | the call |
-| `EDD-9106` | Two key halves stored in one attribute compose different text, sharded or not (§17.3) | types, where the literals say so, + `Entity.make` |
+| `EDD-9106` | Two key halves stored in one attribute, on a sharded index and anything else, aren't provably the same bytes (§17.7) | types, where the literals say so; `Entity.make` for what no schema can reconcile; `Table.make` for what the schema's casing decides |
 | `EDD-9094` | Cursor mismatch or tamper (existing) | the terminal |
 
 ### 10.1 The cap on `count` *(proposed)*
@@ -659,7 +665,7 @@ the direction, and it is still proposed for the owner.
 | D35 | `fanOut.pruned` speaks for the current layout: it can be `true` while a `previous` layout is read whole (§7) | proposed — awaiting owner confirmation |
 | D36 | Removing `by` at an unchanged `count` is a boundary now that full pins prune: such a query misses unmoved rows until `rekey` has moved them (§8) | proposed — awaiting owner confirmation |
 | D37 | Request sizing and refills stay as they are after the AWS measurement (26 requests, 2.1 s p50 for a page of 100 over 20 shards, §12). Whether to tune them is the owner's decision | open — owner to decide |
-| D38 | Two key halves in one attribute must compose the same text for every item: `EDD-9106` at `Entity.make`. **This covers unsharded halves that disagree too**, which already overwrote each other; same-text overlaps (an inverted index, an LSI's partition key) stay legal (§17.3) | proposed — awaiting owner confirmation |
+| D38 | Two key halves in one attribute must compose the same text for every item: `EDD-9106`. **Its extension to unsharded halves is reversed by D49** | proposed — awaiting owner confirmation |
 | D39 | The type level refuses a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`. Two sharded indexes that differ, and non-literal `field`s, are caught at runtime only (§17.3) | proposed — awaiting owner confirmation |
 | D40 | An update that changes `by` when the sort key half can't be recomposed fails with `EDD-9100`, on the standard and `append` paths, **even when the value named is the one already stored**, as no read is sent (§5 case 6a, §17.4) | proposed — awaiting owner confirmation |
 | D41 | An item legitimately lacking a sort key composite can't have its `by` changed until the update includes that composite or `.remove()`s it (§17.4) | proposed — awaiting owner confirmation |
@@ -670,6 +676,15 @@ the direction, and it is still proposed for the owner.
 | D46 | Leaving `previous: 1` requires a `rekey` that reports no conflicts: documented, not enforced, since nothing at `make` can know (§9.3) | proposed — awaiting owner confirmation |
 | D47 | Unbound `Query.where()` undoes pruning and reads every partition, including `previous`'s. Internal callers whose condition stays under the pins use `Query.whereUnderPins` (§17.6) | proposed — awaiting owner confirmation |
 | D48 | With the fallback on, on any index, a row whose key an index policy left stays visible to pins whose text changed: the current read rejects a row only at its own 1.36 text (§17.5) | proposed — awaiting owner confirmation |
+| D49 | `EDD-9106` judges only pairs with a sharded index among them. Precision is impossible for two unsharded halves: whether two different texts clash depends on data a definition can't show, and two accessors on one index over composites no item holds together is a working pattern. Refusing them would break definitions in a minor release. Every sharded pair is in a new definition, so refusing one breaks nothing (§17.8) | proposed — awaiting owner confirmation |
+| D50 | A shared attribute is allowed only when the two halves are provably the same: the text a half composes with a stand-in for each value, from the composers themselves, plus the exact shard count and source, or a Z-order half's full declaration. A probe can't prove it, and the case it let through was destructive (§17.7) | proposed — awaiting owner confirmation |
+| D51 | `Entity.make` refuses what no schema can reconcile; `Table.make` decides a casing left to the schema, before it binds anything. One entity on two tables is judged by each table's schema, so one can accept it and the other refuse, and a refused table leaves its members bound as they were (§17.7) | proposed — awaiting owner confirmation |
+| D52 | A casing or an escape reaches a composite unless the model pins it to `number` or `bigint`. A literal union that happens to be all lowercase counts as text, so a pair over one is refused though its bytes may agree (§17.7) | proposed — awaiting owner confirmation |
+| D53 | An update never writes a table key attribute, and history rows never lose one, whichever index's half is stored there. Every update on an entity with a local or inverted index was refused by DynamoDB until now (§17.9) | proposed — awaiting owner confirmation |
+| D54 | `"legacySortKey"` judges a composite as a number when the model declares it so, whatever the row holds. The row's value decides only where the schema doesn't pin one kind (§17.10) | proposed — awaiting owner confirmation |
+| D55 | A dry run judges the row the move would write, and reports what the real run reports, a move that would fail included (§17.11) | proposed — awaiting owner confirmation |
+| D56 | A new conflict reason, `"legacyPartitionKey"`, for an unsharded partition key only 1.36 could have spelled, rather than widening `"uncomposable"`, whose values may in fact compose, or `"legacySortKey"`, whose name would then mislead (§17.10) | proposed — awaiting owner confirmation |
+| D57 | `rekey` calls a row under both keys only if it's still at the old one when it finds it at the new one (§17.13) | proposed — awaiting owner confirmation |
 
 ## 15. Scoping decisions
 
@@ -786,8 +801,11 @@ Not in the issue; each one is something a caller could otherwise expect:
 | Removing `by` at an unchanged `count` can hide rows from a full primary key pin until `rekey` has moved them | §8, D36 |
 | "`by` is required" means "when the half is composed": a `put` without it is sparse (D26), `.remove(["by"])` drops the half (D7), an unrelated update is a noop (D8), and clearing it under `sparse` removes the half (§5 case 7) | None of them writes an unsharded key |
 | The `rekey` sharding pass covers sharded PK halves; other index keys keep #181's rule, over the composites their values lead with | §9.2 |
-| Two key halves in one attribute must compose the same text, sharded or not | `EDD-9106`, D38: the one written last overwrites the other |
-| `EDD-9106` compares letter case only when both halves spell out their `casing`, and Z-order halves by composite names | `Entity.make` doesn't know the schema's casing, and a Z-order half's bytes need an item (§17.3) |
+| A key half on a sharded index shares an attribute only with a half provably composing the same bytes | `EDD-9106`, D50: the one written last overwrites the other |
+| Two accessors on one sharded index over composites no item holds together are refused, though they wouldn't clash | "Provably the same" can't see the data. The unsharded form stays legal (D49); give each its own attribute here |
+| **Two unsharded halves that compose different text aren't refused, and overwrite each other if one item composes both** | As before this PR (D49). A possible follow-up: a warning, or a check that can see the optional composites |
+| A composite counts as unable to hold cased or escaped text only when the model pins `number` or `bigint` | D52: a false refusal has a clear fix, and a false pass overwrites a key |
+| `Entity.make` passes a definition that only some schemas can take; `Table.make` refuses it under the others | The schema's casing isn't known until then (D51) |
 | A key `field` equal to a model attribute or a vector index's partition attribute isn't checked | Not part of this fix; not examined further |
 | Type-level refusal stops at what literals show: two sharded indexes that differ, and non-literal `field`s, are runtime only | D39 |
 | Naming the stored `by` value in an update with a hole in the sort key is refused | No read is sent to tell it's the same value (D40) |
@@ -796,9 +814,9 @@ Not in the issue; each one is something a caller could otherwise expect:
 | Reads under `previous: 1` double their requests on pins whose text changed | §9.3, D42 |
 | Leaving `previous: 1` needs a `rekey` that reports no conflicts, and nothing enforces it | §9.3, D46 |
 | `{ count }` with no `previous`, over a populated index, reads neither the old layout nor its 1.36 text | As before: `previous` is how old rows stay readable (§9.3) |
-| A value spelled like an escape (`50%25`) can't be told from one when judging `"legacySortKey"` | Its values are gone: only the text is left. It reads as the value that escapes to it (§9.2) |
-| `"legacySortKey"`'s number check applies only when the row still holds that composite as a number | Otherwise nothing says the segment was a number (§9.2) |
-| A truncated partition key half on an unsharded index isn't judged by `rekey` | No query can reach one, then or now |
+| A value spelled like an escape (`50%25`) can't be told from one when judging `"legacySortKey"` | Undecidable: those bytes are what 1.36 wrote for `50%25` and what 1.37 writes for `50%`, the value is gone, and an item carries no mark of which code wrote its key (§17.10) |
+| A composite the model types as a union of kinds, whose value is gone, isn't judged as a number | Undecidable: `00000000000000-3` may be 1.36's `-3`, or a string whose text never changed (§17.10) |
+| A partition key string value holding `#` and a number composite's label reads as that number | A partition key isn't escaped, so the text can't say. It's reported, and writing the composite clears it: a false conflict, not a lost row |
 | `.where()` bounds other than `eq` and `beginsWith` have no 1.36 pass, and the unbound `Query.where()` drops the 1.36 read | Existing since #181 (`LegacyKeyQueries`), now on shards too |
 | After `rekey`, a row that can't compose a key stays where it is: a conflict when it's in another layout, left alone in the current one | D18, D24. "No stored key stays unsharded" holds for rows that can compose |
 | The move path keeps a row's key when `by` is absent | `onMissingShardSource: "keep"` (§5): the row has nothing to hash |
@@ -827,7 +845,11 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
 | Question | Where | Finding |
 |---|---|---|
 | Which write paths can leave a 1.36 sort key in a shard? | `update`, `Transaction.transactWrite`, `append`, retain, `put`, `Batch.write`, the 1.37 move, `rekey` | §9.3's table. Each is covered by a test on a recording table and on DynamoDB Local |
-| Which key attributes can a sharded partition key overwrite? | Table `pk` and `sk`; another index's `pk` or `sk`; its own `sk`; a sharded one with another count, source, composites or collection | All refused (§17.3). Identical sharded layouts and same-text unsharded overlaps stay legal |
+| Which key attributes can a half on a sharded index overwrite? | Table `pk` and `sk`; another index's `pk` or `sk`; its own `sk`; a sharded one with another count, source, composites, casing or collection; a Z-order half with another layout | All refused (§17.3, §17.7). What's provably the same stays legal, and pairs with nothing sharded aren't judged (§17.8) |
+| Which paths write or strip a table key attribute through an index half? | The update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first three did, all fixed (§17.9). `rekey` finds nothing stale there: such a half holds the table key's text. The move's `current` wins |
+| Which definitions reach a client without `Table.make`? | `_configure` is called only by `Table.make` and `carryConfigure`, which copies its result | None (§17.7) |
+| Which halves can a row lose the value of and keep the text of, so `rekey` has only that text to judge? | An unsharded index's sort key and partition key; a sharded index's sort key; a sharded partition key, which is already `"uncomposable"`. Z-order has no 1.36 text. A vector partition's text isn't judged, and wasn't examined here: it's no key half of a sharded index | All judged (§17.10) |
+| Which `ChangeFeed` tests assert on state a fiber is still on its way to? | All of them, at `MaxOpsBeforeYield` 16 to 2048, five rounds | Two (§16) |
 | Which combinators can change the sort key condition after pruning? | `skConditions` is written only by `make`, `scan`, `where` and the planner | Only `where` (§17.6). `.within()` and Z-order plans are refused on a sharded index, `planEmpty` drops the fan-out, and collections compose with `prune: false` |
 | Which paths can change `by` with a hole in the sort key? | Standard update, `append`, retain, computed | Standard and `append` refuse. Retain and computed read the item and compose it; a real gap refuses there too (§17.4) |
 
@@ -875,7 +897,28 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   a reverse read reverses it.
 - **`ChangeFeed.test.ts`:** the sleeps that could fail under load now await the signal they were waiting
   for, with the same assertions. Three remain that can't fail from load: a slow consumer, a real lease
-  expiry, and a check that a held lease stays waiting.
+  expiry, and a check that a held lease stays waiting. The lease-loss test's first rewrite still raced:
+  its signal fired when the store answered, before the feed recorded the loss, so the assertion got
+  `undefined` at `MaxOpsBeforeYield` 16. It now commits until the feed refuses, which only happens once
+  the loss is recorded, and asserts that attempt never reached the store. It runs at budgets 16, 256 and
+  2048. Running every test in the file at budgets 16 to 2048 found one more, written earlier: the feed
+  ends once its shards are drained, so the last child lookups can lose that race and the count is at
+  most 8, not exactly 8.
+- **`EDD-9106` against its own truth:** `Shards.test.ts` takes every pair of 42 half shapes and three
+  schema casings, composes real items (mixed case, characters a sort key escapes, numbers) with the real
+  composers, and asserts a pair is refused exactly when their bytes differ. So the rule can't refuse what
+  is the same or pass what differs, for those shapes.
+- **Key halves sharing an attribute:** `helpers/SharedKeyAttributes.ts` runs on a recording table and on
+  DynamoDB Local, which is what refuses `SET sk`. New degenerate fixture **11** (§17.9) in
+  `KeyComposer.test.ts`, there and in `connected.sharding.test.ts`.
+- **Dry run:** `helpers/ShardedLegacyRows.ts` seeds 16 situations on both tables and asserts the report
+  equals the real run's, whole; `Rekey.test.ts` does the same over its seeds of every row kind.
+- **Number text:** a brute force over 3,000 random numbers and 1,000 bigints plus the edges: current text
+  never reads as 1.36's, and 1.36's reads as 1.36's exactly when it differs from current. A truth table for
+  the partition key, and a scenario on both tables: read through the fallback, reported, lost with
+  `legacyKeys: false`, resolved by writing the composite.
+- **A false `bothKeys`:** forced with the recording table's request hook (§17.13), since on DynamoDB Local it
+  took one run in about eight, then 18 of 18 clean after the fix.
 - **Each regression test was seen to fail** with its fix reverted. A mutation check over 20 reverts: the
   old gate predicate, `begins_with` for a subtree, pruning for `by` only, `EDD-9106` absent and ignoring
   the shard source, a `by` update leaving the sort key, `Query.where` keeping its pruning, the three
@@ -884,7 +927,12 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   requiring every sort key composite, `"legacySortKey"` not reported, `isSortKeyText136` never true, a
   move not judged, and a tie ignoring `reverse`. Its first run found two survivors, both closed: a count
   comparison that was dead code, as the marker spells the count, so it's gone; and a row in both ranges,
-  which no test reached, so it has one now.
+  which no test reached, so it has one now. A later check over §17.7 to §17.13 and the "a move isn't judged" revert, on
+  the connected suite too for those touching key writes or `rekey`, ran 46 reverts, which all fail a test
+  now. It found five survivors, all closed. Stripping a date's `from` was dead code, as it's held normalized,
+  so it's gone. A row that was never on the index reaches the retain path's dropped entry, and has scenarios on
+  both tables. A dry run reading back shows only on a chain of rows, which has a scenario. A string that makes
+  a composed partition key read as 1.36's, and another row taking the old key during a move, have tests.
 - **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
   never throughput.
 
@@ -894,7 +942,9 @@ The first version of this PR reported §17.1 and §17.2 as observed and unchange
 identically on 1.36.0 (`60014d2`), 1.37.0 (`31ec5da`) and 1.38.0 as first pushed (`2fc7bc6`), on unsharded
 indexes. Both are bugs. Neither fix changes stored key text.
 
-§17.3 to §17.6 came from an independent review of `c5874c0`. Each one reproduced before it was fixed.
+§17.3 to §17.6 came from an independent review of `c5874c0`, and §17.7 to §17.12 from one of the fixes it
+led to; §17.13 and the partition key half of §17.10 came from writing their tests. Each one reproduced
+before it was fixed.
 
 ### 17.1 A pin on a truncated row's own level
 
@@ -984,13 +1034,9 @@ compose the same text, and both compiled.
 `sk`, or another index's `pk` or `sk`, sharded or not, with a different `count`, source, composites or
 collection.
 
-**Fix: `EDD-9106` at `Entity.make`.** The principle is that two key halves in one attribute must compose
-the same text for every item. Both are composed for one made-up item and compared, and a sharded half
-matches only a half sharded the same way.
-
-**On unsharded indexes:** two unsharded halves that disagree were already overwriting each other, so the
-same check refuses them (D38). No fixture in the repo breaks except one that was overlapping by accident.
-Same-text overlaps stay legal: an inverted index over the table's keys, or an LSI's partition key.
+**Fix: `EDD-9106`.** Two key halves in one attribute, one of them on a sharded index, must compose the same
+bytes for every item. §17.7 has how that's decided and §17.8 why it stops at sharded pairs: this section's
+first version compared one made-up item, and refused unsharded pairs too (D38).
 
 **At the type level:** a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an
 unsharded index's `pk` is a compile error on that entry. Two sharded indexes that differ, and non-literal
@@ -1057,3 +1103,143 @@ partitions (`ReadFanOut.everyPartition`), and reports `pruned: false`. A pin com
 `Entity.query`, and a bound `.where()` clamped under those pins, use the internal `Query.whereUnderPins`,
 since they select only rows the chosen shard holds. `where` is the only combinator that can change the sort
 key condition after pruning (audit in §15).
+
+### 17.7 `EDD-9106` needs a proof, not a probe
+
+The check in §17.3's first version composed one made-up item, lower-cased the result and compared. That
+can't establish that two halves always compose the same text, and three destructive overlaps came through:
+
+| Definition | Before | Now |
+|---|---|---|
+| A sharded index with `casing: "uppercase"` sharing the table's `sk`, the table inheriting lowercase | `put` overwrote `sk`, `get` returned `ItemNotFound` | `Table.make` refuses it. Accepted under an uppercase schema, and every read finds the row |
+| Two sharded indexes sharing `gpk` over the attributes `tenant` and `Tenant` | The second overwrote the first | `Entity.make` refuses it |
+| Two Z-order sort keys sharing an attribute, one composite, ranges `0..100` and `0..1000` | Passed, composing different bytes | `Entity.make` refuses it |
+
+**The rule:** a shared attribute is allowed only when the two halves are provably the same (D50).
+
+- **A text half** is compared by the text it composes with a stand-in for each value, from `composePk` and
+  `composeSk` themselves, so the rule can't drift from them. A stand-in is unique to the exact attribute, so
+  `tenant` and `Tenant` differ though they share a label. It holds letters of both cases, so a casing shows
+  wherever it reaches a value, and a character a sort key escapes and a partition key doesn't, so a half's
+  kind shows. A composite the model pins to `number` or `bigint` gets a stand-in with neither, as its text
+  has neither (D52). The literals around them (schema prefix, entity type or collection, labels, an
+  isolated or clustered sort key's parts) come from the composer.
+- **A sharded partition key** also needs the exact `count` and source. `previous` doesn't count: it changes
+  what's read, not what's written.
+- **A Z-order half** is compared by its prefix (field and hash, and casing unless the field holds only
+  numbers) and every dimension's options in interleave order. A date's `from` is held normalized, so two
+  spellings of one instant are the same. Text and Z-order are never the same.
+
+**Where it runs (D51).** The schema's casing resolves an index that spells out none, and `Entity.make`
+doesn't know the schema. So `Entity.make` refuses a pair only if it differs under every casing a schema can
+have, and `Table.make` decides under the real one, as a sibling of `EDD-9069`, before it binds any member.
+`Table.make` is the chokepoint: a client gets its schema only from there.
+
+**One entity on two tables.** Each `Table.make` judges by its own schema, so one can accept the entity and
+the other refuse it. The refused table throws before binding, so the entity stays bound to the table it had,
+and valid members of the refused table aren't bound either.
+
+**The boundary "compares letter case only when both halves declare casing" is gone**, since this destructive
+case came through it.
+
+### 17.8 Two unsharded halves aren't judged
+
+§17.3's first version refused any two halves that composed different text (D38). That broke a definition
+that worked: two unsharded indexes with their own partition keys and different explicit `casing`, sharing an
+identical numeric Z-order sort key, compose the same bytes because casing reaches nothing in them. It passed
+on `c5874c0` and threw at `dfaad77`.
+
+The structural rule (§17.7) fixes that case, but can't make the unsharded check precise, because the answer
+isn't in the definition. Two accessors on one physical index over composites no item holds together have
+different text and never clash: `put` writes only the one whose composites are present. Refusing them at
+load in a minor release is the harm the check was meant to prevent.
+
+**Decision: `EDD-9106` judges only pairs with a sharded index among them (D49).** Such a pair can only be in a
+definition written for this release, so refusing it breaks nothing, and a sharded partition key is the case
+that can't be right: its marker differs from everything but an identically sharded partition key. So the
+rule refuses what it can't prove where that costs nothing, including two exclusive accessors on a sharded
+index, and stays out where it would break a working definition.
+
+**What this leaves:** two unsharded halves that really do compose different text for one item overwrite each
+other, as they always have. It's listed in §15, and a possible follow-up. Tests pin both directions: the
+numeric Z-order pair passes `Entity.make` and `Table.make`, and two exclusive accessors work through real
+`put` and query on DynamoDB Local.
+
+### 17.9 A half in a table key attribute
+
+While checking what §17.7 allows: a sharded index's sort key sharing the table's `sk` with identical text is
+legal, and then every update failed. DynamoDB answered `Cannot update attribute sk. This attribute is part of
+the key`. **The same held on unsharded indexes, on any entity with a local index (its partition key is the
+table's) or an inverted one**. By the code, that dates from 1.7.2's `keyRecord` arm, which started recomposing
+halves wholly known from the key; it was run on this branch only, not on an old release. Nothing tested it, as
+the only suite that would notice is the connected one.
+
+**Verdict: a bug.** It's fixed here because what §17.7 allows must work (D53).
+
+- `composeGsiKeysForUpdatePolicyAware` never returns a table key attribute, in `sets` or `removes`. A half
+  stored in one holds what the table key does, composed of what an update can't change, so there's nothing to
+  write, and dropping an index entry takes the other half, which is enough to leave the index. This is the
+  central composer, so every update path has it. No gate logic changed.
+- `gsiKeyFields` no longer lists one, so a snapshot, tombstone or event keeps the attribute it would have lost
+  on a shared `pk`, and the retain path's dropped entry doesn't delete it.
+
+**New degenerate fixture 11**, on `KeyComposer.test.ts`, on the entity through a recording table (which checks
+the expression), and on DynamoDB Local (which refuses it): a sharded and an unsharded index's sort key in the
+table's, a local index and an inverted one, each through updates, retained versions, soft delete and restore,
+then a query; and a row leaving the index, on the ordinary and retain paths.
+
+### 17.10 A number the row no longer holds
+
+A 1.36 row with an optional numeric `score: -3`, then `.set({ score: undefined })`, which legally removes the
+value and keeps the sort key. `rekey` moved the partition key into a shard and reported `conflicts: []`.
+Removing `previous` then lost the row: a `score: -3` query found 1 before, 1 during, 0 after. The number check
+ran only while the row held a number.
+
+**Verdict: a bug.** The model declares the composite numeric, so the text isn't ambiguous (D54).
+`isSortKeyText136` now takes the model's kind and judges the segment against the current number text, whatever
+the row holds. The row's value decides only where the schema doesn't pin one kind. A positive integer's text
+is the same in both, so it's reachable in both and is no conflict.
+
+**What stays undecidable, and why:**
+
+- **A value spelled like an escape.** `50%25` is byte for byte what 1.36 wrote for the value `50%25` and what
+  1.37 writes for the value `50%`. The row no longer holds the value, and items carry no mark of which code
+  wrote their key, so no check can tell. It reads as the value that escapes to it, so it stays a boundary.
+- **A union of kinds with its value gone.** `00000000000000-3` may be 1.36's `-3`, or a string whose text
+  never changed.
+
+**The same on a partition key.** This fix was first going to leave an unsharded partition key alone, on the
+belief that no pin read such a row. A test written to pin that belief failed: a `score: -3` pin found the row
+through the fallback, and with `legacyKeys: false` didn't, after a run reporting no conflicts. So it's the
+same defect on the other half, on an index with no shards, and it's fixed the same way (D56):
+`isPartitionKeyText136`, and the conflict `"legacyPartitionKey"`. A partition key isn't escaped, so only a
+number's text can have changed, and a sharded one is already `"uncomposable"`.
+
+### 17.11 A dry run predicts the real run
+
+For a row needing a table key move whose index sort key can be recomposed, a dry run judged the keys before
+the move and reported `legacySortKey`, while the real run wrote the right key and reported nothing.
+
+**Verdict: a bug** (D55). What a move writes is now a pure step, `movedRowOf`, used by the move and the dry
+run. A dry run judges that row and reports what the real run would: a rewrite, what's held back, or `"failed"`
+for values that compose no key, with the same `key` and `target`. It doesn't read back: nothing moved, so what
+that key holds, if anything, is another row, which the scan reaches itself. The test compares whole reports,
+less `dryRun` and `capacity`, which differ by definition.
+
+### 17.12 The lease-loss test
+
+§16 has it. Production code is fine: `settle` checks the record first, and a failed write leaves the batch
+unsettled. Only the test was early.
+
+### 17.13 A false `bothKeys`
+
+A new dry-run scenario, one row's current key holding another's 1.36 key, failed one run in about eight on
+DynamoDB Local with `"bothKeys"`: "The row is also stored under its current key." It wasn't. `rekey` handles a
+page's rows four at a time, so while one row's move was making room by moving the other, the scan's own fiber
+moved that row too. One read the row at its old key, the other moved it, and the first then read it at the new
+key and took that for a copy. Any concurrent write moving the row hits the same window, chain or not.
+
+**Verdict: a bug, from #181's `rekey`,** and harmless to data: the row had moved, and a rerun reports nothing.
+But a migration is told to stop on a conflict (D57). `clearTarget` now reads the old key again before it reports:
+if the row isn't still there, it moved. A test forces the order with the recording table's hook, both with the
+old key empty and with another row in it; the existing test keeps a real copy reported.

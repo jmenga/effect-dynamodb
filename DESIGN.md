@@ -1188,12 +1188,26 @@ values lead with, as the structural rule truncates it, so one truncated under
 1.36 is rewritten like a whole one. One that is neither what its values compose
 now nor what they composed under 1.36 was kept by an index policy, and is left.
 When its text can only be 1.36's (`KeyText136.isSortKeyText136`: a character 1.37
-escapes, a `%` starting no escape, a `#` a value held, a number in 1.36's form),
-no query reads it once the fallback or `previous: 1` goes, so it is the conflict
-`legacySortKey`, on every run until a write names its composites. A key left in
-current text is no conflict. A value spelled like an escape (`50%25`) can't be
-told from one. A run that moves an item from its 1.36 table key reads the moved
-row and judges it the same way (`rekeyAfterMove`).
+escapes, a `%` starting no escape, a `#` a value held, a number in 1.36's form,
+judged by the model's kind since the row may have lost the value), no query reads
+it once the fallback or `previous: 1` goes, so it is the conflict `legacySortKey`,
+on every run until a write names its composites. A key left in current text is no
+conflict. Two things can't be told: a value spelled like an escape (`50%25` is the
+bytes 1.36 wrote for `50%25` and 1.37 writes for `50%`), and a composite typed as a
+union of kinds whose value is gone. A run that moves an item from its 1.36 table
+key reads the moved row and judges it the same way (`rekeyAfterMove`); a dry run
+judges the row the move would write (`movedRowOf`), so it reports what the real run
+does.
+
+**Partition keys, on an unsharded index.** The same judgement
+(`KeyText136.isPartitionKeyText136`): a partition key is not escaped, so only a
+number's text changed. One that holds a number only 1.36 could have spelled and
+that its values no longer compose is read only through the fallback, so it is the
+conflict `legacyPartitionKey`, until a write names its composites.
+
+**A row under both keys.** `clearTarget` reports `bothKeys` only if the row is still
+at its old key when it finds it at the new one. A page's rows run concurrently, and a
+write can move one, so between the two reads another fiber may have moved it.
 
 **Per row kind.** Every write is conditioned on what the move read: a Put
 lands only where nothing is (a stream's snapshot: over an older one; a stream
@@ -1369,7 +1383,7 @@ byTenant: {
 - **Shard function** (`schema/src/internal/Shards.ts`). `FNV-1a-32(F(text(v1)) ‖ 0xFF ‖ F(text(v2)) ‖ …) mod count`, with `text` = `KeyComposer.serializeValue` over key-form values and `F(s) = s.toLowerCase().toUpperCase()` in UTF-8. Golden vectors pin it; changing it is a breaking change. The fold is fixed, whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under `lowercase` and must reach one shard. `L∘U` would fail on `ß` / `ẞ`, which lowercase to one key but fold apart. `0xFF` never occurs in UTF-8, so `("ab", "c")` and `("a", "bc")` differ. `TextEncoder` and `Math.imul` keep it runtime-agnostic.
 - **Composing is structural.** `composePk` and the truncating composer always add the marker and throw `ShardSourceError` (`EDD-9100`) when a source value is absent, which the error boundaries turn into a `ValidationError`; an index never bound to an entity throws, as an unbound Z-order half does. So `put`, `create`, `upsert`, `restore`, `Batch`, `Transaction`, `update`, `patch`, retain, `append` and the 1.37 move path need no per-site change. A key for a sharded index can't be composed unsharded. Soft-deleted items, version snapshots and time-series events strip GSI keys; unique sentinels hold none; EventStore projection rows are entity writes; aggregates compose their own attributes and read no `entity.indexes`.
 - **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when the accessor pins every attribute of the shard source, whether that source is `by` or the primary key), then the `previous` layout's, never pruned. The pins are a leading sort key prefix, so a default source prunes only when the sort key holds the whole primary key. Query behaviour: §10 "Fan-out Queries".
-- **Key attributes.** Two key halves stored in one attribute must compose the same text for every item, or the one written last overwrites the other: a sharded index over the table's `pk` would leave the item unreachable by `get`. `Entity.make` refuses that with `EDD-9106`, sharded or not; a same-text overlap (an inverted index, an LSI's partition key) stays legal, and a sharded half matches only one sharded the same way. Letter case is compared only when both halves spell out `casing`, and Z-order halves by composite names. The types refuse a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`; two sharded indexes that differ, and non-literal `field`s, are runtime only.
+- **Key attributes.** A key half on a sharded index shares an attribute only with a half provably composing the same bytes, or the one written last overwrites the other: a sharded index over the table's `pk` would leave the item unreachable by `get`. `EDD-9106` compares structure, not a sample: the text each half composes with a stand-in per exact attribute (`KeyComposer` itself), the exact shard count and source, and a Z-order half's full declaration. A casing or an escape counts wherever it reaches a value, and a composite the model pins to `number` or `bigint` holds neither. `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema, before binding any member; an entity on two tables is judged by each. A pair with nothing sharded isn't judged: two different texts clash only if one item composes both, which a definition can't show, so two accessors over composites no item holds together stay legal, and halves that do clash overwrite each other as they always have. The types refuse a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`; two sharded indexes that differ, and non-literal `field`s, are runtime only.
 - **Collections.** Every member must declare the same `count` and `previous` (`EDD-9103`), since the partitions read are shared. `by` may differ. A collection query always reads every shard.
 - **Refused** (`EDD-9104`): `.within()`, skip-scan and `.zorder()` on a sharded accessor, and a `GeoIndex` over a sharded index. A Z-order sort key without `by` is allowed: the merge compares bytes.
 
@@ -1746,6 +1760,8 @@ Shapes 1 to 8 hold on a sharded index as well (#183). The gate's new dependency 
 10. **A half mixing a primary key composite with a mutable one** (#183) — `sk: [zone, deviceId]`, `sk: [deviceId, zone]` or `pk: [channel, zone]` on `primaryKey: [channel, deviceId]`. An update naming neither composite leaves the stored key byte for byte under both policies, on the standard, retain and append paths; naming the mutable composite composes the half; `.remove(["zone"])` cascades as ever. The composites in the key record alone never wake it, whichever position they hold. **This is the regression scenario from v1.7.2 through 1.37**, reachable on an unsharded index: the half woke through `keyRecord`, so an unrelated update removed the key under `'sparse'` or truncated it under `'preserve'`.
 
 The retain path holds the whole item in `keyRecord`, so a mixed half whose composites are all present recomposes to the key it already has. When every half of an index is skipped there, the existing Put-style fallback recomposes the entry from the new item: an item lacking a composite has no entry, as it had none.
+
+11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -5476,7 +5492,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9103` | `KeyComposer.ts` (schema, `assertCollectionShardsAgreement`), through `DynamoClient.make` and `Collections.make` | Collection members disagree on `count` or `previous`; undeclared differs from declared |
 | `EDD-9104` | `Query.ts` (`refuseShardedPlan`, thrown at the call), `effect-dynamodb-geo`'s `GeoIndex.make` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` |
 | `EDD-9105` | `Query.ts` (`Query.concurrency`, thrown at the call) | `concurrency` not a positive integer |
-| `EDD-9106` | `Entity.ts` (schema, `refuseSharedKeyAttribute`), through `Entity.make`, and the type-level guard where literals show it | Two key halves stored in one attribute compose different text, sharded or not |
+| `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard where literals show it | Two key halves stored in one attribute, one of them on a sharded index, aren't provably the same bytes |
 
 Next free code: **`EDD-9107`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
 

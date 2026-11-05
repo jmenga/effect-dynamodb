@@ -66,7 +66,7 @@ const Devices = Entity.make({
 
 Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
 
-A sharded partition key needs an attribute of its own. Stored in the table's `pk`, or in another key's attribute, it would overwrite that key, so `Entity.make` refuses it (`EDD-9106`), and the type system refuses the cases it can see. Two sharded indexes may share an attribute only when they're sharded the same way and compose the same text.
+A sharded partition key needs an attribute of its own. Stored in the table's `pk`, or in another key's attribute, it would overwrite that key, so `Entity.make` refuses it (`EDD-9106`), and the type system refuses the cases it can see. Any key half on a sharded index may share an attribute only when the two provably compose the same bytes: the same composites, casing and layout. `Table.make` decides a casing left to the schema, so an index that spells out `casing: "uppercase"` over the table's `sk` is refused on a lowercase schema and accepted on an uppercase one. Two indexes with no shards aren't judged.
 
 ### The stored key
 
@@ -374,6 +374,9 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 |---|---|---|
 | `"uncomposable"` | It is under another layout, and its values can't compose a current key (a `by` attribute cleared under `preserve`) | Write the attribute, or remove the item from the index, then run `rekey` again |
 | `"legacySortKey"` | Its sort key holds text from before 1.37 that its values don't compose: an index policy left it, so `rekey` can't rewrite it | Write that sort key's composites to the item, then run `rekey` again |
+| `"legacyPartitionKey"` | The same of its partition key on an index with no shards: only the 1.36 fallback reads it | Write that partition key's composites to the item, then run `rekey` again |
+
+A dry run reports what the real run does, conflicts included. Two keys can't be told from current text, so neither is reported: a value spelled like an escape (`50%25`), and a composite typed as a union of kinds whose value has gone.
 
 **Step 3: remove `previous`,** once a run reports no conflicts. Nothing reads what's left after that.
 
@@ -425,7 +428,7 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
 | `EDD-9105` | `concurrency` isn't a positive integer | The call |
-| `EDD-9106` | Two key halves stored in one attribute compose different text, sharded or not | Types, where they can see it, and `Entity.make` |
+| `EDD-9106` | Two key halves stored in one attribute, one of them on a sharded index, aren't provably the same bytes | Types, where they can see it, `Entity.make`, and `Table.make` for a casing left to the schema |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
 
 ## What's Next?
