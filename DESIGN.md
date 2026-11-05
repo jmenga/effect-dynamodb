@@ -1186,17 +1186,17 @@ current layout that can't compose is left alone with no conflict. This is step
 **Index keys, on every index: compare with what 1.36 composed, don't parse.** Nothing
 reads a value out of a stored key. An unsharded partition key, any sort key and a vector
 partition are rewritten only when the stored key is exactly the text 1.36 composed from
-the row's values, and that isn't the current text. Each half is judged by itself, so a
-half only touches a key that is its own 1.36 text, and which accessor owns an attribute
-two of them share, which a row's values can't say, never comes up. A sort key missing a
+the row's values, and that isn't the current text. Each half is judged by itself and by
+its bytes, with no question of which accessor owns an attribute two of them share, which
+a row's values can't say. So it can't tell a healthy key from another half's 1.36 text
+when the bytes match (canonical shape 13 in §7). A sort key missing a
 trailing composite is judged by the composites before the gap, which is what a row
 truncated under 1.36 stores. Anything else is left with no conflict: a key an index
 policy kept, one lagging its values, one cleared of them. A key the row doesn't have
 isn't written, since under `sparse` its absence can be deliberate. A Z-order index has no
 1.36 text, so only a sharded one's partition key is rewritten, and a table key attribute
 never is. A run that moves an item from its 1.36 table key reads the moved row and does
-the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would,
-but for an attribute two accessors of unsharded indexes share, which stays as stored.
+the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would.
 
 **The accepted limit.** A key that isn't its own 1.36 text stays, as when a row cleared a
 composite or the key lags its values. When its text changed in 1.37, once the fallback or
@@ -1771,7 +1771,7 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 
 12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
 
-13. **Two accessors storing their halves in one attribute, on a row holding composites of both** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index. Nothing on the row says which owns the attribute, so `rekey` never asks: a half is rewritten only when the stored key is its own 1.36 text, and a move leaves a shared attribute as stored. **The regression scenario from the first form of `rekey`'s comparison**, in which a sparse put, or an update of one accessor's composites, left `byRegion` for `byGroup`'s partition. Ordinary writes to such a pair aren't safe: an unrelated `.set()` overwrites the sort key of `byGroup`'s entry on the standard path, and flips `byRegion`'s partition key on the retain path. Those predate #183. Scenarios in `test/helpers/RekeyComparison.ts` (`sharedPairScenarios`, `sharedPairMoveScenarios`), on a recording table and DynamoDB Local, and on the composer in `KeyComposer.test.ts`.
+13. **Two unsharded accessors storing their halves in one attribute** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index. Such a pair isn't safe, and unlike #183's sharded pairs it isn't refused (D49). This is existing behaviour, not changed by #183, and left for a separate issue: an ordinary update can replace one half and leave a mismatched pair, including on a row that only ever populated one accessor; a table key move composes from the whole row with the later accessor winning, so a row can lose an entry; and `rekey` can't tell a healthy key from another half's 1.36 text when the bytes match, as with a partition key `[name]` and a sparse reverse index's sort key `[name]` on one attribute, and rewrites the healthy key. **What the fixture pins is `rekey`'s rule on such a pair, the regression scenario from its first comparison rule**, in which a sparse put, or an update of one accessor's composites, left `byRegion` for `byGroup`'s partition: a half is rewritten only when the stored key is its own 1.36 text. Include a control with the attributes apart, and a half that really is 1.36 text. Don't pin the defects above as desired. Scenarios in `test/helpers/RekeyComparison.ts` (`sharedPairScenarios`), on a recording table and DynamoDB Local, and on the composer in `KeyComposer.test.ts`.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 

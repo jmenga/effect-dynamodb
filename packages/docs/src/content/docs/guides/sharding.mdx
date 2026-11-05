@@ -374,7 +374,7 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 |---|---|---|
 | `"uncomposable"` | It is under another layout, and its values can't compose a current key (a `by` attribute cleared under `preserve`) | Write the attribute, or remove the item from the index, then run `rekey` again |
 
-`rekey` compares. A sharded partition key is composed from the row's values, and rewritten if it differs. Any other key is rewritten only when it is exactly its own 1.36 text, so it never overwrites another accessor's entry in an attribute two of them share. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
+`rekey` compares. A sharded partition key is composed from the row's values, and rewritten if it differs. Any other key is rewritten only when it is exactly its own 1.36 text. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
 
 A dry run judges each row on its own. A row whose destination is held by a row that can't move may be predicted as moved, and the real run then reports it as a conflict.
 
