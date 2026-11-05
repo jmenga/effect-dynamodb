@@ -170,7 +170,8 @@
     kept, which then name the item's current key), time-series events, aggregates, and the event
     streams passed in `options.streams` (the client doesn't register streams; a stream is copied,
     flipped in one conditional transaction, then deleted, while writers keep appending). Items
-    already at their current key whose index keys still hold 1.36 text are rewritten in place. It
+    already at their current key whose index keys still hold 1.36 text, a sort key truncated under
+    1.36 among them, are rewritten in place. It
     scans the table in `segments` parallel scan segments, `concurrency` rows of a page at once;
     `dryRun` counts what would move and writes nothing; `maxPages` bounds a run and `resume` goes
     on from its token, as from the last one `onProgress` received before an interruption. A row
