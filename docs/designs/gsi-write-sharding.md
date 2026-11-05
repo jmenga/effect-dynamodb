@@ -12,7 +12,7 @@ order and cursors); v1.7.x policy-aware GSI composition (#41 / #43 / #46); #171'
 1.36 fallback.
 **Affected packages:** `packages/schema` (`KeyComposer`, new `internal/Shards`, `Entity.make`),
 `packages/effect-dynamodb` (`Query`, new `internal/ShardMerge`, `internal/Cursor`,
-`internal/BoundQuery`, `DynamoClient`, `Collection`, `Entity`, `Table`, `internal/Rekey`,
+`internal/RangePlanner`, `internal/BoundQuery`, `DynamoClient`, `Collection`, `Entity`, `Table`,
 `internal/TransactableOps`), `packages/effect-dynamodb-geo` (rejection only),
 `packages/language-service`, `packages/docs`, `packages/doctest` (no code change).
 **Semver impact:** `minor`, 1.38.0 in lockstep. Purely additive for an index without `shards`:
