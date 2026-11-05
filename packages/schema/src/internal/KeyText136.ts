@@ -42,7 +42,12 @@ import {
   composeKey,
   KEY_DELIMITER,
 } from "../DynamoSchema.js"
-import { effectiveCasing, type IndexDefinition, isZOrderHalf } from "../KeyComposer.js"
+import {
+  effectiveCasing,
+  type IndexDefinition,
+  isZOrderHalf,
+  subtreeCondition,
+} from "../KeyComposer.js"
 
 /** Whether operations read and move rows under their 1.36 keys (`DynamoSchema.make`'s `legacyKeys`). */
 export const enabled = (schema: DynamoSchema.DynamoSchema): boolean => schema.legacyKeys !== false
@@ -279,7 +284,10 @@ const leadingSupplied = (index: IndexDefinition, record: Record<string, unknown>
 /**
  * The condition that selects, under 1.36's key text, the rows a query
  * accessor's pins select (`KeyComposer.composeSortKeyCondition`): `eq` on the
- * complete key, else `beginsWith` on the prefix and the delimiter.
+ * complete key; a partial prefix's subtree on a secondary index, with the row
+ * truncated there; else `beginsWith` on the prefix and the delimiter. 1.36's text
+ * is not escaped, so that subtree's range also holds longer sibling values (`new
+ * york` after `new`): the read judges each row by its values.
  */
 export const composeSortKeyCondition = (
   schema: DynamoSchema.DynamoSchema,
@@ -287,20 +295,24 @@ export const composeSortKeyCondition = (
   entityVersion: number,
   index: IndexDefinition,
   record: Record<string, unknown>,
-): { readonly eq: string } | { readonly beginsWith: string } => {
+):
+  | { readonly eq: string }
+  | { readonly beginsWith: string }
+  | { readonly between: readonly [string, string] } => {
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
-  return leadingSupplied(index, record) === index.sk.composite.length
-    ? { eq: prefix }
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+  if (leadingSupplied(index, record) === index.sk.composite.length) return { eq: prefix }
+  return index.index === undefined
+    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
+    : subtreeCondition(prefix)
 }
 
 /**
  * The condition that selects, under 1.36's key text, the rows an `eq` or
  * `beginsWith` bound on sort key composite `field` selects, every composite
  * before it pinned in `pinned` (`composeRangeUnder` in `DynamoClient.ts`):
- * `eq` on the last composite is its key, on any other the value's subtree (the
- * delimiter appended); a `beginsWith` is a prefix of the value's text, or `eq`
- * for a number, which has no text prefix.
+ * `eq` on the last composite is its key, on any other the value's subtree (on a
+ * secondary index with the row truncated there, as for pins); a `beginsWith` is a
+ * prefix of the value's text, or `eq` for a number, which has no text prefix.
  */
 export const composeBoundCondition = (
   schema: DynamoSchema.DynamoSchema,
@@ -310,7 +322,10 @@ export const composeBoundCondition = (
   pinned: Record<string, unknown>,
   field: string,
   bound: { readonly eq: unknown } | { readonly beginsWith: unknown },
-): { readonly eq: string } | { readonly beginsWith: string } => {
+):
+  | { readonly eq: string }
+  | { readonly beginsWith: string }
+  | { readonly between: readonly [string, string] } => {
   const casing = effectiveCasing(schema, index)
   const prefix = composeSortKeyBeginsWith(schema, entityType, entityVersion, index, pinned)
   const segment = (value: unknown) =>
@@ -323,7 +338,10 @@ export const composeBoundCondition = (
   }
   const value = "eq" in bound ? bound.eq : bound.beginsWith
   const last = index.sk.composite.indexOf(field) === index.sk.composite.length - 1
-  return last ? { eq: segment(value) } : { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
+  if (last) return { eq: segment(value) }
+  return index.index === undefined
+    ? { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
+    : subtreeCondition(segment(value))
 }
 
 /**

@@ -20,7 +20,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { shardOf } from "@effect-dynamodb/schema/internal/Shards.js"
-import { Config, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Config, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -553,6 +553,9 @@ describeConnected("#183 canonical shapes — shape 3, hierarchical", () => {
           expect(row.gsi3pk?.S).toContain(`#!8.${keyShard}#region_r`)
           expect(row.gsi3sk?.S).toBe("$sharding#v1#fleet#country_c")
           expect(ids(yield* fleet.byPlace({ region: "r" }).collect())).toEqual(["device-1"])
+          expect(ids(yield* fleet.byPlace({ region: "r", country: "c" }).collect())).toEqual([
+            "device-1",
+          ])
         }),
       { region: "r", country: "c", city: "x" },
     ),
@@ -726,6 +729,346 @@ describeConnected("#183 canonical shapes — Z-order sort keys", () => {
           )
         }),
       (name) => ZTable.layer({ name }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// A default source prunes when the accessor pins the whole primary key. The sort
+// key holds it, so the pins are the values the write hashed, serialized as it did.
+// ---------------------------------------------------------------------------
+
+describeConnected("#183 a default source: the whole primary key pinned", () => {
+  const COUNT = 20
+
+  const Pinned = Entity.make({
+    model: Device,
+    entityType: "Device",
+    primaryKey: {
+      pk: { field: "pk", composite: ["channel"] },
+      sk: { field: "sk", composite: ["deviceId"] },
+    },
+    indexes: {
+      byTenant: {
+        name: "gsi5",
+        pk: { field: "gsi5pk", composite: ["tenantId"] },
+        sk: { field: "gsi5sk", composite: ["groupId", "channel", "deviceId"] },
+        shards: COUNT,
+      },
+    },
+  })
+  const PinnedTable = Table.make({ schema, entities: { Pinned } })
+
+  const onPinned = <A, E>(body: (devices: any, tableName: string) => Effect.Effect<A, E, any>) =>
+    withTable(
+      PinnedTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({ entities: { Pinned }, tables: { PinnedTable } })
+          const devices: any = db.entities.Pinned
+          yield* Effect.forEach(
+            Array.from({ length: 200 }, (_, i) => ({
+              channel: "channel-a",
+              deviceId: `device-${i}`,
+              tenantId: "t-123",
+              groupId: "group-a",
+              status: "on",
+              reading: i,
+            })),
+            (item) => devices.put(item).asEffect(),
+            { concurrency: 16, discard: true },
+          )
+          return yield* body(devices, tableName)
+        }),
+      (name) => PinnedTable.layer({ name }),
+    )
+
+  const fullPin = (deviceId: string) => ({
+    tenantId: "t-123",
+    groupId: "group-a",
+    channel: "channel-a",
+    deviceId,
+  })
+
+  /** The partition a device was stored on, read back from the table. */
+  const storedPartition = (rows: ReadonlyArray<Record<string, AttributeValue>>, deviceId: string) =>
+    rows.find((row) => row.deviceId?.S === deviceId)!.gsi5pk!.S!
+
+  it.live("a full pin reads the one shard the row is on, for every row", () =>
+    onPinned((devices, tableName) =>
+      Effect.gen(function* () {
+        const rows = yield* scanAll(tableName)
+        expect(new Set(rows.map((row) => row.gsi5pk!.S!)).size).toBeGreaterThan(1)
+        for (let i = 0; i < 200; i += 7) {
+          const deviceId = `device-${i}`
+          const pin = devices.byTenant(fullPin(deviceId))
+          const explained: Query.QueryExplain = yield* pin.explain()
+          expect(explained.fanOut?.pruned, deviceId).toBe(true)
+          expect(explained.fanOut?.partitions, deviceId).toEqual([storedPartition(rows, deviceId)])
+          expect(ids(yield* pin.collect()), deviceId).toEqual([deviceId])
+        }
+      }),
+    ),
+  )
+
+  it.live("a partial pin fans out, and still finds every row", () =>
+    onPinned((devices) =>
+      Effect.gen(function* () {
+        for (const pins of [
+          { tenantId: "t-123" },
+          { tenantId: "t-123", groupId: "group-a" },
+          { tenantId: "t-123", groupId: "group-a", channel: "channel-a" },
+        ]) {
+          const query = devices.byTenant(pins)
+          const explained: Query.QueryExplain = yield* query.explain()
+          expect(explained.fanOut?.pruned).toBe(false)
+          expect(explained.fanOut?.partitions).toHaveLength(COUNT)
+          expect(yield* query.collect()).toHaveLength(200)
+        }
+      }),
+    ),
+  )
+
+  it.live("a pin in another case reaches the stored shard", () =>
+    onPinned((devices, tableName) =>
+      Effect.gen(function* () {
+        const rows = yield* scanAll(tableName)
+        const pin = devices.byTenant({
+          tenantId: "T-123",
+          groupId: "GROUP-A",
+          channel: "CHANNEL-A",
+          deviceId: "DEVICE-17",
+        })
+        const explained: Query.QueryExplain = yield* pin.explain()
+        expect(explained.fanOut?.partitions).toEqual([storedPartition(rows, "device-17")])
+        expect(ids(yield* pin.collect())).toEqual(["device-17"])
+      }),
+    ),
+  )
+
+  it.live("a cursor on a pruned query stays on the shard, and isn't another query's", () =>
+    onPinned((devices) =>
+      Effect.gen(function* () {
+        const pin = devices.byTenant(fullPin("device-17"))
+        const page: Query.Page<Device> = yield* pin.limit(1).fetch()
+        expect(ids(page.items)).toEqual(["device-17"])
+        if (Option.isSome(page.cursor)) {
+          const rest: Query.Page<Device> = yield* pin.limit(1).startFrom(page.cursor.value).fetch()
+          expect(rest.items).toEqual([])
+          expect(rest.cursor).toEqual(Option.none())
+        }
+        const wide: Query.Page<Device> = yield* devices
+          .byTenant({ tenantId: "t-123" })
+          .limit(1)
+          .fetch()
+        const refused = yield* pin
+          .startFrom(Option.getOrThrow(wide.cursor))
+          .collect()
+          .pipe(Effect.flip)
+        expect(String(refused.cause ?? refused)).toContain("[EDD-9094]")
+      }),
+    ),
+  )
+
+  it.live("`.where()` doesn't prune: the range is read on every shard", () =>
+    onPinned((devices) =>
+      Effect.gen(function* () {
+        const query = devices
+          .byTenant({ tenantId: "t-123", groupId: "group-a", channel: "channel-a" })
+          .where((t: any, { eq }: any) => eq(t.deviceId, "device-17"))
+        const explained: Query.QueryExplain = yield* query.explain()
+        expect(explained.fanOut?.pruned).toBe(false)
+        expect(ids(yield* query.collect())).toEqual(["device-17"])
+      }),
+    ),
+  )
+
+  it.live("`previous` isn't pruned: a row not yet moved is found by a full pin", () => {
+    const Moving = Entity.make({
+      model: Device,
+      entityType: "Device",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel"] },
+        sk: { field: "sk", composite: ["deviceId"] },
+      },
+      indexes: {
+        byTenant: {
+          name: "gsi5",
+          pk: { field: "gsi5pk", composite: ["tenantId"] },
+          sk: { field: "gsi5sk", composite: ["groupId", "channel", "deviceId"] },
+          shards: { count: 4, previous: 1 },
+        },
+      },
+    } as any) as any
+    const MovingTable = Table.make({ schema, entities: { Moving } })
+    return withTable(
+      MovingTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { Moving },
+            tables: { MovingTable },
+          } as any)
+          const devices = db.entities.Moving
+          yield* devices
+            .put({
+              channel: "channel-a",
+              deviceId: "device-17",
+              tenantId: "t-123",
+              groupId: "group-a",
+              status: "on",
+              reading: 1,
+            })
+            .asEffect()
+          const pin = devices.byTenant(fullPin("device-17"))
+          const explained: Query.QueryExplain = yield* pin.explain()
+          // One current shard, and the unsharded layout whole.
+          expect(explained.fanOut?.pruned).toBe(true)
+          expect(explained.fanOut?.partitions).toHaveLength(2)
+          expect(ids(yield* pin.collect())).toEqual(["device-17"])
+          // The same row where the unsharded layout left it.
+          const [row] = yield* scanAll(tableName)
+          const client = yield* DynamoClient
+          yield* client.updateItem({
+            TableName: tableName,
+            Key: { pk: row!.pk!, sk: row!.sk! },
+            UpdateExpression: "SET #pk = :pk",
+            ExpressionAttributeNames: { "#pk": "gsi5pk" },
+            ExpressionAttributeValues: { ":pk": { S: explained.fanOut!.partitions[1]! } },
+          })
+          expect(ids(yield* pin.collect())).toEqual(["device-17"])
+        }),
+      (name) => MovingTable.layer({ name }),
+    )
+  })
+
+  // A write hashes the primary key as `keyForm` serializes it. A number, a date and a
+  // transformed value reach the hash the way they do on the accessor.
+  class Typed extends Schema.Class<Typed>("Typed")({
+    tenantId: Schema.String,
+    seq: Schema.Number,
+    at: Schema.DateTimeUtc,
+    big: Schema.BigInt,
+  }) {}
+
+  const Typeds = Entity.make({
+    model: Typed,
+    entityType: "Typed",
+    primaryKey: {
+      pk: { field: "pk", composite: ["seq"] },
+      sk: { field: "sk", composite: ["at", "big"] },
+    },
+    indexes: {
+      byTenant: {
+        name: "gsi5",
+        pk: { field: "gsi5pk", composite: ["tenantId"] },
+        sk: { field: "gsi5sk", composite: ["seq", "at", "big"] },
+        shards: COUNT,
+      },
+    },
+  })
+  const TypedTable = Table.make({ schema, entities: { Typeds } })
+
+  it.live("typed composites hash on the accessor as they do on the write", () =>
+    withTable(
+      TypedTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({ entities: { Typeds }, tables: { TypedTable } })
+          const made = Array.from({ length: 30 }, (_, i) => ({
+            tenantId: "t-123",
+            seq: i * 1.5 - 7,
+            at: DateTime.makeUnsafe(1_780_000_000_000 + i * 86_400_000),
+            big: BigInt(i) * 1_000_000_000_000n,
+          }))
+          for (const item of made) yield* db.entities.Typeds.put(item).asEffect()
+          const rows = yield* scanAll(tableName)
+          for (const item of made) {
+            const stored = rows.find((row) => Number(row.seq?.N) === item.seq)!.gsi5pk!.S!
+            const pin = db.entities.Typeds.byTenant(item)
+            const explained: Query.QueryExplain = yield* pin.explain()
+            expect(explained.fanOut?.partitions, `seq ${item.seq}`).toEqual([stored])
+            const found = yield* pin.collect()
+            expect(
+              found.map((row) => row.seq),
+              `seq ${item.seq}`,
+            ).toEqual([item.seq])
+          }
+        }),
+      (name) => TypedTable.layer({ name }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shape 10 on a sharded index: an unrelated update must not move an entry.
+// ---------------------------------------------------------------------------
+
+describeConnected("#183 canonical shapes — shape 10, a half mixing key and mutable", () => {
+  class Mixed extends Schema.Class<Mixed>("Mixed")({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    zone: Schema.optional(Schema.String),
+    status: Schema.optional(Schema.String),
+  }) {}
+
+  const Mixeds = Entity.make({
+    model: Mixed,
+    entityType: "Mixed",
+    primaryKey: {
+      pk: { field: "pk", composite: ["channel"] },
+      sk: { field: "sk", composite: ["deviceId"] },
+    },
+    indexes: {
+      byZone: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["channel", "zone"] },
+        sk: { field: "gsi1sk", composite: ["deviceId"] },
+        shards: 8,
+      },
+    },
+  })
+  const MixedTable = Table.make({ schema, entities: { Mixeds } })
+
+  const onMixed = <A, E>(
+    initial: Record<string, unknown>,
+    body: (mixeds: any, tableName: string) => Effect.Effect<A, E, any>,
+  ) =>
+    withTable(
+      MixedTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({ entities: { Mixeds }, tables: { MixedTable } })
+          const mixeds: any = db.entities.Mixeds
+          yield* mixeds.put({ ...KEY, ...initial }).asEffect()
+          return yield* body(mixeds, tableName)
+        }),
+      (name) => MixedTable.layer({ name }),
+    )
+
+  it.live("an unrelated update leaves the entry on its shard, byte for byte", () =>
+    onMixed({ zone: "z" }, (mixeds, tableName) =>
+      Effect.gen(function* () {
+        const before = (yield* rowOf(tableName)).gsi1pk?.S
+        expect(before).toContain(`#!8.${keyShard}#channel_channel-a#zone_z`)
+        yield* mixeds.update(KEY).set({ status: "on" }).asEffect()
+        expect((yield* rowOf(tableName)).gsi1pk?.S).toBe(before)
+        const found = yield* mixeds.byZone({ channel: "channel-a", zone: "z" }).collect()
+        expect(ids(found)).toEqual(["device-1"])
+      }),
+    ),
+  )
+
+  it.live("an item lacking the composite joins only when a write names it", () =>
+    onMixed({}, (mixeds, tableName) =>
+      Effect.gen(function* () {
+        yield* mixeds.update(KEY).set({ status: "on" }).asEffect()
+        expect((yield* rowOf(tableName)).gsi1pk).toBeUndefined()
+        yield* mixeds.update(KEY).set({ zone: "z" }).asEffect()
+        expect((yield* rowOf(tableName)).gsi1pk?.S).toContain(
+          `#!8.${keyShard}#channel_channel-a#zone_z`,
+        )
+      }),
     ),
   )
 })

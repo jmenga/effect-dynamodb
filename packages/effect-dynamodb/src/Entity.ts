@@ -4935,20 +4935,16 @@ const makeImpl = <
     ],
     composed: (row) => {
       try {
-        // Rows of both forms live in a sharded index's unsharded layout (#183).
-        const keys = KeyComposer.composeIndexKeys(
+        // Rows of both forms live in a sharded index's unsharded layout (#183). A
+        // row truncated by the structural rule is stored at the key it composes;
+        // a binary key (Z-order) has no 1.36 form.
+        return KeyComposer.tryComposeStructuralKeys(
           schema,
           entityType,
           entityVersion,
           KeyComposer.unshardedView(index),
           keyForm(toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)),
         )
-        const pk = keys[index.pk.field]
-        const sk = keys[index.sk.field]
-        // A binary key (Z-order) has no 1.36 form.
-        return typeof pk === "string" && (sk === undefined || typeof sk === "string")
-          ? { pk, sk }
-          : undefined
       } catch {
         return undefined
       }
@@ -11354,31 +11350,29 @@ const makeImpl = <
         counter++
       }
 
-      // GSI key recomposition. v3 unifies append with update — both call
-      // the same composer. v1.7.2 (closes #43): the full encoded record is
-      // passed as both `updatePayload` and `keyRecord`. The previous
-      // v1.7.0 / v1.7.1 path filtered PK composites out of the payload on
-      // the rationale that they "never change during an append" — but
-      // combined with v1.7.1's per-half evaluation gate (which only looked
-      // at `updatePayload`), that filter caused any GSI half whose
-      // composites are entirely entity-PK composites to be classified as
-      // untouched on every append, silently skipping GSI evaluation. The
-      // PK exclusion never solved a real problem (the composer doesn't
-      // emit redundant SETs for the underlying composite fields, and
-      // idempotent recomposition from immutable PK composites is fine), so
-      // it's removed. The gate now broadens its "touched" check to also
-      // count `keyRecord` membership, so PK-composite-only halves are
-      // touched on every write and the structural rule composes them.
-      // EDD-9024 was deprecated in v1.7.1 — the composer doesn't throw for
-      // hole patterns. A Z-order value it can't place (EDD-9092, #171) fails
-      // the append with a `ValidationError`.
+      // GSI key recomposition. v3 unifies append with update — both call the
+      // same composer. The encoded input is the key record, and also the
+      // payload without the primary key composites, which every append repeats
+      // and so assert nothing: a half mixing one with a field this appendInput
+      // doesn't carry belongs to whichever writer owns that field (DESIGN.md §7,
+      // shape 10). A half made only of primary key composites still composes on
+      // every append, through the key record (#43). EDD-9024 was deprecated in
+      // v1.7.1 — the composer doesn't throw for hole patterns. A Z-order value
+      // it can't place (EDD-9092, #171) fails the append with a `ValidationError`.
+      const appendNamed = Object.fromEntries(
+        Object.entries(encoded).filter(
+          ([attr]) =>
+            !config.indexes.primary.pk.composite.includes(attr) &&
+            !config.indexes.primary.sk.composite.includes(attr),
+        ),
+      )
       const gsiUpdate = yield* composeKeysOrFail(entityType, "append", () =>
         KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
           entityType,
           entityVersion,
           allIndexes,
-          keyForm(encoded),
+          keyForm(appendNamed),
           keyForm(encoded),
           removedSet !== undefined ? { removedSet } : undefined,
         ),
@@ -12029,11 +12023,11 @@ const makeImpl = <
         // DynamoDB's rejection of the key condition (#144) names the accessor.
         keyConditionDiagnosis: { operation: "query", label: `${entityType}.query.${indexName}` },
       }).pipe((made) => Query.fanOut(made, read))
-      // `composeSortKeyCondition`: a partial prefix terminates on a segment
-      // boundary, or it matches sibling values that merely start with the
-      // supplied one (`status_done` also matching `status_done_archived`,
-      // issue #115); a complete key is an exact `=`, or `seq: 3` also
-      // matches 3.14.
+      // `composeSortKeyCondition`: a partial prefix stops on a segment boundary,
+      // or it matches sibling values that merely start with the supplied one
+      // (`status_done` also matching `status_done_archived`, issue #115), and on a
+      // secondary index takes the row truncated at it; a complete key is an exact
+      // `=`, or `seq: 3` also matches 3.14.
       const pinned = hasSkComposites
         ? Query.where(
             query,

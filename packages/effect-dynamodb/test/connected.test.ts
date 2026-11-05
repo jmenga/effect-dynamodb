@@ -5268,11 +5268,18 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
         // SK SET to truncated leading prefix.
         expect(item.gsi1sk as string).toBe("$ip-test#v1#hierasset#country_us#city_sf")
 
-        // begins_with query at city level still finds the asset.
+        // Found from each level above it, and from its own: a pin on `city` is the row
+        // at that level and its subtree.
         const atRegion = yield* db.entities.HierAssets.byLocation({
           region: "americas",
         }).collect()
         expect(atRegion.some((a) => a.assetId === "rack-9")).toBe(true)
+        const atCity = yield* db.entities.HierAssets.byLocation({
+          region: "americas",
+          country: "us",
+          city: "sf",
+        }).collect()
+        expect(atCity.some((a) => a.assetId === "rack-9")).toBe(true)
       }).pipe(provideHier),
   )
 

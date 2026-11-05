@@ -53,6 +53,68 @@ const refusal = (effect: Effect.Effect<unknown, unknown>) =>
 const partition = (shard: number, width = 1, count = 8) =>
   `$fleet-db#v1#devicestate#!${count}.${String(shard).padStart(width, "0")}#tenantid_${TENANT}`
 
+describe("rounds: what a page costs", () => {
+  const on = makeDevices({ shards: 20 })
+  const many = randomDevices(prng(7), 2000)
+
+  it.effect("`.fetch()` without a limit is one round: one request per shard", () =>
+    run(
+      (devices, server) =>
+        Effect.gen(function* () {
+          yield* devices.byTenant({ tenantId: TENANT }).fetch()
+          expect(server.inputs).toHaveLength(20)
+        }),
+      {},
+      many,
+      on,
+    ),
+  )
+
+  it.effect("`.limit(n).fetch()`: every shard at `n / N`, then the shards that ran dry", () =>
+    run(
+      (devices, server) =>
+        Effect.gen(function* () {
+          const page = yield* devices.byTenant({ tenantId: TENANT }).limit(100).fetch()
+          expect(page.items).toHaveLength(100)
+          const first = server.inputs.slice(0, 20)
+          expect(
+            new Set(first.map((input) => input.ExpressionAttributeValues![":pk"]!.S)),
+          ).toHaveProperty("size", 20)
+          // `n / N` and a margin: enough that a page rarely needs every shard again, not
+          // enough to spare the shards that run dry.
+          for (const input of first) {
+            expect(input.Limit).toBeGreaterThanOrEqual(5)
+            expect(input.Limit).toBeLessThan(10)
+          }
+          // A shard's first page runs out before a page of 100 is proven in order.
+          expect(server.inputs.length).toBeGreaterThan(20)
+        }),
+      {},
+      many,
+      on,
+    ),
+  )
+
+  it.effect("`.pageSize(n)` at the page's size: one round, reading more rows", () =>
+    run(
+      (devices, server) =>
+        Effect.gen(function* () {
+          const page = yield* devices
+            .byTenant({ tenantId: TENANT })
+            .limit(100)
+            .pageSize(100)
+            .fetch()
+          expect(page.items).toHaveLength(100)
+          expect(server.inputs).toHaveLength(20)
+          for (const input of server.inputs) expect(input.Limit).toBe(100)
+        }),
+      {},
+      many,
+      on,
+    ),
+  )
+})
+
 describe("requests", () => {
   it.effect("collect reads each partition once, with one key condition per shard", () =>
     run((devices, server) =>
@@ -142,14 +204,164 @@ describe("requests", () => {
     )
   })
 
-  it.effect("a default source never prunes, whatever is pinned", () =>
-    run((devices, server) =>
-      Effect.gen(function* () {
-        yield* devices.byTenant({ tenantId: TENANT, groupId: "group-a" }).collect()
-        expect(server.inputs).toHaveLength(8)
-      }),
-    ),
-  )
+  describe("a default source: the whole primary key pinned", () => {
+    const target = items[17]!
+    const fullPin = {
+      tenantId: TENANT,
+      groupId: target.groupId,
+      channel: target.channel,
+      deviceId: target.deviceId,
+    }
+    const storedPk = fixture.rowOf(target).gsi5pk!.S!
+
+    it.effect("reads the one shard the row is on", () =>
+      run((devices, server) =>
+        Effect.gen(function* () {
+          const found = yield* devices.byTenant(fullPin).collect()
+          expect(server.partitionsRead()).toEqual([storedPk])
+          expect(idsOf(found)).toEqual([target.deviceId])
+          const explained: Query.QueryExplain = yield* devices.byTenant(fullPin).explain()
+          expect(explained.fanOut?.pruned).toBe(true)
+          expect(explained.fanOut?.partitions).toEqual([storedPk])
+          expect(explained.reason).toContain("one shard")
+        }),
+      ),
+    )
+
+    it.effect("a partial pin still fans out", () =>
+      run((devices, server) =>
+        Effect.gen(function* () {
+          for (const pins of [
+            { tenantId: TENANT, groupId: target.groupId },
+            { tenantId: TENANT, groupId: target.groupId, channel: target.channel },
+          ]) {
+            server.clear()
+            const found = yield* devices.byTenant(pins).collect()
+            expect(server.inputs).toHaveLength(8)
+            expect(idsOf(found)).toContain(target.deviceId)
+            const explained: Query.QueryExplain = yield* devices.byTenant(pins).explain()
+            expect(explained.fanOut?.pruned).toBe(false)
+          }
+        }),
+      ),
+    )
+
+    it.effect("a pin in another case reaches the stored shard and finds the row", () =>
+      run((devices, server) =>
+        Effect.gen(function* () {
+          const found = yield* devices
+            .byTenant({
+              tenantId: TENANT,
+              groupId: target.groupId.toUpperCase(),
+              channel: target.channel.toUpperCase(),
+              deviceId: target.deviceId.toUpperCase(),
+            })
+            .collect()
+          expect(server.partitionsRead()).toEqual([storedPk])
+          expect(idsOf(found)).toEqual([target.deviceId])
+        }),
+      ),
+    )
+
+    it.effect("a fetch chain on a pruned query stays on the shard and ends", () =>
+      run((devices, server) =>
+        Effect.gen(function* () {
+          const query = devices.byTenant(fullPin).limit(1)
+          const first = yield* query.fetch()
+          expect(idsOf(first.items)).toEqual([target.deviceId])
+          if (Option.isSome(first.cursor)) {
+            const second = yield* query.startFrom(first.cursor.value).fetch()
+            expect(second.items).toEqual([])
+            expect(second.cursor).toEqual(Option.none())
+          }
+          expect(new Set(server.partitionsRead())).toEqual(new Set([storedPk]))
+        }),
+      ),
+    )
+
+    it.effect("a pruned query's cursor is one of its own: another query's is refused", () => {
+      // A whole-primary-key pin holds one row, so a page with more behind it takes
+      // a pruned `by` query. The cursor format is the same: one per index.
+      const on = makeDevices({ shards: { count: 8, by: ["groupId"] } })
+      return run(
+        (devices) =>
+          Effect.gen(function* () {
+            const pruned = devices.byTenant({ tenantId: TENANT, groupId: target.groupId })
+            const page = yield* pruned.limit(1).fetch()
+            const cursor = Option.getOrThrow(page.cursor as Option.Option<string>)
+            const rest = yield* pruned.startFrom(cursor).collect()
+            expect([...idsOf(page.items), ...idsOf(rest)]).toEqual(idsOf(yield* pruned.collect()))
+            yield* refusal(devices.byTenant({ tenantId: TENANT }).startFrom(cursor).collect())
+            const wide = yield* devices.byTenant({ tenantId: TENANT }).limit(1).fetch()
+            yield* refusal(
+              pruned.startFrom(Option.getOrThrow(wide.cursor as Option.Option<string>)).collect(),
+            )
+          }),
+        {},
+        items,
+        on,
+      )
+    })
+
+    it.effect("a primary key composite outside the sort key: it never fires", () => {
+      const on = makeDevices({ shards: 8, sk: ["groupId", "deviceId"] })
+      return run(
+        (devices, server) =>
+          Effect.gen(function* () {
+            const found = yield* devices
+              .byTenant({ tenantId: TENANT, groupId: target.groupId, deviceId: target.deviceId })
+              .collect()
+            expect(server.inputs).toHaveLength(8)
+            expect(idsOf(found)).toEqual([target.deviceId])
+          }),
+        {},
+        items,
+        on,
+      )
+    })
+
+    it.effect("`.where()` doesn't prune, even to the last primary key composite", () =>
+      run((devices, server) =>
+        Effect.gen(function* () {
+          const found = yield* devices
+            .byTenant({ tenantId: TENANT, groupId: target.groupId, channel: target.channel })
+            .where((t: any, { eq }: any) => eq(t.deviceId, target.deviceId))
+            .collect()
+          expect(server.inputs).toHaveLength(8)
+          expect(idsOf(found)).toEqual([target.deviceId])
+        }),
+      ),
+    )
+
+    for (const [previous, partitions] of [
+      [1, 2],
+      [4, 5],
+    ] as const) {
+      it.effect(`\`previous: ${previous}\` isn't pruned: ${partitions} partitions`, () => {
+        const on = makeDevices({ shards: { count: 8, previous } })
+        const server = on.serve(items)
+        return Effect.gen(function* () {
+          const devices = yield* on.client
+          const found = yield* devices.byTenant(fullPin).collect()
+          expect(server.inputs).toHaveLength(partitions)
+          expect(idsOf(found)).toEqual([target.deviceId])
+        }).pipe(Effect.provide(server.layer)) as Effect.Effect<void, unknown>
+      })
+    }
+
+    it("Entity.query.<index> prunes as the accessor does", () => {
+      const query = fixture.Devices.query.byTenant(fullPin)
+      expect(query._state.pkValue).toBe(storedPk)
+      expect(query._state.fanOut?.pruned).toBe(true)
+      expect(query._state.fanOut?.partitions).toEqual([storedPk])
+    })
+
+    it("a partial pin on Entity.query.<index> fans out", () => {
+      const partial = fixture.Devices.query.byTenant({ tenantId: TENANT })
+      expect(partial._state.fanOut?.pruned).toBe(false)
+      expect(partial._state.fanOut?.partitions).toHaveLength(8)
+    })
+  })
 
   it.effect("`.where()` doesn't prune, even on a `by` attribute", () => {
     const on = makeDevices({ shards: { count: 8, by: ["groupId"] } })

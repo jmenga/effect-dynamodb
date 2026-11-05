@@ -2370,3 +2370,285 @@ describe("Entity update — sharded indexes, canonical shapes (#183)", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// Canonical shape 10 (#183): a half mixing a primary key composite with a mutable
+// one. One composite in the key record is no claim on the half: an update that
+// names no composite of it must leave the stored key byte for byte, on every path.
+// ---------------------------------------------------------------------------
+
+class MixedDevice extends Schema.Class<MixedDevice>("MixedDevice")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  at: Schema.DateTimeUtc,
+  zone: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+}) {}
+
+const mixedIndexes = {
+  leadingSparse: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["channel"] },
+    sk: { field: "gsi1sk", composite: ["zone", "deviceId"] },
+    indexPolicy: { sk: "sparse" },
+  },
+  leadingPreserve: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["channel"] },
+    sk: { field: "gsi2sk", composite: ["zone", "deviceId"] },
+  },
+  trailing: {
+    name: "gsi3",
+    pk: { field: "gsi3pk", composite: ["channel"] },
+    sk: { field: "gsi3sk", composite: ["deviceId", "zone"] },
+  },
+  mixedPk: {
+    name: "gsi4",
+    pk: { field: "gsi4pk", composite: ["channel", "zone"] },
+    sk: { field: "gsi4sk", composite: ["deviceId"] },
+  },
+  sharded: {
+    name: "gsi5",
+    pk: { field: "gsi5pk", composite: ["channel", "zone"] },
+    sk: { field: "gsi5sk", composite: ["deviceId"] },
+    shards: 8,
+  },
+} as const
+
+const mixedPrimary = {
+  pk: { field: "pk", composite: ["channel"] },
+  sk: { field: "sk", composite: ["deviceId"] },
+} as const
+
+const MixedSchema = DynamoSchema.make({ name: "mixed", version: 1 })
+const MixedDevices = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedDevice",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+})
+const MixedRetained = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedRetained",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  versioned: { retain: true },
+})
+const MixedSeries = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedSeries",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      at: Schema.DateTimeUtc,
+      status: Schema.optional(Schema.String),
+    }),
+  },
+})
+const MixedSeriesWithZone = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedSeries",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      at: Schema.DateTimeUtc,
+      zone: Schema.optional(Schema.String),
+    }),
+  },
+})
+const MixedTable = Table.make({
+  schema: MixedSchema,
+  entities: { MixedDevices, MixedRetained, MixedSeries },
+})
+const MixedZoneTable = Table.make({
+  schema: MixedSchema,
+  entities: { MixedSeriesWithZone },
+})
+
+/** Every half the unrelated writes below must not touch. */
+const MIXED_HALVES = ["gsi1sk", "gsi2sk", "gsi3sk", "gsi4pk", "gsi5pk"] as const
+
+const mixedStored = (entityType: string, zone?: string): Record<string, AttributeValue> => ({
+  pk: { S: `$mixed#v1#${entityType.toLowerCase()}#channel_c-1` },
+  sk: { S: `$mixed#v1#${entityType.toLowerCase()}#deviceid_d-1` },
+  channel: { S: "c-1" },
+  deviceId: { S: "d-1" },
+  at: { S: "2026-04-30T10:00:00.000Z" },
+  version: { N: "1" },
+  __edd_e__: { S: entityType },
+  ...(zone === undefined ? {} : { zone: { S: zone } }),
+})
+
+const mixedLayer = (capture: Capture, stored: Record<string, AttributeValue>) =>
+  Layer.mergeAll(
+    Layer.succeed(
+      DynamoClient,
+      mockDynamoClient({
+        ...makeMockClient(capture),
+        getItem: () => Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: stored })),
+        updateItem: (input) => {
+          capture.updateItem = input
+          return Effect.succeed(mockOutput<UpdateItemCommandOutput>({ Attributes: stored }))
+        },
+      }),
+    ),
+    MixedTable.layer({ name: "mixed-table" }),
+    MixedZoneTable.layer({ name: "mixed-table" }),
+  )
+
+const mixedClient = DynamoClient.make({
+  entities: { MixedDevices, MixedRetained, MixedSeries },
+  tables: { MixedTable },
+})
+
+const standardMixed = (
+  f: (devices: Effect.Success<typeof mixedClient>["entities"]["MixedDevices"]) => ZWrite,
+) => {
+  const capture: Capture = {}
+  return Effect.gen(function* () {
+    const db = yield* mixedClient
+    yield* f(db.entities.MixedDevices).asEffect()
+    return wireOf(capture.updateItem!)
+  }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedDevice"))), Effect.scoped)
+}
+
+const expectUntouched = (wire: ReturnType<typeof wireOf>) => {
+  for (const half of MIXED_HALVES) {
+    expect(wire.sets, half).not.toHaveProperty(half)
+    expect(wire.removes.has(half), half).toBe(false)
+  }
+}
+
+describe("Entity writes — shape 10: a half mixing a primary key composite with a mutable one", () => {
+  describe("the standard path", () => {
+    it.effect("an unrelated update leaves every mixed half alone, under both policies", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).set({ status: "on" }),
+        )
+        expectUntouched(wire)
+        // The halves wholly in the primary key still compose (#43).
+        expect(wire.sets.gsi1pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1")
+        expect(wire.sets.gsi4sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1")
+      }),
+    )
+
+    it.effect("naming the mutable composite composes each half", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).set({ zone: "z" }),
+        )
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixeddevice#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi2sk?.S).toBe("$mixed#v1#mixeddevice#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1#zone_z")
+        expect(wire.sets.gsi5pk?.S).toBe(
+          `$mixed#v1#mixeddevice#!8.${shardOf(["c-1", "d-1"], 8)}#channel_c-1#zone_z`,
+        )
+        expect(wire.removes.size).toBe(0)
+      }),
+    )
+
+    it.effect("`.remove()` cascades: a leading hole drops, a trailing one truncates", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).remove(["zone"]),
+        )
+        expect(wire.removes.has("gsi1sk")).toBe(true)
+        expect(wire.removes.has("gsi2sk")).toBe(true)
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1")
+      }),
+    )
+  })
+
+  describe("the retain path", () => {
+    const retained = (zone?: string) => {
+      const capture: Capture = {}
+      const stored = mixedStored("MixedRetained", zone)
+      return Effect.gen(function* () {
+        const db = yield* mixedClient
+        yield* db.entities.MixedRetained.update({ channel: "c-1", deviceId: "d-1" }).set({
+          status: "on",
+        })
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        return wireOf(tx.TransactItems.find((item) => item.Update !== undefined)!.Update!)
+      }).pipe(Effect.provide(mixedLayer(capture, stored)), Effect.scoped)
+    }
+
+    it.effect("an item lacking the mutable composite gets no such half", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained()
+        for (const half of MIXED_HALVES) expect(wire.sets, half).not.toHaveProperty(half)
+      }),
+    )
+
+    it.effect("an item holding it recomposes the key it already has: idempotent", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained("z")
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixedretained#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixedretained#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixedretained#channel_c-1#zone_z")
+        expect(wire.removes.size).toBe(0)
+      }),
+    )
+  })
+
+  describe("the append path", () => {
+    const at = DateTime.makeUnsafe("2026-04-30T11:00:00.000Z")
+
+    it.effect("appendInput repeating the primary key claims no mixed half", () => {
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* mixedClient
+        yield* db.entities.MixedSeries.append({
+          channel: "c-1",
+          deviceId: "d-1",
+          at,
+          status: "on",
+        }).skipFollowUp()
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        const wire = wireOf(tx.TransactItems[0]!.Update!)
+        expectUntouched(wire)
+        // Wholly primary halves still compose (#43).
+        expect(wire.sets.gsi1pk?.S).toBe("$mixed#v1#mixedseries#channel_c-1")
+        expect(wire.sets.gsi4sk?.S).toBe("$mixed#v1#mixedseries#deviceid_d-1")
+      }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedSeries"))), Effect.scoped)
+    })
+
+    it.effect("an appendInput carrying the mutable composite composes them", () => {
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { MixedSeriesWithZone },
+          tables: { MixedZoneTable },
+        })
+        yield* db.entities.MixedSeriesWithZone.append({
+          channel: "c-1",
+          deviceId: "d-1",
+          at,
+          zone: "z",
+        }).skipFollowUp()
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        const wire = wireOf(tx.TransactItems[0]!.Update!)
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixedseries#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixedseries#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixedseries#channel_c-1#zone_z")
+      }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedSeries"))), Effect.scoped)
+    })
+  })
+})

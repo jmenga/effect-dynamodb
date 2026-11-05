@@ -215,12 +215,12 @@ describe("an accessor given every sort key composite matches the key exactly (#1
     }),
   )
 
-  it.effect("a partial pin is a terminated begins_with: tag t, every seq in order", () =>
+  it.effect("a partial pin selects the prefix and below: tag t, every seq in order", () =>
     Effect.gen(function* () {
       requests.length = 0
       const got = yield* collect("byTag", { sensorId: "s-1", tag: "t" }, false)
       expect(got.map((r) => r.seq)).toEqual([...SEQS].sort((a, b) => a - b))
-      expect(requests.at(-1)?.keyCondition).toBe("#pk = :pk AND begins_with(#sk, :sk)")
+      expect(requests.at(-1)?.keyCondition).toBe("#pk = :pk AND #sk BETWEEN :sk1 AND :sk2")
     }),
   )
 
@@ -231,11 +231,11 @@ describe("an accessor given every sort key composite matches the key exactly (#1
       eq: KeyComposer.composeSk(AppSchema, "Reading", 1, index, { tag: "t", seq: 3 }),
     })
     const partial = Readings.query.byTag({ sensorId: "s-1", tag: "t" } as never)
-    expect(partial._state.skConditions[0]!.condition).toEqual({
-      beginsWith: KeyComposer.composeSortKeyBeginsWith(AppSchema, "Reading", 1, index, {
-        tag: "t",
-      }),
-    })
+    expect(partial._state.skConditions[0]!.condition).toEqual(
+      KeyComposer.subtreeCondition(
+        KeyComposer.composeSortKeyPrefix(AppSchema, "Reading", 1, index, { tag: "t" }),
+      ),
+    )
   })
 
   // A number has no text prefix: `.where(beginsWith)` on a numeric composite

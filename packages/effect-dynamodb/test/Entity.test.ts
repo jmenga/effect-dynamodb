@@ -3187,7 +3187,7 @@ describe("Entity", () => {
       expect(q._state.skConditions).toHaveLength(0)
     })
 
-    it("query with PK + partial SK params applies beginsWith condition", () => {
+    it("query with PK + partial SK params selects the prefix and what is below it", () => {
       const UserEntity = withConfig(
         Entity.make({
           model: User,
@@ -3208,10 +3208,11 @@ describe("Entity", () => {
 
       const q = UserEntity.query.byRole({ role: "admin", userId: "u-1" })
       expect(q._state.skConditions).toHaveLength(1)
-      expect(q._state.skConditions[0]!.condition).toHaveProperty("beginsWith")
-      expect((q._state.skConditions[0]!.condition as { beginsWith: string }).beginsWith).toContain(
-        "u-1",
-      )
+      const { between } = q._state.skConditions[0]!.condition as {
+        between: readonly [string, string]
+      }
+      expect(between[0]).toContain("u-1")
+      expect(between[1]).toBe(`${between[0]}#\uFFFF`)
     })
 
     it("query with PK + full SK composites matches the complete key with eq", () => {

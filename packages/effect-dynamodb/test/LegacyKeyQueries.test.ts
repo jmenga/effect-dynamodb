@@ -317,6 +317,82 @@ describe("legacy key queries — zero overhead", () => {
   )
 })
 
+describe("legacy key queries — a pin whose text didn't change, on a truncated row's level", () => {
+  // 1.36 didn't escape: `label_a b` sorts between `label_a` and `label_a#`, inside the
+  // subtree of the pin on `a`. The read sends what it would with the fallback off, one
+  // query and nothing more, and judges each row by its key.
+  const sibling = {
+    site: "s1",
+    zone: 7,
+    label: "a b",
+    tag: "t",
+    seq: 1,
+  }
+  const child = { site: "s2", zone: 7, label: "a", tag: "t", seq: 2 }
+
+  const pinned = <A extends World>(w: A) =>
+    Effect.gen(function* () {
+      const db = yield* clientOf(w)
+      yield* db.entities.Readings.put(sibling).asEffect()
+      yield* db.entities.Readings.put(child).asEffect()
+      return yield* db.entities.Readings.byZone({ zone: 7, label: "a" }).collect()
+    })
+
+  it.effect("the same requests with the fallback on and off", () =>
+    Effect.gen(function* () {
+      const onTable = freshTable()
+      const offTable = freshTable()
+      yield* inTable(On, onTable, pinned(On))
+      yield* inTable(Off, offTable, pinned(Off))
+      const queries = (table: Recording) =>
+        normalized(table.requests).filter((request: Request) => request.command === "Query")
+      expect(queries(onTable)).toHaveLength(1)
+      expect(queries(onTable)).toEqual(queries(offTable))
+    }),
+  )
+
+  it.effect("the row under 1.36's text inside the range isn't returned", () =>
+    Effect.gen(function* () {
+      const table = freshTable()
+      const found = yield* inTable(
+        On,
+        table,
+        Effect.gen(function* () {
+          const db = yield* clientOf(On)
+          yield* db.entities.Readings.put(sibling).asEffect()
+          yield* db.entities.Readings.put(child).asEffect()
+          // `label_a b` is where 1.36 left the sibling: in the pin's range.
+          const keys = KeyComposer.composeAllKeys(
+            On.schema,
+            "Reading",
+            1,
+            On.Readings.indexes,
+            sibling,
+          )
+          const old = KeyText136.composeAllKeys(
+            On.schema,
+            "Reading",
+            1,
+            On.Readings.indexes,
+            sibling,
+          )
+          expect(old.gsi1sk).toContain("label_a b")
+          const client = yield* DynamoClient
+          yield* client.updateItem({
+            TableName: "t",
+            Key: { pk: { S: keys.pk as string }, sk: { S: keys.sk as string } },
+            UpdateExpression: "SET #sk = :sk",
+            ExpressionAttributeNames: { "#sk": "gsi1sk" },
+            ExpressionAttributeValues: { ":sk": { S: old.gsi1sk as string } },
+          })
+          return yield* db.entities.Readings.byZone({ zone: 7, label: "a" }).collect()
+        }),
+      )
+      expect(found.map((row: { readonly seq: number }) => row.seq)).toEqual([2])
+    }),
+  )
+})
+
 // ---------------------------------------------------------------------------
 // Entity accessors
 // ---------------------------------------------------------------------------
@@ -376,7 +452,10 @@ describe("legacy key queries — an accessor over pins whose text changed", () =
         On.Readings.indexes.byZone,
         { label: "a b" },
       )
-      expect(conditions[0]).toContain("beginsWith" in condition136 ? condition136.beginsWith : "")
+      expect("between" in condition136 ? condition136.between : []).toHaveLength(2)
+      for (const bound of "between" in condition136 ? condition136.between : []) {
+        expect(conditions[0]).toContain(bound)
+      }
     }),
   )
 

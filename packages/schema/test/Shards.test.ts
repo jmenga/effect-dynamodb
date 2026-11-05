@@ -381,13 +381,129 @@ describe("composeReadPartitions", () => {
     })
   })
 
-  it("a default source is never pruned", () => {
-    const { partitions } = read(index(defaultSource(4)), {
-      tenantId: "t",
-      channel: "c",
-      deviceId: "d",
+  describe("a default source prunes when the accessor pins the whole primary key", () => {
+    const pinsPrimary = index(defaultSource(8), {
+      sk: { field: "gsi5sk", composite: ["groupId", "channel", "deviceId"] },
     })
-    expect(partitions).toHaveLength(4)
+    const stored = KeyComposer.composePk(schema, "DeviceState", pinsPrimary, {
+      tenantId: "t",
+      channel: "c-1",
+      deviceId: "d-1",
+    })
+    const pins = { tenantId: "t", groupId: "g", channel: "c-1", deviceId: "d-1" }
+
+    it("reads the one shard the write stored", () => {
+      const { partitions, fanOut } = read(pinsPrimary, pins)
+      expect(partitions).toEqual([stored])
+      expect(fanOut?.pruned).toBe(true)
+      expect(fanOut?.source).toEqual(["channel", "deviceId"])
+    })
+
+    it("a partial pin fans out", () => {
+      for (const partial of [
+        { tenantId: "t" },
+        { tenantId: "t", groupId: "g" },
+        { tenantId: "t", groupId: "g", channel: "c-1" },
+      ]) {
+        const { partitions, fanOut } = read(pinsPrimary, partial)
+        expect(partitions).toHaveLength(8)
+        expect(fanOut?.pruned).toBe(false)
+      }
+    })
+
+    it("an input in another case reaches the stored shard", () => {
+      for (const [channel, deviceId] of [
+        ["C-1", "D-1"],
+        ["c-1", "D-1"],
+        ["C-1", "d-1"],
+      ]) {
+        expect(read(pinsPrimary, { ...pins, channel, deviceId }).partitions).toEqual([stored])
+      }
+    })
+
+    it("a primary key composite outside the sort key never prunes: it can't be pinned", () => {
+      const { partitions, fanOut } = read(index(defaultSource(4)), {
+        tenantId: "t",
+        groupId: "g",
+        channel: "c",
+        deviceId: "d",
+      })
+      expect(partitions).toHaveLength(4)
+      expect(fanOut?.pruned).toBe(false)
+    })
+
+    it("a value past a hole selects nothing, so it doesn't prune", () => {
+      const { partitions, fanOut } = read(pinsPrimary, {
+        tenantId: "t",
+        channel: "c-1",
+        deviceId: "d-1",
+      })
+      expect(partitions).toHaveLength(8)
+      expect(fanOut?.pruned).toBe(false)
+      const hashedPastHole = index({
+        count: 4,
+        by: ["deviceId"],
+        previous: undefined,
+        source: ["deviceId"],
+      })
+      expect(read(hashedPastHole, { tenantId: "t", deviceId: "d" }).partitions).toHaveLength(4)
+    })
+
+    it("a source composite in the partition key half is pinned as well", () => {
+      const spread = index(defaultSource(8), {
+        pk: { field: "gsi5pk", composite: ["tenantId", "channel"] },
+        sk: { field: "gsi5sk", composite: ["deviceId"] },
+      })
+      const record = { tenantId: "t", channel: "c-1", deviceId: "d-1" }
+      expect(read(spread, record).partitions).toEqual([
+        KeyComposer.composePk(schema, "DeviceState", spread, record),
+      ])
+      expect(read(spread, { tenantId: "t", channel: "c-1" }).partitions).toHaveLength(8)
+    })
+
+    it("hashes non-string values as the write does", () => {
+      const typed = index(
+        { count: 8, by: undefined, previous: undefined, source: ["seq", "at", "wide"] },
+        { sk: { field: "gsi5sk", composite: ["seq", "at", "wide"] } },
+      )
+      const record = {
+        tenantId: "t",
+        seq: -3,
+        at: DateTime.makeUnsafe("2026-01-02T03:04:05.000Z"),
+        wide: 42n,
+      }
+      expect(read(typed, record).partitions).toEqual([
+        KeyComposer.composePk(schema, "DeviceState", typed, record),
+      ])
+    })
+
+    it("`previous` stays unpruned, and `prune: false` reads every shard", () => {
+      const moving = index(defaultSource(8, 2), {
+        sk: { field: "gsi5sk", composite: ["groupId", "channel", "deviceId"] },
+      })
+      const { partitions } = read(moving, pins)
+      expect(shardsOf(partitions).slice(1)).toEqual(["!2.0", "!2.1"])
+      expect(partitions).toHaveLength(3)
+      expect(
+        KeyComposer.composeReadPartitions(schema, "DeviceState", pinsPrimary, pins, {
+          prune: false,
+        }).partitions,
+      ).toHaveLength(8)
+    })
+
+    it("a Z-order sort key never prunes: an accessor can't pin it", () => {
+      const zorder = {
+        ...index(defaultSource(4)),
+        sk: {
+          field: "gsi5sk",
+          composite: ["channel", "deviceId"],
+          zorderHalf: { prefix: [], dimensions: [], layout: undefined },
+        },
+      } as unknown as KeyComposer.IndexDefinition
+      expect(
+        read(zorder, { tenantId: "t", channel: "c-1", deviceId: "d-1" }).partitions,
+      ).toHaveLength(4)
+    })
   })
 
   it("prunes to one shard when every `by` attribute is pinned", () => {

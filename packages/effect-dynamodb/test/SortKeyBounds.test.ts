@@ -854,9 +854,13 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
           for (const bound of conditions(x, y)) {
             for (const isLast of [false, true]) {
               for (const clamped of [false, true]) {
-                const composed = composeRangeUnder({ casing, isLast }, prefixText, "city", bound, {
-                  clampToPrefix: clamped,
-                })
+                const composed = composeRangeUnder(
+                  { casing, isLast, secondary: false },
+                  prefixText,
+                  "city",
+                  bound,
+                  { clampToPrefix: clamped },
+                )
                 // 1.36 refused a strict `lt` on a clamped last composite
                 // (EDD-9046): BETWEEN's inclusive high end is now the greatest
                 // key text below the value. A number's `beginsWith` is `eq`.

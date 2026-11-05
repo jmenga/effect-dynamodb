@@ -714,6 +714,35 @@ export const composeStoredPk = (
 }
 
 /**
+ * The index key a row's values compose now, truncating a half whose trailing
+ * composites are absent as the structural rule does (`DESIGN.md §7`). `undefined`
+ * when a half can't compose (a hole, or no leading value) or the sort key is a
+ * binary Z-order address.
+ */
+export const tryComposeStructuralKeys = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): { readonly pk: string; readonly sk: string } | undefined => {
+  if (isZOrderHalf(index.sk)) return undefined
+  const pk = classifyHalf(index.pk.composite, record, "sparse", false)
+  const sk = classifyHalf(index.sk.composite, record, "sparse", false)
+  if (pk.kind !== "set" || sk.kind !== "set") return undefined
+  return {
+    pk:
+      pk.length === index.pk.composite.length
+        ? composePk(schema, entityType, index, record)
+        : composePkPrefixUpTo(schema, entityType, index, record, pk.length),
+    sk:
+      sk.length === index.sk.composite.length
+        ? composeSk(schema, entityType, entityVersion, index, record)
+        : composeSkPrefixUpTo(schema, entityType, entityVersion, index, record, sk.length),
+  }
+}
+
+/**
  * Does stored partition key text lie in `index`'s current layout (#183): shard
  * marker with this count, whatever shard? A row whose values can't compose its key
  * can only be left alone when this holds.
@@ -738,6 +767,27 @@ const boundShardSource = (index: IndexDefinition, shards: IndexShards): Readonly
 }
 
 /**
+ * Do the pins in `record` name every attribute of the shard source? A pin is a
+ * partition key composite or part of the sort key's leading run of present values:
+ * what a key condition can select. A value elsewhere in `record` selects nothing,
+ * and reading one shard for it would lose the rows of the others.
+ */
+const pinsShardSource = (
+  index: IndexDefinition,
+  source: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+): boolean => {
+  const pins = new Set(index.pk.composite)
+  if (!isZOrderHalf(index.sk)) {
+    for (const attr of index.sk.composite) {
+      if (!hasValue(record[attr])) break
+      pins.add(attr)
+    }
+  }
+  return source.every((attr) => pins.has(attr) && hasValue(record[attr]))
+}
+
+/**
  * What a query of an index reads (#183): the partition key text of each physical
  * partition, and on a sharded index, what the fan-out needs to know.
  */
@@ -752,7 +802,7 @@ export interface ReadFanOut {
   readonly count: number
   readonly source: ReadonlyArray<string>
   readonly previous: number | undefined
-  /** Every `by` attribute was pinned, so one current shard is read. */
+  /** Every attribute of the shard source was pinned, so one current shard is read. */
   readonly pruned: boolean
   /** The partition of the unsharded layout, when `previous` is `1`. */
   readonly unsharded: string | undefined
@@ -760,10 +810,11 @@ export interface ReadFanOut {
 
 /**
  * The partitions a query of `index` reads for the pinned composites in `record`,
- * in merge order: the current layout's by shard number (one, when every `by`
- * attribute is pinned), then the `previous` layout's, which are never pruned: the
- * old source isn't recorded. Every read path uses this; {@link composePk}
- * composes the one key a write stores.
+ * in merge order: the current layout's by shard number (one, when every attribute
+ * of the shard source is pinned, whether that source is `by` or the primary key),
+ * then the `previous` layout's, which are never pruned: the old source isn't
+ * recorded. Every read path uses this; {@link composePk} composes the one key a
+ * write stores.
  */
 export const composeReadPartitions = (
   schema: DynamoSchema.DynamoSchema,
@@ -789,11 +840,8 @@ export const composeReadPartitions = (
       shardMarker(count, shard),
     )
   const layout = (count: number) => Array.from({ length: count }, (_, i) => partition(count, i))
-  const pinnedBy =
-    options?.prune !== false &&
-    shards.by !== undefined &&
-    shards.by.every((attr) => record[attr] !== undefined && record[attr] !== null)
-  const current = pinnedBy
+  const pruned = options?.prune !== false && pinsShardSource(index, source, record)
+  const current = pruned
     ? [
         partition(
           shards.count,
@@ -820,7 +868,7 @@ export const composeReadPartitions = (
       count: shards.count,
       source,
       previous: shards.previous,
-      pruned: pinnedBy,
+      pruned,
       unsharded,
     },
   }
@@ -1238,6 +1286,19 @@ const classifyZOrderHalf = (
 const hasValue = (value: unknown): boolean => value !== undefined && value !== null
 
 /**
+ * The per-half gate's question for a half with composites: does this writer name
+ * none of them, while the half can't be recomposed from what it knows? Then the
+ * half belongs to some other writer, and its stored key stays as it is.
+ */
+const writerLeavesHalf = (
+  composites: ReadonlyArray<string>,
+  updatePayload: Record<string, unknown>,
+  keyRecord: Record<string, unknown>,
+): boolean =>
+  composites.every((attr) => !(attr in updatePayload)) &&
+  composites.some((attr) => !hasValue(keyRecord[attr]))
+
+/**
  * The PK half's outcome on a sharded index, from what {@link classifyHalf} says
  * of its composites and what the update did to the shard source (design §5). On
  * an unsharded index, that outcome as it is.
@@ -1317,10 +1378,11 @@ const resolveIndexPolicy = (
  * protection: prevent writer A from clobbering keys for halves it doesn't
  * own when writer B does own them. The skip-predicate states that purpose
  * directly: skip iff multi-writer protection actually applies (the half has
- * composites, no composite was explicitly removed, and every composite is
- * absent from BOTH `updatePayload` AND `keyRecord` — so this writer is
- * genuinely not claiming ownership of this half on this call). If the half
- * cannot be safely skipped, it is evaluated by the structural rule.
+ * composites, no composite was explicitly removed, none is in `updatePayload`,
+ * and at least one is unknown to `keyRecord` — so this writer is genuinely not
+ * claiming ownership of this half on this call, and can't recompose it to the
+ * value it already holds). If the half cannot be safely skipped, it is evaluated
+ * by the structural rule.
  *
  * Pre-v1.7.3 the predicate was inverted ("list cases for which to evaluate"
  * as a chain of `||` clauses) and had to enumerate every shape: payload
@@ -1330,7 +1392,9 @@ const resolveIndexPolicy = (
  * PK-composites-only case (#43), v1.7.2 then missed the empty-composite-half
  * case (#46) because every `.some(...)` clause trivially returned `false`
  * for an empty composite array. The skip-predicate closes the entire class
- * of degenerate-case bugs structurally.
+ * of degenerate-case bugs structurally. Through v1.37 its `keyRecord` arm asked
+ * whether *every* composite was absent, so one entity-PK composite woke a half
+ * that mixes it with a mutable composite (#183: `DESIGN.md §7`, shape 10).
  *
  * **Two-way payload classification.**
  * - **present** (`attr: <value>` in payload, or inherited from `keyRecord`)
@@ -1406,16 +1470,17 @@ export const composeGsiKeysForUpdatePolicyAware = (
     //     skipping would just leave a missing key forever — closes #46),
     //   - AND no composite of this half was explicitly removed (cascade
     //     intent must always evaluate),
-    //   - AND every composite is absent from BOTH `updatePayload` AND
-    //     `keyRecord` (so this writer is genuinely not claiming ownership
-    //     of this half on this call — preserves the v1.7.1 multi-writer
-    //     fix #41 and the v1.7.2 PK-composites-only fix #43, since
-    //     entity-PK composites are always present in `keyRecord`).
+    //   - AND no composite is in `updatePayload` (this writer names none of
+    //     them, so it claims no ownership of this half — #41),
+    //   - AND some composite is unknown to `keyRecord` (so the half can't be
+    //     recomposed to the value it already has). Every composite known
+    //     means a SET the writer can't get wrong: entity-PK composites are
+    //     immutable, which keeps #43's PK-composites-only half composing on
+    //     every write. One known composite proves nothing: a half mixing an
+    //     entity-PK composite with a mutable one is not this writer's to
+    //     truncate or drop on an unrelated write (see `DESIGN.md §7`, shape 10).
     //
-    // The negation `!shouldSkip` is observably equivalent to the previous
-    // touched-predicate `||`-chain extended with `composites.length === 0`:
-    // every fix the touched-predicate accumulated falls out of one of the
-    // skip-predicate's three structural conditions. See `DESIGN.md §7`.
+    // See `DESIGN.md §7`.
     const pkHasRemoved =
       removedSet !== undefined && pkComposites.some((attr) => removedSet.has(attr))
     const skHasRemoved =
@@ -1430,16 +1495,15 @@ export const composeGsiKeysForUpdatePolicyAware = (
     // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
       (pkComposites.length > 0
-        ? !pkHasRemoved &&
-          pkComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
-        : by.length > 0 && by.every((attr) => !(attr in keyRecord))) &&
+        ? !pkHasRemoved && writerLeavesHalf(pkComposites, updatePayload, keyRecord)
+        : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
       !byTouched &&
       !byCleared &&
       !byRemoved
     const skipSk =
       skComposites.length > 0 &&
       !skHasRemoved &&
-      skComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+      writerLeavesHalf(skComposites, updatePayload, keyRecord)
 
     if (skipPk && skipSk) continue
 
@@ -1644,6 +1708,34 @@ export const composeSortKeyBeginsWith = (
 }
 
 /**
+ * Above every key below a complete sort key prefix: the delimiter is followed by
+ * a composite's label, and no label reaches U+FFFF.
+ */
+export const SORT_KEY_MAX = "\uFFFF"
+
+/**
+ * The condition selecting a complete sort key prefix on a secondary index: the
+ * key itself, where the structural rule truncates a row whose trailing composites
+ * are absent (`DESIGN.md §7`), and every key below it. A longer sibling value stays
+ * out: its text extends the prefix with a character above the delimiter (escaping
+ * puts everything up to `%` out of reach of a value).
+ */
+export const subtreeCondition = (
+  prefix: string,
+): { readonly between: readonly [string, string] } => ({
+  between: [prefix, `${prefix}${KEY_DELIMITER}${SORT_KEY_MAX}`],
+})
+
+/** The prefix a {@link subtreeCondition} selects; `undefined` for any other condition. */
+export const subtreePrefix = (condition: object): string | undefined => {
+  if (!("between" in condition)) return undefined
+  const [lower, upper] = condition.between as readonly [unknown, unknown]
+  return typeof lower === "string" && upper === `${lower}${KEY_DELIMITER}${SORT_KEY_MAX}`
+    ? lower
+    : undefined
+}
+
+/**
  * The sort key condition a query accessor sends for the leading SK composites
  * present in `record` (the caller has checked at least one is):
  *
@@ -1653,8 +1745,12 @@ export const composeSortKeyBeginsWith = (
  *   matching `"ab"`, and `seq: 3` matching 3.14 and 3.5, whose key text
  *   extends 3's. On the primary index `=` also leaves out the item's history
  *   rows, whose keys extend the current one.
- * - **Partial prefix** — `{ beginsWith }` on {@link composeSortKeyBeginsWith}:
- *   the prefix and the delimiter, so it stops on a segment boundary.
+ * - **Partial prefix, secondary index** — {@link subtreeCondition}: a row
+ *   truncated at this prefix belongs to these pins, and `begins_with` on the
+ *   prefix and delimiter can't reach it (the key ends where the operand goes on).
+ * - **Partial prefix, primary index** — `{ beginsWith }` on
+ *   {@link composeSortKeyBeginsWith}: the prefix and the delimiter, so it stops on
+ *   a segment boundary. Primary keys are never truncated.
  */
 export const composeSortKeyCondition = (
   schema: DynamoSchema.DynamoSchema,
@@ -1662,12 +1758,16 @@ export const composeSortKeyCondition = (
   entityVersion: number,
   index: IndexDefinition,
   record: Record<string, unknown>,
-): { readonly eq: string } | { readonly beginsWith: string } => {
+):
+  | { readonly eq: string }
+  | { readonly beginsWith: string }
+  | { readonly between: readonly [string, string] } => {
   assertStringHalf(index, "composeSortKeyCondition")
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
-  return availableSkCount(index, record) === index.sk.composite.length
-    ? { eq: prefix }
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+  if (availableSkCount(index, record) === index.sk.composite.length) return { eq: prefix }
+  return index.index === undefined
+    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
+    : subtreeCondition(prefix)
 }
 
 /**

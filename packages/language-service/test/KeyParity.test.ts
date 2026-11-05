@@ -176,7 +176,7 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
         ["byOrg", { orgId: "Org-A" }],
         ["byRegion", { regionId: "EU-1" }],
       ] as const) {
-        it(`query ${name} ${JSON.stringify(args)} uses the same PK and begins_with operand`, () => {
+        it(`query ${name} ${JSON.stringify(args)} uses the same PK and sort key condition`, () => {
           const index = indexes[name]
           const params = buildParamsOrThrow({
             entity,
@@ -187,9 +187,18 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
           expect(params.ExpressionAttributeValues![":pk"]).toBe(
             KeyComposer.composePk(schema, "Ticket", index, args),
           )
-          expect(params.ExpressionAttributeValues![":skPrefix"]).toBe(
-            KeyComposer.composeSortKeyBeginsWith(schema, "Ticket", 1, index, args),
-          )
+          if (args.status !== undefined) {
+            const expected = KeyComposer.composeSortKeyCondition(schema, "Ticket", 1, index, args)
+            expect(params.KeyConditionExpression).toContain("BETWEEN :skLow AND :skHigh")
+            expect([
+              params.ExpressionAttributeValues![":skLow"],
+              params.ExpressionAttributeValues![":skHigh"],
+            ]).toEqual("between" in expected ? expected.between : [])
+          } else {
+            expect(params.ExpressionAttributeValues![":skPrefix"]).toBe(
+              KeyComposer.composeSortKeyBeginsWith(schema, "Ticket", 1, index, args),
+            )
+          }
         })
       }
 
@@ -218,8 +227,8 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
       // The bound accessor (`db.entities.Tickets.<index>(…)`) — through the
       // index, and through a collection its index belongs to — sends the
       // library accessor's condition: none without a sort key composite (an
-      // empty-composite half among them), `=` on a complete key, and a
-      // terminated `begins_with` on a prefix.
+      // empty-composite half among them), `=` on a complete key, and on a prefix
+      // its subtree, or a terminated `begins_with` on the primary index.
       const collectionOf = (name: "byOrg" | "byRegion"): ResolvedCollection => {
         const index = indexes[name]
         const collectionName = typeof index.collection === "string" ? index.collection : "Region"
@@ -280,6 +289,12 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
             } else if ("eq" in expected) {
               expect(params.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
               expect(params.ExpressionAttributeValues![":sk"]).toBe(expected.eq)
+            } else if ("between" in expected) {
+              expect(params.KeyConditionExpression).toBe(
+                "#pk = :pk AND #sk BETWEEN :skLow AND :skHigh",
+              )
+              expect(params.ExpressionAttributeValues![":skLow"]).toBe(expected.between[0])
+              expect(params.ExpressionAttributeValues![":skHigh"]).toBe(expected.between[1])
             } else {
               expect(params.KeyConditionExpression).toBe(
                 "#pk = :pk AND begins_with(#sk, :skPrefix)",
@@ -474,7 +489,7 @@ describe("sort key text escaping parity with @effect-dynamodb/schema (#171)", ()
     const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing })
     const entity: ResolvedEntity = { ...entityFor(casing), indexes: textIndexes }
 
-    it(`put, the begins_with operand and the exact key match the library (${casing})`, () => {
+    it(`put, a pin's bounds and the exact key match the library (${casing})`, () => {
       for (const status of values) {
         for (const title of ["T", "a#b c"]) {
           const record = { title, status, teamId: "Team-B" }
@@ -489,10 +504,18 @@ describe("sort key text escaping parity with @effect-dynamodb/schema (#171)", ()
             indexName: "byStatus",
             arguments: { teamId: "Team-B", status },
           })
-          expect(partial.ExpressionAttributeValues![":skPrefix"], JSON.stringify(status)).toBe(
-            KeyComposer.composeSortKeyBeginsWith(schema, "Ticket", 1, textIndexes.byStatus, {
-              status,
-            }),
+          expect(
+            [
+              partial.ExpressionAttributeValues![":skLow"],
+              partial.ExpressionAttributeValues![":skHigh"],
+            ],
+            JSON.stringify(status),
+          ).toEqual(
+            KeyComposer.subtreeCondition(
+              KeyComposer.composeSortKeyPrefix(schema, "Ticket", 1, textIndexes.byStatus, {
+                status,
+              }),
+            ).between,
           )
           const complete = buildParamsOrThrow({
             entity,

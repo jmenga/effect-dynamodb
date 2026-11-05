@@ -45,6 +45,7 @@ import {
   succ,
   toBytes,
 } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
+import { SORT_KEY_MAX, subtreePrefix } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { KeyCondition, KeyValue, PlanMode, QueryExplain, ZOrderOptions } from "../Query.js"
 import * as Cursor from "./Cursor.js"
 import { compileExpr, type Expr } from "./Expr.js"
@@ -184,7 +185,7 @@ export const JUMP_MAX_LIMIT = 1_000
  * `SK_MAX_SENTINEL` (`DynamoClient.ts`): above every character key
  * composition emits, so `prefix + MAX` bounds every key under `prefix`.
  */
-export const KEY_MAX = "￿"
+export const KEY_MAX = SORT_KEY_MAX
 
 const encoder = new TextEncoder()
 
@@ -959,6 +960,24 @@ export const keyPassChecks = (
     rows === undefined
       ? []
       : [...new Set([spec.pkField, ...(skField === undefined ? [] : [skField]), ...rows.reads])]
+  /**
+   * For a row whose values compose no key, all that's left is its text: is it the
+   * pinned prefix or below it? A subtree's range also holds a longer sibling in
+   * 1.36's unescaped text (`new york` after `new`).
+   */
+  const inSubtreeText = (
+    condition: KeyCondition | undefined,
+    row: Record<string, AttributeValue>,
+  ): boolean => {
+    const prefix = condition === undefined ? undefined : subtreePrefix(condition)
+    const key = skField === undefined ? undefined : row[skField]?.S
+    return (
+      prefix === undefined ||
+      key === undefined ||
+      key === prefix ||
+      key.startsWith(`${prefix}${KEY_DELIMITER}`)
+    )
+  }
   /** Is the row stored at this key? */
   const storedAt = (
     row: Record<string, AttributeValue>,
@@ -968,7 +987,8 @@ export const keyPassChecks = (
   /** A row the current read keeps: stored at its key now, or at no value's 1.36 text. */
   const currentAccepts = (rows: KeyPassRows, row: Record<string, AttributeValue>): boolean => {
     const composed = rows.composed(row)
-    if (composed === undefined || storedAt(row, composed)) return true
+    if (composed === undefined) return inSubtreeText(currentCondition, row)
+    if (storedAt(row, composed)) return true
     if (rows.composed136 === undefined) return false
     const own136 = rows.composed136(row)
     return own136 === undefined || !storedAt(row, own136)
@@ -994,7 +1014,12 @@ export const keyPassChecks = (
             reads,
             accepts: (row) => {
               const composed = rows.composed(row)
-              if (composed === undefined) return dedupe === undefined || dedupe.accepts(row)
+              if (composed === undefined) {
+                return (
+                  inSubtreeText(spec.legacy.condition, row) &&
+                  (dedupe === undefined || dedupe.accepts(row))
+                )
+              }
               if (storedAt(row, composed)) return false
               // Both ranges hold it, in one partition: the current read returned it.
               if (samePartition && inCurrentRange(row) && currentAccepts(rows, row)) return false

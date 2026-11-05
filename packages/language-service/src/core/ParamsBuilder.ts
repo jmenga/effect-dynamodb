@@ -170,12 +170,16 @@ function buildQueryParams(
 
   // Mirrors `KeyComposer.composeSortKeyCondition`: a complete key is an exact
   // `=` — `begins_with` on it would also match longer values (`seq: 3`
-  // matching 3.14) — and a partial prefix a terminated `begins_with`.
+  // matching 3.14) — and a partial prefix selects its subtree.
   const pinned = isZOrderHalf(index.sk) ? 0 : availableSkSlots(index, args).length
-  if (skPrefix && pinned > 0 && pinned === index.sk.composite.length) {
-    names["#sk"] = index.sk.field
-    values[":sk"] = skPrefix
-    keyCondition += " AND #sk = :sk"
+  const accessor =
+    pinned > 0 && args
+      ? accessorSkCondition(entity.schema, entity.entityType, index, args)
+      : undefined
+  if (accessor) {
+    names["#sk"] = accessor.name
+    Object.assign(values, accessor.values)
+    keyCondition += accessor.keyCondition
   } else if (skPrefix) {
     names["#sk"] = index.sk.field
     values[":skPrefix"] = skPrefix
@@ -608,7 +612,9 @@ function composeSkBeginsWithValue(
  * The sort key condition an accessor sends for the composites it is given —
  * mirrors the library's accessor (`KeyComposer.composeSortKeyCondition`): none
  * when no composite is given (or the key is Z-order), `=` on the complete key
- * when every one is, and a terminated `begins_with` on a leading prefix.
+ * when every one is, on a leading prefix a `BETWEEN` of the prefix and all below
+ * it on a secondary index, whose rows can be truncated there, and a terminated
+ * `begins_with` on the primary index.
  */
 function accessorSkCondition(
   schema: SchemaConfig,
@@ -619,7 +625,7 @@ function accessorSkCondition(
   | {
       readonly keyCondition: string
       readonly name: string
-      readonly value: readonly [string, string]
+      readonly values: Readonly<Record<string, string>>
     }
   | undefined {
   if (isZOrderHalf(index.sk)) return undefined
@@ -628,13 +634,22 @@ function accessorSkCondition(
     ? {
         keyCondition: " AND #sk = :sk",
         name: index.sk.field,
-        value: [":sk", composeSkValue(schema, entityType, index, args)],
+        values: { ":sk": composeSkValue(schema, entityType, index, args) },
       }
-    : {
-        keyCondition: " AND begins_with(#sk, :skPrefix)",
-        name: index.sk.field,
-        value: [":skPrefix", composeSkBeginsWithValue(schema, entityType, index, args)],
-      }
+    : index.index === undefined
+      ? {
+          keyCondition: " AND begins_with(#sk, :skPrefix)",
+          name: index.sk.field,
+          values: { ":skPrefix": composeSkBeginsWithValue(schema, entityType, index, args) },
+        }
+      : {
+          keyCondition: " AND #sk BETWEEN :skLow AND :skHigh",
+          name: index.sk.field,
+          values: {
+            ":skLow": composeSkPrefixValue(schema, entityType, index, args),
+            ":skHigh": `${composeSkBeginsWithValue(schema, entityType, index, args)}\uFFFF`,
+          },
+        }
 }
 
 function composePrimaryKey(
@@ -690,7 +705,7 @@ function buildEntityAccessorParams(
     `Query accessor '${collectionName}'`,
     `  Index: ${collection.index} (collection: ${collection.collectionName}, ${collection.type})`,
     `  PK: ${pkComposites} (required)`,
-    skComposites ? `  SK: ${skComposites} (optional: begins_with, or = when all given)` : undefined,
+    skComposites ? `  SK: ${skComposites} (optional: a prefix, or = when all given)` : undefined,
     `  Returns: BoundQuery<${entity.entityType}>`,
   ]
     .filter(Boolean)
@@ -726,7 +741,7 @@ function buildEntityAccessorParams(
     const sk = accessorSkCondition(entity.schema, entity.entityType, indexDef, args)
     if (sk) {
       names["#sk"] = sk.name
-      values[sk.value[0]] = sk.value[1]
+      Object.assign(values, sk.values)
       keyCondition += sk.keyCondition
     }
 
@@ -787,7 +802,7 @@ function buildEntityIndexAccessorParams(
     zorder
       ? `  SK: ${ZORDER_KEY_PLACEHOLDER} over ${skComposites} (bound with .within())`
       : skComposites
-        ? `  SK: ${skComposites} (optional: begins_with, or = when all given)`
+        ? `  SK: ${skComposites} (optional: a prefix, or = when all given)`
         : undefined,
     indexDef.shards === undefined ? undefined : shardsInfo(indexDef.shards),
     `  Returns: BoundQuery<${entity.entityType}>`,
@@ -808,13 +823,13 @@ function buildEntityIndexAccessorParams(
       : args
 
     // Without `.where()`: the accessor's own condition — none, `=` on a
-    // complete key, or a terminated `begins_with`.
+    // complete key, or a prefix's subtree.
     const sk = whereCondition
       ? undefined
       : accessorSkCondition(entity.schema, entity.entityType, indexDef, args)
     if (sk) {
       names["#sk"] = sk.name
-      values[sk.value[0]] = sk.value[1]
+      Object.assign(values, sk.values)
       keyCondition += sk.keyCondition
     }
 

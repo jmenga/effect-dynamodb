@@ -13,8 +13,13 @@ import type {
   QueryCommandOutput,
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
+import { KEY_DELIMITER } from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
+import {
+  type ReadFanOut,
+  type ReadPartitions,
+  subtreePrefix,
+} from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
@@ -661,6 +666,7 @@ export const where: {
     // A new condition is not the pins the 1.36 key was composed for (#171):
     // the caller that composed it installs the 1.36 key again.
     key136: undefined,
+    keepRow: undefined,
   })
 })
 
@@ -677,8 +683,10 @@ const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined)
  * (`RangePlanner.keyPassesPlanner`): the 1.36 key first, or last under
  * {@link reverse}. A key equal to the query's own adds nothing — unless its
  * rows are split by form (`KeyPass.rows.split`) — so a query whose key text
- * did not change sends exactly what it always sent. Installed after the
- * pins' {@link where}, which clears it.
+ * did not change sends exactly what it always sent. Such a query's subtree
+ * (`KeyComposer.subtreeCondition`) can still hold a longer sibling in 1.36's
+ * unescaped text (`new york` after `new`): it is left out by its key text, and
+ * nothing more is read. Installed after the pins' {@link where}, which clears it.
  */
 export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<A> => {
   const state = self._state
@@ -689,7 +697,19 @@ export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<
   const own = state.skConditions[0]?.condition
   const same =
     key.pkValue === (state.fanOut?.unsharded ?? state.pkValue) && sameCondition(key.condition, own)
-  if (same && key.rows?.split !== true) return self
+  if (same && key.rows?.split !== true) {
+    const prefix = own === undefined ? undefined : subtreePrefix(own)
+    const skField = state.skField
+    if (prefix === undefined || skField === undefined) return self
+    const below = `${prefix}${KEY_DELIMITER}`
+    return new QueryImpl<A>({
+      ...state,
+      keepRow: (row) => {
+        const text = row[skField]?.S
+        return text === undefined || text === prefix || text.startsWith(below)
+      },
+    })
+  }
   return new QueryImpl<A>({ ...state, key136: key })
 }
 

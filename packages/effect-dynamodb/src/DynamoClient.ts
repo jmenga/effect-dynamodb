@@ -220,7 +220,7 @@ import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } 
  * code point representable in a 3-byte UTF-8 sequence, which sorts above every
  * character DynamoDB key composition emits for the following segment.
  */
-const SK_MAX_SENTINEL = "￿"
+const SK_MAX_SENTINEL = KeyComposer.SORT_KEY_MAX
 
 /**
  * A composite value's key text as key composition writes it: serialized,
@@ -304,7 +304,12 @@ const boundHolds = (
  * Shared by `.where()` and `.within()` (#171), so the two can't drift.
  */
 export const composeRangeUnder = (
-  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  index: {
+    readonly casing: DynamoSchema.Casing
+    readonly isLast: boolean
+    /** A secondary index: a row may be truncated at a value (`subtreeCondition`). */
+    readonly secondary: boolean
+  },
   prefixText: string,
   field: string,
   bound: RawSortKeyCondition,
@@ -356,7 +361,10 @@ export const composeRangeUnder = (
     return { beginsWith: compose(operand) }
   }
   if ("eq" in bound) {
-    return index.isLast ? { eq: compose(bound.eq) } : { beginsWith: subtreeBeginsWith(bound.eq) }
+    if (index.isLast) return { eq: compose(bound.eq) }
+    return index.secondary
+      ? KeyComposer.subtreeCondition(compose(bound.eq))
+      : { beginsWith: subtreeBeginsWith(bound.eq) }
   }
   if ("between" in bound) {
     return { between: [compose(bound.between[0]), upper(bound.between[1])] }
@@ -396,7 +404,11 @@ export const composeRangeUnder = (
  * ends could be reversed, which DynamoDB refuses.
  */
 export const composeIntervalUnder = (
-  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  index: {
+    readonly casing: DynamoSchema.Casing
+    readonly isLast: boolean
+    readonly secondary: boolean
+  },
   prefixText: string,
   field: string,
   lower: RawSortKeyCondition | undefined,
@@ -666,7 +678,7 @@ const planCompositeWithin = <A>(args: {
    */
   const composeBound = (prefixText: string, i: number): Query.SortKeyCondition | undefined => {
     const bound = bounds.get(i)!
-    const index = { casing, isLast: i === n - 1 }
+    const index = { casing, isLast: i === n - 1, secondary: indexDef.index !== undefined }
     return bound._tag === "eq"
       ? composeRangeUnder(index, prefixText, sk[i]!, { eq: bound.value }, { clampToPrefix: true })
       : composeIntervalUnder(index, prefixText, sk[i]!, bound.lower, bound.upper)
@@ -709,7 +721,18 @@ const planCompositeWithin = <A>(args: {
         checked: [...bounds.keys()].filter((j) => j > i),
       }
     }
-    return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
+    // The eq bounds end at a value with nothing after it bounded. On a secondary
+    // index a row truncated there belongs too; the range that takes it also holds
+    // a longer sibling in 1.36's unescaped text (`new york` after `new`), so while
+    // such rows can exist the last eq is judged on the row.
+    if (indexDef.index === undefined) {
+      return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
+    }
+    const judged = KeyText136.enabled(entityLike._schema) ? i - 1 : i
+    return {
+      condition: KeyComposer.subtreeCondition(q.slice(0, -1)),
+      checked: [...bounds.keys()].filter((j) => j >= judged),
+    }
   }
 
   /**
@@ -2620,11 +2643,12 @@ const makeFromConfig = (config: {
         const query = Query.fanOut(unpartitioned, read)
 
         // Apply the SK condition from the provided composites
-        // (`composeSortKeyCondition`): a partial prefix is a `begins_with`
-        // terminated on a segment boundary, or it matches sibling values that
-        // merely start with the supplied one (`status_done` also matching
-        // `status_done_archived`, issue #115); a complete key is an exact `=`,
-        // or `seq: 3` also matches 3.14 and `name: "a"` also matches "ab".
+        // (`composeSortKeyCondition`): a partial prefix stops on a segment
+        // boundary, or it matches sibling values that merely start with the
+        // supplied one (`status_done` also matching `status_done_archived`,
+        // issue #115), and on a secondary index takes the row truncated at it; a
+        // complete key is an exact `=`, or `seq: 3` also matches 3.14 and
+        // `name: "a"` also matches "ab".
         const hasSkComposites =
           !zorder &&
           indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
@@ -2796,6 +2820,7 @@ const makeFromConfig = (config: {
             {
               casing: KeyComposer.effectiveCasing(entityLike._schema, indexDef),
               isLast: targetIndex === skComposites.length - 1,
+              secondary: indexDef.index !== undefined,
             },
             prefixText,
             targetAttr,

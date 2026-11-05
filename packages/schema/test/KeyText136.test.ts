@@ -358,15 +358,25 @@ describe("KeyText136 — what changed in 1.37", () => {
     }
     const full = { tenant: "acme", city: "new york", seq: -3 }
     const sk136 = KeyText136.composeSk(schema, "Item", 1, byPlace, full)
-    // The pins: a complete key is `eq`, a partial one a prefix ending on the delimiter.
+    // The pins: a complete key is `eq`; a partial one the prefix and what's below it.
     expect(KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, full)).toEqual({
       eq: sk136,
     })
     const pinned = KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, {
       city: "new york",
     })
-    expect(pinned).toEqual({ beginsWith: "$app#v1#item#city_new york#" })
-    expect(sk136.startsWith((pinned as { beginsWith: string }).beginsWith)).toBe(true)
+    expect(pinned).toEqual({
+      between: ["$app#v1#item#city_new york", "$app#v1#item#city_new york#\uFFFF"],
+    })
+    expect(sk136.startsWith("$app#v1#item#city_new york#")).toBe(true)
+    // On the primary index, nothing is truncated: the prefix ending on the delimiter.
+    const { index: _gsi, ...primary } = byPlace
+    expect(
+      KeyText136.composeSortKeyCondition(schema, "Item", 1, primary, { city: "new york" }),
+    ).toEqual({ beginsWith: "$app#v1#item#city_new york#" })
+    expect(
+      KeyText136.composeBoundCondition(schema, "Item", 1, primary, {}, "city", { eq: "new york" }),
+    ).toEqual({ beginsWith: "$app#v1#item#city_new york#" })
     // Text that did not change composes as the current composer does.
     const same = { city: "boston" }
     expect(KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, same)).toEqual(
