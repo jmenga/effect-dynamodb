@@ -1,6 +1,7 @@
 /**
  * Rows an upgrade from 1.36 meets at the edges of the key fallback and `rekey` (#171):
- * a sort key an index policy left behind its values. The scenarios run on a
+ * a sort key an index policy left behind its values, a sort key truncated under 1.36,
+ * and a row under its 1.36 table key with a truncated sort key. The scenarios run on a
  * recording table (`LegacyEdgeRows.test.ts`) and on DynamoDB Local
  * (`connected.legacy-edge-rows.test.ts`) through a {@link Harness}, and assert on which
  * reads find a row and what `rekey` leaves stored, rather than on what was sent.
@@ -16,6 +17,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import { toAttributeMap } from "../../src/Marshaller.js"
 import * as Table from "../../src/Table.js"
+import { rekeyOutcome } from "./RekeyOutcome.js"
 
 export const TENANT = "t"
 /** A value whose sort key text changed in 1.37: the space is escaped. */
@@ -169,6 +171,116 @@ export const leftSortKeyOnceScenario = (h: Harness) =>
     )
   })
 
+/**
+ * A sort key truncated under 1.36, on a row under its current table key: `rekey` judges
+ * it by the composites before the gap, and rewrites it to their current text. Until then
+ * a read with the fallback off misses it where the escaped text sorts.
+ */
+export const truncatedSortKeyScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    yield* h.seed(row136({ id: "1", region: REGION }, "current"))
+    const underRegion = (db: Db) =>
+      db.entities.Rows.byTenant({ tenant: TENANT })
+        .where((t, { beginsWith }) => beginsWith(t.region, REGION))
+        .collect()
+    yield* h.inWorld(Off, (db) =>
+      Effect.gen(function* () {
+        expect(yield* underRegion(db)).toEqual([])
+      }),
+    )
+    yield* h.inWorld(On, (db) =>
+      Effect.gen(function* () {
+        const dry = yield* db.tables.MainTable.rekey({ dryRun: true })
+        const report = yield* db.tables.MainTable.rekey()
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+        expect(report.indexKeysRewritten).toBe(1)
+        expect(report.conflicts).toEqual([])
+        const again = yield* db.tables.MainTable.rekey()
+        expect(again.indexKeysRewritten).toBe(0)
+        expect(again.unchanged).toBe(1)
+      }),
+    )
+    const [after] = yield* h.rows()
+    expect(after!.gsk?.S).toBe(gskNow({ id: "1", region: REGION }))
+    expect(after!.gsk?.S).toBe("$edge#v1#row#region_new%20york")
+    yield* h.inWorld(Off, (db) =>
+      Effect.gen(function* () {
+        expect(idsOf(yield* underRegion(db))).toEqual(["1"])
+      }),
+    )
+  })
+
+/**
+ * Rows under their 1.36 table keys with sort keys truncated under 1.36. The move
+ * recomposes index keys as an update would: where the values stop, it composes the
+ * truncated key in current text; where a later composite fills the gap (`group` without
+ * `zone`), it can't compose, and `preserve` keeps the 1.36 text, so the same run
+ * rewrites it after the move. A second run has nothing to do, and a dry run predicts the
+ * real one.
+ */
+export const truncatedAfterMoveScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    const truncated = { id: "1", name: "a b", region: REGION }
+    const holed = { id: "2", name: "a b", region: REGION, group: "g" }
+    for (const values of [truncated, holed]) {
+      const seeded = row136(values)
+      expect(seeded.sk?.S).toContain("name_a b")
+      expect(seeded.gsk?.S).toBe("$edge#v1#row#region_new york")
+      yield* h.seed(seeded)
+    }
+    yield* h.inWorld(On, (db) =>
+      Effect.gen(function* () {
+        const dry = yield* db.tables.MainTable.rekey({ dryRun: true })
+        expect(dry.moved.item).toBe(2)
+        expect(dry.indexKeysRewritten).toBe(1)
+        const report = yield* db.tables.MainTable.rekey()
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+        expect(report.conflicts).toEqual([])
+        const again = yield* db.tables.MainTable.rekey()
+        expect(again.moved.item).toBe(0)
+        expect(again.indexKeysRewritten).toBe(0)
+        expect(again.unchanged).toBe(2)
+      }),
+    )
+    const rows = yield* h.rows()
+    expect(rows).toHaveLength(2)
+    for (const row of rows) {
+      expect(row.sk?.S).toContain("name_a%20b")
+      expect(row.gsk?.S).toBe("$edge#v1#row#region_new%20york")
+    }
+  })
+
+/**
+ * Keys `rekey` leaves, with no conflict: one an index policy left in current text, and a
+ * 1.36 one kept for a value since cleared, which holds more than the composites before
+ * the gap. Neither is what 1.36 composed for what the row holds.
+ */
+export const keysLeftScenario = (h: Harness) =>
+  Effect.gen(function* () {
+    yield* h.inWorld(On, (db) =>
+      leaveSortKey(db, { id: "1", region: REGION, zone: "z", group: "b" }),
+    )
+    const { group: _group, ...cleared } = row136(
+      { id: "2", region: REGION, zone: "z", group: "g" },
+      "current",
+    )
+    yield* h.seed(cleared)
+    const before = yield* h.rows()
+    yield* h.inWorld(On, (db) =>
+      Effect.gen(function* () {
+        const dry = yield* db.tables.MainTable.rekey({ dryRun: true })
+        const report = yield* db.tables.MainTable.rekey()
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+        expect(report.conflicts).toEqual([])
+        expect(report.indexKeysRewritten).toBe(0)
+        expect(report.unchanged).toBe(2)
+      }),
+    )
+    const byId = (rows: ReadonlyArray<StoredRow>) =>
+      [...rows].sort((a, b) => (a.id?.S ?? "").localeCompare(b.id?.S ?? ""))
+    expect(byId(yield* h.rows())).toEqual(byId(before))
+  })
+
 /** Every scenario, for both harnesses. */
 export const scenarios: ReadonlyArray<{
   readonly name: string
@@ -181,5 +293,17 @@ export const scenarios: ReadonlyArray<{
   {
     name: "a sort key an index policy left, in a range both texts hold, is read once",
     run: leftSortKeyOnceScenario,
+  },
+  {
+    name: "rekey rewrites a sort key truncated under 1.36",
+    run: truncatedSortKeyScenario,
+  },
+  {
+    name: "rekey rewrites a truncated 1.36 sort key in the run that moves its row",
+    run: truncatedAfterMoveScenario,
+  },
+  {
+    name: "rekey leaves a key an index policy left and one kept for a cleared value",
+    run: keysLeftScenario,
   },
 ]

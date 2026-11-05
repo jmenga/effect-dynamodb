@@ -40,6 +40,7 @@ import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { clientLayer, serviceOf, withConsumedCapacity } from "./helpers/CapacityMock.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -399,9 +400,7 @@ describe("rekey — every row kind", () => {
       const { meter: m, staleMeter } = yield* seed(On, table)
       const dry = yield* rekey(On, table, { dryRun: true })
       const report = yield* rekey(On, table)
-      expect(report.moved).toEqual(dry.moved)
-      expect(report.indexKeysRewritten).toBe(dry.indexKeysRewritten)
-      expect(report.sentinelsMoved).toBe(dry.sentinelsMoved)
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
       expect(report.byMember.Meter?.moved.item).toBe(1)
       expect(report.byMember.Ledger?.moved.stream).toBe(3)
 
@@ -507,7 +506,7 @@ describe("rekey — a retained item's snapshots", () => {
       const dry = yield* rekey(On, table, { dryRun: true })
       expect(dry.moved).toEqual({ ...ZERO, item: 1, snapshot: 1 })
       const report = yield* rekey(On, table)
-      expect(report.moved).toEqual(dry.moved)
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
       expect(report.conflicts).toEqual([])
       expect(keysUnder(table, pk.old)).toEqual([])
       expect(table.items.has(`${pk.now}|${snapshotSk(1)}`)).toBe(true)
@@ -769,6 +768,7 @@ describe("rekey — tombstones holding their unique values", () => {
       expect(table.items).toEqual(before)
 
       const report = yield* rekey(On, table)
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
       expect(report.sentinelsMoved).toBe(2)
       expect(report.moved.tombstone).toBe(1)
       expect(report.conflicts).toEqual([])

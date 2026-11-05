@@ -3582,6 +3582,10 @@ const makeImpl = <
     return fields
   }
 
+  /** Is `field` a key attribute of the table? It is the table's to hold. */
+  const isTableKeyField = (field: string): boolean =>
+    field === allIndexes.primary?.pk.field || field === allIndexes.primary?.sk.field
+
   // ---------------------------------------------------------------------------
   // Vector search — write-path helpers (see `DESIGN.md §14`)
   // ---------------------------------------------------------------------------
@@ -5716,6 +5720,51 @@ const makeImpl = <
     )
 
   /**
+   * What a move writes for `read` at its current key `current`: index keys recomposed as
+   * an update would, so a half that can't compose keeps its text. Reads nothing and
+   * writes nothing, so a dry run judges what the real run would leave.
+   */
+  const movedRowOf = (
+    read: globalThis.Record<string, AttributeValue>,
+    current: globalThis.Record<string, string>,
+    operation: string,
+  ): Effect.Effect<globalThis.Record<string, AttributeValue>, ValidationError> =>
+    Effect.gen(function* () {
+      const rowKeyForm = keyForm(
+        toDomainView(fromAttributeMap(read) as globalThis.Record<string, unknown>),
+      )
+      const gsi = yield* composeKeysOrFail(entityType, operation, () =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          entityType,
+          entityVersion,
+          allIndexes,
+          rowKeyForm,
+          rowKeyForm,
+          {},
+        ),
+      )
+      const moved: globalThis.Record<string, AttributeValue> = {
+        ...read,
+        ...toAttributeMap({ ...current, ...gsi.sets }),
+      }
+      for (const field of gsi.removes) delete moved[field]
+      for (const [, definition] of vectorIndexEntries) {
+        if (read[definition.vectorField] === undefined) continue
+        const partition = KeyComposer.tryComposeVectorPartition(
+          schema,
+          entityType,
+          definition,
+          rowKeyForm,
+        )
+        if (partition !== undefined) {
+          moved[definition.partitionField] = toAttributeValue(partition)
+        }
+      }
+      return moved
+    })
+
+  /**
    * {@link moveFrom136}, telling apart what it folds into `"moved"`: `"both"`
    * when the Put found the item at its current key while the 1.36 row was
    * still as read — stored under both keys, which an op takes as moved (it
@@ -5779,34 +5828,7 @@ const makeImpl = <
           continue
         }
         const stored = toDomainView(fromAttributeMap(read) as globalThis.Record<string, unknown>)
-        const gsi = yield* composeKeysOrFail(entityType, operation, () =>
-          KeyComposer.composeGsiKeysForUpdatePolicyAware(
-            schema,
-            entityType,
-            entityVersion,
-            allIndexes,
-            keyForm(stored),
-            keyForm(stored),
-            {},
-          ),
-        )
-        const moved: globalThis.Record<string, AttributeValue> = {
-          ...read,
-          ...toAttributeMap({ ...current, ...gsi.sets }),
-        }
-        for (const field of gsi.removes) delete moved[field]
-        for (const [, definition] of vectorIndexEntries) {
-          if (read[definition.vectorField] === undefined) continue
-          const partition = KeyComposer.tryComposeVectorPartition(
-            schema,
-            entityType,
-            definition,
-            keyForm(stored),
-          )
-          if (partition !== undefined) {
-            moved[definition.partitionField] = toAttributeValue(partition)
-          }
-        }
+        const moved = yield* movedRowOf(read, current, operation)
         const sentinels = yield* sentinelMoves(
           tableName,
           stored,
@@ -13617,6 +13639,21 @@ const makeImpl = <
       const room = yield* clearTarget(ctx, "item", from, to, depth)
       if (!room.cleared) return room.tally
       if (ctx.dryRun) {
+        const predicted = yield* movedRowOf(read!, to, "rekey").pipe(
+          Effect.map((row) => ({ _tag: "Moved" as const, row })),
+          Effect.catchTag("ValidationError", (error) =>
+            Effect.succeed({
+              _tag: "Failed" as const,
+              message: String(error.cause ?? error.message),
+            }),
+          ),
+        )
+        if (predicted._tag === "Failed") {
+          return Rekey.mergeTallies(
+            room.tally,
+            rekeyConflict("item", "failed", from, to, predicted.message),
+          )
+        }
         const sentinels = yield* sentinelMoves(
           ctx.tableName,
           values,
@@ -13624,9 +13661,14 @@ const makeImpl = <
           ownerOf(to),
           true,
         )
-        return Rekey.mergeTallies(countMove(ctx, "item", to, room.tally), {
-          sentinelsMoved: sentinels.reserves.length,
-        })
+        // The real run goes on to rewrite what the move leaves on the row.
+        return Rekey.mergeTallies(
+          countMove(ctx, "item", to, room.tally),
+          { sentinelsMoved: sentinels.reserves.length },
+          Object.keys(staleIndexKeys(predicted.row).sets).length === 0
+            ? {}
+            : { indexKeysRewritten: 1 },
+        )
       }
       const moved = yield* moveFrom136Detailed(values, "rekey", { depth, force: true }).pipe(
         Effect.map((result) => ({ _tag: "Done" as const, result })),
@@ -13684,19 +13726,40 @@ const makeImpl = <
     })
 
   /**
-   * The index keys and vector partitions of an item under its current table
-   * key that still hold the text 1.36 composed for its values. A half is
-   * rewritten only when its stored text is exactly that: a half the index
-   * policy left as it was, or a Z-order half (new in 1.37), is not.
+   * The index keys and vector partitions of an item under its current table key that
+   * `rekey` rewrites. It compares a stored key with what 1.36 composed from the row's
+   * values, and never reads a value out of a stored key.
+   *
+   * A partition key, a sort key or a vector partition is rewritten only when it is
+   * exactly its own 1.36 text and that isn't the current text. Each half is judged by
+   * itself and by its bytes. A sort key missing a trailing composite is judged by the
+   * composites before the gap, which is what a row truncated under 1.36 stores.
+   * Anything else is left, with no conflict: a key an index policy kept, one lagging its
+   * values, one cleared of them. So is a key that isn't stored (under `sparse` its
+   * absence can be deliberate), and a table key attribute, which is the table's to hold.
+   * A Z-order index has no 1.36 text (it is new in 1.37), so neither half is compared.
    */
   const staleIndexKeys = (row: StoredRow) => {
-    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
-    const rowKeyForm = keyForm(values)
+    const rowKeyForm = keyForm(
+      toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>),
+    )
+    const composing = (compose: () => string | undefined): string | undefined => {
+      try {
+        return compose()
+      } catch {
+        // Its values compose no key now: left as stored.
+        return undefined
+      }
+    }
     const sets: globalThis.Record<string, string> = {}
     const olds: globalThis.Record<string, string> = {}
     const composites = new Set<string>()
-    const present = (attrs: ReadonlyArray<string>) =>
-      attrs.every((attr) => rowKeyForm[attr] !== undefined && rowKeyForm[attr] !== null)
+    const rewrite = (field: string, text: string, attrs: ReadonlyArray<string>) => {
+      if (isTableKeyField(field)) return
+      sets[field] = text
+      olds[field] = row[field]!.S!
+      for (const attr of attrs) composites.add(resolveDbName(attr))
+    }
     const consider = (
       field: string,
       attrs: ReadonlyArray<string>,
@@ -13704,18 +13767,9 @@ const makeImpl = <
       then: () => string | undefined,
     ) => {
       const stored = row[field]?.S
-      if (stored === undefined || !present(attrs)) return
-      try {
-        const text136 = then()
-        const text = now()
-        if (text === undefined || text136 === undefined) return
-        if (stored !== text136 || text136 === text) return
-        sets[field] = text
-        olds[field] = text136
-        for (const attr of attrs) composites.add(resolveDbName(attr))
-      } catch {
-        // Its values compose no key now: left as stored.
-      }
+      if (stored === undefined || stored !== composing(then)) return
+      const text = composing(now)
+      if (text !== undefined && text !== stored) rewrite(field, text, attrs)
     }
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary" || KeyComposer.isZOrderHalf(index.sk)) continue
@@ -13728,8 +13782,9 @@ const makeImpl = <
       consider(
         index.sk.field,
         index.sk.composite,
-        () => KeyComposer.composeSk(schema, entityType, entityVersion, index, rowKeyForm),
-        () => KeyText136.composeSk(schema, entityType, entityVersion, index, rowKeyForm),
+        () =>
+          KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
+        () => KeyText136.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
       )
     }
     for (const [, definition] of vectorIndexEntries) {
@@ -13744,10 +13799,10 @@ const makeImpl = <
   }
 
   /**
-   * An item under its current table key: rewrite index keys still holding
-   * 1.36 text in place — `UpdateItem` conditioned on each still holding it and
-   * the composites they are composed from unchanged — and move its unique
-   * sentinels whose text changed.
+   * An item under its current table key: rewrite the index keys {@link staleIndexKeys}
+   * names, in place — `UpdateItem` conditioned on each still holding what was read and
+   * the composites they are composed from unchanged — and move its unique sentinels
+   * whose text changed.
    */
   const rekeyCurrentItem = (
     ctx: Rekey.RekeyRowContext,
@@ -13787,6 +13842,9 @@ const makeImpl = <
           guards.push(`#k${i} = :o${i}`)
         }
         for (const [i, attr] of stale.composites.entries()) {
+          // A composite the row lacks (the gap of a truncated sort key) or one derived
+          // from another attribute isn't stored: the key's text is what the guard holds on.
+          if (row[attr] === undefined) continue
           names[`#c${i}`] = attr
           operands[`:c${i}`] = row[attr]!
           guards.push(`#c${i} = :c${i}`)
@@ -13827,6 +13885,37 @@ const makeImpl = <
         rewritten ? { indexKeysRewritten: 1 } : {},
         sentinels,
       )
+    })
+
+  /**
+   * What a move left on an item: it recomposes index keys as an update would, so a half
+   * that can't compose (a sort key truncated under 1.36 before a gap that a later
+   * composite fills) keeps its text. A later run would rewrite it; this one does, so a
+   * second run has nothing to add. It reads the item only when the move, as predicted
+   * from the scanned row ({@link movedRowOf}), leaves such a half.
+   */
+  const rekeyAfterMove = (
+    ctx: Rekey.RekeyRowContext,
+    scanned: StoredRow,
+    at: StoredKey,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const predicted = yield* movedRowOf(scanned, at, "rekey").pipe(
+        Effect.catchTag("ValidationError", () => Effect.succeed(undefined)),
+      )
+      if (predicted === undefined || Object.keys(staleIndexKeys(predicted).sets).length === 0) {
+        return {}
+      }
+      const client = yield* Capacity.client
+      const { Item: moved } = yield* client.getItem({
+        TableName: ctx.tableName,
+        Key: toAttributeMap(at),
+        ConsistentRead: true,
+      })
+      // Gone, or another row's: the scan judges that one where it finds it.
+      if (moved === undefined || occupantOf(moved, at) !== "same") return {}
+      const { unchanged: _unchanged, ...tally } = yield* rekeyCurrentItem(ctx, moved, at)
+      return tally
     })
 
   /** The live keys a row's unique sentinels may name: 1.36's and the current one. */
@@ -14035,9 +14124,14 @@ const makeImpl = <
           : { unchanged: 1 }
       }
       if (!sameStoredKey(stored, targets.old)) return { skipped: { unrecognizedKey: 1 } }
-      return targets.kind === "item"
-        ? yield* moveItem(ctx, stored, targets.current, depth)
-        : yield* moveHistoryRow(ctx, targets.kind, stored, targets.current, depth)
+      if (targets.kind !== "item") {
+        return yield* moveHistoryRow(ctx, targets.kind, stored, targets.current, depth)
+      }
+      const moved = yield* moveItem(ctx, stored, targets.current, depth)
+      // A dry run wrote nothing to read back: `moveItem` judged the row it predicted.
+      // A conflict left the row where it was.
+      if (ctx.dryRun || (moved.conflicts ?? []).length > 0) return moved
+      return Rekey.mergeTallies(moved, yield* rekeyAfterMove(ctx, row, targets.current))
     })
 
   /**
