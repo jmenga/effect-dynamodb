@@ -1183,27 +1183,30 @@ current layout that can't compose is left alone with no conflict. This is step
 2 of adopting a sharded layout: deploy with `previous`, `rekey`, and remove
 `previous` once a run reports no conflicts.
 
-**Sort keys, on every index.** A sort key half is judged by the composites its
-values lead with, as the structural rule truncates it, so one truncated under
-1.36 is rewritten like a whole one. One that is neither what its values compose
-now nor what they composed under 1.36 was kept by an index policy, and is left.
-When its text can only be 1.36's (`KeyText136.isSortKeyText136`: a character 1.37
-escapes, a `%` starting no escape, a `#` a value held, a number in 1.36's form,
-judged by the model's kind since the row may have lost the value), no query reads
-it once the fallback or `previous: 1` goes, so it is the conflict `legacySortKey`,
-on every run until a write names its composites. A key left in current text is no
-conflict. Two things can't be told: a value spelled like an escape (`50%25` is the
-bytes 1.36 wrote for `50%25` and 1.37 writes for `50%`), and a composite typed as a
-union of kinds whose value is gone. A run that moves an item from its 1.36 table
-key reads the moved row and judges it the same way (`rekeyAfterMove`); a dry run
-judges the row the move would write (`movedRowOf`), so it reports what the real run
-does.
+**Index keys, on every index: compare, don't parse.** `staleIndexKeys` composes each
+half from the row's values and compares the result with the stored key; nothing reads a
+value out of a stored key. A half whose row holds every composite is rewritten when they
+differ, whatever text it held. A sort key missing a composite is one of two things, and
+the same comparison tells them apart: truncated under 1.36 (it is exactly what 1.36
+composed for the composites before the gap, and is rewritten like a whole one), or kept
+for a cleared value (`.set({ x: undefined })` under `preserve`), which is left with no
+conflict, as is a partition key missing a composite. A key the row doesn't have isn't
+written, since under `sparse` its absence can be deliberate. A Z-order half is never
+composed here, a table key attribute is never rewritten, and two indexes sharing an
+attribute resolve as on a write: the later one wins. A run that moves an item from its
+1.36 table key reads the moved row and does the same (`rekeyAfterMove`).
 
-**Partition keys, on an unsharded index.** The same judgement
-(`KeyText136.isPartitionKeyText136`): a partition key is not escaped, so only a
-number's text changed. One that holds a number only 1.36 could have spelled and
-that its values no longer compose is read only through the fallback, so it is the
-conflict `legacyPartitionKey`, until a write names its composites.
+**The accepted limit.** A row that cleared a composite whose key text changed in 1.37
+keeps its old key. Once the fallback or `previous: 1` goes, a pin on the cleared value
+misses it: under a sort key half a broader query finds it where its old text sorts, and
+under a partition key half `get` still reads it. Writing the composite puts it back.
+Telling such text apart from current text would take parsing it, and a value can spell
+anything.
+
+**A dry run judges each row on its own.** It judges the row the move would write
+(`movedRowOf`), so it reports what the real run does for that row. It doesn't simulate
+chains: a row whose destination is held by a row that can't move may be predicted as
+moved.
 
 **A row under both keys.** `clearTarget` reports `bothKeys` only if the row is still
 at its old key when it finds it at the new one. A page's rows run concurrently, and a
@@ -1219,7 +1222,7 @@ value's 1.36 row (Aliasing) is moved first, never overwritten.
 | Row | Move |
 |---|---|
 | Item under its 1.36 key | A consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then the ops' move (`moveFrom136Detailed`, forced): consistent read, one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the 1.36 item under `deleteGuard`, sentinels moved or re-pointed, the snapshot of the version it is at moved with it (counted in `moved.snapshot`). A row at the target that is another value's 1.36 row (Aliasing) is displaced first (`displace`, `DISPLACE_DEPTH`). The same item already at the target is `bothKeys` only if it is still at its 1.36 key when read again: a move since (another row's in this run, or a write) put it there. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a sort key truncated under 1.36 before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
-| Item at its current key | GSI halves and vector partitions whose stored text is exactly their 1.36 text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sort key missing a trailing composite is judged by the composites before the gap, which is what a row truncated under 1.36 stores, and rewritten to their current text. A Z-order half, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched, and one left in text only 1.36 could spell is the conflict `legacySortKey`. Unique sentinels whose text changed (a numeric unique value) are put at the current key and the 1.36 sentinel released (`sentinelsMoved`) |
+| Item at its current key | GSI halves and vector partitions whose stored text is exactly their 1.36 text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sort key missing a trailing composite is judged by the composites before the gap, which is what a row truncated under 1.36 stores, and rewritten to their current text. A sharded index's partition key is the exception: it is composed and compared whatever it holds, which is what moves rows into the layout, and one whose values can't compose it is left, the conflict `uncomposable` unless it is already in the current layout. A Z-order half, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed (a numeric unique value) are put at the current key and the 1.36 sentinel released (`sentinelsMoved`) |
 | Version snapshot, soft-delete tombstone, time-series event | Consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the 1.36 row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the 1.36 row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's 1.36 or current live key under its 1.36 key is put at its current key and the 1.36 one released; one at its current key naming the 1.36 live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
 | Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: both partitions read consistently whatever `legacyKeys` says; each built row placed — under its current key, its 1.36 key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its 1.36 key moves (Put at the current key `attribute_not_exists`, Delete of the 1.36 row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold 1.36 text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the two partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the 1.36 partition has gone from it the attempt starts over; a row placed under both is checked under its 1.36 key the same way |
@@ -1759,9 +1762,11 @@ Shapes 1 to 8 hold on a sharded index as well (#183). The gate's new dependency 
 
 10. **A half mixing a primary key composite with a mutable one** (#183) — `sk: [zone, deviceId]`, `sk: [deviceId, zone]` or `pk: [channel, zone]` on `primaryKey: [channel, deviceId]`. An update naming neither composite leaves the stored key byte for byte under both policies, on the standard, retain and append paths; naming the mutable composite composes the half; `.remove(["zone"])` cascades as ever. The composites in the key record alone never wake it, whichever position they hold. **This is the regression scenario from v1.7.2 through 1.37**, reachable on an unsharded index: the half woke through `keyRecord`, so an unrelated update removed the key under `'sparse'` or truncated it under `'preserve'`.
 
-The retain path holds the whole item in `keyRecord`, so a mixed half whose composites are all present recomposes to the key it already has. When every half of an index is skipped there, the existing Put-style fallback recomposes the entry from the new item: an item lacking a composite has no entry, as it had none.
+The retain path holds the whole item in `keyRecord`, so a mixed half whose composites are all present recomposes to the key it already has. When every half of an index is skipped there, the entry stays as stored, as on the standard path.
 
 11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
+
+12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 

@@ -200,7 +200,7 @@ Both `make` and `definition` check the members against each other. Every member 
 | `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
 | `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
-| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable" \| "legacySortKey" \| "legacyPartitionKey", key, target, message }` — a row `rekey` left as it is. `legacySortKey`: a sort key holding text from before 1.37 that its values don't compose, which an index policy left, so `rekey` can't rewrite it. Queries stop reading it when the 1.36 fallback or a sharded index's `previous: 1` goes. `legacyPartitionKey`: the same of a partition key on an index with no shards |
+| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable", key, target, message }` — a row `rekey` left as it is |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
 
 ### Table operations

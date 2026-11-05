@@ -373,12 +373,21 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 | Conflict reason | The row | What to do |
 |---|---|---|
 | `"uncomposable"` | It is under another layout, and its values can't compose a current key (a `by` attribute cleared under `preserve`) | Write the attribute, or remove the item from the index, then run `rekey` again |
-| `"legacySortKey"` | Its sort key holds text from before 1.37 that its values don't compose: an index policy left it, so `rekey` can't rewrite it | Write that sort key's composites to the item, then run `rekey` again |
-| `"legacyPartitionKey"` | The same of its partition key on an index with no shards: only the 1.36 fallback reads it | Write that partition key's composites to the item, then run `rekey` again |
 
-A dry run reports what the real run does, conflicts included. Two keys can't be told from current text, so neither is reported: a value spelled like an escape (`50%25`), and a composite typed as a union of kinds whose value has gone.
+`rekey` compares. It composes each key from the values a row holds, and rewrites the stored key if it differs, including a key an index policy left on a row that holds all its composites. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
 
-**Step 3: remove `previous`,** once a run reports no conflicts. Nothing reads what's left after that.
+A dry run judges each row on its own. A row whose destination is held by a row that can't move may be predicted as moved, and the real run then reports it as a conflict.
+
+:::caution[A composite cleared before `rekey` runs]
+`.set({ x: undefined })` under `preserve` removes the value and keeps the key, and then nothing on the row says what the key's text meant. `rekey` leaves that half alone, with no conflict. If the value's text changed in 1.37 (a number other than a positive integer, or a sort key value holding a character 1.37 escapes), then once `previous: 1` or the 1.36 fallback goes:
+
+- **A sort key:** a broader query finds the row, where its old text sorts. A pin on the cleared value misses it.
+- **A partition key on an index with no shards:** a pin on the old value misses it with `legacyKeys: false`. `get` still reads the row.
+
+Writing the composite again puts the row back. To keep such pins working, do that before you leave the fallback.
+:::
+
+**Step 3: remove `previous`,** once a run reports no conflicts. Don't do it sooner: `previous` is what reads rows still in the old layout and, at `previous: 1`, sort keys still in 1.36 text inside a shard, so leaving it early hides them. Nothing enforces this, since nothing at `make` can know. Nothing reads what's left after that.
 
 ```typescript region="adopt-finish" example="guide-sharding.ts"
 // Step 3: deploy without `previous`. Only the 8 shards are read now.
@@ -397,7 +406,7 @@ Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `re
 
 - **Removing `by`** at the same count: a query that reads every shard keeps finding every row, and `rekey` moves rows to the default source's shards. A query that [pins the whole primary key](#pruning) prunes to the default source's shard, so it can miss a row until `rekey` has moved it. If you have such a query, change the count too.
 - **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
-- **Rows still under 1.36 key text** are read and moved as well. With `previous: 1`, the query also reads the 1.36 key when its text differs. A write can move such a row's partition key into a shard and leave its sort key, so a query whose pins' text changed reads each shard under both texts until you remove `previous`: for 8 shards, 18 requests where a query whose text didn't change sends 9. `rekey` converts those sort keys, or reports the ones it can't. Running `rekey` before adopting is simpler to reason about and costs less, but adopting directly works.
+- **Rows still under 1.36 key text** are read and moved as well. With `previous: 1`, the query also reads the 1.36 key when its text differs. A write can move such a row's partition key into a shard and leave its sort key, so a query whose pins' text changed reads each shard under both texts until you remove `previous`: for 8 shards, 18 requests where a query whose text didn't change sends 9. `rekey` converts those sort keys, unless the row has cleared one of their composites. Running `rekey` before adopting is simpler to reason about and costs less, but adopting directly works.
 
 ## Collections
 

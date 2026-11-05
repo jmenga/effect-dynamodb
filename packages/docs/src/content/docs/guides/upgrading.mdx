@@ -180,10 +180,10 @@ A stream appended to without a pause can win every flip: it is reported `contend
 | `contended` | Concurrent writes changed it on every attempt, or a drainer is delivering an outbox item | Run `rekey` again |
 | `failed` | It can't be moved as stored: its values no longer decode, a stream id reads as two different ids, or a write was refused | `message` says why: fix the row, then run `rekey` again |
 | `uncomposable` | Its key on a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) is from another layout, and its values can't compose a current one (a `by` attribute was cleared) | Give it the missing values, or remove them from the index with `.remove()`, then run `rekey` again |
-| `legacySortKey` | Its sort key holds text from before 1.37 that its values don't compose: an index policy left it, so `rekey` can't rewrite it. Queries stop reading it when the fallback or a sharded index's `previous: 1` goes | Write that sort key's composites to the item, then run `rekey` again |
-| `legacyPartitionKey` | The same of its partition key on an index with no shards. Queries stop reading it when the fallback goes | Write that partition key's composites to the item, then run `rekey` again |
 
 Until a conflicting row moves, the fallback keeps reading it, so leave the fallback on.
+
+A row that has cleared one of a key's composites isn't a conflict: nothing on it says what the key's text meant, so `rekey` leaves that half alone. Once the fallback goes, a pin on the cleared value misses the row if that value's text changed, though a broader query or `get` still finds it. Writing the composite again puts it back. See [A composite cleared before `rekey` runs](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index).
 
 ## Cost
 
