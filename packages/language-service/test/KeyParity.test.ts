@@ -19,6 +19,10 @@ import { buildParamsOrThrow } from "./helpers/params"
 // never composes — it shows `<binary Z-order key>` (see ParamsBuilder.test.ts) —
 // so there is no text for parity to pin.
 
+// Shard markers are mirrored too, with a placeholder for the shard: a hover has no
+// item to hash. The parity is the library's key with its shard replaced.
+const shardPlaceholder = (key: unknown) => String(key).replace(/!(\d+)\.\d+/, "!$1.{shard}")
+
 const indexes = {
   primary: {
     pk: { field: "pk", composite: ["orgId", "seq"] },
@@ -77,6 +81,75 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
     describe(`casing: "${casing}"`, () => {
       const entity = entityFor(casing)
       const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing })
+
+      describe("a sharded index", () => {
+        const library = {
+          index: "gsi5",
+          pk: { field: "gsi5pk", composite: ["teamId"] },
+          sk: { field: "gsi5sk", composite: ["title"] },
+          shards: { count: 20, by: undefined, previous: undefined, source: ["orgId", "seq"] },
+        } satisfies KeyComposer.IndexDefinition
+        const emptyHalf = {
+          index: "gsi6",
+          pk: { field: "gsi6pk", composite: [] },
+          sk: { field: "gsi6sk", composite: ["title"] },
+          shards: { count: 8, by: undefined, previous: undefined, source: ["orgId", "seq"] },
+        } satisfies KeyComposer.IndexDefinition
+        const collection = {
+          index: "gsi7",
+          collection: "OrgData",
+          pk: { field: "gsi7pk", composite: ["orgId"] },
+          sk: { field: "gsi7sk", composite: ["title"] },
+          shards: { count: 200, by: undefined, previous: undefined, source: ["orgId", "seq"] },
+        } satisfies KeyComposer.IndexDefinition
+        const sharded: ResolvedEntity = {
+          ...entity,
+          indexes: {
+            primary: indexes.primary,
+            byTeam: {
+              ...library,
+              shards: { count: 20, by: [], previous: undefined },
+            },
+            allTitles: {
+              ...emptyHalf,
+              shards: { count: 8, by: [], previous: undefined },
+            },
+            byOrg: {
+              ...collection,
+              shards: { count: 200, by: [], previous: undefined },
+            },
+          },
+        }
+
+        it("put shows the library's key, its shard a placeholder", () => {
+          const params = buildParamsOrThrow({ entity: sharded, type: "put", arguments: record })
+          expect(params.Item!.gsi5pk).toBe(
+            shardPlaceholder(KeyComposer.composePk(schema, "Ticket", library, record)),
+          )
+          expect(params.Item!.gsi6pk).toBe(
+            shardPlaceholder(KeyComposer.composePk(schema, "Ticket", emptyHalf, record)),
+          )
+          expect(params.Item!.gsi7pk).toBe(
+            shardPlaceholder(KeyComposer.composePk(schema, "Ticket", collection, record)),
+          )
+          expect(params.Item!.gsi5pk).toContain("#!20.{shard}#")
+        })
+
+        it("a query shows the marker the first partition sends", () => {
+          const params = buildParamsOrThrow({
+            entity: sharded,
+            type: "query",
+            indexName: "byTeam",
+            arguments: { teamId: "Team-B" },
+          })
+          const read = KeyComposer.composeReadPartitions(schema, "Ticket", library, {
+            teamId: "Team-B",
+          })
+          expect(params.ExpressionAttributeValues![":pk"]).toBe(
+            shardPlaceholder(read.partitions[0]),
+          )
+        })
+      })
 
       it("put writes the same keys for every index", () => {
         const params = buildParamsOrThrow({ entity, type: "put", arguments: record })

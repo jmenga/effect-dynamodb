@@ -1,6 +1,7 @@
 import {
   type Casing,
   type IndexDefinition,
+  type IndexShards,
   isZOrderHalf,
   type ResolvedCollection,
   type ResolvedEntity,
@@ -418,11 +419,13 @@ function composeKey(
   label: string,
   slots: ReadonlyArray<CompositeSlot>,
   casing?: Casing,
+  marker?: string,
 ): string {
   const effectiveCasing = casing ?? schema.casing
   return [
     schemaPrefix(schema),
     applyCasing(label, effectiveCasing),
+    ...(marker === undefined ? [] : [marker]),
     ...formatComposites(slots, effectiveCasing),
   ].join("#")
 }
@@ -516,12 +519,28 @@ function composePkValue(
 ): string {
   const slots = extractCompositeSlots(index.pk.composite, record)
   const collection = index.collection
+  const marker = index.shards === undefined ? undefined : shardMarkerText(index.shards)
   if (collection !== undefined) {
     const collectionName = typeof collection === "string" ? collection : collection[0]!
-    return composeKey(schema, collectionName, slots, index.casing)
+    return composeKey(schema, collectionName, slots, index.casing, marker)
   }
-  return composeKey(schema, entityType, slots, index.casing)
+  return composeKey(schema, entityType, slots, index.casing, marker)
 }
+
+/** What a sharded partition key's shard shows: a hover has no item to hash (#183). */
+export const SHARD_PLACEHOLDER = "{shard}"
+
+/** Mirrors `Shards.shardMarker`, with the shard as a placeholder. No casing reaches it. */
+const shardMarkerText = (shards: IndexShards): string =>
+  `!${shards.count ?? "{count}"}.${SHARD_PLACEHOLDER}`
+
+/** A hover's line about a sharded index. */
+const shardsInfo = (shards: IndexShards): string =>
+  `  Shards: ${shards.count ?? "{count}"}${
+    shards.by.length > 0
+      ? ` by ${shards.by.join(", ")} (one shard when all are given, else all merged)`
+      : " (every shard read, merged)"
+  }${shards.previous === undefined ? "" : `; also reads previous layout of ${shards.previous}`}`
 
 /** What a Z-order sort key (#171) shows: its value is bytes, not text. */
 export const ZORDER_KEY_PLACEHOLDER = "<binary Z-order key>"
@@ -770,6 +789,7 @@ function buildEntityIndexAccessorParams(
       : skComposites
         ? `  SK: ${skComposites} (optional: begins_with, or = when all given)`
         : undefined,
+    indexDef.shards === undefined ? undefined : shardsInfo(indexDef.shards),
     `  Returns: BoundQuery<${entity.entityType}>`,
   ]
     .filter(Boolean)

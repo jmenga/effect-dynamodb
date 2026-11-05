@@ -536,4 +536,42 @@ describe("EntityResolver", () => {
       expect(Object.keys(collections[0]!.members)).toEqual(["Tasks"])
     })
   })
+
+  describe("shards (#183)", () => {
+    const resolve = (shards: string) => {
+      const source = `
+        const Devices = Entity.make({
+          model: Device,
+          entityType: "Device",
+          primaryKey: { pk: { field: "pk", composite: ["channel"] }, sk: { field: "sk", composite: ["deviceId"] } },
+          indexes: {
+            byTenant: {
+              name: "gsi5",
+              pk: { field: "gsi5pk", composite: ["tenantId"] },
+              sk: { field: "gsi5sk", composite: ["groupId"] },
+              shards: ${shards},
+            },
+          },
+        })
+        const MainTable = Table.make({ schema: DynamoSchema.make({ name: "fleet", version: 1 }), entities: { Devices } })
+      `
+      return resolveEntities(ts, parseSource(source))[0]!.indexes.byTenant!.shards
+    }
+
+    it("parses the shorthand", () => {
+      expect(resolve("20")).toEqual({ count: 20, by: [], previous: undefined })
+    })
+
+    it("parses the object form", () => {
+      expect(resolve('{ count: 20, by: ["groupId"], previous: 4 }')).toEqual({
+        count: 20,
+        by: ["groupId"],
+        previous: 4,
+      })
+    })
+
+    it("a count that isn't a literal stays unknown", () => {
+      expect(resolve("SHARDS")).toEqual({ count: undefined, by: [], previous: undefined })
+    })
+  })
 })

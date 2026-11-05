@@ -181,7 +181,8 @@ export const generateQueryParams = (
   pkRecord: Record<string, unknown>,
   tableName: string,
 ): GeneratedQuery => {
-  const pk = composePk(schema, entityType, index, pkRecord)
+  // A sharded index reads several partitions (#183): this shows the first's request.
+  const pk = KeyComposer.composeReadPartitions(schema, entityType, index, pkRecord).partitions[0]!
 
   // Build SK prefix for begins_with (entity type filtering)
   const skPrefix = index.collection
