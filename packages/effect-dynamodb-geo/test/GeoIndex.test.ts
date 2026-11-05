@@ -1,3 +1,5 @@
+import { Schema } from "effect"
+import { Entity } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
@@ -166,5 +168,46 @@ describe("GeoIndex", () => {
       const enriched = geoIndex.enrich(input)
       expect(h3.cellToParent(enriched.cell!, 3)).toBe(enriched.parentCell)
     })
+  })
+})
+
+describe("a sharded index (#183)", () => {
+  it("is refused with [EDD-9104]", () => {
+    class Spot extends Schema.Class<Spot>("Spot")({
+      spotId: Schema.String,
+      channel: Schema.String,
+      cell: Schema.String,
+      timePartition: Schema.String,
+      latitude: Schema.Number,
+      longitude: Schema.Number,
+    }) {}
+    const Spots = Entity.make({
+      model: Spot,
+      entityType: "Spot",
+      primaryKey: {
+        pk: { field: "pk", composite: ["channel"] },
+        sk: { field: "sk", composite: ["spotId"] },
+      },
+      indexes: {
+        byCell: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["cell", "timePartition"] },
+          sk: { field: "gsi1sk", composite: ["spotId"] },
+          shards: 8,
+        },
+      },
+    })
+    expect(() =>
+      GeoIndex.make({
+        entity: Spots,
+        index: "byCell",
+        coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+        fields: {
+          cell: { field: "cell", resolution: 8 },
+          timePartition: { field: "timePartition" },
+        },
+        timePartition: { size: "1 day" },
+      } as never),
+    ).toThrow("[EDD-9104]")
   })
 })
