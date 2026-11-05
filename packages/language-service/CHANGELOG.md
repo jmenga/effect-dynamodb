@@ -4,7 +4,7 @@
 
 ### Minor Changes
 
-- [#181](https://github.com/jmenga/effect-dynamodb/pull/181) [`d67decf`](https://github.com/jmenga/effect-dynamodb/commit/d67decf65cdf4388ef21656bbfb31b0d6a5c150f) Thanks [@jmenga](https://github.com/jmenga)! - Z-order indexes (`sk.zorder`, `sk.prefix`) with binary sort keys and `.within()` queries
+- [#181](https://github.com/jmenga/effect-dynamodb/pull/181) [`ae1930f`](https://github.com/jmenga/effect-dynamodb/commit/ae1930f482f8ed00c106122ccca2fbdf52caa937) Thanks [@jmenga](https://github.com/jmenga)! - Z-order indexes (`sk.zorder`, `sk.prefix`) with binary sort keys and `.within()` queries
   (`naive` / `jump` / `precise`), skip-scan for bounds on non-leading sort-key composites,
   `.explain()` / `.onRequest()`, and cursor v2. Key text now sorts the way values do, and
   `db.tables.<Table>.rekey()` moves the rows 1.36 wrote to their new keys ("Upgrading from 1.36"
