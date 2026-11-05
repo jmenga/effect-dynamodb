@@ -18,6 +18,7 @@ import {
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
 import { encodeBigInt, encodeNumber } from "./internal/NumericKey.js"
+import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import {
   concatBytes,
   interleave,
@@ -144,6 +145,38 @@ export interface IndexPolicy {
   readonly sk?: IndexPolicyKey
 }
 
+/**
+ * Write sharding as declared on a secondary index (#183): one logical partition
+ * spread over `count` physical ones.
+ */
+export interface ShardsConfig<F extends string = string> {
+  /** How many physical partitions. An integer from 2 to 256. */
+  readonly count: number
+  /**
+   * The attributes to hash instead of the item's primary key: sort key
+   * composites of this index. A query pinning all of them reads one shard. A
+   * value that dominates a logical partition brings its hot key back.
+   */
+  readonly by?: ReadonlyArray<F>
+  /**
+   * Migration only: also read the old layout, `1` for the unsharded key or the
+   * old `count`. Deploy with it, run `rekey`, then remove it.
+   */
+  readonly previous?: number
+}
+
+/** A normalised {@link ShardsConfig}. Built only by {@link normalizeGsiConfig}. */
+export interface IndexShards {
+  readonly count: number
+  readonly by: ReadonlyArray<string> | undefined
+  readonly previous: number | undefined
+  /**
+   * The attributes hashed: `by`, or the primary key composites. `undefined`
+   * until `Entity.make` binds it; such an index can't compose a key.
+   */
+  readonly source: ReadonlyArray<string> | undefined
+}
+
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
@@ -159,6 +192,8 @@ export interface IndexDefinition {
    * missing.
    */
   readonly indexPolicy?: IndexPolicy
+  /** Write sharding (#183). Secondary indexes only. */
+  readonly shards?: IndexShards
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
@@ -192,6 +227,13 @@ export interface GsiConfig<TFields = globalThis.Record<string, unknown>> {
    * applied on `put()`. See `DESIGN.md §7 Policy-Aware GSI Composition`.
    */
   readonly indexPolicy?: IndexPolicy
+  /**
+   * Spread each logical partition over several physical ones, for a key too hot
+   * for one partition's write limit. `20` is short for `{ count: 20 }`. Writes
+   * hash the shard source; a query reads every shard and merges them, so callers
+   * don't change.
+   */
+  readonly shards?: number | ShardsConfig<keyof TFields & string>
 }
 
 /** The casing an index's keys are composed with: its own, else the schema's. */
@@ -221,6 +263,94 @@ export const assertCollectionCasingAgreement = (
         `physical index, so their keys would never meet — give the collection's index the same ` +
         `\`casing\` on every member.`,
     )
+  }
+}
+
+/**
+ * Fail when a collection's members would read different partitions (#183). They
+ * share one physical index and one logical key, so they must agree on how many
+ * partitions it is spread over and on the layout being migrated from. `by` may
+ * differ: each member hashes its own source, into the same partitions.
+ */
+export const assertCollectionShardsAgreement = (
+  collectionName: string,
+  members: ReadonlyArray<{
+    readonly key: string
+    readonly index: IndexDefinition
+  }>,
+): void => {
+  const layout = (member: { readonly index: IndexDefinition }) =>
+    `${member.index.shards?.count ?? "unsharded"}/${member.index.shards?.previous ?? "none"}`
+  if (new Set(members.map(layout)).size > 1) {
+    const shown = members.map((member) => {
+      const { count, previous } = member.index.shards ?? {}
+      return `${member.key}: ${count === undefined ? "unsharded" : `count ${count}`}${
+        previous === undefined ? "" : `, previous ${previous}`
+      }`
+    })
+    throw new Error(
+      `[EDD-9103] Collection "${collectionName}" members spread its index differently ` +
+        `(${shown.join("; ")}). They share one logical partition, so a query has to read one ` +
+        `set of partitions: give the collection's index the same \`shards\` count and \`previous\` ` +
+        `on every member.`,
+    )
+  }
+}
+
+const shardsMalformed = (index: string, why: string): Error =>
+  new Error(`[EDD-9099] Index "${index}" declares malformed shards: ${why}`)
+
+/** Normalise and check a declared `shards` (the rest is `Entity.make`'s, which has the model). */
+const normalizeShards = (index: string, declared: unknown): IndexShards => {
+  const config: { readonly count?: unknown; readonly by?: unknown; readonly previous?: unknown } =
+    typeof declared === "number" ? { count: declared } : (declared as object)
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    throw shardsMalformed(index, "pass a count, or { count, by?, previous? }.")
+  }
+  const unknownKeys = Object.keys(config).filter(
+    (key) => key !== "count" && key !== "by" && key !== "previous",
+  )
+  if (unknownKeys.length > 0) {
+    throw shardsMalformed(
+      index,
+      `unknown option ${unknownKeys.map((key) => `"${key}"`).join(", ")}: it takes count, by and previous.`,
+    )
+  }
+  const { count, by, previous } = config
+  if (
+    typeof count !== "number" ||
+    !Number.isInteger(count) ||
+    count < 2 ||
+    count > MAX_SHARD_COUNT
+  ) {
+    throw shardsMalformed(
+      index,
+      `count ${JSON.stringify(count)} must be an integer from 2 to ${MAX_SHARD_COUNT}.`,
+    )
+  }
+  if (previous !== undefined) {
+    if (typeof previous !== "number" || !Number.isInteger(previous) || previous < 1) {
+      throw shardsMalformed(
+        index,
+        `previous ${JSON.stringify(previous)} must be a positive integer: 1 for the unsharded key, or the old count.`,
+      )
+    }
+    if (previous === count) {
+      throw shardsMalformed(
+        index,
+        `previous ${previous} equals count: it names the layout being migrated from, which has to differ.`,
+      )
+    }
+    if (previous > MAX_SHARD_COUNT) {
+      throw shardsMalformed(index, `previous ${previous} is above ${MAX_SHARD_COUNT}.`)
+    }
+  }
+  return {
+    count,
+    by:
+      by === undefined ? undefined : ([...(by as ReadonlyArray<string>)] as ReadonlyArray<string>),
+    previous,
+    source: undefined,
   }
 }
 
@@ -262,6 +392,7 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
       : { field: sk.field, composite: [...sk.composite!] },
     ...(config.casing !== undefined && { casing: config.casing }),
     ...(config.indexPolicy !== undefined && { indexPolicy: config.indexPolicy }),
+    ...(config.shards !== undefined && { shards: normalizeShards(config.name, config.shards) }),
   }
 }
 
@@ -478,17 +609,221 @@ export const composePk = (
   record: Record<string, unknown>,
 ): string => {
   const composites = extractComposites(index.pk.composite, record)
-  const names = [...index.pk.composite]
+  return composePkText(
+    schema,
+    entityType,
+    index,
+    composites,
+    index.pk.composite,
+    composedShardMarker(entityType, index, record),
+  )
+}
+
+/**
+ * The text of a partition key: the entity type or collection name, the marker
+ * of a sharded index (design §2), then the composites.
+ */
+const composePkText = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  composites: ReadonlyArray<string>,
+  names: ReadonlyArray<string>,
+  marker: string | undefined,
+): string => {
   const collection = index.collection
+  // Collection index — PK uses collection name; regular index — entity type.
+  const label =
+    collection === undefined
+      ? entityType
+      : Array.isArray(collection)
+        ? collection[0]!
+        : (collection as string)
+  const spelled = marker === undefined ? label : `${label}${KEY_DELIMITER}${marker}`
+  const options = { casing: index.casing, names: [...names] }
+  return collection === undefined
+    ? composeKey(schema, spelled, composites, options)
+    : composeCollectionKey(schema, spelled, composites, options)
+}
 
-  if (collection !== undefined) {
-    // Collection index — PK uses collection name
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, { casing: index.casing, names })
+/**
+ * The marker of the shard `record` hashes to; `undefined` on an unsharded index.
+ * Throws `[EDD-9100]` when the source is missing: a sharded index never composes
+ * an unsharded partition key, so a write can't go wrong by forgetting it.
+ */
+const composedShardMarker = (
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): string | undefined => {
+  const shards = index.shards
+  if (shards === undefined) return undefined
+  const source = boundShardSource(index, shards)
+  const absent = source.filter((attr) => record[attr] === undefined || record[attr] === null)
+  if (absent.length > 0) {
+    throw new ShardSourceError({
+      message:
+        `[EDD-9100] Entity "${entityType}": index "${index.index}" is sharded, and its partition ` +
+        `key can't be composed without the shard source: ${absent.map((attr) => `"${attr}"`).join(", ")} ` +
+        `missing. A sharded index never composes an unsharded key, so nothing was written. ` +
+        `Include ${absent.length === 1 ? "it" : "them"} in the write.`,
+    })
   }
+  return shardMarker(
+    shards.count,
+    shardOf(
+      source.map((attr) => serializeValue(record[attr])),
+      shards.count,
+    ),
+  )
+}
 
-  // Regular entity index — PK uses entity type
-  return composeKey(schema, entityType, composites, { casing: index.casing, names })
+/**
+ * `index` as its unsharded layout: what a `previous: 1` migration reads, and the
+ * only layout rows under 1.36 key text can be in. Reads only.
+ */
+export const unshardedView = (index: IndexDefinition): IndexDefinition => {
+  if (index.shards === undefined) return index
+  const { shards: _shards, ...view } = index
+  return view
+}
+
+/**
+ * The partition key a stored row's values compose now, for `rekey` (#183): by the
+ * structural rule an update composes with, truncated included. `undefined` when
+ * they can't compose one: a hole, no leading composite, or the source missing.
+ */
+export const composeStoredPk = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): string | undefined => {
+  const outcome = classifyHalf(index.pk.composite, record, "sparse", false)
+  if (outcome.kind !== "set") return undefined
+  const shards = index.shards
+  if (
+    shards !== undefined &&
+    !boundShardSource(index, shards).every((attr) => hasValue(record[attr]))
+  ) {
+    return undefined
+  }
+  return outcome.length === index.pk.composite.length
+    ? composePk(schema, entityType, index, record)
+    : composePkPrefixUpTo(schema, entityType, index, record, outcome.length)
+}
+
+/**
+ * Does stored partition key text lie in `index`'s current layout (#183): shard
+ * marker with this count, whatever shard? A row whose values can't compose its key
+ * can only be left alone when this holds.
+ */
+export const isCurrentShardLayout = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  stored: string,
+): boolean =>
+  index.shards !== undefined &&
+  stored.startsWith(composePkText(schema, entityType, index, [], [], `!${index.shards.count}.`))
+
+const boundShardSource = (index: IndexDefinition, shards: IndexShards): ReadonlyArray<string> => {
+  if (shards.source === undefined) {
+    throw new Error(
+      `KeyComposer: sharded index "${index.index}" was never bound to an entity — Entity.make ` +
+        `binds a sharded index's source to the primary key composites or \`by\`.`,
+    )
+  }
+  return shards.source
+}
+
+/**
+ * What a query of an index reads (#183): the partition key text of each physical
+ * partition, and on a sharded index, what the fan-out needs to know.
+ */
+export interface ReadPartitions {
+  /** The one partition of an unsharded index; else the current shards, then `previous`'s. */
+  readonly partitions: ReadonlyArray<string>
+  readonly fanOut: ReadFanOut | undefined
+}
+
+/** The layout a sharded query reads: what its cursor's fingerprint covers. */
+export interface ReadFanOut {
+  readonly count: number
+  readonly source: ReadonlyArray<string>
+  readonly previous: number | undefined
+  /** Every `by` attribute was pinned, so one current shard is read. */
+  readonly pruned: boolean
+  /** The partition of the unsharded layout, when `previous` is `1`. */
+  readonly unsharded: string | undefined
+}
+
+/**
+ * The partitions a query of `index` reads for the pinned composites in `record`,
+ * in merge order: the current layout's by shard number (one, when every `by`
+ * attribute is pinned), then the `previous` layout's, which are never pruned: the
+ * old source isn't recorded. Every read path uses this; {@link composePk}
+ * composes the one key a write stores.
+ */
+export const composeReadPartitions = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+  /** `false`: read every shard, whatever is pinned (a collection's members may differ). */
+  options?: { readonly prune?: boolean },
+): ReadPartitions => {
+  const shards = index.shards
+  if (shards === undefined) {
+    return { partitions: [composePk(schema, entityType, index, record)], fanOut: undefined }
+  }
+  const source = boundShardSource(index, shards)
+  const composites = extractComposites(index.pk.composite, record)
+  const partition = (count: number, shard: number) =>
+    composePkText(
+      schema,
+      entityType,
+      index,
+      composites,
+      index.pk.composite,
+      shardMarker(count, shard),
+    )
+  const layout = (count: number) => Array.from({ length: count }, (_, i) => partition(count, i))
+  const pinnedBy =
+    options?.prune !== false &&
+    shards.by !== undefined &&
+    shards.by.every((attr) => record[attr] !== undefined && record[attr] !== null)
+  const current = pinnedBy
+    ? [
+        partition(
+          shards.count,
+          shardOf(
+            source.map((attr) => serializeValue(record[attr])),
+            shards.count,
+          ),
+        ),
+      ]
+    : layout(shards.count)
+  const unsharded =
+    shards.previous === 1
+      ? composePkText(schema, entityType, index, composites, index.pk.composite, undefined)
+      : undefined
+  const previous =
+    unsharded !== undefined
+      ? [unsharded]
+      : shards.previous === undefined
+        ? []
+        : layout(shards.previous)
+  return {
+    partitions: [...current, ...previous],
+    fanOut: {
+      count: shards.count,
+      source,
+      previous: shards.previous,
+      pruned: pinnedBy,
+      unsharded,
+    },
+  }
 }
 
 /**
@@ -726,21 +1061,14 @@ const composePkPrefixUpTo = (
   stopBefore: number,
 ): string => {
   const slice = index.pk.composite.slice(0, stopBefore)
-  const composites = extractComposites(slice, record)
-  const collection = index.collection
-
-  if (collection !== undefined) {
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, {
-      casing: index.casing,
-      names: [...slice],
-    })
-  }
-
-  return composeKey(schema, entityType, composites, {
-    casing: index.casing,
-    names: [...slice],
-  })
+  return composePkText(
+    schema,
+    entityType,
+    index,
+    extractComposites(slice, record),
+    slice,
+    composedShardMarker(entityType, index, record),
+  )
 }
 
 /**
@@ -907,6 +1235,66 @@ const classifyZOrderHalf = (
   return "noop"
 }
 
+const hasValue = (value: unknown): boolean => value !== undefined && value !== null
+
+/**
+ * The PK half's outcome on a sharded index, from what {@link classifyHalf} says
+ * of its composites and what the update did to the shard source (design §5). On
+ * an unsharded index, that outcome as it is.
+ *
+ * A write that would leave the shard stale or need an unsharded key throws
+ * `[EDD-9100]`; a `by` attribute explicitly gone drops the entry, which writes no
+ * unsharded key; and an update that doesn't touch the source leaves the stored
+ * key alone.
+ */
+const shardedPkOutcome = (
+  entityType: string,
+  index: IndexDefinition,
+  outcome: HalfOutcome,
+  update: {
+    readonly merged: Record<string, unknown>
+    readonly updatePayload: Record<string, unknown>
+    readonly policy: IndexPolicyKey
+    readonly pkHasRemoved: boolean
+    readonly byTouched: boolean
+    readonly byCleared: boolean
+    readonly byRemoved: boolean
+    readonly onMissing: "fail" | "keep"
+  },
+): HalfOutcome => {
+  const shards = index.shards
+  if (shards === undefined) return outcome
+  const { merged, updatePayload, policy } = update
+  const pkComposites = index.pk.composite
+  const refuse = (): HalfOutcome => {
+    if (update.onMissing === "keep") return { kind: "noop" }
+    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(merged[attr]))
+    const missing = absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(merged[a]))
+    throw new ShardSourceError({
+      message:
+        `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
+        `sharded by, and its partition key can't be composed without ` +
+        `${missing.map((attr) => `"${attr}"`).join(", ")}. The stored shard would go stale, so ` +
+        `nothing was written. Include ${missing.length === 1 ? "it" : "them"} in the update.`,
+    })
+  }
+  if (update.byRemoved) return { kind: "drop" }
+  if (outcome.kind === "drop") {
+    const pkExplicitlyGone =
+      update.pkHasRemoved ||
+      pkComposites.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    return update.byTouched && !pkExplicitlyGone ? refuse() : outcome
+  }
+  if (outcome.kind === "noop") return update.byTouched ? refuse() : outcome
+  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) return outcome
+  if (update.byCleared && policy === "sparse") return { kind: "drop" }
+  // The source is incomplete: an update changing the partition or part of `by`
+  // can't compute the shard; any other leaves the stored key alone.
+  return update.byTouched || pkComposites.some((attr) => hasValue(updatePayload[attr]))
+    ? refuse()
+    : { kind: "noop" }
+}
+
 /**
  * Resolve the per-half policy for an index. Defaults each half to `"preserve"`
  * when omitted (or when `indexPolicy` is omitted entirely).
@@ -987,6 +1375,13 @@ export const composeGsiKeysForUpdatePolicyAware = (
   keyRecord: Record<string, unknown>,
   options?: {
     readonly removedSet?: ReadonlySet<string>
+    /**
+     * What a sharded half does when the update can't compute its new shard:
+     * `"fail"` (the default) throws `[EDD-9100]`; `"keep"` leaves the stored key,
+     * for a caller composing from partial knowledge whose result is not the
+     * write (see `docs/designs/gsi-write-sharding.md` §5).
+     */
+    readonly onMissingShardSource?: "fail" | "keep"
   },
 ): GsiUpdateResult => {
   const sets: Record<string, KeyValue> = {}
@@ -1025,10 +1420,22 @@ export const composeGsiKeysForUpdatePolicyAware = (
       removedSet !== undefined && pkComposites.some((attr) => removedSet.has(attr))
     const skHasRemoved =
       removedSet !== undefined && skComposites.some((attr) => removedSet.has(attr))
+    // A `by` attribute (#183) is a dependency of the PK half, when the writer
+    // touches it: the shard follows its value. Its presence in `keyRecord` is no
+    // evidence of a change. The retain path's holds the whole item.
+    const by = index.shards?.by ?? []
+    const byTouched = by.some((attr) => hasValue(updatePayload[attr]))
+    const byCleared = by.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    const byRemoved = removedSet !== undefined && by.some((attr) => removedSet.has(attr))
+    // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
-      pkComposites.length > 0 &&
-      !pkHasRemoved &&
-      pkComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+      (pkComposites.length > 0
+        ? !pkHasRemoved &&
+          pkComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+        : by.length > 0 && by.every((attr) => !(attr in keyRecord))) &&
+      !byTouched &&
+      !byCleared &&
+      !byRemoved
     const skipSk =
       skComposites.length > 0 &&
       !skHasRemoved &&
@@ -1059,7 +1466,21 @@ export const composeGsiKeysForUpdatePolicyAware = (
     const policy = resolveIndexPolicy(index.indexPolicy)
 
     if (!skipPk) {
-      const pkOutcome = classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved)
+      const pkOutcome = shardedPkOutcome(
+        entityType,
+        index,
+        classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved),
+        {
+          merged,
+          updatePayload,
+          policy: policy.pk,
+          pkHasRemoved,
+          byTouched,
+          byCleared,
+          byRemoved,
+          onMissing: options?.onMissingShardSource ?? "fail",
+        },
+      )
       if (pkOutcome.kind === "drop") {
         removes.push(index.pk.field)
       } else if (pkOutcome.kind === "set") {

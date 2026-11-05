@@ -82,6 +82,7 @@ import { type DimensionField, resolveDimension } from "./internal/ZOrderDimensio
 import type {
   GsiConfig,
   IndexDefinition,
+  IndexShards,
   KeyPart,
   ZOrderKeyPart,
   ZOrderSkPart,
@@ -215,9 +216,14 @@ type NormalizedGsi<G extends GsiConfig<any>> = G["sk"] extends {
  * attribute names a composite may name: on `Entity.make`, the model's fields
  * plus ref-derived ids ({@link KeyFields}). At least one half has a composite.
  */
-export type PrimaryKeyDef<F extends string = string> = Omit<IndexDefinition, "pk" | "sk"> & {
+export type PrimaryKeyDef<F extends string = string> = Omit<
+  IndexDefinition,
+  "pk" | "sk" | "shards"
+> & {
   readonly pk: KeyPart<F>
   readonly sk: KeyPart<F>
+  /** A table's primary key can't be sharded: `shards` is an index option. */
+  readonly shards?: never
 } & (
     | { readonly pk: { readonly composite: readonly [F, ...F[]] } }
     | { readonly sk: { readonly composite: readonly [F, ...F[]] } }
@@ -285,10 +291,31 @@ type AllowedEntryKeys<E, TFields> = E extends { readonly field: infer F extends 
  * loses the editor's completions.
  */
 export type ZOrderEntriesGuard<TIndexes, TFields> = {
-  readonly [K in keyof TIndexes]: TIndexes[K] extends { readonly sk: infer SK }
+  readonly [K in keyof TIndexes]: (TIndexes[K] extends { readonly sk: infer SK }
     ? { readonly sk: ZOrderHalfGuard<SK, TFields> }
-    : unknown
+    : unknown) &
+    ShardsByGuard<TIndexes[K]>
 }
+
+/**
+ * @internal A `shards.by` names sort key composites of its own index (#183): any
+ * other attribute, or any attribute on a Z-order half (no accessor can pin its
+ * dimensions), is an error on that entry. The constraint already checks each name
+ * against the model; `Entity.make` checks again at runtime (`EDD-9102`).
+ */
+type ShardsByGuard<TEntry> = TEntry extends { readonly shards: { readonly by: unknown } }
+  ? {
+      readonly shards: {
+        readonly by: ReadonlyArray<
+          TEntry extends {
+            readonly sk: { readonly composite: infer C extends ReadonlyArray<string> }
+          }
+            ? C[number]
+            : never
+        >
+      }
+    }
+  : unknown
 
 /** @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name. */
 export type EntityIndexesGuard<TModel extends Schema.Top, TRefs, TIndexes> = ZOrderEntriesGuard<
@@ -583,6 +610,56 @@ export interface EntityDefinition<
  *
  * @throws on invalid configuration (EDD-90xx).
  */
+/**
+ * Check a declared `shards` against its entity and bind its source (#183). The
+ * checks needing no model are `normalizeGsiConfig`'s.
+ */
+const bindShards = (
+  entityType: string,
+  indexName: string,
+  index: IndexDefinition,
+  primary: IndexDefinition,
+): IndexShards => {
+  const shards = index.shards!
+  const primaryComposites = [...primary.pk.composite, ...primary.sk.composite]
+  if (primaryComposites.every((attr) => index.pk.composite.includes(attr))) {
+    throw new Error(
+      `[EDD-9101] Entity "${entityType}": index "${indexName}" has nothing to spread. Every ` +
+        `primary key composite is also one of its partition key composites, so each logical ` +
+        `partition holds at most one item and every write to it lands on one shard. Its hot ` +
+        `spot is the write rate on one item, which sharding an index can't split: remove ` +
+        `\`shards\`.`,
+    )
+  }
+  const by = shards.by
+  if (by === undefined) return { ...shards, source: primaryComposites }
+  const refuseBy = (why: string): Error =>
+    new Error(`[EDD-9102] Entity "${entityType}": index "${indexName}" shards.by ${why}`)
+  if (!Array.isArray(by) || by.length === 0) {
+    throw refuseBy(
+      "must name at least one sort key composite of this index. Omit it to hash the primary key.",
+    )
+  }
+  if (new Set(by).size !== by.length) {
+    throw refuseBy(`names an attribute twice: ${by.map((attr) => `"${attr}"`).join(", ")}.`)
+  }
+  if (isZOrderHalf(index.sk)) {
+    throw refuseBy(
+      "can't be used on a Z-order sort key: an accessor can't pin its dimensions, so no query " +
+        "could read fewer shards. Omit it to hash the primary key.",
+    )
+  }
+  const outside = by.filter((attr) => !index.sk.composite.includes(attr))
+  if (outside.length > 0) {
+    throw refuseBy(
+      `${outside.map((attr) => `"${attr}"`).join(", ")} must be a sort key composite of this index ` +
+        `(${index.sk.composite.join(", ") || "it has none"}): a query can never pin anything else, ` +
+        `so it would give no pruning and a worse spread than the default.`,
+    )
+  }
+  return { ...shards, source: by }
+}
+
 export const buildEntityDefinition = (config: {
   readonly model: Schema.Top | ConfiguredModel<Schema.Top, any>
   readonly entityType: string
@@ -640,6 +717,12 @@ export const buildEntityDefinition = (config: {
     if (indexDef.collection !== undefined && isZOrderHalf(indexDef.sk)) {
       throw zorderInCollection(config.entityType, indexName)
     }
+  }
+  if ((primaryIndex as { readonly shards?: unknown }).shards !== undefined) {
+    throw new Error(
+      `[EDD-9099] Entity "${config.entityType}": the primary key can't be sharded — shards is ` +
+        `an option of a secondary index.`,
+    )
   }
   if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
     throw new Error(
@@ -1162,6 +1245,16 @@ export const buildEntityDefinition = (config: {
         schema: inputFields[field],
         encoding: fieldEncodings[field] ?? optionalFieldEncoding(modelFields[field]),
       })),
+    }
+  }
+
+  // Bind every sharded index (#183): its source is `by`, or the primary key's
+  // composites. Unbound indexes never compose a key.
+  for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
+    if (indexDef.shards === undefined) continue
+    initialIndexes[indexName] = {
+      ...indexDef,
+      shards: bindShards(config.entityType, indexName, indexDef, primaryIndex),
     }
   }
 

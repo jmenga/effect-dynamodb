@@ -61,7 +61,7 @@ shard zero-padded to the width of `count - 1`:
 | Sharded, shard 7 of 20 | `$fleet-db#v1#devicestate#!20.07#tenantid_t-123` |
 | Sharded, empty PK half | `$fleet-db#v1#devicestate#!20.07` |
 | Sharded collection | `$fleet-db#v1#assignments#!20.07#employee_x` |
-| `casing: "uppercase"` | `$FLEET-DB#V1#DEVICESTATE#!20.07#TENANTID_T-123` |
+| `casing: "uppercase"` on the schema | `$FLEET-DB#v1#DEVICESTATE#!20.07#TENANTID_T-123` |
 
 This **changes the issue's proposal** of a final segment (§15). Reasoning:
 
@@ -185,12 +185,11 @@ from payload and `keyRecord` and not T / N / R. Empty PK half without `by`: neve
 | 4 | P = noop, T | **fail `EDD-9100`** | Otherwise the stored shard goes stale |
 | 5 | P = noop, otherwise | noop | `preserve` as today |
 | 6 | P = set, not A | SET sharded, truncated included | The normal case |
-| 7 | P = set, A, PT, N and `sparse` | REMOVE | The writer explicitly cleared `by` |
-| 8 | P = set, A, PT, otherwise | **fail `EDD-9100`** | Moves the tenant without `by`: the issue's "silent fallback" scenario |
-| 9 | P = set, A, not PT, N and `sparse` | REMOVE | Explicit clear under `sparse` |
-| 10 | P = set, A, not PT, otherwise | noop | An unrelated `.set({ status })`, with PK composites from `keyRecord`, must never evict or fail |
+| 7 | P = set, A, N and `sparse` | REMOVE | The writer explicitly cleared `by` |
+| 8 | P = set, A, PT or T | **fail `EDD-9100`** | Moves the tenant without `by` (the issue's "silent fallback" scenario), or changes one `by` attribute without another |
+| 9 | P = set, A, otherwise | noop | An unrelated `.set({ status })`, with PK composites from `keyRecord`, must never evict or fail |
 
-A composer option `onMissingShardSource: "keep"` turns cases 2, 4 and 8 into a noop for the two
+A composer option `onMissingShardSource: "keep"` turns the failing cases into a noop for the two
 callers that compose from partial knowledge and don't write the result as-is:
 
 - the pre-check at the retain branch point, whose `keyRecord` is the encoded key only (the retain
@@ -476,7 +475,7 @@ the direction, and it is still proposed for the owner.
 | D5 | Hash input fold `toLowerCase().toUpperCase()`, separator `0xFF` | proposed — awaiting owner confirmation |
 | D6 | `by`-only update without PK composites fails, even under `sparse` (§5 case 2) | proposed — awaiting owner confirmation |
 | D7 | Explicit `.remove(["by"])` drops the PK half under both policies | proposed — awaiting owner confirmation |
-| D8 | Unrelated update where `by` is absent is a noop under both policies (§5 case 10) | proposed — awaiting owner confirmation |
+| D8 | Unrelated update where `by` is absent is a noop under both policies (§5 case 9) | proposed — awaiting owner confirmation |
 | D9 | Collection members must agree on `count` and `previous`, not `by` | proposed — awaiting owner confirmation |
 | D10 | Collections never prune in v1 | proposed (task) |
 | D11 | `.maxPages(n)` means n rounds | proposed — awaiting owner confirmation |
