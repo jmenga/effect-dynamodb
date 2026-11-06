@@ -283,7 +283,7 @@ describe.each(
   }
 })
 
-describe("a dry run judges each row on its own", () => {
+describe("a dry run follows the chain", () => {
   for (const scenario of dryRunChainScenarios) {
     it.effect(scenario.name, () => scenario.run(harness))
   }

@@ -2244,14 +2244,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
           let fromOnly = false
           if (from !== undefined) {
             const stale = yield* staleRootAt(ctx.tableName, current)
-            if (stale !== undefined && ctx.dryRun) {
-              fromOnly = true
-            } else if (stale !== undefined) {
-              first =
-                depth >= Rekey.DISPLACE_DEPTH
-                  ? {}
-                  : ((yield* rekeyRow(stale, ctx, depth + 1)) ?? {})
-              if ((yield* staleRootAt(ctx.tableName, current)) !== undefined) {
+            if (stale !== undefined) {
+              const tooDeep = depth >= Rekey.DISPLACE_DEPTH
+              first = tooDeep
+                ? {}
+                : yield* Rekey.displace(ctx, (under) => rekeyRow(stale, under, depth + 1))
+              // A dry run moved nothing: what would stop that aggregate is what would leave it.
+              const stillThere = ctx.dryRun
+                ? tooDeep || (first.conflicts ?? []).length > 0
+                : (yield* staleRootAt(ctx.tableName, current)) !== undefined
+              if (stillThere) {
                 return Rekey.mergeTallies(first, {
                   conflicts: [
                     {
@@ -2265,6 +2267,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   ],
                 })
               }
+              fromOnly = ctx.dryRun
             }
           }
           const moved = yield* rekeyCore(key, ctx.dryRun, from, fromOnly).pipe(

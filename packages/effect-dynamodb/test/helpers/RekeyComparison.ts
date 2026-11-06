@@ -1088,13 +1088,15 @@ export const labelScenarios: ReadonlyArray<{
 })
 
 /**
- * The limit on a dry run (D55): it judges each row on its own. One value moves to where the other
- * value's row is, and that row can't move, so the real run moves neither. The dry run says the
- * first would move. Without the blocked row the two agree.
+ * A dry run follows the chain (D88). One value moves to where the other value's row is, and when
+ * that row can't move, the real run moves neither and reports both: the one that can't, and the one
+ * it holds up. The dry run says the same, and without the blocked row both move in each.
  */
 export const dryRunChainScenarios: ReadonlyArray<Scenario> = [false, true].flatMap((blocked) =>
   bothWays(
-    blocked ? "blocked: a dry run predicts the move a real run refuses" : "not blocked: agrees",
+    blocked
+      ? "blocked: neither moves, in the dry run too"
+      : "not blocked: both move, in the dry run too",
     (h, { now, was }) => {
       const model = Schema.Struct({ id: Schema.String, status: Schema.String })
       const world = worldOf(
@@ -1130,14 +1132,15 @@ export const dryRunChainScenarios: ReadonlyArray<Scenario> = [false, true].flatM
           yield* table.seed(rowAtThen({ id: held, status: blocked ? "c" : "b" }))
           const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
           const real: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+          expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
           if (blocked) {
-            expect(dry.moved.item).toBe(1)
-            expect(dry.conflicts.map((conflict) => conflict.reason)).toEqual(["failed"])
             expect(real.moved.item).toBe(0)
-            expect(real.conflicts.length).toBeGreaterThan(dry.conflicts.length)
+            expect(real.conflicts.map((conflict) => conflict.reason).sort()).toEqual([
+              "failed",
+              "taken",
+            ])
             expect(yield* table.rows()).toHaveLength(2)
           } else {
-            expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
             expect(real.moved.item).toBe(2)
           }
         }),

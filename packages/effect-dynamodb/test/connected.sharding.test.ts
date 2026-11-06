@@ -1466,7 +1466,7 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
   for (const scenario of RekeyComparison.labelScenarios) {
     it.live(scenario.name, () => scenario.run(harness))
   }
-  describe("a dry run judges each row on its own", () => {
+  describe("a dry run follows the chain", () => {
     for (const scenario of RekeyComparison.dryRunChainScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }

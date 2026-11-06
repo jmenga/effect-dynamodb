@@ -483,6 +483,58 @@ describe.each(DIRECTIONS)("rekey, a projection's rows, %s", (_direction, from, t
     ),
   )
 
+  it.effect("a row whose key holds no values of the read model is counted, on every run", () =>
+    inTable((table) =>
+      Effect.gen(function* () {
+        const key = { pk: { S: "somewhere" }, sk: { S: "else" } }
+        table.items.set("somewhere|else", { ...key, __edd_e__: { S: "Tally#tombstone" } })
+        table.items.set("somewhere|else#o", {
+          pk: key.pk,
+          sk: { S: "else#o" },
+          __edd_row_pk__: key.pk,
+          __edd_row_sk__: { S: "other" },
+          __edd_e__: { S: "Tally#outbox" },
+        })
+        const before = new Map(table.items)
+        const dry = yield* rekey(to, { dryRun: true })
+        const real = yield* rekey(to)
+        expect(real.skipped.unrecognizedKey).toBe(2)
+        expect(dry.skipped.unrecognizedKey).toBe(2)
+        expect(real.moved).toEqual(ZERO)
+        expect(table.items).toEqual(before)
+        expect((yield* rekey(to)).skipped.unrecognizedKey).toBe(2)
+      }),
+    ),
+  )
+
+  it.effect("a tombstone whose key a live row holds is taken, in the dry run too", () =>
+    inTable((table) =>
+      Effect.gen(function* () {
+        const events = yield* seed(from, "both", [new Opened(), new Closed()], 0)
+        yield* from.Notifying.applyBatch(events)
+        expect(rowsOf(table, "Tally#tombstone")).toHaveLength(1)
+        const key = keyOf(to, "Tally", "both")
+        table.items.set(
+          at(key),
+          toAttributeMap({
+            ...key,
+            ...ROWS.both,
+            total: 0,
+            version: 0,
+            rev: 0,
+            __edd_e__: "Tally",
+          }),
+        )
+        const dry = yield* rekey(to, { dryRun: true })
+        const real = yield* rekey(to)
+        expect(real.moved.tombstone).toBe(0)
+        expect(dry.moved).toEqual(real.moved)
+        expect(real.conflicts.map((conflict) => conflict.reason)).toEqual(["taken"])
+        expect(dry.conflicts).toEqual(real.conflicts)
+      }),
+    ),
+  )
+
   it.effect("rows already at what the setting composes are left alone", () =>
     inTable((table) =>
       Effect.gen(function* () {

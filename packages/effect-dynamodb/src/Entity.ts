@@ -10918,8 +10918,6 @@ const makeImpl = <
           tally: rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
         }
       }
-      // A dry run counts the stale row when the scan reaches it.
-      if (ctx.dryRun) return { cleared: true, tally: {} }
       if (depth >= Rekey.DISPLACE_DEPTH) {
         return {
           cleared: false,
@@ -10932,7 +10930,7 @@ const makeImpl = <
           ),
         }
       }
-      const tally = (yield* rekeyRow(held, ctx, depth + 1)) ?? {}
+      const tally = yield* Rekey.displace(ctx, (under) => rekeyRow(held, under, depth + 1))
       return (tally.conflicts ?? []).length === 0
         ? { cleared: true, tally }
         : { cleared: false, tally: Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to)) }
@@ -11655,7 +11653,7 @@ const makeImpl = <
         }
         const current = now.key
         if (current === undefined) continue
-        let heldNow = yield* readAt(current)
+        const heldNow = yield* readAt(current)
         let found:
           | {
               readonly key: { readonly pk: string; readonly sk: string }
@@ -11707,30 +11705,33 @@ const makeImpl = <
               )
               continue
             }
-            // A dry run counts the other row when the scan reaches it.
-            if (!ctx.dryRun) {
-              if (depth >= Rekey.DISPLACE_DEPTH) {
-                refused(
-                  "contended",
-                  constraintName,
-                  found.key,
-                  current,
-                  "too many sentinels under other key text hold each other's current keys.",
-                )
-                continue
-              }
-              tally = Rekey.mergeTallies(tally, (yield* rekeyRow(holder!, ctx, depth + 1)) ?? {})
-              heldNow = yield* readAt(current)
-              if (heldNow !== undefined) {
-                refused(
-                  "taken",
-                  constraintName,
-                  found.key,
-                  current,
-                  "its sentinel's current key is held by another item.",
-                )
-                continue
-              }
+            if (depth >= Rekey.DISPLACE_DEPTH) {
+              refused(
+                "contended",
+                constraintName,
+                found.key,
+                current,
+                "too many sentinels under other key text hold each other's current keys.",
+              )
+              continue
+            }
+            const displaced = yield* Rekey.displace(ctx, (under) =>
+              rekeyRow(holder!, under, depth + 1),
+            )
+            tally = Rekey.mergeTallies(tally, displaced)
+            // A dry run moved nothing: what would stop the holder is what would leave it there.
+            const stillHeld = ctx.dryRun
+              ? (displaced.conflicts ?? []).length > 0
+              : (yield* readAt(current)) !== undefined
+            if (stillHeld) {
+              refused(
+                "taken",
+                constraintName,
+                found.key,
+                current,
+                "its sentinel's current key is held by another item.",
+              )
+              continue
             }
           }
           items.push(
@@ -11877,21 +11878,31 @@ const makeImpl = <
         return { skipped: { unrecognizedKey: 1 } }
       }
       if (sameStoredKey(stored, targets.current)) {
-        if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored, depth)
-        if (targets.kind !== "tombstone") return { unchanged: 1 }
-        // A tombstone under its current key: its sentinels may still hold
-        // other key text or name another of the item's keys.
-        const sentinels = yield* rekeySentinels(
-          ctx,
-          "tombstone",
-          row,
-          targets.lives,
-          targets.live,
-          depth,
+        // A sentinel in another row's way has this row reached before the scan gets to it, and
+        // then it has nothing left to do: `unchanged` counts a row the run didn't touch.
+        const firstVisit = ctx.claim(
+          `${entityType}\u0000at\u0000${stored[rekeyPk]}\u0000${stored[rekeySk]}`,
         )
-        return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
-          ? sentinels
-          : { unchanged: 1 }
+        const tally: Rekey.RekeyTally = yield* Effect.gen(function* () {
+          if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored, depth)
+          if (targets.kind !== "tombstone") return { unchanged: 1 }
+          // A tombstone under its current key: its sentinels may still hold
+          // other key text or name another of the item's keys.
+          const sentinels = yield* rekeySentinels(
+            ctx,
+            "tombstone",
+            row,
+            targets.lives,
+            targets.live,
+            depth,
+          )
+          return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
+            ? sentinels
+            : { unchanged: 1 }
+        })
+        if (firstVisit) return tally
+        const { unchanged: _again, ...rest } = tally
+        return rest
       }
       if (targets.old === undefined) return { skipped: { unrecognizedKey: 1 } }
       if (targets.kind !== "item") {
@@ -12079,8 +12090,10 @@ const makeImpl = <
             rekeyConflict(kind, "contended", from, to, "A drainer holds it."),
           )
         }
-        if (ctx.dryRun) return countMove(ctx, kind, counted, tally)
-        if (yield* moveValueless(ctx.tableName, keys.pk, from, read, plan.moved(read))) {
+        if (
+          !ctx.dryRun &&
+          (yield* moveValueless(ctx.tableName, keys.pk, from, read, plan.moved(read)))
+        ) {
           return countMove(ctx, kind, counted, tally)
         }
         const { Item: there } = yield* client.getItem({
@@ -12108,14 +12121,17 @@ const makeImpl = <
               ),
             )
           }
-          const displaced = isValueless(there)
-            ? yield* rekeyProjectionRow(there, ctx, keys, depth + 1)
-            : ((yield* rekeyRow(there, ctx, depth + 1)) ?? {})
+          const displaced = yield* Rekey.displace(ctx, (under) =>
+            isValueless(there)
+              ? rekeyProjectionRow(there, under, keys, depth + 1)
+              : rekeyRow(there, under, depth + 1),
+          )
           tally = Rekey.mergeTallies(tally, displaced)
           if ((displaced.conflicts ?? []).length > 0) {
             return Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to))
           }
         }
+        if (ctx.dryRun) return countMove(ctx, kind, counted, tally)
         // It changed between the read and the write, or made room: read again.
       }
       return Rekey.mergeTallies(

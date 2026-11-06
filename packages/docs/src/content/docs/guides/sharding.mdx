@@ -376,7 +376,7 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 
 `rekey` compares. A sharded partition key is composed from the row's values, and rewritten if it differs. Any other key is rewritten only when it is exactly its own text under another setting or release. A key the row doesn't have isn't written: under `sparse`, its absence can be deliberate.
 
-A dry run judges each row on its own. A row whose destination is held by a row that can't move may be predicted as moved, and the real run then reports it as a conflict.
+A dry run reports what the real run does, chains included: a row whose destination is held by a row that can't move is a conflict in both.
 
 :::caution[A key that no longer matches its row's values]
 `rekey` leaves a key that isn't exactly what any setting or release composed for the values the row holds, with no conflict, as nothing on the row says what its text meant. Under `preserve` there are two ways to get one: `.set({ x: undefined })` removes the value and keeps the key, and an update naming a composite it can't recompose the half from changes the value and keeps the key. If the key's text is one the setting doesn't compose (a number other than a positive integer, or a value holding a character up to `%`):

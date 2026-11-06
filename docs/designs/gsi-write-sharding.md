@@ -681,7 +681,7 @@ whose decisions are D64 to D70. D71 and D72 are this PR's scoping calls, D73 a f
 | D52 | ~~A casing or an escape reaches a composite unless the model pins it to `number` or `bigint`.~~ **Superseded by D69:** halves compare their effective casing whatever they hold | superseded |
 | D53 | An update never writes a table key attribute, and history rows never lose one, whichever index's half is stored there. Every update on an entity with a local or inverted index was refused by DynamoDB until now (§17.9) | confirmed |
 | D54 | ~~`"legacySortKey"` judges a composite as a number when the model declares it so~~ **Superseded by D58**: nothing judges a cleared value, by its text or by the model | superseded |
-| D55 | A dry run judges each row on its own: the row the move would write, reporting for it what the real run would, a move that would fail included. It doesn't simulate chains, so a row whose destination is held by a row that can't move may be predicted as moved (§17.11) | confirmed |
+| D55 | A dry run judges the row the move would write, reporting for it what the real run would, a move that would fail included. ~~It doesn't simulate chains, so a row whose destination is held by a row that can't move may be predicted as moved (§17.11)~~ **That limit is superseded by D88** | confirmed, in part |
 | D56 | ~~A new conflict reason, `"legacyPartitionKey"`~~ **Superseded by D58**, which removes the conflict | superseded |
 | D57 | `rekey` calls a row under both keys only if it's still at the old one when it finds it at the new one (§17.13) | confirmed |
 | D58 | `rekey` compares with what 1.36 composed (each form's text, since D79), and never parses. An unsharded partition key, any sort key and a vector partition are rewritten only when the stored key is exactly their own 1.36 text and that isn't the current text; a sort key missing a trailing composite is judged by the composites before the gap (D43). A sharded partition key stays compose-and-compare (D24). Anything else is left with no conflict. **The accepted limit:** a key that isn't its own 1.36 text stays, so a row that cleared a composite, or whose key lags its values, is missed by a pin once the fallback or `previous` goes, when its text changed in 1.37 (§9.2, §17.10, §17.15). It replaces D44, D54 and D56 | confirmed |
@@ -714,6 +714,7 @@ whose decisions are D64 to D70. D71 and D72 are this PR's scoping calls, D73 a f
 | D85 | **An aggregate's root moves last,** so a run cut short leaves it where the next run finds the aggregate. An aggregate update during the move fails `AggregateAssemblyError` and writes nothing, and a delete deletes the edges already at the current key while the root still arrives: nothing is promised until `rekey` finishes, and a test pins it. The current version's snapshot no longer moves in its item's transaction: the scan moves it | scoping call, for review |
 | D86 | **What's found below no root is judged after the scan** (`RekeyMember.finish`, `rekeyRowBelowRoot`, `rekeyFinish`), so a dry run agrees with the real run whichever order the scan met them. What can't be placed is counted on every run: an orphan sentinel (`skipped.unrecognizedKey`, at one or two extra reads per sentinel), orphan aggregate edges, and a 1.37.0 or 1.38.0 crash state (root at the current key, edges at the old partition). A run stopped early by `maxPages` can count one whose root a later page brings in | scoping call, for review |
 | D87 | **`RekeyReport.conflicts` lists a row once per run,** and a row whose destination holder can't move stops retrying and reports `taken` (`cantMoveHolder`). With a drainer-held outbox item under off, the other value's item bound for that key stays too. A stream's move filters by `streamId`, so another id's rows in a partition are its own, and a multi-composite id holding `#` written under off that reads two ways under on is a `failed` conflict | scoping call, for review |
+| D88 | **A dry run follows the chain,** on every kind of row (`Rekey.displace`), superseding D55's limit: what holds a row's current key is judged by its own handler, counting nothing, and what would stop it stops the row in the dry run too. An item at its current key that a chain reached before the scan counts `unchanged` only on its first visit, so the two runs agree there as well (§17.11) | scoping call, for review |
 
 ## 15. Scoping decisions
 
@@ -847,7 +848,6 @@ Not in the issue; each one is something a caller could otherwise expect:
 | Until `rekey`, a write that can't move the other value's rows is a false conflict that writes nothing (`ItemNotMoved`, `ConditionalCheckFailed`, `VersionConflict`, `UniqueConstraintViolation`) | D73, D74, §17.17 |
 | A key that isn't any form's text stays, as when a row cleared a composite or the key lags its values. When its text changed, a pin misses it, a broader query finds a sort key half where its old text sorts, and `get` reads a partition key half | §9.2, D58: nothing on the row says what the text meant, and reading it from the text is what §17.10 removed |
 | A run that moves a row catches a lagging key up. A run that leaves the row where it is doesn't | §9.2: a move recomposes as an update would, as it has since #181 |
-| A dry run judges each row on its own, so a row whose destination is held by a row that can't move may be predicted as moved | §17.11, D55: simulating chains isn't worth what it costs a dry run. The real run reports the conflict |
 | `.where()` bounds other than `eq` and `beginsWith` have no 1.36 pass, and the unbound `Query.where()` drops the 1.36 read | Existing since #181 (`LegacyKeyQueries`), now on shards too |
 | After `rekey`, a row that can't compose a key stays where it is: a conflict when it's in another layout, left alone in the current one | D18, D24. "No stored key stays unsharded" holds for rows that can compose |
 | The move path keeps a row's key when `by` is absent | `onMissingShardSource: "keep"` (§5): the row has nothing to hash |
@@ -949,7 +949,7 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   half (§17.10 lists them), and the 16 indexes of `SHAPES`, or three of them for `append`, through `put`, `create`, `Batch.write`, `upsert`, updates naming every composite, none or
   one, a removal, a clearing, a transaction's update, a retained update and `append`: after each, `rekey` judges every
   row, skips none, rewrites nothing, and the stored rows are equal to what they were, compared whole. Also a Z-order
-  index, a table key attribute, labels that begin alike, and a dry run's chain limit. On the recording table alone, a
+  index, a table key attribute, labels that begin alike, and a dry run's chain (D88). On the recording table alone, a
   vector partition, and a write landing between `rekey`'s read and its write.
 - **Two accessors sharing attributes:** degenerate fixture **13** (§17.15) is a refusal now, at `Entity.make` and
   `Table.make`, in `SharedKeyAttribute.test.ts`. `rekey`'s rule on such a pair moved to the same accessors with their
@@ -1025,6 +1025,15 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   blinded (no aliases, no transactions). All but one fail a test now. The first run had four survivors. Three were missing tests, all
   closed: the prefix composer, a vector partition and a bound `.history()` had no value to escape. The fourth is aggregate `rekey`'s filter,
   which no definition can reach (§17.18).
+  A check of what's left after D76 to D88, on this base, over 52 reverts: each key form dropped from `rekey`'s judging, the inverted form swapped, a
+  valueless mark read as off, marks never written, `pinCondition` and `compositeText` and `eventOrderByValue` forced to one setting, the chain
+  (holder not moved first, a holder that can't move not reported, or reported and then cleared), `bothKeys` without rereading the old key, conflict
+  dedupe, index key forms, Z-order prefix bytes, the table key guard, each sentinel form, every count of what can't be placed, an aggregate's root
+  order, its waves, its 1.37.0 partition and `rekeyFinish`, a stream merging another id, `EDD-9109`, `EDD-9112`, `isTableKeyAttribute`, a second `get`
+  for a changed value, and each part of `Rekey.displace`. All fail a test now, 35 of the first 41 on the first run. Its six survivors were all
+  closed. Five had no row reaching them, now tested: a history row under a partition its values never composed, a stream row and a valueless row
+  likewise, an edge gone by the end of the scan, and a stream with an event another id's write landed on it. The sixth, a holder reported and then
+  cleared, showed D55's limit: a dry run predicted a move the real run refused, which D88 closes for every kind of row.
 - **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
   never throughput.
 
@@ -1347,12 +1356,14 @@ for values that compose no key, with the same `key` and `target`. It doesn't rea
 that key holds, if anything, is another row, which the scan reaches itself. The test compares whole reports,
 less `dryRun` and `capacity`, which differ by definition.
 
-**The limit: it judges each row on its own.** It assumes a stale row holding a destination can move, and doesn't
-simulate the chain. `a b` moves to where `a%20b` holds its 1.36 text, and `a%20b` can't move (its `status` is
-outside a Z-order dimension's values). The dry run reports 1 moved and 1 conflict; the real run reports 0 moved
-and 3 conflicts. Without the blocked row the two agree. A review found this, and it stays: simulating chains would
-make a dry run keep the state of a run it isn't doing, to improve a prediction that's right about every row except
-those in such a chain, and the real run reports them. `dryRunChainScenarios` pins both, on both tables.
+**A chain (D88).** This section first left a limit here: a dry run assumed a stale row holding a destination could
+move. `a b` moves to where `a%20b` holds its 1.36 text, and `a%20b` can't move (its `status` is outside a Z-order
+dimension's values), so the dry run reported a move the real run refused. With `rekey` the only migration, a dry run
+has to agree, and it needs no state of a run it isn't doing: `Rekey.displace` runs the holder's own handler under a
+context that counts nothing and claims nothing, and keeps only the conflicts. So both report the holder's conflict
+and `taken` for the row it holds up, on every kind of row: items and history rows (`clearTarget`), sentinels,
+projection rows, streams and aggregates. It costs a dry run the reads of each link, once more than the scan does, and
+only on a chain. `dryRunChainScenarios` and `RekeyCompleteness.test.ts` pin both outcomes.
 
 ### 17.12 The lease-loss test
 

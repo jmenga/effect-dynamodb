@@ -444,6 +444,26 @@ export const run = (args: {
   )
 
 /** Tallies added up, field by field. */
+/**
+ * Get a row out of the way of another row's move, `run` being its own handler under the context
+ * given: for real in a real run. In a dry run nothing moves, so the row is only judged, under a
+ * context that counts nothing and takes no claim, since the scan counts it when it reaches it:
+ * what comes back is what would stop it, the same conflicts the real run gets, and so a dry run
+ * agrees with the real run about a chain. A row that's met more than once is reported once
+ * ({@link RekeyReport.conflicts}).
+ */
+export const displace = <E, R>(
+  ctx: RekeyRowContext,
+  run: (ctx: RekeyRowContext) => Effect.Effect<RekeyTally | undefined, E, R>,
+): Effect.Effect<RekeyTally, E, R> =>
+  ctx.dryRun
+    ? Effect.map(
+        run({ ...ctx, claim: () => false, once: (_unit, work) => work }),
+        (tally): RekeyTally =>
+          (tally?.conflicts ?? []).length > 0 ? { conflicts: tally!.conflicts! } : {},
+      )
+    : Effect.map(run(ctx), (tally): RekeyTally => tally ?? {})
+
 export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally => {
   const moved: Partial<Record<RekeyRowKind, number>> = {}
   const skipped: Partial<Record<RekeySkipReason, number>> = {}

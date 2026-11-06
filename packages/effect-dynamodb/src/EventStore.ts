@@ -5393,10 +5393,9 @@ export const makeStream = <
         const flipped = first === undefined || first[MOVED_ATTRIBUTE] !== undefined
         if (!flipped) {
           const atTarget = yield* readAll(to)
-          // Another stream under other key text moves out first. A dry run counts it when the
-          // scan reaches it.
+          // Another stream under other key text moves out first.
           const stale = atTarget.find(elsewhere)
-          if (stale !== undefined && !ctx.dryRun) {
+          if (stale !== undefined) {
             if (depth >= Rekey.DISPLACE_DEPTH) {
               return Rekey.mergeTallies(
                 tally,
@@ -5406,14 +5405,21 @@ export const makeStream = <
                 ),
               )
             }
-            tally = Rekey.mergeTallies(tally, (yield* rekeyStreamRow(stale, ctx, depth + 1)) ?? {})
-            if ((yield* readAll(to)).some(elsewhere)) {
+            const displaced = yield* Rekey.displace(ctx, (under) =>
+              rekeyStreamRow(stale, under, depth + 1),
+            )
+            tally = Rekey.mergeTallies(tally, displaced)
+            // A dry run moved nothing: what would stop that stream is what would leave it there.
+            const stillThere = ctx.dryRun
+              ? (displaced.conflicts ?? []).length > 0
+              : (yield* readAll(to)).some(elsewhere)
+            if (stillThere) {
               return Rekey.mergeTallies(
                 tally,
                 conflict("taken", "rows of another stream are under its current partition key."),
               )
             }
-            continue
+            if (!ctx.dryRun) continue
           }
           const there = new Map(
             atTarget.filter((row) => !elsewhere(row)).map((row) => [skOf(row), row]),
