@@ -383,7 +383,12 @@ const composeUniqueSentinel = (
     fieldsRecord[f] = s
   }
   return {
-    key: DynamoSchema.composeUniqueKey(schema, entityType, constraintName, serialized),
+    key: DynamoSchema.composeUniqueKey(
+      schema,
+      entityType,
+      constraintName,
+      serialized.map((text) => KeyComposer.keyText(schema, text, schema.casing)),
+    ),
     fieldsRecord,
   }
 }
@@ -4011,6 +4016,10 @@ const makeImpl = <
       ...(Object.keys(same.values).length > 0 && { ExpressionAttributeValues: same.values }),
     }
   }
+  /** The primary key's composites, each once: what a key's text is composed from. */
+  const primaryCompositeFields = [
+    ...new Set([...config.indexes.primary.pk.composite, ...config.indexes.primary.sk.composite]),
+  ]
   /**
    * The condition that a stored snapshot is the same state as `item`, a
    * snapshot as stored: the same version, incarnation and (with timestamps)
@@ -4046,10 +4055,10 @@ const makeImpl = <
     sameAs(INCARNATION_TOKEN, "snapInc")
     if (systemFields.updatedAt) sameAs(systemFields.updatedAt, "snapUpd")
     // Another value's 1.36 snapshot of the same version can be under the
-    // item's segment (#171, G25): the same state also holds the same escaped
-    // sort key values ({@link aliasGuard}).
-    if (KeyText136.enabled(schema)) {
-      for (const field of config.indexes.primary.sk.composite) {
+    // item's key (#171, G25): the same state also holds the same escaped
+    // key values ({@link aliasGuard}).
+    if (KeyText136.canSpell(schema)) {
+      for (const field of primaryCompositeFields) {
         const attr = resolveDbName(field)
         const text = item[attr]?.S
         if (text === undefined || !KeyText136.holdsEscaped(text)) continue
@@ -4989,8 +4998,8 @@ const makeImpl = <
 
   /**
    * A unique sentinel's 1.36 key for `source`'s values, when its text differs
-   * from `current` — the sentinel's key now. Only a number's text can differ:
-   * a sentinel's values are not escaped. `force`: as {@link primaryKey136}.
+   * from `current` — the sentinel's key now: a number whose text changed, or a
+   * value that escapes. `force`: as {@link primaryKey136}.
    */
   const sentinel136 = (
     constraintName: string,
@@ -5138,19 +5147,13 @@ const makeImpl = <
   }
 
   /** The stored attributes of the primary key's composites: what tells whose a row is. */
-  const primaryCompositeAttrs = [
-    ...new Set(
-      [...config.indexes.primary.pk.composite, ...config.indexes.primary.sk.composite].map(
-        resolveDbName,
-      ),
-    ),
-  ]
+  const primaryCompositeAttrs = [...new Set(primaryCompositeFields.map(resolveDbName))]
 
   /**
    * Whose a row read at a key of the item at `encodedKey` is (#171). `"own"`:
    * its values compose the item's current key — the item, wherever it was
    * read. `"foreign"`: they compose another value's, and `at` — the key it was
-   * read at — is that value's 1.36 key. 1.36 did not escape sort key text, so
+   * read at — is that value's 1.36 key. 1.36 did not escape key text, so
    * its text of a value holding `%` and two hex digits spells another value's
    * escaped text: `foo%20bar`'s 1.36 key is `foo bar`'s current key, and its
    * row sits there until it moves. Read at the item's 1.36 key, the current
@@ -5209,7 +5212,7 @@ const makeImpl = <
   /**
    * A condition that holds for the item at `encodedKey`, stored at its
    * current key, and fails for a 1.36 row of another value stored there
-   * (#171, {@link rowOwner}). Only a sort key composite whose text is escaped
+   * (#171, {@link rowOwner}). Only a key composite whose text is escaped
    * can be spelled by such a row, so the condition is over those: a value
    * holding a character below `%` is `contains` that character — no such row
    * holds one, and casing never changes it; a value holding only `%` is `=`
@@ -5228,14 +5231,14 @@ const makeImpl = <
       }
     | "read"
     | undefined => {
-    if (!KeyText136.enabled(schema)) return undefined
+    if (!KeyText136.canSpell(schema)) return undefined
     const primary = config.indexes.primary
     const casing = KeyComposer.effectiveCasing(schema, primary)
     const values = keyForm(encodedKey)
     const parts: Array<string> = []
     const names: globalThis.Record<string, string> = {}
     const operands: globalThis.Record<string, AttributeValue> = {}
-    for (const field of primary.sk.composite) {
+    for (const field of primaryCompositeFields) {
       const text = values[field]
       if (typeof text !== "string" || !KeyText136.holdsEscaped(text)) continue
       const i = parts.length
@@ -5520,14 +5523,14 @@ const makeImpl = <
 
   /**
    * Can the item's 1.36 key hold another value's current row (#171)? Only
-   * when a sort key composite's 1.36 text can be escaped text: it holds `%`
+   * when a key composite's 1.36 text can be escaped text: it holds `%`
    * and no character below it. `foo%20bar`'s 1.36 key is `foo bar`'s current
    * key; `foo bar`'s holds a space, which no current key does.
    */
   const spells136 = (encodedKey: globalThis.Record<string, unknown>): boolean => {
-    if (!KeyText136.enabled(schema)) return false
+    if (!KeyText136.canSpell(schema)) return false
     const values = keyForm(encodedKey)
-    return config.indexes.primary.sk.composite.some((field) => {
+    return primaryCompositeFields.some((field) => {
       const text = values[field]
       return (
         typeof text === "string" &&
@@ -5792,7 +5795,12 @@ const makeImpl = <
   const moveFrom136Detailed = (
     encodedKey: globalThis.Record<string, unknown>,
     operation: string,
-    options: { readonly depth?: number | undefined; readonly force?: boolean | undefined },
+    options: {
+      readonly depth?: number | undefined
+      readonly force?: boolean | undefined
+      /** Where the item is, when `rekey` found it: 1.37's key can be neither of the others. */
+      readonly from?: globalThis.Record<string, string> | undefined
+    },
   ): Effect.Effect<
     {
       readonly outcome: "moved" | "absent" | "both"
@@ -5805,7 +5813,7 @@ const makeImpl = <
     Effect.gen(function* () {
       const depth = options.depth ?? 0
       const force = options.force === true
-      const old = primaryKey136(encodedKey, force)
+      const old = options.from ?? primaryKey136(encodedKey, force)
       if (old === undefined) return { outcome: "absent" as const, sentinels: 0 }
       const client = yield* Capacity.client
       const { name: tableName } = yield* tableTag
@@ -11300,11 +11308,7 @@ const makeImpl = <
         return {
           pkValue: KeyComposer.composePk(schema, entityType, primary, appendKeyForm),
           currentSk,
-          eventSk: KeyComposer.composeEventSk(
-            currentSk,
-            appendKeyForm[orderByField],
-            schema.casing,
-          ),
+          eventSk: KeyComposer.composeEventSk(schema, currentSk, appendKeyForm[orderByField]),
         }
       })
       const marshalledKey = toAttributeMap({
@@ -11917,7 +11921,7 @@ const makeImpl = <
           const sk = KeyComposer.composeSk(schema, entityType, entityVersion, primary, rowKeyForm)
           return {
             pk: KeyComposer.composePk(schema, entityType, primary, rowKeyForm),
-            sk: KeyComposer.composeEventSk(sk, rowKeyForm[orderBy], schema.casing),
+            sk: KeyComposer.composeEventSk(schema, sk, rowKeyForm[orderBy]),
           }
         } catch {
           return undefined
@@ -13198,6 +13202,19 @@ const makeImpl = <
     const sk = row[rekeySk]?.S
     return pk === undefined || sk === undefined ? undefined : keyAt(pk, sk)
   }
+  /** The partition key 1.37 composed for a row's values; `undefined` when they compose none. */
+  const composing137 = (row: StoredRow): string | undefined => {
+    try {
+      return KeyComposer.composePk(
+        KeyText136.schema137(schema),
+        entityType,
+        config.indexes.primary,
+        keyForm(toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)),
+      )
+    } catch {
+      return undefined
+    }
+  }
 
   /**
    * Where a row of the entity belongs now and where 1.36 put it, from its
@@ -13206,8 +13223,10 @@ const makeImpl = <
    * keeps its layout: one an earlier release wrote without an item segment
    * (#133) moves only its partition key.
    */
-  const rowTargets = (
+  const rowTargets136 = (
     row: StoredRow,
+    stored: StoredKey,
+    pk137: string,
   ):
     | {
         readonly kind: RowKind
@@ -13218,9 +13237,6 @@ const makeImpl = <
         readonly live136: StoredKey
       }
     | undefined => {
-    if (row.__edd_e__?.S !== entityType) return undefined
-    const stored = storedKeyOf(row)
-    if (stored === undefined) return undefined
     try {
       const primary = config.indexes.primary
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
@@ -13233,7 +13249,11 @@ const makeImpl = <
         primary,
         rowKeyForm,
       )
-      if (sameStoredKey(stored, live) || sameStoredKey(stored, live136)) {
+      if (
+        sameStoredKey(stored, live) ||
+        sameStoredKey(stored, live136) ||
+        sameStoredKey(stored, keyAt(pk137, live[rekeySk]!))
+      ) {
         return { kind: "item", current: live, old: live136, live, live136 }
       }
       const sk = stored[rekeySk]!
@@ -13319,7 +13339,7 @@ const makeImpl = <
           kind: "event",
           current: keyAt(
             currentPk,
-            KeyComposer.composeEventSk(live[rekeySk]!, rowKeyForm[orderBy], schema.casing),
+            KeyComposer.composeEventSk(schema, live[rekeySk]!, rowKeyForm[orderBy]),
           ),
           old: keyAt(
             oldPk,
@@ -13333,6 +13353,24 @@ const makeImpl = <
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * {@link rowTargets136}, and where 1.37 put the row, which `rekey` alone looks at: its
+   * partition key's strings unescaped, and everything else as it is now. Such a row counts as
+   * under its old key, so what moves a row from there moves it from here.
+   */
+  const rowTargets = (row: StoredRow) => {
+    if (row.__edd_e__?.S !== entityType) return undefined
+    const stored = storedKeyOf(row)
+    if (stored === undefined) return undefined
+    const pk137 = composing137(row)
+    if (pk137 === undefined) return undefined
+    const targets = rowTargets136(row, stored, pk137)
+    if (targets === undefined) return undefined
+    return sameStoredKey(stored, keyAt(pk137, targets.current[rekeySk]!))
+      ? { ...targets, old: stored, live137: keyAt(pk137, targets.live[rekeySk]!) }
+      : { ...targets, live137: keyAt(pk137, targets.live[rekeySk]!) }
   }
 
   /**
@@ -13686,7 +13724,7 @@ const makeImpl = <
           heldBackIndexKeys(to, left.uncomposable),
         )
       }
-      const moved = yield* moveFrom136Detailed(values, "rekey", { depth, force: true }).pipe(
+      const moved = yield* moveFrom136Detailed(values, "rekey", { depth, force: true, from }).pipe(
         Effect.map((result) => ({ _tag: "Done" as const, result })),
         Effect.catchTag("ConcurrentModification", () =>
           Effect.succeed({ _tag: "Contended" as const }),
@@ -13747,17 +13785,17 @@ const makeImpl = <
    * composed from the row's values, and never reads a value out of a stored key.
    *
    * An unsharded partition key, a sort key or a vector partition is rewritten only when
-   * it is exactly its own 1.36 text and that isn't the current text. Each half is judged
-   * by itself and by its bytes: halves in one attribute compose the same bytes
+   * it is exactly its own 1.36 text, or a partition's own 1.37 text, and that isn't the
+   * current text. Each half is judged
+   * by itself and by its bytes: halves in one attribute have the same definition
    * (`EDD-9106`), so none can be another's 1.36 text. A sort key missing a trailing
    * composite is judged by the composites before the gap, which is what a row truncated
    * under 1.36 stores (D43). Anything else is left, with no conflict: a key an index
    * policy kept, one lagging its values, one cleared of them. So is a key that isn't
-   * stored (under `sparse` its absence can be deliberate).
-   *
-   * A half that is the table's key (D62) never gets as far as a rewrite. This reads a row
-   * under its current table key, where such a half holds what it composes; a row under
-   * its 1.36 table key moves first, and a row under any other key isn't read here.
+   * stored (under `sparse` its absence can be deliberate), and a table key attribute:
+   * no part of the primary key is ever set, on any write path (`DESIGN.md §7`). A writer
+   * changing a composite under this read can make that attribute look like its own 1.36
+   * text, and DynamoDB refuses an update naming it.
    *
    * A sharded index's partition key is the exception (D24): moving rows into the layout
    * is the feature, so it is composed and compared whatever it holds, and `EDD-9106`
@@ -13783,6 +13821,7 @@ const makeImpl = <
     const olds: globalThis.Record<string, string> = {}
     const composites = new Set<string>()
     const rewrite = (field: string, text: string, attrs: ReadonlyArray<string>) => {
+      if (isTableKeyField(field)) return
       sets[field] = text
       olds[field] = row[field]!.S!
       for (const attr of attrs) composites.add(resolveDbName(attr))
@@ -13792,12 +13831,17 @@ const makeImpl = <
       attrs: ReadonlyArray<string>,
       now: () => string | undefined,
       then: () => string | undefined,
+      then137?: () => string | undefined,
     ) => {
       const stored = row[field]?.S
-      if (stored === undefined || stored !== composing(then)) return
+      if (stored === undefined) return
+      if (stored !== composing(then) && (then137 === undefined || stored !== composing(then137))) {
+        return
+      }
       const text = composing(now)
       if (text !== undefined && text !== stored) rewrite(field, text, attrs)
     }
+    const schema137 = KeyText136.schema137(schema)
     const uncomposable: Array<string> = []
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary") continue
@@ -13823,6 +13867,7 @@ const makeImpl = <
           index.pk.composite,
           () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
           () => KeyText136.composePk(schema, entityType, index, rowKeyForm),
+          () => KeyComposer.composePk(schema137, entityType, index, rowKeyForm),
         )
       }
       consider(
@@ -13839,6 +13884,7 @@ const makeImpl = <
         definition.partition,
         () => KeyComposer.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
         () => KeyText136.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
+        () => KeyComposer.tryComposeVectorPartition(schema137, entityType, definition, rowKeyForm),
       )
     }
     return { sets, olds, composites: [...composites], uncomposable }
@@ -13989,12 +14035,15 @@ const makeImpl = <
       return tally
     })
 
-  /** The live keys a row's unique sentinels may name: 1.36's and the current one. */
+  /** The live keys a row's unique sentinels may name: 1.36's, 1.37's and the current one. */
   const liveOwners = (targets: {
     readonly live: StoredKey
     readonly live136: StoredKey
+    readonly live137: StoredKey
   }): ReadonlyArray<StoredKey> =>
-    sameStoredKey(targets.live136, targets.live) ? [targets.live] : [targets.live136, targets.live]
+    [targets.live136, targets.live137, targets.live].filter(
+      (key, i, all) => all.findIndex((other) => sameStoredKey(other, key)) === i,
+    )
 
   const NO_SENTINEL_REKEYS: {
     readonly items: ReadonlyArray<TransactWriteItem>
@@ -14933,7 +14982,7 @@ export const bind = <
           const keyFormOf = (v: unknown) =>
             orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy]
           const rewrite = (v: unknown) =>
-            `${prefix}${KeyComposer.serializeSortKeyValue(keyFormOf(v), schemaRef.casing)}`
+            `${prefix}${KeyComposer.keyValueText(schemaRef, keyFormOf(v), schemaRef.casing)}`
           // DynamoDB allows ONE sort key condition, and this one replaces the
           // history query's `begins_with(prefix)`. Every operator therefore
           // keeps both ends inside `prefix` — the `.where()` clamp of

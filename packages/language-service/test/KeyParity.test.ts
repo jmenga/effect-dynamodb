@@ -456,10 +456,10 @@ describe("numeric key text parity with @effect-dynamodb/schema", () => {
   })
 })
 
-describe("sort key text escaping parity with @effect-dynamodb/schema (#171)", () => {
+describe("key text escaping parity with @effect-dynamodb/schema (#171, #183)", () => {
   // Every escaped code point (U+0000–U+0025), the first one that isn't, and
-  // values casing maps unevenly: a sort key escapes them, a partition key
-  // keeps them as they are.
+  // values casing maps unevenly: every key escapes them, or with `escapeKeys:
+  // false` none does.
   const values = [
     ...Array.from({ length: 0x27 }, (_, code) => `a${String.fromCharCode(code)}b`),
     "New York",
@@ -485,11 +485,21 @@ describe("sort key text escaping parity with @effect-dynamodb/schema (#171)", ()
     },
   } satisfies Record<string, IndexDefinition>
 
-  for (const casing of ["lowercase", "uppercase", "preserve"] as const) {
-    const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing })
-    const entity: ResolvedEntity = { ...entityFor(casing), indexes: textIndexes }
+  const settings = (["lowercase", "uppercase", "preserve"] as const).flatMap((casing) => [
+    { casing, label: casing, flag: {} },
+    { casing, label: `${casing}, escapeKeys off`, flag: { escapeKeys: false as const } },
+  ])
 
-    it(`put, a pin's bounds and the exact key match the library (${casing})`, () => {
+  for (const { casing, label, flag } of settings) {
+    const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing, ...flag })
+    const base = entityFor(casing)
+    const entity: ResolvedEntity = {
+      ...base,
+      schema: { ...base.schema, ...flag },
+      indexes: textIndexes,
+    }
+
+    it(`put, a pin's bounds and the exact key match the library (${label})`, () => {
       for (const status of values) {
         for (const title of ["T", "a#b c"]) {
           const record = { title, status, teamId: "Team-B" }

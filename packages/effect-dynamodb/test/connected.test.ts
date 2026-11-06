@@ -5646,7 +5646,7 @@ describeConnected("Empty-composite-half GSI shape (closes #46)", () => {
         })
         expect(raw.Item).toBeDefined()
         expect(raw.Item!.gsi3pk?.S).toBe(
-          "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud#dev-46-1",
+          "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud%23dev-46-1",
         )
         // The empty-composite half — gsi3sk MUST be the constant entity prefix.
         expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")

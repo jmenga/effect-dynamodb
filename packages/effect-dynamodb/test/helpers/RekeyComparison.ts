@@ -939,10 +939,10 @@ export const shardLayoutMoveScenario = (h: Harness) => {
 }
 
 /**
- * A half stored in a table key attribute is the table's key: its text is the row's whatever
- * the values hold, so `rekey` has nothing to compare it with (D62). A local index's partition
- * key, a sort key shared with the table, and an inverted index's halves, whose kinds differ
- * from the table's they're stored in.
+ * A half stored in a table key attribute is never set, whatever the values compose (D70), so
+ * `rekey` has nothing to compare it with. A local index's partition key, a sort key shared with
+ * the table, and an inverted index's halves, whose kinds differ from the table's they're stored
+ * in.
  */
 export const tableKeyAttributeScenarios: ReadonlyArray<{
   readonly name: string
@@ -981,8 +981,6 @@ export const tableKeyAttributeScenarios: ReadonlyArray<{
     const world = worldOf(Flat, primaryKey, { byNote: index })
     const values = { tenant: "a b", id: "c d", status: "s", count: 1 }
     const row = rowOf(world, values, keys)
-    const half = world.Rows.indexes.byNote
-    expect(half.tableKey).toBeDefined()
     return h.on(world, (db, table) =>
       Effect.gen(function* () {
         yield* table.seed(row)

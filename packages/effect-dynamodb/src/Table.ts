@@ -10,12 +10,11 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseSharedKeyAttribute } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
-import { type Config, Context, Effect, Layer, type Option, type Schema } from "effect"
+import { type Config, Context, Effect, Layer, type Option } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
 import type { BoundEventStream, EventStream } from "./EventStore.js"
 import type { CapacityTotals } from "./internal/Capacity.js"
@@ -54,8 +53,6 @@ interface EntityLike {
   readonly _tag: "Entity"
   readonly entityType?: string | undefined
   readonly indexes: Record<string, IndexDefinition>
-  /** What says which key composites hold only numbers (`EDD-9106`). */
-  readonly inputSchema?: Schema.Top | undefined
   /** Normalized vector index definitions (absent on entities without any). */
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
   /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
@@ -180,16 +177,11 @@ export const make = <
   // can't share its attribute with a string key half or a vector filter
   // attribute of another type (EDD-9091).
   resolveKeyAttributeTypes(entities, aggregates, primary)
-  // Two of an entity's key halves in one attribute must compose the same bytes (EDD-9106).
-  // `Entity.make` refused what no schema can reconcile; a casing an index leaves to the
-  // schema resolves only here.
+  // Two of an entity's key halves in one attribute must have the same fields, order and
+  // casing (EDD-9106). `Entity.make` refused what no schema can reconcile; a casing an index
+  // leaves to the schema resolves only here.
   for (const entity of Object.values(entities)) {
-    refuseSharedKeyAttribute(
-      config.schema,
-      entity.entityType ?? "(unnamed)",
-      entity.indexes,
-      entity.inputSchema === undefined ? undefined : getSchemaFields(entity.inputSchema),
-    )
+    refuseSharedKeyAttribute(config.schema, entity.entityType ?? "(unnamed)", entity.indexes)
   }
 
   // Configure all entities with this table's schema and tag — only once the

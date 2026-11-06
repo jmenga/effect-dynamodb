@@ -85,7 +85,7 @@ const { Items: stored } = yield* raw.scan({ TableName: tableName, Limit: 1 })
 | Shard 7 of 20, no partition key composites | `$fleet-db#v1#devicestate#!20.07` |
 | Shard 7 of 20, in a collection | `$fleet-db#v1#assignments#!20.07#employee_x` |
 
-Key values aren't escaped, so the marker comes before all of them. An unsharded key's next segment always holds `<label>_`, which a marker can't spell, so an unsharded key for tenant `t-123#07` can't equal a sharded key for tenant `t-123`. The count separates two sharded layouts in the same way, which is why reading both during a migration needs no filter and no dedupe.
+With `escapeKeys: false` a value can hold `#`, so the marker comes before all of them, with the flag on or off. An unsharded key's next segment always holds `<label>_`, which a marker can't spell, so an unsharded key for tenant `t-123#07` can't equal a sharded key for tenant `t-123`. The count separates two sharded layouts in the same way, which is why reading both during a migration needs no filter and no dedupe.
 
 ## Choosing N
 
@@ -437,7 +437,8 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
 | `EDD-9105` | `concurrency` isn't a positive integer | The call |
-| `EDD-9106` | Two key halves of one entity stored in one attribute, sharded or not, aren't provably the same bytes | Types, for a sharded half they can see, `Entity.make`, and `Table.make` for a casing left to the schema |
+| `EDD-9106` | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently | Types, for a sharded half they can see, `Entity.make`, and `Table.make` for a casing left to the schema |
+| `EDD-9108` | One entity uses one physical index twice, even over the same fields | `Entity.make` |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
 
 ## What's Next?

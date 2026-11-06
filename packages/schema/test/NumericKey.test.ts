@@ -222,8 +222,9 @@ describe("NumericKey — keys built on serializeValue", () => {
     ({ a, b }) => {
       for (const casing of casings) {
         const current = "$App#v1#Reading#sensorId_S-1"
-        const ka = KeyComposer.composeEventSk(current, a, casing)
-        const kb = KeyComposer.composeEventSk(current, b, casing)
+        const schema = DynamoSchema.make({ name: "App", version: 1, casing })
+        const ka = KeyComposer.composeEventSk(schema, current, a, casing)
+        const kb = KeyComposer.composeEventSk(schema, current, b, casing)
         expect(byteOrder(ka, kb), `${a} vs ${b}`).toBe(numericOrder(a, b))
       }
     },

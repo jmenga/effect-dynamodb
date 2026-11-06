@@ -194,17 +194,6 @@ export interface IndexDefinition {
   readonly indexPolicy?: IndexPolicy
   /** Write sharding (#183). Secondary indexes only. */
   readonly shards?: IndexShards
-  /**
-   * Set by `Entity.make`, never by a definition: which half of the table's key each
-   * half of this index is. See {@link bindTableKeyHalves}.
-   */
-  readonly tableKey?: TableKeyHalves
-}
-
-/** The halves of an index that are a half of the table's key, and which. */
-export interface TableKeyHalves {
-  readonly pk?: "pk" | "sk"
-  readonly sk?: "pk" | "sk"
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
@@ -252,55 +241,6 @@ export const effectiveCasing = (
   schema: DynamoSchema.DynamoSchema,
   index: IndexDefinition,
 ): DynamoSchema.Casing => index.casing ?? schema.casing
-
-/**
- * An index half stored in a key attribute of the table, with the composites of the table
- * half stored there in the same order, **is** that half of the table's key (#183, D62). It
- * has no bytes of its own: the table's composition is the only writer, on every write
- * path, and whatever reads through it composes the table half's text. So `composeIndexKeys`
- * leaves it out, an index partition key in the table's sort key composes sort key text, and
- * an index sort key in the table's partition key composes partition key text. The table's
- * own text doesn't change.
- *
- * The attribute alone decides here, so the composers read one property. `[EDD-9106]` then
- * refuses, from what the composers produce, whatever doesn't compose the table half's bytes:
- * other composites or another order, another casing, a collection's label, a sharded
- * partition key, a Z-order address. A sharded index's sort key can't be the table's
- * partition key: it keeps its own text, so that's refused too.
- */
-export const bindTableKeyHalves = (
-  index: IndexDefinition,
-  primary: IndexDefinition,
-): IndexDefinition => {
-  const tableHalf = (field: string): "pk" | "sk" | undefined =>
-    field === primary.pk.field ? "pk" : field === primary.sk.field ? "sk" : undefined
-  const pk = tableHalf(index.pk.field)
-  const held = tableHalf(index.sk.field)
-  const sk = held === "pk" && index.shards !== undefined ? undefined : held
-  return pk === undefined && sk === undefined
-    ? index
-    : {
-        ...index,
-        tableKey: { ...(pk === undefined ? {} : { pk }), ...(sk === undefined ? {} : { sk }) },
-      }
-}
-
-/**
- * Is this index's sort key the table's partition key (D62)? Its text is then partition
- * key text, whose values aren't escaped: a value's text holds what sorts below the
- * delimiter, so a composite before the last doesn't sort as its value.
- */
-export const sortKeyHoldsPartitionText = (index: IndexDefinition): boolean =>
-  index.tableKey?.sk === "pk"
-
-/**
- * Can a row's sort key stop at a composite, by the structural rule (`DESIGN.md §7`)?
- * On a secondary index, unless its sort key holds partition key text: the table's
- * partition key always has every composite, and a range taking a truncated row would
- * also take a longer sibling value in unescaped text.
- */
-export const sortKeyTruncates = (index: IndexDefinition): boolean =>
-  index.index !== undefined && !sortKeyHoldsPartitionText(index)
 
 /**
  * Fail when a collection's members would compose its keys with different
@@ -609,16 +549,17 @@ export const serializeValue = (value: unknown): string => {
   return String(value)
 }
 
-/** The highest code point a sort key composite's text escapes: `%`. */
+/** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
 
 /**
- * A composite value's serialized text as a sort key holds it (#171): cased,
+ * A composite value's serialized text as a key holds it (#171, #183): cased,
  * then each code point U+0000–U+0025 — control characters, space, `!`, `"`,
  * `#`, `$` and `%` — escaped as `%` and two hex digits (space → `%20`, `#` →
  * `%23`, `%` → `%25`), the hex digits in upper case, or lower case under
  * `"lowercase"` casing. Any other text is unchanged, so a value without such a
- * character keeps its 1.36 key text.
+ * character keeps its 1.36 key text. The same rule holds in a partition key and
+ * a sort key, so the two build identical text from identical values.
  *
  * Every escaped value sorts as its cased value and starts with its cased
  * prefixes' text: an unescaped character sorts above `%`, and an escape starts
@@ -630,7 +571,7 @@ const ESCAPED_MAX = 0x25
  * Casing comes first so the hex digits are the only text it can't reach: the
  * composer cases the key again, which leaves cased text as it is.
  */
-export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string => {
+export const escapeKeyText = (text: string, casing: DynamoSchema.Casing): string => {
   const cased = applyCasing(text, casing)
   let escaped = ""
   let from = 0
@@ -644,39 +585,33 @@ export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string =
   return from === 0 ? cased : `${escaped}${cased.slice(from)}`
 }
 
-/** A composite value's text in a sort key: {@link serializeValue}, then {@link sortKeyText}. */
-export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
-  sortKeyText(serializeValue(value), casing)
-
-/** {@link extractComposites} for a sort key half: each value's {@link sortKeyText}. */
-const extractSortKeyComposites = (
-  composite: ReadonlyArray<string>,
-  record: Record<string, unknown>,
+/**
+ * {@link escapeKeyText}, unless the schema turns escaping off (`escapeKeys: false`): every
+ * key composite's serialized text passes through here, in every key.
+ */
+export const keyText = (
+  schema: DynamoSchema.DynamoSchema,
+  text: string,
   casing: DynamoSchema.Casing,
-): ReadonlyArray<string> =>
-  extractComposites(composite, record).map((text) => sortKeyText(text, casing))
+): string => (schema.escapeKeys === false ? applyCasing(text, casing) : escapeKeyText(text, casing))
 
-/** A partition key half's composite values: its own text, or the table's sort key's (D62). */
-const partitionKeyComposites = (
+/** A composite value's text in a key: {@link serializeValue}, then {@link keyText}. */
+export const keyValueText = (
   schema: DynamoSchema.DynamoSchema,
-  index: IndexDefinition,
+  value: unknown,
+  casing: DynamoSchema.Casing,
+): string => keyText(schema, serializeValue(value), casing)
+
+/** {@link extractComposites} for a key half: each value's {@link keyText}. */
+const extractKeyComposites = (
+  schema: DynamoSchema.DynamoSchema,
+  index: { readonly casing?: DynamoSchema.Casing },
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
 ): ReadonlyArray<string> =>
-  index.tableKey?.pk === "sk"
-    ? extractSortKeyComposites(composite, record, effectiveCasing(schema, index))
-    : extractComposites(composite, record)
-
-/** A sort key half's composite values: its own text, or the table's partition key's (D62). */
-const sortKeyComposites = (
-  schema: DynamoSchema.DynamoSchema,
-  index: IndexDefinition,
-  composite: ReadonlyArray<string>,
-  record: Record<string, unknown>,
-): ReadonlyArray<string> =>
-  sortKeyHoldsPartitionText(index)
-    ? extractComposites(composite, record)
-    : extractSortKeyComposites(composite, record, effectiveCasing(schema, index))
+  extractComposites(composite, record).map((text) =>
+    keyText(schema, text, index.casing ?? schema.casing),
+  )
 
 /**
  * Compose a partition key for an entity index.
@@ -690,7 +625,7 @@ export const composePk = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
-  const composites = partitionKeyComposites(schema, index, index.pk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
   return composePkText(
     schema,
     entityType,
@@ -917,7 +852,7 @@ export const composeReadPartitions = (
     return { partitions: [composePk(schema, entityType, index, record)], fanOut: undefined }
   }
   const source = boundShardSource(index, shards)
-  const composites = extractComposites(index.pk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
   const partition = (count: number, shard: number) =>
     composePkText(
       schema,
@@ -978,7 +913,7 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   assertStringHalf(index, "composeSk")
-  const composites = sortKeyComposites(schema, index, index.sk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.sk.composite, record)
   const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
@@ -1051,7 +986,7 @@ export const composeZOrderSk = (
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
-    return prefixSegment(serializeSortKeyValue(value, casing), part.hash)
+    return prefixSegment(keyValueText(schema, value, casing), part.hash)
   })
   const levels = layout.dimensions.map((dim) => {
     const value = record[dim.field]
@@ -1102,9 +1037,8 @@ export const composeHistoryItemSegment = (
 }
 
 /**
- * Compose all key attributes for a single index: a record mapping field names to composed
- * key values. A half that is a half of the table's key has none of its own
- * ({@link bindTableKeyHalves}).
+ * Compose all key attributes for a single index.
+ * Returns a record mapping field names to composed key values.
  */
 export const composeIndexKeys = (
   schema: DynamoSchema.DynamoSchema,
@@ -1113,12 +1047,8 @@ export const composeIndexKeys = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): Record<string, KeyValue> => ({
-  ...(index.tableKey?.pk === undefined
-    ? { [index.pk.field]: composePk(schema, entityType, index, record) }
-    : {}),
-  ...(index.tableKey?.sk === undefined
-    ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
-    : {}),
+  [index.pk.field]: composePk(schema, entityType, index, record),
+  [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record),
 })
 
 /**
@@ -1203,7 +1133,7 @@ const composePkPrefixUpTo = (
     schema,
     entityType,
     index,
-    partitionKeyComposites(schema, index, slice, record),
+    extractKeyComposites(schema, index, slice, record),
     slice,
     composedShardMarker(entityType, index, record),
   )
@@ -1232,7 +1162,7 @@ export const composeSkPrefixUpTo = (
 ): string => {
   assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
-  const composites = sortKeyComposites(schema, index, slice, record)
+  const composites = extractKeyComposites(schema, index, slice, record)
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
 
@@ -1700,12 +1630,13 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
   }
 
-  // DynamoDB refuses an update that writes one of the table's key attributes. A half
-  // stored in one (a local index's partition key, an inverted index, a sort key shared
-  // with the table) is the table's key (`bindTableKeyHalves`), composed of what an update
-  // can't change, so there is nothing to write; dropping the entry takes only the other
-  // half. A half reads as dropped here only for a row an earlier release's `.remove()` left
-  // without a composite, which a move from its 1.36 key recomposes from: it keeps its key.
+  // No part of the primary key is ever set or removed by an update, whatever the index
+  // structure (`DESIGN.md §7`). A half stored in a table key attribute (a local index's
+  // partition key, an inverted index, a sort key shared with the table) composes the
+  // table's text from what an update can't change, so there is nothing to write; dropping
+  // the entry takes only the other half. A half reads as dropped here only for a row an
+  // earlier release's `.remove()` left without a composite, which a move from its 1.36 key
+  // recomposes from: it keeps its key.
   const primary = indexes.primary
   if (primary === undefined) return { sets, removes }
   const tableKey = new Set([primary.pk.field, primary.sk.field])
@@ -1742,12 +1673,8 @@ export const tryComposeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string | undefined => {
-  const composites = tryExtractComposites(index.partition, record)
-  if (composites === undefined) return undefined
-  return composeKey(schema, entityType, composites, {
-    casing: index.casing,
-    names: [...index.partition],
-  })
+  if (tryExtractComposites(index.partition, record) === undefined) return undefined
+  return composeVectorPartition(schema, entityType, index, record)
 }
 
 /**
@@ -1764,7 +1691,7 @@ export const composeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractComposites(index.partition, record)
+  const composites = extractKeyComposites(schema, index, index.partition, record)
   return composeKey(schema, entityType, composites, {
     casing: index.casing,
     names: [...index.partition],
@@ -1894,9 +1821,9 @@ export const composeSortKeyCondition = (
   assertStringHalf(index, "composeSortKeyCondition")
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
   if (availableSkCount(index, record) === index.sk.composite.length) return { eq: prefix }
-  return sortKeyTruncates(index)
-    ? subtreeCondition(prefix)
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+  return index.index === undefined
+    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
+    : subtreeCondition(prefix)
 }
 
 /**
@@ -1925,11 +1852,7 @@ export const composeSortKeyPrefix = (
   for (const attr of index.sk.composite) {
     const value = record[attr]
     if (value === undefined || value === null) break
-    available.push(
-      sortKeyHoldsPartitionText(index)
-        ? serializeValue(value)
-        : serializeSortKeyValue(value, casing),
-    )
+    available.push(keyValueText(schema, value, casing))
     names.push(attr)
   }
 
@@ -1959,7 +1882,7 @@ export const composeSortKeyPrefix = (
 // Event item SK format: `<currentSk>#e#<orderBy value's sort key text>`.
 // Casing is applied to both the `#e#` infix and the value for consistency with
 // the rest of the SK — matches how every other composite segment is cased —
-// and the value is escaped as every sort key composite is (`sortKeyText`).
+// and the value is escaped as every key composite is (`keyText`).
 // ---------------------------------------------------------------------------
 
 const EVENT_SK_INFIX = "e"
@@ -1971,11 +1894,12 @@ const EVENT_SK_INFIX = "e"
  * `"$app#v1#telemetry_1#e#0000000000000042"` (with default lowercase casing).
  */
 export const composeEventSk = (
+  schema: DynamoSchema.DynamoSchema,
   currentSk: string,
   orderByValue: unknown,
-  casing: DynamoSchema.Casing = "lowercase",
+  casing: DynamoSchema.Casing = schema.casing,
 ): string =>
-  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${serializeSortKeyValue(orderByValue, casing)}`
+  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(schema, orderByValue, casing)}`
 
 /**
  * Compose the prefix used to scope `.history()` queries to event items only.

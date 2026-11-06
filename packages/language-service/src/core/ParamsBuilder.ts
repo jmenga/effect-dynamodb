@@ -470,11 +470,12 @@ function composeIsolatedSortKey(
 }
 
 /**
- * Mirrors `KeyComposer.sortKeyText`: a sort key composite's text cased, then
- * each code point U+0000–U+0025 escaped as `%` and two hex digits (lower case
- * under `"lowercase"` casing).
+ * Mirrors `KeyComposer.keyText`: a key composite's text cased, then each code
+ * point U+0000–U+0025 escaped as `%` and two hex digits (lower case under
+ * `"lowercase"` casing), unless the schema has `escapeKeys: false`.
  */
-function sortKeyText(text: string, casing: Casing): string {
+function keyText(schema: SchemaConfig, text: string, casing: Casing): string {
+  if (schema.escapeKeys === false) return applyCasing(text, casing)
   let escaped = ""
   for (const char of applyCasing(text, casing)) {
     const code = char.charCodeAt(0)
@@ -497,7 +498,7 @@ function composeSkFromSlots(
   const entityVersion = 1
   const casing = index.casing ?? schema.casing
   const slots = given.map((slot) =>
-    slot.placeholder ? slot : { ...slot, value: sortKeyText(slot.value, casing) },
+    slot.placeholder ? slot : { ...slot, value: keyText(schema, slot.value, casing) },
   )
   if (index.collection !== undefined) {
     if ((index.type ?? "isolated") === "clustered") {
@@ -521,7 +522,10 @@ function composePkValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
-  const slots = extractCompositeSlots(index.pk.composite, record)
+  const casing = index.casing ?? schema.casing
+  const slots = extractCompositeSlots(index.pk.composite, record).map((slot) =>
+    slot.placeholder ? slot : { ...slot, value: keyText(schema, slot.value, casing) },
+  )
   const collection = index.collection
   const marker = index.shards === undefined ? undefined : shardMarkerText(index.shards)
   if (collection !== undefined) {

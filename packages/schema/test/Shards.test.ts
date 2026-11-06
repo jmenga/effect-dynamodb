@@ -985,11 +985,20 @@ describe("EDD-9106: two key halves in one attribute", () => {
       expect(() => make({ byRegion: gsi(overrides) })).toThrow("[EDD-9106]")
     })
 
-    it("two accessors on one index, whichever composites an item holds (shape 13)", () => {
+    it("two accessors on one index are refused before their attributes are judged (EDD-9108)", () => {
       expect(() =>
         make({
           byRegion: gsi(),
           byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
+        }),
+      ).toThrow("[EDD-9108]")
+    })
+
+    it("two indexes sharing an attribute over other composites", () => {
+      expect(() =>
+        make({
+          byRegion: gsi(),
+          byGroup: gsi({ name: "gsi2", sk: { field: "gsk", composite: ["group"] } }),
         }),
       ).toThrow("[EDD-9106]")
     })
@@ -1020,7 +1029,7 @@ describe("EDD-9106: two key halves in one attribute", () => {
       ).toThrow(/\[EDD-9106\].*"uppercase" and "lowercase"/)
     })
 
-    it("a partition key and a sort key over the same composites, outside the table's key", () => {
+    it("a partition key and a sort key over the same composites build the same text", () => {
       expect(() =>
         make({
           a: gsi({ pk: { field: "shared", composite: ["region"] } }),
@@ -1030,21 +1039,21 @@ describe("EDD-9106: two key halves in one attribute", () => {
             sk: { field: "shared", composite: ["region"] },
           }),
         }),
-      ).toThrow(/\[EDD-9106\].*a sort key escapes what a partition key doesn't/)
+      ).not.toThrow()
     })
 
     it("names the attribute and says what to do, for an unsharded pair too", () => {
       expect(() =>
         make({
           byRegion: gsi(),
-          byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
+          byGroup: gsi({ name: "gsi2", sk: { field: "gsk", composite: ["group"] } }),
         }),
       ).toThrow(/"gsk".*overwrites the other.*Give each its own attribute/)
     })
   })
 })
 
-describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
+describe("EDD-9106: a shared attribute needs the same fields, order and casing", () => {
   class Item extends Schema.Class<Item>("Item")({
     id: Schema.String,
     tenant: Schema.String,
@@ -1207,12 +1216,12 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
     } as Record<string, KeyComposer.IndexDefinition>
   }
 
-  const fields = Item.fields as unknown as Record<string, Schema.Top>
   const names = Object.keys(HALVES)
   const pairs = names.flatMap((a, i) => names.slice(i + 1).map((b) => [a, b] as const))
 
-  // The rule against its own truth: compose real items, and the decision must match what
-  // happened. So it can't refuse what is the same, or pass what differs, for these shapes.
+  // The rule against its own truth: compose real items. What it passes must compose the same
+  // bytes, so it can't pass what differs. What it refuses with the same bytes must be a
+  // difference of casing where nothing is cased, as the rule compares casing itself.
   it.each([
     "lowercase",
     "uppercase",
@@ -1229,12 +1238,15 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
         JSON.stringify(composed(on, definition, "b", b))
       let refused = false
       try {
-        refuseSharedKeyAttribute(on, "row", sharing(definition, a, b), fields)
+        refuseSharedKeyAttribute(on, "row", sharing(definition, a, b))
       } catch (error) {
         expect(String(error)).toContain("[EDD-9106]")
         refused = true
       }
-      if (refused !== !same) wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
+      const casingDiffers = (a.def.casing ?? casing) !== (b.def.casing ?? casing)
+      if (refused ? same && !casingDiffers : !same) {
+        wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
+      }
     }
     expect(wrong).toEqual([])
   })
@@ -1252,7 +1264,6 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
             DynamoSchema.make({ name: "any", version: 1, casing }),
             "row",
             indexes,
-            fields,
           )
           return false
         } catch {
@@ -1261,7 +1272,7 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
       }
       let refused = false
       try {
-        refuseSharedKeyAttributeOnEverySchema("row", indexes, fields)
+        refuseSharedKeyAttributeOnEverySchema("row", indexes)
       } catch {
         refused = true
       }
@@ -1313,57 +1324,53 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
       const made = entity({
         byTenant: gsi("gsi", { sk: { field: "sk", composite: ["id"] }, casing: "uppercase" }),
       })
-      const fieldsOf = Item.fields as unknown as Record<string, Schema.Top>
       expect(() =>
-        refuseSharedKeyAttribute(
-          DynamoSchema.make({ name: "s", version: 1 }),
-          "Row",
-          made.indexes,
-          fieldsOf,
-        ),
+        refuseSharedKeyAttribute(DynamoSchema.make({ name: "s", version: 1 }), "Row", made.indexes),
       ).toThrow(/\[EDD-9106\].*"lowercase" and "uppercase"/)
       expect(() =>
         refuseSharedKeyAttribute(
           DynamoSchema.make({ name: "s", version: 1, casing: "uppercase" }),
           "Row",
           made.indexes,
-          fieldsOf,
         ),
       ).not.toThrow()
     })
   })
 
-  describe("where casing reaches nothing, it's no difference", () => {
-    it("identical numeric Z-order halves, separate partition keys", () => {
+  describe("a casing is a difference, whatever it reaches", () => {
+    it("identical numeric Z-order halves", () => {
       const zorder = [{ field: "x", min: 0, max: 100 }]
-      const made = entity({
-        a: gsi("a", { sk: { field: "zsk", zorder }, casing: "lowercase" }),
-        b: gsi("b", { sk: { field: "zsk", zorder }, casing: "uppercase" }),
-      })
-      expect(made.indexes.b?.casing).toBe("uppercase")
+      expect(() =>
+        entity({
+          a: gsi("a", { sk: { field: "zsk", zorder }, casing: "lowercase" }),
+          b: gsi("b", { sk: { field: "zsk", zorder }, casing: "uppercase" }),
+        }),
+      ).toThrow(/\[EDD-9106\].*"lowercase" and "uppercase"/)
     })
 
-    it("a numeric prefix too, but not a text one", () => {
+    it("a numeric prefix, and a text one", () => {
       const half = (prefix: string, casing: string) =>
         gsi(casing, {
           sk: { field: "zsk", prefix: [prefix], zorder: [{ field: "x", min: 0, max: 100 }] },
           casing,
         })
-      expect(() => entity({ a: half("n", "lowercase"), b: half("n", "uppercase") })).not.toThrow()
-      expect(() =>
-        entity({ a: half("tenant", "lowercase"), b: half("tenant", "uppercase") }),
-      ).toThrow("[EDD-9106]")
+      for (const prefix of ["n", "tenant"]) {
+        expect(() =>
+          entity({ a: half(prefix, "lowercase"), b: half(prefix, "uppercase") }),
+        ).toThrow("[EDD-9106]")
+      }
     })
+  })
 
-    it("a sort key half and a partition key half, when the value can't hold what's escaped", () => {
+  describe("a sort key half and a partition key half build the same text", () => {
+    it("over a number or a string", () => {
       const onN = { pk: { field: "pk", composite: ["n"] }, sk: { field: "sk", composite: ["id"] } }
       expect(() =>
         entity({ a: gsi("a", { sk: { field: "pk", composite: ["n"] } }) }, onN),
       ).not.toThrow()
-      const onTenant = primaryKey
       expect(() =>
-        entity({ a: gsi("a", { sk: { field: "pk", composite: ["tenant"] } }) }, onTenant),
-      ).toThrow("[EDD-9106]")
+        entity({ a: gsi("a", { sk: { field: "pk", composite: ["tenant"] } }) }, primaryKey),
+      ).not.toThrow()
     })
   })
 

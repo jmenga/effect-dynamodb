@@ -85,17 +85,19 @@ Several entities can overload one physical GSI (`gsi1` serving `byProject` on on
 
 ### Sharing a key attribute
 
-Give each key half its own attribute. Two halves of one entity may share one only when they provably compose the same text for every item. A row can't show which half owns the attribute, so the one written last would overwrite the other, and an update would corrupt even a row that only used one. Anything else throws `EDD-9106` when the definition loads: `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema.
+**Give every index key its own attribute.** That's the library's principle: a dedicated `gsi1pk` and `gsi1sk` for each GSI, which several entities can overload.
+
+One entity can use a physical index once, even over the same fields (`EDD-9108`), since an item has one key in an index. Two key halves of one entity may share an attribute only with the same fields, in the same order and casing, and a sharded partition key only with one sharded the same way (`EDD-9106`). A row can't show which half owns the attribute, so the one written last would overwrite the other, and an update would corrupt even a row that only used one.
 
 ```typescript
-// Refused: one attribute, two different texts
-byRegion: { name: "gsi1", pk: { field: "gpk", composite: ["region"] }, sk: { field: "gsk", composite: ["id"] } },
-byGroup: { name: "gsi1", pk: { field: "gpk", composite: ["group"] }, sk: { field: "gsk", composite: ["extra"] } },
+// Refused: one attribute, two different definitions
+byRegion: { name: "gsi1", pk: { field: "gpk", composite: ["region"] }, sk: { field: "gsk1", composite: ["id"] } },
+byGroup: { name: "gsi2", pk: { field: "gpk", composite: ["group"] }, sk: { field: "gsk2", composite: ["extra"] } },
 ```
 
 Give each its own attribute, which means a new index, and re-put existing rows. The check runs per entity, so several entities can still overload one index.
 
-An index half with the same composites, in the same order and casing, as the table half stored in its attribute **is** that table key. That's a local index's partition key, a sort key shared with the table, and an inverted index:
+A local index's partition key and a sort key shared with the table meet that rule. So does an inverted index, which is **supported but not encouraged**:
 
 ```typescript
 primaryKey: {
@@ -111,11 +113,7 @@ indexes: {
 },
 ```
 
-The table's own composition is the only writer of such a half, and a query through it composes the table half's text, so an inverted index stays in step with `get` for any value. Its sort key holds partition key text, which isn't escaped:
-
-- It has no truncated form, so a partial pin is a `begins_with`, as on a primary key.
-- It isn't in value order before its last composite (`x y#...` sorts below `x#...`), so a `.where()` range on a composite before the last throws `EDD-9107`. `.within()` can read one: it reads what's pinned and judges the rows.
-- A value holding `#` can match the `begins_with` of another value, as the table's partition key text is already ambiguous there.
+One rule composes every key's values, so both roles of an attribute build identical text, with `escapeKeys` on or off, and an inverted index stays in step with `get` for any value. An update never writes a table key attribute: a key changes only by moving the row.
 
 ### Z-order Sort Keys
 
@@ -215,7 +213,7 @@ Both `pk.composite` and `sk.composite` can be empty arrays. The entity type pref
 
 | Type | Key Value |
 |------|-----------|
-| `string` | As-is; in a sort key, characters up to `%` escaped ([Sort key text](#sort-key-text)) |
+| `string` | Characters up to `%` escaped ([Key text](#key-text)) |
 | `number`, `bigint` | Numeric key text (below) |
 | `DateTime.Utc` | ISO 8601 |
 | `boolean` | `"true"` / `"false"` |
@@ -241,22 +239,34 @@ The text holds no letters and no `#`, so casing never changes it. A composite ho
 Up to 1.36, a number was zero-padded as text (`String(n).padStart(16, "0")`), which sorted `-3` above `-5` and `10.5` below `3.14`. Non-negative integers below 1e16 (below 1e38 for a `bigint`) keep the same key text. Every other value composes different text: negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970. A row written by 1.36 with one in a key keeps its old key until it moves. Single-item operations still find it, and move it the first time they write it, and queries that pin its key read it (see [Migrating rows written by 1.36](#migrating-rows-written-by-136)); a range bound misses or misorders it until it moves.
 :::
 
-### Sort key text
+### Key text
 
-In a sort key, a string's text escapes every character up to `%` — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two hex digits, after casing:
+In every key, partition and sort, a string's text escapes every character up to `%` — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two hex digits, after casing. That's table keys, index keys, collections, aggregates, event streams, unique constraints and vector partitions:
 
-| Value | Sort key text (`"lowercase"` casing) |
+| Value | Key text (`"lowercase"` casing) |
 |-------|--------------------------------------|
 | `new york` | `new%20york` |
 | `a#b` | `a%23b` |
 | `50%` | `50%25` |
 | `"Line\nTwo"` | `line%0atwo` |
 
-Every remaining character sorts above the `#` that follows a composite, so keys sort as their values do and a value may hold `#`: a bound on any composite is one key condition that returns exactly the values it means, and `a` neither equals nor prefixes `a#b` (see [Queries](/effect-dynamodb/guides/queries/#sort-key-conditions)). Every sort key composed from composite values is escaped: table and index sort keys, time-series event keys, version snapshot and tombstone keys, aggregate sort keys and Z-order prefix segments. Partition keys and unique-constraint values aren't, and the stored attribute keeps its value.
+Every remaining character sorts above the `#` that follows a composite, so keys sort as their values do and a value may hold `#`: a bound on any composite is one key condition that returns exactly the values it means, and `a` neither equals nor prefixes `a#b` (see [Queries](/effect-dynamodb/guides/queries/#sort-key-conditions)).
 
-:::caution[Stored keys changed in 1.37.0]
-Up to 1.36 a sort key held a string's text as it was: a space, `!`, `"` or control character sorted below the `#` after a composite, so `new york` sorted before `new` and bounds returned the wrong rows, and `#` split a value in two. A string without a character up to `%` keeps the same key text. A row written by 1.36 with such a string in a sort key composite, or as a time-series `orderBy`, keeps its old sort key until it moves (below); partition keys are unaffected.
+:::caution[Stored keys changed in 1.37.0 and 1.38.0]
+Up to 1.36 no key escaped a string: a space, `!`, `"` or control character sorted below the `#` after a composite, so `new york` sorted before `new` and bounds returned the wrong rows, and `#` split a value in two. 1.37.0 escaped sort keys, and 1.38.0 escapes every key. A string without a character up to `%` keeps the same key text. A row written with such a value keeps its old key until it moves: see [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/).
 :::
+
+### Turning key escaping off
+
+`DynamoSchema.make({ name, version, escapeKeys: false })` turns escaping off for every key, partition and sort: it's all or nothing, and the default is on. String key text is then byte for byte what 1.36 wrote. Numbers keep the [encoding from 1.37](#numeric-composites) either way.
+
+It's for a table whose existing keys you'd rather not rewrite, and comes with these limitations, for which the library has no machinery and no refusal:
+
+- A range on a sort key composite that isn't the last can return the wrong rows when a value holds a character below `#`: `new york` sorts below `new#…`, so `lte: "new york"` leaves out `new`. `gt` under a pin on the last composite can miss a longer value continuing below `#` (`a b` for `a`).
+- A `#` in a value can imitate a segment: `a#b` + `c` and `a` + `b#c` compose one key.
+- Skip-scan over free-form strings can hide rows.
+- With `legacyKeys: false` too, a pin on a sort key composite of a secondary index that isn't the last also returns a longer sibling (`new york` for `new`).
+- Rows written with escaping on aren't found: a sort key 1.37.0 escaped, or any key 1.38.0 escaped. A key with nothing to escape is the same either way.
 
 ### Migrating rows written by 1.36
 
@@ -264,7 +274,7 @@ Through 1.37.x, single-item operations keep working over rows 1.36 wrote under k
 
 Moving costs requests while the fallback is on. A conditioned `put`, `upsert`, `update`, `patch` and `append` are sent first, as if the item were at its current key; only when that finds no item do they move it (one read of the 1.36 key and one transaction) and send again, so creating a new item this way costs one failed conditional write more. An unconditioned `put` of an item whose key text changed is always one transaction of two items, a Put at the current key and a Delete at the 1.36 key: twice the write capacity of a plain put for each, and a concurrent transaction on either key can cancel it, which the put retries up to three times. A value holding `%` and no character below it, whose 1.36 key can be another value's current key (below), is put as a conditioned put is. `Batch.write` deletes a put's 1.36 key in a later request, once the put is written. On a `retain` entity a move also reads the snapshot of the item's version and moves it in the same transaction: one more strongly consistent read and two more transaction items.
 
-1.36 didn't escape sort key text, so the 1.36 key of a string holding `%` and two hex digits can be another value's current key: `foo%20bar`'s 1.36 row sits where `foo bar` is stored now, and `x%23y`'s where `x#y` is. Operations tell the two apart by the row's values. A `get`, a batch or transaction read, or an accessor query of `foo bar` doesn't return `foo%20bar`'s row. `update`, `patch` and `delete` of `foo bar` treat it as no item, and `purge` deletes only the item's own rows. A write that needs the key — a `put`, `create` or `upsert` of `foo bar`, or the move of `foo bar`'s own 1.36 row — first moves `foo%20bar`'s row to its own current key. The other way round, a write of `foo%20bar` leaves `foo bar`'s row at its 1.36 key alone: a `put` of it is sent as a conditioned put is, and `create` and `restore` read that key first. A retained `foo%20bar` created afresh continues its own versions, not `foo bar`'s, and each lists only its own: 1.36 kept `foo%20bar`'s version history under the prefix `foo bar`'s history is under now, so a write of `foo bar` whose version snapshot lands on one of `foo%20bar`'s moves that snapshot to `foo%20bar`'s current key first. `Transaction.transactWrite` can't move the row, so it fails `ItemNotMoved` naming the item that holds the key; write that item once through the entity first.
+1.36 didn't escape key text, so the 1.36 key of a string holding `%` and two hex digits can be another value's current key: `foo%20bar`'s 1.36 row sits where `foo bar` is stored now, and `x%23y`'s where `x#y` is. Operations tell the two apart by the row's values. A `get`, a batch or transaction read, or an accessor query of `foo bar` doesn't return `foo%20bar`'s row. `update`, `patch` and `delete` of `foo bar` treat it as no item, and `purge` deletes only the item's own rows. A write that needs the key — a `put`, `create` or `upsert` of `foo bar`, or the move of `foo bar`'s own 1.36 row — first moves `foo%20bar`'s row to its own current key. The other way round, a write of `foo%20bar` leaves `foo bar`'s row at its 1.36 key alone: a `put` of it is sent as a conditioned put is, and `create` and `restore` read that key first. A retained `foo%20bar` created afresh continues its own versions, not `foo bar`'s, and each lists only its own: 1.36 kept `foo%20bar`'s version history under the prefix `foo bar`'s history is under now, so a write of `foo bar` whose version snapshot lands on one of `foo%20bar`'s moves that snapshot to `foo%20bar`'s current key first. `Transaction.transactWrite` can't move the row, so it fails `ItemNotMoved` naming the item that holds the key; write that item once through the entity first.
 
 A transaction can't move an item: an update, patch, conditioned put or delete, guarded put or condition check in `Transaction.transactWrite` of an item still under its 1.36 key fails with `ItemNotMoved` (`EDD-9097`) and writes nothing. Write the item once through the entity, then run the transaction again.
 

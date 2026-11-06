@@ -1,7 +1,8 @@
 /**
- * An index half that is a half of the table's key (#183, D62, canonical shape 14): which
- * halves are, what the composers do with one, and that nothing else changes. Entity-level
- * and connected coverage is in `packages/effect-dynamodb/test/helpers/TableKeyHalves.ts`.
+ * An inverted index (#183, canonical shape 14) and every other half stored in a table key
+ * attribute: one rule composes both roles, with `escapeKeys` on or off, so they build the
+ * same text with no case of their own. Entity-level and connected coverage is in
+ * `packages/effect-dynamodb/test/helpers/InvertedIndexes.ts`.
  */
 
 import { Schema } from "effect"
@@ -42,7 +43,18 @@ const inverted = {
   sk: { field: "pk", composite: ["tenant", "id"] },
 }
 
-const VALUES = ["plain", "a b", "50%", "a#b", "MiXeD Case", "Zürich 東京", "x!y", "\u0000", "~"]
+const VALUES = [
+  "plain",
+  "u 1",
+  "a b",
+  "50%",
+  "a#b",
+  "MiXeD Case",
+  "Zürich 東京",
+  "x!y",
+  "\u0000",
+  "~",
+]
 
 const recordOf = (value: string) => ({
   tenant: value,
@@ -50,47 +62,6 @@ const recordOf = (value: string) => ({
   group: `${value}2`,
   kind: `${value}3`,
   region: "r",
-})
-
-describe("which halves are the table's key", () => {
-  it("an inverted index: both", () => {
-    expect(make({ inverted }).indexes.inverted?.tableKey).toEqual({ pk: "sk", sk: "pk" })
-  })
-
-  it("a local index: its partition key", () => {
-    const made = make({
-      local: {
-        name: "lsi",
-        pk: { field: "pk", composite: ["tenant", "id"] },
-        sk: { field: "lsk", composite: ["region"] },
-      },
-    })
-    expect(made.indexes.local?.tableKey).toEqual({ pk: "pk" })
-  })
-
-  it("a sort key shared with the table", () => {
-    const made = make({
-      shared: {
-        name: "gsi",
-        pk: { field: "gpk", composite: ["region"] },
-        sk: { field: "sk", composite: ["group", "kind"] },
-      },
-    })
-    expect(made.indexes.shared?.tableKey).toEqual({ sk: "sk" })
-  })
-
-  it("an index in attributes of its own: neither", () => {
-    const made = make({
-      own: {
-        name: "gsi",
-        pk: { field: "gpk", composite: ["tenant", "id"] },
-        sk: { field: "gsk", composite: ["group", "kind"] },
-      },
-    })
-    expect(made.indexes.own?.tableKey).toBeUndefined()
-    const all: Readonly<Record<string, KeyComposer.IndexDefinition>> = made.indexes
-    expect(all.primary?.tableKey).toBeUndefined()
-  })
 })
 
 describe("what stays refused", () => {
@@ -127,16 +98,6 @@ describe("what stays refused", () => {
       /shard marker/,
     ],
     [
-      "a sharded index's sort key across kinds",
-      {
-        name: "gsi",
-        pk: { field: "gpk", composite: ["region"] },
-        sk: { field: "pk", composite: ["tenant", "id"] },
-        shards: 8,
-      },
-      /a sort key escapes what a partition key doesn't/,
-    ],
-    [
       "a Z-order half",
       {
         name: "gsi",
@@ -163,8 +124,7 @@ describe("what stays refused", () => {
 
   it("a casing only the schema can judge: Table.make's half of the check", () => {
     const made = make({ x: { ...inverted, casing: "uppercase" } })
-    const fields = Row.fields as unknown as Record<string, Schema.Top>
-    expect(() => refuseSharedKeyAttribute(schema, "Row", made.indexes, fields)).toThrow(
+    expect(() => refuseSharedKeyAttribute(schema, "Row", made.indexes)).toThrow(
       /\[EDD-9106\].*"lowercase" and "uppercase"/,
     )
     expect(() =>
@@ -172,23 +132,25 @@ describe("what stays refused", () => {
         DynamoSchema.make({ name: "halves", version: 1, casing: "uppercase" }),
         "Row",
         made.indexes,
-        fields,
       ),
     ).not.toThrow()
   })
 })
 
-describe("an inverted index composes the table's text", () => {
+describe("an inverted index builds the table's text, with the flag on or off", () => {
   const made = make({ inverted })
   const index = made.indexes.inverted!
   const primary = made.indexes.primary!
 
   describe.each(
-    (["lowercase", "uppercase", "preserve"] as const).map((casing) => ({
-      casing,
-      on: DynamoSchema.make({ name: "halves", version: 1, casing }),
-    })),
-  )("under a $casing schema", ({ on }) => {
+    (["lowercase", "uppercase", "preserve"] as const).flatMap((casing) =>
+      [true, false].map((escapeKeys) => ({
+        casing,
+        escapeKeys,
+        on: DynamoSchema.make({ name: "halves", version: 1, casing, escapeKeys }),
+      })),
+    ),
+  )("under a $casing schema, escapeKeys $escapeKeys", ({ on }) => {
     it.each(VALUES)("the full key, for %j", (value) => {
       const record = recordOf(value)
       const pk = KeyComposer.composePk(on, "Row", primary, record)
@@ -207,57 +169,18 @@ describe("an inverted index composes the table's text", () => {
       expect(KeyComposer.composeReadPartitions(on, "Row", index, record).partitions).toEqual([sk])
     })
 
-    it.each(VALUES)("a prefix, for %j", (value) => {
-      const record = { tenant: value, group: "g", kind: "k" }
-      const text = KeyComposer.composeSkPrefixUpTo(on, "Row", 1, index, { ...record, id: "i" }, 1)
-      const label = DynamoSchema.applyCasing("tenant", on.casing)
-      expect(text.endsWith(`${label}_${DynamoSchema.applyCasing(value, on.casing)}`)).toBe(true)
-      expect(KeyComposer.composeSortKeyPrefix(on, "Row", 1, index, record)).toBe(text)
-      expect(KeyComposer.composeSortKeyBeginsWith(on, "Row", 1, index, record)).toBe(`${text}#`)
-      expect(KeyComposer.composeSortKeyCondition(on, "Row", 1, index, record)).toEqual({
-        beginsWith: `${text}#`,
-      })
-    })
-  })
-
-  it("a partition key prefix, for a row missing a trailing composite", () => {
-    const text = KeyComposer.composeStoredPk(schema, "Row", index, { group: "a b" })
-    expect(text).toBe("$halves#v1#row#group_a%20b")
-  })
-
-  it("the table's own text doesn't change: its partition key unescaped, its sort key escaped", () => {
-    const keys = KeyComposer.composeIndexKeys(schema, "Row", 1, primary, recordOf("a b"))
-    expect(keys).toEqual({
-      pk: "$halves#v1#row#tenant_a b#id_a b1",
-      sk: "$halves#v1#row#group_a%20b2#kind_a%20b3",
-    })
-  })
-
-  describe("nothing is written through it", () => {
-    it("composeIndexKeys leaves out what is the table's", () => {
-      expect(KeyComposer.composeIndexKeys(schema, "Row", 1, index, recordOf("a b"))).toEqual({})
-      const local = make({
-        local: {
-          name: "lsi",
-          pk: { field: "pk", composite: ["tenant", "id"] },
-          sk: { field: "lsk", composite: ["region"] },
-        },
-      }).indexes.local!
-      expect(
-        Object.keys(KeyComposer.composeIndexKeys(schema, "Row", 1, local, recordOf("a"))),
-      ).toEqual(["lsk"])
-    })
-
     it.each(VALUES)("composeAllKeys holds the table's text, for %j", (value) => {
       const record = recordOf(value)
-      expect(KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, record)).toEqual(
-        KeyComposer.composeIndexKeys(schema, "Row", 1, primary, record),
+      expect(KeyComposer.composeAllKeys(on, "Row", 1, made.indexes, record)).toEqual(
+        KeyComposer.composeIndexKeys(on, "Row", 1, primary, record),
       )
     })
+  })
 
-    it("nor by an update, or the 1.36 text it left", () => {
+  it("an update sets none of it", () => {
+    for (const on of [schema, DynamoSchema.make({ name: "h", version: 1, escapeKeys: false })]) {
       const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-        schema,
+        on,
         "Row",
         1,
         made.indexes,
@@ -265,25 +188,10 @@ describe("an inverted index composes the table's text", () => {
         recordOf("a b"),
       )
       expect(result).toEqual({ sets: {}, removes: [] })
-    })
+    }
   })
 
-  it("a partial pin never takes a longer sibling: rows aren't truncated here", () => {
-    const pin = { group: "g", kind: "k", tenant: "new" }
-    expect(KeyComposer.sortKeyTruncates(index)).toBe(false)
-    expect(KeyComposer.composeSortKeyCondition(schema, "Row", 1, index, pin)).toEqual({
-      beginsWith: "$halves#v1#row#tenant_new#",
-    })
-    expect(KeyText136.composeSortKeyCondition(schema, "Row", 1, index, pin)).toEqual({
-      beginsWith: "$halves#v1#row#tenant_new#",
-    })
-    const bound = KeyText136.composeBoundCondition(schema, "Row", 1, index, {}, "tenant", {
-      eq: "new",
-    })
-    expect(bound).toEqual({ beginsWith: "$halves#v1#row#tenant_new#" })
-  })
-
-  it("1.36's text has no halves, so it isn't changed", () => {
+  it("1.36's text of each role is the other's too", () => {
     const record = recordOf("a b")
     expect(KeyText136.composePk(schema, "Row", index, record)).toBe(
       KeyText136.composeSk(schema, "Row", 1, primary, record),
@@ -294,11 +202,43 @@ describe("an inverted index composes the table's text", () => {
   })
 })
 
+describe("one entity can't use a physical index twice (EDD-9108)", () => {
+  const own = (field: string) => ({
+    name: "gsi1",
+    pk: { field: `${field}pk`, composite: ["tenant"] },
+    sk: { field: `${field}sk`, composite: ["id"] },
+  })
+
+  it("over the same fields", () => {
+    expect(() => make({ a: own("g"), b: own("g") })).toThrow(/\[EDD-9108\].*"a" and "b".*"gsi1"/)
+  })
+
+  it("over other fields", () => {
+    expect(() => make({ a: own("g"), b: { ...own("h"), name: "gsi1" } })).toThrow("[EDD-9108]")
+  })
+
+  it("two indexes are fine", () => {
+    expect(() => make({ a: own("g"), b: { ...own("h"), name: "gsi2" } })).not.toThrow()
+  })
+
+  it("two entities can share one", () => {
+    const other = Entity.make({
+      model: Row,
+      entityType: "Other",
+      primaryKey: primaryKey as never,
+      indexes: { a: own("g") } as never,
+    })
+    expect(() => make({ a: own("g") })).not.toThrow()
+    expect(other.indexes.a).toBeDefined()
+  })
+})
+
 /**
- * The key text of definitions with no half across kinds, spelled out: this rule must not
- * move a byte of any of them, and 1.37.0 stored the same keys.
+ * Every definition's key text, spelled out under both settings. `off` is byte for byte what the
+ * real 1.36.0 package composes for these strings; `numbers` is the one that differs, as the
+ * number encoding of 1.37 stays on either way.
  */
-describe("every other definition composes the bytes it did", () => {
+describe("every definition's bytes", () => {
   const record = {
     tenant: "T 1",
     id: "I%2",
@@ -307,8 +247,9 @@ describe("every other definition composes the bytes it did", () => {
     region: "Zürich R",
     n: -3,
   }
+  const off = DynamoSchema.make({ name: "halves", version: 1, escapeKeys: false })
   const SHAPES: ReadonlyArray<
-    readonly [string, Record<string, unknown>, Record<string, string>, string | undefined]
+    readonly [string, Record<string, unknown>, Record<string, string>, Record<string, string>]
   > = [
     [
       "an index of its own",
@@ -318,10 +259,13 @@ describe("every other definition composes the bytes it did", () => {
         sk: { field: "gsk", composite: ["group", "kind"] },
       },
       {
-        gpk: "$halves#v1#row#tenant_t 1#id_i%2",
+        gpk: "$halves#v1#row#tenant_t%201#id_i%252",
         gsk: "$halves#v1#row#group_g%233#kind_k%204",
       },
-      "$halves#v1#row#group_g%233#",
+      {
+        gpk: "$halves#v1#row#tenant_t 1#id_i%2",
+        gsk: "$halves#v1#row#group_g#3#kind_k 4",
+      },
     ],
     [
       "a local index",
@@ -331,7 +275,7 @@ describe("every other definition composes the bytes it did", () => {
         sk: { field: "lsk", composite: ["group", "region"] },
       },
       { lsk: "$halves#v1#row#group_g%233#region_zürich%20r" },
-      "$halves#v1#row#group_g%233#",
+      { lsk: "$halves#v1#row#group_g#3#region_zürich r" },
     ],
     [
       "a sort key shared with the table",
@@ -340,8 +284,8 @@ describe("every other definition composes the bytes it did", () => {
         pk: { field: "gpk", composite: ["region"] },
         sk: { field: "sk", composite: ["group", "kind"] },
       },
+      { gpk: "$halves#v1#row#region_zürich%20r" },
       { gpk: "$halves#v1#row#region_zürich r" },
-      "$halves#v1#row#group_g%233#",
     ],
     [
       "numbers",
@@ -354,7 +298,10 @@ describe("every other definition composes the bytes it did", () => {
         gpk: "$halves#v1#row#n_-9999999999999996:",
         gsk: "$halves#v1#row#n_-9999999999999996:",
       },
-      undefined,
+      {
+        gpk: "$halves#v1#row#n_-9999999999999996:",
+        gsk: "$halves#v1#row#n_-9999999999999996:",
+      },
     ],
     [
       "a collection",
@@ -365,10 +312,13 @@ describe("every other definition composes the bytes it did", () => {
         sk: { field: "gsk", composite: ["group", "kind"] },
       },
       {
-        gpk: "$halves#v1#things#tenant_t 1",
+        gpk: "$halves#v1#things#tenant_t%201",
         gsk: "$halves#v1#row_1#group_g%233#kind_k%204",
       },
-      undefined,
+      {
+        gpk: "$halves#v1#things#tenant_t 1",
+        gsk: "$halves#v1#row_1#group_g#3#kind_k 4",
+      },
     ],
     [
       "a clustered collection",
@@ -380,27 +330,37 @@ describe("every other definition composes the bytes it did", () => {
         sk: { field: "gsk", composite: ["group", "kind"] },
       },
       {
-        gpk: "$halves#v1#things#tenant_t 1",
+        gpk: "$halves#v1#things#tenant_t%201",
         gsk: "$halves#v1#things#row_1#group_g%233#kind_k%204",
       },
-      undefined,
+      {
+        gpk: "$halves#v1#things#tenant_t 1",
+        gsk: "$halves#v1#things#row_1#group_g#3#kind_k 4",
+      },
     ],
   ]
 
-  it.each(SHAPES)("%s", (_name, index, golden, subtree) => {
+  it.each(SHAPES)("%s", (_name, index, escaped, unescaped) => {
     const made = make({ x: index })
-    const x = made.indexes.x!
-    const keys = KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, record)
-    expect(keys).toEqual({
-      pk: "$halves#v1#row#tenant_t 1#id_i%2",
+    expect(KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, record)).toEqual({
+      pk: "$halves#v1#row#tenant_t%201#id_i%252",
       sk: "$halves#v1#row#group_g%233#kind_k%204",
-      ...golden,
+      ...escaped,
     })
-    if (subtree !== undefined) {
-      const prefix = subtree.slice(0, -1)
-      expect(
-        KeyComposer.composeSortKeyCondition(schema, "Row", 1, x, { group: record.group }),
-      ).toEqual({ between: [prefix, `${prefix}#${KeyComposer.SORT_KEY_MAX}`] })
+    expect(KeyComposer.composeAllKeys(off, "Row", 1, made.indexes, record)).toEqual({
+      pk: "$halves#v1#row#tenant_t 1#id_i%2",
+      sk: "$halves#v1#row#group_g#3#kind_k 4",
+      ...unescaped,
+    })
+  })
+
+  it("a value with nothing to escape composes the same under both", () => {
+    const plain = { tenant: "T1", id: "I2", group: "G3", kind: "K4", region: "Zürich", n: 7 }
+    for (const [, index] of SHAPES) {
+      const made = make({ x: index })
+      expect(KeyComposer.composeAllKeys(off, "Row", 1, made.indexes, plain)).toEqual(
+        KeyComposer.composeAllKeys(schema, "Row", 1, made.indexes, plain),
+      )
     }
   })
 })

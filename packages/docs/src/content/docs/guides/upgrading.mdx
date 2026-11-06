@@ -8,7 +8,7 @@ import { Aside } from "@astrojs/starlight/components"
 1.37.0 changes the key text of some values, so that keys sort as their values do:
 
 - **numbers** that are negative, fractional, or 1e16 and up, and bigints that are negative or 1e38 and up ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites));
-- **strings in sort keys** holding a character up to `%` — a control character, space, `!`, `"`, `#`, `$` or `%` ([Sort key text](/effect-dynamodb/guides/indexes/#sort-key-text));
+- **strings in sort keys** holding a character up to `%` — a control character, space, `!`, `"`, `#`, `$` or `%` ([Key text](/effect-dynamodb/guides/indexes/#key-text)), which 1.38.0 extends to [every key](#every-key-escaped-in-138);
 - **time-series event keys** of a `NumberFromString` or `BigIntFromString` `orderBy` ([Time-series](/effect-dynamodb/guides/timeseries/)).
 
 A row 1.36 wrote with such a value keeps its old key. Through 1.37.x the **1.36 key fallback** keeps those rows working: single-item operations read them, the first write of an item moves it, and queries that pin a key prefix read both keys ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)). Range bounds and `.within()` still miss rows that haven't moved, and the fallback costs requests while it is on.
@@ -208,11 +208,49 @@ With it off, no request names a 1.36 key, and no operation pays for the fallback
 `rekey` moves the rows of the members the client knows. A table shared with a service that registers other entities, aggregates or streams reports their rows as `unregistered`: run `rekey` there too, with a client that knows them.
 </Aside>
 
-## Key attributes in 1.38
+## Every key escaped in 1.38
 
-`EDD-9106` judges every pair of key halves in one entity from 1.38.0, sharded or not. If a definition now throws it at load, two of its halves share an attribute without provably composing the same text, so an item could be unreachable through one of them. Give each half its own attribute, which means a new index on the table, then re-put existing rows, or the new index holds none of them. See [Sharing a key attribute](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute).
+From 1.38.0 **every key** escapes a string's characters up to `%`, as sort keys have since 1.37.0: table and index partition keys, collections, aggregates, event streams, unique constraints and vector partitions. A value with nothing to escape keeps the same bytes. The upgrade is the one above: a row whose key text changed is found through the fallback, and `rekey` moves it.
 
-An inverted index, and any other index half with the same composites, order and casing as the table half in its attribute, keeps working, with no change to the table's key text. 1.38.0 also fixes what 1.37.0 did to an inverted index over strings, where a value with a space, `%` or another character a sort key escapes overwrote a table key:
+**Run `rekey` before relying on a range.** A range bound (`gt`, `gte`, `lt`, `lte`, `between`) and `.within()` read the current key only. Under a partition value holding a character to escape, that leaves out every row that hasn't moved, so until `rekey` has run such a query returns nothing of that partition. A query that pins a key prefix, or has no bound, reads both keys.
+
+**A cursor from before the upgrade** resumes when its partition key text didn't change, and on a query with no bound when it did. Under a partition whose text changed, one from a range bound is refused by DynamoDB (`DynamoValidationError`), and one from a query that read both keys in 1.37.0 is refused with `EDD-9094`: restart that listing. Changing `escapeKeys` refuses a cursor the same ways, on a sharded query with `EDD-9094`.
+
+**Prefer to keep your partition keys as they are?** Turn escaping off for every key, with `DynamoSchema.make({ name, version, escapeKeys: false })`, and accept [what that costs](/effect-dynamodb/guides/indexes/#turning-key-escaping-off). String key text is then byte for byte what 1.36 wrote, so a table 1.36 wrote needs no `rekey` for strings. Numbers keep the 1.37 encoding either way. Rows 1.37.0 wrote with escaped sort keys, and rows written with escaping on, aren't found under it.
+
+### Rows 1.37.0 wrote
+
+1.37.0 escaped sort keys and no partition key. So a partition key holding a character to escape, beside an escape or a changed number elsewhere in the row's keys, is at neither its 1.36 text nor its current one: `tenant: "a b"` with `label: "x y"`, or `[tenant: "a b", n: -3]`.
+
+**Run `rekey` first.** It looks for that form and moves those rows: items, version snapshots, tombstones, time-series events, index keys, vector partitions, streams and aggregates. Until it has run:
+
+- A read doesn't find such a row: no fallback read looks for this form.
+- A `put` of the same key writes beside it, and `rekey` then reports `bothKeys`. Keep the row you want and delete the other.
+
+`rekey` doesn't recognize three forms:
+
+- **A unique constraint mixing a string to escape with a changed number.** The value isn't seen as taken, so a duplicate isn't refused. Delete and re-put the holder to restore its sentinel.
+- **An inverted row with a string to escape in each half.** It counts in `skipped.unrecognizedKey`. Read it with a `scan`, `put` it again, and delete the old key by its stored text.
+- **An aggregate partition mixing a string to escape with a changed number** isn't read. Re-create the aggregate.
+
+### Values holding `%` and two hex digits
+
+The stored 1.36 key of `foo%20bar` is the text `foo bar` escapes to now. An entity tells them apart by the row's values, but a stream or an aggregate reads a whole partition, so until `rekey` has run, a read of `foo bar` returns `foo%20bar`'s, and an `append` or `create` of `foo bar` conflicts with it. `rekey` moves them to their own key, and frees `foo bar`.
+
+### What 1.37.0 did to an inverted index
+
+An inverted index over strings broke in 1.37.0: a value with a space, `%` or another character a sort key escapes overwrote a table key. Since 1.38.0 both roles build one text.
 
 - **`sk` stored unescaped**, as for a `groupId` of `50%`: that's the row's 1.36 text, so the fallback finds it, and `rekey` moves it.
-- **`pk` stored escaped**, as `userid_u%201` for a `userId` of `u 1`: not repaired. `get`, a pin on `userId` and `delete` don't reach the row, and `rekey` leaves it, counted in `skipped.unrecognizedKey`, though an inverted query with no pin lists it. Re-put the item, which writes a correct second row, then delete the old one by spelling its stored text: `delete({ userId: "u%201", groupId })`. Partition key text isn't escaped, so that composes the stored key.
+- **`pk` stored escaped**, as `userid_u%201` for a `userId` of `u 1`: that's its key now, so it's correct and needs no repair.
+
+Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
+
+## Definitions refused in 1.38
+
+Two rules run at load from 1.38.0. If a definition throws one, give each key its own attribute, which means a new index on the table, then re-put existing rows, or the new index holds none of them.
+
+- **`EDD-9106`**: two key halves of one entity stored in one attribute without the same fields, in the same order and casing, or a sharded partition key with one sharded differently. An item could be unreachable through one of them.
+- **`EDD-9108`**: one entity using one physical index twice, even over the same fields. Different entities can share one.
+
+An update also refuses a `.remove()` of a primary key composite, as it refuses a `.set()` of one.

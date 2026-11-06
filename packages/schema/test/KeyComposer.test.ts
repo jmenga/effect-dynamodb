@@ -1739,7 +1739,7 @@ describe("KeyComposer", () => {
           { deviceBinding: "cloud#dev-1" },
           { id: "veh-1" },
         )
-        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         expect(result.removes).toEqual([])
       })
@@ -1827,7 +1827,7 @@ describe("KeyComposer", () => {
           { deviceBinding: "cloud#dev-1" },
           { id: "veh-1" },
         )
-        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         expect(result.removes).toEqual([])
       })

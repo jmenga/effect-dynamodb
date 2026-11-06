@@ -1,0 +1,557 @@
+{
+ "generated": "Stored by the published effect-dynamodb@1.36.0 and @effect-dynamodb/schema@1.36.0 (effect@4.0.0), on DynamoDB Local, running test/helpers/KeyRows.ts. Do not regenerate from this repo.",
+ "rows": {
+  "lowercase/spelled": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$rows#v1#edge#userid_u 1",
+    "sk": "$rows#v1#edge#groupid_a b"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$rows#v1#item#region_50%",
+    "gsi1sk": "$rows#v1#item#zone_foo#bar\nbaz",
+    "pk": "$rows#v1#item#tenant_u 1#n_0000000000000005",
+    "sk": "$rows#v1#item#label_a b#s_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$rows#v1#team#teamid_a b",
+    "gsi2sk": "$rows#v1#member_1#memberid_u 1",
+    "gsi3pk": "$rows#v1#org#orgid_50%",
+    "gsi3sk": "$rows#v1#org#dept#member_1#memberid_u 1",
+    "pk": "$rows#v1#member#memberid_u 1",
+    "sk": "$rows#v1#member"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$rows#v1#reading#device_u 1",
+    "sk": "$rows#v1#reading#channel_a b"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$rows#v1#reading#device_u 1",
+    "sk": "$rows#v1#reading#channel_a b#e#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$rows#v1#routelist#a b",
+    "gsi5sk": "$rows#v1#routelist#u 1",
+    "lsi1sk": "$rows#v1#routes#a b",
+    "pk": "$rows#v1#routes#u 1",
+    "sk": "$rows#v1#routeitem"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$rows#v1#routestop#50%",
+    "pk": "$rows#v1#routes#u 1",
+    "sk": "$rows#v1#routestop#50%"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_50%",
+    "sk": "$rows#v1#user"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_50%",
+    "sk": "$rows#v1#user#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u 1",
+    "sk": "$rows#v1#user#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u 1",
+    "sk": "$rows#v1#user#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u 1",
+    "sk": "$rows#v1#user#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$rows#v1#user.contact#foo#bar\nbaz",
+    "sk": "$rows#v1#user.contact"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$rows#v1#accounts#u 1#0000000000000005",
+    "sk": "$rows#v1#accounts.command#a b"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$rows#v1#accounts#u 1#0000000000000005",
+    "sk": "$rows#v1#accounts.event_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$rows#v1#Ledgers#Foo#Bar\nBaz",
+    "sk": "$rows#v1#Ledgers.event_1#0000000001"
+   }
+  ],
+  "lowercase/plain": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$rows#v1#edge#userid_u1",
+    "sk": "$rows#v1#edge#groupid_ab"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$rows#v1#item#region_50",
+    "gsi1sk": "$rows#v1#item#zone_foobarbaz",
+    "pk": "$rows#v1#item#tenant_u1#n_0000000000000005",
+    "sk": "$rows#v1#item#label_ab#s_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$rows#v1#team#teamid_ab",
+    "gsi2sk": "$rows#v1#member_1#memberid_u1",
+    "gsi3pk": "$rows#v1#org#orgid_50",
+    "gsi3sk": "$rows#v1#org#dept#member_1#memberid_u1",
+    "pk": "$rows#v1#member#memberid_u1",
+    "sk": "$rows#v1#member"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$rows#v1#reading#device_u1",
+    "sk": "$rows#v1#reading#channel_ab"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$rows#v1#reading#device_u1",
+    "sk": "$rows#v1#reading#channel_ab#e#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$rows#v1#routelist#ab",
+    "gsi5sk": "$rows#v1#routelist#u1",
+    "lsi1sk": "$rows#v1#routes#ab",
+    "pk": "$rows#v1#routes#u1",
+    "sk": "$rows#v1#routeitem"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$rows#v1#routestop#50",
+    "pk": "$rows#v1#routes#u1",
+    "sk": "$rows#v1#routestop#50"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_50",
+    "sk": "$rows#v1#user"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_50",
+    "sk": "$rows#v1#user#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u1",
+    "sk": "$rows#v1#user#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u1",
+    "sk": "$rows#v1#user#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$rows#v1#user#id_u1",
+    "sk": "$rows#v1#user#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$rows#v1#user.contact#foobarbaz",
+    "sk": "$rows#v1#user.contact"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$rows#v1#accounts#u1#0000000000000005",
+    "sk": "$rows#v1#accounts.command#ab"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$rows#v1#accounts#u1#0000000000000005",
+    "sk": "$rows#v1#accounts.event_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$rows#v1#Ledgers#FooBarBaz",
+    "sk": "$rows#v1#Ledgers.event_1#0000000001"
+   }
+  ],
+  "uppercase/spelled": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$ROWS#v1#EDGE#USERID_U 1",
+    "sk": "$ROWS#v1#EDGE#GROUPID_A B"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$ROWS#v1#ITEM#REGION_50%",
+    "gsi1sk": "$ROWS#v1#ITEM#ZONE_FOO#BAR\nBAZ",
+    "pk": "$ROWS#v1#ITEM#TENANT_U 1#N_0000000000000005",
+    "sk": "$ROWS#v1#ITEM#LABEL_A B#S_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$ROWS#v1#TEAM#TEAMID_A B",
+    "gsi2sk": "$ROWS#v1#MEMBER_1#MEMBERID_U 1",
+    "gsi3pk": "$ROWS#v1#ORG#ORGID_50%",
+    "gsi3sk": "$ROWS#v1#ORG#DEPT#MEMBER_1#MEMBERID_U 1",
+    "pk": "$ROWS#v1#MEMBER#MEMBERID_U 1",
+    "sk": "$ROWS#v1#MEMBER"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$ROWS#v1#READING#DEVICE_U 1",
+    "sk": "$ROWS#v1#READING#CHANNEL_A B"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$ROWS#v1#READING#DEVICE_U 1",
+    "sk": "$ROWS#v1#READING#CHANNEL_A B#E#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$ROWS#v1#ROUTELIST#A B",
+    "gsi5sk": "$ROWS#v1#ROUTELIST#U 1",
+    "lsi1sk": "$ROWS#v1#ROUTES#A B",
+    "pk": "$ROWS#v1#ROUTES#U 1",
+    "sk": "$ROWS#v1#ROUTEITEM"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$ROWS#v1#ROUTESTOP#50%",
+    "pk": "$ROWS#v1#ROUTES#U 1",
+    "sk": "$ROWS#v1#ROUTESTOP#50%"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_50%",
+    "sk": "$ROWS#v1#USER"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_50%",
+    "sk": "$ROWS#v1#USER#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U 1",
+    "sk": "$ROWS#v1#USER#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U 1",
+    "sk": "$ROWS#v1#USER#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U 1",
+    "sk": "$ROWS#v1#USER#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$ROWS#v1#USER.CONTACT#FOO#BAR\nBAZ",
+    "sk": "$ROWS#v1#USER.CONTACT"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$ROWS#v1#ACCOUNTS#U 1#0000000000000005",
+    "sk": "$ROWS#v1#ACCOUNTS.COMMAND#A B"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$ROWS#v1#ACCOUNTS#U 1#0000000000000005",
+    "sk": "$ROWS#v1#ACCOUNTS.EVENT_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$ROWS#v1#Ledgers#Foo#Bar\nBaz",
+    "sk": "$ROWS#v1#Ledgers.event_1#0000000001"
+   }
+  ],
+  "uppercase/plain": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$ROWS#v1#EDGE#USERID_U1",
+    "sk": "$ROWS#v1#EDGE#GROUPID_AB"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$ROWS#v1#ITEM#REGION_50",
+    "gsi1sk": "$ROWS#v1#ITEM#ZONE_FOOBARBAZ",
+    "pk": "$ROWS#v1#ITEM#TENANT_U1#N_0000000000000005",
+    "sk": "$ROWS#v1#ITEM#LABEL_AB#S_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$ROWS#v1#TEAM#TEAMID_AB",
+    "gsi2sk": "$ROWS#v1#MEMBER_1#MEMBERID_U1",
+    "gsi3pk": "$ROWS#v1#ORG#ORGID_50",
+    "gsi3sk": "$ROWS#v1#ORG#DEPT#MEMBER_1#MEMBERID_U1",
+    "pk": "$ROWS#v1#MEMBER#MEMBERID_U1",
+    "sk": "$ROWS#v1#MEMBER"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$ROWS#v1#READING#DEVICE_U1",
+    "sk": "$ROWS#v1#READING#CHANNEL_AB"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$ROWS#v1#READING#DEVICE_U1",
+    "sk": "$ROWS#v1#READING#CHANNEL_AB#E#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$ROWS#v1#ROUTELIST#AB",
+    "gsi5sk": "$ROWS#v1#ROUTELIST#U1",
+    "lsi1sk": "$ROWS#v1#ROUTES#AB",
+    "pk": "$ROWS#v1#ROUTES#U1",
+    "sk": "$ROWS#v1#ROUTEITEM"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$ROWS#v1#ROUTESTOP#50",
+    "pk": "$ROWS#v1#ROUTES#U1",
+    "sk": "$ROWS#v1#ROUTESTOP#50"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_50",
+    "sk": "$ROWS#v1#USER"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_50",
+    "sk": "$ROWS#v1#USER#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U1",
+    "sk": "$ROWS#v1#USER#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U1",
+    "sk": "$ROWS#v1#USER#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$ROWS#v1#USER#ID_U1",
+    "sk": "$ROWS#v1#USER#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$ROWS#v1#USER.CONTACT#FOOBARBAZ",
+    "sk": "$ROWS#v1#USER.CONTACT"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$ROWS#v1#ACCOUNTS#U1#0000000000000005",
+    "sk": "$ROWS#v1#ACCOUNTS.COMMAND#AB"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$ROWS#v1#ACCOUNTS#U1#0000000000000005",
+    "sk": "$ROWS#v1#ACCOUNTS.EVENT_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$ROWS#v1#Ledgers#FooBarBaz",
+    "sk": "$ROWS#v1#Ledgers.event_1#0000000001"
+   }
+  ],
+  "preserve/spelled": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$Rows#v1#Edge#userId_u 1",
+    "sk": "$Rows#v1#Edge#groupId_a b"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$Rows#v1#Item#region_50%",
+    "gsi1sk": "$Rows#v1#Item#zone_Foo#Bar\nBaz",
+    "pk": "$Rows#v1#Item#tenant_u 1#n_0000000000000005",
+    "sk": "$Rows#v1#Item#label_a b#s_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$Rows#v1#team#teamId_a b",
+    "gsi2sk": "$Rows#v1#Member_1#memberId_u 1",
+    "gsi3pk": "$Rows#v1#org#orgId_50%",
+    "gsi3sk": "$Rows#v1#org#dept#Member_1#memberId_u 1",
+    "pk": "$Rows#v1#Member#memberId_u 1",
+    "sk": "$Rows#v1#Member"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$Rows#v1#Reading#device_u 1",
+    "sk": "$Rows#v1#Reading#channel_a b"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$Rows#v1#Reading#device_u 1",
+    "sk": "$Rows#v1#Reading#channel_a b#e#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$Rows#v1#routelist#a b",
+    "gsi5sk": "$Rows#v1#routelist#u 1",
+    "lsi1sk": "$Rows#v1#routes#a b",
+    "pk": "$Rows#v1#routes#u 1",
+    "sk": "$Rows#v1#RouteItem"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$Rows#v1#RouteStop#50%",
+    "pk": "$Rows#v1#routes#u 1",
+    "sk": "$Rows#v1#RouteStop#50%"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_50%",
+    "sk": "$Rows#v1#User"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_50%",
+    "sk": "$Rows#v1#User#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u 1",
+    "sk": "$Rows#v1#User#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u 1",
+    "sk": "$Rows#v1#User#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u 1",
+    "sk": "$Rows#v1#User#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$Rows#v1#User.contact#Foo#Bar\nBaz",
+    "sk": "$Rows#v1#User.contact"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$Rows#v1#accounts#u 1#0000000000000005",
+    "sk": "$Rows#v1#accounts.command#a b"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$Rows#v1#accounts#u 1#0000000000000005",
+    "sk": "$Rows#v1#accounts.event_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$Rows#v1#Ledgers#Foo#Bar\nBaz",
+    "sk": "$Rows#v1#Ledgers.event_1#0000000001"
+   }
+  ],
+  "preserve/plain": [
+   {
+    "__edd_e__": "Edge",
+    "pk": "$Rows#v1#Edge#userId_u1",
+    "sk": "$Rows#v1#Edge#groupId_ab"
+   },
+   {
+    "__edd_e__": "Item",
+    "gsi1pk": "$Rows#v1#Item#region_50",
+    "gsi1sk": "$Rows#v1#Item#zone_FooBarBaz",
+    "pk": "$Rows#v1#Item#tenant_u1#n_0000000000000005",
+    "sk": "$Rows#v1#Item#label_ab#s_0000000000000007"
+   },
+   {
+    "__edd_e__": "Member",
+    "gsi2pk": "$Rows#v1#team#teamId_ab",
+    "gsi2sk": "$Rows#v1#Member_1#memberId_u1",
+    "gsi3pk": "$Rows#v1#org#orgId_50",
+    "gsi3sk": "$Rows#v1#org#dept#Member_1#memberId_u1",
+    "pk": "$Rows#v1#Member#memberId_u1",
+    "sk": "$Rows#v1#Member"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$Rows#v1#Reading#device_u1",
+    "sk": "$Rows#v1#Reading#channel_ab"
+   },
+   {
+    "__edd_e__": "Reading",
+    "pk": "$Rows#v1#Reading#device_u1",
+    "sk": "$Rows#v1#Reading#channel_ab#e#0000000000000009"
+   },
+   {
+    "__edd_e__": "RouteItem",
+    "gsi5pk": "$Rows#v1#routelist#ab",
+    "gsi5sk": "$Rows#v1#routelist#u1",
+    "lsi1sk": "$Rows#v1#routes#ab",
+    "pk": "$Rows#v1#routes#u1",
+    "sk": "$Rows#v1#RouteItem"
+   },
+   {
+    "__edd_e__": "RouteStop",
+    "lsi1sk": "$Rows#v1#RouteStop#50",
+    "pk": "$Rows#v1#routes#u1",
+    "sk": "$Rows#v1#RouteStop#50"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_50",
+    "sk": "$Rows#v1#User"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_50",
+    "sk": "$Rows#v1#User#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u1",
+    "sk": "$Rows#v1#User#deleted#<time>"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u1",
+    "sk": "$Rows#v1#User#v#0000001"
+   },
+   {
+    "__edd_e__": "User",
+    "pk": "$Rows#v1#User#id_u1",
+    "sk": "$Rows#v1#User#v#0000002"
+   },
+   {
+    "__edd_e__": "User._unique.contact",
+    "pk": "$Rows#v1#User.contact#FooBarBaz",
+    "sk": "$Rows#v1#User.contact"
+   },
+   {
+    "__edd_e__": "accounts.command",
+    "pk": "$Rows#v1#accounts#u1#0000000000000005",
+    "sk": "$Rows#v1#accounts.command#ab"
+   },
+   {
+    "__edd_e__": "accounts.event",
+    "pk": "$Rows#v1#accounts#u1#0000000000000005",
+    "sk": "$Rows#v1#accounts.event_1#0000000001"
+   },
+   {
+    "__edd_e__": "ledgers.event",
+    "pk": "$Rows#v1#Ledgers#FooBarBaz",
+    "sk": "$Rows#v1#Ledgers.event_1#0000000001"
+   }
+  ]
+ }
+}

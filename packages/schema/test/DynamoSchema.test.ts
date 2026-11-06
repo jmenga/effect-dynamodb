@@ -238,10 +238,9 @@ describe("DynamoSchema", () => {
     })
 
     it("time-series `#e#` infix follows casing", () => {
-      expect(KeyComposer.composeEventSk("$APP#v2#METER", "Ab", "uppercase")).toBe(
-        "$APP#v2#METER#E#AB",
-      )
-      expect(KeyComposer.composeEventSk("$app#v2#meter", "Ab", "lowercase")).toBe(
+      const schema = DynamoSchema.make({ name: "app", version: 2, casing: "uppercase" })
+      expect(KeyComposer.composeEventSk(schema, "$APP#v2#METER", "Ab")).toBe("$APP#v2#METER#E#AB")
+      expect(KeyComposer.composeEventSk(schema, "$app#v2#meter", "Ab", "lowercase")).toBe(
         "$app#v2#meter#e#ab",
       )
       expect(KeyComposer.composeEventSkPrefix("$App#v2#Meter", "preserve")).toBe("$App#v2#Meter#e#")

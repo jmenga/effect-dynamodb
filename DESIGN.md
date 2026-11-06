@@ -233,6 +233,7 @@ const AppSchema = DynamoSchema.make({
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
 | `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
+| `escapeKeys` | `boolean` | `true` | `false` turns off string escaping in every key, partition and sort (§7 "Key text"): all or nothing. String key text is then what 1.36 wrote; the number encoding from 1.37 stays. Has accepted limitations |
 | `legacyKeys` | `boolean` | `true` | `false` turns off the 1.36 key fallback (§7 "Rows written by 1.36"): operations stop reading and moving rows stored under the key text 1.36 composed (`rekey` moves rows whatever it is set to). 1.37.x only; removed with the fallback in the next major |
 
 ### Casing Rules
@@ -775,14 +776,13 @@ an `EventStore` stream is read and appended where it lives; a range bound still 
 or misorders them. `rekey` ("Rows written by 1.36", "`rekey`") moves every remaining
 row, row kind by row kind.
 
-#### Sort key text
+#### Key text
 
-A composite value's text in a **sort key** escapes every code point
-U+0000–U+0025 — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%`
-and two hex digits (`KeyComposer.sortKeyText`, `serializeSortKeyValue`):
-`new york` is `new%20york`, `a#b` is `a%23b`, `50%` is `50%25`. The value is cased
-first, then escaped; the hex digits follow the casing (`%0A`, or `%0a` under
-`"lowercase"`). Partition key text is not escaped.
+One rule composes every key's values. A composite's text escapes every code point
+U+0000–U+0025 — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two
+hex digits (`KeyComposer.keyText`, `keyValueText`): `new york` is `new%20york`, `a#b` is
+`a%23b`, `50%` is `50%25`. The value is cased first, then escaped; the hex digits follow
+the casing (`%0A`, or `%0a` under `"lowercase"`).
 
 DynamoDB orders sort keys by UTF-8 bytes, and a composite that is not the last
 is followed by `#`. Escaped, a composite's text holds no character below `%`, so
@@ -797,21 +797,90 @@ escaped character, and a string without one keeps its 1.36 bytes.
 
 | Key | Escaped |
 |---|---|
-| Table and index sort keys (clustered collection members included), and every condition and prefix composed from their composites | yes |
+| Table and index partition keys and sort keys (clustered and isolated collection members included), and every condition and prefix composed from their composites | yes |
 | Time-series event sort key: the `orderBy` segment | yes |
 | Version snapshot and tombstone sort keys: the item segment, taken from the escaped live key | yes |
-| Aggregate: collection and list sort key composites, many-edge composites, discriminator values (not the discriminator names) | yes |
+| Aggregate: partition, collection and list key composites, many-edge composites, discriminator values (not the discriminator names) | yes |
+| EventStore stream partition keys, under the stream's own casing | yes |
+| Unique-constraint sentinels: the values in the sentinel's partition key | yes |
+| Vector index partitions | yes |
 | Z-order `sk.prefix` segments, before their length prefix or hash | yes |
-| Partition keys (table, index, aggregate, EventStore stream), unique-constraint sentinels (the value is in the sentinel's pk), EventStore event and command sort keys | no |
+| The structural parts of a key: the schema prefix, entity type, collection name, attribute labels, shard marker | no |
+| EventStore event sort keys (their parts are structural and a version) and command sort keys (an id only ever read by its exact key, never by a range, so old sentinels keep being found) | no |
 
 The language service's params mirror it (`ParamsBuilder`, pinned by
 `KeyParity.test.ts`).
+
+Since both roles of an attribute build one text, an inverted index needs no case of its
+own: `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`
+composes the same bytes the table's halves do, with the flag on or off (canonical shape 14).
+
+**`DynamoSchema.make({ escapeKeys: false })` turns escaping off, for every key, partition
+and sort.** It's all or nothing, and the default is on. It covers string escaping only: the
+number encoding from 1.37 stays either way. With it off, string key text is byte for byte
+what 1.36 wrote (`test/EscapeKeys.test.ts` against `fixtures/rows-1.36.0.json`, which the
+published 1.36.0 stored). Off has accepted limitations, with no machinery and no refusal for
+any of them:
+
+- A range on a sort key composite that isn't the last can return the wrong rows when a value
+  holds a character below `#`: `new york` sorts below `new#...`, so `lte: "new york"` leaves
+  out `new`. `gt` under a pin on the last composite can miss a longer value continuing below
+  `#` (`a b` or `a!` for `a`), as real 1.36 code does.
+- A `#` in a value can imitate a segment: `a#b` + `c` and `a` + `b#c` compose one key.
+- Skip-scan over free-form strings can hide rows, since its partition walk reads key order.
+- With `legacyKeys: false` too, a pin on a composite of a secondary index that isn't the last
+  also returns a longer sibling (`new york` for `new`), which the fallback's row check
+  otherwise drops.
+- Rows written with escaping on aren't found: a sort key 1.37.0 escaped, or any key 1.38
+  escaped. A key with nothing to escape is unaffected.
 
 **This changed stored keys in 1.37.0** for a sort key composite or time-series
 `orderBy` value holding such a character. Up to 1.36 such a value sorted apart
 from its order and `#` split it into two segments, so bounds returned wrong rows.
 Rows written by 1.36 keep their old sort keys until they move — a write, or
-`rekey` — as for numeric key text above (partition keys are unaffected).
+`rekey` — as for numeric key text above.
+
+**Partition keys followed in 1.38.0**, with every other key in the table above. A row under
+a partition key text that changes is found through the same fallback. `rekey` also recognises
+what 1.37 alone wrote, a partition key with its strings raw beside an escaped sort key
+(`KeyText136.schema137`), and moves it; only `rekey` looks for that form, so a read of such a row
+misses it until then. See "Rows written by 1.37" below. A range bound and `.within()` read the
+current key only, so under a partition key whose text changed they return none of its unmoved rows.
+
+A cursor from before the upgrade resumes when its partition key text didn't change, and on a query
+with no bound when it did: `keyPassesPlanner` places a plain cursor by its key. Under a partition
+whose text changed, a range bound's cursor is refused by DynamoDB (`DynamoValidationError`, its
+start key isn't in the partition), and that of a query that read both keys in 1.37.0 with
+`EDD-9094` (the fingerprint covers the partition). Changing `escapeKeys` refuses a cursor the same
+ways, on a sharded query with `EDD-9094`. The hash reads a value's `serializeValue` text, so a row's
+shard doesn't change with the flag.
+
+#### Rows written by 1.37 (#183)
+
+1.37 escaped sort keys and no partition key, so a partition key holding a character to escape
+sits at neither its 1.36 text (a number can differ) nor its current one. Measured against rows
+the published 1.37.0 stored:
+
+| Row | Until `rekey` | `rekey` |
+|---|---|---|
+| An escape in the partition key alone, or in the sort key alone, with no changed number | Found through the fallback | Moves it |
+| An escape in the partition key, and an escape or a changed number elsewhere in either half | A read misses it. A `put` writes beside it, and `rekey` then reports `bothKeys` | Moves it, with `moved.item`, snapshots, tombstones and events alike |
+| An index partition key with an escape, beside an escape or a changed number elsewhere in that index's key, or a vector partition | The accessor misses it | Rewrites it (`then137`) |
+| A stream id mixing an escape and a changed number | `read` finds no events | Moves it, recognised as `pk137` |
+| An aggregate under a raw partition key | Read through the fallback | Moves it to the escaped partition, with a row at (old partition, current sort key) counted as a row to move |
+
+**What stays unrecognized.** A unique sentinel mixing an escape and a changed number isn't
+found, so a duplicate isn't refused until the holder's `delete` and `put` restore it. An
+inverted row with an escape in both halves isn't recognised and counts in
+`skipped.unrecognizedKey` (recipe: `scan`, `put`, delete the old key). An aggregate partition
+mixing an escape and a changed number isn't read.
+
+**Aliases.** A value literally holding `%` and two hex digits, in a row under 1.36 text: `foo%20bar`
+was stored at the text `foo bar` now escapes to. Entities tell them apart (`aliasGuard`), so a
+`get` of `foo bar` doesn't return it and a `create` of `foo bar` moves the row away first. A stream's
+and an aggregate's partition reads don't: until `rekey` moves them, a read of `foo bar` returns
+`foo%20bar`'s, and an `append` or `create` of `foo bar` conflicts with it. `rekey` moves them to
+`foo%2520bar` and frees `foo bar`. Pinned in `test/helpers/Rows137.ts`.
 
 #### Rows written by 1.36 (#171)
 
@@ -1188,8 +1257,9 @@ reads a value out of a stored key. An unsharded partition key, any sort key and 
 partition are rewritten only when the stored key is exactly the text 1.36 composed from
 the row's values, and that isn't the current text. Each half is judged by itself and by
 its bytes. Halves in one attribute compose the same bytes (`EDD-9106`), so no half can
-look like another's 1.36 text, and a half that is the table's key is never rewritten
-(canonical shapes 13 and 14 in §7). A sort key missing a
+look like another's 1.36 text, and a half in a table key attribute is never rewritten: the
+table key's move carries it, and no update may set it ("Never set a table key attribute", §7,
+canonical shapes 13 and 14). A sort key missing a
 trailing composite is judged by the composites before the gap, which is what a row
 truncated under 1.36 stores. Anything else is left with no conflict: a key an index
 policy kept, one lagging its values, one cleared of them. A key the row doesn't have
@@ -1385,11 +1455,11 @@ byTenant: {
 ```
 
 - **`count`**: an integer from 2 to 256. **`by`**: string-half sort key composites of this index, hashed in place of the primary key composites; checked by type and by `Entity.make`. **`previous`**: migration only, the old layout's count, `1` for the unsharded key; a positive integer, not `count`. Definition errors: `EDD-9099`, `EDD-9101`, `EDD-9102`.
-- **Key text.** `!<count>.<shard>` right after the entity type or collection name, the shard zero-padded to the width of `count - 1`: `$fleet-db#v1#devicestate#!20.07#tenantid_t-123`, or `$fleet-db#v1#devicestate#!20.07` on an empty half. Partition key values aren't escaped, so no final segment could be safe: the unsharded key for tenant `t-123#07` would equal shard 07 of tenant `t-123`. An unsharded key's fourth segment always holds `<label>_`, which a marker can't spell, and the count keeps two sharded layouts apart. So reading both needs no filter and no dedupe. Compact keys (#182) will carry the same marker in the same place; nothing is built for them yet.
+- **Key text.** `!<count>.<shard>` right after the entity type or collection name, the shard zero-padded to the width of `count - 1`: `$fleet-db#v1#devicestate#!20.07#tenantid_t-123`, or `$fleet-db#v1#devicestate#!20.07` on an empty half. Under `escapeKeys: false` a value can hold `#`, so no final segment could be safe: the unsharded key for tenant `t-123#07` would equal shard 07 of tenant `t-123`. So the marker comes before all values, with the flag on or off. An unsharded key's fourth segment always holds `<label>_`, which a marker can't spell, and the count keeps two sharded layouts apart. So reading both needs no filter and no dedupe. Compact keys (#182) will carry the same marker in the same place; nothing is built for them yet.
 - **Shard function** (`schema/src/internal/Shards.ts`). `FNV-1a-32(F(text(v1)) ‖ 0xFF ‖ F(text(v2)) ‖ …) mod count`, with `text` = `KeyComposer.serializeValue` over key-form values and `F(s) = s.toLowerCase().toUpperCase()` in UTF-8. Golden vectors pin it; changing it is a breaking change. The fold is fixed, whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under `lowercase` and must reach one shard. `L∘U` would fail on `ß` / `ẞ`, which lowercase to one key but fold apart. `0xFF` never occurs in UTF-8, so `("ab", "c")` and `("a", "bc")` differ. `TextEncoder` and `Math.imul` keep it runtime-agnostic.
 - **Composing is structural.** `composePk` and the truncating composer always add the marker and throw `ShardSourceError` (`EDD-9100`) when a source value is absent, which the error boundaries turn into a `ValidationError`; an index never bound to an entity throws, as an unbound Z-order half does. So `put`, `create`, `upsert`, `restore`, `Batch`, `Transaction`, `update`, `patch`, retain, `append` and the 1.37 move path need no per-site change. A key for a sharded index can't be composed unsharded. Soft-deleted items, version snapshots and time-series events strip GSI keys; unique sentinels hold none; EventStore projection rows are entity writes; aggregates compose their own attributes and read no `entity.indexes`.
 - **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when the accessor pins every attribute of the shard source, whether that source is `by` or the primary key), then the `previous` layout's, never pruned. The pins are a leading sort key prefix, so a default source prunes only when the sort key holds the whole primary key. Query behaviour: §10 "Fan-out Queries".
-- **Key attributes.** Two key halves of one entity, sharded or not, share an attribute only when they provably compose the same bytes. A row can't show which owns the attribute, so the one written last overwrites the other, and an update corrupts even a row that only used one: a sharded index over the table's `pk` would leave the item unreachable by `get`. `EDD-9106` compares structure, not a sample: the text each half composes with a stand-in per exact attribute (`KeyComposer` itself), the exact shard count and source, and a Z-order half's full declaration. A casing or an escape counts wherever it reaches a value, and a composite the model pins to `number` or `bigint` holds neither. `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema, before binding any member; an entity on two tables is judged by each. An index half with the composites, order and casing of the table half stored in its attribute is that table key (canonical shape 14 in §7). The types refuse a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`; two sharded indexes that differ, and non-literal `field`s, are runtime only, as is every pair with nothing sharded, since literals can't prove two halves the same and a type-level check that disagrees with the runtime would be worse than none.
+- **Key attributes.** Two key halves of one entity, sharded or not, share an attribute only with the same fields, in the same order and casing, and a sharded partition key only with one sharded the same way. A row can't show which owns the attribute, so the one written last overwrites the other, and an update corrupts even a row that only used one: a sharded index over the table's `pk` would leave the item unreachable by `get`. `EDD-9106` compares definitions: the effective casing, the shard count and source, a Z-order half's full declaration, and the text each half composes with a stand-in per exact attribute (`KeyComposer` itself), which is how a collection's label counts as well as the fields. `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema, before binding any member; an entity on two tables is judged by each. With one rule for every key, halves with the same definition build the same text in either role, so an inverted index is no special case (canonical shape 14 in §7). One entity can't use one physical index twice, even over the same fields (`EDD-9108`); different entities sharing one stay fine. The types refuse a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`; two sharded indexes that differ, and non-literal `field`s, are runtime only, as is every pair with nothing sharded, since literals can't prove two halves the same and a type-level check that disagrees with the runtime would be worse than none.
 - **Collections.** Every member must declare the same `count` and `previous` (`EDD-9103`), since the partitions read are shared. `by` may differ. A collection query always reads every shard.
 - **Refused** (`EDD-9104`): `.within()`, skip-scan and `.zorder()` on a sharded accessor, and a `GeoIndex` over a sharded index. A Z-order sort key without `by` is allowed: the merge compares bytes.
 
@@ -1773,7 +1843,20 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 
 13. **Two accessors storing their halves in one attribute** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index, or `byName: { pk: [name], sk: [id] }` with a sparse `byOther: { pk: [other], sk: [name] }` in one attribute. **Refused: `EDD-9106` at `Entity.make`, or at `Table.make` for a casing left to the schema.** A row can't show which accessor owns the attribute, so no composer can be right: an ordinary update replaces one half and leaves a mismatched pair, including on a row that only ever populated one accessor, and a table key move composes from the whole row with the later accessor winning. Fixing the writes would mean patching every path, which is how this kept regressing. The check runs per entity, so overloading one index across entity types is unaffected. To keep such access patterns, give each half its own attribute, which means a new index, and re-put existing rows.
 
-14. **An index half that is the table's key** (#183) — an index half stored in a table key attribute, with the same composites in the same order and the same effective casing as the table half stored there: above all an inverted index, `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`, and also a local index's partition key and a sort key shared with the table. **It is that key.** `Entity.make` records it on the definition (`IndexDefinition.tableKey`). It's never written through the index path: the table's own composition is the only writer on every write path, and nothing strips it. Everything reading through it composes the table half's text, so an index partition key in the table's `sk` composes sort key text, and an index sort key in the table's `pk` composes partition key text. The table's own key text doesn't change. A sharded index's sort key in the table's `pk` stays refused, as anything sharded is. A sort key holding partition key text isn't in value order before its last composite (`x y#...` sorts below `x#...`) and has no truncated form, so a partial pin is `begins_with` as on the primary key, a `.where()` range on a composite before the last is `EDD-9107`, a `.within()` over one reads what's pinned and judges the rows, and a tupled `.within()` plans as a filter. **The regression scenario from 1.37.0**, in which a sort key's escaping overwrote `pk`, so `get` failed for a value with a space, and a `put` of a value with one in `sk` failed. Cover values with a space, `%`, `#`, mixed case and non-ASCII, numbers and dates, each write path, a 1.36 row through `rekey` with the fallback off, and that no other definition's bytes change.
+14. **An index half with the same definition as the table half in its attribute** (#183) — above all an inverted index, `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`, and also a local index's partition key and a sort key shared with the table. **Supported, not encouraged:** the library's principle is that index keys go in dedicated GSI attributes. It needs no case of its own: one rule composes every key, so both roles build identical text with `escapeKeys` on or off, and `EDD-9106` holds the rest by comparing definitions. No update writes it ("Never set a table key attribute", below). **The regression scenario from 1.37.0**, in which a sort key's escaping overwrote `pk`, so `get` failed for a value with a space, and a `put` of a value with one in `sk` failed. Cover values with a space, `%`, `#`, mixed case and non-ASCII, numbers and dates, each write path, under both flag settings, a 1.36 row through `rekey` with the fallback off, and that no other definition's bytes change.
+
+15. **Both halves of one index over one composite, holding only what a key escapes** (#183) — `pk: [tag], sk: [tag]` with `tag` of `#`, `%`, `%23`, `%25`, a space or `# #`. Each value has its own key under both flag settings, and a value spelled like another's escape isn't it. Cover on the composer, the entity and DynamoDB Local (`test/helpers/EscapeKeyScenarios.ts`, `schema/test/EscapeKeys.test.ts`).
+
+#### Never set a table key attribute
+
+**No update the library sends names any attribute of the table's primary key, on any write path, whatever the index structure.** DynamoDB refuses such an update (`Cannot update attribute sk. This attribute is part of the key`), and an index half can only be in one by having the same definition, so there's never anything to write.
+
+- The update composer's `sets` and `removes` never hold one (`composeGsiKeysForUpdatePolicyAware`), so every update path has it.
+- Each builder that writes key attributes itself excludes them: the retain path, `upsert`, `append`, `rekey`'s in-place rewrite (`staleIndexKeys`, which guards this before judging a half, as a retry after another writer can compose new text for one), the vector backfill, and aggregate `rekey` (`indexFields`).
+- A key changes only by moving the row: a `Put` under the new key and a `Delete` of the old one, in a transaction.
+- A user's own `.pathSet(["pk"])`-style write takes any string, and stays DynamoDB's refusal. `.remove` of a primary key composite is refused (D63).
+
+`test/NoTableKeyWrites.test.ts` records every `UpdateItem` and transactional `Update` across inverted, shared `sk`, sharded shared `sk`, local and dedicated definitions, under both flag settings, through every lifecycle, `rekey` and its retry, aggregates, streams and the scenarios of the other suites, and fails if any names `pk` or `sk`.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -2498,7 +2581,7 @@ its own as well as the parent of `city_sf#block_1`. A condition on `begins_with(
 missed that row, and `begins_with(city_sf)` would catch the sibling `city_sfx`. So a
 partial pin on a secondary index sends `BETWEEN <prefix> AND <prefix>#U+FFFF`: after a
 complete value the next byte is the end of the key, `#`, or a longer sibling's next
-character, and composite text escapes everything up to `%` (§7 "Sort key text"), so a
+character, and composite text escapes everything up to `%` (§7 "Key text"), so a
 sibling's next byte is above `#` and outside the range. `.where(eq)` on a composite that
 isn't the last, and an `eq` in `.within()`, mean the same.
 
@@ -2525,7 +2608,7 @@ prefix by value (`3` is not a prefix of `35`), so `.where(beginsWith)` with a
 padded text has the full width.
 
 **A bound is one exact key range.** A composite's key text is escaped (§7
-"Sort key text"), so it sorts as the cased value, and the `#` that follows a
+"Key text"), so it sorts as the cased value, and the `#` that follows a
 non-last composite sorts below every character the text holds: a value's subtree
 (`v#…`) sorts after `v` and before every greater value (`v%20x`, `v0`). So every
 `.where()` / `.within()` bound composes one condition over the composed operand
@@ -5504,10 +5587,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9103` | `KeyComposer.ts` (schema, `assertCollectionShardsAgreement`), through `DynamoClient.make` and `Collections.make` | Collection members disagree on `count` or `previous`; undeclared differs from declared |
 | `EDD-9104` | `Query.ts` (`refuseShardedPlan`, thrown at the call), `effect-dynamodb-geo`'s `GeoIndex.make` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` |
 | `EDD-9105` | `Query.ts` (`Query.concurrency`, thrown at the call) | `concurrency` not a positive integer |
-| `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard for a sharded half where literals show it | Two key halves of one entity stored in one attribute, sharded or not, aren't provably the same bytes |
-| `EDD-9107` | `DynamoClient.ts` (the accessor's `.where()`, thrown at the call) | A range on a composite before the last, on a sort key holding the table's partition key text |
+| `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard for a sharded half where literals show it | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently |
+| `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
 
-Next free code: **`EDD-9107`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+Next free code: **`EDD-9109`**, then **`EDD-9112`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

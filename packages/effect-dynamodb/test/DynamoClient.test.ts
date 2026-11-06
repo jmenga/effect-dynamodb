@@ -1809,7 +1809,7 @@ describe(".within() on composite accessors (#171)", () => {
           )
           const under = (bound: any, isLast = false, prefix = prefixText) =>
             composeRangeUnder(
-              { casing: effective, isLast, secondary: true },
+              { schema, casing: effective, isLast, secondary: true },
               prefix,
               isLast ? "id" : "value",
               bound,

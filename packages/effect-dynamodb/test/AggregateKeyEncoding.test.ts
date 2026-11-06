@@ -136,7 +136,7 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
     },
   })
 
-  it.effect("sort key composites escape characters up to '%'; the partition key does not", () =>
+  it.effect("key composites escape characters up to '%', partition and sort", () =>
     Effect.gen(function* () {
       mockTransactWrite.mockResolvedValue({})
       yield* RouteAggregate.create({
@@ -156,12 +156,19 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
             }
           ).TransactItems,
       )
-      const keys = items.map((item) => ({
-        pk: item.Put!.Item.pk!.S,
-        sk: item.Put!.Item.sk!.S,
-        lsi1sk: item.Put!.Item.lsi1sk?.S,
-      }))
-      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r 1#x"]))
+      // The rest are checks that nothing is at this partition's 1.36 text.
+      const keys = items.flatMap((item) =>
+        item.Put === undefined
+          ? []
+          : [
+              {
+                pk: item.Put.Item.pk!.S,
+                sk: item.Put.Item.sk!.S,
+                lsi1sk: item.Put.Item.lsi1sk?.S,
+              },
+            ],
+      )
+      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r%201%23x"]))
       expect(keys.map((key) => key.sk).sort()).toEqual([
         "$aggkeys#v1#routeitem",
         "$aggkeys#v1#routestop#50%25",

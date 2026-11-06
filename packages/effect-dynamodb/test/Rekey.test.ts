@@ -953,7 +953,7 @@ describe("rekey — event streams", () => {
       ).pipe(Effect.provide(layerOf(On, table)))
       const pk = {
         now: DynamoSchema.composeKey(On.schema, "Accounts", [
-          "a#b",
+          "a%23b",
           KeyComposer.serializeValue(-3),
         ]),
         old: DynamoSchema.composeKey(On.schema, "Accounts", ["a#b", KeyText136.serializeValue(-3)]),

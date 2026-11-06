@@ -1,9 +1,9 @@
 /**
- * Canonical shape 14 (#183, D62): an index half stored in a table key attribute, with the
- * composites of the table half stored there, is that half of the table's key. An inverted
- * index is the case that matters: its partition key is the table's sort key, its sort key
- * the table's partition key. Nothing writes either through the index, and whatever reads
- * through them composes the table half's text. These scenarios run on a recording table and
+ * Canonical shape 14 (#183): an inverted index, whose partition key is the table's sort key
+ * and whose sort key is the table's partition key. It is supported, not encouraged: index keys
+ * belong in dedicated GSI attributes. One rule composes every key's text, so both roles build
+ * identical text with `escapeKeys` on or off, and no part of it needs a case of its own. Nothing
+ * writes a table key attribute through the index. These scenarios run on a recording table and
  * on DynamoDB Local, through a {@link Harness}.
  */
 
@@ -57,6 +57,19 @@ type Scenario = {
 
 const on = DynamoSchema.make({ name: "halves", version: 1 })
 const noFallback = DynamoSchema.make({ name: "halves", version: 1, legacyKeys: false })
+const off = DynamoSchema.make({ name: "halves", version: 1, escapeKeys: false })
+const offNoFallback = DynamoSchema.make({
+  name: "halves",
+  version: 1,
+  escapeKeys: false,
+  legacyKeys: false,
+})
+
+/** Both settings of the flag, by what a scenario's name says of them. */
+const BOTH: ReadonlyArray<readonly [string, DynamoSchema.DynamoSchema]> = [
+  ["escaped", on],
+  ["escapeKeys off", off],
+]
 
 const worldOf = (
   model: unknown,
@@ -97,7 +110,7 @@ const edges = (options: Record<string, unknown> = {}, schema: DynamoSchema.Dynam
   worldOf(Edge, edgeKey, invertedEdges, options, schema)
 
 /** A value of each kind a key's text can treat differently. */
-const TEXT = ["plain", "a b", "50%", "a#b", "MiXeD Case", "Zürich 東京", "x!y"]
+const TEXT = ["plain", "u 1", "a b", "50%", "a#b", "MiXeD Case", "Zürich 東京", "x!y"]
 
 /** The row's text is the table's: nothing composed through the index reached it. */
 const expectTableText = (schema: DynamoSchema.DynamoSchema, row: StoredRow, values: object) => {
@@ -148,7 +161,17 @@ export const textScenarios: ReadonlyArray<Scenario> = (
     ["a lowercase schema", on],
     ["an uppercase schema", DynamoSchema.make({ name: "halves", version: 1, casing: "uppercase" })],
     ["a preserve schema", DynamoSchema.make({ name: "halves", version: 1, casing: "preserve" })],
-    ["the fallback off", DynamoSchema.make({ name: "halves", version: 1, legacyKeys: false })],
+    ["the fallback off", noFallback],
+    ["escapeKeys off", off],
+    [
+      "escapeKeys off, uppercase",
+      DynamoSchema.make({ name: "halves", version: 1, casing: "uppercase", escapeKeys: false }),
+    ],
+    [
+      "escapeKeys off, preserve",
+      DynamoSchema.make({ name: "halves", version: 1, casing: "preserve", escapeKeys: false }),
+    ],
+    ["escapeKeys and the fallback off", offNoFallback],
   ] as const
 ).flatMap(([label, schema]) =>
   TEXT.map((value) => ({
@@ -180,14 +203,14 @@ const invertedReadings = {
   },
 } as const
 
-/** Number and date composites, whose key text holds nothing either half escapes. */
-export const numberAndDateScenarios: ReadonlyArray<Scenario> = [-3, 0, 2.5, 123456789].map(
-  (seq) => ({
-    name: `${seq}`,
+/** Number and date composites, whose key text holds nothing either setting escapes. */
+export const numberAndDateScenarios: ReadonlyArray<Scenario> = BOTH.flatMap(([label, schema]) =>
+  [-3, 0, 2.5, 123456789].map((seq) => ({
+    name: `${label}: ${seq}`,
     run: (h: Harness) => {
       const at = DateTime.makeUnsafe("2026-01-02T03:04:05.678Z")
       const key = { seq, at }
-      return h.on(worldOf(Reading, readingKey, invertedReadings), (db, table) =>
+      return h.on(worldOf(Reading, readingKey, invertedReadings, {}, schema), (db, table) =>
         Effect.gen(function* () {
           yield* db.entities.Rows.put(key).asEffect()
           expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ seq })
@@ -201,7 +224,7 @@ export const numberAndDateScenarios: ReadonlyArray<Scenario> = [-3, 0, 2.5, 1234
         }),
       )
     },
-  }),
+  })),
 )
 
 const VALUES = [
@@ -217,18 +240,24 @@ const expectFound = (db: any, key: { readonly userId: string; readonly groupId: 
     expect(yield* db.entities.Rows.byGroup(key).collect()).toHaveLength(1)
   })
 
-/** Every other path that writes a row: the table's composition is the only writer on each. */
-export const writePathScenarios: ReadonlyArray<Scenario> = [
+/**
+ * Every other path that writes a row, under `schema`: the table's composition is the only
+ * writer on each.
+ */
+const writePathsUnder = (
+  label: string,
+  schema: DynamoSchema.DynamoSchema,
+): ReadonlyArray<Scenario> => [
   {
-    name: "a batch",
+    name: `${label}: a batch`,
     run: (h: Harness) => {
-      const world = edges()
+      const world = edges({}, schema)
       return h.on(world, (db, table) =>
         Effect.gen(function* () {
           yield* Batch.write(VALUES.map((key) => world.Rows.put(key)))
           for (const key of VALUES) yield* expectFound(db, key)
           for (const row of yield* table.rows()) {
-            expectTableText(on, row, { userId: row.userId.S, groupId: row.groupId.S })
+            expectTableText(schema, row, { userId: row.userId.S, groupId: row.groupId.S })
           }
           const got = yield* Batch.get(VALUES.map((key) => world.Rows.get(key)))
           expect(got.filter((item: unknown) => item !== undefined)).toHaveLength(VALUES.length)
@@ -239,9 +268,9 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
     },
   },
   {
-    name: "a transaction",
+    name: `${label}: a transaction`,
     run: (h: Harness) => {
-      const world = edges()
+      const world = edges({}, schema)
       return h.on(world, (db, table) =>
         Effect.gen(function* () {
           yield* Transaction.transactWrite(VALUES.map((key) => world.Rows.put(key)))
@@ -254,7 +283,7 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
             expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ role: "r" })
           }
           for (const row of yield* table.rows()) {
-            expectTableText(on, row, { userId: row.userId.S, groupId: row.groupId.S })
+            expectTableText(schema, row, { userId: row.userId.S, groupId: row.groupId.S })
           }
           const got = yield* Transaction.transactGet(VALUES.map((key) => world.Rows.get(key)))
           expect(got.filter((item: unknown) => item !== undefined)).toHaveLength(VALUES.length)
@@ -265,25 +294,26 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
     },
   },
   ...VALUES.flatMap((key): ReadonlyArray<Scenario> => {
-    const label = JSON.stringify(key)
+    const title = label
+    const value = JSON.stringify(key)
     return [
       {
-        name: `an upsert: ${label}`,
+        name: `${title}: an upsert: ${value}`,
         run: (h: Harness) =>
-          h.on(edges(), (db, table) =>
+          h.on(edges({}, schema), (db, table) =>
             Effect.gen(function* () {
               yield* db.entities.Rows.upsert(key).asEffect()
               yield* db.entities.Rows.upsert(key).asEffect()
               yield* expectFound(db, key)
               expect(yield* table.rows()).toHaveLength(1)
-              expectTableText(on, (yield* table.rows())[0]!, key)
+              expectTableText(schema, (yield* table.rows())[0]!, key)
             }),
           ),
       },
       {
-        name: `retained versions: ${label}`,
+        name: `${title}: retained versions: ${value}`,
         run: (h: Harness) =>
-          h.on(edges({ versioned: { retain: true } }), (db, table) =>
+          h.on(edges({ versioned: { retain: true } }, schema), (db, table) =>
             Effect.gen(function* () {
               yield* db.entities.Rows.put({ ...key, role: "first" }).asEffect()
               yield* db.entities.Rows.update(key).set({ role: "second" }).asEffect()
@@ -295,7 +325,7 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
               expect(found.map((row: Edge) => row.role)).toEqual(["second"])
               const stored = yield* table.rows()
               const current = stored.filter(
-                (row) => row.sk.S === KeyComposer.composeSk(on, "Edge", 1, primaryOfEdges, key),
+                (row) => row.sk.S === KeyComposer.composeSk(schema, "Edge", 1, primaryOfEdges, key),
               )
               expect(current).toHaveLength(1)
               expect(stored.length).toBeGreaterThan(1)
@@ -303,9 +333,9 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
           ),
       },
       {
-        name: `soft delete and restore: ${label}`,
+        name: `${title}: soft delete and restore: ${value}`,
         run: (h: Harness) =>
-          h.on(edges({ softDelete: true }), (db, table) =>
+          h.on(edges({ softDelete: true }, schema), (db, table) =>
             Effect.gen(function* () {
               yield* db.entities.Rows.put({ ...key, role: "r" }).asEffect()
               yield* db.entities.Rows.delete(key).asEffect()
@@ -317,14 +347,14 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
               yield* expectFound(db, key)
               const stored = yield* table.rows()
               expect(stored).toHaveLength(1)
-              expectTableText(on, stored[0]!, key)
+              expectTableText(schema, stored[0]!, key)
             }),
           ),
       },
     ]
   }),
   {
-    name: "append",
+    name: `${label}: append`,
     run: (h: Harness) =>
       h.on(
         worldOf(
@@ -347,6 +377,7 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
               }),
             },
           },
+          schema,
         ),
         (db, table) =>
           Effect.gen(function* () {
@@ -359,11 +390,17 @@ export const writePathScenarios: ReadonlyArray<Scenario> = [
             const pinned = yield* db.entities.Rows.byGroup(key).collect()
             expect(pinned).toHaveLength(1)
             const stored = yield* table.rows()
-            expect(stored.some((row) => row.pk.S.includes("%"))).toBe(false)
+            for (const row of stored) {
+              expect(row.pk.S).toBe(KeyComposer.composePk(schema, "Edge", primaryOfEdges, key))
+            }
           }),
       ),
   },
 ]
+
+export const writePathScenarios: ReadonlyArray<Scenario> = BOTH.flatMap(([label, schema]) =>
+  writePathsUnder(label, schema),
+)
 
 const primaryOfEdges = edges().Rows.indexes.primary as KeyComposer.IndexDefinition
 
@@ -403,9 +440,9 @@ const expectSame = (found: ReadonlyArray<Member>, pick: Pick) =>
   )
 
 /**
- * A sort key in partition key text with more than one composite: its values aren't escaped,
- * so a value can hold what sorts below the delimiter (`new york#…` before `new#…`). The rows
- * picked by value are the rows returned, whichever plan reads them.
+ * A sort key of several composites, whose values include what sorts below the delimiter
+ * unescaped (`new york#…` before `new#…`). The rows picked by value are the rows returned,
+ * whichever plan reads them.
  */
 const membersWorld = (schema: DynamoSchema.DynamoSchema) =>
   worldOf(Member, memberKey, invertedMembers, {}, schema)
@@ -494,13 +531,14 @@ export const multiCompositeScenarios: ReadonlyArray<Scenario> = [
       ),
   },
   {
-    name: ".where() range on a composite before the last is refused, naming .within()",
+    name: ".where() range on a composite before the last",
     run: (h) =>
       withMembers(h, (db) =>
-        Effect.sync(() => {
-          expect(() =>
-            db.entities.Rows.byGroup(group).where((t: any, o: any) => o.gt(t.tenant, "new")),
-          ).toThrow(/\[EDD-9107\].*"tenant".*\.within\(\)/)
+        Effect.gen(function* () {
+          const found = yield* db.entities.Rows.byGroup(group)
+            .where((t: any, o: any) => o.gt(t.tenant, "new"))
+            .collect()
+          expectSame(found, (m) => above("new")(m.tenant))
         }),
       ),
   },
@@ -556,15 +594,120 @@ export const multiCompositeScenarios: ReadonlyArray<Scenario> = [
       })),
   ),
   {
-    name: ".within() past an unbounded composite is a filter plan, whatever the value holds",
+    name: ".within() is planned as on any other index",
     run: (h) =>
       withMembers(h, (db) =>
         Effect.gen(function* () {
-          const query = db.entities.Rows.byGroup(group).within({ userId: { gt: "a" } })
+          const query = db.entities.Rows.byGroup(group).within({ tenant: { gt: "new" } })
           const explained = yield* query.explain()
-          expect(explained.plan).toBe("filter")
-          expect(explained.reason).toContain("partition key text")
+          expect(explained.plan).toBe("key")
         }),
+      ),
+  },
+]
+
+/**
+ * What holds under `escapeKeys: false` for the same rows: a complete pin and ranges on the last
+ * composite. A range on a composite before the last can return wrong rows here, as the docs
+ * say; the last three pin what it returns rather than endorse it.
+ */
+export const multiCompositeOffScenarios: ReadonlyArray<Scenario> = [
+  {
+    name: "a complete pin is that one row",
+    run: (h) =>
+      withMembers(
+        h,
+        (db) =>
+          Effect.gen(function* () {
+            const pin = { ...group, tenant: "new", userId: "a" }
+            const found = yield* db.entities.Rows.byGroup(pin).collect()
+            expectSame(found, (m) => m.tenant === "new" && m.userId === "a")
+          }),
+        off,
+      ),
+  },
+  {
+    name: "a pin on the first composite stops at its value, with the fallback on",
+    run: (h) =>
+      withMembers(
+        h,
+        (db) =>
+          Effect.gen(function* () {
+            const found = yield* db.entities.Rows.byGroup({ ...group, tenant: "new" }).collect()
+            expectSame(found, (m) => m.tenant === "new")
+          }),
+        off,
+      ),
+  },
+  ...(
+    [
+      ["eq", (t: any, o: any) => o.eq(t.userId, "a b"), (v: string) => v === "a b"],
+      ["lt", (t: any, o: any) => o.lt(t.userId, "a!"), below("a!")],
+      [
+        "between",
+        (t: any, o: any) => o.between(t.userId, "a b", "ab"),
+        (v: string) => !below("a b")(v) && !above("ab")(v),
+      ],
+    ] as const
+  ).map(
+    ([name, where, picked]): Scenario => ({
+      name: `.where() ${name} on the last composite, under a pin`,
+      run: (h) =>
+        withMembers(
+          h,
+          (db) =>
+            Effect.gen(function* () {
+              const found = yield* db.entities.Rows.byGroup({ ...group, tenant: "new" })
+                .where(where)
+                .collect()
+              expectSame(found, (m) => m.tenant === "new" && picked(m.userId))
+            }),
+          off,
+        ),
+    }),
+  ),
+  {
+    name: "pinned, not endorsed: `gt` under a pin passes a longer value below the delimiter, as in 1.36",
+    run: (h) =>
+      withMembers(
+        h,
+        (db) =>
+          Effect.gen(function* () {
+            const found = yield* db.entities.Rows.byGroup({ ...group, tenant: "new" })
+              .where((t: any, o: any) => o.gt(t.userId, "a"))
+              .collect()
+            expect(found.map((m: Member) => m.userId).sort()).toEqual(["ab", "b"])
+          }),
+        off,
+      ),
+  },
+  {
+    name: "pinned, not endorsed: a range on the first composite takes a value below the delimiter",
+    run: (h) =>
+      withMembers(
+        h,
+        (db) =>
+          Effect.gen(function* () {
+            const found = yield* db.entities.Rows.byGroup(group)
+              .where((t: any, o: any) => o.lte(t.tenant, "new"))
+              .collect()
+            // `new york#…` sorts before `new#…` unescaped, so it is inside the range.
+            expect(found.some((m: Member) => m.tenant === "new york")).toBe(true)
+          }),
+        off,
+      ),
+  },
+  {
+    name: "pinned, not endorsed: with the fallback off a pin on the first composite does too",
+    run: (h) =>
+      withMembers(
+        h,
+        (db) =>
+          Effect.gen(function* () {
+            const found = yield* db.entities.Rows.byGroup({ ...group, tenant: "new" }).collect()
+            expect(found.some((m: Member) => m.tenant === "new york")).toBe(true)
+          }),
+        offNoFallback,
       ),
   },
 ]
@@ -579,7 +722,7 @@ const seededEdge = (values: { readonly userId: string; readonly groupId: string 
 
 /**
  * A row 1.36 wrote: found with the fallback on, moved by `rekey` (the index follows, as its
- * half is the table's key), and found with the fallback off.
+ * halves are the table's key), and found with the fallback off.
  */
 export const row136Scenarios: ReadonlyArray<Scenario> = [
   { userId: "u 1", groupId: "a b" },
@@ -613,7 +756,7 @@ export const row136Scenarios: ReadonlyArray<Scenario> = [
 
 /** A 1.36 row whose text didn't change: nothing moves, and it never needed the fallback. */
 export const unchanged136Scenario = (h: Harness) => {
-  const values = { userId: "u 1", groupId: "plain" }
+  const values = { userId: "u1", groupId: "plain" }
   return h.on(edges(), (db, table) =>
     Effect.gen(function* () {
       yield* table.seed(seededEdge(values))
@@ -626,103 +769,121 @@ export const unchanged136Scenario = (h: Harness) => {
   )
 }
 
-/** A 1.36 row with number composites, whose text changed in both keys. */
-export const number136Scenario = (h: Harness) => {
-  const at = DateTime.makeUnsafe("2026-01-02T03:04:05.678Z")
-  const world = worldOf(Reading, readingKey, invertedReadings)
-  const current = worldOf(Reading, readingKey, invertedReadings, {}, noFallback)
-  const key = { seq: -3, at }
-  const keyForm = { seq: -3, at: "2026-01-02T03:04:05.678Z" }
-  const primary = world.Rows.indexes.primary
-  const found = (db: any) =>
-    Effect.gen(function* () {
-      expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ seq: -3 })
-      expect(yield* db.entities.Rows.byAt({ at }).collect()).toHaveLength(1)
-      expect(yield* db.entities.Rows.byAt(key).collect()).toHaveLength(1)
-    })
-  return h.on(world, (db, table) =>
-    Effect.gen(function* () {
-      const old = {
-        pk: KeyText136.composePk(on, "Edge", primary, keyForm),
-        sk: KeyText136.composeSk(on, "Edge", 1, primary, keyForm),
-      }
-      expect(old.pk).not.toBe(KeyComposer.composePk(on, "Edge", primary, keyForm))
-      yield* table.seed(
-        toAttributeMap({
-          seq: -3,
-          at: keyForm.at,
-          ...old,
-          __edd_e__: "Edge",
-        }) as StoredRow,
-      )
-      yield* found(db)
-      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
-      expect(report.moved.item).toBe(1)
-      expect(report.conflicts).toEqual([])
-      const [row] = yield* table.rows()
-      expect(row!.pk.S).toBe(KeyComposer.composePk(on, "Edge", primary, keyForm))
-      yield* table.as(current, found)
-    }),
-  )
-}
+/**
+ * Under `escapeKeys: false` a 1.36 row of strings is already at its current key, whatever its
+ * values hold: nothing moves, and it never needed the fallback.
+ */
+export const off136Scenarios: ReadonlyArray<Scenario> = VALUES.map((values) => ({
+  name: JSON.stringify(values),
+  run: (h: Harness) =>
+    h.on(edges({}, off), (db, table) =>
+      Effect.gen(function* () {
+        yield* table.seed(seededEdge(values))
+        yield* expectFound(db, values)
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.moved.item).toBe(0)
+        expect(report.indexKeysRewritten).toBe(0)
+        expect(report.unchanged).toBe(1)
+        yield* table.as(edges({}, offNoFallback), (current) => expectFound(current, values))
+      }),
+    ),
+}))
 
 /**
- * What 1.37.0 left, writing an inverted index's halves over the table's: a partition key
- * holding sort key text. Nothing composes that key from the row's values any more.
+ * A 1.36 row with number composites, whose text changed in both keys: under either setting,
+ * as `escapeKeys` covers strings only.
+ */
+export const number136Scenarios: ReadonlyArray<Scenario> = (
+  [
+    ["escaped", on, noFallback],
+    ["escapeKeys off", off, offNoFallback],
+  ] as const
+).map(([label, schema, current]) => ({
+  name: label,
+  run: (h: Harness) => {
+    const at = DateTime.makeUnsafe("2026-01-02T03:04:05.678Z")
+    const world = worldOf(Reading, readingKey, invertedReadings, {}, schema)
+    const key = { seq: -3, at }
+    const keyForm = { seq: -3, at: "2026-01-02T03:04:05.678Z" }
+    const primary = world.Rows.indexes.primary
+    const found = (db: any) =>
+      Effect.gen(function* () {
+        expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ seq: -3 })
+        expect(yield* db.entities.Rows.byAt({ at }).collect()).toHaveLength(1)
+        expect(yield* db.entities.Rows.byAt(key).collect()).toHaveLength(1)
+      })
+    return h.on(world, (db, table) =>
+      Effect.gen(function* () {
+        const old = {
+          pk: KeyText136.composePk(schema, "Edge", primary, keyForm),
+          sk: KeyText136.composeSk(schema, "Edge", 1, primary, keyForm),
+        }
+        expect(old.pk).not.toBe(KeyComposer.composePk(schema, "Edge", primary, keyForm))
+        yield* table.seed(
+          toAttributeMap({
+            seq: -3,
+            at: keyForm.at,
+            ...old,
+            __edd_e__: "Edge",
+          }) as StoredRow,
+        )
+        yield* found(db)
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.moved.item).toBe(1)
+        expect(report.conflicts).toEqual([])
+        const [row] = yield* table.rows()
+        expect(row!.pk.S).toBe(KeyComposer.composePk(schema, "Edge", primary, keyForm))
+        yield* table.as(worldOf(Reading, readingKey, invertedReadings, {}, current), found)
+      }),
+    )
+  },
+}))
+
+/**
+ * What 1.37.0 left, writing an inverted index's halves over the table's when the sort key's
+ * values have nothing to escape: a partition key escaped by the index's sort key rule.
  */
 const overwrittenRow = (values: { readonly userId: string; readonly groupId: string }) =>
   toAttributeMap({
     ...values,
-    pk: KeyComposer.composeSk(on, "Edge", 1, primaryWithUserSort, values),
+    pk: KeyComposer.composePk(on, "Edge", primaryOfEdges, values),
     sk: KeyComposer.composeSk(on, "Edge", 1, primaryOfEdges, values),
     __edd_e__: "Edge",
   }) as StoredRow
 
-const primaryWithUserSort: KeyComposer.IndexDefinition = {
-  pk: { field: "sk", composite: ["groupId"] },
-  sk: { field: "pk", composite: ["userId"] },
-}
-
-/**
- * Pinned, not endorsed: this release doesn't repair such a row. `get` and a pin can't reach
- * it, and `delete` reports success and leaves it, as they did on 1.37.0. The inverted
- * partition still lists it, and `rekey` leaves it alone. A re-put writes the row at its key
- * and leaves this one beside it; a delete spelling the stored text removes it.
- */
+/** That key is now the row's own, so it needs no repair. */
 export const overwritten137Scenario = (h: Harness) => {
   const values = { userId: "u 1", groupId: "plain" }
-  const spelled = { userId: "u%201", groupId: "plain" }
   return h.on(edges(), (db, table) =>
     Effect.gen(function* () {
       const row = overwrittenRow(values)
       expect(row.pk.S).toContain("userid_u%201")
       yield* table.seed(row)
-
-      expect(yield* notFound(db, values)).toBe("ItemNotFound")
-      expect(yield* db.entities.Rows.byGroup(values).collect()).toHaveLength(0)
-      const listed = yield* db.entities.Rows.byGroup({ groupId: values.groupId }).collect()
-      expect(listed.map((found: Edge) => found.userId)).toEqual(["u 1"])
-
-      yield* db.entities.Rows.delete(values).asEffect()
-      expect(yield* table.rows()).toHaveLength(1)
+      yield* expectFound(db, values)
 
       const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
       expect(report.moved.item).toBe(0)
       expect(report.indexKeysRewritten).toBe(0)
       expect(report.conflicts).toEqual([])
-      expect(report.skipped.unrecognizedKey).toBe(1)
-      expect((yield* table.rows()).map((stored) => stored.pk.S)).toEqual([row.pk.S])
+      expect(report.unchanged).toBe(1)
 
-      yield* db.entities.Rows.put(values).asEffect()
-      expect(yield* db.entities.Rows.get(values).asEffect()).toMatchObject(values)
-      expect(yield* db.entities.Rows.byGroup(values).collect()).toHaveLength(1)
-      expect(yield* table.rows()).toHaveLength(2)
-      expect(yield* db.entities.Rows.byGroup({ groupId: values.groupId }).collect()).toHaveLength(2)
+      yield* db.entities.Rows.delete(values).asEffect()
+      expect(yield* table.rows()).toHaveLength(0)
+    }),
+  )
+}
 
-      yield* db.entities.Rows.delete(spelled).asEffect()
-      const left = yield* table.rows()
-      expect(left).toHaveLength(1)
-      expectTableText(on, left[0]!, values)
+/**
+ * A limit of `escapeKeys: false`, pinned: a key holding an escape isn't found, whichever release
+ * wrote it, as nothing composes that text under off.
+ */
+export const overwritten137OffScenario = (h: Harness) => {
+  const values = { userId: "u 1", groupId: "plain" }
+  return h.on(edges({}, off), (db, table) =>
+    Effect.gen(function* () {
+      yield* table.seed(overwrittenRow(values))
+      expect(yield* notFound(db, values)).toBe("ItemNotFound")
+      expect(yield* db.entities.Rows.byGroup(values).collect()).toHaveLength(0)
     }),
   )
 }

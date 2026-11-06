@@ -550,10 +550,10 @@ const routePk = (id: number) => ({
   old: DynamoSchema.composeCollectionKey(AppSchema, "routes", [KeyText136.serializeValue(id)]),
 })
 const stopSk = (label: string) =>
-  DynamoSchema.composeKey(AppSchema, "RouteStop", [KeyComposer.sortKeyText(label, "lowercase")])
+  DynamoSchema.composeKey(AppSchema, "RouteStop", [KeyComposer.escapeKeyText(label, "lowercase")])
 const stopSk136 = (label: string) => DynamoSchema.composeKey(AppSchema, "RouteStop", [label])
 const trailStopSk = (label: string) =>
-  DynamoSchema.composeKey(AppSchema, "TrailStop", [KeyComposer.sortKeyText(label, "lowercase")])
+  DynamoSchema.composeKey(AppSchema, "TrailStop", [KeyComposer.escapeKeyText(label, "lowercase")])
 const trailStopSk136 = (label: string) => DynamoSchema.composeKey(AppSchema, "TrailStop", [label])
 const cardPk = {
   now: KeyComposer.composePk(AppSchema, "Card", Cards.indexes.primary, { cardId: -3 }),
@@ -1250,7 +1250,7 @@ describeConnected("#171 rekey — connected", () => {
           )
           const pk = {
             now: DynamoSchema.composeKey(AppSchema, "Accounts", [
-              "a#b",
+              "a%23b",
               KeyComposer.serializeValue(-3),
             ]),
             old: DynamoSchema.composeKey(AppSchema, "Accounts", [

@@ -71,7 +71,10 @@ import type {
   ModelFieldName,
   PrefixFieldNames,
 } from "./internal/EntityTypes.js"
-import { refuseSharedKeyAttributeOnEverySchema } from "./internal/SharedKeyAttribute.js"
+import {
+  refuseRepeatedIndex,
+  refuseSharedKeyAttributeOnEverySchema,
+} from "./internal/SharedKeyAttribute.js"
 import {
   type BoundDimension,
   bindDimension,
@@ -88,7 +91,7 @@ import type {
   ZOrderKeyPart,
   ZOrderSkPart,
 } from "./KeyComposer.js"
-import { bindTableKeyHalves, isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
+import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
@@ -1306,14 +1309,8 @@ export const buildEntityDefinition = (config: {
       shards: bindShards(config.entityType, indexName, indexDef, primaryIndex),
     }
   }
-  // Mark the halves that are a half of the table's key (D62), which the composers read,
-  // and refuse what shares an attribute without composing its bytes (EDD-9106).
-  for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
-    if (indexName !== "primary") {
-      initialIndexes[indexName] = bindTableKeyHalves(indexDef, primaryIndex)
-    }
-  }
-  refuseSharedKeyAttributeOnEverySchema(config.entityType, initialIndexes, inputFields)
+  refuseRepeatedIndex(config.entityType, initialIndexes)
+  refuseSharedKeyAttributeOnEverySchema(config.entityType, initialIndexes)
 
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)

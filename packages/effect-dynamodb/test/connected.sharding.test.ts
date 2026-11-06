@@ -32,9 +32,9 @@ import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as InvertedIndexes from "./helpers/InvertedIndexes.js"
 import * as RekeyComparison from "./helpers/RekeyComparison.js"
 import * as SharedKeys from "./helpers/SharedKeyAttributes.js"
-import * as TableKeyHalves from "./helpers/TableKeyHalves.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -1508,11 +1508,11 @@ describeConnected("#183 key halves sharing an attribute, on real writes", () => 
   )
 })
 
-describeConnected("#183 two accessors sharing an attribute (shape 13)", () => {
+describeConnected("#183 two accessors on one physical index (shape 13)", () => {
   // Refused where the definition loads, so nothing reaches the table. It's here so that
-  // this suite, which holds the same accessors with their attributes apart, can't pass
-  // while the pair itself is allowed.
-  it("Entity.make refuses the pair whose attributes this suite keeps apart", () => {
+  // this suite, which holds the same accessors on two indexes, can't pass while the pair
+  // itself is allowed.
+  it("Entity.make refuses the pair this suite keeps on two indexes", () => {
     class Paired extends Schema.Class<Paired>("Paired")({
       id: Schema.String,
       region: Schema.optional(Schema.String),
@@ -1540,18 +1540,18 @@ describeConnected("#183 two accessors sharing an attribute (shape 13)", () => {
           },
         },
       }),
-    ).toThrow(/\[EDD-9106\]/)
+    ).toThrow(/\[EDD-9108\]/)
   })
 })
 
-describeConnected("#183 an inverted index is the table's key (shape 14), on real writes", () => {
-  const harness: TableKeyHalves.Harness = {
+describeConnected("#183 an inverted index (shape 14), on real writes", () => {
+  const harness: InvertedIndexes.Harness = {
     on: (world, body) =>
       withTable(
         world.MainTable,
         (tableName) =>
           Effect.gen(function* () {
-            const db = yield* TableKeyHalves.clientOf(world)
+            const db = yield* InvertedIndexes.clientOf(world)
             return yield* body(db, {
               seed: (row) =>
                 Effect.gen(function* () {
@@ -1561,7 +1561,7 @@ describeConnected("#183 an inverted index is the table's key (shape 14), on real
               rows: () => scanAll(tableName),
               as: (other, inner) =>
                 Effect.gen(function* () {
-                  const current = yield* TableKeyHalves.clientOf(other)
+                  const current = yield* InvertedIndexes.clientOf(other)
                   return yield* inner(current)
                 }).pipe(Effect.provide(other.MainTable.layer({ name: tableName }))),
             })
@@ -1571,34 +1571,47 @@ describeConnected("#183 an inverted index is the table's key (shape 14), on real
   }
 
   describe("what any value does through it", () => {
-    for (const scenario of TableKeyHalves.textScenarios) {
+    for (const scenario of InvertedIndexes.textScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
   describe("number and date composites", () => {
-    for (const scenario of TableKeyHalves.numberAndDateScenarios) {
+    for (const scenario of InvertedIndexes.numberAndDateScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
   describe("every other write path", () => {
-    for (const scenario of TableKeyHalves.writePathScenarios) {
+    for (const scenario of InvertedIndexes.writePathScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
-  describe("a sort key of several composites, in partition key text", () => {
-    for (const scenario of TableKeyHalves.multiCompositeScenarios) {
+  describe("a sort key of several composites", () => {
+    for (const scenario of InvertedIndexes.multiCompositeScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a sort key of several composites, escapeKeys off", () => {
+    for (const scenario of InvertedIndexes.multiCompositeOffScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
   describe("a row 1.36 wrote", () => {
-    for (const scenario of TableKeyHalves.row136Scenarios) {
+    for (const scenario of InvertedIndexes.row136Scenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
-    it.live("whose text didn't change", () => TableKeyHalves.unchanged136Scenario(harness))
-    it.live("of numbers and dates", () => TableKeyHalves.number136Scenario(harness))
+    it.live("whose text didn't change", () => InvertedIndexes.unchanged136Scenario(harness))
+    for (const scenario of InvertedIndexes.number136Scenarios) {
+      it.live(`of numbers and dates, ${scenario.name}`, () => scenario.run(harness))
+    }
+    for (const scenario of InvertedIndexes.off136Scenarios) {
+      it.live(`under escapeKeys off: ${scenario.name}`, () => scenario.run(harness))
+    }
   })
-  it.live("a row 1.37.0 overwrote stays where it is", () =>
-    TableKeyHalves.overwritten137Scenario(harness),
+  it.live("a row 1.37.0 overwrote is at its key", () =>
+    InvertedIndexes.overwritten137Scenario(harness),
+  )
+  it.live("escapeKeys off doesn't find an escaped key", () =>
+    InvertedIndexes.overwritten137OffScenario(harness),
   )
 })
 

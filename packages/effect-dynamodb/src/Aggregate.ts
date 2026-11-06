@@ -1473,7 +1473,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const tableConfig: TableConfig = yield* config.table.Tag
-      const composites = KeyComposer.extractComposites(config.pk.composite, keyRecord(key))
+      const composites = keyComposites(
+        config.schema,
+        KeyComposer.extractComposites(config.pk.composite, keyRecord(key)),
+      )
       const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
       const read = (partition: string) =>
         queryAllItems(
@@ -1521,13 +1524,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
   /** A stored row's position: its partition and sort key. */
   const positionOf = (pk: string, sk: string): string => `${pk}\u0000${sk}`
 
-  /** Attributes holding index keys the aggregate composes: the collection SK mirror, the list keys. */
+  /**
+   * Attributes holding index keys the aggregate composes: the collection SK mirror, the list
+   * keys. Never a table key attribute, which no write path sets (`DESIGN.md §7`).
+   */
   const indexFields = [
     ...(config.collection.index !== undefined && config.collection.sk !== undefined
       ? [config.collection.sk.field]
       : []),
     ...(config.list === undefined ? [] : [config.list.pk.field, config.list.sk.field]),
-  ]
+  ].filter((field) => field !== config.pk.field && field !== "sk")
 
   /** Index key attributes of `composed` whose text the row stored as `stored` doesn't hold. */
   const staleIndexFields = (
@@ -1538,6 +1544,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const text = (composed[field] as { S?: string } | undefined)?.S
       return text !== undefined && text !== stored[field]
     })
+
+  /**
+   * Where a row may be under the partition's old text: at the sort key 1.36 composed, or the
+   * current one, where 1.37 wrote it (its partition key unescaped, its sort key escaped). Under
+   * a partition whose text didn't change, the current sort key is where the row belongs.
+   */
+  const oldPosition = (
+    pk: string,
+    pkNow: string,
+    sk136: string,
+    sk: string,
+    storedAt: ReadonlyMap<string, Record<string, unknown>>,
+  ): { readonly pk: string; readonly sk: string } =>
+    pk !== pkNow && !storedAt.has(positionOf(pk, sk136)) && storedAt.has(positionOf(pk, sk))
+      ? { pk, sk }
+      : { pk, sk: sk136 }
 
   /**
    * Where the aggregate's rows are stored (#171, DESIGN.md §7 "Rows written by
@@ -1567,10 +1589,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
           group: group.name,
           built,
           current: { pk: pkValue, sk: (built.sk as { S?: string } | undefined)?.S ?? "" },
-          old: {
-            pk: pk136 ?? pkValue,
-            sk: composeKey(config.schema, item.entityType, [...item.skComposites136]),
-          },
+          old: oldPosition(
+            pk136 ?? pkValue,
+            pkValue,
+            composeKey(config.schema, item.entityType, [...item.skComposites136]),
+            (built.sk as { S?: string } | undefined)?.S ?? "",
+            storedAt,
+          ),
         }
       }),
     )
@@ -1696,7 +1721,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         oldGroups,
         config,
         pkValue,
-        sortKeyComposites(
+        keyComposites(
           config.schema,
           KeyComposer.extractComposites(
             config.collection.sk?.composite ?? [],
@@ -1748,7 +1773,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
         config,
         pkValue,
-        sortKeyComposites(
+        keyComposites(
           config.schema,
           KeyComposer.extractComposites(
             config.collection.sk?.composite ?? [],
@@ -1902,7 +1927,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           aggregateName,
           config.schema,
         )
-        const rootComposites = sortKeyComposites(
+        const rootComposites = keyComposites(
           config.schema,
           KeyComposer.extractComposites(
             config.collection.sk?.composite ?? [],
@@ -2150,7 +2175,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           current = composeCollectionKey(
             config.schema,
             config.collection.name,
-            KeyComposer.extractComposites(config.pk.composite, keyRecord(key)),
+            keyComposites(
+              config.schema,
+              KeyComposer.extractComposites(config.pk.composite, keyRecord(key)),
+            ),
           )
         } catch {
           return { skipped: { unrecognizedKey: 1 } }
@@ -2260,9 +2288,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const assembled = { ...(decoded as object) } as Record<string, unknown>
 
           // 3. Compose PK
-          const composites = KeyComposer.extractComposites(
-            config.pk.composite,
-            keyRecord(assembled),
+          const composites = keyComposites(
+            config.schema,
+            KeyComposer.extractComposites(config.pk.composite, keyRecord(assembled)),
           )
           const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
 
@@ -2280,7 +2308,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // form — `update` already did (see `newDynamo` / `oldDynamo` below), so
           // leaving `create` raw made the two write paths mirror the collection SK
           // differently for a transformed composite.
-          const collectionSkComposites = sortKeyComposites(
+          const collectionSkComposites = keyComposites(
             config.schema,
             KeyComposer.extractComposites(
               config.collection.sk?.composite ?? [],
@@ -2401,21 +2429,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // DOMAIN record, so it goes through the same key form the write side
           // used — otherwise `list` composes a key `create` never wrote and
           // silently returns nothing (#111).
-          const listPkComposites = KeyComposer.extractComposites(
-            listConfig.pk.composite,
-            keyRecord(filter ?? {}),
+          const listPkComposites = keyComposites(
+            config.schema,
+            KeyComposer.extractComposites(listConfig.pk.composite, keyRecord(filter ?? {})),
           )
 
           // Build SK prefix from contiguous filter values matching SK composites.
-          // `serializeSortKeyValue`, NOT `String(v)` — the write side encodes
+          // `keyValueText`, NOT `String(v)` — the write side encodes
           // numerics, so `String(5)` would look for `5` where `0000000000000005`
-          // is stored, and escapes the sort key's text.
+          // is stored, and escapes the key's text.
           const skValues: string[] = []
           const listSkFilter = keyRecord(filter ?? {})
           for (const attr of listConfig.sk.composite) {
             if (listSkFilter[attr] !== undefined)
               skValues.push(
-                KeyComposer.serializeSortKeyValue(listSkFilter[attr], config.schema.casing),
+                KeyComposer.keyValueText(config.schema, listSkFilter[attr], config.schema.casing),
               )
             else break // Stop at first gap (prefix matching)
           }
@@ -2465,7 +2493,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               const sk = composeCollectionKey(
                 config.schema,
                 listConfig.name,
-                sortKeyComposites(
+                keyComposites(
                   config.schema,
                   KeyComposer.extractComposites(listConfig.sk.composite, keyRecord(item)),
                 ),
@@ -3766,7 +3794,7 @@ const decomposeAggregate = (
         "root",
         { current: [], legacy: [] },
         aggregateName,
-        schema.casing,
+        schema,
       )
     }
 
@@ -3831,21 +3859,21 @@ interface DiscriminatorValues {
 /** A node's own static discriminator values as {@link DiscriminatorValues}. */
 const ownDiscriminatorValues = (
   node: ResolvedNode,
-  casing: DynamoSchemaModule.Casing,
+  schema: DynamoSchemaModule.DynamoSchema,
 ): DiscriminatorValues => {
   const entries =
     node.ownDiscriminator === undefined
       ? []
       : Object.entries(node.ownDiscriminator).filter(([, v]) => typeof v !== "function")
   return {
-    current: entries.flatMap(([k, v]) => [k, KeyComposer.serializeSortKeyValue(v, casing)]),
+    current: entries.flatMap(([k, v]) => [k, KeyComposer.keyValueText(schema, v, schema.casing)]),
     legacy: entries.flatMap(([k, v]) => [k, KeyText136.serializeValue(v)]),
   }
 }
 
 /**
  * Recursively decompose a node's value into DynamoDB items. Sort key values
- * are escaped with the schema's `casing` (`KeyComposer.sortKeyText`); the
+ * are escaped with the schema's `casing` (`KeyComposer.keyText`); the
  * discriminator names between them are field names, kept as they are.
  */
 const decomposeNode = (
@@ -3857,7 +3885,7 @@ const decomposeNode = (
   /** The parent's discriminator values, in today's text and in 1.36's (#171). */
   parentDiscriminators: DiscriminatorValues,
   aggregateName: string,
-  casing: DynamoSchemaModule.Casing,
+  schema: DynamoSchemaModule.DynamoSchema,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -3874,7 +3902,7 @@ const decomposeNode = (
       // Discriminator values for SK composition: the parent sub-aggregate's
       // (name#value pairs, empty at the top level) then this node's own, so a
       // nested sub-aggregate's rows are keyed apart per binding of its parent.
-      const own = ownDiscriminatorValues(node, casing)
+      const own = ownDiscriminatorValues(node, schema)
       const discValues: DiscriminatorValues = {
         current: [...parentDiscriminators.current, ...own.current],
         legacy: [...parentDiscriminators.legacy, ...own.legacy],
@@ -3919,7 +3947,7 @@ const decomposeNode = (
           txGroup,
           discValues,
           aggregateName,
-          casing,
+          schema,
         )
       }
     } else if (node.cardinality === "one") {
@@ -3935,7 +3963,7 @@ const decomposeNode = (
       }
 
       // Own discriminator values as name#value pairs for SK composition
-      const own = ownDiscriminatorValues(node, casing)
+      const own = ownDiscriminatorValues(node, schema)
 
       items.push({
         entityType: node.entityType,
@@ -3986,7 +4014,7 @@ const decomposeNode = (
           transactionGroup: parentGroup,
           skComposites: [
             ...parentDiscriminators.current,
-            ...values.map((value) => KeyComposer.serializeSortKeyValue(value, casing)),
+            ...values.map((value) => KeyComposer.keyValueText(schema, value, schema.casing)),
           ],
           skComposites136: [
             ...parentDiscriminators.legacy,
@@ -4017,15 +4045,16 @@ const readCompositePath = (attrs: Record<string, unknown>, path: string): unknow
 }
 
 /**
- * A collection or list sort key's composites as the key holds them: each
- * serialized value (`KeyComposer.extractComposites` over the key-form record)
- * cased and escaped (`KeyComposer.sortKeyText`), so the key's text sorts as
- * its values and a value never holds the delimiter.
+ * A key's composites as it holds them: each serialized value
+ * (`KeyComposer.extractComposites` over the key-form record) cased and escaped
+ * (`KeyComposer.keyText`), so the key's text sorts as its values and a value
+ * never holds the delimiter.
  */
-const sortKeyComposites = (
+const keyComposites = (
   schema: DynamoSchemaModule.DynamoSchema,
   composites: ReadonlyArray<string>,
-): ReadonlyArray<string> => composites.map((text) => KeyComposer.sortKeyText(text, schema.casing))
+): ReadonlyArray<string> =>
+  composites.map((text) => KeyComposer.keyText(schema, text, schema.casing))
 
 /**
  * Whether a resolved composite value can be a sort-key segment.
@@ -4233,9 +4262,12 @@ const buildDynamoItems = (
 
       // List collection GSI keys (root items only)
       if (isRootItem && config.list) {
-        const listPkComposites = KeyComposer.extractComposites(
-          config.list.pk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
+        const listPkComposites = keyComposites(
+          config.schema,
+          KeyComposer.extractComposites(
+            config.list.pk.composite,
+            keyRecord(item.keyAttributes ?? item.attributes),
+          ),
         )
         if (config.list.cardinality) {
           const shard = hashToShard(pkValue, config.list.cardinality)
@@ -4250,7 +4282,7 @@ const buildDynamoItems = (
             listPkComposites,
           )
         }
-        const listSkComposites = sortKeyComposites(
+        const listSkComposites = keyComposites(
           config.schema,
           KeyComposer.extractComposites(
             config.list.sk.composite,

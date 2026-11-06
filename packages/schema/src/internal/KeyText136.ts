@@ -9,10 +9,11 @@
  *   in order and nothing else; 1.37 encodes every number in numeric order
  *   (`NumericKey.ts`). The text of a non-negative integer below 1e16 (1e38 for
  *   a bigint) is unchanged.
- * - **Sort key values** holding a code point U+0000–U+0025 — a control
- *   character, space, `!`, `"`, `#`, `$` or `%` — are escaped in 1.37
- *   (`KeyComposer.sortKeyText`) and were not in 1.36. Partition keys, unique
- *   sentinels and the structural parts of a key are not escaped.
+ * - **Key values** holding a code point U+0000–U+0025 — a control character,
+ *   space, `!`, `"`, `#`, `$` or `%` — are escaped (`KeyComposer.escapeKeyText`)
+ *   and were not in 1.36: in sort keys since 1.37, and in partition keys and
+ *   unique sentinels since 1.38. The structural parts of a key are not escaped.
+ *   With the schema's `escapeKeys: false` they compose as they did in 1.36.
  * - **Time-series event keys** carried the orderBy attribute's ENCODED value
  *   (a `NumberFromString` `"10"` as the string `10`); 1.37 composes its key
  *   form (`0000000000000010`).
@@ -46,20 +47,38 @@ import {
   effectiveCasing,
   type IndexDefinition,
   isZOrderHalf,
-  sortKeyTruncates,
   subtreeCondition,
 } from "../KeyComposer.js"
 
 /** Whether operations read and move rows under their 1.36 keys (`DynamoSchema.make`'s `legacyKeys`). */
 export const enabled = (schema: DynamoSchema.DynamoSchema): boolean => schema.legacyKeys !== false
 
-/** `%`: the highest code point 1.37 escapes in sort key text, and the first of every escape. */
+/**
+ * Can a row 1.36 wrote for one value sit at another value's current key? Only while the
+ * fallback is on, and only when keys escape: 1.36's text of a value holding `%` and two hex
+ * digits then spells another value's escaped text.
+ */
+export const canSpell = (schema: DynamoSchema.DynamoSchema): boolean =>
+  enabled(schema) && schema.escapeKeys !== false
+
+/**
+ * The schema whose `composePk` gives the partition key 1.37 stored: its numbers as they are
+ * now, its strings unescaped. 1.37 escaped sort keys and no partition key, so a row whose
+ * partition key holds a character to escape can be at neither its 1.36 key nor its current
+ * one. Only `rekey` looks there.
+ */
+export const schema137 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
+  ...schema,
+  escapeKeys: false,
+})
+
+/** `%`: the highest code point keys escape, and the first of every escape. */
 const ESCAPE = 0x25
 
 /**
- * Does sort key value text `text` hold a code point 1.37 escapes (U+0000–
- * U+0025)? Then its key text differs from 1.36's — and holds an escape, which
- * 1.36's text of another value can spell: `foo%20bar` is `foo bar`'s key now.
+ * Does key value text `text` hold a code point that escapes (U+0000–U+0025)? Then its key
+ * text differs from 1.36's — and holds an escape, which 1.36's text of another value can
+ * spell: `foo%20bar` is `foo bar`'s key now.
  */
 export const holdsEscaped = (text: string): boolean => {
   for (let i = 0; i < text.length; i++) {
@@ -302,9 +321,9 @@ export const composeSortKeyCondition = (
   | { readonly between: readonly [string, string] } => {
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
   if (leadingSupplied(index, record) === index.sk.composite.length) return { eq: prefix }
-  return sortKeyTruncates(index)
-    ? subtreeCondition(prefix)
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+  return index.index === undefined
+    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
+    : subtreeCondition(prefix)
 }
 
 /**
@@ -340,9 +359,9 @@ export const composeBoundCondition = (
   const value = "eq" in bound ? bound.eq : bound.beginsWith
   const last = index.sk.composite.indexOf(field) === index.sk.composite.length - 1
   if (last) return { eq: segment(value) }
-  return sortKeyTruncates(index)
-    ? subtreeCondition(segment(value))
-    : { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
+  return index.index === undefined
+    ? { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
+    : subtreeCondition(segment(value))
 }
 
 /**

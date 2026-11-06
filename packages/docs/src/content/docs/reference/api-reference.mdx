@@ -144,7 +144,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `legacyKeys: false` to turn off the 1.36 key fallback once `rekey` has moved every row ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136), [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, `escapeKeys: false` to turn off string escaping in every key ([Key text](/effect-dynamodb/guides/indexes/#turning-key-escaping-off)), and `legacyKeys: false` to turn off the 1.36 key fallback once `rekey` has moved every row ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136), [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -161,7 +161,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Type | Description |
 |------|-------------|
-| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, legacyKeys?: false }` |
+| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, escapeKeys?: false, legacyKeys?: false }` |
 | `Casing` | `"lowercase" \| "uppercase" \| "preserve"` |
 
 ### Usage
@@ -1055,8 +1055,9 @@ import { KeyComposer } from "effect-dynamodb"
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
 | `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
-| `sortKeyText` | `(text, casing) => string` | A composite's text as a sort key holds it: cased, then each code point U+0000–U+0025 escaped as `%` and two hex digits ([Sort key text](/effect-dynamodb/guides/indexes/#sort-key-text)) |
-| `serializeSortKeyValue` | `(value, casing) => string` | `serializeValue`, then `sortKeyText` |
+| `escapeKeyText` | `(text, casing) => string` | A composite's text escaped: cased, then each code point U+0000–U+0025 as `%` and two hex digits ([Key text](/effect-dynamodb/guides/indexes/#key-text)) |
+| `keyText` | `(schema, text, casing) => string` | `escapeKeyText`, or the cased text under `escapeKeys: false` |
+| `keyValueText` | `(schema, value, casing) => string` | `serializeValue`, then `keyText` |
 | `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
 | `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 

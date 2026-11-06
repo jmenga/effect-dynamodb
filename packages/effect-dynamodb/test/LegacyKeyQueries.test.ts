@@ -655,7 +655,7 @@ describe("legacy key queries — an aggregate under its 1.36 keys", () => {
     KeyText136.serializeValue(-5),
   ])
   const stopSk = (label: string) =>
-    DynamoSchema.composeKey(On.schema, "RouteStop", [KeyComposer.sortKeyText(label, "lowercase")])
+    DynamoSchema.composeKey(On.schema, "RouteStop", [KeyComposer.escapeKeyText(label, "lowercase")])
   const stopSk136 = (label: string) => DynamoSchema.composeKey(On.schema, "RouteStop", [label])
 
   /** The route as 1.36 wrote it: its partition, its edge keys and its list sort key. */
@@ -822,7 +822,7 @@ describe("legacy key queries — an aggregate at its current key with a 1.36 lis
   const pk = DynamoSchema.composeCollectionKey(On.schema, "lines", [KeyComposer.serializeValue(7)])
   const rootSk = DynamoSchema.composeKey(On.schema, "LineItem", [])
   const listSk = DynamoSchema.composeCollectionKey(On.schema, "linelist", [
-    KeyComposer.sortKeyText("big game", "lowercase"),
+    KeyComposer.escapeKeyText("big game", "lowercase"),
   ])
   const listSk136 = DynamoSchema.composeCollectionKey(On.schema, "linelist", ["big game"])
 

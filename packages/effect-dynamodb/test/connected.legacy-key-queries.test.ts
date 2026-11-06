@@ -458,7 +458,9 @@ describeConnected("#171 queries over rows still under their 1.36 keys — connec
     const pk136 = (id: number) =>
       DynamoSchema.composeCollectionKey(AppSchema, "routes", [KeyText136.serializeValue(id)])
     const stopSk = (label: string) =>
-      DynamoSchema.composeKey(AppSchema, "RouteStop", [KeyComposer.sortKeyText(label, "lowercase")])
+      DynamoSchema.composeKey(AppSchema, "RouteStop", [
+        KeyComposer.escapeKeyText(label, "lowercase"),
+      ])
     const stopSk136 = (label: string) => DynamoSchema.composeKey(AppSchema, "RouteStop", [label])
     const rootSk = DynamoSchema.composeKey(AppSchema, "RouteItem", [])
 
@@ -519,7 +521,7 @@ describeConnected("#171 queries over rows still under their 1.36 keys — connec
         const root = rows.find((row) => row.sk === rootSk)!
         expect(root.gsi1sk).toBe(
           DynamoSchema.composeCollectionKey(AppSchema, "routelist", [
-            KeyComposer.sortKeyText(KeyComposer.serializeValue(-7), "lowercase"),
+            KeyComposer.escapeKeyText(KeyComposer.serializeValue(-7), "lowercase"),
           ]),
         )
         const got = yield* Routes.get({ id: -7 })
@@ -535,7 +537,7 @@ describeConnected("#171 queries over rows still under their 1.36 keys — connec
         ])
         const lineSk = DynamoSchema.composeKey(AppSchema, "LineItem", [])
         const listSk = DynamoSchema.composeCollectionKey(AppSchema, "linelist", [
-          KeyComposer.sortKeyText("big game", "lowercase"),
+          KeyComposer.escapeKeyText("big game", "lowercase"),
         ])
         const listSk136 = DynamoSchema.composeCollectionKey(AppSchema, "linelist", ["big game"])
         yield* Lines.create({

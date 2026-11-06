@@ -28,6 +28,11 @@ export interface DynamoSchema {
    * on. See {@link make}.
    */
   readonly legacyKeys?: false | undefined
+  /**
+   * `false` turns off string escaping in every key, partition and sort. Absent means on.
+   * See {@link make}.
+   */
+  readonly escapeKeys?: false | undefined
 }
 
 /**
@@ -45,17 +50,31 @@ export interface DynamoSchema {
  * row has moved (`db.tables.<Table>.rekey()`), turn it off: requests are then
  * exactly those of a build without the fallback. The setting and the fallback
  * go in the next major release.
+ *
+ * `escapeKeys: false` turns off string escaping in every key, partition and sort: table
+ * keys, index keys, collections, aggregates, event streams, unique sentinels and vector
+ * partitions. By default a composite value's text escapes each character U+0000-U+0025 as
+ * `%` and two hex digits (`KeyComposer.escapeKeyText`), so a key sorts as its values and no
+ * value can imitate a delimiter. Off, a string composes the text it did in 1.36 and nothing
+ * else changes: numbers keep their 1.37 encoding. It's all or nothing, and a table's rows
+ * are written under one setting. The limitations, which off accepts: a range on a sort key
+ * composite before the last can return wrong rows when a value holds a character below `#`
+ * (`new york` sorts below `new#...`), a `#` in a value can imitate a segment, a skip-scan
+ * over free-form strings can hide rows, and rows 1.37.0 wrote with escaped sort keys aren't
+ * found.
  */
 export const make = (config: {
   readonly name: string
   readonly version: number
   readonly casing?: Casing | undefined
   readonly legacyKeys?: boolean | undefined
+  readonly escapeKeys?: boolean | undefined
 }): DynamoSchema => ({
   name: config.name,
   version: config.version,
   casing: config.casing ?? "lowercase",
   ...(config.legacyKeys === false && { legacyKeys: false as const }),
+  ...(config.escapeKeys === false && { escapeKeys: false as const }),
 })
 
 /**

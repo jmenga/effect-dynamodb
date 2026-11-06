@@ -2887,15 +2887,24 @@ export const makeStream = <
   // Key helpers
   // ---------------------------------------------------------------------------
 
-  const composeStreamPk = (streamId: Record<string, unknown>): string => {
-    const composites = KeyComposer.extractComposites(compositeFields, streamId)
-    return DynamoSchema.composeKey(schema, keyLabel, composites, keyOptions)
+  const composeStreamPkUnder = (
+    under: DynamoSchema.DynamoSchema,
+    streamId: Record<string, unknown>,
+  ): string => {
+    // A stream's own casing, if it has one: its escapes' hex digits are in it too.
+    const composites = KeyComposer.extractComposites(compositeFields, streamId).map((text) =>
+      KeyComposer.keyText(under, text, config.casing ?? under.casing),
+    )
+    return DynamoSchema.composeKey(under, keyLabel, composites, keyOptions)
   }
+  const composeStreamPk = (streamId: Record<string, unknown>): string =>
+    composeStreamPkUnder(schema, streamId)
 
   /**
    * The partition key 1.36 composed for `streamId`, when the 1.36 key
    * fallback is on and its text differs from {@link composeStreamPk}'s — a
-   * number stream id composite whose text changed (#171). `force` answers
+   * number stream id composite whose text changed (#171), or a value that
+   * escapes. `force` answers
    * with the fallback off too: `rekey` moves streams whatever it is set to.
    */
   const composeStreamPk136 = (
@@ -5352,9 +5361,10 @@ export const makeStream = <
   }
 
   /**
-   * Where a stream row belongs now and where 1.36 put it, from its
-   * `streamId`: the readings of the id whose keys hold the row's partition
-   * key. `"ambiguous"` when readings disagree on where it belongs.
+   * Where a stream row belongs now and where an earlier release put it, from
+   * its `streamId`: the readings of the id whose keys hold the row's partition
+   * key, in 1.36's text or 1.37's (its strings unescaped, its numbers as now).
+   * `"ambiguous"` when readings disagree on where it belongs.
    */
   const streamKeys = (
     row: Record<string, AttributeValue>,
@@ -5366,7 +5376,8 @@ export const makeStream = <
     for (const candidate of streamIdCandidates(text)) {
       try {
         const current = composeStreamPk(candidate)
-        const old = composeStreamPk136(candidate, true) ?? current
+        const pk137 = composeStreamPkUnder(KeyText136.schema137(schema), candidate)
+        const old: string = pk === pk137 ? pk137 : (composeStreamPk136(candidate, true) ?? current)
         if (pk !== current && pk !== old) continue
         if (found === undefined) found = { current, old }
         else if (found.current !== current || found.old !== old) return "ambiguous"

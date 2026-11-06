@@ -305,7 +305,6 @@ describe("KeyText136 — what changed in 1.37", () => {
       { tenant: "acme", seq: "a" },
       { tenant: "acme", seq: 0 },
       { tenant: "acme", seq: Number.MAX_SAFE_INTEGER },
-      { tenant: "new york", seq: 42 },
       { tenant: "acme", seq: 99_999_999_999_999_999_999_999_999_999_999_999_999n },
     ]) {
       expect(
@@ -314,8 +313,9 @@ describe("KeyText136 — what changed in 1.37", () => {
     }
   })
 
-  it("a changed number or an escaped sort key value has its 1.36 key", () => {
+  it("a changed number or an escaped key value has its 1.36 key", () => {
     for (const record of [
+      { tenant: "new york", seq: 42 },
       { tenant: "acme", seq: -3 },
       { tenant: "acme", seq: 2.5 },
       { tenant: "acme", seq: 1e16 },

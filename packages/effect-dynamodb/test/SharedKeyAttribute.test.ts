@@ -89,68 +89,32 @@ describe("Table.make resolves a casing an index leaves to the schema", () => {
     })
   })
 
-  it("reads the model through the table too: a casing that reaches only numbers is none", () => {
-    const withPrefix = (prefix: string) =>
-      Entity.make({
-        model: Schema.Struct({
-          tenant: Schema.String,
-          id: Schema.String,
-          n: Schema.Number,
-          x: Schema.Number,
-        }),
-        entityType: "Numeric",
-        primaryKey: definition.primaryKey,
-        indexes: {
-          a: {
-            name: "a",
-            pk: { field: "apk", composite: ["tenant"] },
-            sk: {
-              field: "zsk",
-              prefix: [prefix as "n"],
-              zorder: [{ field: "x", min: 0, max: 100 }],
-            },
-            shards: 8,
-          },
-          b: {
-            name: "b",
-            pk: { field: "bpk", composite: ["tenant"] },
-            sk: {
-              field: "zsk",
-              prefix: [prefix as "n"],
-              zorder: [{ field: "x", min: 0, max: 100 }],
-            },
-            shards: 8,
-            casing: "uppercase",
-          },
-        },
-      })
-    const Numeric = withPrefix("n")
-    expect(Table.make({ schema: lower, entities: { Numeric } }).schema).toBe(lower)
-    const Texted = withPrefix("tenant")
-    expect(() => Table.make({ schema: lower, entities: { Texted } })).toThrow("[EDD-9106]")
-  })
-
-  it("unsharded numeric Z-order halves too: their bytes are the same whatever the casing", () => {
+  it("a casing is judged through the table, whatever it reaches", () => {
     const Numeric = Entity.make({
-      model: Schema.Struct({ tenant: Schema.String, id: Schema.String, x: Schema.Number }),
+      model: Schema.Struct({
+        tenant: Schema.String,
+        id: Schema.String,
+        n: Schema.Number,
+        x: Schema.Number,
+      }),
       entityType: "Numeric",
       primaryKey: definition.primaryKey,
       indexes: {
         a: {
           name: "a",
           pk: { field: "apk", composite: ["tenant"] },
-          sk: { field: "zsk", zorder: [{ field: "x", min: 0, max: 100 }] },
-          casing: "lowercase",
+          sk: { field: "zsk", prefix: ["n"], zorder: [{ field: "x", min: 0, max: 100 }] },
         },
         b: {
           name: "b",
           pk: { field: "bpk", composite: ["tenant"] },
-          sk: { field: "zsk", zorder: [{ field: "x", min: 0, max: 100 }] },
+          sk: { field: "zsk", prefix: ["n"], zorder: [{ field: "x", min: 0, max: 100 }] },
           casing: "uppercase",
         },
       },
     })
-    expect(Table.make({ schema: lower, entities: { Numeric } }).schema).toBe(lower)
+    expect(() => Table.make({ schema: lower, entities: { Numeric } })).toThrow("[EDD-9106]")
+    expect(Table.make({ schema: upper, entities: { Numeric } }).schema).toBe(upper)
   })
 })
 
@@ -241,7 +205,7 @@ describe("a half stored in a table key attribute", () => {
   it.effect("under a casing the schema agrees with", () => agreeingCasingScenario(harness().h))
 })
 
-describe("two accessors sharing an attribute (shape 13)", () => {
+describe("two accessors over one row (shape 13)", () => {
   const model = Schema.Struct({
     tenant: Schema.String,
     id: Schema.String,
@@ -266,9 +230,8 @@ describe("two accessors sharing an attribute (shape 13)", () => {
     },
   } as const
 
-  it("Entity.make refuses them, on the runtime and the pure definition", () => {
-    const refused =
-      /\[EDD-9106\].*index "byRegion"'s sort key and index "byGroup"'s sort key.*"gsk"/
+  it("Entity.make refuses them on one index, on the runtime and the pure definition", () => {
+    const refused = /\[EDD-9108\].*indexes "byRegion" and "byGroup".*"gsi"/
     expect(() => Entity.make(shape13)).toThrow(refused)
     expect(() => PureEntity.make(shape13)).toThrow(refused)
   })

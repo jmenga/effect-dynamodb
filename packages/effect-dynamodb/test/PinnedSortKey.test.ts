@@ -361,7 +361,7 @@ const tickRows = (): ReadonlyArray<Row> => {
       toAttributeMap({
         ...tick(at),
         pk,
-        sk: KeyComposer.composeEventSk(currentSk, at, AppSchema.casing),
+        sk: KeyComposer.composeEventSk(AppSchema, currentSk, at),
         __edd_e__: "Tick",
       }),
     )
@@ -768,7 +768,7 @@ describe(".history().where() on a string orderBy (#171 sort key escaping)", () =
           channel,
           stamp,
           pk,
-          sk: KeyComposer.composeEventSk(currentSk, stamp, AppSchema.casing),
+          sk: KeyComposer.composeEventSk(AppSchema, currentSk, stamp),
           __edd_e__: "Note",
         }),
       ),

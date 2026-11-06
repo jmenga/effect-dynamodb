@@ -8,7 +8,7 @@
  * control characters sort below `#`: `new york#…` sorted before `new#…`, so
  * `lte: "new york"` left out `new` and `gt: "new"` left out `new york`; a
  * value holding `#` itself split into two segments. Sort key text is now
- * escaped (`KeyComposer.sortKeyText`), so key order is value order and every
+ * escaped (`KeyComposer.keyText`), so key order is value order and every
  * bound is one exact key condition. `.where()` and `.within()` (every plan)
  * must return exactly the rows whose cased value satisfies the bound.
  *
@@ -285,7 +285,7 @@ const makeReadings = (casing: Casing) => {
           ...reading,
           at,
           pk,
-          sk: KeyComposer.composeEventSk(sk, at, casing),
+          sk: KeyComposer.composeEventSk(schema, sk, at, casing),
           __edd_e__: "Reading",
         }),
       ),
@@ -841,8 +841,9 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
     },
     ({ a, b, plainA, plainB, n, m }) => {
       for (const casing of casings) {
+        const schema = DynamoSchema.make({ name: "app", version: 1, casing })
         const escaped = (value: unknown) =>
-          `${DynamoSchema.applyCasing("city", casing)}_${KeyComposer.serializeSortKeyValue(value, casing)}`
+          `${DynamoSchema.applyCasing("city", casing)}_${KeyComposer.keyValueText(schema, value, casing)}`
         // 1.36's segment: the value as it was, cased.
         const unescaped = (value: unknown) =>
           `${DynamoSchema.applyCasing("city", casing)}_${DynamoSchema.applyCasing(KeyComposer.serializeValue(value), casing)}`
@@ -855,7 +856,7 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
             for (const isLast of [false, true]) {
               for (const clamped of [false, true]) {
                 const composed = composeRangeUnder(
-                  { casing, isLast, secondary: false },
+                  { schema, casing, isLast, secondary: false },
                   prefixText,
                   "city",
                   bound,

@@ -1,8 +1,8 @@
 /**
- * An index half that is a half of the table's key (#183, D62), on a table that stores what
- * it is sent. The scenarios are in `helpers/TableKeyHalves.ts`; `connected.sharding.test.ts`
- * runs them on DynamoDB Local. `packages/schema/test/TableKeyHalves.test.ts` covers the
- * composers and the definitions.
+ * An inverted index (#183, canonical shape 14), on a table that stores what it is sent. The
+ * scenarios are in `helpers/InvertedIndexes.ts`; `connected.sharding.test.ts` runs them on
+ * DynamoDB Local. `packages/schema/test/InvertedIndex.test.ts` covers the composers and the
+ * definitions.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -12,19 +12,22 @@ import { Effect, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import {
   clientOf,
   type Harness,
+  multiCompositeOffScenarios,
   multiCompositeScenarios,
-  number136Scenario,
+  number136Scenarios,
   numberAndDateScenarios,
+  off136Scenarios,
+  overwritten137OffScenario,
   overwritten137Scenario,
   row136Scenarios,
   textScenarios,
   unchanged136Scenario,
   writePathScenarios,
-} from "./helpers/TableKeyHalves.js"
+} from "./helpers/InvertedIndexes.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const harness: Harness = {
   on: (world, body) => {
@@ -55,7 +58,7 @@ const harness: Harness = {
   },
 }
 
-describe("an inverted index is the table's key (shape 14)", () => {
+describe("an inverted index (shape 14)", () => {
   describe("what any value does through it", () => {
     for (const scenario of textScenarios) {
       it.effect(scenario.name, () => scenario.run(harness))
@@ -71,8 +74,13 @@ describe("an inverted index is the table's key (shape 14)", () => {
       it.effect(scenario.name, () => scenario.run(harness))
     }
   })
-  describe("a sort key of several composites, in partition key text", () => {
+  describe("a sort key of several composites", () => {
     for (const scenario of multiCompositeScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a sort key of several composites, escapeKeys off", () => {
+    for (const scenario of multiCompositeOffScenarios) {
       it.effect(scenario.name, () => scenario.run(harness))
     }
   })
@@ -81,9 +89,15 @@ describe("an inverted index is the table's key (shape 14)", () => {
       it.effect(scenario.name, () => scenario.run(harness))
     }
     it.effect("whose text didn't change", () => unchanged136Scenario(harness))
-    it.effect("of numbers and dates", () => number136Scenario(harness))
+    for (const scenario of number136Scenarios) {
+      it.effect(`of numbers and dates, ${scenario.name}`, () => scenario.run(harness))
+    }
+    for (const scenario of off136Scenarios) {
+      it.effect(`under escapeKeys off: ${scenario.name}`, () => scenario.run(harness))
+    }
   })
-  it.effect("a row 1.37.0 overwrote stays where it is", () => overwritten137Scenario(harness))
+  it.effect("a row 1.37.0 overwrote is at its key", () => overwritten137Scenario(harness))
+  it.effect("escapeKeys off doesn't find an escaped key", () => overwritten137OffScenario(harness))
 })
 
 describe("what an inverted query sends", () => {
@@ -93,7 +107,7 @@ describe("what an inverted query sends", () => {
     groupId: Schema.String,
   }) {}
   const schema = DynamoSchema.make({ name: "sent", version: 1 })
-  const Members = Entity.make({
+  const definition = {
     model: Member,
     entityType: "Member",
     primaryKey: {
@@ -107,7 +121,8 @@ describe("what an inverted query sends", () => {
         sk: { field: "pk", composite: ["tenant", "userId"] },
       },
     },
-  })
+  } as const
+  const Members = Entity.make(definition)
   const MainTable = Table.make({ schema, entities: { Members } })
 
   const queries = (
@@ -128,53 +143,90 @@ describe("what an inverted query sends", () => {
       .map((value) => value.S)
       .filter((text) => text.startsWith("$"))
 
-  it.effect("a partial pin on plain values: one request, begins_with on the table's text", () =>
+  it.effect("a partial pin on plain values: one request, as on any other index", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "g", tenant: "t" }).collect(),
       )
       expect(sent).toHaveLength(1)
-      expect(sent[0]!.KeyConditionExpression).toContain("begins_with")
+      expect(sent[0]!.KeyConditionExpression).toContain("BETWEEN")
       expect(key(sent[0]!).sort()).toEqual([
         "$sent#v1#member#groupid_g",
-        "$sent#v1#member#tenant_t#",
+        "$sent#v1#member#tenant_t",
+        "$sent#v1#member#tenant_t#\uFFFF",
       ])
     }),
   )
 
-  it.effect("a value whose text changed adds the 1.36 partition, and no pass for the pins", () =>
+  it.effect("a value whose text changed adds its 1.36 key", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "a b", tenant: "x y" }).collect(),
       )
       expect(sent.map((input) => key(input).sort())).toEqual([
-        ["$sent#v1#member#groupid_a b", "$sent#v1#member#tenant_x y#"],
-        ["$sent#v1#member#groupid_a%20b", "$sent#v1#member#tenant_x y#"],
+        [
+          "$sent#v1#member#groupid_a b",
+          "$sent#v1#member#tenant_x y",
+          "$sent#v1#member#tenant_x y#\uFFFF",
+        ],
+        [
+          "$sent#v1#member#groupid_a%20b",
+          "$sent#v1#member#tenant_x%20y",
+          "$sent#v1#member#tenant_x%20y#\uFFFF",
+        ],
       ])
     }),
   )
 
-  it.effect("a `.where()` equal on a composite before the last, in 1.36 text too", () =>
+  it.effect("escapeKeys off: one key, in 1.36 text", () =>
+    Effect.gen(function* () {
+      const off = DynamoSchema.make({ name: "sent", version: 1, escapeKeys: false })
+      const Unescaped = Entity.make(definition)
+      const OffTable = Table.make({ schema: off, entities: { Members: Unescaped } })
+      const table = makeRecordingTable({ indexes: { inverted: { pk: "sk", sk: "pk" } } })
+      yield* Effect.gen(function* () {
+        const db = (yield* DynamoClient.make({
+          entities: { Members: Unescaped },
+          tables: { MainTable: OffTable },
+        })) as any
+        yield* db.entities.Members.byGroup({ groupId: "a b", tenant: "x y" }).collect()
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, OffTable.layer({ name: "sent" }))),
+      ) as Effect.Effect<void>
+      const sent = table.requests
+        .filter((request) => request.command === "Query")
+        .map((request) => request.input)
+      expect(sent.map((input) => key(input).sort())).toEqual([
+        [
+          "$sent#v1#member#groupid_a b",
+          "$sent#v1#member#tenant_x y",
+          "$sent#v1#member#tenant_x y#\uFFFF",
+        ],
+      ])
+    }),
+  )
+
+  it.effect("a `.where()` equal on a composite before the last, in both texts", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "g" })
           .where((t: any, o: any) => o.eq(t.tenant, "x y"))
           .collect(),
       )
-      expect(sent).toHaveLength(1)
-      expect(sent[0]!.KeyConditionExpression).toContain("begins_with")
-      expect(key(sent[0]!)).toContain("$sent#v1#member#tenant_x y#")
+      expect(sent.flatMap((input) => key(input))).toEqual(
+        expect.arrayContaining(["$sent#v1#member#tenant_x y", "$sent#v1#member#tenant_x%20y"]),
+      )
     }),
   )
 
-  it.effect("a one-sided range under a pin takes the longer value below the delimiter", () =>
+  it.effect("a one-sided range under a pin is the plan of any other index", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "g", tenant: "t" })
           .where((t: any, o: any) => o.gt(t.userId, "a"))
           .collect(),
       )
-      expect(key(sent[0]!)).toContain("$sent#v1#member#tenant_t#userid_a\u0000")
+      expect(key(sent[0]!)).toContain("$sent#v1#member#tenant_t#userid_a#\uFFFF")
     }),
   )
 })
