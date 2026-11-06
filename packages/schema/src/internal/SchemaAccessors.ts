@@ -92,6 +92,27 @@ export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undef
   return undefined
 }
 
+/**
+ * The value schema of a keyed collection a custom `decompose` takes apart: `Schema.Record(K, T)` or
+ * `Schema.ReadonlyMap(K, T)`, either under `optional` / `optionalKey`. Returns `T`.
+ */
+export const extractKeyedValue = (fieldSchema: Schema.Top): Schema.Top | undefined => {
+  const keyed = (schema: Schema.Top): Schema.Top | undefined =>
+    getSchemaProp(schema, "key") === undefined ? undefined : getSchemaProp(schema, "value")
+  if (SchemaAST.isOptional(fieldSchema.ast)) {
+    const inner = getSchemaProp(fieldSchema, "schema")
+    if (inner === undefined) return undefined
+    const members = getSchemaMembers(inner)
+    if (members === undefined) return keyed(inner)
+    for (const member of members) {
+      const value = keyed(member)
+      if (value !== undefined) return value
+    }
+    return undefined
+  }
+  return keyed(fieldSchema)
+}
+
 /** Read the typed `.value` element schema off an `Array`/`NonEmptyArray` schema. */
 const arrayValue = (schema: Schema.Top): Schema.Top | undefined => getSchemaProp(schema, "value")
 
@@ -110,7 +131,10 @@ const getSchemaMembers = (schema: Schema.Top): ReadonlyArray<Schema.Top> | undef
  * a function (a `Schema.Class` is its constructor) — both carry `.ast`, so we
  * accept either `typeof`.
  */
-const getSchemaProp = (schema: Schema.Top, prop: "schema" | "value"): Schema.Top | undefined => {
+const getSchemaProp = (
+  schema: Schema.Top,
+  prop: "schema" | "key" | "value",
+): Schema.Top | undefined => {
   const value = (schema as unknown as Record<string, unknown>)[prop]
   if (isSchemaLike(value)) return value
   return undefined

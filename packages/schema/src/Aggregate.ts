@@ -24,6 +24,7 @@ import {
   deriveAggregateSchemas,
   getSchemaFields,
   refuseAggregateKeyOverMovingValue,
+  refuseManySortKeysOverMovingValue,
 } from "./internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
@@ -299,6 +300,12 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
     config.timestamps,
     getSchemaFields(schema),
     config.pk.composite,
+  )
+  refuseManySortKeysOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.edges,
   )
   const derivedSchemas = deriveAggregateSchemas(
     schema,

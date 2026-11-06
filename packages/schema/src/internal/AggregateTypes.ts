@@ -92,6 +92,19 @@ export type UpdateFn<T> = T extends { readonly schema: infer S extends Schema.To
  * modifier widens `infer E` to `E | undefined`, fails the `extends RefEntity`
  * guard, and silently collapses the brand back to `string`.
  */
+type _HasEntity<Edge> =
+  RefEntity extends NonNullable<Edge extends { readonly entity?: unknown } ? Edge["entity"] : never>
+    ? false
+    : true
+
+/** An edge whose input is an id `create` fetches: a `ref`, or a `one` with an entity. */
+type _IsIdEdge<Edge> =
+  Edge extends RefEdge<any> ? true : Edge extends OneEdge<any> ? _HasEntity<Edge> : false
+
+/** A `one` edge with no entity: there's nothing to fetch, so its input is the value itself. */
+type _IsValueEdge<Edge> =
+  Edge extends OneEdge<any> ? (_HasEntity<Edge> extends true ? false : true) : false
+
 type _EdgeIdValue<Edge> =
   NonNullable<
     Edge extends { readonly entity?: unknown } ? Edge["entity"] : undefined
@@ -104,7 +117,8 @@ type _EdgeIdValue<Edge> =
 /**
  * Compute the aggregate input type from the domain model, edges, and PK composites.
  *
- * - OneEdge / RefEdge fields → `${field}Id: <entity branded id | string>`
+ * - RefEdge, and OneEdge with an entity, fields → `${field}Id: <entity branded id>`
+ * - OneEdge without one → the value, under its field name (`create` has nothing to fetch)
  * - BoundSubAggregate fields → recursed
  * - ManyEdge fields → array elements recursed for ref replacement
  * - PK composites → omitted
@@ -113,8 +127,7 @@ type _EdgeIdValue<Edge> =
  *
  * Edge id fields resolve to the referenced entity's branded primary-key
  * identifier type (e.g. `venueId: VenueId`) when the edge carries an `entity`,
- * mirroring the standalone Entity ref path (`EntityRefInputType`). Without an
- * entity, they fall back to `string`.
+ * mirroring the standalone Entity ref path (`EntityRefInputType`).
  */
 export type AggregateInputType<
   TModel,
@@ -141,19 +154,35 @@ export type AggregateInputType<
           ? K
           : never]?: _StripUndefined<TModel[K]>
   } & {
-    // Required OneEdge / RefEdge fields → ${name}Id: <entity branded id>
-    readonly [K in keyof TEdges as TEdges[K] extends OneEdge<any> | RefEdge<any>
+    // Required RefEdge fields, and OneEdge with an entity → ${name}Id: <entity branded id>
+    readonly [K in keyof TEdges as _IsIdEdge<TEdges[K]> extends true
       ? _IsOptionalIn<TModel, K> extends true
         ? never
         : `${K & string}Id`
       : never]: _EdgeIdValue<TEdges[K]>
   } & {
-    // Optional OneEdge / RefEdge fields → ${name}Id?: <entity branded id>
-    readonly [K in keyof TEdges as TEdges[K] extends OneEdge<any> | RefEdge<any>
+    // Optional RefEdge fields, and OneEdge with an entity → ${name}Id?: <entity branded id>
+    readonly [K in keyof TEdges as _IsIdEdge<TEdges[K]> extends true
       ? _IsOptionalIn<TModel, K> extends true
         ? `${K & string}Id`
         : never
       : never]?: _EdgeIdValue<TEdges[K]>
+  } & {
+    // Required OneEdge with no entity → the value
+    readonly [K in keyof TEdges as _IsValueEdge<TEdges[K]> extends true
+      ? _IsOptionalIn<TModel, K> extends true
+        ? never
+        : K
+      : never]: K extends keyof TModel ? _OptionalStamps<TModel[K], TStamps> : never
+  } & {
+    // Optional OneEdge with no entity → the value
+    readonly [K in keyof TEdges as _IsValueEdge<TEdges[K]> extends true
+      ? _IsOptionalIn<TModel, K> extends true
+        ? K
+        : never
+      : never]?: K extends keyof TModel
+      ? _OptionalStamps<_StripUndefined<TModel[K]>, TStamps>
+      : never
   } & {
     // Required BoundSubAggregate fields → recurse
     readonly [K in keyof TEdges as TEdges[K] extends BoundSubAggregate<any, any>
@@ -250,7 +279,11 @@ type _TransformManyEdge<T, Id, TStamps = never> =
     ? _IsRefLike<E> extends true
       ? ReadonlyArray<Id>
       : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id>, TStamps>>
-    : T
+    : T extends Readonly<Record<string, infer V>>
+      ? string extends keyof T
+        ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
+        : T
+      : T
 
 /** `T` with the dates the library stamps optional. */
 type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]
@@ -297,6 +330,23 @@ export type AggregateEdgesGuard<TSchema extends Schema.Top, TEdges> = {
 }
 
 /**
+ * What a many edge's rows are: an array's elements, or a record's or map's values (a custom
+ * `decompose`). Any other object has rows only its own `decompose` knows the shape of.
+ */
+type ManyElement<T> =
+  T extends ReadonlyArray<infer El>
+    ? El
+    : T extends ReadonlyMap<unknown, infer V>
+      ? V
+      : T extends object
+        ? T extends Readonly<Record<string, infer V>>
+          ? string extends keyof T
+            ? V
+            : unknown
+          : unknown
+        : never
+
+/**
  * The attribute paths of a many edge's element that `sk.composite` may name:
  * its scalar fields, and the scalar fields one level into an object field (a
  * hydrated ref: `"umpire.id"`) — not the object itself, which the runtime
@@ -305,7 +355,7 @@ export type AggregateEdgesGuard<TSchema extends Schema.Top, TEdges> = {
  */
 export type ManyEdgeSkPaths<TField> = unknown extends TField
   ? string
-  : ElementPaths<NonNullable<TField> extends ReadonlyArray<infer El> ? El : never>
+  : ElementPaths<ManyElement<NonNullable<TField>>>
 
 /** A value a key composes from as one scalar: a primitive, or a date. */
 type IsScalar<V> = V extends string | number | bigint | boolean

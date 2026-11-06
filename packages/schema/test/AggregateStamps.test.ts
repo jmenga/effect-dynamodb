@@ -76,11 +76,88 @@ describe("the input of an aggregate with `timestamps`", () => {
     const Child = Schema.Struct({ name: Schema.String, ...Dates })
     const stamps = { timestamps: true }
 
-    it("a one edge's input is its id, whatever the row declares", () => {
+    it("a one edge with an entity takes its id, whatever the row declares", () => {
       const Model = Schema.Struct({ id: Schema.String, venue: Child })
-      const edges = { edges: { venue: Aggregate.one({ entityType: "Venue" } as never) } }
+      const entity = {
+        model: Child,
+        entityType: "Venue",
+        indexes: { primary: { pk: { field: "pk", composite: ["name"] } } },
+      }
+      const edges = { edges: { venue: Aggregate.one({ entityType: "Venue", entity } as never) } }
       expect(accepts(Model, { ...edges, ...stamps }, { venueId: "v" })).toBe(true)
       expect(accepts(Model, { ...edges, ...stamps }, {})).toBe(false)
+    })
+
+    it("a one edge with no entity takes the value, as create does", () => {
+      const Model = Schema.Struct({ id: Schema.String, venue: Child })
+      const edges = { edges: { venue: Aggregate.one({ entityType: "Venue" }) } }
+      const input = { venue: { name: "n" } }
+      expect(accepts(Model, { ...edges, ...stamps }, input)).toBe(true)
+      expect(accepts(Model, edges, input)).toBe(false)
+      expect(accepts(Model, edges, { venue: { name: "n", createdAt: at, updatedAt: at } })).toBe(
+        true,
+      )
+      expect(accepts(Model, { ...edges, ...stamps }, { venueId: "v" })).toBe(false)
+      expect(accepts(Model, { ...edges, ...stamps }, { venue: {} })).toBe(false)
+    })
+
+    it("an optional one edge with no entity", () => {
+      const Model = Schema.Struct({ id: Schema.String, venue: Schema.optional(Child) })
+      const edges = { edges: { venue: Aggregate.one({ entityType: "Venue" }) } }
+      expect(accepts(Model, { ...edges, ...stamps }, {})).toBe(true)
+      expect(accepts(Model, { ...edges, ...stamps }, { venue: { name: "n" } })).toBe(true)
+    })
+
+    it("a keyed many edge's values (a custom decompose)", () => {
+      const Model = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Record(Schema.String, Child),
+      })
+      const edges = {
+        edges: {
+          lines: Aggregate.many({
+            entityType: "Line",
+            sk: { composite: ["name"] },
+            decompose: (value) => Object.values(value as object),
+            assemble: (items) => items,
+          }),
+        },
+      }
+      const input = { lines: { a: { name: "n" } } }
+      expect(accepts(Model, { ...edges, ...stamps }, input)).toBe(true)
+      expect(accepts(Model, edges, input)).toBe(false)
+      const Optional = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.optional(Schema.Record(Schema.String, Child)),
+      })
+      expect(accepts(Optional, { ...edges, ...stamps }, {})).toBe(true)
+      expect(accepts(Optional, { ...edges, ...stamps }, input)).toBe(true)
+    })
+
+    it("a keyed many edge of plain values, or a map, is as the model has it", () => {
+      const edges = {
+        edges: {
+          lines: Aggregate.many({ entityType: "Line", decompose: () => [], assemble: () => ({}) }),
+        },
+      }
+      const Plain = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Record(Schema.String, Schema.String),
+      })
+      expect(accepts(Plain, { ...edges, ...stamps }, { lines: { a: "x" } })).toBe(true)
+      const Mapped = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.ReadonlyMap(Schema.String, Child),
+      })
+      expect(accepts(Mapped, { ...edges, ...stamps }, { lines: [["a", { name: "n" }]] })).toBe(
+        false,
+      )
+      const dated = {
+        name: "n",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }
+      expect(accepts(Mapped, { ...edges, ...stamps }, { lines: [["a", dated]] })).toBe(true)
     })
 
     it("a many element", () => {
@@ -146,6 +223,91 @@ describe("the input's type", () => {
     expectTypeOf<StampedInput["title"]>().toEqualTypeOf<string>()
     // @ts-expect-error `title` isn't stamped
     const _missing: StampedInput = {}
+  })
+})
+
+describe("EDD-9121, a many edge's sort key over `updatedAt`", () => {
+  const Line = Schema.Struct({ sku: Schema.String, updatedAt: Schema.DateTimeUtc })
+  const lines = (composite: ReadonlyArray<string>, extra: Record<string, unknown> = {}) =>
+    Aggregate.many({ entityType: "Line", sk: { composite }, ...extra })
+  const edges = (composite: ReadonlyArray<string>) => ({ edges: { lines: lines(composite) } })
+  const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+
+  it("is refused where the library stamps it, as the operational make does", () => {
+    expect(() => definition(Model, { ...edges(["updatedAt"]), timestamps: true })).toThrow(
+      /\[EDD-9121\] Aggregate "Root": edge "lines"/,
+    )
+    expect(() => definition(Model, { ...edges(["sku", "updatedAt"]), timestamps: true })).toThrow(
+      /EDD-9121/,
+    )
+  })
+
+  it("isn't where it doesn't, or over another field", () => {
+    expect(() => definition(Model, edges(["updatedAt"]))).not.toThrow()
+    expect(() => definition(Model, { ...edges(["sku"]), timestamps: true })).not.toThrow()
+    expect(() =>
+      definition(Model, {
+        ...edges(["updatedAt"]),
+        timestamps: { updated: { field: "changed" } },
+      }),
+    ).not.toThrow()
+  })
+
+  it("a row's field of that name of another type is its own", () => {
+    const Own = Schema.Struct({
+      id: Schema.String,
+      lines: Schema.Array(Schema.Struct({ sku: Schema.String, updatedAt: Schema.String })),
+    })
+    expect(() => definition(Own, { ...edges(["updatedAt"]), timestamps: true })).not.toThrow()
+  })
+
+  it("a root's field of that name of another type turns the stamp off on every row", () => {
+    const Root = Schema.Struct({
+      id: Schema.String,
+      updatedAt: Schema.String,
+      lines: Schema.Array(Line),
+    })
+    expect(() => definition(Root, { ...edges(["updatedAt"]), timestamps: true })).not.toThrow()
+  })
+
+  it("under a sub-aggregate, and over an entity's model or a keyed value", () => {
+    const Sub = Aggregate.make(Schema.Struct({ name: Schema.String, lines: Schema.Array(Line) }), {
+      root: { entityType: "Sub" },
+      edges: { lines: lines(["updatedAt"]) },
+    } as never) as any
+    const Nested = Schema.Struct({
+      id: Schema.String,
+      sub: Schema.Struct({ name: Schema.String, lines: Schema.Array(Line) }),
+    })
+    expect(() =>
+      definition(Nested, {
+        edges: { sub: Sub.with({ discriminator: { slot: "a" } }) },
+        timestamps: true,
+      }),
+    ).toThrow(/EDD-9121/)
+    const Opaque = Schema.Struct({ id: Schema.String, lines: Schema.Unknown })
+    const entity = { model: Line, entityType: "Line" }
+    expect(() =>
+      definition(Opaque, {
+        edges: { lines: lines(["updatedAt"], { entity }) },
+        timestamps: true,
+      }),
+    ).toThrow(/EDD-9121/)
+    // An entity's model says the same about its rows as the aggregate's would.
+    const OwnLine = Schema.Struct({ sku: Schema.String, updatedAt: Schema.String })
+    expect(() =>
+      definition(Opaque, {
+        edges: { lines: lines(["updatedAt"], { entity: { model: OwnLine, entityType: "Line" } }) },
+        timestamps: true,
+      }),
+    ).not.toThrow()
+    const Keyed = Schema.Struct({ id: Schema.String, lines: Schema.Record(Schema.String, Line) })
+    expect(() => definition(Keyed, { ...edges(["updatedAt"]), timestamps: true })).toThrow(
+      /EDD-9121/,
+    )
+    // Nothing says what an opaque value's rows hold: they're stamped, not declared, and read back
+    // from nothing, so the key isn't over a value of the row's.
+    expect(() => definition(Opaque, { ...edges(["sku"]), timestamps: true })).not.toThrow()
   })
 })
 

@@ -151,7 +151,9 @@ import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
   isFieldOptional,
+  manyElementFields,
   refuseAggregateKeyOverMovingValue,
+  refuseManySortKeysOverMovingValue,
   resolveAggregateStamps,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
@@ -1013,21 +1015,6 @@ const isOpaqueRefField = (field: Schema.Top): boolean => {
 }
 
 /**
- * The fields of a `many` edge's ELEMENT, read off the parent model's array
- * field (`players: Schema.Array(PlayerSheet)` → `PlayerSheet`'s fields).
- * `undefined` when the field is not array-shaped (a custom `decompose`) or its
- * element exposes no fields (a scalar, or an opaque ref).
- */
-const manyElementFields = (
-  parentFields: Record<string, Schema.Top> | undefined,
-  edgeName: string,
-): Record<string, Schema.Top> | undefined => {
-  const field = parentFields?.[edgeName]
-  const element = field === undefined ? undefined : extractArrayElement(field)
-  return element === undefined ? undefined : getSchemaFields(element)
-}
-
-/**
  * A sub-aggregate nested in another inherits its parent's discriminator, and
  * its rows carry both (#133). Re-using an inherited attribute name would
  * overwrite the parent's value on the inner rows: the two bindings of the
@@ -1297,21 +1284,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       updatedRequired: own.updatedAtCollision && required(own.updatedAt),
     }
   }
-  const withRowStamps = (node: ResolvedNode): ResolvedNode => {
-    const rowStamps = rowStampsOf(node.ownFields)
-    if (
-      rowStamps?.updatedAt !== null &&
-      rowStamps?.updatedAt !== undefined &&
-      node.skComposite?.includes(rowStamps.updatedAt) === true
-    ) {
-      throw new Error(
-        `[EDD-9121] Aggregate "${aggregateName}": edge "${node.fieldName}"'s sort key can't be ` +
-          `composed from "${rowStamps.updatedAt}". The library changes it on every write and a ` +
-          `sort key never changes, so the key would stop matching the value at the first update.`,
-      )
-    }
-    return { ...node, rowStamps, children: node.children.map(withRowStamps) }
-  }
+  refuseManySortKeysOverMovingValue(aggregateName, config.timestamps, schemaFields, config.edges)
+  const withRowStamps = (node: ResolvedNode): ResolvedNode => ({
+    ...node,
+    rowStamps: rowStampsOf(node.ownFields),
+    children: node.children.map(withRowStamps),
+  })
 
   // Build resolved graph by walking edges recursively. Each node's attribute
   // encoders come from the schema its decomposed values actually have — for a
@@ -4369,6 +4347,32 @@ interface RowStamps {
 }
 
 /**
+ * A `many` value's rows, each through `fill`, put back in the shape the value has. A custom
+ * `decompose` says what the rows are, and only its `assemble` can put them back: with no `assemble`,
+ * a value that isn't an array has no way back, so its rows can't be filled. This runs before the
+ * input is decoded, so a value they can't take apart or put back is left for the schema to report.
+ */
+const fillRows = (
+  child: ResolvedNode,
+  value: unknown,
+  fill: (row: unknown) => unknown,
+): unknown => {
+  const filledOf = (rows: ReadonlyArray<unknown>) => {
+    const filled = rows.map(fill)
+    return filled.some((row, i) => row !== rows[i]) ? filled : undefined
+  }
+  if (child.decompose !== undefined && child.assemble !== undefined) {
+    try {
+      const filled = value === undefined ? undefined : filledOf(child.decompose(value))
+      return filled === undefined ? value : child.assemble(filled)
+    } catch {
+      return value
+    }
+  }
+  return Array.isArray(value) ? (filledOf(value) ?? value) : value
+}
+
+/**
  * `value` with the dates its rows declare and it doesn't supply, walking the graph: a stamped date is
  * never the input's to supply, as on an entity. `"required"` leaves one a schema doesn't require,
  * which a rewrite stamps anyway: a mutation that changes nothing still has nothing to write. A value
@@ -4401,16 +4405,11 @@ const fillStamps = (
   }
   for (const child of node.children) {
     const current = given[child.fieldName!]
-    if (child.cardinality === "many") {
-      if (!Array.isArray(current)) continue
-      const elements = current.map((element) => fillStamps(child, element, now, which))
-      if (elements.some((element, i) => element !== current[i])) {
-        added[child.fieldName!] = elements
-      }
-    } else {
-      const next = fillStamps(child, current, now, which)
-      if (next !== current) added[child.fieldName!] = next
-    }
+    const next =
+      child.cardinality === "many"
+        ? fillRows(child, current, (row) => fillStamps(child, row, now, which))
+        : fillStamps(child, current, now, which)
+    if (next !== current) added[child.fieldName!] = next
   }
   return Object.keys(added).length === 0 ? value : { ...given, ...added }
 }

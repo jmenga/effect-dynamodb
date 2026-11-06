@@ -408,7 +408,67 @@ describe("Aggregate input: dates the library stamps", () => {
     const _left: Input = { createdAt: "mine", sub: { name: "n" } }
   })
 
-  it("a many element and a sub-aggregate root's too; a one edge's input is its id", () => {
+  it("a one edge with an entity takes its id; with none, optional or not, the value", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const ChildEntity = Entity.make({
+      model: Child,
+      entityType: "Child",
+      primaryKey: {
+        pk: { field: "pk", composite: ["name"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const Model = Schema.Struct({
+      id: Schema.String,
+      owned: Child,
+      spare: Schema.optional(Child),
+      fetched: Child,
+    })
+    const Own = Aggregate.make(Model, {
+      ...base,
+      edges: {
+        owned: Aggregate.one({ entityType: "Owned" }),
+        spare: Aggregate.one({ entityType: "Spare" }),
+        fetched: Aggregate.one({ entityType: "Fetched", entity: ChildEntity }),
+      },
+      timestamps: true,
+    })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = { owned: { name: "n" }, fetchedId: "f" }
+    expectTypeOf(given).toExtend<Input>()
+    const spare: Input = { owned: { name: "n" }, spare: { name: "s" }, fetchedId: "f" }
+    expectTypeOf(spare).toExtend<Input>()
+    // @ts-expect-error an edge with an entity is fetched by its id
+    const _fetched: Input = { owned: { name: "n" }, fetched: { name: "f" } }
+    // @ts-expect-error `name` isn't stamped
+    const _noName: Input = { owned: { name: "n" }, spare: {}, fetchedId: "f" }
+    // @ts-expect-error an edge with no entity has nothing to fetch by id
+    const _spareId: Input = { owned: { name: "n" }, spareId: "s", fetchedId: "f" }
+  })
+
+  it("a keyed many edge's values, as a custom decompose takes them", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Model = Schema.Struct({ id: Schema.String, lines: Schema.Record(Schema.String, Child) })
+    const edges = {
+      lines: Aggregate.many({
+        entityType: "Line",
+        sk: { composite: ["name"] },
+        decompose: (value) => Object.values(value as object),
+        assemble: (items) => items,
+      }),
+    }
+    const Stamped = Aggregate.make(Model, { ...base, edges, timestamps: true })
+    const Unstamped = Aggregate.make(Model, { ...base, edges })
+    type Input = Aggregate.Input<typeof Stamped>
+    const given: Input = { lines: { a: { name: "n" } } }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error `name` isn't stamped
+    const _noName: Input = { lines: { a: {} } }
+    // @ts-expect-error nothing stamps them without `timestamps`
+    const _unstamped: Aggregate.Input<typeof Unstamped> = { lines: { a: { name: "n" } } }
+  })
+
+  it("a many element and a sub-aggregate root's too; a one edge with no entity takes the value", () => {
     const Child = Schema.Struct({ name: Schema.String, ...Dates })
     const Sub = Aggregate.make(Child, { root: { entityType: "Sub" }, edges: {} })
     const Nested = Schema.Struct({
@@ -427,19 +487,31 @@ describe("Aggregate input: dates the library stamps", () => {
     type Input = Aggregate.Input<typeof Stamped>
     type UnstampedInput = Aggregate.Input<typeof Unstamped>
     const left: Input = {
-      venueId: "v" as never,
+      venue: { name: "n" },
       lines: [{ name: "n" }],
       sub: { name: "n" },
     }
     expectTypeOf(left).toExtend<Input>()
+    const _venueId: Input = {
+      // @ts-expect-error a one edge with no entity has nothing to fetch by id
+      venueId: "v",
+      lines: [],
+      sub: { name: "n" },
+    }
+    const _noVenue: Input = {
+      // @ts-expect-error `name` isn't stamped
+      venue: {},
+      lines: [],
+      sub: { name: "n" },
+    }
     const _noName: Input = {
-      venueId: "v" as never,
+      venue: { name: "n" },
       lines: [],
       // @ts-expect-error `name` isn't stamped
       sub: {},
     }
     const _unstamped: UnstampedInput = {
-      venueId: "v" as never,
+      venue: { name: "n", createdAt: DateTime.makeUnsafe(0), updatedAt: DateTime.makeUnsafe(0) },
       lines: [],
       // @ts-expect-error nothing stamps them
       sub: { name: "n" },

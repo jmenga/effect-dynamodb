@@ -516,6 +516,71 @@ describe("definition attribute names are typed from the model", () => {
       })
     })
 
+    it("a many sk over a record's or a map's values, as a custom decompose takes them", () => {
+      const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
+      const base = {
+        table,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { index: "lsi1", name: "keyed", sk: { field: "lsi1sk", composite: [] } },
+        root: { entityType: "Keyed" },
+      } as const
+      const ByRecord = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Record(Schema.String, Line),
+      })
+      const ByMap = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.ReadonlyMap(Schema.String, Line),
+      })
+      const ByStruct = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Struct({ first: Line, second: Line }),
+      })
+      const ByText = Schema.Struct({ id: Schema.String, lines: Schema.String })
+      Aggregate.make(ByRecord, {
+        ...base,
+        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }) },
+      })
+      Aggregate.make(ByMap, {
+        ...base,
+        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }) },
+      })
+      // Its rows are what its `decompose` makes: nothing here says what they hold.
+      Aggregate.make(ByStruct, {
+        ...base,
+        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["anything"] } }) },
+      })
+      const typeOnly = (_: () => unknown) => undefined
+      typeOnly(() =>
+        Aggregate.make(ByRecord, {
+          ...base,
+          edges: {
+            // @ts-expect-error a record's value has no `skuu`
+            lines: Aggregate.many({ entityType: "L", sk: { composite: ["skuu"] } }),
+          },
+        }),
+      )
+      typeOnly(() =>
+        Aggregate.make(ByMap, {
+          ...base,
+          edges: {
+            // @ts-expect-error a map's value has no `skuu`
+            lines: Aggregate.many({ entityType: "L", sk: { composite: ["skuu"] } }),
+          },
+        }),
+      )
+      typeOnly(() =>
+        Aggregate.make(ByText, {
+          ...base,
+          edges: {
+            // @ts-expect-error a string has no rows
+            lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }),
+          },
+        }),
+      )
+    })
+
     it("a misspelled name in each position", () => {
       const base = {
         table,
