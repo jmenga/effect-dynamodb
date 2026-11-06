@@ -95,9 +95,14 @@ const fixedVectors: Record<string, ReadonlyArray<number>> = {}
 const setVector = (text: string, vector: ReadonlyArray<number>): void => {
   fixedVectors[text] = vector
 }
+let embedded = 0
 const FixedEmbedder = Layer.succeed(Embedder, {
   dimensions: DIMENSIONS,
-  embed: (text: string) => Effect.succeed(fixedVectors[text] ?? [1, 0, 0, 0]),
+  embed: (text: string) =>
+    Effect.sync(() => {
+      embedded++
+      return fixedVectors[text] ?? [1, 0, 0, 0]
+    }),
 })
 
 /**
@@ -116,6 +121,7 @@ const PARTITION_ATTR = "__edd_vp_vec1__"
 // ---------------------------------------------------------------------------
 
 interface Capture {
+  gets?: number
   putItem?: PutItemCommandInput
   updateItem?: UpdateItemCommandInput
   transactWriteItems?: TransactWriteItemsCommandInput
@@ -151,7 +157,10 @@ const makeMockClient = (capture: Capture): DynamoClientService =>
       capture.transactWriteItems = input
       return Effect.succeed(mockOutput<TransactWriteItemsCommandOutput>({}))
     },
-    getItem: () => Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: currentItem })),
+    getItem: () => {
+      capture.gets = (capture.gets ?? 0) + 1
+      return Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: currentItem }))
+    },
     deleteItem: () => Effect.succeed(mockOutput<DeleteItemCommandOutput>({})),
     query: () => Effect.succeed(mockOutput<QueryCommandOutput>({ Items: [] })),
     scan: () => Effect.succeed(mockOutput<ScanCommandOutput>({ Items: capture.scanItems ?? [] })),
@@ -601,6 +610,131 @@ const makeEmulatedLayer = (capture: Capture) =>
     MainTable.layer({ name: "test-table" }),
     FixedEmbedder,
   )
+
+describe("a value DynamoDB can't store", () => {
+  const product = {
+    productId: "p-1",
+    tenantId: "t-1",
+    name: "n",
+    description: "d",
+    category: "c",
+    price: 1,
+  }
+  const key = { tenantId: "t-1", productId: "p-1" }
+  const refused = (
+    capture: Capture,
+    says: RegExp,
+    failing: (entities: any) => { asEffect: () => Effect.Effect<unknown, unknown> },
+  ) =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
+      embedded = 0
+      const error: any = yield* Effect.flip(failing(db.entities).asEffect())
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toMatch(says)
+      expect(embedded).toBe(0)
+      expect(capture.putItem).toBeUndefined()
+      expect(capture.updateItem).toBeUndefined()
+      expect(capture.transactWriteItems).toBeUndefined()
+      expect(capture.searchVectors).toBeUndefined()
+    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+
+  it.effect("in a put is refused before it embeds anything", () => {
+    const capture: Capture = {}
+    return refused(capture, /"price": .*MAX_SAFE_INTEGER/, (e) =>
+      e.Products.put({ ...product, price: 2 ** 60 }),
+    )
+  })
+
+  it.effect("in .withVector on a put is refused, naming the index", () => {
+    const capture: Capture = {}
+    return refused(capture, /"byDescription\[0\]": .*NaN/, (e) =>
+      e.Products.put(product).withVector("byDescription", [Number.NaN, 0, 0, 0]),
+    )
+  })
+
+  it.effect("in .withVector on an update is refused, naming the index", () => {
+    const capture: Capture = {}
+    return refused(capture, /\.withVector\(\) of "byDescription\[0\]": .*NaN/, (e) =>
+      e.Products.update(key).withVector("byDescription", [Number.NaN, 0, 0, 0]),
+    )
+  })
+
+  it.effect("in .withVector on an upsert is refused, naming the index", () => {
+    const capture: Capture = {}
+    return refused(capture, /"byDescription\[0\]": .*NaN/, (e) =>
+      e.Products.upsert(product).withVector("byDescription", [Number.NaN, 0, 0, 0]),
+    )
+  })
+
+  it.effect("in .withVector on an upsert that reads first is refused before it reads", () => {
+    const capture: Capture = {}
+    const Retained = Entity.make({
+      model: Product,
+      entityType: "retainedProduct",
+      primaryKey: {
+        pk: { field: "pk", composite: ["tenantId", "productId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      versioned: { retain: true },
+      vectorIndexes: {
+        byDescription: {
+          name: "vec1",
+          dimensions: DIMENSIONS,
+          distance: "cosine",
+          source: { fields: ["description"] },
+          partition: ["tenantId"],
+        },
+      },
+    } as never) as any
+    const RetainedTable = Table.make({ schema: AppSchema, entities: { Retained } })
+    return Effect.gen(function* () {
+      const db = (yield* DynamoClient.make({
+        entities: { Retained },
+        tables: { RetainedTable },
+      } as never)) as any
+      const error: any = yield* Effect.flip(
+        db.entities.Retained.upsert(product)
+          .withVector("byDescription", [Number.NaN, 0, 0, 0])
+          .asEffect() as Effect.Effect<unknown, unknown>,
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toMatch(/"byDescription\[0\]": .*NaN/)
+      expect(capture.gets).toBeUndefined()
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DynamoClient, makeMockClient(capture)),
+          RetainedTable.layer({ name: "test-table" }),
+          FixedEmbedder,
+        ),
+      ),
+    )
+  })
+
+  it.effect("in a search's .filter is refused, naming the field and sending nothing", () => {
+    const capture: Capture = {}
+    setVector("anything", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
+      for (const [value, says] of [
+        [Number.NaN, /"category": .*NaN/],
+        [new Set(), /"category": DynamoDB has no empty set\. Nothing was sent\./],
+        [[new Set()], /"category\[0\]": .*no empty set/],
+      ] as const) {
+        const error: any = yield* Effect.flip(
+          db.entities.Products.byDescription("anything")
+            .partition({ tenantId: "t-1" })
+            .filter({ category: value as never })
+            .collect(),
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toMatch(says)
+      }
+      expect(capture.searchVectors).toBeUndefined()
+    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+  })
+})
 
 describe("vector search read path", () => {
   it.effect("ranks hits most-similar-first and normalizes the score", () => {

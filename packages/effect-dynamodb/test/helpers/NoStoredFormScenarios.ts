@@ -9,7 +9,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
-import { Effect, Schema, SchemaGetter, SchemaIssue } from "effect"
+import { Effect, HashSet, Option, Schema, SchemaGetter, SchemaIssue } from "effect"
 import { expect } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import * as Batch from "../../src/Batch.js"
@@ -22,6 +22,7 @@ import {
   type Harness,
   key,
   live,
+  type Probe,
   refused,
   type Scenario,
   schema,
@@ -1887,6 +1888,1005 @@ const honestScenarios: ReadonlyArray<Scenario> = [
   },
 ]
 
+// ---------------------------------------------------------------------------
+// A value DynamoDB can't store, with no attribute to leave out: a caller's value is
+// a ValidationError naming the field, on every path, never a defect
+// ---------------------------------------------------------------------------
+
+const Holding = Schema.Struct({
+  id: Schema.String,
+  /** Set when a row is seeded, so the operand-taking operations have something to act on. */
+  lists: Schema.optional(Schema.Array(Strings)),
+  pair: Schema.optional(Schema.Tuple([Schema.String, Strings])),
+  anything: Schema.optional(Schema.Unknown),
+  n: Schema.optional(Schema.Number),
+})
+
+const expectNothingWritten = (
+  probe: Probe,
+  failing: () => Effect.Effect<unknown, unknown, any>,
+  says: RegExp,
+  options: { readonly reads?: boolean } = {},
+) =>
+  Effect.gen(function* () {
+    const before = yield* probe.rows()
+    const sent = probe.sent()
+    const error: any = yield* failing().pipe(Effect.flip)
+    expect(error._tag).toBe("ValidationError")
+    expect(String(error.cause)).toMatch(says)
+    if (options.reads !== true) expect(probe.sent()).toBe(sent)
+    expect(yield* probe.rows()).toEqual(before)
+  })
+
+/** The configurations that send a request before their write, and the one that doesn't. */
+const WRITE_PATHS: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+  ["plain", {}],
+  ["versioned", { versioned: true }],
+  ["retained", { versioned: { retain: true } }],
+  ["unique", { unique: { byN: ["n"] } }],
+]
+
+const OPERANDS: ReadonlyArray<readonly [string, (update: any) => any, RegExp]> = [
+  [
+    ".set of a tuple",
+    (u) => u.set({ pair: ["a", empty()] }),
+    /\.set\(\) of "pair\[1\]": .*no empty set/,
+  ],
+  [
+    ".set of a list",
+    (u) => u.set({ lists: [empty()] }),
+    /\.set\(\) of "lists\[0\]": .*no empty set/,
+  ],
+  [
+    ".set of an unknown value",
+    (u) => u.set({ anything: { deep: [{ more: [empty()] }] } }),
+    /\.set\(\) of "anything\.deep\[0\]\.more\[0\]": .*no empty set/,
+  ],
+  [
+    ".append",
+    (u) => u.append({ lists: [empty()] }),
+    /\.append\(\) of "lists\[0\]": .*no empty set/,
+  ],
+  [
+    "pathSet",
+    (u) => u.pathSet({ segments: ["pair"], value: ["a", empty()], isPath: false }),
+    /pathSet of "pair\[1\]": .*no empty set/,
+  ],
+  [
+    "pathAppend",
+    (u) => u.pathAppend({ segments: ["lists"], value: [empty()], isPath: false }),
+    /pathAppend of "lists\[0\]": .*no empty set/,
+  ],
+  [
+    "pathPrepend",
+    (u) => u.pathPrepend({ segments: ["lists"], value: [empty()], isPath: false }),
+    /pathPrepend of "lists\[0\]": .*no empty set/,
+  ],
+  [
+    "pathIfNotExists",
+    (u) => u.pathIfNotExists({ segments: ["lists"], value: [empty()], isPath: false }),
+    /pathIfNotExists of "lists\[0\]": .*no empty set/,
+  ],
+  [
+    "pathAdd",
+    (u) => u.pathAdd({ segments: ["anything"], value: Number.NaN, isPath: false }),
+    /pathAdd of "anything": .*NaN/,
+  ],
+  [
+    "pathSubtract",
+    (u) => u.pathSubtract({ segments: ["n"], value: Number.NaN, isPath: false }),
+    /(pathSubtract|\.subtract\(\)) of "n": .*NaN/,
+  ],
+  [
+    "pathDelete",
+    (u) => u.pathDelete({ segments: ["anything"], value: new Set<unknown>([{}]), isPath: false }),
+    /pathDelete of "anything": .*Set/,
+  ],
+  [".add", (u) => u.add({ n: Number.NaN }), /\.add\(\) of "n": .*NaN/],
+  [".subtract", (u) => u.subtract({ n: Number.NaN }), /\.subtract\(\) of "n": .*NaN/],
+  [
+    ".deleteFromSet",
+    (u) => u.deleteFromSet({ anything: new Set<unknown>([{}]) }),
+    /\.deleteFromSet\(\) of "anything": .*Set/,
+  ],
+  [".set of NaN", (u) => u.set({ n: Number.NaN }), /\.set\(\) of "n": .*NaN/],
+  [
+    ".set past the safe integers",
+    (u) => u.set({ n: 2 ** 60 }),
+    /\.set\(\) of "n": .*MAX_SAFE_INTEGER/,
+  ],
+  [
+    ".cascade filter",
+    (u) => u.set({ id: "1" } as never).cascade({ targets: [], filter: { kind: [empty()] } }),
+    /\.cascade\(\) filter on "kind\[0\]": .*no empty set/,
+  ],
+  [
+    ".cascade filter of an empty set",
+    (u) => u.set({ id: "1" } as never).cascade({ targets: [], filter: { kind: empty() } }),
+    /\.cascade\(\) filter on "kind": .*no empty set/,
+  ],
+]
+
+class Moved extends Schema.TaggedClass<Moved>()("NoStoredFormMoved", {
+  pair: Schema.Tuple([Schema.String, Strings]),
+  lists: Schema.Array(Strings),
+  anything: Schema.optional(Schema.Unknown),
+  gap: Schema.optional(
+    Schema.Tuple([Schema.String, Schema.UndefinedOr(Schema.String), Schema.String]),
+  ),
+}) {}
+
+const movedOf = (fields: Partial<Record<keyof Moved, unknown>>) =>
+  new Moved(
+    { pair: ["a", new Set(["b"])], lists: [new Set(["c"])], ...fields } as never,
+    { disableChecks: true } as never,
+  )
+
+const movedWorld = (options: Record<string, unknown> = {}) => {
+  const world = worldOf(Holding)
+  const Stream = EventStore.makeStream({
+    table: world.MainTable,
+    streamName: "Moves",
+    events: [Moved],
+    streamId: { composite: ["moveId"] },
+    metadata: Schema.Struct({
+      lists: Schema.optional(Schema.Array(Strings)),
+      gap: Schema.optional(
+        Schema.Tuple([Schema.String, Schema.UndefinedOr(Schema.String), Schema.String]),
+      ),
+    }),
+    ...options,
+  } as never) as any
+  return { world, Stream }
+}
+
+class HoldingPart extends Schema.Class<HoldingPart>("NoStoredFormHoldingPart")({
+  partId: Schema.String,
+  pair: Schema.Tuple([Schema.String, Strings]),
+}) {}
+
+class HoldingHeader extends Schema.Class<HoldingHeader>("NoStoredFormHoldingHeader")({
+  lists: Schema.Array(Strings),
+  gap: Schema.optional(
+    Schema.Tuple([Schema.String, Schema.UndefinedOr(Schema.String), Schema.String]),
+  ),
+}) {}
+
+class HoldingAssembly extends Schema.Class<HoldingAssembly>("NoStoredFormHoldingAssembly")({
+  id: Schema.String,
+  anything: Schema.optional(Schema.Unknown),
+  header: HoldingHeader,
+  parts: Schema.Array(HoldingPart),
+}) {}
+
+const holdingAggregateWorld = () => {
+  const world = worldOf(Holding)
+  const Assemblies = Aggregate.make(HoldingAssembly, {
+    table: world.MainTable,
+    schema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "assembly" },
+    root: { entityType: "HoldingRoot" },
+    edges: {
+      header: Aggregate.one({ entityType: "HoldingHeader" }),
+      parts: Aggregate.many({ entityType: "HoldingPart", sk: { composite: ["partId"] } }),
+    },
+  } as never) as any
+  return { world, Assemblies }
+}
+
+const holdingInput = () => ({
+  id: "1",
+  header: { lists: [new Set(["a"])] },
+  parts: [{ partId: "p", pair: ["a", new Set(["b"])] }],
+})
+
+const unstorableScenarios: ReadonlyArray<Scenario> = [
+  ...WRITE_PATHS.flatMap(([path, options]) => [
+    {
+      name: `${path}: a put holding a value DynamoDB can't store sends nothing`,
+      run: (h: Harness) =>
+        h.on(worldOf(Holding, options), (db, probe) =>
+          Effect.gen(function* () {
+            for (const [input, says] of [
+              [{ pair: ["a", empty()] }, /"pair\[1\]": .*no empty set/],
+              [{ lists: [new Set(["a"]), empty()] }, /"lists\[1\]": .*no empty set/],
+              [{ anything: { deep: [empty()] } }, /"anything\.deep\[0\]": .*no empty set/],
+              [{ n: Number.NaN }, /"n": .*NaN|EDD-9096/],
+              [{ n: 2 ** 60 }, /"n": .*MAX_SAFE_INTEGER/],
+            ] as const) {
+              yield* expectNothingWritten(
+                probe,
+                () => db.entities.Rows.put({ id: "1", ...input }).asEffect(),
+                says,
+              )
+              yield* expectNothingWritten(
+                probe,
+                () => db.entities.Rows.create({ id: "1", ...input }).asEffect(),
+                says,
+              )
+              yield* expectNothingWritten(
+                probe,
+                () => db.entities.Rows.upsert({ id: "1", ...input }).asEffect(),
+                says,
+              )
+            }
+          }),
+        ),
+    },
+    ...OPERANDS.map(([operation, apply, says]) => ({
+      name: `${path}: ${operation} holding one sends nothing`,
+      run: (h: Harness) =>
+        h.on(worldOf(Holding, options), (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({
+              id: "1",
+              lists: [new Set(["a"])],
+              anything: new Set(["a"]),
+              n: 1,
+            }).asEffect()
+            yield* expectNothingWritten(
+              probe,
+              () => apply(db.entities.Rows.update(key)).asEffect(),
+              says,
+            )
+          }),
+        ),
+    })),
+  ]),
+  {
+    name: "a renamed field is named by its model field, on the path that marshals last",
+    run: (h) =>
+      h.on(worldOf(DynamoModel.configure(Holding, { pair: { field: "p" } })), (db, probe) =>
+        expectNothingWritten(
+          probe,
+          () => db.entities.Rows.put({ id: "1", pair: ["a", empty()] }).asEffect(),
+          /"pair\[1\]": /,
+        ),
+      ),
+  },
+  {
+    name: "a renamed field is named by its model field, in a transaction",
+    run: (h) =>
+      h.on(worldOf(DynamoModel.configure(Holding, { pair: { field: "p" } })), (db, probe) =>
+        expectNothingWritten(
+          probe,
+          () =>
+            Transaction.transactWrite([
+              db.entities.Rows.put({ id: "1", pair: ["a", empty()] }),
+            ] as never),
+          /"pair\[1\]": /,
+        ),
+      ),
+  },
+  ...(
+    [
+      ["plain", {}],
+      ["versioned", { versioned: true }],
+      ["retained", { versioned: { retain: true } }],
+      ["unique", { unique: { byOther: ["other"] } }],
+    ] as const
+  ).map(([path, options]) => ({
+    name: `${path}: a NaN on a composite of a half nothing composes is refused too`,
+    run: (h: Harness) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            n: Schema.optional(Schema.Number),
+            m: Schema.optional(Schema.Number),
+            other: Schema.optional(Schema.String),
+          }),
+          {
+            ...options,
+            indexes: {
+              byPair: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["id"] },
+                sk: { field: "gsi1sk", composite: ["n", "m"] },
+              },
+            },
+          },
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            const NaN = Number.NaN
+            for (const write of [
+              () => db.entities.Rows.put({ id: "1", n: NaN }).asEffect(),
+              () => db.entities.Rows.upsert({ id: "1", n: NaN }).asEffect(),
+              () => db.entities.Rows.update(key).set({ n: NaN }).asEffect(),
+            ]) {
+              yield* expectNothingWritten(probe, write, /"n": .*NaN|EDD-9096/)
+            }
+            // A half it composes: key text refuses it with `escapeKeys`, and has text for it
+            // without.
+            yield* expectNothingWritten(
+              probe,
+              () => db.entities.Rows.update(key).set({ n: NaN, m: 1 }).asEffect(),
+              /"n": .*NaN|EDD-9096/,
+            )
+          }),
+      ),
+  })),
+  {
+    name: "a time-series append of a NaN on an index composite sends nothing",
+    run: (h) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            at: Schema.Number,
+            n: Schema.optional(Schema.Number),
+            m: Schema.optional(Schema.Number),
+          }),
+          {
+            timeSeries: {
+              orderBy: "at",
+              appendInput: Schema.Struct({
+                id: Schema.String,
+                at: Schema.Number,
+                n: Schema.optional(Schema.Number),
+                m: Schema.optional(Schema.Number),
+              }),
+            },
+            indexes: {
+              byPair: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["id"] },
+                sk: { field: "gsi1sk", composite: ["n", "m"] },
+              },
+            },
+          },
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            for (const input of [
+              { id: "1", at: 1, n: Number.NaN },
+              { id: "1", at: 1, n: Number.NaN, m: 2 },
+            ]) {
+              yield* expectNothingWritten(
+                probe,
+                () => db.entities.Rows.append(input).asEffect(),
+                /"n": .*NaN|EDD-9096/,
+              )
+            }
+          }),
+      ),
+  },
+  {
+    name: "a put hydrating a ref refuses the value before it reads the target",
+    run: (h) => {
+      class Target extends Schema.Class<Target>("NoStoredFormRefusedTarget")({
+        targetId: Schema.String.pipe(DynamoModel.identifier),
+      }) {}
+      class Holder extends Schema.Class<Holder>("NoStoredFormRefusedHolder")({
+        id: Schema.String,
+        target: Target.pipe(DynamoModel.ref),
+        n: Schema.optional(Schema.Number),
+      }) {}
+      const Targets = Entity.make({
+        model: Target,
+        entityType: "Target",
+        primaryKey: {
+          pk: { field: "pk", composite: ["targetId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as never) as any
+      const Rows = Entity.make({
+        model: Holder,
+        entityType: "Row",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        refs: { target: { entity: Targets } },
+      } as never) as any
+      const MainTable = Table.make({ schema, entities: { Rows, Targets } })
+      return h.on({ Rows, MainTable }, (_db, probe) =>
+        Effect.gen(function* () {
+          const db = (yield* DynamoClient.make({
+            entities: { Rows, Targets },
+            tables: { MainTable },
+          } as never)) as any
+          yield* db.entities.Targets.put({ targetId: "t" }).asEffect()
+          yield* expectNothingWritten(
+            probe,
+            () => db.entities.Rows.put({ id: "1", targetId: "t", n: 2 ** 60 }).asEffect(),
+            /"n": .*MAX_SAFE_INTEGER/,
+          )
+        }),
+      )
+    },
+  },
+  {
+    name: "an .append operand is judged in the form it would be stored",
+    run: (h) => {
+      const Joined = Strings.pipe(
+        Schema.decodeTo(Schema.String, {
+          decode: SchemaGetter.transform((set: ReadonlySet<string>) => [...set].join(",")),
+          encode: SchemaGetter.transform(
+            (joined: string) => new Set(joined === "" ? [] : joined.split(",")),
+          ),
+        }),
+      )
+      return h.on(
+        worldOf(Schema.Struct({ id: Schema.String, parts: Schema.Array(Joined) })),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", parts: ["a"] }).asEffect()
+            yield* expectNothingWritten(
+              probe,
+              () =>
+                db.entities.Rows.update(key)
+                  .append({ parts: [""] })
+                  .asEffect(),
+              /\.append\(\) of "parts\[0\]": .*no empty set/,
+            )
+          }),
+      )
+    },
+  },
+  {
+    name: "a renamed field is named as the model names it, on every path",
+    run: (h) =>
+      h.on(worldOf(DynamoModel.configure(Holding, { pair: { field: "stored" } })), (db, probe) =>
+        Effect.gen(function* () {
+          const input = { id: "1", pair: ["a", empty()] }
+          for (const write of [
+            () => db.entities.Rows.put(input).asEffect(),
+            () => db.entities.Rows.upsert(input).asEffect(),
+            () => Transaction.transactWrite([db.entities.Rows.put(input)] as never),
+            () => Batch.write([db.entities.Rows.put(input)] as never),
+          ]) {
+            yield* expectNothingWritten(probe, write, /"pair\[1\]": .*no empty set/)
+          }
+        }),
+      ),
+  },
+  {
+    name: "a field whose encoded form the marshaller won't take is refused, naming it",
+    run: (h) =>
+      h.on(
+        worldOf(Schema.Struct({ id: Schema.String, h: Schema.HashSet(Schema.String) })),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* expectNothingWritten(
+              probe,
+              () => db.entities.Rows.put({ id: "1", h: HashSet.make("a") }).asEffect(),
+              /"h\./,
+            )
+            // A limit, as it always was: an empty one marshals as a map of its internals.
+            yield* db.entities.Rows.put({ id: "1", h: HashSet.empty<string>() }).asEffect()
+            expect(live(yield* probe.rows())!.h?.M).toBeDefined()
+            const read = yield* db.entities.Rows.get(key)
+            expect(HashSet.size(read.h)).toBe(0)
+          }),
+      ),
+  },
+  {
+    name: "a packed field isn't judged as if it were stored natively",
+    run: (h) => {
+      const Boxed = Schema.Struct({ id: Schema.String, box: Schema.Struct({ x: Schema.Number }) })
+      return h.on(
+        worldOf(
+          DynamoModel.configure(Boxed, {
+            box: { storedAs: DynamoModel.Packed({ format: "json" }) as never },
+          }),
+          { versioned: true },
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            // Past `MAX_SAFE_INTEGER`, which a native number refuses and JSON holds.
+            const huge = 2 ** 60
+            yield* db.entities.Rows.put({ id: "1", box: { x: huge } }).asEffect()
+            expect(live(yield* probe.rows())!.box).toEqual({ S: `{"x":${huge}}` })
+            yield* db.entities.Rows.update(key)
+              .set({ box: { x: huge * 2 } })
+              .asEffect()
+            expect(live(yield* probe.rows())!.box).toEqual({ S: `{"x":${huge * 2}}` })
+            expect(Number(live(yield* probe.rows())!.version?.N)).toBe(2)
+          }),
+      )
+    },
+  },
+  {
+    name: "an immutable field holding one is refused on an update",
+    run: (h) =>
+      h.on(worldOf(DynamoModel.configure(Holding, { pair: { immutable: true } })), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", pair: ["a", new Set(["b"])] }).asEffect()
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              db.entities.Rows.update(key)
+                .set({ pair: ["a", empty()] })
+                .asEffect(),
+            /\.set\(\): "pair\[1\]": .*no empty set/,
+          )
+        }),
+      ),
+  },
+  {
+    name: "upsert holding one sends nothing",
+    run: (h) =>
+      h.on(worldOf(Holding), (db, probe) =>
+        expectNothingWritten(
+          probe,
+          () => db.entities.Rows.upsert({ id: "1", pair: ["a", empty()] }).asEffect(),
+          /"pair\[1\]": .*no empty set/,
+        ),
+      ),
+  },
+  {
+    name: "a time-series append holding one sends nothing",
+    run: (h) => {
+      const Reading = Schema.Struct({
+        id: Schema.String,
+        at: Schema.Number,
+        pair: Schema.Tuple([Schema.String, Strings]),
+      })
+      return h.on(
+        worldOf(Reading, { timeSeries: { orderBy: "at", appendInput: Reading } }),
+        (db, probe) =>
+          expectNothingWritten(
+            probe,
+            () => db.entities.Rows.append({ id: "1", at: 1, pair: ["a", empty()] }).asEffect(),
+            /"pair\[1\]": .*no empty set/,
+          ),
+      )
+    },
+  },
+  {
+    name: "Transaction and Batch holding one send nothing",
+    run: (h) =>
+      h.on(worldOf(Holding), (db, probe) =>
+        Effect.gen(function* () {
+          const put = () => db.entities.Rows.put({ id: "1", pair: ["a", empty()] })
+          yield* expectNothingWritten(
+            probe,
+            () => Transaction.transactWrite([put()] as never),
+            /"pair\[1\]": .*no empty set/,
+          )
+          yield* expectNothingWritten(
+            probe,
+            () => Batch.write([put()] as never),
+            /"pair\[1\]": .*no empty set/,
+          )
+        }),
+      ),
+  },
+  {
+    name: "a condition or filter comparing with one is refused, naming the field",
+    run: (h) =>
+      h.on(worldOf(Holding), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", n: 1 }).asEffect()
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              db.entities.Rows.update(key)
+                .set({ n: 2 })
+                .condition((t: any, { eq }: any) => eq(t.lists, [empty()]))
+                .asEffect(),
+            /"lists".*"\[0\]"|"lists".*\[0\]/,
+          )
+          for (const filter of [
+            (t: any, { eq }: any) => eq(t.lists, [empty()]),
+            (t: any, { ne }: any) => ne(t.lists, [empty()]),
+            (t: any, { contains }: any) => contains(t.lists, [empty()]),
+            (t: any, { gt }: any) => gt(t.n, Number.NaN),
+            (t: any, { between }: any) => between(t.n, 1, Number.NaN),
+            (t: any, { isIn }: any) => isIn(t.n, [1, Number.NaN]),
+          ]) {
+            yield* expectNothingWritten(
+              probe,
+              () => db.entities.Rows.scan().filter(filter).collect(),
+              /Comparing "(lists|n)" with a value DynamoDB can't store/,
+            )
+          }
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              db.entities.Rows.scan()
+                .filter({ lists: [empty()] })
+                .collect(),
+            /Comparing "lists" with a value DynamoDB can't store/,
+          )
+        }),
+      ),
+  },
+  {
+    name: "a condition with no path to name still says what it refuses",
+    run: (h) =>
+      h.on(worldOf(Holding), (db, probe) =>
+        expectNothingWritten(
+          probe,
+          () =>
+            db.entities.Rows.scan()
+              .filter((_t: any, { eq }: any) => eq(1, [empty()]))
+              .collect(),
+          /Comparing a value with a value DynamoDB can't store/,
+        ),
+      ),
+  },
+  {
+    name: "an aggregate holding one, in a tuple, a list or an unknown field, writes nothing",
+    run: (h) => {
+      const { world, Assemblies } = holdingAggregateWorld()
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          for (const [change, says] of [
+            [{ anything: [empty()] }, /"anything\[0\]": .*no empty set/],
+            [{ header: { lists: [empty()] } }, /"lists\[0\]": .*no empty set/],
+            [{ parts: [{ partId: "p", pair: ["a", empty()] }] }, /"pair\[1\]": .*no empty set/],
+          ] as const) {
+            yield* expectNothingWritten(
+              probe,
+              () => Assemblies.create({ ...holdingInput(), ...change }),
+              says,
+            )
+          }
+        }),
+      )
+    },
+  },
+  {
+    name: "an aggregate update to one reads, and writes nothing",
+    run: (h) => {
+      const { world, Assemblies } = holdingAggregateWorld()
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          yield* Assemblies.create(holdingInput())
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              Assemblies.update({ id: "1" }, ({ state }: any) => ({
+                ...state,
+                anything: [empty()],
+              })),
+            /"anything\[0\]": .*no empty set/,
+            { reads: true },
+          )
+        }),
+      )
+    },
+  },
+  {
+    name: "an event holding one writes nothing, in a tuple, a list or an unknown field",
+    run: (h) => {
+      const { world, Stream } = movedWorld()
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          for (const [fields, says] of [
+            [{ pair: ["a", empty()] }, /"data\.pair\[1\]": .*no empty set/],
+            [{ lists: [empty()] }, /"data\.lists\[0\]": .*no empty set/],
+            [{ anything: { deep: [empty()] } }, /"data\.anything\.deep\[0\]": .*no empty set/],
+          ] as const) {
+            yield* expectNothingWritten(
+              probe,
+              () => Stream.append({ moveId: "m" }, [movedOf(fields)], 0),
+              says,
+            )
+          }
+        }),
+      )
+    },
+  },
+  {
+    name: "metadata holding one writes nothing, shared or per event",
+    run: (h) => {
+      const { world, Stream } = movedWorld()
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              Stream.append({ moveId: "m" }, [movedOf({})], 0, {
+                metadata: { lists: [empty()] },
+              }),
+            /"metadata\.lists\[0\]": .*no empty set/,
+          )
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              Stream.append({ moveId: "m" }, [movedOf({})], 0, {
+                eventMetadata: [{ lists: [empty()] }],
+              }),
+            /"metadata\.lists\[0\]": .*no empty set/,
+          )
+        }),
+      )
+    },
+  },
+  {
+    name: "a snapshot state holding one writes nothing, inline or on its own",
+    run: (h) => {
+      const State = Schema.Struct({ lists: Schema.Array(Strings) })
+      const { world, Stream } = movedWorld({
+        snapshot: { schema: State, mode: "inline" },
+      })
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              Stream.append({ moveId: "m" }, [movedOf({})], 0, {
+                snapshot: { lists: [empty()] },
+              }),
+            /"state\.lists\[0\]": .*no empty set/,
+          )
+          yield* Stream.append({ moveId: "m" }, [movedOf({})], 0, {
+            snapshot: { lists: [new Set(["a"])] },
+          })
+          yield* expectNothingWritten(
+            probe,
+            () => Stream.writeSnapshot({ moveId: "m" }, { lists: [empty()] }, 1),
+            /"state\.lists\[0\]": .*no empty set/,
+          )
+        }),
+      )
+    },
+  },
+  {
+    name: "a command deciding an event holding one reads, and writes nothing",
+    run: (h) => {
+      const { world, Stream } = movedWorld()
+      const handle = EventStore.commandHandler(
+        {
+          initialState: { count: 0 },
+          decide: () => Effect.succeed([movedOf({ lists: [empty()] })]),
+          evolve: (state: any) => state,
+        } as never,
+        Stream,
+      ) as any
+      return h.on(world, (_db, probe) =>
+        expectNothingWritten(
+          probe,
+          () => handle({ moveId: "m" }, {}),
+          /"data\.lists\[0\]": .*no empty set/,
+          { reads: true },
+        ),
+      )
+    },
+  },
+  {
+    name: "an event beside one holding one in another stream's appendOp writes nothing",
+    run: (h) => {
+      const { world, Stream } = movedWorld()
+      const { Stream: Other } = (() => {
+        const made = EventStore.makeStream({
+          table: world.MainTable,
+          streamName: "OtherMoves",
+          events: [Moved],
+          streamId: { composite: ["moveId"] },
+        } as never) as any
+        return { Stream: made }
+      })()
+      return h.on(world, (_db, probe) =>
+        expectNothingWritten(
+          probe,
+          () =>
+            Stream.append({ moveId: "m" }, [movedOf({})], 0, {
+              additionalItems: [
+                Other.appendOp({ moveId: "n" }, [movedOf({ lists: [empty()] })], 0),
+              ],
+            }),
+          /"data\.lists\[0\]": .*no empty set/,
+        ),
+      )
+    },
+  },
+]
+
+// ---------------------------------------------------------------------------
+// `undefined` in a list: marshalling drops it, closing the list up
+// ---------------------------------------------------------------------------
+
+const S_ = Schema.String
+const U_ = Schema.UndefinedOr(Schema.String)
+const O_ = Schema.optional(Schema.String)
+
+const withField = (field: Schema.Top) =>
+  Schema.Struct({ id: Schema.String, t: Schema.optional(field) })
+
+const positionScenarios: ReadonlyArray<Scenario> = [
+  ...(
+    [
+      ["a gap before a required position", Schema.Tuple([S_, U_, S_]), ["a", undefined, "b"], 1],
+      ["a gap at the start", Schema.Tuple([U_, S_]), [undefined, "b"], 0],
+      ["an empty required last position", Schema.Tuple([S_, U_]), ["a", undefined], 1],
+      ["a gap before an optional position", Schema.Tuple([S_, U_, O_]), ["a", undefined, "c"], 1],
+      ["a gap in optional positions", Schema.Tuple([S_, O_, O_]), ["a", undefined, "c"], 1],
+    ] as const
+  ).flatMap(([name, tuple, value, position]) => [
+    {
+      name: `a tuple, ${name}: a put is refused, naming the field and the position`,
+      run: (h: Harness) =>
+        h.on(worldOf(withField(tuple)), (db, probe) =>
+          expectNothingWritten(
+            probe,
+            () => db.entities.Rows.put({ id: "1", t: value }).asEffect(),
+            new RegExp(`Position ${position} holds undefined`),
+          ),
+        ),
+    },
+    {
+      name: `a tuple, ${name}: .set and pathSet are refused`,
+      run: (h: Harness) =>
+        h.on(worldOf(withField(tuple)), (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1" }).asEffect()
+            yield* expectNothingWritten(
+              probe,
+              () => db.entities.Rows.update(key).set({ t: value }).asEffect(),
+              /holds undefined/,
+            )
+            yield* expectNothingWritten(
+              probe,
+              () =>
+                db.entities.Rows.update(key)
+                  .pathSet({ segments: ["t"], value, isPath: false })
+                  .asEffect(),
+              /holds undefined/,
+            )
+          }),
+        ),
+    },
+  ]),
+  {
+    name: "a tuple: a last optional position holding undefined goes, and the row reads",
+    run: (h) =>
+      h.on(worldOf(withField(Schema.Tuple([S_, O_]))), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", t: ["a", undefined] }).asEffect()
+          expect(live(yield* probe.rows())!.t).toEqual({ L: [{ S: "a" }] })
+          expect((yield* db.entities.Rows.get(key)).t).toEqual(["a"])
+          yield* db.entities.Rows.put({ id: "1", t: ["a"] }).asEffect()
+          expect((yield* db.entities.Rows.get(key)).t).toEqual(["a"])
+        }),
+      ),
+  },
+  {
+    name: "a tuple with every position holding a value stores the same bytes",
+    run: (h) =>
+      h.on(worldOf(withField(Schema.Tuple([S_, U_, S_]))), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", t: ["a", "b", "c"] }).asEffect()
+          expect(live(yield* probe.rows())!.t).toEqual({
+            L: [{ S: "a" }, { S: "b" }, { S: "c" }],
+          })
+          expect((yield* db.entities.Rows.get(key)).t).toEqual(["a", "b", "c"])
+        }),
+      ),
+  },
+  {
+    name: "a tuple nested in a struct, a list, a union and a class is refused the same",
+    run: (h) => {
+      class Boxed extends Schema.Class<Boxed>("NoStoredFormBoxed")({
+        t: Schema.Tuple([S_, U_, S_]),
+      }) {}
+      const gap = ["a", undefined, "b"]
+      const model = Schema.Struct({
+        id: Schema.String,
+        inStruct: Schema.optional(Schema.Struct({ t: Schema.Tuple([S_, U_, S_]) })),
+        inList: Schema.optional(Schema.Array(Schema.Tuple([S_, U_, S_]))),
+        inUnion: Schema.optional(Schema.Union([Schema.Number, Schema.Tuple([S_, U_, S_])])),
+        inClass: Schema.optional(Boxed),
+      })
+      return h.on(worldOf(model), (db, probe) =>
+        Effect.gen(function* () {
+          for (const input of [
+            { inStruct: { t: gap } },
+            { inList: [gap] },
+            { inUnion: gap },
+            { inClass: { t: gap } },
+          ]) {
+            const sent = probe.sent()
+            const exit = yield* db.entities.Rows.put({ id: "1", ...input })
+              .asEffect()
+              .pipe(Effect.flip)
+            expect((exit as any)._tag).toBe("ValidationError")
+            expect(probe.sent()).toBe(sent)
+          }
+        }),
+      )
+    },
+  },
+  {
+    name: "an event, metadata, snapshot state and aggregate holding such a tuple write nothing",
+    run: (h) => {
+      const gap = ["a", undefined, "b"]
+      const State = Schema.Struct({
+        gap: Schema.Tuple([Schema.String, Schema.UndefinedOr(Schema.String), Schema.String]),
+      })
+      const { world, Stream } = movedWorld({ snapshot: { schema: State, mode: "inline" } })
+      const Assemblies = Aggregate.make(HoldingAssembly, {
+        table: world.MainTable,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "assembly" },
+        root: { entityType: "HoldingRoot" },
+        edges: {
+          header: Aggregate.one({ entityType: "HoldingHeader" }),
+          parts: Aggregate.many({ entityType: "HoldingPart", sk: { composite: ["partId"] } }),
+        },
+      } as never) as any
+      return h.on(world, (_db, probe) =>
+        Effect.gen(function* () {
+          const held = /holds undefined/
+          yield* expectNothingWritten(
+            probe,
+            () => Stream.append({ moveId: "m" }, [movedOf({ gap })], 0),
+            /holds undefined/,
+          )
+          yield* expectNothingWritten(
+            probe,
+            () => Stream.append({ moveId: "m" }, [movedOf({})], 0, { metadata: { gap } }),
+            held,
+          )
+          yield* expectNothingWritten(
+            probe,
+            () => Stream.append({ moveId: "m" }, [movedOf({})], 0, { snapshot: { gap } }),
+            held,
+          )
+          yield* expectNothingWritten(
+            probe,
+            () =>
+              Assemblies.create({
+                ...holdingInput(),
+                header: { lists: [new Set(["a"])], gap },
+              }),
+            held,
+          )
+        }),
+      )
+    },
+  },
+  {
+    // A limit: the check sees the domain value, and `Option.none()` isn't `undefined` until it's
+    // encoded. Documented, and pinned so it's seen if it changes.
+    name: "a tuple position that only encodes to undefined isn't seen",
+    run: (h) =>
+      h.on(
+        worldOf(withField(Schema.Tuple([S_, Schema.OptionFromUndefinedOr(Schema.String), S_]))),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", t: ["a", Option.none(), "b"] }).asEffect()
+            expect(live(yield* probe.rows())!.t).toEqual({ L: [{ S: "a" }, { S: "b" }] })
+          }),
+      ),
+  },
+  {
+    // Not refused, deliberately: a put and a read of these both work today, and a caller
+    // can rely on the list closing up. It's a documented limit, and the owner's to change.
+    name: "a list holding undefined still closes up: stored and read back without it",
+    run: (h) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            list: Schema.Array(U_),
+            anything: Schema.Unknown,
+          }),
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({
+              id: "1",
+              list: ["a", undefined, "b"],
+              anything: ["a", undefined, "b"],
+            }).asEffect()
+            const row = live(yield* probe.rows())!
+            expect(row.list).toEqual({ L: [{ S: "a" }, { S: "b" }] })
+            expect(row.anything).toEqual({ L: [{ S: "a" }, { S: "b" }] })
+            const read = yield* db.entities.Rows.get(key)
+            expect(read.list).toEqual(["a", "b"])
+            expect(read.anything).toEqual(["a", "b"])
+          }),
+      ),
+  },
+]
+
 export const allScenarios = {
   noStoredForm: kindScenarios,
   noStoredFormLifecycle: kindLifecycleScenarios,
@@ -1902,4 +2902,6 @@ export const allScenarios = {
   noStoredFormAggregates: aggregateScenarios,
   noStoredFormEvents: eventScenarios,
   relativeUpdates: honestScenarios,
+  noStoredFormUnstorable: unstorableScenarios,
+  noStoredFormPositions: positionScenarios,
 }

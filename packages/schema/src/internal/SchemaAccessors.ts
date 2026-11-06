@@ -252,14 +252,6 @@ export const isSetDeclaration = (ast: SchemaAST.AST): boolean =>
       | undefined
   )?.id === READONLY_SET
 
-/** Whether a schema's stored side is a set, or a union with one. */
-export const storesSet = (schema: Schema.Top): boolean => {
-  const encoded = SchemaAST.toEncoded(schema.ast)
-  return SchemaAST.isUnion(encoded)
-    ? encoded.types.some((member) => isSetDeclaration(member))
-    : isSetDeclaration(encoded)
-}
-
 /**
  * The value on a stored side that DynamoDB can't store, if there is one. With
  * both in one union, `undefined` is what an absent attribute means.
@@ -289,6 +281,16 @@ const valueWithNoStoredForm = (
       return undefined
   }
 }
+
+/**
+ * Whether a value of this type can be `undefined` and be stored as one: an `undefined` that
+ * encodes to something else has a stored form.
+ */
+export const holdsUndefined = (ast: SchemaAST.AST): boolean =>
+  [SchemaAST.toType(ast), SchemaAST.toEncoded(ast)].every((side) => {
+    const found = valueWithNoStoredForm(side)
+    return found !== undefined && found.stored === undefined
+  })
 
 /**
  * The one rule for values with no stored form. DynamoDB can't store `undefined`

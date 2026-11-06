@@ -18,7 +18,7 @@ import { DateTime, Effect, Option, Schema } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
-import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
+import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshaller.js"
 import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 
 /**
@@ -452,6 +452,35 @@ export const composeKeysOrFail = <A>(
   )
 
 /**
+ * Marshal an item holding a caller's values. A value DynamoDB can't store (an
+ * empty set in a list, `NaN`, a number past `Number.MAX_SAFE_INTEGER`, …) fails with
+ * a `ValidationError` naming the field; `fieldOf` names a stored attribute by its
+ * model field. Any other throw stays a defect.
+ */
+export const marshalOrFail = <A>(
+  entityType: string,
+  operation: string,
+  marshal: () => A,
+  options: {
+    readonly fieldOf?: (attribute: string) => string
+    readonly outcome?: string
+  } = {},
+): Effect.Effect<A, ValidationError> =>
+  Effect.try({ try: marshal, catch: (error) => error }).pipe(
+    Effect.catch((error) =>
+      isUnstorableValue(error)
+        ? Effect.fail(
+            new ValidationError({
+              entityType,
+              operation,
+              cause: `${error.describe(options.fieldOf)} ${options.outcome ?? "Nothing was written."}`,
+            }),
+          )
+        : Effect.die(error),
+    ),
+  )
+
+/**
  * Compose the primary key for an entity item.
  */
 export const composePrimaryKey = (
@@ -615,5 +644,11 @@ export const validateAndBuildPutItem = (
     // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
     yield* entity._packFields(item, operation)
 
-    return { item, marshalled: toAttributeMap(item), now, createdAtSupplied }
+    const marshalled = yield* marshalOrFail(
+      entity.entityType,
+      operation,
+      () => toAttributeMap(item),
+      { fieldOf: entity._fieldOfAttribute },
+    )
+    return { item, marshalled, now, createdAtSupplied }
   })

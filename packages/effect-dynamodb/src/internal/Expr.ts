@@ -7,7 +7,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ConditionInput } from "../Expression.js"
-import { isEmptySet, toAttributeValue } from "../Marshaller.js"
+import { isEmptySet, toAttributeValue, unstorableIn } from "../Marshaller.js"
 import {
   compilePath,
   type PackedPath,
@@ -466,17 +466,33 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       return emptySetOperands(expr).some(isEmptySetOperand)
         ? "DynamoDB has no empty set, so a row holding one is a row without the attribute. " +
             "Only eq() and ne() can compare with one, by whether the attribute exists."
-        : undefined
+        : unstorableOperandProblem(expr)
   }
+}
+
+/** A value a comparison holds that DynamoDB can't store: compiling it would throw. */
+const unstorableOperandProblem = (expr: Expr): string | undefined => {
+  const operands = comparedOperands(expr)
+  for (const operand of operands) {
+    if (operand._tag !== "value") continue
+    const unstorable = unstorableIn({ value: operand.value })
+    if (unstorable === undefined) continue
+    const named = operands.find((other) => other._tag === "path")
+    const field = named === undefined ? "a value" : `"${named.segments.join(".")}"`
+    return `Comparing ${field} with a value DynamoDB can't store: ${unstorable.describe()}`
+  }
+  return undefined
 }
 
 /** Whether an operand is an empty set, which marshals to nothing. */
 const isEmptySetOperand = (operand: Operand): boolean =>
   operand._tag === "value" && isEmptySet(operand.value)
 
-/** The operands that can't take an empty set: `eq` and `ne` compile it to an existence test. */
-const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> => {
+/** The operands of a comparison. */
+const comparedOperands = (expr: Expr): ReadonlyArray<Operand> => {
   switch (expr._tag) {
+    case "eq":
+    case "ne":
     case "lt":
     case "lte":
     case "gt":
@@ -494,6 +510,10 @@ const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> => {
       return []
   }
 }
+
+/** The operands that can't take an empty set: `eq` and `ne` compile it to an existence test. */
+const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> =>
+  expr._tag === "eq" || expr._tag === "ne" ? [] : comparedOperands(expr)
 
 /** A condition or filter as an `Expr`: shorthand records are parsed. */
 export const toExpr = (cond: Expr | ConditionInput): Expr =>

@@ -216,6 +216,37 @@ describe("projection removal (tombstones)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("a tombstone holding a value DynamoDB can't store fails, writing nothing", () =>
+    Effect.gen(function* () {
+      const Unstorable = EventStore.projection({
+        ...base,
+        revision: { field: "rev", initial: Number.NaN },
+        removal: {},
+      })
+      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Cancelled({})])
+      const { outcomes } = yield* Unstorable.applyBatch(events)
+      const outcome = outcomes[0]!
+      if (outcome._tag !== "Failed") throw new Error("not refused")
+      expect(outcome.error).toBeInstanceOf(ValidationError)
+      expect(String((outcome.error as ValidationError).cause)).toMatch(/"rev": .*NaN/)
+      expect(rowOf("o1")).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("the entity's create refuses a value before reading for a tombstone", () =>
+    Effect.gen(function* () {
+      void Removable
+      resetCalls()
+      const error = yield* Effect.flip(
+        Summaries.create({ orderId: "o9", total: 2 ** 60, version: 0, rev: 0 }).asEffect(),
+      )
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(String((error as ValidationError).cause)).toMatch(/"total": .*MAX_SAFE_INTEGER/)
+      expect(calls.getItem).toBe(0)
+      expect(rowOf("o9")).toBeUndefined()
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("the entity's create takes a tombstone's place, as get reports none", () =>
     Effect.gen(function* () {
       const events = yield* seed("o1", [new Placed({ amount: 1 }), new Cancelled({})])
@@ -361,6 +392,38 @@ describe("projection outbox", () => {
       expect(delivered).toHaveLength(1)
       expect(delivered[0].tags).toEqual(new Set())
       expect("note" in delivered[0]).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("an effect holding a value DynamoDB can't store fails the row, writing nothing", () =>
+    Effect.gen(function* () {
+      const Refusing = (effect: unknown) =>
+        EventStore.projection({
+          ...base,
+          revision: "rev",
+          outbox: {
+            schema: Schema.Struct({
+              lists: Schema.optional(Schema.Array(Schema.ReadonlySet(Schema.String))),
+              gap: Schema.optional(
+                Schema.Tuple([Schema.String, Schema.UndefinedOr(Schema.String), Schema.String]),
+              ),
+            }),
+            effects: () => [effect as never],
+          },
+        })
+      const events = yield* seed("o1", [new Placed({ amount: 1 })])
+      const before = items("read").length
+      const emptySet = yield* Effect.flip(
+        Refusing({ lists: [new Set<string>()] }).apply(events[0]!),
+      )
+      expect(emptySet).toBeInstanceOf(ValidationError)
+      expect(String((emptySet as ValidationError).cause)).toMatch(
+        /"effect\.lists\[0\]": .*no empty set/,
+      )
+      const gap = yield* Effect.flip(Refusing({ gap: ["a", undefined, "b"] }).apply(events[0]!))
+      expect(gap).toBeInstanceOf(ValidationError)
+      expect(String((gap as ValidationError).cause)).toMatch(/holds undefined/)
+      expect(items("read")).toHaveLength(before)
     }).pipe(Effect.provide(TestLayer)),
   )
 

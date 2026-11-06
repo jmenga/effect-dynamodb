@@ -25,11 +25,11 @@ import {
   absentReading,
   firstTypeParameterAst,
   getSchemaFields,
+  holdsUndefined,
   isSchemaLike,
   isSetDeclaration,
   numericTypeWithStringEncoding,
   rowCanLack,
-  storesSet,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
 import { parseZonedIso } from "./ZonedIso.js"
@@ -1185,6 +1185,8 @@ export interface DeepSubstitutionOptions {
    * back. `create` input stays a set. Propagated through the recursion.
    */
   readonly listedSets?: boolean | undefined
+  /** See {@link writingTuplePositions}. Propagated through the recursion. */
+  readonly undefinedPositionsOnly?: boolean | undefined
 }
 
 /** The options a nested schema inherits: everything but the per-position ones. */
@@ -1196,7 +1198,8 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.path ||
   opts?.enforceChecks ||
   opts?.absentReads ||
-  opts?.listedSets
+  opts?.listedSets ||
+  opts?.undefinedPositionsOnly
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
         ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
@@ -1206,6 +1209,7 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
         ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
         ...(opts?.absentReads ? { absentReads: opts.absentReads } : {}),
         ...(opts?.listedSets ? { listedSets: true } : {}),
+        ...(opts?.undefinedPositionsOnly ? { undefinedPositionsOnly: true } : {}),
       }
     : undefined
 
@@ -1562,24 +1566,65 @@ const holdsAbsentRead = (schema: Schema.Top): boolean => {
   )
 }
 
-/** Whether an array's elements can be an empty set, which a list has no way to leave out. */
-const listsEmptySets = (schema: Schema.Top): boolean => {
-  if (!isArraySchema(schema)) return false
-  const element = arrayElementOf(schema)
-  return element !== undefined && storesSet(element)
+/** Whether a tuple has a fixed position that can hold `undefined`. */
+const hasUndefinedPosition = (schema: Schema.Top): boolean =>
+  SchemaAST.isArrays(schema.ast) && schema.ast.elements.some((element) => holdsUndefined(element))
+
+/** Whether a tuple with a position that can hold `undefined` is anywhere in the schema. */
+const holdsUndefinedPosition = (schema: Schema.Top): boolean => {
+  const inner = optionalField(schema)?.inner ?? decodingDefaultField(schema)?.inner
+  if (inner !== undefined) return holdsUndefinedPosition(inner)
+  if (hasUndefinedPosition(schema)) return true
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    return container.children.some((child) => holdsUndefinedPosition(child))
+  }
+  if (isArraySchema(schema)) {
+    const element = arrayElementOf(schema)
+    return element !== undefined && holdsUndefinedPosition(element)
+  }
+  const fields = schemaFieldsOf(schema)
+  return (
+    fields !== undefined && Object.values(fields).some((field) => holdsUndefinedPosition(field))
+  )
 }
 
-/** A list element can't be absent: it would close up, moving the elements after it. */
-const refusingEmptySetElements = (list: Schema.Top): Schema.Top =>
-  (
-    list as Schema.Top & { readonly check: (...checks: ReadonlyArray<unknown>) => Schema.Top }
-  ).check(
-    Schema.makeFilter(
-      (elements: ReadonlyArray<unknown>) =>
-        !elements.some((element) => element instanceof Set && element.size === 0) ||
-        "DynamoDB has no empty set, and a list element can't be left out. Remove the element instead",
-    ),
+/**
+ * Marshalling drops `undefined` from a list, closing it up. In a tuple that moves
+ * the values after it to other positions, or leaves a required position empty, so
+ * the row reads back wrong or not at all. Only a last optional position can go, and
+ * a position in a tuple's rest, which is a list.
+ */
+const refusingUndefinedPositions = (tuple: Schema.Top): Schema.Top => {
+  const optional = (tuple.ast as SchemaAST.Arrays).elements.map((element) =>
+    SchemaAST.isOptional(element),
   )
+  return (
+    tuple as Schema.Top & { readonly check: (...checks: ReadonlyArray<unknown>) => Schema.Top }
+  ).check(
+    Schema.makeFilter((values: ReadonlyArray<unknown>) => {
+      const position = values.findIndex(
+        (value, index) =>
+          value === undefined &&
+          index < optional.length &&
+          (optional[index] !== true ||
+            values.slice(index + 1).some((later) => later !== undefined)),
+      )
+      return (
+        position === -1 ||
+        `Position ${position} holds undefined, and a list can't keep an empty position: ` +
+          "the values after it would move, or the row couldn't be read"
+      )
+    }),
+  )
+}
+
+/** Whether a substitution of this schema refuses what its tuple positions can't keep. */
+const refusesUndefinedPositions = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): boolean =>
+  opts?.enforceChecks === true && opts.absentReads !== "only" && hasUndefinedPosition(schema)
 
 /**
  * Recursively determine whether a schema contains — at any depth reachable
@@ -1594,9 +1639,10 @@ const refusingEmptySetElements = (list: Schema.Top): Schema.Top =>
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
   if (opts?.absentReads === "only") return holdsAbsentRead(schema)
   if (opts?.absentReads && holdsAbsentRead(schema)) return true
-  if (opts?.enforceChecks && listsEmptySets(schema)) return true
+  if (opts?.enforceChecks && hasUndefinedPosition(schema)) return true
   // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
   // `skipTopLevel` names top-level fields only, so it is dropped below.
   //
@@ -1709,7 +1755,12 @@ export const substituteSchemaDeep = (
   // field beneath it and keep the step, so a missing key still defaults (#133).
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
-    return defaulted.rewrap(substituteSchemaDeep(defaulted.inner, opts))
+    const beneath = substituteSchemaDeep(defaulted.inner, opts)
+    return defaulted.rewrap(
+      refusesUndefinedPositions(defaulted.inner, opts)
+        ? refusingUndefinedPositions(beneath)
+        : beneath,
+    )
   }
 
   // Leaf: self-date schema → tolerant bidirectional date transform.
@@ -1765,7 +1816,8 @@ export const substituteSchemaDeep = (
     const ordered = [...children.filter((c) => c.first), ...children.filter((c) => !c.first)]
     const lenient = opts?.absentReads ? ordered.filter((c) => holdsAbsentRead(c.child)) : []
     if (!container.isUnion || lenient.length === 0) {
-      return container.rebuild(ordered.map((c) => c.substituted))
+      const rebuilt = container.rebuild(ordered.map((c) => c.substituted))
+      return refusesUndefinedPositions(schema, opts) ? refusingUndefinedPositions(rebuilt) : rebuilt
     }
     // A member reading an absent attribute as a value accepts more than it
     // declares, enough to claim a row of a later member. So every member gets
@@ -1791,9 +1843,7 @@ export const substituteSchemaDeep = (
     const rebuilt = Schema.Array(
       substituteSchemaDeep(element, deeper) as Schema.Codec<any>,
     ) as unknown as Schema.Top
-    if (!opts?.enforceChecks) return rebuilt
-    const kept = withMetadataOf(schema, rebuilt)
-    return listsEmptySets(schema) ? refusingEmptySetElements(kept) : kept
+    return opts?.enforceChecks ? withMetadataOf(schema, rebuilt) : rebuilt
   }
 
   // Struct / Class: substitute each field, recursing into nested structures.
@@ -1858,6 +1908,16 @@ export const substituteSchemaDeep = (
  */
 export const readingAbsentValues = (schema: Schema.Top): Schema.Top =>
   substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
+
+/**
+ * A schema the library stores but doesn't derive, refusing a tuple position holding
+ * `undefined` that a stored list can't keep, and otherwise exactly as declared.
+ * Unchanged when no tuple of it can hold one.
+ *
+ * @internal
+ */
+export const writingTuplePositions = (schema: Schema.Top): Schema.Top =>
+  substituteSchemaDeep(schema, { undefinedPositionsOnly: true, enforceChecks: true })
 
 /**
  * Substitute model fields with bidirectional transforms where needed:

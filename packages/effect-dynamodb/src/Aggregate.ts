@@ -85,7 +85,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
-import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
+import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
   diagnosedValidationError,
@@ -1746,18 +1746,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
       // Packed AFTER the group diff above compared the decomposed values, so
       // an unchanged packed value is never rewritten (#147).
-      const newDynamo = buildDynamoItems(
-        yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
-        config,
-        pkValue,
-        KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembledNew),
+      const newPacked = yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update")
+      const newDynamo = yield* marshalOrFail(aggregateName, "update", () =>
+        buildDynamoItems(
+          newPacked,
+          config,
+          pkValue,
+          KeyComposer.extractKeyComposites(
+            config.schema,
+            {},
+            config.collection.sk?.composite ?? [],
+            keyRecord(assembledNew),
+          ),
+          keyRecord,
+          stampFor(now, existingCreated),
         ),
-        keyRecord,
-        stampFor(now, existingCreated),
       )
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -2427,13 +2430,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // 6. Build DynamoDB items with composed keys (create only ever PUTs).
           //    Every row is new, so `created` has nothing to carry forward.
           const now = yield* DateTime.now
-          const dynamoGroups = buildDynamoItems(
-            yield* packAggregateGroups(groups, packedByType, aggregateName, "create"),
-            config,
-            pkValue,
-            collectionSkComposites,
-            keyRecord,
-            stampFor(now, EMPTY_CREATED),
+          const packedGroups = yield* packAggregateGroups(
+            groups,
+            packedByType,
+            aggregateName,
+            "create",
+          )
+          const dynamoGroups = yield* marshalOrFail(aggregateName, "create", () =>
+            buildDynamoItems(
+              packedGroups,
+              config,
+              pkValue,
+              collectionSkComposites,
+              keyRecord,
+              stampFor(now, EMPTY_CREATED),
+            ),
           )
 
           // 7. Write via sub-aggregate transactions. The root item goes first in

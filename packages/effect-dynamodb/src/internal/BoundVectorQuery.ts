@@ -37,6 +37,7 @@ import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import { fromAttributeMap, toAttributeValue } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
+import { marshalOrFail } from "./TransactableOps.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
@@ -326,7 +327,12 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         // Stored attribute name — a `storedAs`-renamed field lives on disk (and
         // in the index's SearchSchema) under its DB name, not its domain name.
         names[nameKey] = resolveDbName(field)
-        values[valueKey] = toAttributeValue(value)
+        values[valueKey] = yield* marshalOrFail(
+          entityType,
+          "search",
+          () => toAttributeValue(value, field),
+          { outcome: "Nothing was sent." },
+        )
         conditions.push(`${nameKey} = ${valueKey}`)
         filterIndex++
       }

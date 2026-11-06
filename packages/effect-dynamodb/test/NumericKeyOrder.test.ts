@@ -486,9 +486,26 @@ const Meters = Entity.make({
   },
   timeSeries: { orderBy: "at", appendInput: Meter },
 })
+/** An upsert that reads first: keys are composed before that read, so it isn't paid for. */
+const GuardedGauges = Entity.make({
+  model: Gauge,
+  entityType: "GuardedGauge",
+  primaryKey: {
+    pk: { field: "pk", composite: ["gaugeId"] },
+    sk: { field: "sk", composite: ["slot"] },
+  },
+  indexes: {
+    byScore: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["gaugeId"] },
+      sk: { field: "gsi1sk", composite: ["score"] },
+    },
+  },
+  versioned: { retain: true },
+})
 const NanTable = Table.make({
   schema: DynamoSchema.make({ name: "nan-keys", version: 1, escapeKeys: true }),
-  entities: { Gauges, Badges, Slots, Meters },
+  entities: { Gauges, Badges, Slots, Meters, GuardedGauges },
 })
 /**
  * Every write dies: a NaN must be refused before any write is built. (A
@@ -502,7 +519,7 @@ const NanLayer = Layer.merge(
 describe("[EDD-9096] a NaN composite is a ValidationError, never a write (#171 E8)", () => {
   const NaN = Number.NaN
   const db = DynamoClient.make({
-    entities: { Gauges, Badges, Slots, Meters },
+    entities: { Gauges, Badges, Slots, Meters, GuardedGauges },
     tables: { NanTable },
   })
   const cases: ReadonlyArray<
@@ -528,6 +545,10 @@ describe("[EDD-9096] a NaN composite is a ValidationError, never a write (#171 E
     ],
     ["restore", (c) => c.entities.Gauges.restore({ gaugeId: "g", slot: NaN })],
     ["purge", (c) => c.entities.Gauges.purge({ gaugeId: "g", slot: NaN })],
+    [
+      "upsert that reads first, of a NaN index composite",
+      (c) => c.entities.GuardedGauges.upsert({ gaugeId: "g", slot: 1, score: NaN }).asEffect(),
+    ],
     [
       "append of a NaN orderBy",
       (c) => c.entities.Meters.append({ meterId: "m", at: NaN, v: 1 }).asEffect(),

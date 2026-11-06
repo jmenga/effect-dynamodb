@@ -5,11 +5,15 @@
  * field two ways: the model lets it (`rowOmits`), or the field holds a value DynamoDB can't
  * store, which an absent attribute stands for (`absentReading`).
  */
-import { Effect, Exit, Option, Schema, SchemaGetter } from "effect"
+import { DateTime, Effect, Exit, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
-import { readingAbsentValues } from "../src/internal/EntitySchemas.js"
+import {
+  readingAbsentValues,
+  substituteSchemaDeep,
+  writingTuplePositions,
+} from "../src/internal/EntitySchemas.js"
 import {
   absentReading,
   pathIsRequired,
@@ -464,6 +468,192 @@ describe("the derived update schema", () => {
     it("a field whose value has no stored form: `null` means clear it", () => {
       expect(Exit.isSuccess(json()({ tags: null }))).toBe(true)
       expect(Exit.isSuccess(json()({ undefinable: null }))).toBe(true)
+    })
+  })
+})
+
+describe("a tuple position holding undefined", () => {
+  const S = Schema.String
+  const U = Schema.UndefinedOr(Schema.String)
+  const O = Schema.optional(Schema.String)
+  const u = undefined
+  const writes = (schema: Schema.Top, value: unknown) =>
+    Exit.isSuccess(Schema.encodeUnknownExit(writingTuplePositions(schema) as never)(value))
+  const refusal = (schema: Schema.Top, value: unknown) => {
+    const exit = Schema.encodeUnknownExit(writingTuplePositions(schema) as never)(value)
+    return Exit.isFailure(exit) ? String(exit.cause) : ""
+  }
+
+  const REFUSED: ReadonlyArray<readonly [string, Schema.Top, unknown, number]> = [
+    ["in the middle", Schema.Tuple([S, U, S]), ["a", u, "b"], 1],
+    ["at the end, required", Schema.Tuple([S, U]), ["a", u], 1],
+    ["at the start", Schema.Tuple([U, S]), [u, "b"], 0],
+    ["before an optional that holds a value", Schema.Tuple([S, U, O]), ["a", u, "c"], 1],
+    ["an optional with a value after it", Schema.Tuple([S, O, O]), ["a", u, "c"], 1],
+    ["the first of several", Schema.Tuple([U, U, S]), [u, u, "c"], 0],
+  ]
+  for (const [name, schema, value, position] of REFUSED) {
+    it(`refused ${name}`, () => {
+      expect(refusal(schema, value)).toContain(`Position ${position} holds undefined`)
+    })
+  }
+
+  const STORED: ReadonlyArray<readonly [string, Schema.Top, unknown]> = [
+    ["every position holding a value", Schema.Tuple([S, U, S]), ["a", "b", "c"]],
+    ["a last optional holding undefined", Schema.Tuple([S, O]), ["a", u]],
+    ["a last optional left out", Schema.Tuple([S, O]), ["a"]],
+    ["two last optionals holding undefined", Schema.Tuple([S, O, O]), ["a", u, u]],
+    ["an optional holding a value", Schema.Tuple([S, O]), ["a", "b"]],
+  ]
+  for (const [name, schema, value] of STORED) {
+    it(`stored: ${name}`, () => {
+      expect(writes(schema, value)).toBe(true)
+    })
+  }
+
+  const NESTED: ReadonlyArray<readonly [string, Schema.Top, unknown]> = [
+    ["a struct field", Schema.Struct({ t: Schema.Tuple([U, S]) }), { t: [u, "b"] }],
+    [
+      "an optional field",
+      Schema.Struct({ t: Schema.optional(Schema.Tuple([U, S])) }),
+      { t: [u, "b"] },
+    ],
+    [
+      "a field with a decoding default",
+      Schema.Struct({
+        t: Schema.Tuple([U, S]).pipe(Schema.withDecodingDefault(Effect.succeed([u, "d"] as const))),
+      }),
+      { t: [u, "b"] },
+    ],
+    ["a list", Schema.Array(Schema.Tuple([U, S])), [[u, "b"]]],
+    ["a tuple", Schema.Tuple([S, Schema.Tuple([U, S])]), ["a", [u, "b"]]],
+    [
+      "a deep struct",
+      Schema.Struct({ a: Schema.Struct({ b: Schema.Array(Schema.Tuple([U, S])) }) }),
+      { a: { b: [[u, "b"]] } },
+    ],
+    ["a union", Schema.Union([Schema.Number, Schema.Tuple([U, S])]), [u, "b"]],
+    ["a record", Schema.Record(Schema.String, Schema.Tuple([U, S])), { k: [u, "b"] }],
+  ]
+  for (const [name, schema, value] of NESTED) {
+    it(`found inside ${name}`, () => {
+      expect(refusal(schema, value)).toContain("Position 0 holds undefined")
+    })
+  }
+
+  it("a class holding one", () => {
+    class Holder extends Schema.Class<Holder>("RowCanLackTupleHolder")({
+      t: Schema.Tuple([U, S]),
+    }) {}
+    expect(refusal(Holder, new Holder({ t: [u, "b"] }))).toContain("Position 0 holds undefined")
+  })
+
+  const UNCHANGED: ReadonlyArray<readonly [string, Schema.Top]> = [
+    ["a plain struct", Schema.Struct({ a: S, b: Schema.Number })],
+    ["a tuple no position of which can hold it", Schema.Tuple([S, Schema.Number])],
+    ["a list of undefined", Schema.Array(U)],
+    ["a struct field holding undefined", Schema.Struct({ a: U })],
+    ["a nullable tuple position", Schema.Tuple([S, Schema.NullOr(S)])],
+    ["a transformation", Schema.Tuple([Schema.NumberFromString, S])],
+    [
+      "a set position, which is an empty set and not undefined",
+      Schema.Tuple([S, Schema.ReadonlySet(S)]),
+    ],
+    ["a date, left as declared", Schema.Struct({ at: Schema.DateTimeUtc })],
+    [
+      "a position only its encoding makes undefined",
+      Schema.Tuple([S, Schema.OptionFromUndefinedOr(S)]),
+    ],
+  ]
+  for (const [name, schema] of UNCHANGED) {
+    it(`no tuple can hold one: ${name} is the same schema`, () => {
+      expect(writingTuplePositions(schema)).toBe(schema)
+    })
+  }
+
+  it("what it doesn't refuse is encoded as declared", () => {
+    const Declared = Schema.Struct({
+      t: Schema.Tuple([U, Schema.NumberFromString]),
+      n: Schema.NumberFromString,
+      checked: Schema.String.check(Schema.isMinLength(3)),
+      at: Schema.DateTimeUtc,
+    })
+    const at = DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")
+    const encoded = Schema.encodeUnknownSync(writingTuplePositions(Declared) as never)({
+      t: ["a", 1],
+      n: 2,
+      checked: "abc",
+      at,
+    })
+    expect(encoded).toEqual({ t: ["a", "1"], n: "2", checked: "abc", at })
+  })
+
+  it("an undefined that encodes to something else has a stored form, and stays", () => {
+    const NoneIsEmpty = Schema.String.pipe(
+      Schema.decodeTo(Schema.UndefinedOr(S), {
+        decode: SchemaGetter.transform((text: string) => (text === "" ? undefined : text)),
+        encode: SchemaGetter.transform((value: string | undefined) => value ?? ""),
+      }),
+    )
+    const Declared = Schema.Tuple([NoneIsEmpty, S])
+    expect(writingTuplePositions(Declared)).toBe(Declared)
+    expect(Schema.encodeUnknownSync(writingTuplePositions(Declared) as never)([u, "b"])).toEqual([
+      "",
+      "b",
+    ])
+  })
+
+  it("a limit: a struct beneath a decoding default isn't walked", () => {
+    const Declared = Schema.Struct({ t: Schema.Tuple([U, S]) }).pipe(
+      Schema.withDecodingDefault(Effect.succeed({ t: [u, "d"] as const })),
+    )
+    expect(writes(Declared, { t: [u, "b"] })).toBe(true)
+  })
+
+  it("a read isn't refused, nor anything but the write schemas", () => {
+    const Read = readingAbsentValues(Schema.Tuple([U, Schema.Struct({ s: Schema.ReadonlySet(S) })]))
+    expect(Exit.isSuccess(Schema.decodeUnknownExit(Read as never)([u, {}]))).toBe(true)
+    const Plain = substituteSchemaDeep(Schema.Tuple([U, Schema.DateTimeUtc]))
+    const at = DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")
+    expect(Exit.isSuccess(Schema.encodeUnknownExit(Plain as never)([u, at]))).toBe(true)
+  })
+
+  it("a list holding undefined isn't its concern: a list has no positions to keep", () => {
+    const Declared = Schema.Array(U)
+    expect(writes(Declared, ["a", u, "b"])).toBe(true)
+  })
+
+  it("the rest of a tuple with a rest is a list, and it's the fixed positions that count", () => {
+    const Declared = Schema.TupleWithRest(Schema.Tuple([S, U]), [U])
+    expect(writes(Declared, ["a", "b", u, "c"])).toBe(true)
+    expect(refusal(Declared, ["a", u, "c"])).toContain("Position 1 holds undefined")
+  })
+
+  describe("on an entity", () => {
+    const Tupled = Schema.Struct({ id: S, t: Schema.Tuple([S, U, S]) })
+    const Rows = Entity.make({
+      model: Tupled,
+      entityType: "Row",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    } as never) as unknown as {
+      readonly inputSchema: Schema.Top
+      readonly updateSchema: Schema.Top
+    }
+
+    it("the write schemas refuse it, on an encode and a decode", () => {
+      const value = { id: "1", t: ["a", u, "b"] }
+      for (const derived of [Rows.inputSchema]) {
+        expect(Exit.isFailure(Schema.encodeUnknownExit(derived as never)(value))).toBe(true)
+        expect(Exit.isFailure(Schema.decodeUnknownExit(derived as never)(value))).toBe(true)
+      }
+      expect(
+        Exit.isFailure(Schema.encodeUnknownExit(Rows.updateSchema as never)({ t: ["a", u, "b"] })),
+      ).toBe(true)
+    })
+
+    it("and take it whole", () => {
+      const value = { id: "1", t: ["a", "x", "b"] }
+      expect(Exit.isSuccess(Schema.encodeUnknownExit(Rows.inputSchema as never)(value))).toBe(true)
     })
   })
 })

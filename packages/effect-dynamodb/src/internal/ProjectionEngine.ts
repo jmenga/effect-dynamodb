@@ -25,7 +25,10 @@ import {
   ProjectionSourceConflict,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { readingAbsentValues } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import {
+  readingAbsentValues,
+  writingTuplePositions,
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   DateTime,
@@ -53,6 +56,7 @@ import {
   composePrimaryKey,
   generateTimestampPrimitive,
   KEY_TEXT,
+  marshalOrFail,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
   validateAndBuildPutItem,
@@ -610,7 +614,9 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
         const outbox = config.outbox!
-        const encoded = yield* S.encodeUnknownEffect(outbox.schema)(e.effect).pipe(
+        const encoded = yield* S.encodeUnknownEffect(
+          writingTuplePositions(outbox.schema) as S.Codec<unknown>,
+        )(e.effect).pipe(
           Effect.mapError(
             (cause) =>
               new ValidationError({ entityType, operation: `${config.label}.outbox`, cause }),
@@ -637,7 +643,9 @@ export const makeEngine = (config: EngineConfig) => {
           item[outbox.index.pk] = outboxMarker(entityType)
           item[outbox.index.sk] = `${rowPk}#${sk}`
         }
-        return toAttributeMap(item)
+        return yield* marshalOrFail(entityType, `${config.label}.outbox`, () =>
+          toAttributeMap(item),
+        )
       }),
     )
 
@@ -689,7 +697,9 @@ export const makeEngine = (config: EngineConfig) => {
             (DateTime.toEpochMillis(now) + Dur.toMillis(config.removal.ttl)) / 1000,
           )
         }
-        rowItem = toAttributeMap(tomb)
+        rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
+          toAttributeMap(tomb),
+        )
       } else if (enqueued.length > 0) {
         const built = yield* validateAndBuildPutItem(
           readModel as any,

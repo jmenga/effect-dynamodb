@@ -355,10 +355,25 @@ This holds at any depth (a struct, a class, the elements of a list), and on ever
 
 Some places have no attribute to leave out, or no way to say so:
 
-- **A list element.** Leaving one out moves the elements after it, so an empty set in a `Schema.Array` of sets is refused with a `ValidationError`, as is a `pathSet` of one onto an element. Use `pathRemove` to remove the element.
+- **An empty set in a list or a tuple.** Leaving it out moves the elements after it, so it's refused with a `ValidationError` naming where it is, such as `"pair[1]"`, before anything is sent. That goes for a `Schema.Array` of sets, a `Schema.Tuple`, an `.append` or `pathSet` operand, a list in a `Schema.Unknown` field, and a list in an event, its metadata, a snapshot's state or an outbox effect. Use `pathRemove` to remove an element.
+- **`undefined` in a tuple position.** A stored list closes up, so the values after it would move, or the row couldn't be read. It's refused the same way, unless no value follows it in an optional position or it encodes to something else. The check looks at the domain value, so a position only its encoding makes `undefined` (`Option.none()` under `Schema.OptionFromUndefinedOr`) isn't seen, and closes up. Use `Schema.OptionFromNullOr` there.
+- **`undefined` in a list.** It closes up: `["a", undefined, "b"]` in a `Schema.Array(Schema.UndefinedOr(...))` or a `Schema.Unknown` field is stored, and reads back, as `["a", "b"]`. So does the rest of a `Schema.TupleWithRest`. Use `Schema.NullOr` for a position that has to hold nothing.
 - **A record entry.** An entry holding an empty set isn't stored, so the record reads back without that key.
 - **A `.select()`.** A projection returns what's stored, undecoded, so the attribute stays absent.
-- **A comparison.** Only `eq` and `ne` have a meaning for an empty set, as `attribute_not_exists` and `attribute_exists`. Any other comparison with one is refused. `eq(t.field, undefined)` is left as it is, since an `undefined` there is more often a mistake.
+- **A comparison.** Only `eq` and `ne` have a meaning for an empty set, as `attribute_not_exists` and `attribute_exists`. Any other comparison with one is refused. `eq(t.field, undefined)` is left as it is, since an `undefined` there is more often a mistake, and `.filter({ field: undefined })` still means no filter.
+
+`Schema.Unknown`, `Schema.Any` and `Schema.Void` fields count as holding `undefined`, since they can.
+
+Anything else the marshaller won't take is refused the same way, naming the field: `NaN`, `Infinity`, a number past `Number.MAX_SAFE_INTEGER` (use `Schema.BigInt`), and a set of anything but strings, numbers or binary. With `escapeKeys`, a `NaN` feeding a key is `EDD-9096` instead. A `DynamoModel.Packed` field is judged by its own form, so it holds a number that large and refuses `NaN`, because JSON does.
+
+The marshaller lets a few things past. DynamoDB rejects a set mixing strings and numbers, as a `DynamoError`. A function in a map is dropped, and a class with no enumerable fields, such as a plain `Date`, is stored as an empty map. A `Schema.HashSet` can't be stored: a non-empty one is refused, and an empty one is stored as a map of its internals, reading back empty.
+
+The rule has limits a value can run into:
+
+- **Schemas it can't walk.** `Schema.suspend` and a class built with `.check()` or `.annotate()` aren't looked into, and nor is what's beneath a container's decoding default. An absent attribute inside them is a decode failure, and a tuple inside them isn't checked. `oneOf` union members stay strict, because a lenient copy would make two members match.
+- **A transform that won't round trip.** A transform encoding a value to an empty set that doesn't decode one back can't read back what it stored. `.set` of that value is refused, naming the field, and `put` fails with `EDD-9050` as a defect, writing nothing.
+- **The `Expression` builders.** `Expression.condition` and the other builders are plain functions that build their expression when called, so a value they can't marshal throws there, as `UnstorableValue`. Inside `Effect.gen` that's a defect, and it's how a `Transaction.check` gets its condition. `.condition()` and `.filter()` take the same input and refuse it with a `ValidationError`.
+- **Reads that come first.** An aggregate `update` and a `commandHandler` read before they decide what to write, so a refused value there has cost a read, though nothing is written.
 
 ### Relative Updates Aren't Checked Against the Model
 

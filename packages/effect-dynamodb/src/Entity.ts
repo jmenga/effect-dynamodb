@@ -139,11 +139,13 @@ import {
   INCARNATION_TOKEN,
   isProjectionTombstone,
   KEY_TEXT,
+  marshalOrFail,
   OUTBOX_CLAIM,
   OUTBOX_CLAIMED_UNTIL,
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   overTombstone,
+  projectionTombstonesOf,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
@@ -163,6 +165,8 @@ import {
   isEmptySet,
   toAttributeMap,
   toAttributeValue,
+  UnstorableValue,
+  unstorableIn,
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
@@ -737,6 +741,8 @@ export interface Entity<
    * differently-shaped item depending on which API wrote it.
    */
   readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
+  /** @internal The model field a stored attribute holds, for a message naming it. */
+  readonly _fieldOfAttribute: (attribute: string) => string
 
   /**
    * @internal Whether a created item carries the hidden incarnation token
@@ -2603,6 +2609,66 @@ const makeImpl = <
 
   const modelFieldSchemas = data.modelFields as globalThis.Record<string, Schema.Top>
   const isModelField = (name: string): boolean => Object.hasOwn(modelFieldSchemas, name)
+  const modelFieldStoredIn = (attribute: string): string | undefined =>
+    Object.keys(modelFieldSchemas).find((field) => resolveDbName(field) === attribute)
+  const fieldOfAttribute = (attribute: string): string => modelFieldStoredIn(attribute) ?? attribute
+
+  /**
+   * The fields of an encoded payload to judge against what DynamoDB can store. A
+   * packed field has its own form, and a `NaN` feeding a key is key composition's to
+   * refuse first, with its own code (`refuseUncomposed` has the rest).
+   */
+  const fieldsToStore = (
+    encoded: globalThis.Record<string, unknown>,
+  ): globalThis.Record<string, unknown> => {
+    const composites = indexCompositeFields()
+    return Object.fromEntries(
+      Object.entries(encoded).filter(
+        ([field, value]) =>
+          !(field in packedFields) &&
+          !(Number.isNaN(value) && (composites.has(field) || isPrimaryComposite(field))),
+      ),
+    )
+  }
+
+  /** Refuses a value DynamoDB can't store, for a path about to read or send something. */
+  const refuseUnstorable = (
+    encoded: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const unstorable = unstorableIn(fieldsToStore(encoded as globalThis.Record<string, unknown>))
+    return unstorable === undefined
+      ? Effect.void
+      : Effect.fail(
+          new ValidationError({
+            entityType,
+            operation,
+            cause: `${unstorable.describe()} Nothing was sent.`,
+          }),
+        )
+  }
+
+  /**
+   * For a path that has composed its keys: a `NaN` `fieldsToStore` left to key composition,
+   * which didn't refuse it. It fed a half that wasn't composed, or `escapeKeys` is off.
+   */
+  const refuseUncomposed = (
+    encoded: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const fields = encoded as globalThis.Record<string, unknown>
+    const left = Object.keys(fields).filter((field) => Number.isNaN(fields[field]))
+    const unstorable = unstorableIn(Object.fromEntries(left.map((field) => [field, fields[field]])))
+    return unstorable === undefined
+      ? Effect.void
+      : Effect.fail(
+          new ValidationError({
+            entityType,
+            operation,
+            cause: `${unstorable.describe()} Nothing was sent.`,
+          }),
+        )
+  }
 
   const canLack = new Map<string, boolean>()
   /**
@@ -2659,7 +2725,7 @@ const makeImpl = <
       return undefined
     }
     if (name.startsWith("__edd_")) return `"${name}" is an attribute the library manages`
-    const storedBy = Object.keys(modelFieldSchemas).find((field) => resolveDbName(field) === name)
+    const storedBy = modelFieldStoredIn(name)
     if (storedBy !== undefined) {
       return `"${name}" is the attribute "${storedBy}" is stored in. Name the model field: "${storedBy}"`
     }
@@ -2860,6 +2926,76 @@ const makeImpl = <
   }
 
   /**
+   * A value in an update that DynamoDB can't store, in words, before the update reads or
+   * sends anything: an operand of any operation, in the form it would be written.
+   */
+  const unstorableOperand = (
+    uState: UpdateState,
+    encodedUpdates: globalThis.Record<string, unknown>,
+  ): string | undefined => {
+    const refused = (op: string, unstorable: UnstorableValue) =>
+      `${op} ${unstorable.describe()} Nothing was sent.`
+    const appended = Object.fromEntries(
+      Object.entries(uState.append ?? {}).map(([field, value]) => [
+        field,
+        encodePathValue([field], value, "elements").encoded,
+      ]),
+    )
+    const records: ReadonlyArray<readonly [string, globalThis.Record<string, unknown>]> = [
+      [".set() of", fieldsToStore(encodedUpdates)],
+      [".add() of", uState.add ?? {}],
+      [".subtract() of", uState.subtract ?? {}],
+      [".append() of", appended],
+      [".deleteFromSet() of", uState.deleteFromSet ?? {}],
+      [".withVector() of", uState.withVectors ?? {}],
+    ]
+    for (const [op, record] of records) {
+      const unstorable = unstorableIn(record)
+      if (unstorable !== undefined) return refused(op, unstorable)
+    }
+    type Operand = {
+      readonly segments: ReadonlyArray<string | number>
+      readonly value: unknown
+    }
+    const pathOps: ReadonlyArray<
+      readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements" | undefined]
+    > = [
+      ["pathSet of", uState.pathSets, "value"],
+      ["pathAdd of", uState.pathAdds, undefined],
+      ["pathSubtract of", uState.pathSubtracts, undefined],
+      ["pathAppend of", uState.pathAppends, "elements"],
+      ["pathPrepend of", uState.pathPrepends, "elements"],
+      ["pathIfNotExists of", uState.pathIfNotExists, "value"],
+      ["pathDelete of", uState.pathDeletes, undefined],
+    ]
+    for (const [op, ops, kind] of pathOps) {
+      for (const operand of ops ?? []) {
+        const value =
+          kind === undefined
+            ? operand.value
+            : encodePathValue(operand.segments, operand.value, kind).encoded
+        const unstorable = unstorableIn({ value })
+        if (unstorable !== undefined) {
+          return refused(
+            op,
+            new UnstorableValue({
+              path: [...operand.segments, ...unstorable.path.slice(1)],
+              reason: unstorable.reason,
+            }),
+          )
+        }
+      }
+    }
+    for (const [attribute, value] of Object.entries(uState.cascade?.filter ?? {})) {
+      const unstorable = isEmptySet(value)
+        ? new UnstorableValue({ path: [attribute], reason: "DynamoDB has no empty set." })
+        : unstorableIn({ [attribute]: value })
+      if (unstorable !== undefined) return refused(".cascade() filter on", unstorable)
+    }
+    return undefined
+  }
+
+  /**
    * A `pathRemove` of a field no row can be without, or of a property below a field
    * whose schema requires it. Primary-key composites, and paths below a field that
    * feeds a key or a sentinel, get their refusal from `normalizeDerivedPathOps`.
@@ -2931,6 +3067,8 @@ const makeImpl = <
       if (encoded.issue !== undefined) {
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }
+      const unstorable = unstorableIn({ [field]: encoded.encoded })
+      if (unstorable !== undefined) return `.set(): ${unstorable.describe()} Nothing was sent.`
       out.push({
         field,
         attr: resolveDbName(field),
@@ -5961,6 +6099,22 @@ const makeImpl = <
             operation,
           )
 
+          // A put that sends something before its write refuses a value DynamoDB can't
+          // store first. Any other put finds out when it marshals, at no extra cost.
+          if (
+            hasRefs ||
+            hasVectorIndexes ||
+            Boolean(systemFields.version) ||
+            Object.keys(config.unique ?? {}).length > 0 ||
+            (opts.putKind === "create" && projectionTombstonesOf(self) !== undefined)
+          ) {
+            yield* refuseUnstorable(
+              { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
+              operation,
+            )
+            yield* refuseUncomposed(encodedInput, operation)
+          }
+
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded: globalThis.Record<string, unknown> = hasRefs
             ? yield* hydrateRefs(encodedInput as globalThis.Record<string, unknown>)
@@ -6087,7 +6241,12 @@ const makeImpl = <
             return yield* decodeAs(plan.item, plan.marshalled, mode)
           }
 
-          const marshalledItem = toAttributeMap(item)
+          const marshalledItem = yield* marshalOrFail(
+            entityType,
+            operation,
+            () => toAttributeMap(item),
+            { fieldOf: fieldOfAttribute },
+          )
           {
             // Simple put without unique constraints or versioning
             const putInput: {
@@ -6393,6 +6552,14 @@ const makeImpl = <
         "update",
       )
 
+      const unstorable = unstorableOperand(
+        uState,
+        encodedUpdates as globalThis.Record<string, unknown>,
+      )
+      if (unstorable !== undefined) {
+        return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
+      }
+
       // Hydrate refs in updates: for any ${field}Id present, fetch and embed
       let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
       if (hasRefs) {
@@ -6409,8 +6576,7 @@ const makeImpl = <
       // The index keys the payload feeds, composed once before anything is
       // marshalled: a composite with no key text (`NaN`, `[EDD-9096]`) or
       // Z-order level (`[EDD-9092]`) fails the update with a
-      // `ValidationError`, where the marshaller would refuse the attribute as
-      // a defect. Each branch below composes the keys it writes itself.
+      // `ValidationError`. Each branch below composes the keys it writes itself.
       yield* composeKeysOrFail(entityType, "update", () =>
         KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
@@ -6427,6 +6593,7 @@ const makeImpl = <
           },
         ),
       )
+      yield* refuseUncomposed(encodedUpdates, "update")
 
       // Compose primary key
       const primaryKey = composePrimaryKey(encodedKey)
@@ -9052,12 +9219,18 @@ const makeImpl = <
       const { name: tableName } = yield* tableTag
       yield* checkWithVectorNames(opts.withVectors, "upsert")
       // Required fields are required whether or not the item exists.
-      yield* encodeOrDecodeEncode(
+      const encodedInput = yield* encodeOrDecodeEncode(
         schemas.inputSchema as Schema.Codec<any>,
         yield* fillDecodingDefaults(input),
         entityType,
         "upsert",
       )
+      yield* refuseUnstorable(
+        { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
+        "upsert",
+      )
+      yield* composeAllKeys(encodedInput as globalThis.Record<string, unknown>, "upsert")
+      yield* refuseUncomposed(encodedInput, "upsert")
       const record = (input ?? {}) as globalThis.Record<string, unknown>
       const primary = config.indexes.primary
       const keyFields = [...primary.pk.composite, ...primary.sk.composite]
@@ -9185,6 +9358,10 @@ const makeImpl = <
             entityType,
             "upsert",
           )
+          yield* refuseUnstorable(
+            { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
+            "upsert",
+          )
 
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded = hasRefs
@@ -9195,9 +9372,9 @@ const makeImpl = <
 
           // Every index's keys, composed before anything is marshalled: a
           // composite with no key text (`NaN`, `[EDD-9096]`) or Z-order level
-          // (`[EDD-9092]`) fails the upsert with a `ValidationError`, where the
-          // marshaller would refuse the attribute as a defect.
+          // (`[EDD-9092]`) fails the upsert with a `ValidationError`.
           const allKeys = yield* composeAllKeys(item, "upsert")
+          yield* refuseUncomposed(encodedInput, "upsert")
           const primaryKey = composePrimaryKey(item)
           const marshalledKey = toAttributeMap(primaryKey)
           // Build UpdateExpression with if_not_exists for immutable fields + createdAt
@@ -9745,9 +9922,8 @@ const makeImpl = <
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites),
       // and the event key, before anything is marshalled: a value with no key
-      // text (`NaN`, `[EDD-9096]`) fails the append with a `ValidationError`,
-      // where the marshaller would refuse it as a defect. The event key's
-      // orderBy segment follows the setting, as `.history().where()` and
+      // text (`NaN`, `[EDD-9096]`) fails the append with a `ValidationError`.
+      // The event key's orderBy segment follows the setting, as `.history().where()` and
       // `liveRows` compose it (`eventOrderByValue`): with `escapeKeys: true` a
       // `NumberFromString` orderBy is the number, so events sort numerically;
       // off, the encoded text 1.36 wrote, which sorts "10" before "9".
@@ -9775,6 +9951,11 @@ const makeImpl = <
           ),
         }
       })
+
+      // Before anything is read or sent. `.append` marshals each value twice over
+      // already: the current item's SET and the event item.
+      yield* refuseUnstorable(encoded, "append")
+      yield* refuseUncomposed(encoded, "append")
       const marshalledKey = toAttributeMap({
         [primary.pk.field]: pkValue,
         [primary.sk.field]: currentSk,
@@ -12806,6 +12987,7 @@ const makeImpl = <
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
     _renameToDynamo: renameToDynamo,
+    _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
