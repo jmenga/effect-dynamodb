@@ -2,7 +2,7 @@
 
 **Issue:** [#183](https://github.com/jmenga/effect-dynamodb/issues/183)
 **Status:** Implemented in the same PR (single-PR workflow: this doc is commit 1). The owner has
-confirmed §14 as proposed. D61 and D62 came after that, and are *proposed — awaiting owner confirmation*.
+confirmed §14 as proposed. D61, D62 and D63 came after that, and are *proposed — awaiting owner confirmation*.
 **On top of:** #181 (1.37.0, merged as `dc48baa`): cursor v2, `Option` page cursors, model-checked
 attribute names, adaptive request sizing and `rekey` all come from it. The PR targets `main`.
 **Builds on:** `zorder-indexes.md` §6.3 (the partition limit), §8 (request sizing), §10.3 (byte
@@ -640,8 +640,8 @@ they are and measure first, and measuring small pages is tracked in [#185](https
 
 ## 14. Decisions
 
-The owner has confirmed these as proposed, so each is confirmed unless its row says otherwise. D61 and D62
-came after that confirmation, and are still proposed.
+The owner has confirmed these as proposed, so each is confirmed unless its row says otherwise. D61, D62 and
+D63 came after that confirmation, and are still proposed.
 
 | # | Decision | Status |
 |---|---|---|
@@ -707,6 +707,7 @@ came after that confirmation, and are still proposed.
 | D60 | ~~A move leaves an attribute two accessors of unsharded indexes share as stored~~ **Rejected:** it regressed ordinary lazy moves, as a plain update on a healthy 1.36 row kept the shared key's 1.36 text beside the other half's current text, and a pin missed the row with the fallback on. It's reverted, so a move behaves as at #181 (§17.15) | rejected |
 | D61 | `EDD-9106` judges every pair of key halves in one entity, sharded or not, with the one exception of D62. It reverses D49 and restores D38's intent with D50's proof; the rule's stages (D51) don't change, and D52 isn't widened. **Behaviour change:** a definition whose halves aren't provably the same text now throws at load, including two accessors over composites no item holds together, which worked for `put` and query until an ordinary update corrupted them (§17.8) | proposed — awaiting owner confirmation |
 | D62 | An index half stored in a table key attribute, with the same composites in the same order and the same effective casing as the table half stored there, **is** that table key. It's never written through the index path, nothing strips it, and everything reading through it composes the table half's text. The table's own key text doesn't change. `Entity.make` records which half in `IndexDefinition.tableKey`, and the composers read that. A sort key holding partition key text doesn't truncate, so a partial pin is `begins_with`, a `.where()` range on a composite before the last is `EDD-9107`, a `.within()` reads such a composite with `begins_with` and judges the rows, and a tupled `.within()` plans as a filter. A sharded index's sort key in the table's partition key stays refused, as anything sharded is; one in the table's sort key stays legal (§17.16) | proposed — awaiting owner confirmation |
+| D63 | An update can't remove a primary key composite. `.remove()` and `Entity.remove` fail with the `ValidationError` a `.set()` of it gets, and `.remove()` and the path operations also refuse one by the attribute it's stored in, as each takes any string. On DynamoDB Local the `REMOVE` kept the key and lost the attribute, so the row stopped decoding for every reader, and a transaction reported success. The composer's `removes` filter stays: a row already damaged still reaches it through a move (§17.9) | proposed — awaiting owner confirmation |
 
 ## 15. Scoping decisions
 
@@ -872,7 +873,8 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
 |---|---|---|
 | Which write paths can leave a 1.36 sort key in a shard? | `update`, `Transaction.transactWrite`, `append`, retain, `put`, `Batch.write`, the 1.37 move, `rekey` | §9.3's table. Each is covered by a test on a recording table and on DynamoDB Local |
 | Which key attributes can a half on a sharded index overwrite? | Table `pk` and `sk`; another index's `pk` or `sk`; its own `sk`; a sharded one with another count, source, composites, casing or collection; a Z-order half with another layout | All refused (§17.3, §17.7), and so is the same with nothing sharded (§17.8). What's provably the same stays legal, including an index half that is the table's own (§17.16) |
-| Which paths write or strip a table key attribute through an index half? | `composeIndexKeys`, the update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first four did, all fixed (§17.9, §17.16), and the dropped entry is gone (§17.14). `rekey` can't reach one now, so its guard is gone (§17.16). The move composes no such half (D62) |
+| Which paths write or strip a table key attribute through an index half? | `composeIndexKeys`, the update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first four did, all fixed (§17.9, §17.16), and the dropped entry is gone (§17.14). `rekey` can't reach one now, so its guard is gone (§17.16). The move keeps the key it computed, through the composer's filter (§17.9) |
+| Which update operations reach a primary key composite? | `.set()`, `.remove()`, `Entity.remove` and the path operations, each by model name and by stored name | `.remove()` by either name and path operations by stored name did, leaving a row that doesn't decode. All refused (D63). `.set()` by stored name writes nothing to it |
 | Which definitions reach a client without `Table.make`? | `_configure` is called only by `Table.make` and `carryConfigure`, which copies its result | None (§17.7) |
 | Which halves can a row lose the value of and keep the text of? | An unsharded index's sort key and partition key; a sharded index's sort key; a sharded partition key; a vector partition | All left with no conflict, and pinned on both tables (D58, §17.10), but for a sharded partition key in another layout, which is `"uncomposable"` |
 | Which paths compose every index from a whole row, where an attribute two accessors share goes to the later one? | The move, the retain path, `put` and its kin | Every definition that could reach them is refused now (D61, §17.8), so halves in one attribute compose the same bytes and the order doesn't matter. `rekey`'s in-place pass doesn't compose a whole row: it judges each half by itself (§9.2) |
@@ -1263,6 +1265,13 @@ the only suite that would notice is the connected one.
   stored in one holds what the table key does, composed of what an update can't change, so there's nothing to
   write, and dropping an index entry takes the other half, which is enough to leave the index. This is the
   central composer, so every update path has it. No gate logic changed.
+- An update can't ask to drop one any more (D63), but `removes` can still name one. Take a row an earlier
+  release's `.remove()` left without the first composite of a table half, under a 1.36 key whose text changed,
+  with that half `sparse`: its move recomposes from the row and reads the half as dropped. Without the filter
+  the move's `Put` has no key, so DynamoDB refuses it, the update fails with `DynamoValidationError` and the
+  row stays as it was. With it the row moves and the update writes and then fails to decode, as any update on
+  that row at its current key does. `delete`, `put` and `rekey` do the same either way. So the filter isn't
+  dead, and its pin moved to this route.
 - `gsiKeyFields` no longer lists one, so a snapshot, tombstone or event keeps the attribute it would have lost
   on a shared `pk`.
 

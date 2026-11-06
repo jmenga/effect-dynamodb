@@ -2403,14 +2403,25 @@ const makeImpl = <
     )
 
   /**
+   * Does `field` name a primary-key composite, by its model name or by the attribute
+   * it's stored in? `.remove()` and `pathRemove()` take any string and write to either.
+   */
+  const isPrimaryComposite = (field: string): boolean => {
+    const primary = allIndexes.primary
+    return (
+      primary !== undefined &&
+      [...primary.pk.composite, ...primary.sk.composite].some(
+        (attr) => attr === field || resolveDbName(attr) === field,
+      )
+    )
+  }
+
+  /**
    * Why `field` feeds a key or a unique sentinel — values the library derives
    * from the field at write time — or `undefined` when it feeds neither.
    */
   const derivedFrom = (field: string): string | undefined => {
-    const primary = allIndexes.primary
-    if (primary && [...primary.pk.composite, ...primary.sk.composite].includes(field)) {
-      return "a primary-key composite"
-    }
+    if (isPrimaryComposite(field)) return "a primary-key composite"
     for (const [name, def] of Object.entries(allIndexes)) {
       if (name === "primary") continue
       if (def.pk.composite.includes(field) || def.sk.composite.includes(field)) {
@@ -2598,6 +2609,10 @@ const makeImpl = <
     }
   }
 
+  const primaryCompositeRefusal = (op: string, field: string): string =>
+    `${op} of "${field}": "${field}" is a primary-key composite — it identifies the item ` +
+    "and cannot be changed by an update."
+
   /**
    * A `.set()` of a primary-key composite with a value other than the key's
    * (#133): it identifies the item and cannot change. It was silently dropped;
@@ -2611,12 +2626,19 @@ const makeImpl = <
     const primary = allIndexes.primary
     for (const field of primary ? [...primary.pk.composite, ...primary.sk.composite] : []) {
       if (record[field] === undefined || Equal.equals(record[field], keyRecord[field])) continue
-      return (
-        `.set() of "${field}": "${field}" is a primary-key composite — it identifies the item ` +
-        "and cannot be changed by an update."
-      )
+      return primaryCompositeRefusal(".set()", field)
     }
     return undefined
+  }
+
+  /**
+   * A `.remove()` of a primary-key composite: the row would keep its key and lose the
+   * attribute, so it would stop decoding for every reader. Refused as a `.set()` of one
+   * is, before a defaulted composite could turn it into one.
+   */
+  const refusedRecordRemove = (fields: ReadonlyArray<string> | undefined): string | undefined => {
+    const field = fields?.find((name) => isPrimaryComposite(name))
+    return field === undefined ? undefined : primaryCompositeRefusal(".remove()", field)
   }
 
   type AssertedImmutable = {
@@ -7677,6 +7699,14 @@ const makeImpl = <
           entityType,
           operation: "update",
           cause: normalized,
+        })
+      }
+      const refusedRemove = refusedRecordRemove(normalized.remove)
+      if (refusedRemove !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update",
+          cause: refusedRemove,
         })
       }
       // Removing a defaulted index composite re-materialises its default —

@@ -1704,7 +1704,8 @@ export const composeGsiKeysForUpdatePolicyAware = (
   // stored in one (a local index's partition key, an inverted index, a sort key shared
   // with the table) is the table's key (`bindTableKeyHalves`), composed of what an update
   // can't change, so there is nothing to write; dropping the entry takes only the other
-  // half.
+  // half. A half reads as dropped here only for a row an earlier release's `.remove()` left
+  // without a composite, which a move from its 1.36 key recomposes from: it keeps its key.
   const primary = indexes.primary
   if (primary === undefined) return { sets, removes }
   const tableKey = new Set([primary.pk.field, primary.sk.field])

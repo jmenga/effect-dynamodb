@@ -1672,24 +1672,30 @@ describe("KeyComposer", () => {
         expect(Object.keys(result.sets).sort()).toEqual(["lsk"])
       })
 
-      it("isn't removed with a composite of its own", () => {
+      // An update can't ask for this any more (a `.remove()` of a primary key composite is
+      // refused), but a row an earlier release left without one still reads this way. Moving
+      // it from its 1.36 key recomposes from the row, and the move has to keep its key.
+      it("isn't removed for a row that lost a composite of its own", () => {
+        const row = { region: "r", id: "1", note: "n" }
+        const pk = { field: "pk", composite: ["tenant", "region"] }
         const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
           "Row",
           1,
           {
-            primary: indexes.primary!,
+            primary: { pk, sk: { field: "sk", composite: ["id"] } },
             local: {
               index: "lsi",
-              pk: { field: "pk", composite: ["tenant"] },
+              pk,
               sk: { field: "lsk", composite: ["note"] },
+              indexPolicy: { pk: "sparse", sk: "sparse" },
             },
           },
-          {},
-          key,
-          { removedSet: new Set(["tenant", "note"]) },
+          row,
+          row,
         )
-        expect(result).toEqual({ sets: {}, removes: ["lsk"] })
+        expect(result.removes).toEqual([])
+        expect(Object.keys(result.sets)).toEqual(["lsk"])
       })
 
       it("every other shape is untouched when the map holds no primary index", () => {

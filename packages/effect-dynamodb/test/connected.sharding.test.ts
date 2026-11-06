@@ -18,6 +18,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { shardOf } from "@effect-dynamodb/schema/internal/Shards.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -1598,5 +1599,81 @@ describeConnected("#183 an inverted index is the table's key (shape 14), on real
   })
   it.live("a row 1.37.0 overwrote stays where it is", () =>
     TableKeyHalves.overwritten137Scenario(harness),
+  )
+})
+
+describeConnected(".remove() of a primary key composite, on a real table", () => {
+  const RemoveRows = Entity.make({
+    model: DynamoModel.configure(
+      Schema.Struct({
+        tenant: Schema.String,
+        id: Schema.String,
+        group: Schema.String,
+        note: Schema.optional(Schema.String),
+      }),
+      { tenant: { field: "t" } },
+    ),
+    entityType: "RemoveRow",
+    primaryKey: {
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "sk", composite: ["id"] },
+    },
+    indexes: {
+      byGroup: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["group"] },
+        sk: { field: "gsi1sk", composite: ["id"] },
+      },
+    },
+  } as any) as any
+  const RemoveTable = Table.make({ schema, entities: { RemoveRows } })
+  const key = { tenant: "acme", id: "1" }
+  const row = { ...key, group: "g", note: "n" }
+
+  it.live("is refused however it's spelled, and the row still decodes for every reader", () =>
+    withTable(
+      RemoveTable,
+      (tableName) =>
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { RemoveRows },
+            tables: { RemoveTable },
+          })
+          const rows = db.entities.RemoveRows
+          yield* rows.put(row).asEffect()
+
+          const unbound = (fields: ReadonlyArray<string>) =>
+            RemoveRows.update(key).pipe(Entity.remove(fields))
+          const attempts: ReadonlyArray<[string, Effect.Effect<unknown, any>]> = [
+            ["partition key composite", rows.update(key).remove(["tenant"]).asEffect()],
+            ["sort key composite", rows.update(key).remove(["id"]).asEffect()],
+            ["stored name", rows.update(key).remove(["t"]).asEffect()],
+            ["path, by model name", rows.update(key).pathRemove(["tenant"]).asEffect()],
+            ["path, by stored name", rows.update(key).pathRemove(["t"]).asEffect()],
+            ["unbound", unbound(["tenant"]).asEffect()],
+            ["transaction", Transaction.transactWrite([unbound(["tenant"])])],
+          ]
+          for (const [name, attempt] of attempts) {
+            const failure = yield* Effect.flip(attempt)
+            expect(failure._tag, name).toBe("ValidationError")
+            expect(String(failure.cause), name).toContain("is a primary-key composite")
+
+            const stored = yield* scanAll(tableName)
+            expect(stored, name).toHaveLength(1)
+            expect(stored[0]!.t, name).toEqual({ S: "acme" })
+            expect(stored[0]!.id, name).toEqual({ S: "1" })
+            expect(yield* rows.get(key).asEffect(), name).toMatchObject(row)
+            expect(yield* rows.scan().collect(), name).toMatchObject([row])
+            expect(yield* rows.byGroup({ group: "g" }).collect(), name).toMatchObject([row])
+          }
+
+          // What's allowed still goes through, and leaves a row that decodes.
+          yield* rows.update(key).remove(["note"]).asEffect()
+          const [stored] = yield* scanAll(tableName)
+          expect(stored!.note).toBeUndefined()
+          expect(yield* rows.get(key).asEffect()).toMatchObject({ ...key, group: "g" })
+        }),
+      (tableName) => RemoveTable.layer({ name: tableName }),
+    ),
   )
 })
