@@ -480,6 +480,14 @@ carries a changeset file or touches publishable `src/`. Empty chore changesets c
 in a batched release they are exactly how the queued PRs are marked. Override with the
 `release-order-override` label when the ordering is deliberate.
 
+### Lockstep pins
+
+`effect-dynamodb@X` must install `@effect-dynamodb/schema@X`, and `@effect-dynamodb/geo@X` must require `effect-dynamodb@X`. Keys are composed in the schema package, so a mixed install writes one version's key text with another version's runtime (#191).
+
+Dependencies between the four packages use `workspace:*`, which `pnpm pack` publishes as the exact version. **The exception is geo's `effect-dynamodb` peer, which stays `workspace:^` in `package.json`**, and which `.pnpmfile.cjs` pins when packing. Changesets major-bumps a package whose peer falls out of range, and an exact peer falls out of range on every minor, so a `workspace:*` peer turns the next minor changeset into 2.0.0 across the whole fixed group.
+
+`.github/scripts/check-lockstep-pins.mjs` checks the packed manifests, in CI on every PR and in `release.yml` before each publish.
+
 ### Trusted Publishing setup
 
 Each of the four publishable packages must be configured on npmjs.com with this repo + `release.yml` as a trusted publisher. No `NPM_TOKEN` is required. The workflow uses `npm publish --provenance --access public` to emit a signed provenance attestation on each publish — verifiable by consumers. **`@effect-dynamodb/schema` is new and must be registered as a Trusted Publisher on npmjs.com before its first release** (this cannot be automated from the repo).
