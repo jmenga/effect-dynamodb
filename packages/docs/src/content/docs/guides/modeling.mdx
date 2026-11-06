@@ -113,6 +113,12 @@ A zoned field, either `DynamoModel.DateTimeZoned` or a self `Schema.DateTimeZone
 
 Offsets that aren't whole minutes, such as historical local-mean-time offsets or a sub-minute `DateTime.zoneMakeOffset`, are rounded to the minute by Effect's ISO format, and the instant read back moves by the same amount. Earlier versions behaved the same way.
 
+#### Maps
+
+Use `Schema.Record` for a keyed collection of values. A `Schema.ReadonlyMap` is refused when the model loads (`EDD-9125`), at any depth: it would be stored as a DynamoDB map, which reads back as a plain object, so the row wouldn't decode. `Schema.Record` is stored the same way, so rows a map field wrote read back without a rewrite.
+
+A `Map` in your domain model is fine as long as its encoded side isn't one: decode it from a `Schema.Record` with `Schema.decodeTo`, or wrap it in `Schema.toCodecJson`.
+
 #### Container checks
 
 A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.
