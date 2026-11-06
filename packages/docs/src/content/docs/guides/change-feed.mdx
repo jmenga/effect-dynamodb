@@ -161,6 +161,7 @@ One lease per consumer and stream, held in the checkpoint store, keeps a second 
 - it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends. `renewEvery` must be less than half of `duration` (`changeFeed` throws `[EDD-9083]` otherwise), which leaves `duration − 2 × renewEvery` to retry a failed renewal in;
 - a second process fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or, with `lease: { onHeld: "wait" }`, retries until the lease is released or expires;
 - a renewal the checkpoint store fails to write is retried until `renewEvery` before the lease would lapse, then fails the feed with that `CheckpointStoreError`;
+- a renewal still unanswered at that point also ends the feed, with `ChangeFeedLeaseLost`, without waiting for the request;
 - if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`;
 - once the lease is lost either way, a batch still in flight cannot commit: its acknowledgement fails with `ChangeFeedLeaseLost`.
 

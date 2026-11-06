@@ -19,6 +19,8 @@
  * parent-before-child across a split is covered by `ChangeFeed.test.ts`.
  */
 
+import { createServer, request, type ServerResponse } from "node:http"
+import type { AddressInfo } from "node:net"
 import { it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -345,6 +347,79 @@ describeConnected("change feed (connected)", () => {
       // Released on interruption: the next process takes it at once.
       yield* Accounts.append({ accountId: "l1" }, [new Deposited({ amount: 1 })], 1)
       const [next] = yield* changeFeed(feedOptions("leased")).pipe(takeOne)
+      expect(next!.records.length).toBeGreaterThan(0)
+    }).pipe(provide),
+  )
+
+  it.live("a renewal hung on the wire fails the feed, and the next process takes over", () =>
+    Effect.gen(function* () {
+      yield* Accounts.append({ accountId: "h1" }, [new Opened({ owner: "hal" })], 0)
+      // Between the checkpoint store and DynamoDB Local: an UpdateItem (the renewal) goes
+      // unanswered, everything else passes through.
+      const unanswered: Array<ServerResponse> = []
+      const target = new URL(ENDPOINT)
+      const proxy = createServer((incoming, outgoing) => {
+        if (String(incoming.headers["x-amz-target"]).endsWith(".UpdateItem")) {
+          incoming.resume()
+          unanswered.push(outgoing)
+          return
+        }
+        const upstream = request(
+          {
+            host: target.hostname,
+            port: target.port,
+            path: incoming.url,
+            method: incoming.method,
+            headers: incoming.headers,
+          },
+          (answer) => {
+            outgoing.writeHead(answer.statusCode ?? 500, answer.headers)
+            answer.pipe(outgoing)
+          },
+        )
+        incoming.pipe(upstream)
+      })
+      yield* Effect.acquireRelease(
+        Effect.promise(() => new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve))),
+        () =>
+          Effect.sync(() => {
+            proxy.closeAllConnections()
+            proxy.close()
+          }),
+      )
+      const { port } = proxy.address() as AddressInfo
+      const hungStore = CheckpointStore.layerDynamoDB({ tableName: checkpointTableName }).pipe(
+        Layer.provide(
+          DynamoClient.layer({
+            region: "us-east-1",
+            endpoint: `http://127.0.0.1:${port}`,
+            credentials,
+          }),
+        ),
+      )
+      const startedAt = Date.now()
+      const exit = yield* changeFeed({
+        ...feedOptions("hung-renewal"),
+        lease: { owner: "hung", duration: "2 seconds", renewEvery: "500 millis" },
+      }).pipe(Stream.runDrain, Effect.provide(hungStore), Effect.exit)
+      expect(String(Exit.isFailure(exit) ? exit.cause : "")).toContain("ChangeFeedLeaseLost")
+      // It ended with the request still open, at the deadline and not before it.
+      expect(unanswered).toHaveLength(1)
+      expect(unanswered[0]!.writableEnded).toBe(false)
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1490)
+      // The release reached the table, though the feed need not wait for its answer, and
+      // the next process takes the lease at once.
+      const client = yield* DynamoClient
+      yield* eventually(
+        client
+          .getItem({
+            TableName: checkpointTableName,
+            Key: { pk: { S: `hung-renewal#${streamArn}` }, sk: { S: "lease" } },
+            ConsistentRead: true,
+          })
+          .pipe(Effect.map((result) => result.Item === undefined)),
+      )
+      const [next] = yield* changeFeed(feedOptions("hung-renewal")).pipe(takeOne)
       expect(next!.records.length).toBeGreaterThan(0)
     }).pipe(provide),
   )
