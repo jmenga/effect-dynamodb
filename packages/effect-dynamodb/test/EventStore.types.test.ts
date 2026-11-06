@@ -64,6 +64,7 @@ import type {
   AppendTooLarge,
   ConcurrentModification,
   DuplicateCommand,
+  ItemNotMoved,
   OptimisticLockError,
   StreamSealed,
   TransactionCancelled,
@@ -1251,6 +1252,7 @@ describe("EventStore packed storage types (#147)", () => {
         | UniqueConstraintViolation
         | OptimisticLockError
         | ConcurrentModification
+        | ItemNotMoved
       >()
       expectTypeOf<
         Effect.Error<ReturnType<typeof Packed.append>>

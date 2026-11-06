@@ -10,24 +10,25 @@
  *
  * **The rule.** Compose from the **Encoded** form, EXCEPT when the domain type
  * is numeric (`number` / `bigint`) and the encoded form is a **string** — then
- * compose from the numeric **Type** form so `KeyComposer.serializeValue` pads
- * it.
+ * compose from the numeric **Type** form so `KeyComposer.serializeValue`
+ * encodes it in numeric order.
  *
  * | composite | Type | Encoded | key uses |
  * |---|---|---|---|
- * | `Schema.Number` | number | number | encoded (already padded) |
- * | `Schema.BigInt` | bigint | bigint | encoded (already padded) |
- * | `Schema.BigIntFromString` | bigint | string | **Type** — a string would not pad |
+ * | `Schema.Number` | number | number | encoded (already numeric) |
+ * | `Schema.BigInt` | bigint | bigint | encoded (already numeric) |
+ * | `Schema.BigIntFromString` | bigint | string | **Type** — a string would sort as text |
  * | `Schema.NumberFromString` | number | string | **Type** — same shape |
- * | `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, padded |
+ * | `DynamoModel.DateEpochMs` | DateTime | number | encoded — epoch, numeric |
  * | `Schema.Date` / `DateTimeUtc` | Date | ISO string | encoded — ISO sorts correctly |
  * | untransformed string | string | string | encoded (identical) |
  *
- * The exception exists because `serializeValue` pads numbers to 16 digits and
- * bigints to 38 so they sort lexicographically in numeric order, and does
- * nothing to a string. Composing the encoded `"42"` of a `BigIntFromString`
- * stored `txn_42` alongside `txn_100` and `txn_5`, which DynamoDB orders
- * 100 < 42 < 5 — so `gte(42n)` returned 42 and 5 instead of 42 and 100.
+ * The exception exists because `serializeValue` encodes numbers and bigints so
+ * their key text sorts in numeric order (a non-negative integer zero-padded to
+ * 16 digits, 38 for a bigint), and does nothing to a string. Composing the
+ * encoded `"42"` of a `BigIntFromString` stored `txn_42` alongside `txn_100`
+ * and `txn_5`, which DynamoDB orders 100 < 42 < 5 — so `gte(42n)` returned 42
+ * and 5 instead of 42 and 100.
  *
  * Not part of the public API.
  */
@@ -57,7 +58,8 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  *    numeric Type value: keep a `number` / `bigint` as-is, otherwise `decode`
  *    to reach it.
  * 3. **Anything else** — target is the Encoded value. A field with no encoding
- *    transformation is identity by construction (`SchemaAST` documents
+ *    transformation is identity by construction (a numeric one still coerced
+ *    to its declared kind, as in case 2) (`SchemaAST` documents
  *    `encoding === undefined` as "type and encoded forms are identical"), and
  *    is passed through WITHOUT attempting an encode — an open sort key bound
  *    like `gte(t.status, "d")` on a `Schema.Literals` composite is deliberately
@@ -91,14 +93,14 @@ export const makeCompositeKeyForm = (
     // Case 2 — the numeric exception. Target is the Type side, and it must be
     // the DECLARED numeric kind, not merely "some number".
     //
-    // `KeyComposer.serializeValue` pads by JS type — 16 digits for a number, 38
-    // for a bigint — so a `bigint` composite handed a `number` composes a
-    // 16-wide key where the write composed 38. That is not hypothetical: a
-    // stored `bigint` attribute marshalls to `{ N: "420" }` and unmarshalls
-    // back as a **number**, so any path that re-derives a key from a stored row
-    // (`Aggregate.list`) lands here with the wrong kind and silently finds
-    // nothing. Coercing to the declared kind is the same rule, applied
-    // exactly; a value already of the right kind is unaffected.
+    // `KeyComposer.serializeValue` encodes by JS type — a number zero-padded to
+    // 16 digits, a bigint to 38 — so a `bigint` composite handed a `number`
+    // composes a 16-wide key where the write composed 38. That is not
+    // hypothetical: a stored `bigint` attribute marshalls to `{ N: "420" }` and
+    // unmarshalls back as a **number**, so any path that re-derives a key from
+    // a stored row (`Aggregate.list`) lands here with the wrong kind and
+    // silently finds nothing. Coercing to the declared kind is the same rule,
+    // applied exactly; a value already of the right kind is unaffected.
     if (numericTypeWithStringEncoding(field)) {
       const wantsBigInt = SchemaAST.isBigInt(SchemaAST.toType(field.ast))
       const decode = Schema.decodeUnknownOption(codec)
@@ -116,10 +118,22 @@ export const makeCompositeKeyForm = (
       return fn
     }
 
-    // Case 3a — identity by construction.
+    // Case 3a — identity by construction. A numeric field still takes its
+    // declared kind, for the reason case 2 does: a stored `Schema.BigInt`
+    // value unmarshalls as a number (and a `Schema.Number` past 2^53 as a
+    // bigint), so a key re-derived from a stored row would compose at the
+    // other kind's width.
     if (!hasEncodingTransformation(field)) {
-      cache.set(attr, null)
-      return null
+      const kind = keyFormValueKind(field)
+      const fn =
+        kind === "bigint"
+          ? (value: unknown): unknown =>
+              typeof value === "number" && Number.isInteger(value) ? BigInt(value) : value
+          : kind === "number"
+            ? (value: unknown): unknown => (typeof value === "bigint" ? Number(value) : value)
+            : null
+      cache.set(attr, fn)
+      return fn
     }
 
     // Case 3b — target is the Encoded side.
@@ -181,4 +195,63 @@ export const compositeKeyFormKind = (source: Schema.Top, attr: string): Composit
   if (numericTypeWithStringEncoding(field)) return "type-numeric"
   if (!hasEncodingTransformation(field)) return "identity"
   return "encoded"
+}
+
+/** The JavaScript type a composite's key form takes, when its schema says. */
+export type KeyFormValueKind = "string" | "number" | "bigint" | "boolean"
+
+const astKeyFormValueKind = (ast: SchemaAST.AST): KeyFormValueKind | undefined => {
+  if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) return "string"
+  if (SchemaAST.isNumber(ast)) return "number"
+  if (SchemaAST.isBigInt(ast)) return "bigint"
+  if (SchemaAST.isBoolean(ast)) return "boolean"
+  if (SchemaAST.isLiteral(ast)) return typeof ast.literal as KeyFormValueKind
+  const kinds = SchemaAST.isEnum(ast)
+    ? ast.enums.map(([, value]) => typeof value as KeyFormValueKind)
+    : SchemaAST.isUnion(ast)
+      ? ast.types
+          .filter((member) => !SchemaAST.isUndefined(member) && !SchemaAST.isNull(member))
+          .map((member) => astKeyFormValueKind(member))
+      : [undefined]
+  const [first] = kinds
+  return first !== undefined && kinds.every((kind) => kind === first) ? first : undefined
+}
+
+/**
+ * The kind of value a field's key form is — the numeric Type for a numeric
+ * field encoded as a string (case 2), else its Encoded side — or `undefined`
+ * when the schema doesn't pin one (a union of kinds, an object, …).
+ */
+export const keyFormValueKind = (field: Schema.Top): KeyFormValueKind | undefined => {
+  if (numericTypeWithStringEncoding(field)) {
+    return SchemaAST.isBigInt(SchemaAST.toType(field.ast)) ? "bigint" : "number"
+  }
+  return astKeyFormValueKind(SchemaAST.toEncoded(field.ast))
+}
+
+/**
+ * The literal members a field's key form is limited to (a literal, a union of
+ * literals or an enum), or `undefined` when it isn't limited to literals.
+ */
+export const keyFormLiterals = (
+  field: Schema.Top,
+): ReadonlyArray<string | number | boolean> | undefined => {
+  const members = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
+    if (SchemaAST.isLiteral(ast)) return [ast.literal]
+    if (SchemaAST.isEnum(ast)) return ast.enums.map(([, value]) => value)
+    if (SchemaAST.isUnion(ast)) {
+      const found: Array<unknown> = []
+      for (const member of ast.types) {
+        if (SchemaAST.isUndefined(member) || SchemaAST.isNull(member)) continue
+        const inner = members(member)
+        if (inner === undefined) return undefined
+        found.push(...inner)
+      }
+      return found
+    }
+    return undefined
+  }
+  return members(SchemaAST.toEncoded(field.ast)) as
+    | ReadonlyArray<string | number | boolean>
+    | undefined
 }

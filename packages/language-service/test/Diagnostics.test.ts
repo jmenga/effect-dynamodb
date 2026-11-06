@@ -198,6 +198,82 @@ describe("Diagnostics", () => {
       expect(filterDiag[0]!.category).toBe(ts.DiagnosticCategory.Warning)
     })
 
+    it("EDD-9005: detects SK composite in .filter() after other combinators", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "test", version: 1 })
+
+        const Tasks = Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey: {
+            pk: { field: "pk", composite: ["taskId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["projectId"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+            },
+          },
+        })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Tasks } })
+
+        const active = db.entities.Tasks.byProject({ projectId: "p-1" })
+          .onRequest(log)
+          .filterBy(keep)
+          .filter({ title: "x" })
+          .ignoreOwnership()
+          .filter({ status: "active" })
+          .collect()
+      `
+      const sf = parseSource(source)
+      const info = mockInfo(sf)
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const filterDiag = diagnostics.filter((d) => d.code === DiagnosticCode.SK_IN_FILTER)
+      expect(filterDiag).toHaveLength(1)
+      expect(filterDiag[0]!.messageText).toContain("`status`")
+    })
+
+    it("EDD-9005: detects SK composite in .filter() after .within(), and names .within()", () => {
+      const source = `
+        const AppSchema = DynamoSchema.make({ name: "test", version: 1 })
+
+        const Tasks = Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey: {
+            pk: { field: "pk", composite: ["taskId"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["projectId"] },
+              sk: { field: "gsi1sk", composite: ["status", "priority"] },
+            },
+          },
+        })
+
+        const MainTable = Table.make({ schema: AppSchema, entities: { Tasks } })
+
+        const urgent = db.entities.Tasks.byProject({ projectId: "p-1" })
+          .within({ priority: { gte: 3 } })
+          .filter({ status: "active" })
+          .collect()
+      `
+      const sf = parseSource(source)
+      const info = mockInfo(sf)
+      const diagnostics = getDiagnostics(ts, info, "test.ts", [])
+
+      const filterDiag = diagnostics.filter((d) => d.code === DiagnosticCode.SK_IN_FILTER)
+      expect(filterDiag).toHaveLength(1)
+      expect(filterDiag[0]!.messageText).toContain("`status`")
+      expect(filterDiag[0]!.messageText).toContain("`.within()`")
+    })
+
     it("EDD-9004: detects SK prefix ordering violation", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "test", version: 1 })
@@ -385,6 +461,113 @@ describe("Diagnostics", () => {
       )
       expect(unknownAttr).toHaveLength(1)
       expect(unknownAttr[0]!.messageText).toContain("`nonExistent`")
+    })
+  })
+
+  describe("Z-order sort keys (#171)", () => {
+    const listings = (usage: string) => `
+      const AppSchema = DynamoSchema.make({ name: "test", version: 1 })
+
+      const Listings = Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: {
+          pk: { field: "pk", composite: ["listingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          search: {
+            name: "gsi2",
+            pk: { field: "gsi2pk", composite: ["region"] },
+            sk: {
+              field: "gsi2sk",
+              prefix: ["agencyId"],
+              zorder: [{ field: "price", min: 0, max: 5000000, step: 1000 }, { field: "bedrooms", min: 0, max: 15 }],
+            },
+          },
+        },
+      })
+
+      const MainTable = Table.make({ schema: AppSchema, entities: { Listings } })
+
+      ${usage}
+    `
+    const diagnose = (source: string, fields?: string[]) => {
+      const sf = parseSource(source)
+      const info = fields === undefined ? mockInfo(sf) : mockInfoWithModelFields(sf, fields)
+      return getDiagnostics(ts, info, "test.ts", [])
+    }
+
+    it("EDD-9093: a dimension or prefix composite passed to the accessor", () => {
+      const diagnostics = diagnose(
+        listings(
+          `const r = db.entities.Listings.search({ region: "north", agencyId: "ag-1", price: 5 }).collect()`,
+        ),
+      )
+      const misplaced = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.ZORDER_FIELD_IN_ACCESSOR,
+      )
+      expect(misplaced).toHaveLength(2)
+      expect(misplaced[0]!.messageText).toContain("`agencyId` feeds the Z-order sort key")
+      expect(misplaced[1]!.messageText).toContain("`price`")
+      expect(misplaced[0]!.messageText).toContain(".within()")
+      expect(misplaced[0]!.category).toBe(ts.DiagnosticCategory.Error)
+      // No prefix-ordering complaint: a Z-order key has no text prefix.
+      expect(diagnostics.filter((d) => d.code === DiagnosticCode.SK_PREFIX_VIOLATION)).toEqual([])
+    })
+
+    it("EDD-9093: a dimension declared by reference is still a Z-order field", () => {
+      const source = listings(
+        `const r = db.entities.Listings.search({ region: "north", listedAt: 5 }).collect()`,
+      ).replace('{ field: "bedrooms", min: 0, max: 15 }]', "bedrooms, listed]")
+      const diagnostics = diagnose(
+        `const bedrooms = { field: "bedrooms", min: 0, max: 15 }
+        const listed = { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 }
+        ${source}`,
+      )
+      const misplaced = diagnostics.filter(
+        (d) => d.code === DiagnosticCode.ZORDER_FIELD_IN_ACCESSOR,
+      )
+      expect(misplaced).toHaveLength(1)
+      expect(misplaced[0]!.messageText).toContain("`listedAt` feeds the Z-order sort key")
+    })
+
+    it("EDD-9006: an unknown attribute on a Z-order accessor lists the partition key composites", () => {
+      const diagnostics = diagnose(
+        listings(
+          `const r = db.entities.Listings.search({ region: "north", colour: "red" }).collect()`,
+        ),
+      )
+      const unknown = diagnostics.filter((d) => d.code === DiagnosticCode.UNKNOWN_QUERY_PROPERTY)
+      expect(unknown).toHaveLength(1)
+      expect(unknown[0]!.messageText).toContain("Valid attributes: `region`")
+    })
+
+    it("no diagnostic for an accessor given the partition key composites", () => {
+      const diagnostics = diagnose(
+        listings(`const r = db.entities.Listings.search({ region: "north" }).collect()`),
+      )
+      expect(diagnostics).toEqual([])
+    })
+
+    it("EDD-9005: a Z-order field in .filter() points at .within()", () => {
+      const diagnostics = diagnose(
+        listings(
+          `const r = db.entities.Listings.search({ region: "north" }).filter({ price: 5 }).collect()`,
+        ),
+      )
+      const filterDiag = diagnostics.filter((d) => d.code === DiagnosticCode.SK_IN_FILTER)
+      expect(filterDiag).toHaveLength(1)
+      expect(filterDiag[0]!.messageText).toContain("`price` feeds the Z-order sort key")
+      expect(filterDiag[0]!.messageText).toContain(".within()")
+      expect(filterDiag[0]!.messageText).not.toContain("query input")
+    })
+
+    it("EDD-9002: an unknown dimension or prefix field", () => {
+      const diagnostics = diagnose(listings(""), ["listingId", "region", "agencyId", "price"])
+      const unknown = diagnostics.filter((d) => d.code === DiagnosticCode.UNKNOWN_COMPOSITE_ATTR)
+      expect(unknown).toHaveLength(1)
+      expect(unknown[0]!.messageText).toContain("`bedrooms`")
     })
   })
 

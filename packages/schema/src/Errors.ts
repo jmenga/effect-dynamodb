@@ -263,6 +263,37 @@ export class ItemNotDeleted extends Data.TaggedError("ItemNotDeleted")<{
   readonly key: Record<string, unknown>
 }> {}
 
+/**
+ * EDD-9097 — a `Transaction.transactWrite` op addressed an item that is still
+ * stored under the key 1.36 composed for it (#171): 1.37 composes its key text
+ * differently, and moving the item to its current key is a write of its own,
+ * which cannot ride in the caller's transaction. Nothing was written.
+ *
+ * Move the item first — write it once through the entity (`update`, `put`,
+ * `upsert`), or run `rekey` over the table — then run the transaction again.
+ *
+ * An op's current key can also hold another value's row 1.36 wrote (its text
+ * of a value holding `%` and two hex digits spells the op's escaped text):
+ * then the error names that other item, which is the one to write first.
+ *
+ * `operation` names the op (`transactWrite.update`, …); `key` is the key of
+ * the item still under its 1.36 key, as the op was given it or as that other
+ * item stores it.
+ */
+export class ItemNotMoved extends Data.TaggedError("ItemNotMoved")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+  readonly operation: string
+}> {
+  override get message(): string {
+    return (
+      `[EDD-9097] ${this.operation}: the ${this.entityType} item is still stored under its ` +
+      "1.36 key, and a transaction cannot move it. Write the item once through the entity " +
+      "(or run rekey over the table), then run the transaction again. Nothing was written."
+    )
+  }
+}
+
 /** Aggregate assembly failed — missing items, structural violations, or decode errors */
 export class AggregateAssemblyError extends Data.TaggedError("AggregateAssemblyError")<{
   readonly aggregate: string

@@ -74,6 +74,14 @@ describe("OperationDetector", () => {
     expect(op!.arguments?.userId).toBe("u-bob")
   })
 
+  it("reads negative and bigint literals as key values", () => {
+    const source = `Users.get({ userId: -3.5, a: 42n, b: -42n, c: -7 })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 6, entities)
+
+    expect(op!.arguments).toEqual({ userId: -3.5, a: 42n, b: -42n, c: -7 })
+  })
+
   it("should detect Users.create() operation", () => {
     const source = `Users.create({ userId: "u-new", email: "new@example.com" })`
     const sf = parseSource(source)
@@ -300,6 +308,28 @@ describe("OperationDetector", () => {
     expect(op).toBeDefined()
     expect(op!.type).toBe("bound-query-terminal")
     expect(op!.terminalName).toBe("collect")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
+  it("should detect a terminal through .onRequest() and .filterBy() combinators", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" }).onRequest(log).filterBy(keep).collect()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, source.indexOf("collect") + 1, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("bound-query-terminal")
+    expect(op!.terminalName).toBe("collect")
+    expect(op!.entity?.variableName).toBe("Tasks")
+  })
+
+  it("should detect a terminal through a .within() combinator (#171)", () => {
+    const source = `db.entities.Tasks.tasksByUser({ userId: "u-1" }).within({ status: { gte: "a" } }, { maxSkips: 4 }).limit(5).fetch()`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, source.indexOf("fetch") + 1, entities, collections)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("bound-query-terminal")
+    expect(op!.terminalName).toBe("fetch")
     expect(op!.entity?.variableName).toBe("Tasks")
   })
 

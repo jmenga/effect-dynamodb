@@ -155,8 +155,8 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
     team: Aggregate.ref(Teams),
-    coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: Coaches }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer", entity: Players }),
+    coach: Aggregate.one({ entityType: "MatchCoach", entity: Coaches }),
+    players: Aggregate.many({ entityType: "MatchPlayer", entity: Players }),
   },
 })
 
@@ -171,7 +171,7 @@ const MatchAggregate = Aggregate.make(Match, {
   },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: Venues }),
+    venue: Aggregate.one({ entityType: "MatchVenue", entity: Venues }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },

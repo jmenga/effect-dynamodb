@@ -10,11 +10,13 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
-import { type Config, Context, Effect, Layer } from "effect"
+import { type Config, Context, Effect, Layer, type Option } from "effect"
 import type { DynamoClientError } from "./DynamoClient.js"
+import type { BoundEventStream, EventStream } from "./EventStore.js"
+import type { CapacityTotals } from "./internal/Capacity.js"
 
 /** Runtime table configuration injected via Effect Layer. */
 export interface TableConfig {
@@ -168,7 +170,12 @@ export const make = <
   // table shares its primary key. Refuse members that disagree (EDD-9069) here,
   // so tables deployed with CDK or Terraform — which never call
   // `Table.definition` — fail at definition time too.
-  mergeSecondaryIndexes(entities, aggregates, resolvePrimaryKey(entities))
+  const primary = resolvePrimaryKey(entities)
+  mergeSecondaryIndexes(entities, aggregates, primary)
+  // One attribute has one `AttributeDefinitions` type: a Z-order (`B`) sort key
+  // can't share its attribute with a string key half or a vector filter
+  // attribute of another type (EDD-9091).
+  resolveKeyAttributeTypes(entities, aggregates, primary)
 
   // Configure all entities with this table's schema and tag — only once the
   // table is valid, so a rejected `Table.make` leaves its members bound to
@@ -580,6 +587,88 @@ export const mergeSecondaryIndexes = (
   return merged
 }
 
+// ---------------------------------------------------------------------------
+// Key attribute types
+// ---------------------------------------------------------------------------
+
+/** An `AttributeDefinitions` scalar type. */
+export type KeyAttributeType = "S" | "N" | "B"
+
+const describeAttributeType = (type: KeyAttributeType): string =>
+  type === "B" ? `"B" (a Z-order sort key)` : `"${type}"`
+
+/**
+ * The `AttributeDefinitions` type of every attribute the table's members use
+ * in a key or a vector index's `SearchSchema`, by attribute name:
+ *
+ * - primary key halves, entity index halves and every aggregate index half:
+ *   `S` — composed key text;
+ * - a Z-order sort key half (#171): `B` — a binary address;
+ * - a vector index's partition attribute: `S`; its filter attributes: the type
+ *   derived from the model (`S` | `N`, EDD-9039).
+ *
+ * DynamoDB types an attribute once per table, so two members declaring one
+ * attribute with different types can't both be served: a GSI keyed on it would
+ * leave one member's items out (index-key violations) and reject its writes.
+ *
+ * @throws when one attribute is declared with two types (EDD-9091), naming
+ *   both declarers.
+ */
+export const resolveKeyAttributeTypes = (
+  entities: Record<string, EntityLike>,
+  aggregates: Record<string, AggregateLike>,
+  primary: { readonly pk: string; readonly sk: string | undefined } | undefined,
+): Map<string, KeyAttributeType> => {
+  const declared = new Map<string, { readonly type: KeyAttributeType; readonly owner: string }>()
+  const add = (name: string, type: KeyAttributeType, owner: string): void => {
+    const existing = declared.get(name)
+    if (existing === undefined) {
+      declared.set(name, { type, owner })
+      return
+    }
+    if (existing.type !== type) {
+      throw new Error(
+        `[EDD-9091] Attribute "${name}" is declared with type ` +
+          `${describeAttributeType(existing.type)} by ${existing.owner} and with type ` +
+          `${describeAttributeType(type)} by ${owner}. DynamoDB types an attribute once per ` +
+          `table, so every member using it must agree — give one of them its own attribute name.`,
+      )
+    }
+  }
+
+  if (primary !== undefined) {
+    add(primary.pk, "S", "the table's primary key")
+    if (primary.sk !== undefined) add(primary.sk, "S", "the table's primary key")
+  }
+  for (const [entityKey, entity] of Object.entries(entities)) {
+    const name = entity.entityType ?? entityKey
+    for (const [indexName, index] of Object.entries(entity.indexes)) {
+      if (!index) continue
+      const owner = `entity "${name}" (index "${indexName}")`
+      add(index.pk.field, "S", owner)
+      add(index.sk.field, isZOrderHalf(index.sk) ? "B" : "S", owner)
+    }
+  }
+  for (const [aggregateKey, agg] of Object.entries(aggregates)) {
+    add(agg.pkField, "S", `aggregate "${aggregateKey}"`)
+    if (agg.collection.index !== undefined && agg.collection.sk !== undefined) {
+      add(agg.collection.sk.field, "S", `aggregate "${aggregateKey}" (collection index)`)
+    }
+    if (agg.listIndex) {
+      const owner = `aggregate "${aggregateKey}" (list index)`
+      add(agg.listIndex.pk.field, "S", owner)
+      add(agg.listIndex.sk.field, "S", owner)
+    }
+  }
+  for (const [indexName, entry] of mergeVectorIndexes(entities)) {
+    const owner = `vector index "${indexName}" (entity "${entry.owner}")`
+    add(entry.definition.partitionField, "S", owner)
+    for (const [stored, type] of Object.entries(entry.filterStoredTypes)) add(stored, type, owner)
+  }
+
+  return new Map(Array.from(declared, ([name, { type }]) => [name, type]))
+}
+
 /**
  * Derive CreateTable input from a table's registered members.
  *
@@ -592,7 +681,10 @@ export const mergeSecondaryIndexes = (
  *   table PK — DynamoDB LSIs by definition share the base table's partition key)
  *
  * The physical table name is omitted — that's deployment config.
- * All key attributes are typed as "S" (String) since generated keys are always strings.
+ * Every key attribute is typed "S" (String) — generated keys are strings — or "B"
+ * for a Z-order sort key (#171); vector filter attributes take their model's
+ * type. One attribute declared with two types fails (EDD-9091, see
+ * {@link resolveKeyAttributeTypes}).
  *
  * LSI auto-detection: an aggregate's `collection` GSI config is emitted as an LSI
  * iff `agg.pkField` equals the table's primary PK field (determined from the first
@@ -628,6 +720,9 @@ export const definition = (table: Table): TableDefinition => {
   // Pass 2: classify secondary indexes (GSI vs LSI), refusing members that
   // disagree on one physical index's key schema (EDD-9069).
   const secondaryIndexes = mergeSecondaryIndexes(table.entities, table.aggregates, primary)
+  // Every attribute's one type: S, or B for a Z-order sort key (EDD-9091 on a
+  // conflict). Also reached by the synthetic tables `DynamoClient.make` builds.
+  const attributeTypes = resolveKeyAttributeTypes(table.entities, table.aggregates, primary)
   const gsiMap = new Map<string, { pk: string; sk: string }>()
   const lsiMap = new Map<string, { pk: string; sk: string }>()
   for (const [indexName, index] of secondaryIndexes) {
@@ -688,16 +783,18 @@ export const definition = (table: Table): TableDefinition => {
 
   const AttributeDefinitions: Array<AttributeDefinition> = Array.from(attributeNames)
     .sort()
-    .map((name) => ({ AttributeName: name, AttributeType: "S" as const }))
+    .map((name) => ({ AttributeName: name, AttributeType: attributeTypes.get(name) ?? "S" }))
 
   // Every SearchSchema element must appear in AttributeDefinitions (verified
   // against the live service; DynamoDB Local silently accepts their absence).
   // The composed HASH partition attribute is always a string; filter types are
-  // derived from the model schema at Entity.make (EDD-9039).
+  // derived from the model schema at Entity.make (EDD-9039). An attribute
+  // already defined above is skipped: `resolveKeyAttributeTypes` refused any
+  // whose types differ (EDD-9091).
   const vectorAttributeDefs = (
     merged: Map<string, MergedVectorIndex>,
   ): Array<AttributeDefinition> => {
-    const defs = new Map<string, "S" | "N">()
+    const defs = new Map<string, KeyAttributeType>()
     for (const entry of merged.values()) {
       if (!attributeNames.has(entry.definition.partitionField)) {
         defs.set(entry.definition.partitionField, "S")
@@ -773,6 +870,166 @@ export const definition = (table: Table): TableDefinition => {
 /** Options for table creation. */
 export interface CreateTableOptions {
   readonly billingMode?: "PAY_PER_REQUEST" | "PROVISIONED" | undefined
+}
+
+// ---------------------------------------------------------------------------
+// rekey — move rows still under their 1.36 keys (#171)
+// ---------------------------------------------------------------------------
+
+/**
+ * The rows `db.tables.<Table>.rekey()` moves, by kind:
+ *
+ * - `item` — an entity's item (its unique sentinels move with it, counted in
+ *   {@link RekeyReport.sentinelsMoved})
+ * - `snapshot` — a version snapshot (`versioned: { retain: true }`)
+ * - `tombstone` — a soft-deleted item (the unique sentinels it kept,
+ *   `preserveUnique`, move to their current keys and name the item's current
+ *   key, counted in {@link RekeyReport.sentinelsMoved}), or a projection's
+ *   row tombstone
+ * - `outbox` — a projection's outbox item, to its read-model row's current
+ *   key (an outbox on another table moves with that table's `rekey`)
+ * - `event` — a time-series event
+ * - `aggregate` — a row of an aggregate
+ * - `stream` — a row of an event stream: events, snapshot, command sentinels
+ */
+export type RekeyRowKind =
+  | "item"
+  | "snapshot"
+  | "tombstone"
+  | "outbox"
+  | "event"
+  | "aggregate"
+  | "stream"
+
+/** Rows moved (or, in a dry run, that would move), by kind. */
+export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
+
+/**
+ * Why `rekey` left a row alone without judging its keys:
+ *
+ * - `notLibrary` — it has no `__edd_e__`: the library did not write it
+ * - `unregistered` — its `__edd_e__` names no entity, aggregate or stream
+ *   the client knows (pass event streams in {@link RekeyOptions.streams}),
+ *   or it is an outbox item on another table than its read model's, of a
+ *   projection not defined where `rekey` runs
+ * - `unrecognizedKey` — its member's, but stored neither under the key its
+ *   values compose now nor under the one 1.36 composed for them
+ */
+export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
+
+/**
+ * A row `rekey` did not move, and why. A row is moved only where nothing is
+ * (or, a stream's snapshot, over an older one), and deleted only while it is
+ * as `rekey` read it, so a write that lands in between wins:
+ *
+ * - `bothKeys` — the same row (the same item, version, event, …) is also
+ *   under its current key — for an aggregate, any of its rows is, or which
+ *   of them are where can't be told; both are left as they are
+ * - `taken` — another row holds its current key
+ * - `contended` — concurrent writes changed it on every attempt
+ * - `failed` — it could not be moved as stored (its values no longer decode,
+ *   a stream id reads as more than one id, or a write was refused);
+ *   `message` says why
+ */
+export interface RekeyConflict {
+  /** The entity type, aggregate or stream name. */
+  readonly member: string
+  readonly kind: RekeyRowKind
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed"
+  /** The row's primary key, as stored. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** Its current key: where it would move. */
+  readonly target: Readonly<Record<string, unknown>> | undefined
+  readonly message: string
+}
+
+/** One member's share of a {@link RekeyReport}. */
+export interface RekeyMemberReport {
+  readonly unchanged: number
+  readonly moved: RekeyCounts
+  readonly indexKeysRewritten: number
+  readonly sentinelsMoved: number
+  readonly conflicts: number
+}
+
+/**
+ * What a `rekey` run did — or, with `dryRun`, would do. Counts are of rows
+ * acted on: a row the scan reads after the run moved it (at its current key)
+ * is `unchanged`, so `scanned` is not the sum of the others. A row an
+ * application write moved between the scan and the move is `unchanged` too:
+ * `moved` counts the rows this run moved.
+ */
+export interface RekeyReport {
+  readonly dryRun: boolean
+  /** Rows the scan returned. */
+  readonly scanned: number
+  /** Rows of a known member already under their current keys, with nothing to rewrite. */
+  readonly unchanged: number
+  /** Rows moved to their current keys (a dry run: rows that would move), by kind. */
+  readonly moved: RekeyCounts
+  /**
+   * Items under their current table key whose index keys or vector partition
+   * held 1.36 text, rewritten in place (`UpdateItem`).
+   */
+  readonly indexKeysRewritten: number
+  /** Unique-constraint sentinels moved to their current keys. */
+  readonly sentinelsMoved: number
+  /** Rows left where they are — see {@link RekeyConflict}. */
+  readonly conflicts: ReadonlyArray<RekeyConflict>
+  /** Rows no member owns, by reason. */
+  readonly skipped: { readonly [R in RekeySkipReason]: number }
+  /** Per entity type, aggregate and stream name. */
+  readonly byMember: Readonly<Record<string, RekeyMemberReport>>
+  /** What the run consumed — always measured, whatever `ConsumedCapacity` reporting is set to. */
+  readonly capacity: CapacityTotals
+  /**
+   * Where the scan stopped, when it stopped before the end of the table
+   * (`maxPages`): pass it as {@link RekeyOptions.resume} to go on.
+   * `None` when the run covered the whole table.
+   */
+  readonly resume: Option.Option<string>
+}
+
+/** Options for `db.tables.<Table>.rekey()`. */
+export interface RekeyOptions {
+  /** Count what would move, reading but writing nothing. Default `false`. */
+  readonly dryRun?: boolean | undefined
+  /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
+  readonly segments?: number | undefined
+  /** Rows of one scan page handled at once, per segment. Default 4. */
+  readonly concurrency?: number | undefined
+  /** The scan's page size (`Limit`). Default: DynamoDB's (1 MB pages). */
+  readonly pageSize?: number | undefined
+  /**
+   * Stop after this many scan pages (all segments together) and return a
+   * {@link RekeyReport.resume} token: bound a run to a time slot and go on
+   * in the next one.
+   */
+  readonly maxPages?: number | undefined
+  /**
+   * A {@link RekeyReport.resume} token — of an earlier run, or the last one
+   * {@link onProgress} received before a run was interrupted. Its segment
+   * count wins; a different `segments` fails (`EDD-9098`).
+   */
+  readonly resume?: string | undefined
+  /**
+   * The event streams on the table, bound or not. `DynamoClient.make` does
+   * not register streams, so a stream's rows are `unregistered` (skipped)
+   * unless it is listed here. A stream on another table is ignored.
+   */
+  readonly streams?:
+    | ReadonlyArray<
+        | EventStream<any, any, any, any, any, any, any>
+        | BoundEventStream<any, any, any, any, any, any, any>
+      >
+    | undefined
+  /**
+   * Called after each scan page, once every row of it is handled, with the
+   * report so far and a `resume` token from that point: a run that is
+   * interrupted resumes from the last token it delivered, redoing at most
+   * the pages in flight (`rekey` is idempotent).
+   */
+  readonly onProgress?: ((progress: RekeyReport) => Effect.Effect<void>) | undefined
 }
 
 /**

@@ -121,6 +121,10 @@ Under the hood, each event is stored as a DynamoDB item with:
 - **SK** containing a zero-padded version number for ordered retrieval
 - **eventType** discriminator for decoding back to the correct Schema.Class
 
+:::note[Numeric stream ids written by 1.36]
+Since 1.37.0 a `number` or `bigint` stream id composite is written as text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)). A non-negative integer below 1e16 (1e38 for a `bigint`) keeps its 1.36 key. A stream 1.36 wrote under a negative, fractional or larger number stays under its 1.36 key, where 1.37.x reads and appends it, never splitting it, until `rekey` moves it whole ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/#event-streams)). Projection read models keyed by such values keep working too: a projection reads its row, tombstone and pending outbox effects under the 1.36 key, its next write moves the row, `drain(key)` and `drainPending` deliver a row's effects under both keys in one order, and `rekey` moves the rest.
+:::
+
 ### Stream key casing
 
 By default a stream **lower-cases its name** in every key it writes, whatever the schema's `casing`, and the rest of the key (stream ids, command ids) follows the schema. Entity types follow the schema's casing, so under `casing: "preserve"` a stream and an entity on the same table disagree:

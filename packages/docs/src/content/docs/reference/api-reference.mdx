@@ -144,7 +144,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, and optional casing |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `legacyKeys: false` to turn off the 1.36 key fallback once `rekey` has moved every row ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136), [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -161,7 +161,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Type | Description |
 |------|-------------|
-| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing }` |
+| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, legacyKeys?: false }` |
 | `Casing` | `"lowercase" \| "uppercase" \| "preserve"` |
 
 ### Usage
@@ -197,6 +197,25 @@ Both `make` and `definition` check the members against each other. Every member 
 | `Table` | Interface with `schema`, `entities`, `aggregates`, `layer()`, `layerConfig()`, and `Tag` for DI |
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
+| `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
+| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
+| `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
+| `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed", key, target, message }` — a row `rekey` left as it is |
+| `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
+
+### Table operations
+
+The typed client's `db.tables.<Table>` binds the table's operations:
+
+| Operation | Description |
+|-----------|-------------|
+| `create(options?)` / `delete()` / `describe()` / `update(input)` | Create the table from its members' key and index declarations, delete it, describe it, update its settings |
+| `backup(name)` / `listBackups()` / `restoreFromBackup(backupArn)` | On-demand backups |
+| `enablePointInTimeRecovery()` / `disablePointInTimeRecovery()` / `restoreToPointInTime(date)` / `exportToS3(bucket, options?)` | Point-in-time recovery and export |
+| `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
+| `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
+| `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row 1.36 wrote whose key text changed to its current key: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, so a concurrent write wins, and conflicts are reported and left; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 
@@ -455,13 +474,14 @@ import { Query } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `where(conditions)` | Dual | Add sort key conditions (`KeyConditionExpression`) |
-| `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter) |
-| `pageSize(n)` | Dual | Fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips) |
+| `limit(n)` | Dual | Return at most `n` items (a contract on results — accumulates across requests, works under a filter). Each request's `Limit` is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed |
+| `pageSize(n \| "natural")` | Dual | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit` (a contract on round trips), never adapted. `"natural"`: size requests as 1.36 did (a natural 1 MB page under a filter). Any other string throws `EDD-9095` |
 | `maxPages(n)` | Dual | Limit total number of pages fetched |
+| `onRequest(observer)` | Dual | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. Observers run in the order added; a failure is a defect |
 | `reverse` | Combinator | Reverse sort order (descending) |
 | `consistentRead` | Combinator | Enable strongly consistent reads (the table, or an LSI). DynamoDB rejects a consistent read of a GSI: the query fails with a `ValidationError` (`operation: "query.consistentRead"`) naming the index, DynamoDB's error as its `cause` |
 | `ignoreOwnership` | Combinator | Skip `__edd_e__` entity type filter — for mixed-table scenarios |
-| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor |
+| `startFrom(cursor)` | Dual | Resume pagination from a previous cursor. The cursor is decoded by the terminal: a malformed one fails it with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it |
 | `select(attrs)` | Dual | Project specific attributes (returns `Query<Record<string, unknown>>`) |
 | `filterExpr(expr)` | Dual | Add an `Expr` ADT filter (from callback API) |
 | `selectPaths(paths)` | Dual | Project path segments (from callback API) |
@@ -470,10 +490,11 @@ import { Query } from "effect-dynamodb"
 
 | Export | Returns | Description |
 |--------|---------|-------------|
-| `execute` | `Effect<Page<A>>` | Execute and return a page: `{ items: Array<A>, cursor: string \| null }` |
+| `execute` | `Effect<Page<A>>` | Execute and return a page: `{ items: Array<A>, cursor: Option<string> }` |
 | `collect` | `Effect<Array<A>>` | Execute, fetch all pages, and flatten into a single array |
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
+| `explain` | `Effect<QueryExplain, never, never>` | Describe the plan, its reason, the key ranges known up front, the fields checked per row and the request sizing, without sending anything. A `startFrom` cursor is not read |
 | `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send |
 
 ### Filter Operators
@@ -499,6 +520,16 @@ Used in entity-level `filter()`:
 | Export | Description |
 |--------|-------------|
 | `isQuery(value)` | Type guard for `Query<A>` |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Page<A>` | `{ items: Array<A>, cursor: Option<string> }` — `cursor` is `None` on the last page; `startFrom` takes the string inside a `Some` |
+| `PlanMode` | `"key" \| "skip-scan" \| "filter" \| "naive" \| "jump" \| "precise" \| "empty"` |
+| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, maxSkips? }` |
+| `QueryRequestEvent` | `{ kind: "read" \| "probe" \| "count", request, lower, upper, limit, scannedCount, count, accepted, discarded }` |
+| `ZOrderOptions` | `{ strategy?: "auto" \| "naive" \| "jump" \| "precise", maxRanges?, pageSize?, concurrency? }` — see [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies) |
 
 ### Usage
 
@@ -536,16 +567,19 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 
 | Method | Description |
 |--------|-------------|
-| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. |
+| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. Bounds compare composite values: sort key text is escaped, so key order is value order and each bound is one exact key condition (see [Sort Key Conditions](/effect-dynamodb/guides/queries/#sort-key-conditions)). |
 | `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before sending. An `isIn` with no values is sent, and DynamoDB's rejection is a `ValidationError` (`operation: "query.filter"`) naming it. |
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
 | `.select(["field", …])` | Projection via attribute name array. |
-| `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. |
-| `.pageSize(n)` | Fetch in batches of `n` rows — sets DynamoDB's `Limit`. A contract on round trips, not on what comes back. |
+| `.within(bounds, options?)` | Bound any sort key composite the accessor left open, not only the leading one: `{ eq }`, `{ between: [lo, hi] }`, or one or two open ends (`gt` / `gte`, `lt` / `lte`). Plans a key condition, a skip-scan or a filter (`options.maxSkips`, default 32). On a Z-order accessor it bounds the dimensions (`in` for a `literals` dimension) and pins the prefix composites. Excludes `.where()`. See [`.within()`](/effect-dynamodb/guides/queries/#bounding-any-sort-key-composite-within). |
+| `.zorder(options)` | Z-order accessors only: how the `.within()` box is read — `ZOrderOptions` (`strategy`, `maxRanges`, `pageSize`, `concurrency`). Later calls merge over earlier ones. See [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies). |
+| `.limit(n)` | Return at most `n` items. A contract on results: the query accumulates across as many requests as it takes, which is what makes it work under `.filter()`. Each request is [sized](/effect-dynamodb/guides/queries/#request-sizing) toward the items still owed. |
+| `.pageSize(n \| "natural")` | `n`: fetch in batches of `n` rows — sets DynamoDB's `Limit`, never adapted. A contract on round trips, not on what comes back. `"natural"`: size requests as 1.36 did. |
 | `.maxPages(n)` | Maximum number of DynamoDB pages to fetch. |
 | `.reverse()` | Reverse sort order (`ScanIndexForward = false`). |
-| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. |
+| `.startFrom(cursor)` | Resume pagination from an opaque cursor returned by `.fetch()`. Decoded by the terminal: a malformed cursor fails it with a `ValidationError` (`EDD-9094`), as does a `.within()` cursor given to a query without `.within()`. A `.within()` query also refuses a cursor from another plan (other bounds, partition, direction or index declaration) or positioned outside its own. A query without `.within()` can't recognise another query's well-formed cursor: DynamoDB may reject it (`DynamoValidationError`) or the query resumes from it. See [Cursor-Based Pagination](/effect-dynamodb/guides/queries/#cursor-based-pagination). |
+| `.onRequest(observer)` | Run `observer` with a `QueryRequestEvent` after every request a terminal sends, probes included. See [Inspecting a query](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest). |
 | `.consistentRead()` | Enable strongly consistent reads. On a GSI, which DynamoDB reads only eventually consistently, DynamoDB rejects the query and it fails with a `ValidationError` naming the index. An entity's indexes are GSIs when `db.tables.*.create()` creates them. |
 | `.ignoreOwnership()` | Skip the `__edd_e__` entity-type filter. Use only when querying a polymorphic GSI shared across entity types and you want every item back. |
 
@@ -554,13 +588,27 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 | Method | Returns |
 |--------|---------|
 | `.collect()` | `Effect<Array<A>, DynamoClientError \| ValidationError, never>` — drain all pages into a single array. |
-| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: string \| undefined }`. |
+| `.fetch()` | `Effect<Page<A>, DynamoClientError \| ValidationError, never>` — single page + opaque cursor. `Page<A>` is `{ items: Array<A>, cursor: Option<string> }`; `cursor` is `None` on the last page. |
 | `.paginate()` | `Stream<A, DynamoClientError \| ValidationError, never>` — lazy stream that paginates automatically. |
-| `.count()` | `Effect<number, DynamoClientError, never>` — count-only query (`Select: COUNT`); items are not returned. |
+| `.count()` | `Effect<number, DynamoClientError \| ValidationError, never>` — count-only query (`Select: COUNT`); items are not returned. |
+| `.explain()` | `Effect<QueryExplain, never, never>` — the plan the terminals would run, and why, without sending anything. |
 
 ### `where` typing
 
 `.where()` is conditionally available based on the `SkRemaining` type parameter. When the index's SK composites have already been fully consumed (e.g., the entity has no SK composites, or all of them were supplied to the query accessor), `.where()` is **not present** on the type — calling it is a compile error. Once called, `.where()` consumes `SkRemaining` and the resulting `BoundQuery` no longer exposes `.where()`.
+
+`.within()` is typed the same way: present only on an accessor with sort key composites left to bound, and gone once `.where()` or `.within()` is called. A Z-order accessor has no `.where()` (a binary address has no text order to compare); after its `.within()`, `.zorder()` stays available.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `BoundQueryWithin<Model, A, W>` | The `.within()` method, present when `W` names bounds |
+| `BoundQueryZOrder<Model, SkRemaining, A, W>` | The `.zorder()` method of a Z-order accessor |
+| `RangeBound<V>` | `{ eq }`, `{ between: [lo, hi] }`, a `gt` / `gte` lower bound, an `lt` / `lte` upper bound, or one of each |
+| `DimensionBound<D, V>` | A `RangeBound` in the field's own type; for a `literals` dimension, ranges follow declaration order and `{ in: [...] }` is allowed |
+| `WithinOptions` | `{ maxSkips?: number }` — the skip-scan probe budget per terminal call (default 32; `0` never skips) |
+| `WithinKind`, `WithinSpec`, `ZOrderApplied` | Type-level bookkeeping for which accessor a `.within()` belongs to |
 
 ### Usage
 
@@ -639,7 +687,7 @@ A collection query takes `.filter()`, `.select()`, `.limit()`, `.pageSize()`, `.
 | Terminal | Returns |
 |----------|---------|
 | `.collect()` | The grouped result, `{ Employees: Employee[], Tasks: Task[] }` |
-| `.fetch()` | One page, grouped the same way, with its `cursor` |
+| `.fetch()` | One page, grouped the same way, with its `cursor` (`Option<string>`, `None` on the last page) |
 | `.paginate()` | A `Stream` of every item, each tagged with its member: `{ member: "Employees", item: Employee }` (`CollectionStreamItem`) |
 | `.count()` | The number of items, every member's together |
 
@@ -942,6 +990,39 @@ const proj = Projection.projection(["name", "email", "status"])
 
 ---
 
+## ZOrder
+
+Types for the dimensions of a [Z-order sort key](/effect-dynamodb/guides/zorder/): `sk: { field, prefix?, zorder: [...] }` on a secondary index. Each `zorder` entry names a model field (a bare name, or `{ field, ...options }`) and quantizes it into levels; the levels' bits are interleaved, MSB-aligned, in declaration order, into one binary (`B`) sort key. The entry's options follow the field's type in the model, and `Entity.make` types each entry from the model: a misspelled field, a misspelled option or an option of another kind is a compile error. The module exports types only. Also exported from `@effect-dynamodb/schema`.
+
+```typescript
+import type { ZOrder } from "effect-dynamodb"
+```
+
+| Field type | Entry | Levels |
+|------------|-------|--------|
+| `number`, `bigint` | `{ field, min, max, step? }` (`NumericDimension`) | `min`..`max` in steps of `step` (default 1); bits derived from the level count. Integer arithmetic when all three are integers, float otherwise (at most 2^53 levels); a `bigint` field takes integers only. Out-of-range values share the edge levels |
+| a date with a known storage format (a `DynamoModel` date schema or an Effect date schema) | `{ field, from, unit, bits }` (`DateTimeDimension`) | `2^bits` levels of one `unit` (`"milliseconds"` … `"weeks"`) from `from` (an ISO string, `Date` or `DateTime`) |
+| a literal union, `boolean` | the bare name, or `{ field, values?, bits? }` (`LiteralsDimension`) | One level per member, in the schema's order; `values` reorders them and lists every member; `bits` reserves room for members appended later. Bounds may use `{ in: [...] }`. A string union also takes a byte width, a number union a range |
+| `string` | `{ field, bytes }` (`StringDimension`) | The first `bytes` (1..16) UTF-8 bytes, in byte order |
+| a plain `string` | `{ field, values, bits? }` (`ListedLiteralsDimension`) | One level per listed value; writing another value fails. A plain `number` takes a range only |
+
+`Entity.make` checks entries at runtime too. Options an entry can't use, options of two kinds or an unknown option throw `EDD-9087`; an entry that doesn't fit its field's schema throws `EDD-9088`; more than 53 bits for one dimension (128 for a byte width) or 512 in all throws `EDD-9089`.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Dimension<TFields>` | The entries a model with fields `TFields` (name → model type) takes, field by field |
+| `DimensionFor<F, V>` | The entries a field `F` of model type `V` takes (the table above); any entry when `V` is unknown |
+| `NumericDimension<F>`, `DateTimeDimension<F>`, `LiteralsDimension<F, L>`, `ListedLiteralsDimension<F, L>`, `StringDimension<F>` | The entry shapes |
+| `AnyDimension` | Any entry, as `Entity.make` reads it at runtime |
+| `DimensionKind` | `"int" \| "float" \| "dateTime" \| "literals" \| "string"`: how a resolved dimension maps values onto levels |
+| `DateTimeUnit` | `"milliseconds" \| "seconds" \| "minutes" \| "hours" \| "days" \| "weeks"` |
+| `LiteralValue` | `string \| number \| boolean`: a member of a literals dimension |
+| `PrefixPart<F>` | `F \| { field: F, hash: number }` — a prefix composite: stored length-prefixed, or as the first `hash` (1..8) bytes of its FNV-1a-64 hash |
+
+---
+
 ## KeyComposer
 
 Composite key composition from index definitions. Used internally by Entity, also available for advanced use cases.
@@ -953,15 +1034,21 @@ import { KeyComposer } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `composePk` | `(schema, entity, index, record) => string` | Compose partition key value |
-| `composeSk` | `(schema, entity, index, record) => string` | Compose sort key value |
+| `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
+| `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
+| `composeSkValue` | `(schema, entityType, entityVersion, index, record) => KeyValue` | `composeSk` for a string half, `composeZOrderSk` for a Z-order half |
+| `isZOrderHalf` | `(part) => part is ZOrderSkPart` | Is this sort key half a Z-order one? |
 | `composeIndexKeys` | `(schema, entity, index, record) => Record` | Compose all key attributes for an index |
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
 | `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append. Implements v3 per-half structural composition + policy-aware hole detection (see `indexPolicy` guide). |
-| `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | Partial SK prefix for `begins_with` queries |
+| `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | The composed SK up to the last composite supplied, with no trailing delimiter |
+| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied, else `{ beginsWith: prefix + "#" }`, so a value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
-| `serializeValue` | `(value) => string` | Serialize a value for key composition |
+| `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
+| `sortKeyText` | `(text, casing) => string` | A composite's text as a sort key holds it: cased, then each code point U+0000–U+0025 escaped as `%` and two hex digits ([Sort key text](/effect-dynamodb/guides/indexes/#sort-key-text)) |
+| `serializeSortKeyValue` | `(value, casing) => string` | `serializeValue`, then `sortKeyText` |
 | `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
 | `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 
@@ -970,10 +1057,13 @@ import { KeyComposer } from "effect-dynamodb"
 | Type | Description |
 |------|-------------|
 | `KeyPart` | `{ field: string, composite: string[] }` |
-| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart, index?, collection?, type?, casing?, indexPolicy? }` |
+| `ZOrderKeyPart` | `{ field: string, prefix?: PrefixPart[], zorder: Dimension[] }` — a Z-order sort key as declared |
+| `ZOrderSkPart` | A normalised Z-order sort key half: `{ field, composite, zorderHalf }`, where `composite` is derived (prefix composites, then dimension fields) |
+| `KeyValue` | `string \| Uint8Array` — text for a string half, bytes for a Z-order half |
+| `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart \| ZOrderSkPart, index?, collection?, type?, casing?, indexPolicy? }` |
 | `IndexPolicyKey` | `"sparse" \| "preserve"` |
 | `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
-| `GsiUpdateResult` | `{ sets: Record<string, string>, removes: ReadonlyArray<string> }` |
+| `GsiUpdateResult` | `{ sets: Record<string, KeyValue>, removes: ReadonlyArray<string> }` |
 
 ---
 
@@ -1063,8 +1153,8 @@ import { Aggregate } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `make` | Overloaded | Create a sub-aggregate or top-level aggregate (see below) |
-| `one` | `(name, { entityType }) => OneEdge` | Create a one-to-one edge descriptor |
-| `many` | `(name, config) => ManyEdge` | Create a one-to-many edge descriptor |
+| `one` | `({ entityType, entity?, discriminator? }) => OneEdge` | Create a one-to-one edge descriptor. The `edges` key names the schema field. `(name, config)` is deprecated (the name is not read) and removed in the next major release |
+| `many` | `({ entityType, entity?, inputField?, sk?, assemble?, decompose? }) => ManyEdge` | Create a one-to-many edge descriptor. `(name, config)` and `edgeAttributes` are deprecated (neither is read) and removed in the next major release |
 | `ref` | `(entity) => RefEdge` | Create a ref edge (inline hydration, no separate DynamoDB item) |
 
 **Sub-aggregate form** — `Aggregate.make(Schema, { root, edges })`:
@@ -1075,8 +1165,8 @@ Returns a `SubAggregate<TSchema>` with a `.with(config)` method for discriminato
 const TeamSheetAggregate = Aggregate.make(TeamSheet, {
   root: { entityType: "MatchTeam" },
   edges: {
-    coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-    players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+    coach: Aggregate.one({ entityType: "MatchCoach" }),
+    players: Aggregate.many({ entityType: "MatchPlayer" }),
   },
 })
 ```
@@ -1094,7 +1184,7 @@ const MatchAggregate = Aggregate.make(Match, {
   root: { entityType: "MatchItem" },
   refs: { Team: Teams, Player: Players, Coach: Coaches, Venue: Venues },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue" }),
+    venue: Aggregate.one({ entityType: "MatchVenue" }),
     team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
     team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
   },
@@ -1109,14 +1199,14 @@ const MatchAggregate = Aggregate.make(Match, {
 | `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove all items in the partition |
-| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is `null` only when exhausted, and is always `null` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor`. Returns `{ data, cursor }`; `cursor` is an `Option<string>`, `None` only when exhausted, and always `None` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 
 | Type | Description |
 |------|-------------|
-| `OneEdge` | One-to-one edge: `{ _tag: "OneEdge", name, entityType }` |
-| `ManyEdge` | One-to-many edge: `{ _tag: "ManyEdge", name, entityType, edgeAttributes?, sk? }` |
+| `OneEdge` | One-to-one edge: `{ _tag: "OneEdge", entityType, entity?, discriminator? }` (`name?`, deprecated, only from the `(name, config)` form) |
+| `ManyEdge` | One-to-many edge: `{ _tag: "ManyEdge", entityType, entity?, inputField?, sk?, assemble?, decompose? }` (`name?` and `edgeAttributes?` deprecated) |
 | `RefEdge` | Inline ref edge: `{ _tag: "RefEdge", entity }` — no separate DynamoDB item |
 | `AggregateEdge` | Union: `OneEdge \| ManyEdge \| RefEdge` |
 
@@ -1259,7 +1349,7 @@ Read models folded from DynamoDB Streams in version order, gap-filled from the e
 | `EventStore.processBatch(records, { projections, streams?, ...options })` | One feed, several projections: each record decoded once (bound projections under their own context) and routed to every projection of its stream (others skipped); `outcomes` per projection name, `positions` indexing `records`; one response across all. `streams` names streams whose events come back in `unrouted` (`{ position, stream, event }`), whether or not a projection also reads them. A marker shared by two streams dies with `[EDD-9082]` |
 | `EventStore.bindProjection(projection)` | Resolve the client, both tables, `evolve`'s requirements and the `Compression` registry; every operation then has `R = never`. Checks the stream's codecs as `bind` does (`[EDD-9078]`) |
 | `projection` options `revision`, `removal`, `outbox` | `revision`: a numeric model field the library owns, set one higher by every write and conditioned on (`attribute_not_exists` when absent); may be an existing write counter; required by `outbox`. `removal: { ttl? }`: `evolve` may return `EventStore.removeRow`, and the row becomes a tombstone at its own key (`__edd_e__` `<entityType>#tombstone`) keeping the checkpoint and revision, absent to every entity read by key (the read model's `create` may replace it, carrying its checkpoints over). `outbox: { schema, effects(event, next, context), table?, keys?, index?, claimFor? }`: effects written as outbox items (`<entityType>#outbox`) in the same `TransactWriteItems` as the row. `removal` / `outbox` on a read model with `unique` constraints, and `outbox` without `revision`, throw `[EDD-9081]` — see [Multi-source Projections, Tombstones and the Outbox](/effect-dynamodb/guides/projections-advanced/) |
-| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
+| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. Through 1.37.x both deliver a row's effects under its current key and under its 1.36 key in one order ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)). `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
 | `EventStore.multiProjection({ readModel, initial, sources: (source) => ({ name: source(stream, { key, evolve, mode?, terminal? }) }), checkpoints: { field?, sources? }, revision, toItem?, retry?, removal?, outbox?, sourcesOf? })` | A read model fed by several streams: a checkpoint per source instance (`checkpoints.field`, a `Record<string, number>` keyed `<source>#<streamId>`; or per-source `{ field, offset?, instanceField }` for legacy rows — another instance goes to the map, or fails with `ProjectionSourceConflict`), each write guarded by `revision`. Every checkpoint, instance, map and revision field may be optional in the model: absent reads as none, and an empty map is not written. `mode: "fold"` (gap-filled) or `"latest"` (newest event per instance, falling back newest-first past `terminal` rejections; older ones `superseded`). An instance whose `evolve` fails (not `terminal`) is left out of the write and reported as its own `Failed` outcome; the row's other instances apply. `revision: { field, initial }` sets a new row's first value. `applyBatch` takes decoder-style `{ stream: <source>, event }` events; `catchUp(rowKey)`; `rebuild(rowKey, { instances })` (or `sourcesOf`); `processBatch`; `drain` / `drainPending`. `bindProjection` and `EventStore.processBatch` accept it next to single-source projections |
 | `EventStore.removeRow` | Returned by `evolve` to remove the row (with `removal`) |
 | `EventStore.skipEvent` | Returned by `evolve` to skip the event: reported in `skipped` (never `applied`), no outbox effects, and no write when the row's events are all skipped or already applied. The instance's checkpoint stops at its last applied or rejected event, so a skipped event above it is decided again later. In `"latest"` mode a skip falls back to the next older event |
@@ -1446,7 +1536,7 @@ import {
   ItemNotFound, ConditionalCheckFailed,
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
-  ItemDeleted, ItemNotDeleted,
+  ItemDeleted, ItemNotDeleted, ItemNotMoved, StaleAppend,
   ConcurrentModification, UpdateAppliedButUnreadable, DeleteAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
@@ -1477,8 +1567,10 @@ import {
 | `OptimisticLockError` | `"OptimisticLockError"` | A versioned write lost a version race: `expectedVersion()` did not match, or another writer changed the item between the read and the write of a read-then-write update, or a `put`, `upsert` or transaction put lost that race on every attempt. `actualVersion` is the stored version (`entityType`, `key`, `expectedVersion`, `actualVersion`) |
 | `ConcurrentModification` | `"ConcurrentModification"` | An unversioned write that reads first (a unique-field change, a computed change to an index composite, a `put` or `upsert` of a unique-constrained entity — the last two after every attempt) found that another writer changed one of the attributes it read before its write landed, or a unique sentinel it was releasing changed hands. Nothing was written; retrying recomputes from the new values (`entityType`, `key`, `attributes`, `current`) |
 | `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
+| `StaleAppend` | `"StaleAppend"` | A time-series `append` lost to a newer one: the current item's `orderByField` is already at or past `attemptedOrderBy`. Expected under newer-wins concurrency; `current` holds the winning item (`Option.none()` after `.skipFollowUp()`, where a failed `.condition()` also raises it) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
-| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
+| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted, or still lives under its 1.36 key) |
+| `ItemNotMoved` | `"ItemNotMoved"` | EDD-9097 — a `Transaction.transactWrite` (or `EventStore` `additionalItems`) op whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row, which a transaction can't move (`entityType`, `key`, `operation`: the item to write first). Nothing was written: write that item once through the entity, or run [`rekey`](/effect-dynamodb/guides/upgrading/), then run the transaction again |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
@@ -1511,11 +1603,12 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
 | `delete` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `ValidationError`, `TransactionOverflow`, `DeleteAppliedButUnreadable` |
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
-| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow` |
+| `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `purge` | `ValidationError` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound`, `ItemNotMoved` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ItemNotMoved` |
 
 ### Usage
 

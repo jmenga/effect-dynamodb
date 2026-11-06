@@ -15,6 +15,7 @@ const Product = Schema.Struct({
   price: Schema.Number,
 })
 
+/** Some cases name non-model fields on purpose, to reach the runtime checks. */
 const makeProducts = (vectorIndexes: Record<string, VectorIndex.VectorIndexConfig>) =>
   Entity.make({
     model: Product,
@@ -23,7 +24,7 @@ const makeProducts = (vectorIndexes: Record<string, VectorIndex.VectorIndexConfi
       pk: { field: "pk", composite: ["productId"] },
       sk: { field: "sk", composite: [] },
     },
-    vectorIndexes,
+    vectorIndexes: vectorIndexes as never,
   })
 
 describe("VectorIndex", () => {
@@ -267,7 +268,8 @@ describe("VectorIndex", () => {
             name: "vec1",
             dimensions: 8,
             source: { fields: ["description"] },
-            filters: Array.from({ length: 19 }, (_, i) => `f${i}`),
+            // The model's f0..f18 are built dynamically, so their names aren't in its type.
+            filters: Array.from({ length: 19 }, (_, i) => `f${i}`) as never,
           },
           ...Object.fromEntries(
             Array.from({ length: 5 }, (_, i) => [

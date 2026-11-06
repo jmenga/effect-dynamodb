@@ -104,7 +104,7 @@ const baseAggregateConfig = {
   pk: { field: "pk", composite: ["id"] as const },
   root: { entityType: "OrderRoot" },
   edges: {
-    lines: Aggregate.many("lines", { entityType: "OrderLine" }),
+    lines: Aggregate.many({ entityType: "OrderLine" }),
   },
 }
 

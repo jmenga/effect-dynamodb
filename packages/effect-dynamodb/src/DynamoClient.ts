@@ -9,6 +9,7 @@
  */
 
 import type {
+  AttributeValue,
   BatchGetItemCommandInput,
   BatchGetItemCommandOutput,
   BatchWriteItemCommandInput,
@@ -125,7 +126,10 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  type CompositeKeyForm,
   compositeKeyFormKind,
+  type KeyFormValueKind,
+  keyFormValueKind,
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -134,7 +138,12 @@ import type {
   EntityKeyType,
   IndexPkInput,
   IndexSkFields,
+  IndexZOrderDimensions,
+  IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
@@ -145,11 +154,13 @@ import {
   Config,
   Context,
   Crypto,
+  DateTime,
   Duration,
   Effect,
   Layer,
   Option,
   type Schema,
+  SchemaAST,
   type Stream,
 } from "effect"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
@@ -162,6 +173,7 @@ import {
   collectionNaming,
   entityNaming,
   type RawSortKeyCondition,
+  type WithinOptions,
 } from "./internal/BoundQuery.js"
 import {
   type BoundVectorQuery,
@@ -170,7 +182,7 @@ import {
 } from "./internal/BoundVectorQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
-import { createConditionOps } from "./internal/Expr.js"
+import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -180,13 +192,24 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
+  canonicalJson,
+  compareUtf8,
+  compositePlanner,
+  type KeyRange,
+  keyJustBelow,
+  type RowCheck,
+  type TupleSpace,
+  zorderPlanner,
+} from "./internal/RangePlanner.js"
+import * as Rekey from "./internal/Rekey.js"
+import {
   diagnoseFailure,
   explainDiagnosis,
   type SentTable,
   withCause,
 } from "./internal/WriteDiagnosis.js"
 import * as Query from "./Query.js"
-import type { CreateTableOptions, Table, TableConfig } from "./Table.js"
+import type { CreateTableOptions, RekeyOptions, RekeyReport, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
 
 /**
@@ -198,6 +221,1141 @@ import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } 
  * character DynamoDB key composition emits for the following segment.
  */
 const SK_MAX_SENTINEL = "￿"
+
+/**
+ * A composite value's key text as key composition writes it: serialized,
+ * cased and escaped (`KeyComposer.serializeSortKeyValue`), so it sorts as the
+ * cased value does.
+ */
+const valueText = (casing: DynamoSchema.Casing, keyForm: unknown): string =>
+  KeyComposer.serializeSortKeyValue(keyForm, casing)
+
+/** A sort key composite's segment as key composition writes it: `<name>_<value>`, cased. */
+export const compositeSegment = (
+  casing: DynamoSchema.Casing,
+  field: string,
+  keyForm: unknown,
+): string => `${DynamoSchema.applyCasing(field, casing)}_${valueText(casing, keyForm)}`
+
+/** `bound` with each operand mapped — into its key form, say. */
+const mapBound = (
+  bound: RawSortKeyCondition,
+  f: (value: unknown) => unknown,
+): RawSortKeyCondition => {
+  if ("eq" in bound) return { eq: f(bound.eq) }
+  if ("lt" in bound) return { lt: f(bound.lt) }
+  if ("lte" in bound) return { lte: f(bound.lte) }
+  if ("gt" in bound) return { gt: f(bound.gt) }
+  if ("gte" in bound) return { gte: f(bound.gte) }
+  if ("between" in bound) return { between: [f(bound.between[0]), f(bound.between[1])] }
+  return { beginsWith: f(bound.beginsWith) }
+}
+
+/**
+ * Does a composite's value satisfy `bound`, compared as key text (§11)? Key
+ * forms. Escaped key text sorts as the cased value, so this is the order the
+ * key condition reads in.
+ */
+const boundHolds = (
+  casing: DynamoSchema.Casing,
+  bound: RawSortKeyCondition,
+  keyForm: unknown,
+): boolean => {
+  const text = valueText(casing, keyForm)
+  const against = (operand: unknown) => compareUtf8(text, valueText(casing, operand))
+  if ("eq" in bound) return against(bound.eq) === 0
+  if ("lt" in bound) return against(bound.lt) < 0
+  if ("lte" in bound) return against(bound.lte) <= 0
+  if ("gt" in bound) return against(bound.gt) > 0
+  if ("gte" in bound) return against(bound.gte) >= 0
+  if ("between" in bound) return against(bound.between[0]) >= 0 && against(bound.between[1]) <= 0
+  // A number has no text prefix: `beginsWith` on a numeric composite is `eq`.
+  const operand = bound.beginsWith
+  return typeof operand === "number" || typeof operand === "bigint"
+    ? against(operand) === 0
+    : text.startsWith(valueText(casing, operand))
+}
+
+/**
+ * @internal Compose a bound on sort key composite `field` into a key condition, the
+ * same way `put` composes the stored key: `prefixText` — the key text of
+ * every composite before `field`, ending with the delimiter — then
+ * `<name>_<value>`. Operands are already in key form.
+ *
+ * A stored SK is `$schema#v1#entity#<name>_<cased value>#...`; comparing a
+ * raw operand against that is meaningless (issue #101 — `gte` matched the
+ * whole partition because `"1-009" < "ballkey_…"`, while `begins_with` /
+ * `between` matched nothing). So the operand is placed in the *position* of
+ * the composite it targets and composed like the key, with `serializeValue`,
+ * the `<name>_` prefix, the casing and the escaping.
+ *
+ * The condition is exact: a composite's key text is escaped
+ * (`KeyComposer.sortKeyText`), so it sorts as its value, and the delimiter
+ * that follows it sorts below every character it holds — a value's subtree
+ * (`v#…`) sorts after `v` itself and before every greater value (`v%20x`,
+ * `v0`), whatever characters the values hold (#171).
+ *
+ * `clampToPrefix` keeps a one-sided bound inside `prefixText`: DynamoDB allows
+ * one sort key condition, so once leading composites are pinned the open end
+ * is clamped and the condition becomes a `BETWEEN`. A strict `lt` on the last
+ * composite then ends at the greatest key text below the bound
+ * (`keyJustBelow`), BETWEEN being inclusive.
+ *
+ * Shared by `.where()` and `.within()` (#171), so the two can't drift.
+ */
+export const composeRangeUnder = (
+  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  prefixText: string,
+  field: string,
+  bound: RawSortKeyCondition,
+  options: { readonly clampToPrefix: boolean },
+): Query.SortKeyCondition => {
+  // A missing operand composes the prefix alone, without its delimiter — as
+  // `composeSortKeyPrefix` stops at the first missing composite.
+  const compose = (value: unknown): string =>
+    value === undefined || value === null
+      ? prefixText.slice(0, -1)
+      : `${prefixText}${compositeSegment(index.casing, field, value)}`
+
+  /**
+   * `begins_with` operand matching exactly the keys whose composite equals
+   * `value`: it stops on a segment boundary rather than leaking into sibling
+   * values (`status_done` vs `status_done_archived`, #115).
+   */
+  const subtreeBeginsWith = (value: unknown): string =>
+    `${compose(value)}${DynamoSchema.KEY_DELIMITER}`
+
+  /**
+   * A bound sorting strictly above every key whose composite is `value`, and
+   * strictly below the first key of any greater value.
+   *
+   * The delimiter here is UNCONDITIONAL, including on the last composite:
+   * `compose(v)￿` alone would sort below `compose(v + "0")`, which is a
+   * strictly greater value that must stay inside a `gt`. `compose(v)#￿` sits
+   * above `compose(v)` and below every longer value because `#` is lower than
+   * every character a composite's escaped text holds.
+   */
+  const aboveSubtree = (value: unknown): string =>
+    `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
+
+  /** Inclusive upper bound covering the whole subtree of `value`. */
+  const upper = (value: unknown): string => (index.isLast ? compose(value) : aboveSubtree(value))
+
+  // `beginsWith` / `between` / `eq` carry the prefix in BOTH operands, so they
+  // never escape it.
+  if ("beginsWith" in bound) {
+    // A number has no text prefix: its key text is not its digits (`-3` is
+    // `-9999999999999996:`), and an integer's text prefixes its fractions'
+    // (3 of 3.14). `beginsWith` on a numeric composite is `eq` — what it
+    // amounted to up to 1.36 for non-negative integers, whose key text was
+    // fixed-width.
+    const operand = bound.beginsWith
+    if (typeof operand === "number" || typeof operand === "bigint") {
+      return composeRangeUnder(index, prefixText, field, { eq: operand }, options)
+    }
+    return { beginsWith: compose(operand) }
+  }
+  if ("eq" in bound) {
+    return index.isLast ? { eq: compose(bound.eq) } : { beginsWith: subtreeBeginsWith(bound.eq) }
+  }
+  if ("between" in bound) {
+    return { between: [compose(bound.between[0]), upper(bound.between[1])] }
+  }
+
+  // One-sided operators are open on the other side, which is exactly right
+  // when nothing is clamped: the open end runs to the edge of the partition.
+  if (!options.clampToPrefix) {
+    if ("lt" in bound) return { lt: compose(bound.lt) }
+    if ("lte" in bound) return { lte: upper(bound.lte) }
+    // `>` is already exclusive of the composed value, so only a non-terminal
+    // target needs the subtree pushed past.
+    if ("gt" in bound) return { gt: index.isLast ? compose(bound.gt) : aboveSubtree(bound.gt) }
+    return { gte: compose(bound.gte) }
+  }
+
+  const prefixMax = `${prefixText}${SK_MAX_SENTINEL}`
+  if ("gte" in bound) return { between: [compose(bound.gte), prefixMax] }
+  if ("gt" in bound) return { between: [aboveSubtree(bound.gt), prefixMax] }
+  if ("lte" in bound) return { between: [prefixText, upper(bound.lte)] }
+  // `lt`. On a non-terminal composite no stored key can equal the composed
+  // bound (trailing composites always follow), so BETWEEN's inclusive high end
+  // is harmless. On the LAST composite the bound IS a storable key: the high
+  // end is the greatest key text below it (`EDD-9046` refused this bound up to
+  // 1.36).
+  const below = compose(bound.lt)
+  return { between: [prefixText, index.isLast ? keyJustBelow(below) : below] }
+}
+
+/**
+ * @internal A `.within()` bound on composite `field` — its lower and / or upper end —
+ * composed under `prefixText` as {@link composeRangeUnder} composes each,
+ * clamped to it: one `BETWEEN` of the lower end's start and the upper end's
+ * end, or the one end given. `undefined` when no value satisfies both ends
+ * (`{ gt: 3, lte: 3 }`, `{ gte: "b", lt: "a" }`), judged on the ends' key
+ * text, which sorts as their values: nothing need be read, and the composed
+ * ends could be reversed, which DynamoDB refuses.
+ */
+export const composeIntervalUnder = (
+  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  prefixText: string,
+  field: string,
+  lower: RawSortKeyCondition | undefined,
+  upper: RawSortKeyCondition | undefined,
+): Query.SortKeyCondition | undefined => {
+  const under = (bound: RawSortKeyCondition) =>
+    composeRangeUnder(index, prefixText, field, bound, { clampToPrefix: true }) as {
+      readonly between: readonly [string, string]
+    }
+  if (lower === undefined || upper === undefined) {
+    const one = lower ?? upper
+    if (one === undefined) throw new Error("[internal] A .within() range bound has no end.")
+    return under(one)
+  }
+  const operand = (bound: RawSortKeyCondition) => valueText(index.casing, Object.values(bound)[0])
+  const order = compareUtf8(operand(lower), operand(upper))
+  if (order > 0 || (order === 0 && ("gt" in lower || "lt" in upper))) return undefined
+  return { between: [under(lower).between[0], under(upper).between[1]] }
+}
+
+/** A composed sort key condition as a planned key range: only the forms a clamped bound composes. */
+const keyRangeOf = (condition: Query.SortKeyCondition, exact: boolean): KeyRange => {
+  if ("eq" in condition) return { lower: condition.eq, upper: condition.eq, exact }
+  if ("between" in condition) {
+    return { lower: condition.between[0], upper: condition.between[1], exact }
+  }
+  if ("beginsWith" in condition) {
+    return { lower: undefined, upper: undefined, beginsWith: condition.beginsWith, exact }
+  }
+  throw new Error("[internal] .within() composed an unclamped sort key condition.")
+}
+
+// ---------------------------------------------------------------------------
+// `.within()` on composite sort keys (#171, design §7)
+// ---------------------------------------------------------------------------
+
+/** A `.within()` bound on one composite, normalised; operands in key form. */
+type CompositeBound =
+  | { readonly _tag: "eq"; readonly value: unknown }
+  | {
+      readonly _tag: "range"
+      readonly lower: RawSortKeyCondition | undefined
+      readonly upper: RawSortKeyCondition | undefined
+    }
+
+const BOUND_OPERATORS: ReadonlySet<string> = new Set(["eq", "between", "gt", "gte", "lt", "lte"])
+
+/**
+ * How a row check reads a composite's key form from a raw row (§11): its
+ * stored attribute — for a ref-derived `${ref}Id`, the referenced identifier
+ * inside the stored ref, which is the value the key was composed from —
+ * through the accessor's encoder for a numeric field stored as a string, so a
+ * stored `"950000"` reads as `950000`. `undefined` when the row lacks it.
+ */
+const storedKeyForm = (
+  args: {
+    readonly entityLike: EntityLike
+    readonly encoderSource: Schema.Top
+    readonly compositeKeyForm: CompositeKeyForm
+  },
+  field: string,
+): {
+  readonly attribute: string
+  readonly read: (row: Record<string, AttributeValue>) => unknown
+} => {
+  const resolve = args.entityLike._resolveDbName ?? ((name: string) => name)
+  const ref = args.entityLike._resolvedRefs?.find((r) => r.idFieldName === field)
+  const attribute = resolve(ref?.fieldName ?? field)
+  const schema = getSchemaFields(args.encoderSource)?.[field]
+  const wantsBigInt = schema !== undefined && SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
+  const typeNumeric = compositeKeyFormKind(args.encoderSource, field) === "type-numeric"
+  return {
+    attribute,
+    read: (row) => {
+      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.identifierField]
+      if (value === undefined) return undefined
+      const stored = value.S ?? value.N
+      if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
+      if (value.S !== undefined) return value.S
+      if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
+      if (value.BOOL !== undefined) return value.BOOL
+      return undefined
+    },
+  }
+}
+
+/** One field's per-row check (§11). */
+interface FieldCheck {
+  readonly field: string
+  readonly attribute: string
+  readonly accepts: (row: Record<string, AttributeValue>) => boolean
+}
+
+/**
+ * A composite's per-row check (§11): its key form read from the raw row
+ * ({@link storedKeyForm}), and `holds` asked of it; a row without it fails.
+ */
+const compositeCheck = (
+  args: Parameters<typeof storedKeyForm>[0],
+  field: string,
+  holds: (keyForm: unknown) => boolean,
+): FieldCheck => {
+  const stored = storedKeyForm(args, field)
+  return {
+    field,
+    attribute: stored.attribute,
+    accepts: (row) => {
+      const keyForm = stored.read(row)
+      return keyForm !== undefined && holds(keyForm)
+    },
+  }
+}
+
+/** Field checks as one row check, every one of them passing; `undefined` for none. */
+const combineRowChecks = (checks: ReadonlyArray<FieldCheck>): RowCheck | undefined =>
+  checks.length === 0
+    ? undefined
+    : {
+        fields: checks.map((check) => check.field),
+        reads: [...new Set(checks.map((check) => check.attribute))],
+        accepts: (row) => checks.every((check) => check.accepts(row)),
+      }
+
+/**
+ * Plan `.within(bounds)` on a composite sort key accessor (design §7.1):
+ *
+ * - eq bounds right after the accessor's pins extend the prefix, like pins;
+ * - a range bound on the next composite (or nothing else bounded) is the `key`
+ *   plan — one key condition, composed as `.where()` composes it;
+ * - otherwise the unbounded composites in between are the skip tuple:
+ *   `skip-scan` when the tuple parse is sound (§7.3), else `filter`.
+ *
+ * Every bound the key condition can't express is checked per row (§11).
+ * Misuse from untyped code throws `[EDD-9093]`; a value that doesn't reach
+ * key form throws `[EDD-9050]` (the accessor's own encoder). `{}` plans
+ * nothing: the query is returned as it is.
+ */
+const planCompositeWithin = <A>(args: {
+  readonly entityLike: EntityLike
+  readonly accessor: string
+  readonly indexDef: IndexDefinition
+  readonly encoderSource: Schema.Top
+  readonly compositeKeyForm: CompositeKeyForm
+  /** The accessor's composites, in key form. */
+  readonly pinnedKeyForm: Record<string, unknown>
+  readonly pkValue: string
+  readonly query: Query.Query<A>
+  readonly bounds: Record<string, unknown>
+  readonly options: WithinOptions | undefined
+}): Query.Query<A> => {
+  const { entityLike, accessor, indexDef, compositeKeyForm, pinnedKeyForm } = args
+  const sk = indexDef.sk.composite
+  const n = sk.length
+  const p = sk.findIndex((attr) => pinnedKeyForm[attr] === undefined)
+  const pinnedCount = p === -1 ? n : p
+  const refuse = (why: string): never => {
+    throw new Error(
+      `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
+    )
+  }
+  if (typeof args.bounds !== "object" || args.bounds === null || Array.isArray(args.bounds)) {
+    return refuse("pass an object of bounds keyed by sort key composite.")
+  }
+  const open = sk.slice(pinnedCount)
+  const fields = getSchemaFields(args.encoderSource)
+  /** The ref a `${ref}Id` composite is derived from: the item stores the ref, not the id. */
+  const refOf = (field: string) =>
+    entityLike._resolvedRefs?.find((ref) => ref.idFieldName === field)
+  /** The kind of value a composite's key form is, when its schema says (EDD-9093's type check). */
+  const kindOf = (field: string): KeyFormValueKind | undefined => {
+    const schema = fields?.[field]
+    return schema === undefined ? undefined : keyFormValueKind(schema)
+  }
+
+  // -- validate and normalise (EDD-9093) --
+  const bounds = new Map<number, CompositeBound>()
+  for (const [field, raw] of Object.entries(args.bounds)) {
+    if (raw === undefined) continue
+    const i = sk.indexOf(field)
+    if (i === -1) {
+      return refuse(
+        indexDef.pk.composite.includes(field)
+          ? `"${field}" is a partition key composite: give it to the accessor.`
+          : `"${field}" is not a sort key composite of the index. Bound one of: ${open.join(", ")}.`,
+      )
+    }
+    if (i < pinnedCount) {
+      return refuse(
+        `"${field}" is already pinned by the accessor, so it can't also be bounded. Drop it ` +
+          `from the accessor call to bound it here.`,
+      )
+    }
+    if (
+      refOf(field) === undefined &&
+      compositeKeyFormKind(args.encoderSource, field) === "absent"
+    ) {
+      return refuse(
+        `"${field}" is not stored on the item, so its bound can't be checked per row. Give ` +
+          `it to the accessor, or bound it with .where().`,
+      )
+    }
+    const shape = raw as Record<string, unknown>
+    const operators =
+      typeof raw === "object" && raw !== null && !Array.isArray(raw)
+        ? Object.keys(shape).filter((key) => shape[key] !== undefined)
+        : []
+    const between = shape?.between
+    const wellFormed =
+      operators.length > 0 &&
+      operators.every((key) => BOUND_OPERATORS.has(key)) &&
+      (operators.includes("eq") || operators.includes("between") ? operators.length === 1 : true) &&
+      !(operators.includes("gt") && operators.includes("gte")) &&
+      !(operators.includes("lt") && operators.includes("lte")) &&
+      (between === undefined || (Array.isArray(between) && between.length === 2))
+    if (!wellFormed) {
+      return refuse(
+        `the bound on "${field}" is not one of { eq }, { between: [low, high] }, or ` +
+          `{ gt | gte } and / or { lt | lte }.`,
+      )
+    }
+    const expected = kindOf(field)
+    const keyForm = (value: unknown): unknown => {
+      const converted = compositeKeyForm(field, value)
+      if (expected !== undefined && typeof converted !== expected) {
+        return refuse(
+          `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
+            `the composite's key form is a ${expected}.`,
+        )
+      }
+      return converted
+    }
+    if (operators.includes("eq")) {
+      bounds.set(i, { _tag: "eq", value: keyForm(shape.eq) })
+      continue
+    }
+    const [low, high] = (between as ReadonlyArray<unknown> | undefined) ?? []
+    bounds.set(i, {
+      _tag: "range",
+      lower:
+        between !== undefined
+          ? { gte: keyForm(low) }
+          : "gt" in shape && shape.gt !== undefined
+            ? { gt: keyForm(shape.gt) }
+            : "gte" in shape && shape.gte !== undefined
+              ? { gte: keyForm(shape.gte) }
+              : undefined,
+      upper:
+        between !== undefined
+          ? { lte: keyForm(high) }
+          : "lt" in shape && shape.lt !== undefined
+            ? { lt: keyForm(shape.lt) }
+            : "lte" in shape && shape.lte !== undefined
+              ? { lte: keyForm(shape.lte) }
+              : undefined,
+    })
+  }
+  if (bounds.size === 0) return args.query
+
+  // -- composition --
+  const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
+  const segment = (i: number, keyForm: unknown) => compositeSegment(casing, sk[i]!, keyForm)
+  const label = (i: number) => `${DynamoSchema.applyCasing(sk[i]!, casing)}_`
+
+  /**
+   * Bound `i` composed under `prefixText`, clamped to it; `undefined` when no
+   * value satisfies it (`{ gt: 3, lte: 3 }`).
+   */
+  const composeBound = (prefixText: string, i: number): Query.SortKeyCondition | undefined => {
+    const bound = bounds.get(i)!
+    const index = { casing, isLast: i === n - 1 }
+    return bound._tag === "eq"
+      ? composeRangeUnder(index, prefixText, sk[i]!, { eq: bound.value }, { clampToPrefix: true })
+      : composeIntervalUnder(index, prefixText, sk[i]!, bound.lower, bound.upper)
+  }
+
+  /** Does bound `i` hold for a composite value (key form), compared as key text? */
+  const holds = (i: number, keyForm: unknown): boolean => {
+    const bound = bounds.get(i)!
+    if (bound._tag === "eq") return boundHolds(casing, { eq: bound.value }, keyForm)
+    return (
+      (bound.lower === undefined || boundHolds(casing, bound.lower, keyForm)) &&
+      (bound.upper === undefined || boundHolds(casing, bound.upper, keyForm))
+    )
+  }
+
+  /**
+   * The key condition under `prefixText` from composite `from`: eq bounds
+   * extend the prefix, then one range bound (or the prefix alone). Returns
+   * the composites left to the row check.
+   */
+  const keyCondition = (
+    prefixText: string,
+    from: number,
+  ): {
+    readonly condition: Query.SortKeyCondition | undefined
+    readonly checked: ReadonlyArray<number>
+  } => {
+    let q = prefixText
+    let i = from
+    while (i < n) {
+      const bound = bounds.get(i)
+      if (bound === undefined) break
+      if (bound._tag === "eq" && i < n - 1) {
+        q = `${q}${segment(i, bound.value)}${DynamoSchema.KEY_DELIMITER}`
+        i++
+        continue
+      }
+      return {
+        condition: composeBound(q, i),
+        checked: [...bounds.keys()].filter((j) => j > i),
+      }
+    }
+    return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
+  }
+
+  /**
+   * Bounds checked on the raw row (§11): each composite's key text is
+   * composed from the stored attribute — `serializeValue`, casing and
+   * escaping, the composer's own path — and compared with the bound's key
+   * text ({@link boundHolds}). Key text sorts as the value, so a row passes
+   * exactly when the key condition would have admitted it, and the skip and
+   * filter plans agree on every row. A ref-derived composite (`${ref}Id`) is
+   * read from the stored ref: the referenced identifier inside its map, which
+   * is the value the key was composed from.
+   */
+  const rowCheckFor = (indices: ReadonlyArray<number>): RowCheck | undefined =>
+    combineRowChecks(
+      [...indices]
+        .sort((a, b) => a - b)
+        .map((i) => compositeCheck(args, sk[i]!, (keyForm) => holds(i, keyForm))),
+    )
+
+  // -- plan choice (§7.1) --
+  const prefix0 = KeyComposer.composeSortKeyBeginsWith(
+    entityLike._schema,
+    entityLike.entityType,
+    1,
+    indexDef,
+    pinnedKeyForm,
+  )
+  let k = pinnedCount
+  let P = prefix0
+  while (k < n - 1 && bounds.get(k)?._tag === "eq") {
+    P = `${P}${segment(k, (bounds.get(k) as { readonly value: unknown }).value)}${DynamoSchema.KEY_DELIMITER}`
+    k++
+  }
+  let t = k
+  while (t < n && !bounds.has(t)) t++
+  const tupled = t < n && t > k
+  const tupleFields = sk.slice(k, t)
+
+  const fingerprint = {
+    index: indexDef.index ?? "primary",
+    entityType: entityLike.entityType,
+    pk: args.pkValue,
+    prefix: prefix0,
+    bounds: [...bounds.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([i, bound]) =>
+        bound._tag === "eq"
+          ? [sk[i], "eq", segment(i, bound.value)]
+          : [
+              sk[i],
+              bound.lower === undefined ? null : Object.keys(bound.lower)[0],
+              bound.lower === undefined ? null : segment(i, Object.values(bound.lower)[0]),
+              bound.upper === undefined ? null : Object.keys(bound.upper)[0],
+              bound.upper === undefined ? null : segment(i, Object.values(bound.upper)[0]),
+            ],
+      ),
+  }
+
+  const inner = tupled ? keyCondition("", t) : keyCondition(prefix0, pinnedCount)
+  const innerRowCheck = rowCheckFor(inner.checked)
+  // No value satisfies some bound (`{ gt: 3, lte: 3 }`): nothing to read,
+  // whatever the prefix it is composed under.
+  const empty = [...bounds.keys()].some((i) => composeBound(prefix0, i) === undefined)
+  const space: TupleSpace = tupled
+    ? {
+        _tag: "string",
+        prefix: P,
+        labels: tupleFields.map((_, j) => label(k + j)),
+        next: label(t),
+        fields: tupleFields,
+      }
+    : { _tag: "none" }
+  // Any tuple composite parses soundly from the key text: escaped values
+  // hold no delimiter (§7.3). History rows don't parse as tuples.
+  const ineligible =
+    tupled && indexDef.index === undefined && entityLike._liveRows?.() !== undefined
+      ? "history rows on the primary index"
+      : undefined
+
+  return Query.plan(args.query, {
+    planner: compositePlanner({
+      entityType: entityLike.entityType,
+      index: indexDef.index ?? "primary",
+      pkField: indexDef.pk.field,
+      pkValue: args.pkValue,
+      skField: indexDef.sk.field,
+      fingerprint,
+      space,
+      inner: {
+        _tag: "single",
+        conditionFor: (tuple) => {
+          const { condition } = tupled
+            ? keyCondition(tuple ?? P, t)
+            : keyCondition(prefix0, pinnedCount)
+          // An empty plan reads nothing, so it never asks for its range.
+          if (condition === undefined) throw new Error("[internal] An empty plan has no range.")
+          return keyRangeOf(condition, innerRowCheck === undefined)
+        },
+        rowCheck: innerRowCheck,
+        empty,
+      },
+      filterPlan: {
+        prefix: P,
+        rowCheck: rowCheckFor([...bounds.keys()].filter((i) => i >= k)),
+      },
+      ineligible,
+    }),
+    maxSkips: args.options?.maxSkips,
+  })
+}
+
+/** What a Z-order dimension bound may name: a composite's operators, and `in` (literals). */
+const DIMENSION_OPERATORS: ReadonlySet<string> = new Set([...BOUND_OPERATORS, "in"])
+
+/** The most operands DynamoDB's `IN` takes. */
+const MAX_IN_OPERANDS = 100
+
+/** How many Z-order range plans an accessor keeps (§5.4). */
+const ZORDER_PLAN_CACHE = 64
+
+/** The capped range plan of a box (§5.4), as an accessor caches it. */
+type ZOrderPlans = (
+  box: ZOrderCurve.Box,
+  maxRanges: number,
+  refineFactor: number,
+) => ReturnType<typeof ZOrderCurve.plan>
+
+/**
+ * An accessor's LRU of Z-order range plans. A plan is a pure function of the
+ * layout (the accessor's), the box and the cap, so a miss only recomputes —
+ * no cursor depends on what is cached.
+ */
+const makeZOrderPlans = (layout: ZOrderCurve.Layout): ZOrderPlans => {
+  const cache = new Map<string, ReturnType<typeof ZOrderCurve.plan>>()
+  return (box, maxRanges, refineFactor) => {
+    const key = canonicalJson({ box, maxRanges, refineFactor })
+    const hit = cache.get(key)
+    if (hit !== undefined) {
+      cache.delete(key)
+      cache.set(key, hit)
+      return hit
+    }
+    const planned = ZOrderCurve.plan(layout, box, maxRanges, refineFactor)
+    cache.set(key, planned)
+    if (cache.size > ZORDER_PLAN_CACHE) cache.delete(cache.keys().next().value!)
+    return planned
+  }
+}
+
+/** A plain object of bound operators (not a value: a `Date` and a `DateTime` are values). */
+const isBoundShape = (u: unknown): u is Record<string, unknown> =>
+  typeof u === "object" &&
+  u !== null &&
+  !Array.isArray(u) &&
+  !(u instanceof Date) &&
+  !DateTime.isDateTime(u)
+
+/** One end of a range bound; `strict` excludes the value itself. */
+interface BoundEnd {
+  readonly value: unknown
+  readonly strict: boolean
+}
+
+/** A {@link BoundEnd} in a numeric unit: epoch milliseconds or stored seconds. */
+interface NumericEnd extends BoundEnd {
+  readonly value: number
+}
+
+/** The ends of a range bound (`eq` as both, inclusive). */
+const boundEnds = (
+  bound: Record<string, unknown>,
+): { readonly lower: BoundEnd | undefined; readonly upper: BoundEnd | undefined } => {
+  if ("eq" in bound && bound.eq !== undefined) {
+    return { lower: { value: bound.eq, strict: false }, upper: { value: bound.eq, strict: false } }
+  }
+  const between = bound.between as readonly [unknown, unknown] | undefined
+  if (between !== undefined) {
+    return {
+      lower: { value: between[0], strict: false },
+      upper: { value: between[1], strict: false },
+    }
+  }
+  return {
+    lower:
+      bound.gt !== undefined
+        ? { value: bound.gt, strict: true }
+        : bound.gte !== undefined
+          ? { value: bound.gte, strict: false }
+          : undefined,
+    upper:
+      bound.lt !== undefined
+        ? { value: bound.lt, strict: true }
+        : bound.lte !== undefined
+          ? { value: bound.lte, strict: false }
+          : undefined,
+  }
+}
+
+/** Numbers and bigints in numeric order (`bigint` against `bigint` exactly). */
+const compareNumeric = (a: unknown, b: unknown): number => {
+  if (typeof a === "bigint" && typeof b === "bigint") return a < b ? -1 : a > b ? 1 : 0
+  const x = Number(a)
+  const y = Number(b)
+  return x < y ? -1 : x > y ? 1 : 0
+}
+
+/** Does `value` lie between the ends, as `compare` orders them? */
+const withinEnds = (
+  value: unknown,
+  lower: BoundEnd | undefined,
+  upper: BoundEnd | undefined,
+  compare: (a: unknown, b: unknown) => number,
+): boolean => {
+  if (lower !== undefined) {
+    const order = compare(value, lower.value)
+    if (Number.isNaN(order) || order < 0 || (order === 0 && lower.strict)) return false
+  }
+  if (upper !== undefined) {
+    const order = compare(value, upper.value)
+    if (Number.isNaN(order) || order > 0 || (order === 0 && upper.strict)) return false
+  }
+  return true
+}
+
+/**
+ * Plan `.within(bounds)` on a Z-order accessor (design §3.3, §5, §7.5, §11):
+ *
+ * - each dimension bound is put into key form through the accessor's encoder
+ *   and quantized into the box (an inverted bound is the empty box: nothing
+ *   is sent);
+ * - the given leading prefix composites are the key prefix `P`; from the first
+ *   one left out, the prefix composites are a binary skip tuple, any given
+ *   later one checked as each probed key is parsed;
+ * - the exact bounds are a `FilterExpression` on the stored attributes where
+ *   DynamoDB's comparison agrees with the dimension's order, and a row check
+ *   where it doesn't (numbers stored as strings, zoned dates, a `literals`
+ *   selection too large for `IN`) and for hashed prefix values (collisions).
+ *
+ * Throws `[EDD-9093]` for misuse from untyped code, `[EDD-9050]` for a value
+ * that doesn't reach key form and `[EDD-9092]` for one no level holds — at
+ * `.within()`, so every terminal (and `explain`) has a valid box. `{}` plans
+ * nothing: the query is returned as it is.
+ */
+const planZOrderWithin = <A>(args: {
+  readonly entityLike: EntityLike
+  readonly accessor: string
+  readonly indexDef: IndexDefinition
+  readonly encoderSource: Schema.Top
+  readonly compositeKeyForm: CompositeKeyForm
+  readonly pkValue: string
+  readonly plans: ZOrderPlans
+  readonly query: Query.Query<A>
+  readonly bounds: Record<string, unknown>
+  readonly options: WithinOptions | undefined
+}): Query.Query<A> => {
+  const { entityLike, accessor, indexDef, compositeKeyForm } = args
+  const refuse = (why: string): never => {
+    throw new Error(
+      `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
+    )
+  }
+  if (!KeyComposer.isZOrderHalf(indexDef.sk) || indexDef.sk.zorderHalf.layout === undefined) {
+    throw new Error("[internal] A Z-order .within() reached a sort key that isn't bound.")
+  }
+  const { prefix } = indexDef.sk.zorderHalf
+  const layout = indexDef.sk.zorderHalf.layout
+  if (!isBoundShape(args.bounds)) {
+    return refuse("pass an object of bounds keyed by dimension or prefix composite.")
+  }
+  const dimensions = layout.dimensions
+  const named = [...prefix.map((part) => part.field), ...dimensions.map((dim) => dim.field)]
+  const fields = getSchemaFields(args.encoderSource)
+  /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
+  const keyForm = (field: string, value: unknown): unknown => {
+    const converted = compositeKeyForm(field, value)
+    const schema = fields?.[field]
+    const expected = schema === undefined ? undefined : keyFormValueKind(schema)
+    if (expected !== undefined && typeof converted !== expected) {
+      return refuse(
+        `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
+          `the field's key form is a ${expected}.`,
+      )
+    }
+    return converted
+  }
+
+  // -- validate and normalise (EDD-9093) --
+  const prefixValues = new Map<string, unknown>()
+  const bounded = new Map<
+    string,
+    { readonly raw: Record<string, unknown>; readonly keyForm: Record<string, unknown> }
+  >()
+  for (const [field, raw] of Object.entries(args.bounds)) {
+    if (raw === undefined) continue
+    const shape = isBoundShape(raw) ? raw : undefined
+    const operators =
+      shape === undefined ? [] : Object.keys(shape).filter((key) => shape[key] !== undefined)
+    if (prefix.some((part) => part.field === field)) {
+      if (operators.some((key) => DIMENSION_OPERATORS.has(key))) {
+        return refuse(
+          `"${field}" is a prefix composite: it takes one exact value, not a range bound.`,
+        )
+      }
+      prefixValues.set(field, keyForm(field, raw))
+      continue
+    }
+    const dimension = dimensions.find((dim) => dim.field === field)
+    if (dimension === undefined) {
+      return refuse(
+        indexDef.pk.composite.includes(field)
+          ? `"${field}" is a partition key composite: give it to the accessor.`
+          : `"${field}" is not a dimension or prefix composite of the index. Bound one of: ` +
+              `${named.join(", ")}.`,
+      )
+    }
+    const between = shape?.between
+    const members = shape?.in
+    const wellFormed =
+      shape !== undefined &&
+      operators.length > 0 &&
+      operators.every((key) => DIMENSION_OPERATORS.has(key)) &&
+      (["eq", "between", "in"].some((key) => operators.includes(key))
+        ? operators.length === 1
+        : true) &&
+      !(operators.includes("gt") && operators.includes("gte")) &&
+      !(operators.includes("lt") && operators.includes("lte")) &&
+      (between === undefined || (Array.isArray(between) && between.length === 2)) &&
+      (members === undefined || Array.isArray(members))
+    if (!wellFormed) {
+      return refuse(
+        `the bound on "${field}" is not one of { eq }, { between: [low, high] }, { in: [...] } ` +
+          `(a literals dimension), or { gt | gte } and / or { lt | lte }.`,
+      )
+    }
+    if (members !== undefined && dimension.spec.kind !== "literals") {
+      return refuse(
+        `"in" bounds only a literals dimension, and "${field}" is ${dimension.spec.kind}.`,
+      )
+    }
+    const converted: Record<string, unknown> = {}
+    for (const key of operators) {
+      converted[key] =
+        key === "between" || key === "in"
+          ? (shape![key] as ReadonlyArray<unknown>).map((value) => keyForm(field, value))
+          : keyForm(field, shape![key])
+    }
+    bounded.set(field, { raw: shape!, keyForm: converted })
+  }
+  if (prefixValues.size === 0 && bounded.size === 0) return args.query
+
+  /** A bound's epoch milliseconds: from the domain value when it has them, else its key form. */
+  const epochMs = (dimension: ZOrderCurve.BoundDimension, raw: unknown, key: unknown): number =>
+    DateTime.isDateTime(raw)
+      ? DateTime.toEpochMillis(raw)
+      : raw instanceof Date
+        ? raw.getTime()
+        : ZOrderCurve.epochMsOf(dimension.storage, key)
+  /** Both ends of a bound: domain values and key forms side by side. */
+  const endsOf = (field: string) => {
+    const bound = bounded.get(field)!
+    return { raw: boundEnds(bound.raw), key: boundEnds(bound.keyForm) }
+  }
+  /**
+   * An `Epoch` dimension's ends in its stored unit, exactly (§11): a stored
+   * second `s` stands for `s × 1000` ms, so each end is converted from the
+   * bound's epoch milliseconds — never from its key form, which floors.
+   */
+  const storedEnds = (
+    dimension: ZOrderCurve.BoundDimension,
+    seconds: boolean,
+  ): { readonly lower: NumericEnd | undefined; readonly upper: NumericEnd | undefined } => {
+    const { raw, key } = endsOf(dimension.field)
+    const convert = (end: "lower" | "upper"): NumericEnd | undefined => {
+      const r = raw[end]
+      const k = key[end]
+      if (r === undefined || k === undefined) return undefined
+      const ms = epochMs(dimension, r.value, k.value)
+      if (!seconds) return { value: ms, strict: r.strict }
+      const u = ms / 1000
+      return end === "lower"
+        ? { value: r.strict ? Math.floor(u) : Math.ceil(u), strict: r.strict }
+        : { value: r.strict ? Math.ceil(u) : Math.floor(u), strict: r.strict }
+    }
+    return { lower: convert("lower"), upper: convert("upper") }
+  }
+  /**
+   * The bound a dimension's levels are quantized from: its key form, except
+   * on epoch seconds, where the key form of a sub-second end is floored. There
+   * the whole stored seconds it holds decide the levels, and whether there are
+   * any: `{ gte: T, lt: T + 500 ms }` holds the second `T`, `{ gt: T, lt: T + 1 s }`
+   * none — inverted only once converted.
+   */
+  const quantizable = (dimension: ZOrderCurve.BoundDimension): ZOrderCurve.DimensionBound => {
+    const keyForm = bounded.get(dimension.field)!.keyForm as ZOrderCurve.DimensionBound
+    const storage = dimension.storage
+    if (storage._tag !== "Epoch" || storage.unit !== "epochSeconds") return keyForm
+    const { lower, upper } = storedEnds(dimension, true)
+    return {
+      ...(lower === undefined ? {} : { gte: lower.strict ? lower.value + 1 : lower.value }),
+      ...(upper === undefined ? {} : { lte: upper.strict ? upper.value - 1 : upper.value }),
+    }
+  }
+
+  // -- the box (§5.1) and each literals dimension's exact selection --
+  const literalSelection = (
+    dimension: ZOrderCurve.BoundDimension,
+    bound: Record<string, unknown>,
+  ): ReadonlyArray<number> => {
+    const index = (value: unknown) => Number(dimension.quantize(value))
+    if (bound.eq !== undefined) return [index(bound.eq)]
+    if (bound.in !== undefined) {
+      return [...new Set((bound.in as ReadonlyArray<unknown>).map(index))].sort((a, b) => a - b)
+    }
+    const between = bound.between as readonly [unknown, unknown] | undefined
+    const lo =
+      between !== undefined
+        ? index(between[0])
+        : bound.gt !== undefined
+          ? index(bound.gt) + 1
+          : bound.gte !== undefined
+            ? index(bound.gte)
+            : 0
+    const hi =
+      between !== undefined
+        ? index(between[1])
+        : bound.lt !== undefined
+          ? index(bound.lt) - 1
+          : bound.lte !== undefined
+            ? index(bound.lte)
+            : Number(dimension.levels) - 1
+    return Array.from({ length: Math.max(0, hi - lo + 1) }, (_, i) => lo + i)
+  }
+  const { box, selections } = (() => {
+    try {
+      const quantized = ZOrderCurve.quantizeBounds(
+        layout,
+        Object.fromEntries(
+          dimensions
+            .filter((dim) => bounded.has(dim.field))
+            .map((dim) => [dim.field, quantizable(dim)]),
+        ),
+      )
+      const selected = new Map(
+        dimensions
+          .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
+          .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
+      )
+      const none = [...selected.values()].some((members) => members.length === 0)
+      return { box: none ? ("empty" as const) : quantized, selections: selected }
+    } catch (error) {
+      // A value that reaches key form but no level (§3.3): thrown, like EDD-9050.
+      if (ZOrderCurve.isZOrderValueError(error)) throw new Error(error.message)
+      throw error
+    }
+  })()
+
+  // -- exact bounds (§11): a FilterExpression where DynamoDB's order agrees, else row checks --
+  const path = (field: string) => ({ _tag: "path" as const, segments: [field] })
+  const compare = (field: string, op: "eq" | "gt" | "gte" | "lt" | "lte", value: unknown): Expr =>
+    ({
+      [ExprTag]: ExprTag,
+      _tag: op,
+      left: path(field),
+      right: { _tag: "value", value },
+    }) as Expr
+  const membership = (field: string, values: ReadonlyArray<unknown>): Expr =>
+    ({
+      [ExprTag]: ExprTag,
+      _tag: "in",
+      operand: path(field),
+      values: values.map((value) => ({ _tag: "value", value })),
+    }) as Expr
+  const rangeFilter = (
+    field: string,
+    lower: BoundEnd | undefined,
+    upper: BoundEnd | undefined,
+  ): ReadonlyArray<Expr> =>
+    lower !== undefined &&
+    upper !== undefined &&
+    !lower.strict &&
+    !upper.strict &&
+    lower.value === upper.value
+      ? [compare(field, "eq", lower.value)]
+      : [
+          ...(lower === undefined
+            ? []
+            : [compare(field, lower.strict ? "gt" : "gte", lower.value)]),
+          ...(upper === undefined
+            ? []
+            : [compare(field, upper.strict ? "lt" : "lte", upper.value)]),
+        ]
+  const filters: Array<Expr> = []
+  const dimensionChecks: Array<FieldCheck> = []
+  for (const dimension of dimensions) {
+    const field = dimension.field
+    if (!bounded.has(field)) continue
+    const storage = dimension.storage
+    if (storage._tag === "Literal") {
+      const values = (dimension.spec as { readonly values: ReadonlyArray<unknown> }).values
+      const selected = selections.get(field) ?? []
+      if (selected.length === values.length) continue
+      const chosen = new Set(selected.map((i) => values[i]))
+      const complement = values.filter((value) => !chosen.has(value))
+      if (chosen.size <= MAX_IN_OPERANDS) {
+        filters.push(membership(field, [...chosen]))
+      } else if (complement.length <= MAX_IN_OPERANDS) {
+        // Exact: every item in the index carries the attribute (the half needs it).
+        filters.push({
+          [ExprTag]: ExprTag,
+          _tag: "not",
+          expr: membership(field, complement),
+        } as Expr)
+      } else {
+        const stored = storedKeyForm(args, field)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => chosen.has(stored.read(row)),
+        })
+      }
+      continue
+    }
+    const { raw, key } = endsOf(field)
+    switch (storage._tag) {
+      case "Number":
+      case "UtcIsoString":
+      case "RawString":
+        filters.push(...rangeFilter(field, key.lower, key.upper))
+        break
+      case "Epoch": {
+        const stored = storedEnds(dimension, storage.unit === "epochSeconds")
+        filters.push(...rangeFilter(field, stored.lower, stored.upper))
+        break
+      }
+      case "NumericString": {
+        // S order isn't numeric order: compared on the key form, per row.
+        const stored = storedKeyForm(args, field)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => {
+            const value = stored.read(row)
+            return value !== undefined && withinEnds(value, key.lower, key.upper, compareNumeric)
+          },
+        })
+        break
+      }
+      case "ZonedIsoString": {
+        // ISO strings with offsets don't sort chronologically: compared as epoch ms, per row.
+        const stored = storedKeyForm(args, field)
+        const toMs = (end: BoundEnd | undefined, k: BoundEnd | undefined): BoundEnd | undefined =>
+          end === undefined || k === undefined
+            ? undefined
+            : { value: epochMs(dimension, end.value, k.value), strict: end.strict }
+        const lower = toMs(raw.lower, key.lower)
+        const upper = toMs(raw.upper, key.upper)
+        dimensionChecks.push({
+          field,
+          attribute: stored.attribute,
+          accepts: (row) => {
+            const ms = ZOrderCurve.epochMsOf(storage, stored.read(row))
+            return Number.isFinite(ms) && withinEnds(ms, lower, upper, compareNumeric)
+          },
+        })
+        break
+      }
+    }
+  }
+
+  // -- the prefix (§4.3, §7.5) --
+  const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
+  const textOf = (value: unknown) => valueText(casing, value)
+  const segmentOf = (part: KeyComposer.ZOrderPrefixSegment) =>
+    ZOrderCurve.prefixSegment(textOf(prefixValues.get(part.field)), part.hash)
+  /** A given prefix composite, checked on the cased value — never a hash, which can collide. */
+  const prefixCheck = (part: KeyComposer.ZOrderPrefixSegment): FieldCheck => {
+    const stored = storedKeyForm(args, part.field)
+    const wanted = textOf(prefixValues.get(part.field))
+    return {
+      field: part.field,
+      attribute: stored.attribute,
+      accepts: (row) => {
+        const value = stored.read(row)
+        return value !== undefined && textOf(value) === wanted
+      },
+    }
+  }
+  const firstMissing = prefix.findIndex((part) => !prefixValues.has(part.field))
+  const leading = firstMissing === -1 ? prefix : prefix.slice(0, firstMissing)
+  const later = firstMissing === -1 ? [] : prefix.slice(firstMissing)
+  const hashed = prefix.filter((part) => part.hash !== undefined && prefixValues.has(part.field))
+  const parsedExactly = later.filter(
+    (part) => part.hash === undefined && prefixValues.has(part.field),
+  )
+
+  const renameExpr = entityNaming(entityLike._resolveDbName).renameExpr ?? ((expr: Expr) => expr)
+  const filter =
+    filters.length === 0
+      ? undefined
+      : renameExpr(
+          filters.length === 1
+            ? filters[0]!
+            : ({ [ExprTag]: ExprTag, _tag: "and", exprs: filters } as Expr),
+        )
+
+  return Query.plan(args.query, {
+    planner: zorderPlanner({
+      entityType: entityLike.entityType,
+      index: indexDef.index ?? "primary",
+      pkField: indexDef.pk.field,
+      pkValue: args.pkValue,
+      skField: indexDef.sk.field,
+      fingerprint: {
+        index: indexDef.index ?? "primary",
+        entityType: entityLike.entityType,
+        pk: args.pkValue,
+        prefix: prefix.map((part) => [
+          part.field,
+          part.hash ?? null,
+          prefixValues.has(part.field) ? textOf(prefixValues.get(part.field)) : null,
+        ]),
+        box,
+        layout: dimensions.map((dim) => ({ spec: dim.spec, storage: dim.storage, bits: dim.bits })),
+      },
+      layout,
+      box,
+      bounded: bounded.size > 0,
+      prefix: ZOrderCurve.concatBytes(leading.map((part) => segmentOf(part))),
+      tuple: later.map((part) => ({
+        field: part.field,
+        hash: part.hash,
+        given: prefixValues.has(part.field) ? segmentOf(part) : undefined,
+      })),
+      filter,
+      rowCheck: combineRowChecks([...dimensionChecks, ...hashed.map(prefixCheck)]),
+      filterRowCheck: combineRowChecks([
+        ...dimensionChecks,
+        ...hashed.map(prefixCheck),
+        ...parsedExactly.map(prefixCheck),
+      ]),
+      ranges: (maxRanges, refineFactor) =>
+        box === "empty" ? { ranges: [], exact: true } : args.plans(box, maxRanges, refineFactor),
+    }),
+    maxSkips: args.options?.maxSkips,
+  })
+}
 
 /**
  * The composite key form for an arbitrary entity-like value — the same rule
@@ -692,9 +1850,12 @@ export type CollectionSelected<TResult> = {
 export interface CollectionQuery<TResult> {
   /** Execute and collect all pages into a grouped result. */
   readonly collect: () => Effect.Effect<TResult, DynamoClientError | ValidationError, never>
-  /** Execute a single page, grouped like `collect()`. */
+  /**
+   * Execute a single page, grouped like `collect()`, with the cursor of the
+   * next page (`None` when there are no more results).
+   */
   readonly fetch: () => Effect.Effect<
-    { items: TResult; cursor: string | null },
+    { readonly items: TResult; readonly cursor: Option.Option<string> },
     DynamoClientError | ValidationError,
     never
   >
@@ -706,6 +1867,8 @@ export interface CollectionQuery<TResult> {
   >
   /** Count the members' items (every member's, together). */
   readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
+  /** Describe the query without sending anything (see `Query.explain`). */
+  readonly explain: () => Effect.Effect<Query.QueryExplain, never, never>
   /**
    * Project attributes — by domain name, per member: each member's items come
    * back as partial records under its key.
@@ -727,10 +1890,20 @@ export interface CollectionQuery<TResult> {
     ): CollectionQuery<TResult>
     (shorthand: import("./internal/Expr.js").ConditionShorthand): CollectionQuery<TResult>
   }
-  /** Return at most `n` items (a contract on results, not on round trips). */
+  /**
+   * Return at most `n` items (a contract on results, not on round trips).
+   * Under a filter, each request is sized from the observed pass rate.
+   */
   readonly limit: (n: number) => CollectionQuery<TResult>
-  /** Fetch in batches of `n` rows — sets DynamoDB's `Limit`. */
-  readonly pageSize: (n: number) => CollectionQuery<TResult>
+  /**
+   * Fetch in batches of `n` rows — sets DynamoDB's `Limit`. `"natural"` sizes
+   * requests exactly as 1.36 did.
+   */
+  readonly pageSize: (size: number | "natural") => CollectionQuery<TResult>
+  /** Run `observer` after every request a terminal sends (see `Query.onRequest`). */
+  readonly onRequest: (
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ) => CollectionQuery<TResult>
   /** Reverse sort order. */
   readonly reverse: () => CollectionQuery<TResult>
   /** Resume from cursor. */
@@ -908,12 +2081,57 @@ type EntityIndexAccessors<
 > = {
   readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
-  ) => import("./internal/BoundQuery.js").BoundQuery<
-    PathModel<Schema.Schema.Type<M>, P>,
-    ResolveSkFields<M, I, K, Provided, R>,
-    Schema.Schema.Type<M>
-  >
+  ) => I[K] extends { readonly sk: { readonly zorder: ReadonlyArray<unknown> } }
+    ? import("./internal/BoundQuery.js").BoundQuery<
+        PathModel<Schema.Schema.Type<M>, P>,
+        never,
+        Schema.Schema.Type<M>,
+        import("./internal/BoundQuery.js").WithinSpec<ZOrderWithin<M, I, K, R>, "zorder">
+      >
+    : import("./internal/BoundQuery.js").BoundQuery<
+        PathModel<Schema.Schema.Type<M>, P>,
+        ResolveSkFields<M, I, K, Provided, R>,
+        Schema.Schema.Type<M>,
+        CompositeWithin<ResolveSkFields<M, I, K, Provided, R>>
+      >
 }
+
+/**
+ * What `.within()` takes on a Z-order accessor (#171): an optional bound per
+ * dimension, in the field's model type (`DateTime.Utc` for a `dateTime`
+ * dimension, the members for a `literals` one, which also takes `in`), and an
+ * optional exact value per prefix composite.
+ */
+type ZOrderWithin<M extends Schema.Top, I, K extends keyof I, R> =
+  IndexZOrderDimensions<M, I, K, R> extends infer Dims
+    ? IndexZOrderPrefix<M, I, K, R> extends infer Prefix
+      ? {
+          readonly [F in keyof Dims]?: Dims[F] extends {
+            readonly dimension: infer D
+            readonly value: infer V
+          }
+            ? import("./internal/BoundQuery.js").DimensionBound<D, V>
+            : never
+        } & { readonly [F in keyof Prefix]?: Prefix[F] }
+      : never
+    : never
+
+/**
+ * What `.within()` takes on a composite accessor (#171): an optional bound per
+ * SK composite the accessor left open, in the composite's own type (string
+ * literal unions widened to `string`, as `.where()` does). `never` — no
+ * `.within()` — when the accessor pinned every composite or the index has none.
+ */
+type CompositeWithin<SK> = [SK] extends [never]
+  ? never
+  : import("./internal/BoundQuery.js").WithinSpec<
+      {
+        readonly [F in keyof SK]?: import("./internal/BoundQuery.js").RangeBound<
+          import("./internal/BoundQuery.js").SkOperand<SK[F]>
+        >
+      },
+      "composite"
+    >
 
 /**
  * Partition composites a vector index accessor requires.
@@ -1055,6 +2273,27 @@ export interface TableOperations {
       readonly timeout?: Duration.Input | undefined
     },
   ) => Effect.Effect<void, DynamoClientError>
+
+  // --- 1.36 keys (#171) ---
+
+  /**
+   * Move every row 1.36 wrote whose key text changed to its current key:
+   * items with their unique sentinels, version snapshots, tombstones,
+   * time-series events, aggregates, and the event streams passed in
+   * `options.streams` (copied, flipped, then deleted, while writers append).
+   * Index keys and vector partitions still holding 1.36 text are rewritten in
+   * place. Scans the table (`segments` in parallel); a row is moved only when
+   * it is stored under the key 1.36 composed for its values, so a rerun moves
+   * nothing. Conflicts are reported, never overwritten. `dryRun` counts what
+   * would move. See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
+   *
+   * Fails with `ValidationError` (`EDD-9098`) for a bad option or resume
+   * token, and with the `DynamoClientError` of a request that failed — resume
+   * from the last `onProgress` token.
+   */
+  readonly rekey: (
+    options?: RekeyOptions,
+  ) => Effect.Effect<RekeyReport, DynamoClientError | ValidationError>
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,8 +2315,21 @@ interface EntityLike {
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
   /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName?: ((domainName: string) => string) | undefined
+  /**
+   * The entity's refs: a `${ref}Id` composite is not stored on the item, but
+   * the ref it names is, as a map holding the referenced identifier.
+   */
+  readonly _resolvedRefs?:
+    | ReadonlyArray<{
+        readonly fieldName: string
+        readonly idFieldName: string
+        readonly identifierField: string
+      }>
+    | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
+  /** Where a stored row's values key it in an index now (#171). */
+  readonly _indexRows136?: ((index: IndexDefinition) => Query.KeyPassRows) | undefined
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
@@ -1301,8 +2553,34 @@ const makeFromConfig = (config: {
         )
       })
 
+      // A Z-order sort key (#171) is a binary address: its prefix composites
+      // and dimensions are bounded with `.within()`, never pinned by the
+      // accessor, which takes the partition key composites only.
+      const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
+      const accessorDef: IndexDefinition = zorder
+        ? { ...indexDef, sk: { field: indexDef.sk.field, composite: [] } }
+        : indexDef
+      // Its range plans, cached across the accessor's queries (§5.4).
+      const zorderLayout = KeyComposer.isZOrderHalf(indexDef.sk)
+        ? indexDef.sk.zorderHalf.layout
+        : undefined
+      const zorderPlans = zorderLayout === undefined ? undefined : makeZOrderPlans(zorderLayout)
+
       return (rawComposites: Record<string, unknown>) => {
-        validateQueryComposites(_indexName, indexDef, rawComposites)
+        if (zorder) {
+          const misplaced = indexDef.sk.composite.filter(
+            (attr) => rawComposites[attr] !== undefined,
+          )
+          if (misplaced.length > 0) {
+            throw new Error(
+              `[EDD-9093] Index "${_indexName}" of entity "${entityLike.entityType}" has a ` +
+                `Z-order sort key, so ${misplaced.map((attr) => `"${attr}"`).join(", ")} can't ` +
+                `be passed to its accessor: pass the partition key composites ` +
+                `(${indexDef.pk.composite.join(", ")}) and bound the rest with .within().`,
+            )
+          }
+        }
+        validateQueryComposites(_indexName, accessorDef, rawComposites)
         const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
         const pkValue = KeyComposer.composePk(
           entityLike._schema,
@@ -1336,49 +2614,81 @@ const makeFromConfig = (config: {
           },
         })
 
-        // Apply SK prefix from provided compositesKeyForm.
-        // `composeSortKeyBeginsWith`, not `composeSortKeyPrefix` — the operand
-        // must terminate on a segment boundary when compositesKeyForm remain, or it
-        // matches sibling values that merely start with the supplied one
-        // (`status_done` also matching `status_done_archived`, issue #115).
-        const hasSkComposites = indexDef.sk.composite.some(
-          (attr: string) => compositesKeyForm[attr] !== undefined,
-        )
-        const finalQuery = hasSkComposites
-          ? Query.where(query, {
-              beginsWith: KeyComposer.composeSortKeyBeginsWith(
+        // Apply the SK condition from the provided composites
+        // (`composeSortKeyCondition`): a partial prefix is a `begins_with`
+        // terminated on a segment boundary, or it matches sibling values that
+        // merely start with the supplied one (`status_done` also matching
+        // `status_done_archived`, issue #115); a complete key is an exact `=`,
+        // or `seq: 3` also matches 3.14 and `name: "a"` also matches "ab".
+        const hasSkComposites =
+          !zorder &&
+          indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
+        const pinnedQuery = hasSkComposites
+          ? Query.where(
+              query,
+              KeyComposer.composeSortKeyCondition(
                 entityLike._schema,
                 entityLike.entityType,
                 1,
                 indexDef,
                 compositesKeyForm,
               ),
-            })
+            )
           : query
+
+        // Rows 1.36 wrote whose key text changed sit under the key 1.36
+        // composed for these pins until they move (#171): the query reads it
+        // too — the partition key, and the pins' `eq` / `begins_with`. A
+        // Z-order index is new in 1.37, so it has no 1.36 rows.
+        const pk136 =
+          !zorder && KeyText136.enabled(entityLike._schema)
+            ? KeyText136.composePk(
+                entityLike._schema,
+                entityLike.entityType,
+                indexDef,
+                compositesKeyForm,
+              )
+            : undefined
+        const finalQuery =
+          pk136 === undefined
+            ? pinnedQuery
+            : Query.alsoRead136(pinnedQuery, {
+                pkValue: pk136,
+                rows: entityLike._indexRows136?.(indexDef),
+                condition: hasSkComposites
+                  ? KeyText136.composeSortKeyCondition(
+                      entityLike._schema,
+                      entityLike.entityType,
+                      1,
+                      indexDef,
+                      compositesKeyForm,
+                    )
+                  : undefined,
+              })
 
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
 
         // composeSkCondition — compose the user's `.where()` operand into a full
-        // sort key value the same way `put` composes the stored one.
-        //
-        // A stored SK is `$schema#v1#entity#<name>_<cased value>#...`; comparing
-        // a raw operand against that is meaningless (issue #101 — `gte` matched
-        // the whole partition because `"1-009" < "ballkey_…"`, while
-        // `begins_with` / `between` matched nothing). So the operand is placed
-        // in the *position* of the SK composite it targets and run through the
-        // same composer, which applies `serializeValue`, the `<name>_` prefix
-        // and the schema casing.
+        // sort key value the same way `put` composes the stored one
+        // (`composeRangeUnder`).
         const skComposites = indexDef.sk.composite
         const composeSkCondition = (
           condition: RawSortKeyCondition,
           field: string | undefined,
         ): Query.SortKeyCondition => {
+          if (zorder) {
+            throw new Error(
+              `[EDD-9093] .where() on index "${_indexName}" of entity ` +
+                `"${entityLike.entityType}": a Z-order sort key has no text order to compare ` +
+                `against — bound its prefix composites and dimensions with .within().`,
+            )
+          }
           if (skComposites.length === 0) {
             throw new Error(
-              `[EDD-9045] Index "${_indexName}" has no sort key compositesKeyForm, so there is ` +
+              `[EDD-9045] Index "${_indexName}" has no sort key composites, so there is ` +
                 `nothing for .where() to constrain. Remove the .where() call, or add sort ` +
-                `key compositesKeyForm to the index definition.`,
+                `key composites to the index definition.`,
             )
           }
 
@@ -1447,141 +2757,87 @@ const makeFromConfig = (config: {
           if (missing.length > 0) {
             throw new Error(
               `[EDD-9004] Sort key condition on "${targetAttr}" for index "${_indexName}" ` +
-                `requires prior compositesKeyForm: ${missing.join(", ")}. Sort key compositesKeyForm must ` +
+                `requires prior composites: ${missing.join(", ")}. Sort key composites must ` +
                 `follow prefix ordering — supply them to the accessor before calling .where().`,
             )
           }
 
-          // Compose a sort key value with the leading pinned compositesKeyForm followed
-          // by `<targetAttr>_<value>`. Trailing compositesKeyForm are excluded — the
-          // condition bounds the key at the target's position.
+          // Compose under the pinned prefix — the key text of the composites
+          // the accessor pinned, ending on a segment boundary (the target
+          // follows them, so the shared delimiter rule always applies).
           const pinnedKeyForm: Record<string, unknown> = {}
           for (let i = 0; i < targetIndex; i++) {
             pinnedKeyForm[skComposites[i]!] = compositesKeyForm[skComposites[i]!]
           }
-          // Encode the operand exactly as the accessor compositesKeyForm (and the
-          // write path) are encoded, so both sides of the comparison come out
-          // of one pipeline.
-          const operand = (value: unknown): unknown => compositeKeyForm(targetAttr, value)
-          const compose = (value: unknown): string =>
-            KeyComposer.composeSortKeyPrefix(
-              entityLike._schema,
-              entityLike.entityType,
-              1,
-              indexDef,
-              {
-                ...pinnedKeyForm,
-                [targetAttr]: operand(value),
-              },
-            )
-
-          const isLastComposite = targetIndex === skComposites.length - 1
-
-          /**
-           * `begins_with` operand matching exactly the keys whose target
-           * composite equals `value`. Delegates the delimiter rule (#115) to
-           * `composeSortKeyBeginsWith` — one rule, shared with the accessor's
-           * own prefix — so it stops on a segment boundary rather than leaking
-           * into sibling values (`status_done` vs `status_done_archived`).
-           */
-          const subtreeBeginsWith = (value: unknown): string =>
-            KeyComposer.composeSortKeyBeginsWith(
-              entityLike._schema,
-              entityLike.entityType,
-              1,
-              indexDef,
-              { ...pinnedKeyForm, [targetAttr]: operand(value) },
-            )
-
-          /**
-           * A bound sorting strictly above every key whose target composite is
-           * `value`, and strictly below the first key of any greater value.
-           *
-           * Unlike `subtreeBeginsWith` the delimiter here is UNCONDITIONAL,
-           * including on the last composite: `compose(v)￿` alone would sort
-           * below `compose(v + "0")`, which is a strictly greater value that
-           * must stay inside a `gt`. `compose(v)#￿` sits above `compose(v)` and
-           * below every longer value because `#` is lower than every character
-           * the composer emits for a value segment.
-           */
-          const aboveSubtree = (value: unknown): string =>
-            `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
-
-          /** Inclusive upper bound covering the whole subtree of `value`. */
-          const upper = (value: unknown): string =>
-            isLastComposite ? compose(value) : aboveSubtree(value)
-
-          // `beginsWith` / `between` / `eq` already carry the pinned compositesKeyForm
-          // in BOTH operands, so they never escape the pinned prefix.
-          if ("beginsWith" in condition) return { beginsWith: compose(condition.beginsWith) }
-          if ("eq" in condition) {
-            return isLastComposite
-              ? { eq: compose(condition.eq) }
-              : { beginsWith: subtreeBeginsWith(condition.eq) }
-          }
-          if ("between" in condition) {
-            return { between: [compose(condition.between[0]), upper(condition.between[1])] }
-          }
-
-          // One-sided operators are open on the other side. With no pinned
-          // compositesKeyForm that is exactly right — the open end runs to the edge of
-          // the partition. But once the accessor has pinned leading compositesKeyForm,
-          // DynamoDB's single sort key condition must ALSO stay inside that
-          // prefix, so the open end is clamped and the condition becomes a
-          // BETWEEN. (`Query.where` replaces the accessor's own `begins_with`,
-          // so it cannot do the clamping.)
-          //
-          // The predicate is "the accessor pinned nothing", NOT `targetIndex === 0`.
-          // Those coincided for every shape the tests covered but are different
-          // claims: an accessor can pin composite[0] itself, and then targeting
-          // index 0 skipped the clamp and dropped the pin (#121). That call now
-          // raises EDD-9053 above, so the two are equivalent again — stating the
-          // real predicate keeps them from drifting apart a second time.
-          if (pinnedCount === 0) {
-            if ("lt" in condition) return { lt: compose(condition.lt) }
-            if ("lte" in condition) return { lte: upper(condition.lte) }
-            // `>` is already exclusive of the composed value, so only a
-            // non-terminal target needs the subtree pushed past.
-            if ("gt" in condition) {
-              return { gt: isLastComposite ? compose(condition.gt) : aboveSubtree(condition.gt) }
-            }
-            if ("gte" in condition) return { gte: compose(condition.gte) }
-            return condition
-          }
-
-          // The pinned compositesKeyForm are a strict prefix by construction (the
-          // target composite follows them), so the shared delimiter rule always
-          // terminates this bound on a segment boundary.
-          const pinnedPrefix = KeyComposer.composeSortKeyBeginsWith(
+          const prefixText = KeyComposer.composeSortKeyBeginsWith(
             entityLike._schema,
             entityLike.entityType,
             1,
             indexDef,
             pinnedKeyForm,
           )
-          const pinnedMax = `${pinnedPrefix}${SK_MAX_SENTINEL}`
-          if ("gte" in condition) return { between: [compose(condition.gte), pinnedMax] }
-          if ("gt" in condition) return { between: [aboveSubtree(condition.gt), pinnedMax] }
-          if ("lte" in condition) return { between: [pinnedPrefix, upper(condition.lte)] }
-          if ("lt" in condition) {
-            // On a non-terminal composite no stored key can equal the composed
-            // bound (trailing compositesKeyForm always follow), so BETWEEN's inclusive
-            // high end is harmless. On the LAST composite the bound IS a
-            // storable key, and DynamoDB has neither a half-open BETWEEN nor a
-            // FilterExpression that may reference a key attribute — so there is
-            // no way to say `begins_with(prefix) AND sk < value` in one key
-            // condition. Refuse rather than silently return the boundary item.
-            if (!isLastComposite) return { between: [pinnedPrefix, compose(condition.lt)] }
-            throw new Error(
-              `[EDD-9046] A strict "lt" condition on sort key composite "${targetAttr}" for ` +
-                `index "${_indexName}" cannot be expressed once earlier compositesKeyForm ` +
-                `(${skComposites.slice(0, targetIndex).join(", ")}) are pinned by the accessor: ` +
-                `DynamoDB allows one sort key condition, BETWEEN is inclusive at both ends, and ` +
-                `a FilterExpression may not reference a key attribute. Use ` +
-                `.where((t, { between }) => between(t.${targetAttr}, low, high)) or "lte" instead.`,
-            )
+          // Operands are encoded exactly as the accessor composites (and the
+          // write path) are, so both sides of the comparison come out of one
+          // pipeline.
+          //
+          // The clamp predicate is "the accessor pinned something", NOT
+          // `targetIndex > 0`. Those coincided for every shape the tests
+          // covered but are different claims: an accessor can pin composite[0]
+          // itself, and then targeting index 0 skipped the clamp and dropped
+          // the pin (#121). That call now raises EDD-9053 above, so the two
+          // are equivalent again — stating the real predicate keeps them from
+          // drifting apart a second time.
+          return composeRangeUnder(
+            {
+              casing: KeyComposer.effectiveCasing(entityLike._schema, indexDef),
+              isLast: targetIndex === skComposites.length - 1,
+            },
+            prefixText,
+            targetAttr,
+            mapBound(condition, (value) => compositeKeyForm(targetAttr, value)),
+            { clampToPrefix: pinnedCount > 0 },
+          )
+        }
+
+        /**
+         * The 1.36 key a `.where()` also reads (#171): an `eq` or
+         * `beginsWith` extends the pins, so the rows it selects under 1.36's
+         * key text are read too. A range bound reads only the current key.
+         */
+        const where136 = (
+          condition: RawSortKeyCondition,
+          field: string | undefined,
+        ): Query.KeyPass | undefined => {
+          if (pk136 === undefined || !("eq" in condition || "beginsWith" in condition)) {
+            return undefined
           }
-          return condition
+          const pinnedCount = skComposites.findIndex(
+            (attr: string) => compositesKeyForm[attr] === undefined,
+          )
+          const targetAttr =
+            field !== undefined && skComposites.includes(field)
+              ? field
+              : skComposites[pinnedCount === -1 ? skComposites.length - 1 : pinnedCount]!
+          const pinned: Record<string, unknown> = {}
+          for (const attr of skComposites.slice(0, skComposites.indexOf(targetAttr))) {
+            pinned[attr] = compositesKeyForm[attr]
+          }
+          const operand = (value: unknown) => compositeKeyForm(targetAttr, value)
+          return {
+            pkValue: pk136,
+            rows: entityLike._indexRows136?.(indexDef),
+            condition: KeyText136.composeBoundCondition(
+              entityLike._schema,
+              entityLike.entityType,
+              1,
+              indexDef,
+              pinned,
+              targetAttr,
+              "eq" in condition
+                ? { eq: operand(condition.eq) }
+                : { beginsWith: operand(condition.beginsWith) },
+            ),
+          }
         }
 
         const bqConfig: BoundQueryConfig<unknown> = {
@@ -1589,7 +2845,42 @@ const makeFromConfig = (config: {
           conditionOps,
           provide,
           composeSkCondition,
-          skFields: indexDef.sk.composite,
+          where136,
+          // A Z-order accessor bounds its dimensions and prefix composites
+          // (#171), and takes `.zorder()`.
+          ...(zorder
+            ? {
+                zorder: true,
+                planWithin: (q, bounds, options) =>
+                  planZOrderWithin({
+                    entityLike,
+                    accessor: _indexName,
+                    indexDef,
+                    encoderSource,
+                    compositeKeyForm,
+                    pkValue,
+                    plans: zorderPlans!,
+                    query: q,
+                    bounds,
+                    options,
+                  }),
+              }
+            : {
+                planWithin: (q, bounds, options) =>
+                  planCompositeWithin({
+                    entityLike,
+                    accessor: _indexName,
+                    indexDef,
+                    encoderSource,
+                    compositeKeyForm,
+                    pinnedKeyForm: compositesKeyForm,
+                    pkValue,
+                    query: q,
+                    bounds,
+                    options,
+                  }),
+              }),
+          skFields: accessorDef.sk.composite,
           ...entityNaming(entityLike._resolveDbName),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
@@ -1811,6 +3102,20 @@ const makeFromConfig = (config: {
           query = Query.where(query, { beginsWith: skPrefix })
         }
 
+        // A collection's sort key prefix holds names only, so its 1.36 key
+        // differs in the partition key alone — a number composite (#171).
+        query = Query.alsoReadPartition136(
+          query,
+          KeyText136.enabled(firstMember.entityLike._schema)
+            ? KeyText136.composePk(
+                firstMember.entityLike._schema,
+                firstMember.entityLike.entityType,
+                indexDef,
+                entityKeyForm(firstMember.entityLike, composites),
+              )
+            : undefined,
+        )
+
         // Wrap in BoundQuery that groups results by entity key
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
@@ -1869,6 +3174,54 @@ const makeFromConfig = (config: {
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
+    // `rekey` (#171) hands each row to the member owning it: the table's
+    // entities and aggregates, those the client binds on the same table, and
+    // the streams the caller passes (`DynamoClient.make` binds no streams).
+    const rekeyFor =
+      (tableName: string, tagKey: string, registered: ReadonlyArray<unknown>) =>
+      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> => {
+        const onTable = (member: unknown) =>
+          (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key === tagKey
+        const handlers = new Set<Rekey.RekeyMember>()
+        for (const member of [
+          ...registered,
+          ...Object.values(config.entities).filter(onTable),
+          ...Object.values(config.aggregates ?? {}).filter(onTable),
+          ...(options?.streams ?? []),
+        ]) {
+          const handler = Rekey.handlerOf(member)
+          if (handler !== undefined) handlers.add(handler)
+        }
+        // A projection's outbox on this table, of a read model on another (#171).
+        const outboxOf = new Set<unknown>()
+        for (const entity of [...registered, ...Object.values(config.entities)]) {
+          const outbox = (
+            entity as {
+              readonly _projectionOutbox?: {
+                readonly table: { readonly Tag: { readonly key: string } }
+                readonly pk: string
+                readonly sk: string
+              }
+            }
+          )._projectionOutbox
+          if (outbox === undefined || outbox.table.Tag.key !== tagKey || outboxOf.has(entity)) {
+            continue
+          }
+          outboxOf.add(entity)
+          const readModel = entity as unknown as Pick<
+            EntityType,
+            "entityType" | "_rekeyProjectionRow"
+          >
+          handlers.add({
+            name: readModel.entityType,
+            types: [`${readModel.entityType}#outbox`],
+            row: (row, ctx) =>
+              readModel._rekeyProjectionRow(row, ctx, { pk: outbox.pk, sk: outbox.sk }),
+          })
+        }
+        return provide(Rekey.run({ tableName, members: [...handlers], options }))
+      }
+
     if (config.tables) {
       for (const [tableKey, table] of Object.entries(config.tables)) {
         const tableConfig = yield* table.Tag
@@ -1903,7 +3256,13 @@ const makeFromConfig = (config: {
             } as unknown as Table
           }
         }
-        tables[tableKey] = buildTableOperationsFromTable(tableConfig.name, mergedTable, client)
+        tables[tableKey] = {
+          ...buildTableOperationsFromTable(tableConfig.name, mergedTable, client),
+          rekey: rekeyFor(tableConfig.name, table.Tag.key, [
+            ...Object.values(mergedTable.entities as Record<string, unknown>),
+            ...Object.values(mergedTable.aggregates as Record<string, unknown>),
+          ]),
+        }
       }
     } else {
       // Group entities by table tag so we can derive full table schema for create().
@@ -1951,11 +3310,10 @@ const makeFromConfig = (config: {
             ]),
           ),
         } as unknown as Table
-        tables[tableConfig.name] = buildTableOperationsFromTable(
-          tableConfig.name,
-          syntheticTable,
-          client,
-        )
+        tables[tableConfig.name] = {
+          ...buildTableOperationsFromTable(tableConfig.name, syntheticTable, client),
+          rekey: rekeyFor(tableConfig.name, tag.key, [...tableEntities, ...tableAggregates]),
+        }
       }
     }
 
@@ -2014,8 +3372,11 @@ const buildTableOperationsFromTable = (
   tableName: string,
   table: Table,
   client: DynamoClientService,
-): TableOperations => {
-  const def = tableDefinition(table)
+): Omit<TableOperations, "rekey"> => {
+  // Composed when a table is created: a table holding only event streams or a
+  // projection's outbox has no definition to give, but its other operations
+  // (`rekey` among them) still work.
+  const definition = () => tableDefinition(table)
   const vectorIndexes = mergeVectorIndexes(
     table.entities as unknown as Record<string, Parameters<typeof mergeVectorIndexes>[0][string]>,
   )
@@ -2023,22 +3384,25 @@ const buildTableOperationsFromTable = (
   return {
     ...buildTableOperations(tableName, client),
     create: (options?: CreateTableOptions) =>
-      idempotentCreate(
-        client
-          .createTable({
-            TableName: tableName,
-            BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
-            ...def,
-          })
-          .pipe(
-            Effect.asVoid,
-            diagnoseVectorLimits("CreateTable", `db.tables create of "${tableName}"`, {
-              vectorIndexes: def.VectorIndexes ?? [],
-              sharers,
-              declared: vectorIndexes.size,
-            }),
-          ),
-      ),
+      Effect.suspend(() => {
+        const def = definition()
+        return idempotentCreate(
+          client
+            .createTable({
+              TableName: tableName,
+              BillingMode: options?.billingMode ?? "PAY_PER_REQUEST",
+              ...def,
+            })
+            .pipe(
+              Effect.asVoid,
+              diagnoseVectorLimits("CreateTable", `db.tables create of "${tableName}"`, {
+                vectorIndexes: def.VectorIndexes ?? [],
+                sharers,
+                declared: vectorIndexes.size,
+              }),
+            ),
+        )
+      }),
     addVectorIndex: (indexName) => {
       const entry = vectorIndexes.get(indexName)
       if (entry === undefined) {
@@ -2096,7 +3460,10 @@ const buildTableOperationsFromTable = (
   }
 }
 
-const buildTableOperations = (tableName: string, client: DynamoClientService): TableOperations => ({
+const buildTableOperations = (
+  tableName: string,
+  client: DynamoClientService,
+): Omit<TableOperations, "rekey"> => ({
   create: (options?: CreateTableOptions) =>
     idempotentCreate(
       client

@@ -1,6 +1,8 @@
-import { DateTime } from "effect"
+import { DateTime, Schema } from "effect"
 import { describe, expect, it } from "vitest"
+import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
+import * as Entity from "../src/Entity.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
 describe("KeyComposer", () => {
@@ -32,15 +34,21 @@ describe("KeyComposer", () => {
       expect(KeyComposer.serializeValue("hello")).toBe("hello")
     })
 
-    it("numbers are zero-padded to 16 digits", () => {
+    it("non-negative integer numbers are zero-padded to 16 digits", () => {
       expect(KeyComposer.serializeValue(42)).toBe("0000000000000042")
       expect(KeyComposer.serializeValue(0)).toBe("0000000000000000")
       expect(KeyComposer.serializeValue(9007199254740991)).toBe("9007199254740991") // MAX_SAFE_INTEGER
     })
 
-    it("bigints are zero-padded to 38 digits", () => {
+    it("non-negative bigints are zero-padded to 38 digits", () => {
       expect(KeyComposer.serializeValue(42n)).toBe("00000000000000000000000000000000000042")
       expect(KeyComposer.serializeValue(0n)).toBe("00000000000000000000000000000000000000")
+    })
+
+    it("negative, fractional and large numbers sort in numeric order (NumericKey.test.ts)", () => {
+      expect(KeyComposer.serializeValue(-3.14)).toBe("-9999999999999996.85:")
+      expect(KeyComposer.serializeValue(3.14)).toBe("0000000000000003.14")
+      expect(KeyComposer.serializeValue(1e21)).toBe(":0211")
     })
 
     it("booleans stringify", () => {
@@ -1497,6 +1505,796 @@ describe("KeyComposer", () => {
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
       })
     })
+
+    // ----------------------------------------------------------------------
+    // Z-order halves — canonical shapes 7 / 8 and their degenerate fixtures (#171)
+    // ----------------------------------------------------------------------
+    //
+    // A Z-order sort key's derived `composite` (prefix composites, then
+    // dimensions) feeds the unchanged skip-predicate. A half that is NOT
+    // skipped is all or nothing: every field present → SET the bytes;
+    // otherwise `'sparse'` → REMOVE, `'preserve'` with a removed field →
+    // REMOVE (cascade override), else `'preserve'` → noop. Never truncated —
+    // the address follows every field, so a partial one is meaningless.
+    //
+    // Fixtures are bound through `Entity.make`: binding is what gives a
+    // Z-order half its layout, and the composers only ever see bound halves.
+
+    describe("Z-order halves (#171 — canonical shapes 7 and 8)", () => {
+      const Listing = Schema.Struct({
+        listingId: Schema.String,
+        region: Schema.String,
+        agencyId: Schema.String,
+        officeId: Schema.String,
+        price: Schema.Number,
+        bedrooms: Schema.Number,
+        listedAt: DynamoModel.DateString,
+        status: Schema.Literals(["draft", "live"]),
+        title: Schema.String,
+      })
+      const facets = [
+        { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+        { field: "bedrooms", min: 0, max: 15 },
+        { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
+      ] as const
+      const byListingId = {
+        pk: { field: "pk", composite: ["listingId"] },
+        sk: { field: "sk", composite: [] },
+      } as const
+
+      const key = { listingId: "l-1" }
+      /** Every dimension of `facets`, in key form. */
+      const dims = { price: 250_000, bedrooms: 3, listedAt: "2024-01-02T00:00:00.000Z" }
+      /** `dims` interleaved: price level 250 (13 bits), bedrooms 3 (4), listedAt hour 24 (16). */
+      const DIMS_BYTES = Uint8Array.of(0x00, 0x02, 0x45, 0x54, 0x68)
+
+      const withPolicy = (
+        indexes: Record<string, KeyComposer.IndexDefinition>,
+        name: string,
+        indexPolicy: KeyComposer.IndexPolicy | undefined,
+      ): Record<string, KeyComposer.IndexDefinition> =>
+        indexPolicy === undefined
+          ? indexes
+          : { ...indexes, [name]: { ...indexes[name]!, indexPolicy } }
+
+      const update = (
+        indexes: Record<string, KeyComposer.IndexDefinition>,
+        payload: Record<string, unknown>,
+        keyRecord: Record<string, unknown>,
+        removed?: ReadonlyArray<string>,
+      ) =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Listing",
+          1,
+          indexes,
+          payload,
+          keyRecord,
+          removed === undefined ? undefined : { removedSet: new Set(removed) },
+        )
+
+      const expectUntouched = (result: KeyComposer.GsiUpdateResult, field: string) => {
+        expect(result.sets).not.toHaveProperty(field)
+        expect(result.removes).not.toContain(field)
+      }
+
+      // --------------------------------------------------------------------
+      // Shape 7 — every dimension a mutable model field
+      // --------------------------------------------------------------------
+
+      describe("shape 7 — Z-order half over mutable fields", () => {
+        const Shape7 = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byFacets: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["region"] },
+              sk: { field: "gsi2sk", zorder: facets },
+            },
+          },
+        })
+        const shape7 = (indexPolicy?: KeyComposer.IndexPolicy) =>
+          withPolicy(Shape7.indexes, "byFacets", indexPolicy)
+
+        it("full payload → SET the address bytes; the untouched PK half is skipped", () => {
+          const result = update(shape7(), dims, key)
+          expect(result.sets.gsi2sk).toBeInstanceOf(Uint8Array)
+          expect(result.sets.gsi2sk).toEqual(DIMS_BYTES)
+          expectUntouched(result, "gsi2pk")
+          expect(result.removes).toEqual([])
+        })
+
+        it("full payload with the PK composite → both halves SET", () => {
+          const payload = { ...dims, region: "North" }
+          const result = update(shape7(), payload, key)
+          expect(result.sets.gsi2pk).toBe(
+            KeyComposer.composePk(schema, "Listing", Shape7.indexes.byFacets, payload),
+          )
+          expect(result.sets.gsi2sk).toEqual(DIMS_BYTES)
+        })
+
+        it("partial payload under 'sparse' → REMOVE, never a truncated SET", () => {
+          // price and bedrooms are the two leading dimensions — a string half
+          // would truncate to them; a Z-order half has no truncated form.
+          const result = update(shape7({ sk: "sparse" }), { price: 300_000, bedrooms: 2 }, key)
+          expect(result.removes).toEqual(["gsi2sk"])
+          expect(result.sets).not.toHaveProperty("gsi2sk")
+        })
+
+        it("partial payload under 'preserve' → noop (the stored address may go stale)", () => {
+          expectUntouched(update(shape7(), { price: 300_000, bedrooms: 2 }, key), "gsi2sk")
+          expectUntouched(update(shape7({ sk: "preserve" }), { price: 300_000 }, key), "gsi2sk")
+        })
+
+        it("'preserve' + remove([dimension]) → REMOVE (cascade override)", () => {
+          const result = update(shape7(), { price: 300_000, bedrooms: 2 }, key, ["listedAt"])
+          expect(result.removes).toEqual(["gsi2sk"])
+          expect(result.sets).not.toHaveProperty("gsi2sk")
+        })
+
+        it("remove([dimension]) alone → REMOVE under both policies", () => {
+          for (const sk of ["sparse", "preserve"] as const) {
+            const result = update(shape7({ sk }), {}, key, ["bedrooms"])
+            expect(result.removes).toEqual(["gsi2sk"])
+          }
+        })
+
+        it("a null dimension in the payload is absent", () => {
+          const result = update(shape7({ sk: "sparse" }), { ...dims, bedrooms: null }, key)
+          expect(result.removes).toEqual(["gsi2sk"])
+        })
+
+        it("untouched (no dimension in payload or key record) → skipped, even under 'sparse'", () => {
+          const result = update(shape7({ pk: "sparse", sk: "sparse" }), { title: "Renovated" }, key)
+          expect(result).toEqual({ sets: {}, removes: [] })
+        })
+
+        it("a change within one level writes identical bytes; crossing a level moves the entry", () => {
+          const at = (payload: Record<string, unknown>) =>
+            update(shape7(), { ...dims, ...payload }, key).sets.gsi2sk
+          // price step is 1,000: 250,000..250,999 share level 250.
+          expect(at({ price: 250_999 })).toEqual(DIMS_BYTES)
+          // listedAt unit is hours: the whole hour shares a level.
+          expect(at({ listedAt: "2024-01-02T00:59:59.999Z" })).toEqual(DIMS_BYTES)
+          expect(at({ price: 251_000 })).not.toEqual(DIMS_BYTES)
+          expect(at({ bedrooms: 4 })).not.toEqual(DIMS_BYTES)
+          expect(at({ listedAt: "2024-01-02T01:00:00.000Z" })).not.toEqual(DIMS_BYTES)
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // 7a / 7a′ — layout edges
+      // --------------------------------------------------------------------
+
+      describe("shape 7a — single-bit layout (one 2-member literals dimension)", () => {
+        const Shape7a = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byStatus: {
+              name: "gsi4",
+              pk: { field: "gsi4pk", composite: ["region"] },
+              sk: { field: "gsi4sk", zorder: [{ field: "status", values: ["draft", "live"] }] },
+            },
+          },
+        })
+
+        it("B = 1, W = 1: the key is the single byte 0x00 or 0x01", () => {
+          const half = Shape7a.indexes.byStatus.sk as KeyComposer.ZOrderSkPart
+          expect(half.zorderHalf.layout?.bits).toBe(1)
+          expect(half.zorderHalf.layout?.bytes).toBe(1)
+          expect(update(Shape7a.indexes, { status: "draft" }, key).sets.gsi4sk).toEqual(
+            Uint8Array.of(0x00),
+          )
+          expect(update(Shape7a.indexes, { status: "live" }, key).sets.gsi4sk).toEqual(
+            Uint8Array.of(0x01),
+          )
+        })
+
+        it("remove([status]) → REMOVE under both policies", () => {
+          for (const sk of ["sparse", "preserve"] as const) {
+            const result = update(withPolicy(Shape7a.indexes, "byStatus", { sk }), {}, key, [
+              "status",
+            ])
+            expect(result.removes).toEqual(["gsi4sk"])
+          }
+        })
+      })
+
+      describe("shape 7a′ — mixed widths (1-bit literals + 13-bit int)", () => {
+        const Shape7aPrime = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byStatusPrice: {
+              name: "gsi4",
+              pk: { field: "gsi4pk", composite: ["region"] },
+              sk: {
+                field: "gsi4sk",
+                zorder: [
+                  { field: "status", values: ["draft", "live"] },
+                  { field: "price", min: 0, max: 8191 },
+                ],
+              },
+            },
+          },
+        })
+
+        it("B = 14, W = 2: right-aligned, the top two bits of the first byte are always zero", () => {
+          const half = Shape7aPrime.indexes.byStatusPrice.sk as KeyComposer.ZOrderSkPart
+          expect(half.zorderHalf.layout?.bits).toBe(14)
+          expect(half.zorderHalf.layout?.bytes).toBe(2)
+          for (const status of ["draft", "live"] as const) {
+            for (const price of [0, 1, 4095, 4096, 8190, 8191]) {
+              const bytes = update(Shape7aPrime.indexes, { status, price }, key).sets.gsi4sk
+              expect(bytes).toBeInstanceOf(Uint8Array)
+              const b = bytes as Uint8Array
+              expect(b.length).toBe(2)
+              expect(b[0]! & 0xc0).toBe(0)
+            }
+          }
+          expect(
+            update(Shape7aPrime.indexes, { status: "draft", price: 0 }, key).sets.gsi4sk,
+          ).toEqual(Uint8Array.of(0x00, 0x00))
+          expect(
+            update(Shape7aPrime.indexes, { status: "live", price: 8191 }, key).sets.gsi4sk,
+          ).toEqual(Uint8Array.of(0x3f, 0xff))
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // 7b — shape 6 analogue: empty-composite PK half over a Z-order SK
+      // --------------------------------------------------------------------
+
+      describe("shape 7b — empty PK half (constant entity prefix) with a Z-order SK", () => {
+        const Shape7b = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byFacets: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: [] },
+              sk: { field: "gsi2sk", zorder: facets },
+            },
+          },
+        })
+        const shape7b = (indexPolicy?: KeyComposer.IndexPolicy) =>
+          withPolicy(Shape7b.indexes, "byFacets", indexPolicy)
+        const constantPk = KeyComposer.composePk(schema, "Listing", Shape7b.indexes.byFacets, {})
+
+        it("'sparse' + partial dimensions → PK SET + SK REMOVE (the item leaves the index)", () => {
+          const result = update(shape7b({ pk: "sparse", sk: "sparse" }), { price: 300_000 }, key)
+          expect(result.sets.gsi2pk).toBe(constantPk)
+          expect(result.removes).toEqual(["gsi2sk"])
+          expect(result.sets).not.toHaveProperty("gsi2sk")
+        })
+
+        it("'preserve' + partial dimensions → PK SET + SK noop", () => {
+          const result = update(shape7b(), { price: 300_000 }, key)
+          expect(result.sets.gsi2pk).toBe(constantPk)
+          expectUntouched(result, "gsi2sk")
+        })
+
+        it("full dimensions → PK SET + SK SET", () => {
+          const result = update(shape7b(), dims, key)
+          expect(result.sets.gsi2pk).toBe(constantPk)
+          expect(result.sets.gsi2sk).toEqual(DIMS_BYTES)
+        })
+
+        it("no dimension touched → the empty PK half is still evaluated; the SK half is skipped", () => {
+          const result = update(shape7b({ sk: "sparse" }), { title: "Renovated" }, key)
+          expect(result.sets).toEqual({ gsi2pk: constantPk })
+          expect(result.removes).toEqual([])
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // Shape 8 — Z-order half with sk.prefix
+      // --------------------------------------------------------------------
+
+      describe("shape 8 — Z-order half with sk.prefix", () => {
+        const Shape8 = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byAgency: {
+              name: "gsi3",
+              pk: { field: "gsi3pk", composite: ["region"] },
+              sk: {
+                field: "gsi3sk",
+                prefix: ["agencyId", { field: "officeId", hash: 8 }],
+                zorder: facets,
+              },
+            },
+          },
+        })
+        const shape8 = (indexPolicy?: KeyComposer.IndexPolicy) =>
+          withPolicy(Shape8.indexes, "byAgency", indexPolicy)
+        const prefix = { agencyId: "AG-1", officeId: "Office-9" }
+        const SHAPE8_BYTES = Uint8Array.of(
+          // "ag-1": u16be length 4, then the cased UTF-8.
+          0x00,
+          0x04,
+          0x61,
+          0x67,
+          0x2d,
+          0x31,
+          // "office-9": the first 8 bytes of its FNV-1a-64 hash.
+          0x66,
+          0x57,
+          0x27,
+          0xe7,
+          0x6e,
+          0xb5,
+          0x0e,
+          0xd7,
+          // The address.
+          ...DIMS_BYTES,
+        )
+
+        it("full payload → SET prefix segments ‖ address", () => {
+          const result = update(shape8(), { ...prefix, ...dims }, key)
+          expect(result.sets.gsi3sk).toEqual(SHAPE8_BYTES)
+        })
+
+        it("a prefix change moves the entry; the address tail is unchanged", () => {
+          const moved = update(shape8(), { ...prefix, ...dims, agencyId: "AG-2" }, key).sets
+            .gsi3sk as Uint8Array
+          expect(moved).not.toEqual(SHAPE8_BYTES)
+          expect(moved.slice(-DIMS_BYTES.length)).toEqual(DIMS_BYTES)
+          const office = update(shape8(), { ...prefix, ...dims, officeId: "Office-10" }, key).sets
+            .gsi3sk as Uint8Array
+          // A hashed segment keeps its width whatever the value's length.
+          expect(office.length).toBe(SHAPE8_BYTES.length)
+          expect(office).not.toEqual(SHAPE8_BYTES)
+        })
+
+        it("a prefix composite alone, dimensions missing → policy decides", () => {
+          const payload = { agencyId: "AG-2" }
+          expect(update(shape8({ sk: "sparse" }), payload, key).removes).toEqual(["gsi3sk"])
+          expectUntouched(update(shape8(), payload, key), "gsi3sk")
+        })
+
+        it("dimensions alone, a prefix composite missing → policy decides", () => {
+          const payload = { agencyId: "AG-1", ...dims }
+          expect(update(shape8({ sk: "sparse" }), payload, key).removes).toEqual(["gsi3sk"])
+          expectUntouched(update(shape8(), payload, key), "gsi3sk")
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // 8a — #43 analogue: every Z-order field is a primary-key composite
+      // --------------------------------------------------------------------
+
+      describe("shape 8a — every prefix composite and dimension is a primary-key composite (#43 analogue)", () => {
+        const Shape8a = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: {
+            pk: { field: "pk", composite: ["region"] },
+            sk: { field: "sk", composite: ["agencyId", "price", "bedrooms", "listedAt"] },
+          },
+          indexes: {
+            byAgency: {
+              name: "gsi3",
+              pk: { field: "gsi3pk", composite: ["region"] },
+              sk: { field: "gsi3sk", prefix: ["agencyId"], zorder: facets },
+            },
+          },
+        })
+        const keyRecord = { region: "North", agencyId: "AG-1", ...dims }
+
+        it("an update touching none of them recomposes both halves from keyRecord", () => {
+          for (const indexPolicy of [
+            undefined,
+            { pk: "sparse", sk: "sparse" },
+            { pk: "preserve", sk: "preserve" },
+          ] as const) {
+            const result = update(
+              withPolicy(Shape8a.indexes, "byAgency", indexPolicy),
+              { title: "Renovated" },
+              keyRecord,
+            )
+            expect(result.sets.gsi3pk).toBe(
+              KeyComposer.composePk(schema, "Listing", Shape8a.indexes.byAgency, keyRecord),
+            )
+            expect(result.sets.gsi3sk).toEqual(
+              KeyComposer.composeZOrderSk(schema, Shape8a.indexes.byAgency, keyRecord),
+            )
+            expect(result.removes).toEqual([])
+          }
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // 8b — #41 analogue: prefix and dimensions owned by different writers
+      // --------------------------------------------------------------------
+
+      describe("shape 8b — prefix owned by one writer, dimensions by another (#41 analogue)", () => {
+        const Shape8b = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byAgency: {
+              name: "gsi3",
+              pk: { field: "gsi3pk", composite: ["region"] },
+              sk: { field: "gsi3sk", prefix: ["agencyId"], zorder: facets },
+            },
+          },
+        })
+        const shape8b = (indexPolicy?: KeyComposer.IndexPolicy) =>
+          withPolicy(Shape8b.indexes, "byAgency", indexPolicy)
+
+        it("writer A updates the prefix alone → never a SET ('preserve' noop)", () => {
+          const result = update(shape8b(), { agencyId: "AG-2" }, key)
+          expectUntouched(result, "gsi3sk")
+          expect(
+            update(shape8b({ sk: "sparse" }), { agencyId: "AG-2" }, key).sets,
+          ).not.toHaveProperty("gsi3sk")
+        })
+
+        it("writer B's full-dimension update without the prefix → policy decides", () => {
+          expectUntouched(update(shape8b(), dims, key), "gsi3sk")
+          expect(update(shape8b({ sk: "sparse" }), dims, key).removes).toEqual(["gsi3sk"])
+        })
+
+        it("writer B's full-dimension update SETs when the prefix is in keyRecord or the payload", () => {
+          const fromKey = update(shape8b(), dims, { ...key, agencyId: "AG-1" })
+          const fromPayload = update(shape8b(), { ...dims, agencyId: "AG-1" }, key)
+          const expected = KeyComposer.composeZOrderSk(schema, Shape8b.indexes.byAgency, {
+            agencyId: "AG-1",
+            ...dims,
+          })
+          expect(fromKey.sets.gsi3sk).toEqual(expected)
+          expect(fromPayload.sets.gsi3sk).toEqual(expected)
+        })
+      })
+
+      // --------------------------------------------------------------------
+      // 8c — shape 3 analogue: hierarchical prefix never truncates
+      // --------------------------------------------------------------------
+
+      describe("shape 8c — hierarchical prefix: removing the leaf REMOVEs, never truncates (shape 3 analogue)", () => {
+        const Shape8c = Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byOffice: {
+              name: "gsi3",
+              pk: { field: "gsi3pk", composite: ["region"] },
+              sk: { field: "gsi3sk", prefix: ["agencyId", "officeId"], zorder: [facets[0]] },
+            },
+            // The string-half hierarchy (canonical shape 3) on the same fields, for contrast.
+            byOfficeText: {
+              name: "gsi5",
+              pk: { field: "gsi5pk", composite: ["region"] },
+              sk: { field: "gsi5sk", composite: ["agencyId", "officeId"] },
+            },
+          },
+        })
+
+        it("set({ agencyId }).remove(['officeId']) → REMOVE under 'sparse' and 'preserve'", () => {
+          for (const sk of ["sparse", "preserve"] as const) {
+            const indexes = withPolicy(
+              withPolicy(Shape8c.indexes, "byOffice", { sk }),
+              "byOfficeText",
+              { sk },
+            )
+            const result = update(indexes, { agencyId: "AG-2" }, { ...key, price: 250_000 }, [
+              "officeId",
+            ])
+            expect(result.removes).toContain("gsi3sk")
+            expect(result.sets).not.toHaveProperty("gsi3sk")
+            // The string half truncates to the parent instead.
+            expect(result.sets.gsi5sk).toBe(
+              KeyComposer.composeSkPrefixUpTo(
+                schema,
+                "Listing",
+                1,
+                Shape8c.indexes.byOfficeText,
+                { agencyId: "AG-2" },
+                1,
+              ),
+            )
+          }
+        })
+      })
+    })
+  })
+
+  describe("Z-order sort keys (#171)", () => {
+    const Listing = Schema.Struct({
+      listingId: Schema.String,
+      region: Schema.String,
+      agencyId: Schema.String,
+      officeId: Schema.String,
+      price: Schema.Number,
+      bedrooms: Schema.Number,
+      listedAt: DynamoModel.DateString,
+    })
+    const facets = [
+      { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+      { field: "bedrooms", min: 0, max: 15 },
+      { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 },
+    ] as const
+    const gsi = (sk: Record<string, unknown>, extra?: Record<string, unknown>) =>
+      ({
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: ["region"] },
+        sk: { field: "gsi2sk", ...sk },
+        ...extra,
+      }) as unknown as KeyComposer.GsiConfig
+    const Listings = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: {
+        pk: { field: "pk", composite: ["listingId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byFacets: {
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["region"] },
+          sk: { field: "gsi2sk", zorder: facets },
+        },
+        byAgency: {
+          name: "gsi3",
+          pk: { field: "gsi3pk", composite: ["region"] },
+          sk: {
+            field: "gsi3sk",
+            prefix: ["agencyId", { field: "officeId", hash: 8 }],
+            zorder: facets,
+          },
+          casing: "preserve",
+        },
+      },
+    })
+    const record = {
+      listingId: "l-1",
+      region: "North",
+      agencyId: "AG-1",
+      officeId: "Office-9",
+      price: 250_000,
+      bedrooms: 3,
+      listedAt: "2024-01-02T00:00:00.000Z",
+    }
+
+    describe("normalizeGsiConfig", () => {
+      it("carries zorder / prefix, derives composite, and leaves the half unbound", () => {
+        const def = KeyComposer.normalizeGsiConfig(
+          gsi({ prefix: ["agencyId", { field: "officeId", hash: 8 }], zorder: facets }),
+        )
+        expect(KeyComposer.isZOrderHalf(def.sk)).toBe(true)
+        const half = def.sk as KeyComposer.ZOrderSkPart
+        expect(half.field).toBe("gsi2sk")
+        expect(half.composite).toEqual(["agencyId", "officeId", "price", "bedrooms", "listedAt"])
+        expect(half.zorderHalf.prefix).toEqual([
+          { field: "agencyId", hash: undefined },
+          { field: "officeId", hash: 8 },
+        ])
+        // The entries, checked and normalised: step defaults to 1, from is an ISO instant.
+        expect(half.zorderHalf.dimensions).toEqual([
+          { shape: "range", field: "price", min: 0, max: 5_000_000, step: 1_000 },
+          { shape: "range", field: "bedrooms", min: 0, max: 15, step: 1 },
+          {
+            shape: "dateTime",
+            field: "listedAt",
+            from: "2024-01-01T00:00:00.000Z",
+            fromMs: Date.UTC(2024, 0, 1),
+            unit: "hours",
+            bits: 16,
+          },
+        ])
+        expect(half.zorderHalf.layout).toBeUndefined()
+        expect(def.type).toBe("isolated")
+      })
+
+      it("a string half is not a Z-order half", () => {
+        const def = KeyComposer.normalizeGsiConfig(gsi({ composite: ["price"] }))
+        expect(KeyComposer.isZOrderHalf(def.sk)).toBe(false)
+      })
+
+      it.each([
+        [
+          "zorder on the partition key",
+          gsi({ composite: [] }, { pk: { field: "gsi2pk", composite: [], zorder: facets } }),
+        ],
+        [
+          "prefix on the partition key",
+          gsi({ composite: [] }, { pk: { field: "gsi2pk", composite: [], prefix: ["agencyId"] } }),
+        ],
+        ["composite with zorder", gsi({ composite: ["price"], zorder: facets })],
+        ["prefix without zorder", gsi({ prefix: ["agencyId"] })],
+        ["an empty zorder", gsi({ zorder: [] })],
+        ["a zorder entry that isn't a name or an entry", gsi({ zorder: [42] })],
+        ["a zorder entry without a field", gsi({ zorder: [{ min: 0, max: 9 }] })],
+        ["a zorder entry with an empty name", gsi({ zorder: [""] })],
+        ["type clustered", gsi({ zorder: facets }, { type: "clustered" })],
+        ["a dimension listed twice", gsi({ zorder: [facets[0], facets[0]] })],
+        ["a field as prefix and dimension", gsi({ prefix: ["price"], zorder: facets })],
+        ["a prefix that isn't an array", gsi({ prefix: "agencyId", zorder: facets })],
+        ["a prefix part that isn't a field", gsi({ prefix: [42], zorder: facets })],
+      ])("[EDD-9086] %s", (_, config) => {
+        expect(() => KeyComposer.normalizeGsiConfig(config)).toThrow(/\[EDD-9086\] Index "gsi2"/)
+      })
+
+      it.each([0, 9, 1.5, "8"])("[EDD-9087] prefix hash %j", (hash) => {
+        expect(() =>
+          KeyComposer.normalizeGsiConfig(
+            gsi({ prefix: [{ field: "officeId", hash }], zorder: facets }),
+          ),
+        ).toThrow(/\[EDD-9087\] Index "gsi2" prefix composite "officeId"/)
+      })
+
+      it("[EDD-9087] an unknown key on a hashed prefix part", () => {
+        expect(() =>
+          KeyComposer.normalizeGsiConfig(
+            gsi({ prefix: [{ field: "officeId", hash: 4, hsh: 4 }], zorder: facets }),
+          ),
+        ).toThrow(
+          '[EDD-9087] Index "gsi2" prefix composite "officeId": "hsh" is not an option of a prefix part, which takes { field, hash }.',
+        )
+      })
+    })
+
+    describe("composeZOrderSk", () => {
+      it("composes golden bytes: address only", () => {
+        expect(KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, record)).toEqual(
+          Uint8Array.of(0x00, 0x02, 0x45, 0x54, 0x68),
+        )
+      })
+
+      it("composes golden bytes: prefix segments cased by the index's effective casing", () => {
+        // byAgency keeps the value's casing ("preserve"): "AG-1", "Office-9".
+        const bytes = KeyComposer.composeZOrderSk(schema, Listings.indexes.byAgency, record)
+        expect(Array.from(bytes.slice(0, 6))).toEqual([0x00, 0x04, 0x41, 0x47, 0x2d, 0x31])
+        expect(bytes.length).toBe(6 + 8 + 5)
+        expect(bytes.slice(-5)).toEqual(Uint8Array.of(0x00, 0x02, 0x45, 0x54, 0x68))
+        // The hash covers the cased text: lowercase casing hashes "office-9".
+        const lower = KeyComposer.composeZOrderSk(
+          schema,
+          { ...(Listings.indexes.byAgency as KeyComposer.IndexDefinition), casing: "lowercase" },
+          record,
+        )
+        expect(Array.from(lower.slice(0, 14))).toEqual([
+          0x00, 0x04, 0x61, 0x67, 0x2d, 0x31, 0x66, 0x57, 0x27, 0xe7, 0x6e, 0xb5, 0x0e, 0xd7,
+        ])
+      })
+
+      it("is a plain Uint8Array", () => {
+        const bytes = KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, record)
+        expect(Object.getPrototypeOf(bytes)).toBe(Uint8Array.prototype)
+      })
+
+      it("throws for a missing prefix composite or dimension", () => {
+        const { price: _, ...noPrice } = record
+        expect(() =>
+          KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, noPrice),
+        ).toThrow('Missing composite attribute "price"')
+        const { agencyId: __, ...noAgency } = record
+        expect(() =>
+          KeyComposer.composeZOrderSk(schema, Listings.indexes.byAgency, noAgency),
+        ).toThrow('Missing composite attribute "agencyId"')
+      })
+
+      it("throws [EDD-9092] (ZOrderValueError) for a value a dimension can't quantize", () => {
+        expect(() =>
+          KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, {
+            ...record,
+            price: Number.NaN,
+          }),
+        ).toThrow(/\[EDD-9092\] Z-order dimension "price"/)
+        try {
+          KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, {
+            ...record,
+            listedAt: "not a date",
+          })
+          expect.unreachable()
+        } catch (error) {
+          expect((error as { _tag?: string })._tag).toBe("ZOrderValueError")
+        }
+      })
+
+      it("refuses an unbound half and a string half", () => {
+        const unbound = KeyComposer.normalizeGsiConfig(gsi({ zorder: facets }))
+        expect(() => KeyComposer.composeZOrderSk(schema, unbound, record)).toThrow(
+          /never bound to an entity/,
+        )
+        expect(() => KeyComposer.composeZOrderSk(schema, Listings.indexes.primary, record)).toThrow(
+          /has no Z-order sort key/,
+        )
+      })
+    })
+
+    describe("string-only composers refuse a Z-order half", () => {
+      const half = Listings.indexes.byFacets
+      it.each([
+        ["composeSk", () => KeyComposer.composeSk(schema, "Listing", 1, half, record)],
+        [
+          "composeSkPrefixUpTo",
+          () => KeyComposer.composeSkPrefixUpTo(schema, "Listing", 1, half, record, 1),
+        ],
+        [
+          "composeSortKeyPrefix",
+          () => KeyComposer.composeSortKeyPrefix(schema, "Listing", 1, half, record),
+        ],
+        [
+          "composeSortKeyBeginsWith",
+          () => KeyComposer.composeSortKeyBeginsWith(schema, "Listing", 1, half, record),
+        ],
+      ])("%s", (fn, compose) => {
+        expect(compose).toThrow(new RegExp(`KeyComposer\\.${fn}: .*Z-order sort key`))
+      })
+
+      it("composeSkValue dispatches on the half", () => {
+        expect(KeyComposer.composeSkValue(schema, "Listing", 1, half, record)).toEqual(
+          KeyComposer.composeZOrderSk(schema, half, record),
+        )
+        expect(
+          KeyComposer.composeSkValue(schema, "Listing", 1, Listings.indexes.primary, record),
+        ).toBe(KeyComposer.composeSk(schema, "Listing", 1, Listings.indexes.primary, record))
+      })
+    })
+
+    describe("put-path composition", () => {
+      it("composeAllKeys writes the Z-order half as bytes beside string keys", () => {
+        const keys = KeyComposer.composeAllKeys(schema, "Listing", 1, Listings.indexes, record)
+        expect(typeof keys.pk).toBe("string")
+        expect(typeof keys.gsi2pk).toBe("string")
+        expect(keys.gsi2sk).toEqual(
+          KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, record),
+        )
+        expect(keys.gsi3sk).toBeInstanceOf(Uint8Array)
+      })
+
+      it("composeAllKeys / tryComposeIndexKeys skip a Z-order GSI with a missing field (sparse)", () => {
+        const { listedAt: _, ...noListedAt } = record
+        const keys = KeyComposer.composeAllKeys(schema, "Listing", 1, Listings.indexes, noListedAt)
+        expect(keys).not.toHaveProperty("gsi2sk")
+        expect(keys).not.toHaveProperty("gsi2pk")
+        expect(keys).not.toHaveProperty("gsi3sk")
+        expect(keys.pk).toBeDefined()
+        expect(
+          KeyComposer.tryComposeIndexKeys(
+            schema,
+            "Listing",
+            1,
+            Listings.indexes.byFacets,
+            noListedAt,
+          ),
+        ).toBeUndefined()
+        const { officeId: __, ...noOffice } = record
+        expect(
+          KeyComposer.tryComposeIndexKeys(
+            schema,
+            "Listing",
+            1,
+            Listings.indexes.byAgency,
+            noOffice,
+          ),
+        ).toBeUndefined()
+        expect(
+          KeyComposer.tryComposeIndexKeys(
+            schema,
+            "Listing",
+            1,
+            Listings.indexes.byFacets,
+            noOffice,
+          ),
+        ).toEqual({
+          gsi2pk: KeyComposer.composePk(schema, "Listing", Listings.indexes.byFacets, record),
+          gsi2sk: KeyComposer.composeZOrderSk(schema, Listings.indexes.byFacets, record),
+        })
+      })
+    })
   })
 
   describe("composeSkPrefixUpTo", () => {
@@ -1641,19 +2439,27 @@ describe("KeyComposer", () => {
       )
     })
 
-    it("padded composites are fixed-width, so the rule is a no-op for them", () => {
-      // Numbers/bigints cannot be prefixes of one another once padded — the
-      // delimiter protects the string and free-text composites. Recorded here so
-      // nobody concludes from numeric fixtures that the rule is unnecessary.
+    it("numeric composites need the rule too: an integer's text prefixes a fraction's", () => {
+      // Only non-negative integers are fixed-width; `42`'s text is a prefix of
+      // `42.5`'s, so without the delimiter `{ seq: 42 }` would match seq 42.5.
+      // Recorded here so nobody concludes from integer fixtures that the rule
+      // is unnecessary for numbers.
       const numericSk: KeyComposer.IndexDefinition = {
         index: "gsi1",
         pk: { field: "gsi1pk", composite: ["deviceId"] },
         sk: { field: "gsi1sk", composite: ["seq", "part"] },
       }
-      expect(
-        KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, { seq: 42 }),
-      ).toBe("$myapp#v1#reading#seq_0000000000000042#")
-      expect(KeyComposer.serializeValue(42).length).toBe(KeyComposer.serializeValue(4242).length)
+      const operand = KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, {
+        seq: 42,
+      })
+      expect(operand).toBe("$myapp#v1#reading#seq_0000000000000042#")
+      const fraction = KeyComposer.composeSk(schema, "Reading", 1, numericSk, {
+        seq: 42.5,
+        part: "a",
+      })
+      expect(fraction).toBe("$myapp#v1#reading#seq_0000000000000042.5#part_a")
+      expect(fraction.startsWith(operand)).toBe(false)
+      expect(fraction.startsWith(operand.slice(0, -1))).toBe(true)
     })
 
     it("isolated collection index keeps the entity_version segment", () => {
@@ -1682,6 +2488,85 @@ describe("KeyComposer", () => {
       expect(
         KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, clustered, { status: "done" }),
       ).toBe("$myapp#v1#org#team#task_1#status_done#")
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // composeSortKeyCondition — `=` on a complete key, `begins_with` on a prefix
+  // (#171 E7)
+  // ---------------------------------------------------------------------------
+
+  describe("composeSortKeyCondition", () => {
+    const onIndex = (
+      sk: ReadonlyArray<string>,
+      collection?: { readonly collection: string | ReadonlyArray<string>; readonly type: string },
+    ): KeyComposer.IndexDefinition =>
+      ({
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["deviceId"] },
+        sk: { field: "gsi1sk", composite: [...sk] },
+        ...collection,
+      }) as KeyComposer.IndexDefinition
+
+    it("partial prefix — begins_with on the prefix and the delimiter", () => {
+      const index = onIndex(["status", "taskId"])
+      expect(
+        KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, { status: "done" }),
+      ).toEqual({
+        beginsWith: KeyComposer.composeSortKeyBeginsWith(schema, "Task", 1, index, {
+          status: "done",
+        }),
+      })
+    })
+
+    it("complete key — eq on exactly the key composeSk writes", () => {
+      const index = onIndex(["status", "taskId"])
+      const record = { status: "done", taskId: "t1" }
+      expect(KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, record)).toEqual({
+        eq: KeyComposer.composeSk(schema, "Task", 1, index, record),
+      })
+    })
+
+    // A complete key is a prefix of every longer value of its last composite.
+    // `=` keeps exactly the pinned value, on every index shape.
+    const shapes = [
+      ["entity index", undefined],
+      ["isolated collection index", { collection: "feed", type: "isolated" }],
+      ["clustered collection index", { collection: ["site", "feed"], type: "clustered" }],
+    ] as const
+    for (const [shape, collection] of shapes) {
+      it(`${shape}: a pinned number matches neither its fractions nor longer digits`, () => {
+        const index = onIndex(["tag", "seq"], collection)
+        const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+          tag: "a",
+          seq: 3,
+        })
+        expect("eq" in condition).toBe(true)
+        const eq = (condition as { readonly eq: string }).eq
+        const stored = (seq: number) =>
+          KeyComposer.composeSk(schema, "Reading", 1, index, { tag: "a", seq })
+        expect(stored(3)).toBe(eq)
+        for (const sibling of [3.14, 3.5, 30, -3, -3.14]) {
+          expect(stored(sibling) === eq, String(sibling)).toBe(false)
+        }
+        // What the bare `begins_with` of 1.36 also matched under the new text:
+        expect(stored(3.14).startsWith(eq)).toBe(true)
+        expect(stored(3.5).startsWith(eq)).toBe(true)
+      })
+    }
+
+    it("a pinned bigint of 1e38 or more does not match its digit-prefix siblings", () => {
+      // `:0381` (1e38) is a prefix of `:03815` (1.5e38) and `:03812` (1.2e38).
+      const index = onIndex(["level"])
+      const stored = (level: bigint) =>
+        KeyComposer.composeSk(schema, "Reading", 1, index, { level })
+      const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        level: 10n ** 38n,
+      })
+      expect(condition).toEqual({ eq: stored(10n ** 38n) })
+      expect(stored(10n ** 38n)).toBe("$myapp#v1#reading#level_:0381")
+      expect(stored(15n * 10n ** 37n).startsWith(stored(10n ** 38n))).toBe(true)
+      expect(stored(12n * 10n ** 37n).startsWith(stored(10n ** 38n))).toBe(true)
     })
   })
 })

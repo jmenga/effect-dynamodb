@@ -465,6 +465,8 @@ describe("TimeSeries — append payload shape", () => {
         expect(result.orderByField).toBe("timestamp")
         expect(Option.isSome(result.current)).toBe(true)
       }
+      // The follow-up read is strongly consistent: an item just created must be seen.
+      expect(mockGetItem.mock.calls.at(-1)![0].ConsistentRead).toBe(true)
     }).pipe(Effect.provide(layer))
   })
 

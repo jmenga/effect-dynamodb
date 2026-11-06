@@ -1639,7 +1639,7 @@ describe("Entity packed fields — vector index source", () => {
     details: Schema.Struct({ summary: Schema.String }),
   }) {}
   const source = {
-    fields: ["title", "details"],
+    fields: ["title", "details"] as const,
     compose: (picked: Record<string, unknown>) =>
       `${String(picked.title ?? "")} ${(picked.details as { summary?: string } | undefined)?.summary ?? ""}`,
   }

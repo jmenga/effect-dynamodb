@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Stream } from "effect"
+import { Effect, Option, Stream } from "effect"
 import { beforeEach, vi } from "vitest"
 import type { DynamoClient } from "../src/DynamoClient.js"
 import {
@@ -225,6 +225,63 @@ describe("BoundQuery", () => {
         expect(mockQuery.mock.calls[0]![0].Limit).toBe(2)
       }).pipe(Effect.provide(TestDynamoClient)),
     )
+
+    it.effect('pageSize("natural") keeps 1.36\'s natural pages under a filter', () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({ Items: [] })
+        const filtered = makeBoundQuery().filter({ status: "active" }).limit(3)
+
+        yield* filtered.collect()
+        yield* filtered.pageSize("natural").collect()
+
+        expect(filtered.pageSize("natural")._query._state.pageSizeValue).toBe("natural")
+        // Adaptive: twice the limit, at least 16 rows; natural: no Limit.
+        expect(mockQuery.mock.calls.map((call) => call[0].Limit)).toEqual([16, undefined])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
+
+    it("rejects any other string with EDD-9095", () => {
+      expect(() => makeBoundQuery().pageSize("all" as unknown as number)).toThrow(/EDD-9095/)
+    })
+  })
+
+  // -----------------------------------------------------------------------
+  // onRequest
+  // -----------------------------------------------------------------------
+
+  describe("onRequest", () => {
+    it("registers observers in order, original unchanged", () => {
+      const original = makeBoundQuery()
+      const first = () => Effect.void
+      const second = () => Effect.void
+      const observed = original.onRequest(first).onRequest(second)
+      expect(observed._query._state.observers).toEqual([first, second])
+      expect(original._query._state.observers).toEqual([])
+    })
+
+    it.effect("each terminal reports its requests to the observer", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValue({
+          Items: [{ pk: { S: "p" }, sk: { S: "s1" }, id: { S: "t-1" } }],
+          Count: 1,
+          ScannedCount: 4,
+        })
+        const events: Array<Query.QueryRequestEvent> = []
+        const bq = makeBoundQuery().onRequest((event) => Effect.sync(() => events.push(event)))
+
+        yield* bq.collect()
+        yield* bq.fetch()
+        yield* Stream.runCollect(bq.paginate())
+        yield* bq.count()
+
+        expect(events.map((event) => [event.kind, event.scannedCount, event.count])).toEqual([
+          ["read", 4, 1],
+          ["read", 4, 1],
+          ["read", 4, 1],
+          ["count", 4, 1],
+        ])
+      }).pipe(Effect.provide(TestDynamoClient)),
+    )
   })
 
   // -----------------------------------------------------------------------
@@ -276,11 +333,174 @@ describe("BoundQuery", () => {
   // -----------------------------------------------------------------------
 
   describe("startFrom", () => {
-    it("sets exclusiveStartKey on the underlying query", () => {
-      const cursor = Buffer.from(JSON.stringify({ pk: { S: "abc" } })).toString("base64")
+    // The cursor is decoded when a terminal runs, once the plan it must
+    // belong to is known (#171): `startFrom` only records it.
+    it("records the cursor on the underlying query", () => {
+      const cursor = btoa(JSON.stringify({ pk: { S: "abc" }, sk: { S: "s1" } }))
       const bq = makeBoundQuery().startFrom(cursor)
-      expect(bq._query._state.exclusiveStartKey).toBeDefined()
+      expect(bq._query._state.cursorText).toBe(cursor)
+      expect(bq._query._state.exclusiveStartKey).toBeUndefined()
     })
+
+    it.effect("a terminal resumes from it with ExclusiveStartKey", () =>
+      Effect.gen(function* () {
+        mockQuery.mockResolvedValueOnce({ Items: [], Count: 0 })
+        const key = { pk: { S: "abc" }, sk: { S: "s1" } }
+        yield* makeBoundQuery()
+          .startFrom(btoa(JSON.stringify(key)))
+          .fetch()
+        expect(mockQuery.mock.calls[0]![0].ExclusiveStartKey).toEqual(key)
+      }),
+    )
+
+    it.effect("a malformed cursor fails the terminal, not startFrom", () =>
+      Effect.gen(function* () {
+        const bq = makeBoundQuery().startFrom("not a cursor")
+        const error = yield* Effect.flip(bq.fetch())
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as { cause: unknown }).cause)).toContain("[EDD-9094]")
+        expect(mockQuery).not.toHaveBeenCalled()
+      }),
+    )
+  })
+
+  // -----------------------------------------------------------------------
+  // within / explain (#171)
+  // -----------------------------------------------------------------------
+
+  describe("within", () => {
+    // A stand-in planner: it records its arguments and marks the query (as
+    // reversed) so the test can see its result is the query carried on.
+    const withPlanner = () => {
+      const calls: Array<{ bounds: unknown; options: unknown }> = []
+      const bq = new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), {
+        ...makeConfigWithSk(),
+        composeSkCondition: (condition) => serializeRaw(condition),
+        planWithin: (query, bounds, options) => {
+          calls.push({ bounds, options })
+          return Query.reverse(query)
+        },
+      })
+      return { bq, calls }
+    }
+
+    it("hands the bounds and options to the accessor's planner", () => {
+      const { bq, calls } = withPlanner()
+      const within = bq.within({ count: { gte: 2 } }, { maxSkips: 4 })
+      expect(calls).toEqual([{ bounds: { count: { gte: 2 } }, options: { maxSkips: 4 } }])
+      expect(within._query._state.scanForward).toBe(false)
+      // Combinators after it keep the query planned.
+      expect(within.limit(3).onRequest(() => Effect.void)._applied).toBe("within")
+    })
+
+    it("refuses .where() after .within() and .within() after .where() [EDD-9093]", () => {
+      const { bq } = withPlanner()
+      expect(() =>
+        (bq.within({ count: { gte: 2 } }) as any).where((t: any, { eq }: any) => eq(t.sk, "a")),
+      ).toThrow(/EDD-9093.*where\(\) after \.within\(\)/)
+      expect(() =>
+        (bq.where((t, { eq }) => eq(t.sk, "a")) as any).within({ count: { gte: 2 } }),
+      ).toThrow(/EDD-9093.*within\(\) after \.where\(\)/)
+      expect(() => (bq.within({ count: { gte: 2 } }) as any).within({ count: { lte: 4 } })).toThrow(
+        /EDD-9093.*a second \.within\(\)/,
+      )
+    })
+
+    it("refuses .within() where the accessor has nothing to bound [EDD-9093]", () => {
+      expect(() => (makeBoundQuery() as any).within({ sk: { gte: "a" } })).toThrow(/EDD-9093/)
+    })
+
+    it("refuses a maxSkips that is not a non-negative integer [EDD-9095]", () => {
+      const { bq, calls } = withPlanner()
+      for (const maxSkips of [-1, 1.5, Number.NaN, "3"]) {
+        expect(() => bq.within({ count: { gte: 2 } }, { maxSkips } as any)).toThrow(/EDD-9095/)
+      }
+      expect(calls).toEqual([])
+      expect(() => bq.within({ count: { gte: 2 } }, { maxSkips: 0 })).not.toThrow()
+    })
+  })
+
+  describe("zorder", () => {
+    const zorderQuery = () =>
+      new BoundQueryImpl<TestModel, TestSkRemaining, TestModel>(makeTestQuery(), {
+        ...makeConfigWithSk(),
+        zorder: true,
+        planWithin: (query) => query,
+      })
+
+    it("records the options, merged over earlier calls, before or after .within()", () => {
+      const before = zorderQuery().zorder({ strategy: "jump", pageSize: 7 })
+      expect(before._query._state.zorderOptions).toEqual({ strategy: "jump", pageSize: 7 })
+      const merged = before
+        .within({ count: { gte: 2 } })
+        // An explicit `undefined` leaves the earlier value.
+        .zorder({ maxRanges: 4, pageSize: undefined })
+        .zorder({ concurrency: 2 })
+      expect(merged._query._state.zorderOptions).toEqual({
+        strategy: "jump",
+        pageSize: 7,
+        maxRanges: 4,
+        concurrency: 2,
+      })
+      // `.within()` stays applied: a second one is still refused.
+      expect(merged._applied).toBe("within")
+      expect(() => (merged as any).within({ count: { lte: 3 } })).toThrow(/EDD-9093/)
+    })
+
+    it("refuses an invalid option [EDD-9095]", () => {
+      const bq = zorderQuery()
+      for (const options of [
+        { strategy: "sideways" },
+        { maxRanges: 0 },
+        { maxRanges: 2.5 },
+        { concurrency: -1 },
+        { concurrency: "4" },
+        { pages: 3 },
+        null,
+        [],
+      ]) {
+        expect(() => bq.zorder(options as any)).toThrow(/EDD-9095/)
+      }
+      // A numeric pageSize goes to DynamoDB as `Limit` unchecked, as `.pageSize(n)` does.
+      expect(() => bq.zorder({ pageSize: 0 })).not.toThrow()
+    })
+
+    it("refuses .zorder() on an accessor without a Z-order sort key [EDD-9095]", () => {
+      expect(() => (makeBoundQuery() as any).zorder({ strategy: "precise" })).toThrow(
+        /EDD-9095.*only to a Z-order index accessor/,
+      )
+    })
+  })
+
+  describe("explain", () => {
+    it.effect("describes a plain query without sending anything", () =>
+      Effect.gen(function* () {
+        const explain = yield* makeBoundQuery()
+          .where((t, { beginsWith }) => beginsWith(t.sk, "a"))
+          .explain()
+        expect(explain).toEqual({
+          index: "primary",
+          plan: "key",
+          reason: "one key condition",
+          // `begins_with` shows its prefix as the lower bound, open above.
+          keyConditions: [{ lower: "a", upper: undefined, exact: true }],
+          filter: undefined,
+          rowChecks: [],
+          sizing: "natural",
+        })
+        expect(mockQuery).not.toHaveBeenCalled()
+      }),
+    )
+
+    it.effect("names the sizing a limit under a filter uses", () =>
+      Effect.gen(function* () {
+        const explain = yield* makeBoundQuery()
+          .filter((t, { eq }) => eq(t.status, "active"))
+          .limit(10)
+          .explain()
+        expect(explain.sizing).toBe("adaptive")
+      }),
+    )
   })
 
   // -----------------------------------------------------------------------
@@ -526,7 +746,7 @@ describe("BoundQuery", () => {
         const page = yield* bq.fetch()
 
         expect(page.items).toHaveLength(1)
-        expect(page.cursor).toBeNull()
+        expect(page.cursor).toEqual(Option.none())
         expect(mockQuery).toHaveBeenCalledOnce()
       }),
     )

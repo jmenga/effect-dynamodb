@@ -14,7 +14,8 @@
  *
  * A comment would not have caught that. This test reads the source and fails if
  * a `KeyComposer` call takes a record argument that did not come through
- * `keyForm(...)` / `keyFormFor(...)`.
+ * `keyForm(...)` / `keyFormFor(...)`. The same holds for `KeyText136` (#171),
+ * which composes the key text 1.36 wrote from the same key-form record.
  */
 
 import { readFileSync } from "node:fs"
@@ -53,17 +54,43 @@ const ENTITY_SRC = fileURLToPath(new URL("../src/Entity.ts", import.meta.url))
 const RECORD_TAKING = [
   "composePk",
   "composeSk",
+  "composeZOrderSk",
+  "composeSkValue",
   "composeAllKeys",
   "composeIndexKeys",
   "tryComposeIndexKeys",
   "composeSortKeyPrefix",
   "composeSortKeyBeginsWith",
+  "composeSortKeyCondition",
   "composeGsiKeysForUpdatePolicyAware",
   "composeVectorPartition",
   "tryComposeVectorPartition",
   "extractComposites",
   "tryExtractComposites",
 ] as const
+
+/**
+ * The `KeyText136` functions taking a record. `changedPrimaryKey` takes the
+ * record and then the current key, which `composePrimaryKey` normalises.
+ */
+const RECORD_TAKING_136 = [
+  "composePk",
+  "composeSk",
+  "composeIndexKeys",
+  "tryComposeIndexKeys",
+  "composeAllKeys",
+  "composeSortKeyPrefix",
+  "composeSortKeyBeginsWith",
+  "tryComposeVectorPartition",
+  "extractComposites",
+  "tryExtractComposites",
+  "changedPrimaryKey",
+] as const
+
+const CALLS = [
+  ...RECORD_TAKING.map((fn) => ({ module: "KeyComposer", fn })),
+  ...RECORD_TAKING_136.map((fn) => ({ module: "KeyText136", fn })),
+]
 
 /**
  * Accepted spellings for an already-normalised record. `_keyForm(` is the
@@ -75,10 +102,10 @@ const NORMALISED = /keyForm\(|keyFormFor\(|KeyForm\b|\bkeyRecord\(|_keyForm\(/
 describe.each(SOURCES)("key-form invariant — $rel", ({ path }) => {
   const src = readFileSync(path, "utf8")
 
-  for (const fn of RECORD_TAKING) {
-    it(`every KeyComposer.${fn} call takes a normalised record`, () => {
+  for (const { module, fn } of CALLS) {
+    it(`every ${module}.${fn} call takes a normalised record`, () => {
       const offenders: Array<string> = []
-      const needle = `KeyComposer.${fn}(`
+      const needle = `${module}.${fn}(`
       let from = 0
       for (;;) {
         const at = src.indexOf(needle, from)
@@ -108,7 +135,7 @@ describe.each(SOURCES)("key-form invariant — $rel", ({ path }) => {
 
       expect(
         offenders,
-        `KeyComposer.${fn} called with a record that did not go through keyForm(). ` +
+        `${module}.${fn} called with a record that did not go through keyForm(). ` +
           `Wrap it — see the composite key-form rule in DESIGN.md §7.`,
       ).toEqual([])
     })

@@ -9,7 +9,7 @@ import {
   type RefNotFound,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Fiber, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Option, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
@@ -165,26 +165,40 @@ describe("Aggregate", () => {
 
   describe("edge builders", () => {
     it("one() creates a OneEdge", () => {
-      const edge = Aggregate.one("venue", { entityType: "MatchVenue" })
-      expect(edge._tag).toBe("OneEdge")
-      expect(edge.name).toBe("venue")
-      expect(edge.entityType).toBe("MatchVenue")
+      const edge = Aggregate.one({ entityType: "MatchVenue" })
+      expect(edge).toEqual({ _tag: "OneEdge", entityType: "MatchVenue" })
     })
 
     it("many() creates a ManyEdge", () => {
-      const edge = Aggregate.many("players", {
+      const edge = Aggregate.many({ entityType: "MatchPlayer", inputField: "playerIds" })
+      expect(edge).toEqual({ _tag: "ManyEdge", entityType: "MatchPlayer", inputField: "playerIds" })
+    })
+
+    it("the deprecated (name, config) forms build the same edges, keeping the unread name", () => {
+      // The name and edgeAttributes are not read; kept until the next major release.
+      expect(Aggregate.one("venue", { entityType: "MatchVenue" })).toEqual({
+        _tag: "OneEdge",
+        name: "venue",
+        entityType: "MatchVenue",
+      })
+      expect(
+        Aggregate.many("players", {
+          entityType: "MatchPlayer",
+          edgeAttributes: ["battingPosition", "isCaptain"],
+        }),
+      ).toEqual({
+        _tag: "ManyEdge",
+        name: "players",
         entityType: "MatchPlayer",
         edgeAttributes: ["battingPosition", "isCaptain"],
       })
-      expect(edge._tag).toBe("ManyEdge")
-      expect(edge.name).toBe("players")
-      expect(edge.entityType).toBe("MatchPlayer")
-      expect(edge.edgeAttributes).toEqual(["battingPosition", "isCaptain"])
+      const named = Aggregate.many("players", { entityType: "MatchPlayer", inputField: "ids" })
+      expect(named.inputField).toBe("ids")
     })
 
     it("many() with custom assemble function", () => {
       const assemble = (items: ReadonlyArray<unknown>) => ({ custom: items })
-      const edge = Aggregate.many("umpires", {
+      const edge = Aggregate.many({
         entityType: "MatchUmpire",
         assemble,
       })
@@ -192,8 +206,8 @@ describe("Aggregate", () => {
     })
 
     it("isOneEdge / isManyEdge type guards", () => {
-      const oneEdge = Aggregate.one("venue", { entityType: "MatchVenue" })
-      const manyEdge = Aggregate.many("players", { entityType: "MatchPlayer" })
+      const oneEdge = Aggregate.one({ entityType: "MatchVenue" })
+      const manyEdge = Aggregate.many({ entityType: "MatchPlayer" })
 
       expect(Aggregate.isOneEdge(oneEdge)).toBe(true)
       expect(Aggregate.isManyEdge(oneEdge)).toBe(false)
@@ -211,8 +225,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -224,8 +238,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -239,8 +253,8 @@ describe("Aggregate", () => {
       const sub = Aggregate.make(TeamSheet, {
         root: { entityType: "MatchTeam" },
         edges: {
-          coach: Aggregate.one("coach", { entityType: "MatchCoach" }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer" }),
+          coach: Aggregate.one({ entityType: "MatchCoach" }),
+          players: Aggregate.many({ entityType: "MatchPlayer" }),
         },
       })
 
@@ -263,8 +277,8 @@ describe("Aggregate", () => {
         root: { entityType: "MatchTeam" },
         edges: {
           team: Aggregate.ref(TeamEntity),
-          coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-          players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+          coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+          players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
         },
       })
 
@@ -279,7 +293,7 @@ describe("Aggregate", () => {
         },
         root: { entityType: "MatchItem" },
         edges: {
-          venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+          venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
           team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
           team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
         },
@@ -316,8 +330,8 @@ describe("Aggregate", () => {
           },
           root: { entityType: "PostItem" },
           edges: {
-            author: Aggregate.one("author", { entityType: "PostAuthor" }),
-            comments: Aggregate.many("comments", { entityType: "PostComment" }),
+            author: Aggregate.one({ entityType: "PostAuthor" }),
+            comments: Aggregate.many({ entityType: "PostComment" }),
           },
         })
 
@@ -386,7 +400,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "SimpleRoot" },
           edges: {
-            items: Aggregate.many("items", { entityType: "SimpleItem" }),
+            items: Aggregate.many({ entityType: "SimpleItem" }),
           },
         })
 
@@ -441,8 +455,8 @@ describe("Aggregate", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -457,7 +471,7 @@ describe("Aggregate", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -616,7 +630,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "MatchRoot" },
           edges: {
-            umpires: Aggregate.many("umpires", {
+            umpires: Aggregate.many({
               entityType: "MatchUmpire",
               assemble: (items) => ({
                 matchReferee: (items as Array<{ umpireName: string; role: string }>).find(
@@ -706,12 +720,12 @@ describe("Aggregate", () => {
     const UmpireSheetAggregate = Aggregate.make(UmpireSheet, {
       root: { entityType: "MatchUmpires" },
       edges: {
-        matchReferee: Aggregate.one("matchReferee", {
+        matchReferee: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "referee" },
         }),
-        tvUmpire: Aggregate.one("tvUmpire", {
+        tvUmpire: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "tvUmpire" },
@@ -922,7 +936,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "WithOneRoot" },
           edges: {
-            detail: Aggregate.one("detail", { entityType: "WithOneDetail" }),
+            detail: Aggregate.one({ entityType: "WithOneDetail" }),
           },
         })
 
@@ -1023,7 +1037,7 @@ describe("Aggregate", () => {
           },
           root: { entityType: "WithManyRoot" },
           edges: {
-            items: Aggregate.many("items", { entityType: "WithManyItem" }),
+            items: Aggregate.many({ entityType: "WithManyItem" }),
           },
         })
 
@@ -1439,10 +1453,10 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "PostItem" },
       edges: {
-        author: Aggregate.one("author", { entityType: "PostAuthor" }),
+        author: Aggregate.one({ entityType: "PostAuthor" }),
         // Entity-less many edge: nothing identifies an element, so the sort key
         // has to be declared or every comment lands on one row (#103).
-        comments: Aggregate.many("comments", {
+        comments: Aggregate.many({
           entityType: "PostComment",
           sk: { composite: ["user"] },
         }),
@@ -1485,8 +1499,8 @@ describe("Aggregate write path", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -1501,7 +1515,7 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -2302,7 +2316,7 @@ describe("Aggregate write path", () => {
       pk: { field: "pk", composite: ["postId"] },
       collection: { index: "lsi1", name: "postx", sk: { field: "lsi1sk", composite: [] } },
       root: { entityType: "PostXRoot" },
-      edges: { comments: Aggregate.many("comments", { entityType: "PostXComment" }) },
+      edges: { comments: Aggregate.many({ entityType: "PostXComment" }) },
     })
 
     // Create (capturing the written rows), then arm the partition query with those
@@ -2526,8 +2540,8 @@ describe("Aggregate write path", () => {
       root: { entityType: "MatchTeam" },
       edges: {
         team: Aggregate.ref(TeamEntity),
-        coach: Aggregate.one("coach", { entityType: "MatchCoach", entity: CoachEntity }),
-        players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+        coach: Aggregate.one({ entityType: "MatchCoach", entity: CoachEntity }),
+        players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
       },
     })
 
@@ -2542,7 +2556,7 @@ describe("Aggregate write path", () => {
       },
       root: { entityType: "MatchItem" },
       edges: {
-        venue: Aggregate.one("venue", { entityType: "MatchVenue", entity: VenueEntity }),
+        venue: Aggregate.one({ entityType: "MatchVenue", entity: VenueEntity }),
         team1: TeamSheetAggregate.with({ discriminator: { teamNumber: 1 } }),
         team2: TeamSheetAggregate.with({ discriminator: { teamNumber: 2 } }),
       },
@@ -2686,7 +2700,7 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "FixtureItem" },
         edges: {
-          sponsor: Aggregate.one("sponsor", { entityType: "FixtureSponsor", entity: TeamEntity }),
+          sponsor: Aggregate.one({ entityType: "FixtureSponsor", entity: TeamEntity }),
         },
       })
 
@@ -2782,7 +2796,11 @@ describe("Aggregate write path", () => {
       officials: Schema.Array(Appointment),
     }) {}
 
-    /** Build the aggregate with a given (or absent) declared sort key. */
+    /**
+     * Build the aggregate with a given (or absent) declared sort key. Some
+     * cases name paths the element lacks on purpose, to reach the runtime
+     * checks, so the composite is not checked against the schema here.
+     */
     const makeMatchAggregate = (sk?: { readonly composite: ReadonlyArray<string> }) =>
       Aggregate.make(OfficiatedMatch, {
         table: MainTable,
@@ -2795,10 +2813,10 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "OfficiatedMatchItem" },
         edges: {
-          officials: Aggregate.many("officials", {
+          officials: Aggregate.many({
             entityType: "MatchOfficial",
             entity: OfficialEntity,
-            ...(sk !== undefined && { sk }),
+            ...(sk !== undefined && { sk: sk as never }),
           }),
         },
       })
@@ -3059,7 +3077,7 @@ describe("Aggregate write path", () => {
           },
           root: { entityType: "RosterItem" },
           edges: {
-            slots: Aggregate.many("slots", {
+            slots: Aggregate.many({
               entityType: "RosterSlot",
               entity: OfficialEntity,
               sk: { composite: ["seq", "confirmed", "official.officialId"] },
@@ -3106,11 +3124,11 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "PanelItem" },
         edges: {
-          onfield: Aggregate.many("onfield", {
+          onfield: Aggregate.many({
             entityType: "PanelOnfield",
             entity: OfficialEntity,
           }),
-          third: Aggregate.one("third", { entityType: "PanelThird", entity: OfficialEntity }),
+          third: Aggregate.one({ entityType: "PanelThird", entity: OfficialEntity }),
         },
       })
 
@@ -3174,12 +3192,12 @@ describe("Aggregate write path", () => {
     const UmpireSheetAggregate = Aggregate.make(UmpireSheet, {
       root: { entityType: "MatchUmpires" },
       edges: {
-        matchReferee: Aggregate.one("matchReferee", {
+        matchReferee: Aggregate.one({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           discriminator: { role: "referee" },
         }),
-        matchUmpire: Aggregate.many("matchUmpire", {
+        matchUmpire: Aggregate.many({
           entity: UmpireEntity,
           entityType: "MatchUmpire",
           inputField: "matchUmpireIds",
@@ -3312,7 +3330,7 @@ describe("Aggregate write path", () => {
         },
         root: { entityType: "SimpleMatchItem" },
         edges: {
-          players: Aggregate.many("players", { entityType: "MatchPlayer", entity: PlayerEntity }),
+          players: Aggregate.many({ entityType: "MatchPlayer", entity: PlayerEntity }),
         },
       })
 
@@ -3451,7 +3469,7 @@ describe("Aggregate write path", () => {
         expect(results.data).toHaveLength(2)
         expect(results.data[0]!.articleId).toBe("a-1")
         expect(results.data[1]!.articleId).toBe("a-2")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // 1 GSI query + 2 assembly queries
         expect(mockListQuery).toHaveBeenCalledTimes(3)
@@ -3504,13 +3522,34 @@ describe("Aggregate write path", () => {
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.author).toBe("Alice")
 
-        // Verify begins_with on SK
+        // Verify begins_with on SK — ending on the delimiter, as `title`
+        // remains: a bare `…#alice` would also match an author `alicex`.
         const gsiInput = mockListQuery.mock.calls[0]![0]
         expect(gsiInput.KeyConditionExpression).toBe("#pk = :pk AND begins_with(#sk, :skPrefix)")
         expect(gsiInput.ExpressionAttributeNames["#sk"]).toBe("gsi1sk")
         expect(gsiInput.ExpressionAttributeValues[":skPrefix"]).toEqual({
-          S: "$myapp#v1#articlelist#alice",
+          S: "$myapp#v1#articlelist#alice#",
         })
+        expect(
+          "$myapp#v1#articlelist#alicex#first".startsWith("$myapp#v1#articlelist#alice#"),
+        ).toBe(false)
+      }).pipe(Effect.provide(ListLayer)),
+    )
+
+    it.effect("GSI query: every list SK composite given matches the key exactly", () =>
+      Effect.gen(function* () {
+        mockListQuery.mockResolvedValueOnce({ Items: [] })
+
+        yield* ListAggregate.list({ author: "Alice", title: "First" })
+
+        // `=`, not `begins_with`: the key is complete, and `begins_with` on it
+        // would also match a title `Firstly` (or, for a number, 3.5 under 3).
+        const gsiInput = mockListQuery.mock.calls[0]![0]
+        expect(gsiInput.KeyConditionExpression).toBe("#pk = :pk AND #sk = :sk")
+        expect(gsiInput.ExpressionAttributeValues[":sk"]).toEqual({
+          S: "$myapp#v1#articlelist#alice#first",
+        })
+        expect(gsiInput.ExpressionAttributeValues[":skPrefix"]).toBeUndefined()
       }).pipe(Effect.provide(ListLayer)),
     )
 
@@ -3521,7 +3560,7 @@ describe("Aggregate write path", () => {
         const results = yield* ListAggregate.list({ author: "Nobody" })
 
         expect(results.data).toHaveLength(0)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
         expect(mockListQuery).toHaveBeenCalledOnce()
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -3586,7 +3625,7 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-1")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // 3 shard queries + 1 assembly query
         expect(mockListQuery).toHaveBeenCalledTimes(4)
@@ -3653,14 +3692,14 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-1")
-        expect(results.cursor).not.toBeNull()
+        expect(Option.isSome(results.cursor)).toBe(true)
 
         // Verify Limit was passed to DynamoDB query
         const gsiInput = mockListQuery.mock.calls[0]![0]
         expect(gsiInput.Limit).toBe(1)
 
         // Decode cursor and verify it matches the LastEvaluatedKey
-        const decodedCursor = JSON.parse(atob(results.cursor!))
+        const decodedCursor = JSON.parse(atob(Option.getOrThrow(results.cursor)))
         expect(decodedCursor).toEqual(lastEvaluatedKey)
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -3711,7 +3750,7 @@ describe("Aggregate write path", () => {
 
         expect(results.data).toHaveLength(1)
         expect(results.data[0]!.articleId).toBe("a-2")
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // Verify ExclusiveStartKey was passed
         const gsiInput = mockListQuery.mock.calls[0]![0]
@@ -3791,7 +3830,7 @@ describe("Aggregate write path", () => {
         const results = yield* ListAggregate.list()
 
         expect(results.data).toHaveLength(2)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
 
         // Without limit, no Limit param is sent
         const gsiInput = mockListQuery.mock.calls[0]![0]
@@ -3927,8 +3966,8 @@ describe("Aggregate write path", () => {
         // Resumes after a-1 — the last aggregate KEPT. Resuming from
         // LastEvaluatedKey (a-3) would skip a-3 itself, which the predicate
         // accepts and the next page still owes the caller.
-        expect(results.cursor).not.toBeNull()
-        const resume = JSON.parse(atob(results.cursor!))
+        expect(Option.isSome(results.cursor)).toBe(true)
+        const resume = JSON.parse(atob(Option.getOrThrow(results.cursor)))
         expect(resume.pk.S).toBe("$myapp#v1#article#a-1")
       }).pipe(Effect.provide(ListLayer)),
     )
@@ -4085,8 +4124,8 @@ describe("Aggregate write path", () => {
           expect(call[0].Limit).toBe(5)
         }
         // More to come, so the cursor is not null.
-        expect(results.cursor).not.toBeNull()
-        expect(JSON.parse(atob(results.cursor!))).toEqual(lek("a-3"))
+        expect(Option.isSome(results.cursor)).toBe(true)
+        expect(JSON.parse(atob(Option.getOrThrow(results.cursor)))).toEqual(lek("a-3"))
       }).pipe(Effect.provide(ListLayer)),
     )
 
@@ -4112,9 +4151,9 @@ describe("Aggregate write path", () => {
 
         expect(results.data.map((a) => a.articleId)).toEqual(["a-1", "a-2"])
         // Not null — a-3 was read and dropped, so the range is NOT exhausted.
-        expect(results.cursor).not.toBeNull()
+        expect(Option.isSome(results.cursor)).toBe(true)
         // Rebuilt from a-2 (the last item handed back), not from a-3.
-        expect(JSON.parse(atob(results.cursor!))).toEqual({
+        expect(JSON.parse(atob(Option.getOrThrow(results.cursor)))).toEqual({
           pk: { S: "$myapp#v1#article#a-2" },
           sk: { S: "$myapp#v1#articleitem" },
           gsi1pk: { S: "$myapp#v1#articlelist" },
@@ -4135,7 +4174,7 @@ describe("Aggregate write path", () => {
         })
 
         expect(results.data).toHaveLength(1)
-        expect(results.cursor).toBeNull()
+        expect(results.cursor).toEqual(Option.none())
       }).pipe(Effect.provide(ListLayer)),
     )
 
@@ -4204,7 +4243,7 @@ describe("Aggregate write path", () => {
             expect(call[0].Limit).toBe(2)
           }
           // No resumable position across shards.
-          expect(results.cursor).toBeNull()
+          expect(results.cursor).toEqual(Option.none())
         }).pipe(Effect.provide(ListLayer)),
       )
 

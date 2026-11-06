@@ -106,6 +106,7 @@ const query = last()
 
 - `collect()` and `count()` read every page; `fetch()` reads one page, or more when a `limit` with a `filter` needs them.
 - `paginate()` returns a stream. **Each run** of the stream is one operation, from its start to its end. A consumer that stops early (`Stream.take`) ends it as a success, with the pages actually read. Running the same stream twice gives two reports.
+- A planned read counts every request it sends under the same operation: the probes of a [skip-scan](/effect-dynamodb/guides/queries/#bounding-any-sort-key-composite-within), each range of a [Z-order](/effect-dynamodb/guides/zorder/) plan (including reads sent alongside others and then discarded), all under `Entity.query`. What an [`onRequest`](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest) observer itself sends to DynamoDB is not charged to the query.
 
 ## Nesting
 

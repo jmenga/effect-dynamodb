@@ -14,6 +14,47 @@ import type { EmbeddingError, RefNotFound } from "../Errors.js"
 /** Extract the model's Type directly — preserves Schema.Class name (e.g. `User`) */
 export type ModelType<TModel extends Schema.Top> = Schema.Schema.Type<TModel>
 
+/** The schemas a `Schema.Struct` or `Schema.Class` model declares, else `never`. */
+type DeclaredFields<TModel> = TModel extends {
+  readonly fields: infer F extends Schema.Struct.Fields
+}
+  ? F
+  : never
+
+/**
+ * The model's fields as a definition names them: field name → model type,
+ * methods left out. A `Schema.Struct` or `Schema.Class` model is read from the
+ * fields it declares, so the names stay known when a field's schema is a type
+ * parameter (a generic entity factory). A model whose type is unknown (one
+ * typed as `Schema.Top`) has any field, of unknown type, so generic code still
+ * compiles and the runtime checks decide; so does one typed `never` or `any`.
+ */
+export type ModelFields<TModel extends Schema.Top> =
+  IsAny<TModel> extends true
+    ? globalThis.Record<string, unknown>
+    : [DeclaredFields<TModel>] extends [never]
+      ? TypeFields<TModel>
+      : {
+          readonly [K in keyof DeclaredFields<TModel> & string]: Schema.Schema.Type<
+            DeclaredFields<TModel>[K]
+          >
+        }
+
+type TypeFields<TModel extends Schema.Top> = [ModelType<TModel>] extends [never]
+  ? globalThis.Record<string, unknown>
+  : unknown extends ModelType<TModel>
+    ? globalThis.Record<string, unknown>
+    : {
+        readonly [K in keyof ModelType<TModel> as K extends string
+          ? ModelType<TModel>[K] extends (...args: ReadonlyArray<any>) => unknown
+            ? never
+            : K
+          : never]: ModelType<TModel>[K]
+      }
+
+/** The names of {@link ModelFields}: what a definition may name as a model attribute. */
+export type ModelFieldName<TModel extends Schema.Top> = keyof ModelFields<TModel> & string
+
 /**
  * Flatten an intersection of object types into a single object literal for
  * cleaner hover/IntelliSense display. Pure identity at the type level —
@@ -380,12 +421,57 @@ export type IndexPkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] 
   ? PKC[number]
   : never
 
-/** Extract sk composite names (union) for a specific index */
+/**
+ * Extract sk composite names (union) for a specific index — `never` for a
+ * Z-order sort key (#171): its derived `composite` lists the fields feeding the
+ * address, which are bounded through `.within()`, never pinned or compared as
+ * key text. Tested before `composite`, which the normalised Z-order half also
+ * carries.
+ */
 export type IndexSkComposites<TIndexes, K extends keyof TIndexes> = TIndexes[K] extends {
-  readonly sk: { readonly composite: infer SKC extends ReadonlyArray<string> }
+  readonly sk: { readonly zorder: ReadonlyArray<unknown> }
 }
-  ? SKC[number]
-  : never
+  ? never
+  : TIndexes[K] extends {
+        readonly sk: { readonly composite: infer SKC extends ReadonlyArray<string> }
+      }
+    ? SKC[number]
+    : never
+
+/** The field a Z-order dimension entry names: a bare name, or its `field`. */
+export type DimensionEntryField<D> = D extends string
+  ? D
+  : D extends { readonly field: infer F extends string }
+    ? F
+    : never
+
+/** The field names of a Z-order key's declared dimensions, in declaration order. */
+export type DimensionFieldNames<Z> = Z extends readonly []
+  ? readonly []
+  : Z extends readonly [infer Head, ...infer Tail]
+    ? readonly [DimensionEntryField<Head>, ...DimensionFieldNames<Tail>]
+    : Z extends ReadonlyArray<infer D>
+      ? ReadonlyArray<DimensionEntryField<D>>
+      : readonly []
+
+type PrefixPartField<P> = P extends string
+  ? P
+  : P extends { readonly field: infer F extends string }
+    ? F
+    : never
+
+type PrefixPartFields<P> = P extends readonly []
+  ? readonly []
+  : P extends readonly [infer Head, ...infer Tail]
+    ? readonly [PrefixPartField<Head>, ...PrefixPartFields<Tail>]
+    : P extends ReadonlyArray<infer Part>
+      ? ReadonlyArray<PrefixPartField<Part>>
+      : readonly []
+
+/** The field names of a Z-order key's `prefix` composites (`readonly []` without one). */
+export type PrefixFieldNames<SK> = SK extends { readonly prefix: infer P }
+  ? PrefixPartFields<P>
+  : readonly []
 
 /**
  * Map a refs config object to its derived `${ref}Id` field map.
@@ -405,6 +491,13 @@ type RefIdFields<TRefs> = [TRefs] extends [undefined]
  */
 type CompositeFields<TModel extends Schema.Top, TRefs> = ModelType<TModel> & RefIdFields<TRefs>
 
+/**
+ * The attributes a key composite may name, with their types: the model's
+ * fields ({@link ModelFields}) plus the derived ref-id fields. What
+ * `Entity.make` types `composite`, `prefix` and `zorder` from.
+ */
+export type KeyFields<TModel extends Schema.Top, TRefs> = ModelFields<TModel> & RefIdFields<TRefs>
+
 /** Pick SK composite fields from the model (or refs) with their actual types. */
 export type IndexSkFields<
   TModel extends Schema.Top,
@@ -422,10 +515,57 @@ export type IndexSkFields<
  * queries should accept both `"Male"` and `"male"` for indexed attributes.
  * Non-string types pass through unchanged.
  */
-type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
+export type CaseInsensitive<T> = T extends string ? T | Lowercase<T> : T
 
 /** Apply CaseInsensitive to all properties of an object type */
 type CaseInsensitiveProps<T> = { [K in keyof T]: CaseInsensitive<T[K]> }
+
+/**
+ * The dimensions of index `K`'s Z-order sort key (#171), keyed by field: each
+ * one's declared entry (a literals entry may carry its members) and the
+ * field's model value type. `never` for any other sort key.
+ */
+export type IndexZOrderDimensions<
+  TModel extends Schema.Top,
+  TIndexes,
+  K extends keyof TIndexes,
+  TRefs = undefined,
+> = TIndexes[K] extends {
+  readonly sk: { readonly zorder: infer Z extends ReadonlyArray<unknown> }
+}
+  ? {
+      readonly [D in Z[number] as DimensionEntryField<D>]: {
+        readonly dimension: D
+        readonly value: DimensionEntryField<D> extends infer F extends keyof CompositeFields<
+          TModel,
+          TRefs
+        >
+          ? CompositeFields<TModel, TRefs>[F]
+          : never
+      }
+    }
+  : never
+
+/**
+ * The prefix composites of index `K`'s Z-order sort key (#171) with their
+ * model value types, case-insensitive like an accessor's composites. `never`
+ * for any other sort key.
+ */
+export type IndexZOrderPrefix<
+  TModel extends Schema.Top,
+  TIndexes,
+  K extends keyof TIndexes,
+  TRefs = undefined,
+> = TIndexes[K] extends {
+  readonly sk: infer SK extends { readonly zorder: ReadonlyArray<unknown> }
+}
+  ? CaseInsensitiveProps<
+      Pick<
+        CompositeFields<TModel, TRefs>,
+        PrefixFieldNames<SK>[number] & keyof CompositeFields<TModel, TRefs>
+      >
+    >
+  : never
 
 /**
  * Compute the typed query input for a specific index.

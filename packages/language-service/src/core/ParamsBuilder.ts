@@ -1,9 +1,10 @@
-import type {
-  Casing,
-  IndexDefinition,
-  ResolvedCollection,
-  ResolvedEntity,
-  SchemaConfig,
+import {
+  type Casing,
+  type IndexDefinition,
+  isZOrderHalf,
+  type ResolvedCollection,
+  type ResolvedEntity,
+  type SchemaConfig,
 } from "./EntityResolver"
 import type { DetectedOperation, UpdateCombinators, WhereCondition } from "./OperationDetector"
 
@@ -166,7 +167,15 @@ function buildQueryParams(
   values[":pk"] = pkValue
   let keyCondition = "#pk = :pk"
 
-  if (skPrefix) {
+  // Mirrors `KeyComposer.composeSortKeyCondition`: a complete key is an exact
+  // `=` — `begins_with` on it would also match longer values (`seq: 3`
+  // matching 3.14) — and a partial prefix a terminated `begins_with`.
+  const pinned = isZOrderHalf(index.sk) ? 0 : availableSkSlots(index, args).length
+  if (skPrefix && pinned > 0 && pinned === index.sk.composite.length) {
+    names["#sk"] = index.sk.field
+    values[":sk"] = skPrefix
+    keyCondition += " AND #sk = :sk"
+  } else if (skPrefix) {
     names["#sk"] = index.sk.field
     values[":skPrefix"] = skPrefix
     keyCondition += " AND begins_with(#sk, :skPrefix)"
@@ -341,10 +350,57 @@ function schemaPrefix(schema: SchemaConfig): string {
 /** Mirrors `KeyComposer.serializeValue` for the values a source literal can hold. */
 function serializeValue(value: unknown): string {
   if (typeof value === "string") return value
-  if (typeof value === "number") return String(value).padStart(16, "0")
-  if (typeof value === "bigint") return String(value).padStart(38, "0")
+  if (typeof value === "number") return encodeNumber(value)
+  if (typeof value === "bigint") return encodeBigInt(value)
   if (typeof value === "boolean") return value ? "true" : "false"
   return String(value)
+}
+
+// Mirrors `@effect-dynamodb/schema/internal/NumericKey.ts`, which documents the
+// format: numeric key text that sorts in numeric order, keeping the zero-padded
+// text of a non-negative integer below the pad width. A hover never throws, so
+// what the library refuses (`NaN`, a bigint past 1,000 digits) is shown as is.
+
+/** `x = 0.<digits> × 10^point` for the shortest round-trip decimal of positive `x`. */
+function decimalOf(x: number): { readonly digits: string; readonly point: number } {
+  const [mantissa = "", exponent = "0"] = String(x).split("e")
+  const [int = "", frac = ""] = mantissa.split(".")
+  const all = `${int}${frac}`
+  const significant = all.replace(/^0+/, "")
+  return {
+    digits: significant.replace(/0+$/, ""),
+    point: int.length + Number(exponent) - (all.length - significant.length),
+  }
+}
+
+function magnitude(digits: string, point: number, width: number): string {
+  if (point > width) return `:${String(point - 1).padStart(3, "0")}${digits}`
+  const int = point <= 0 ? "" : digits.slice(0, point).padEnd(point, "0")
+  const frac = `${"0".repeat(Math.max(0, -point))}${digits.slice(Math.max(0, point))}`
+  return `${int.padStart(width, "0")}${frac === "" ? "" : `.${frac}`}`
+}
+
+function negate(text: string): string {
+  const complement = (t: string) => t.replace(/[0-9]/g, (digit) => String(9 - Number(digit)))
+  return text.startsWith(":") ? `-*${complement(text.slice(1))}:` : `-${complement(text)}:`
+}
+
+function encodeNumber(n: number): string {
+  if (Number.isNaN(n)) return String(n)
+  if (n === Number.POSITIVE_INFINITY) return ";"
+  if (n === Number.NEGATIVE_INFINITY) return "-)"
+  if (n === 0) return "0".repeat(16)
+  const { digits, point } = decimalOf(Math.abs(n))
+  const text = magnitude(digits, point, 16)
+  return n < 0 ? negate(text) : text
+}
+
+function encodeBigInt(n: bigint): string {
+  if (n === 0n) return "0".repeat(38)
+  const abs = (n < 0n ? -n : n).toString()
+  if (abs.length > 1000) return String(n)
+  const text = magnitude(abs.replace(/0+$/, ""), abs.length, 38)
+  return n < 0n ? negate(text) : text
 }
 
 function formatComposites(
@@ -406,13 +462,36 @@ function composeIsolatedSortKey(
   ].join("#")
 }
 
+/**
+ * Mirrors `KeyComposer.sortKeyText`: a sort key composite's text cased, then
+ * each code point U+0000–U+0025 escaped as `%` and two hex digits (lower case
+ * under `"lowercase"` casing).
+ */
+function sortKeyText(text: string, casing: Casing): string {
+  let escaped = ""
+  for (const char of applyCasing(text, casing)) {
+    const code = char.charCodeAt(0)
+    if (code > 0x25) {
+      escaped += char
+      continue
+    }
+    const hex = code.toString(16).padStart(2, "0")
+    escaped += `%${casing === "lowercase" ? hex : hex.toUpperCase()}`
+  }
+  return escaped
+}
+
 function composeSkFromSlots(
   schema: SchemaConfig,
   entityType: string,
   index: IndexDefinition,
-  slots: ReadonlyArray<CompositeSlot>,
+  given: ReadonlyArray<CompositeSlot>,
 ): string {
   const entityVersion = 1
+  const casing = index.casing ?? schema.casing
+  const slots = given.map((slot) =>
+    slot.placeholder ? slot : { ...slot, value: sortKeyText(slot.value, casing) },
+  )
   if (index.collection !== undefined) {
     if ((index.type ?? "isolated") === "clustered") {
       return composeClusteredSortKey(
@@ -444,12 +523,16 @@ function composePkValue(
   return composeKey(schema, entityType, slots, index.casing)
 }
 
+/** What a Z-order sort key (#171) shows: its value is bytes, not text. */
+export const ZORDER_KEY_PLACEHOLDER = "<binary Z-order key>"
+
 function composeSkValue(
   schema: SchemaConfig,
   entityType: string,
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  if (isZOrderHalf(index.sk)) return ZORDER_KEY_PLACEHOLDER
   return composeSkFromSlots(
     schema,
     entityType,
@@ -479,6 +562,8 @@ function composeSkPrefixValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  // A Z-order sort key has no text prefix.
+  if (isZOrderHalf(index.sk)) return ""
   return composeSkFromSlots(schema, entityType, index, availableSkSlots(index, record))
 }
 
@@ -493,9 +578,44 @@ function composeSkBeginsWithValue(
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): string {
+  // A Z-order sort key has no text prefix.
+  if (isZOrderHalf(index.sk)) return ""
   const slots = availableSkSlots(index, record)
   const prefix = composeSkFromSlots(schema, entityType, index, slots)
   return slots.length === index.sk.composite.length ? prefix : `${prefix}#`
+}
+
+/**
+ * The sort key condition an accessor sends for the composites it is given —
+ * mirrors the library's accessor (`KeyComposer.composeSortKeyCondition`): none
+ * when no composite is given (or the key is Z-order), `=` on the complete key
+ * when every one is, and a terminated `begins_with` on a leading prefix.
+ */
+function accessorSkCondition(
+  schema: SchemaConfig,
+  entityType: string,
+  index: IndexDefinition,
+  args: Record<string, unknown>,
+):
+  | {
+      readonly keyCondition: string
+      readonly name: string
+      readonly value: readonly [string, string]
+    }
+  | undefined {
+  if (isZOrderHalf(index.sk)) return undefined
+  if (!index.sk.composite.some((attr) => args[attr] !== undefined)) return undefined
+  return index.sk.composite.every((attr) => args[attr] !== undefined)
+    ? {
+        keyCondition: " AND #sk = :sk",
+        name: index.sk.field,
+        value: [":sk", composeSkValue(schema, entityType, index, args)],
+      }
+    : {
+        keyCondition: " AND begins_with(#sk, :skPrefix)",
+        name: index.sk.field,
+        value: [":skPrefix", composeSkBeginsWithValue(schema, entityType, index, args)],
+      }
 }
 
 function composePrimaryKey(
@@ -551,7 +671,7 @@ function buildEntityAccessorParams(
     `Query accessor '${collectionName}'`,
     `  Index: ${collection.index} (collection: ${collection.collectionName}, ${collection.type})`,
     `  PK: ${pkComposites} (required)`,
-    skComposites ? `  SK: ${skComposites} (optional begins_with)` : undefined,
+    skComposites ? `  SK: ${skComposites} (optional: begins_with, or = when all given)` : undefined,
     `  Returns: BoundQuery<${entity.entityType}>`,
   ]
     .filter(Boolean)
@@ -559,7 +679,18 @@ function buildEntityAccessorParams(
 
   // Build actual query params if we have arguments
   if (args && entity.schema) {
-    const indexDef: IndexDefinition = {
+    // The entity's own index, when it declares the collection: it carries
+    // what the collection doesn't — every collection of a sub-collection
+    // path, which a clustered key spells out, and an index-level casing.
+    const own = Object.values(entity.indexes).find(
+      (index) =>
+        index.index === collection.index &&
+        (typeof index.collection === "string"
+          ? [index.collection]
+          : (index.collection ?? [])
+        ).includes(collection.collectionName),
+    )
+    const indexDef: IndexDefinition = own ?? {
       index: collection.index,
       collection: collection.collectionName,
       type: collection.type,
@@ -572,12 +703,19 @@ function buildEntityAccessorParams(
     const pkValue = composePkValue(entity.schema, entity.entityType, indexDef, args)
     const names: Record<string, string> = { "#pk": indexDef.pk.field }
     const values: Record<string, string> = { ":pk": pkValue }
+    let keyCondition = "#pk = :pk"
+    const sk = accessorSkCondition(entity.schema, entity.entityType, indexDef, args)
+    if (sk) {
+      names["#sk"] = sk.name
+      values[sk.value[0]] = sk.value[1]
+      keyCondition += sk.keyCondition
+    }
 
     return {
       command: "QueryCommand",
       TableName: "<table>",
       IndexName: collection.index,
-      KeyConditionExpression: "#pk = :pk",
+      KeyConditionExpression: keyCondition,
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
       entityType: entity.entityType,
@@ -621,12 +759,17 @@ function buildEntityIndexAccessorParams(
 
   const pkComposites = indexDef.pk.composite.join(", ")
   const skComposites = indexDef.sk.composite.join(", ")
+  const zorder = isZOrderHalf(indexDef.sk)
 
   const info = [
     `Query accessor '${indexName}'`,
     `  Index: ${indexDef.index ?? "primary"} (isolated)`,
     `  PK: ${pkComposites} (required)`,
-    skComposites ? `  SK: ${skComposites} (optional begins_with)` : undefined,
+    zorder
+      ? `  SK: ${ZORDER_KEY_PLACEHOLDER} over ${skComposites} (bound with .within())`
+      : skComposites
+        ? `  SK: ${skComposites} (optional: begins_with, or = when all given)`
+        : undefined,
     `  Returns: BoundQuery<${entity.entityType}>`,
   ]
     .filter(Boolean)
@@ -644,84 +787,69 @@ function buildEntityIndexAccessorParams(
       ? { ...args, [whereCondition.field]: whereCondition.value }
       : args
 
-    // Add SK condition only if SK composites are actually provided
-    const hasSkComposites =
-      indexDef.sk.composite.length > 0 &&
+    // Without `.where()`: the accessor's own condition — none, `=` on a
+    // complete key, or a terminated `begins_with`.
+    const sk = whereCondition
+      ? undefined
+      : accessorSkCondition(entity.schema, entity.entityType, indexDef, args)
+    if (sk) {
+      names["#sk"] = sk.name
+      values[sk.value[0]] = sk.value[1]
+      keyCondition += sk.keyCondition
+    }
+
+    // `.where()` bounds the composite after the pinned ones. An approximation:
+    // the library's `composeRangeUnder` also pushes an inclusive upper bound
+    // past a non-last composite's subtree and clamps under pinned composites.
+    const skPrefix =
+      whereCondition &&
+      !zorder &&
       indexDef.sk.composite.some((attr) => mergedArgs[attr] !== undefined)
-
-    if (hasSkComposites) {
-      const allSkProvided = indexDef.sk.composite.every((attr) => mergedArgs[attr] !== undefined)
-
-      if (allSkProvided && !whereCondition) {
-        // All SK composites provided in query input → exact match
-        const skValue = composeSkValue(entity.schema, entity.entityType, indexDef, mergedArgs)
-        names["#sk"] = indexDef.sk.field
-        values[":sk"] = skValue
-        keyCondition += " AND #sk = :sk"
-      } else {
-        // Partial or .where() with range condition → use appropriate SK condition
-        const skPrefix = composeSkPrefixValue(
-          entity.schema,
-          entity.entityType,
-          indexDef,
-          mergedArgs,
-        )
-        if (skPrefix) {
-          names["#sk"] = indexDef.sk.field
-          if (whereCondition) {
-            // Use the .where() operator on the composed prefix
-            switch (whereCondition.op) {
-              case "beginsWith":
-                values[":skPrefix"] = composeSkBeginsWithValue(
-                  entity.schema,
-                  entity.entityType,
-                  indexDef,
-                  mergedArgs,
-                )
-                keyCondition += " AND begins_with(#sk, :skPrefix)"
-                break
-              case "eq":
-                values[":sk"] = skPrefix
-                keyCondition += " AND #sk = :sk"
-                break
-              case "gt":
-                values[":sk"] = skPrefix
-                keyCondition += " AND #sk > :sk"
-                break
-              case "gte":
-                values[":sk"] = skPrefix
-                keyCondition += " AND #sk >= :sk"
-                break
-              case "lt":
-                values[":sk"] = skPrefix
-                keyCondition += " AND #sk < :sk"
-                break
-              case "lte":
-                values[":sk"] = skPrefix
-                keyCondition += " AND #sk <= :sk"
-                break
-              case "between": {
-                const skPrefix2 = whereCondition.value2
-                  ? composeSkPrefixValue(entity.schema, entity.entityType, indexDef, {
-                      ...args,
-                      [whereCondition.field]: whereCondition.value2,
-                    })
-                  : skPrefix
-                values[":skLow"] = skPrefix
-                values[":skHigh"] = skPrefix2 ?? skPrefix
-                keyCondition += " AND #sk BETWEEN :skLow AND :skHigh"
-                break
-              }
-            }
-          } else {
-            values[":skPrefix"] = composeSkBeginsWithValue(
-              entity.schema,
-              entity.entityType,
-              indexDef,
-              mergedArgs,
-            )
-            keyCondition += " AND begins_with(#sk, :skPrefix)"
-          }
+        ? composeSkPrefixValue(entity.schema, entity.entityType, indexDef, mergedArgs)
+        : ""
+    if (whereCondition && skPrefix) {
+      names["#sk"] = indexDef.sk.field
+      switch (whereCondition.op) {
+        case "beginsWith":
+          values[":skPrefix"] = composeSkBeginsWithValue(
+            entity.schema,
+            entity.entityType,
+            indexDef,
+            mergedArgs,
+          )
+          keyCondition += " AND begins_with(#sk, :skPrefix)"
+          break
+        case "eq":
+          values[":sk"] = skPrefix
+          keyCondition += " AND #sk = :sk"
+          break
+        case "gt":
+          values[":sk"] = skPrefix
+          keyCondition += " AND #sk > :sk"
+          break
+        case "gte":
+          values[":sk"] = skPrefix
+          keyCondition += " AND #sk >= :sk"
+          break
+        case "lt":
+          values[":sk"] = skPrefix
+          keyCondition += " AND #sk < :sk"
+          break
+        case "lte":
+          values[":sk"] = skPrefix
+          keyCondition += " AND #sk <= :sk"
+          break
+        case "between": {
+          const skPrefix2 = whereCondition.value2
+            ? composeSkPrefixValue(entity.schema, entity.entityType, indexDef, {
+                ...args,
+                [whereCondition.field]: whereCondition.value2,
+              })
+            : skPrefix
+          values[":skLow"] = skPrefix
+          values[":skHigh"] = skPrefix2 ?? skPrefix
+          keyCondition += " AND #sk BETWEEN :skLow AND :skHigh"
+          break
         }
       }
     }

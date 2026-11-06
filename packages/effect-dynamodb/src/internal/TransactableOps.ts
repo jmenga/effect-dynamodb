@@ -8,6 +8,10 @@
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
+import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
+import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
@@ -100,6 +104,22 @@ export const isProjectionTombstone = (
   item: { readonly __edd_e__?: { readonly S?: string | undefined } | undefined } | undefined,
   entityType: string,
 ): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
+
+/**
+ * Marks a projection's row tombstone or outbox item written under the key
+ * text 1.37 composes (#171). They hold no values to tell whose key they are
+ * at, and `foo bar`'s current key is `foo%20bar`'s 1.36 key: one without the
+ * mark is 1.36's, the row its key reads back as.
+ */
+export const KEY_TEXT = "__edd_kt__"
+
+/** The read-model row an outbox item was written for: its key attributes' text. */
+export const OUTBOX_ROW_PK = "__edd_row_pk__"
+export const OUTBOX_ROW_SK = "__edd_row_sk__"
+
+/** A drainer's claim on an outbox item: its token, and the epoch millis it holds until. */
+export const OUTBOX_CLAIM = "__edd_claim__"
+export const OUTBOX_CLAIMED_UNTIL = "__edd_claimed_until__"
 
 /**
  * @internal Hidden string set naming the unique-constraint fields an item
@@ -409,6 +429,28 @@ export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity
   })
 
 /**
+ * @internal Run a key composer, turning a value it can't place into a
+ * `ValidationError` for `operation`: a Z-order value (`[EDD-9092]`,
+ * `ZOrderValueError`: `NaN`, an unparseable date, a value outside a `literals`
+ * list — #171), or a composite with no key text (`[EDD-9096]`,
+ * `KeyValueError`: `NaN`, a bigint past 1,000 digits). Every write path that
+ * composes an item's keys goes through this, so the failure is typed instead
+ * of a defect. Any other throw stays a defect.
+ */
+export const composeKeysOrFail = <A>(
+  entityType: string,
+  operation: string,
+  compose: () => A,
+): Effect.Effect<A, ValidationError> =>
+  Effect.try({ try: compose, catch: (error) => error }).pipe(
+    Effect.catch((error) =>
+      isZOrderValueError(error) || isKeyValueError(error)
+        ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
+        : Effect.die(error),
+    ),
+  )
+
+/**
  * Compose the primary key for an entity item.
  */
 export const composePrimaryKey = (
@@ -428,6 +470,20 @@ export const composePrimaryKey = (
     [primary.sk.field]: KeyComposer.composeSk(schema, entity.entityType, 1, primary, recordKeyForm),
   }
 }
+
+/**
+ * {@link composePrimaryKey}, failing with a `ValidationError` for `operation`
+ * where a composite has no key text (`NaN`, `[EDD-9096]`) — the key-taking
+ * multi-item ops (`Batch.get`, `Batch.write` deletes, `transactGet`,
+ * `transactWrite` deletes and condition checks), as an entity's own `get` and
+ * `delete` do.
+ */
+export const composePrimaryKeyOrFail = (
+  entity: Entity,
+  key: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<Record<string, unknown>, ValidationError> =>
+  composeKeysOrFail(entity.entityType, operation, () => composePrimaryKey(entity, key))
 
 /**
  * Validate input, compose all keys, and build a marshalled put item.
@@ -491,14 +547,28 @@ export const validateAndBuildPutItem = (
     // composite composed `txn_420` here and `txn_000…0420` there, so the two
     // APIs wrote two different rows for the same logical item and neither
     // accessor could read the transact-written one (#111).
-    const keys = KeyComposer.composeAllKeys(
-      entity._schema,
-      entity.entityType,
-      1,
-      entity.indexes,
-      entity._keyForm(encoded as Record<string, unknown>),
+    const keys = yield* composeKeysOrFail(entity.entityType, operation, () =>
+      KeyComposer.composeAllKeys(
+        entity._schema,
+        entity.entityType,
+        1,
+        entity.indexes,
+        entity._keyForm(encoded as Record<string, unknown>),
+      ),
     )
     Object.assign(item, keys)
+    // A unique field's sentinel key is composed from its value later, on the
+    // guarded path, after this item is marshalled. One with no key text
+    // (`NaN`, `[EDD-9096]`) is refused here, as `Entity.put` refuses it, not
+    // by the marshaller as a defect.
+    yield* composeKeysOrFail(entity.entityType, operation, () => {
+      for (const def of Object.values(entity.unique ?? {})) {
+        for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
+          const value = (encoded as Record<string, unknown>)[field]
+          if (value !== undefined && value !== null) KeyComposer.serializeValue(value)
+        }
+      }
+    })
 
     // System fields (collision-aware). When a timestamp field collides with a
     // model-declared field, the user may have supplied their own value

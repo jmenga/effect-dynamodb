@@ -1619,7 +1619,7 @@ describe("Entity", () => {
         const rejection = awsValidationException(DDB_TOO_MANY_ITEMS)
         mockTransactWriteItems.mockRejectedValueOnce(rejection)
         // Build an entity with 100 unique constraints → 101 transact items (1 main + 100 sentinels)
-        const uniqueConstraints: Record<string, ReadonlyArray<string>> = {}
+        const uniqueConstraints: Record<string, ReadonlyArray<"email">> = {}
         for (let i = 0; i < 100; i++) {
           uniqueConstraints[`c${i}`] = ["email"]
         }
@@ -3214,7 +3214,7 @@ describe("Entity", () => {
       )
     })
 
-    it("query with PK + full SK composites applies beginsWith for all values", () => {
+    it("query with PK + full SK composites matches the complete key with eq", () => {
       const UserEntity = withConfig(
         Entity.make({
           model: User,
@@ -3239,9 +3239,11 @@ describe("Entity", () => {
         email: "test@example.com",
       })
       expect(q._state.skConditions).toHaveLength(1)
-      const beginsWith = (q._state.skConditions[0]!.condition as { beginsWith: string }).beginsWith
-      expect(beginsWith).toContain("u-1")
-      expect(beginsWith).toContain("test@example.com")
+      // Every SK composite given: an exact `=` on the complete key — a
+      // `begins_with` would also match a longer email.
+      const eq = (q._state.skConditions[0]!.condition as { eq: string }).eq
+      expect(eq).toContain("u-1")
+      expect(eq.endsWith("test@example.com")).toBe(true)
     })
   })
 

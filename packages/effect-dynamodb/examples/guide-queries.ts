@@ -5,7 +5,9 @@
  *   - Entity scan via BoundQuery: db.entities.Entity.scan()
  *   - Entity index queries via db.entities.Entity.indexName({...})
  *   - Post-query filtering (callback and shorthand)
+ *   - `.within()` on a non-leading sort key composite (skip-scan) and `.explain()`
  *   - Pagination: collect, single page (fetch), cursor-based, streaming
+ *   - Request sizing: adaptive under a filter, `.onRequest()`, `.pageSize("natural")`
  *   - Scan: basic, filtered, limited, consistent read, stream
  *   - Consistent reads on get and scan
  *   - Reverse ordering
@@ -17,13 +19,19 @@
  *   npx tsx examples/guide-queries.ts
  */
 
-import { Config, Console, Effect, Layer, Schema, Stream } from "effect"
+import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+
+const assertEq = <T>(actual: T, expected: T, label: string): void => {
+  const a = JSON.stringify(actual)
+  const e = JSON.stringify(expected)
+  if (a !== e) throw new Error(`Assertion failed [${label}]: expected ${e}, got ${a}`)
+}
 
 // ---------------------------------------------------------------------------
 // 1. Domain models
@@ -73,7 +81,7 @@ const TaskEntity = Entity.make({
       pk: { field: "gsi2pk", composite: ["assigneeId"] },
       sk: { field: "gsi2sk", composite: ["status", "createdAt"] },
     },
-    // Numeric sort key composite — zero-padded in the key so it sorts
+    // Numeric sort key composite — encoded in the key so it sorts
     // numerically, and `.where()` takes a `number`.
     byEstimate: {
       name: "gsi3",
@@ -253,12 +261,37 @@ const program = Effect.gen(function* () {
 
   // #region sk-typed-operands
   // `estimateHours` is a number, so `.where()` takes a number — not a string.
-  // The library zero-pads it exactly as the stored key was padded.
+  // The library encodes it exactly as the stored key was encoded.
   const bigTasks = yield* db.entities.TaskEntity.byEstimate({ projectId: "proj-alpha" })
     .where((t, { gte }) => gte(t.estimateHours, 8))
     .collect()
   // #endregion
   yield* Console.log(`Tasks estimated at 8h or more: ${bigTasks.length}\n`)
+
+  // #region within-skip-scan
+  // `.where()` can't bound createdAt without pinning status first. `.within()`
+  // can: it finds each status with a one-row probe, then reads only that
+  // status's createdAt range.
+  const febTasks = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+    .collect()
+  // #endregion
+  yield* Console.log(`Created in Feb (skip-scan over status): ${febTasks.length}`)
+  assertEq(
+    febTasks.map((t) => t.taskId),
+    ["t-002", "t-003", "t-008"],
+    "within skip-scans status",
+  )
+
+  // #region explain
+  const plan = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .within({ createdAt: { between: ["2025-02-01", "2025-02-28"] } })
+    .explain()
+  // plan.plan   → "skip-scan"
+  // plan.reason → "skip tuple: status"
+  // #endregion
+  yield* Console.log(`Plan: ${plan.plan} (${plan.reason})\n`)
+  assertEq(plan.plan, "skip-scan", "explain names the plan")
 
   // -------------------------------------------------------------------------
   // Post-Query Filtering
@@ -319,32 +352,63 @@ const program = Effect.gen(function* () {
   yield* Console.log(`pageSize(2): ${inBatches.length} tasks`)
   yield* Console.log(`pageSize(2).limit(5): ${batchedAndCapped.length} tasks`)
 
+  // #region adaptive-sizing
+  // Under a filter, each request's Limit is sized from the pass rate so far:
+  // the first asks for max(16, 2 × limit) rows, later ones for what the
+  // observed rate says the remaining items need.
+  const lowPriority = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .filter({ priority: "low" })
+    .limit(2)
+    .onRequest((event) =>
+      Console.log(
+        `  request ${event.request}: Limit ${event.limit}, examined ${event.scannedCount}, accepted ${event.accepted}`,
+      ),
+    )
+    .collect()
+  // #endregion
+  yield* Console.log(`filter + limit(2): ${lowPriority.length} tasks`)
+
+  // #region page-size-natural
+  // Opt out: size requests exactly as 1.36 did — a natural 1 MB page under a filter.
+  const lowPriorityNatural = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
+    .filter({ priority: "low" })
+    .limit(2)
+    .pageSize("natural")
+    .collect()
+  // #endregion
+  assertEq(
+    lowPriorityNatural.map((t) => t.taskId),
+    lowPriority.map((t) => t.taskId),
+    "natural sizing returns the same items",
+  )
+  yield* Console.log(`pageSize("natural"): ${lowPriorityNatural.length} tasks`)
+
   // #region single-page
   // Single page with limit — returns page with items and cursor
   const page = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3).fetch()
   // page.items: Task[] (up to 3 items)
-  // page.cursor: string | null — resumes after the 3rd item, or null when done
+  // page.cursor: Option<string> — Some resumes after the 3rd item, None when done
   // #endregion
   yield* Console.log(
-    `Single page (limit 3): ${page.items.length} items, cursor: ${page.cursor != null ? "present" : "null"}`,
+    `Single page (limit 3): ${page.items.length} items, cursor: ${Option.isSome(page.cursor) ? "some" : "none"}`,
   )
 
   // #region cursor-pagination
-  // Cursor-based pagination
-  const page1 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-    .limit(3)
-    .fetch()
-
-  if (page1.cursor) {
-    const page2 = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" })
-      .limit(3)
-      .startFrom(page1.cursor)
-      .fetch()
-    yield* Console.log(
-      `Cursor pagination: page1=${page1.items.length} items, page2=${page2.items.length} items`,
-    )
-  }
+  // Cursor-based pagination: the next page, if there is one
+  const alpha = db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }).limit(3)
+  const page1 = yield* alpha.fetch()
+  const page2 = yield* Option.match(page1.cursor, {
+    onNone: () => Effect.succeed([]),
+    onSome: (cursor) =>
+      alpha
+        .startFrom(cursor)
+        .fetch()
+        .pipe(Effect.map((next) => next.items)),
+  })
   // #endregion
+  yield* Console.log(
+    `Cursor pagination: page1=${page1.items.length} items, page2=${page2.length} items`,
+  )
 
   // #region streaming
   // Streaming — automatic pagination via Stream

@@ -55,30 +55,51 @@ import {
   type DerivedSchemas,
   getFields,
   getSchemaFields,
+  optionalField,
   type ResolvedSystemFields,
+  resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
+  DimensionFieldNames,
   EntityRefCreateType,
   EntityRefInputType,
   EntityRefUpdateType,
+  KeyFields,
+  ModelFieldName,
+  PrefixFieldNames,
 } from "./internal/EntityTypes.js"
-import type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
-import { normalizeGsiConfig } from "./KeyComposer.js"
+import {
+  type BoundDimension,
+  bindDimension,
+  MAX_ADDRESS_BITS,
+  MAX_DIMENSION_BITS,
+  makeLayout,
+} from "./internal/ZOrderCurve.js"
+import { type DimensionField, resolveDimension } from "./internal/ZOrderDimension.js"
+import type {
+  GsiConfig,
+  IndexDefinition,
+  KeyPart,
+  ZOrderKeyPart,
+  ZOrderSkPart,
+} from "./KeyComposer.js"
+import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
   normalizeVectorIndexConfig,
   validateVectorIndexes,
 } from "./VectorIndex.js"
+import type { DimensionFor } from "./ZOrder.js"
 
 // ---------------------------------------------------------------------------
 // Re-export KeyComposer types for convenience
 // ---------------------------------------------------------------------------
 
-export type { IndexDefinition, KeyPart }
+export type { IndexDefinition, KeyPart, ZOrderKeyPart }
 
 /**
  * A ref config object: the entity and optional cascade index config.
@@ -151,25 +172,194 @@ export const resolveUniqueTtl = (
 // Index normalization types
 // ---------------------------------------------------------------------------
 
-type NormalizedIndexes<
+/**
+ * @internal The normalised indexes type from `primaryKey` + optional GSI
+ * configs. Shared with the runtime `Entity.make` in `effect-dynamodb`.
+ */
+export type NormalizedIndexes<
   TPrimaryKey extends PrimaryKeyDef,
-  TGsiIndexes extends globalThis.Record<string, GsiConfig>,
+  TGsiIndexes extends globalThis.Record<string, GsiConfig<any>>,
 > = keyof TGsiIndexes extends never
   ? { readonly primary: TPrimaryKey }
   : { readonly primary: TPrimaryKey } & {
-      readonly [K in keyof TGsiIndexes & string]: IndexDefinition & {
-        readonly collection: TGsiIndexes[K]["collection"]
-        readonly pk: { readonly composite: TGsiIndexes[K]["pk"]["composite"] }
-        readonly sk: { readonly composite: TGsiIndexes[K]["sk"]["composite"] }
+      readonly [K in keyof TGsiIndexes & string]: NormalizedGsi<TGsiIndexes[K]>
+    }
+
+/**
+ * One normalised GSI. A Z-order sort key (#171) keeps its declaration on the
+ * type — `zorder` and `prefix` are phantom carriers for the accessor typing
+ * (the runtime value has `zorderHalf`) — beside the derived `composite`.
+ */
+type NormalizedGsi<G extends GsiConfig<any>> = G["sk"] extends {
+  readonly zorder: infer Z extends ReadonlyArray<unknown>
+}
+  ? IndexDefinition & {
+      readonly collection: G["collection"]
+      readonly pk: { readonly composite: G["pk"]["composite"] }
+      readonly sk: ZOrderSkPart & {
+        readonly composite: readonly [...PrefixFieldNames<G["sk"]>, ...DimensionFieldNames<Z>]
+        readonly zorder: Z
+        readonly prefix: G["sk"] extends { readonly prefix: infer P } ? P : readonly []
+      }
+    }
+  : IndexDefinition & {
+      readonly collection: G["collection"]
+      readonly pk: { readonly composite: G["pk"]["composite"] }
+      readonly sk: {
+        readonly composite: G["sk"] extends { readonly composite: infer C } ? C : never
       }
     }
 
-/** Primary key definition — used in the `primaryKey` config form. */
-type PrimaryKeyDef = IndexDefinition &
-  (
-    | { readonly pk: { readonly composite: readonly [string, ...string[]] } }
-    | { readonly sk: { readonly composite: readonly [string, ...string[]] } }
+/**
+ * @internal Primary key definition — the `primaryKey` config form. `F` is the
+ * attribute names a composite may name: on `Entity.make`, the model's fields
+ * plus ref-derived ids ({@link KeyFields}). At least one half has a composite.
+ */
+export type PrimaryKeyDef<F extends string = string> = Omit<IndexDefinition, "pk" | "sk"> & {
+  readonly pk: KeyPart<F>
+  readonly sk: KeyPart<F>
+} & (
+    | { readonly pk: { readonly composite: readonly [F, ...F[]] } }
+    | { readonly sk: { readonly composite: readonly [F, ...F[]] } }
   )
+
+/**
+ * @internal The configs of `Entity.make` that name model attributes, typed
+ * from the model (`TModel`) and the refs config (`TRefs`). Shared with the
+ * runtime `Entity.make` in `effect-dynamodb`, so both reject a misspelled
+ * attribute name at compile time and complete the names in an editor.
+ */
+export type EntityPrimaryKeyConfig<TModel extends Schema.Top, TRefs> = PrimaryKeyDef<
+  keyof KeyFields<TModel, TRefs> & string
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the secondary indexes. */
+export type EntityIndexesConfig<TModel extends Schema.Top, TRefs> = globalThis.Record<
+  string,
+  GsiConfig<KeyFields<TModel, TRefs>>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: unique constraints over model fields. */
+export type EntityUniqueConfig<TModel extends Schema.Top> = UniqueConfig<ModelFieldName<TModel>>
+
+/**
+ * @internal See {@link EntityPrimaryKeyConfig}: refs keyed by the model's
+ * (ref) fields. The record half keeps it a `Record<string, AnyRefValue>`; the
+ * keyed half gives an editor the field names. A key that is not a model field
+ * is refused by {@link RefsKeyGuard} on the config.
+ */
+export type EntityRefsConfig<TModel extends Schema.Top> = globalThis.Record<string, AnyRefValue> & {
+  readonly [K in ModelFieldName<TModel>]?: AnyRefValue
+}
+
+/**
+ * @internal The keys of the refs as written (`TRefs`) that are not model
+ * fields, each typed `never`, so the error lands on the misspelled key. Keyed
+ * by remapping (`as`), not `Exclude`: the `Exclude` form, beside the indexes
+ * constraint that also reads `TRefs`, made `Parameters<typeof Entity.make>`
+ * resolve to `never`.
+ */
+export type RefsKeyGuard<TModel extends Schema.Top, TRefs> = {
+  readonly [K in keyof TRefs as K extends ModelFieldName<TModel> ? never : K]: never
+}
+
+/** Every option an entry of some kind takes, for an entry whose field the guard can't look up. */
+type AnyEntryKey = "field" | "min" | "max" | "step" | "from" | "unit" | "bits" | "values" | "bytes"
+
+/** The keys the entries over field `F` take (a bare name contributes none). */
+type EntryKeysOf<D> = D extends string ? never : keyof D
+
+/** The keys an object entry may carry: those of the entries its field's type takes. */
+type AllowedEntryKeys<E, TFields> = E extends { readonly field: infer F extends string }
+  ? F extends keyof TFields
+    ? EntryKeysOf<DimensionFor<F, TFields[F]>>
+    : AnyEntryKey
+  : AnyEntryKey
+
+/**
+ * @internal Over the indexes as written (`TIndexes`): on each Z-order sort
+ * key, every key of a `zorder` entry its field's entries don't take, and every
+ * key of a `{ field, hash }` prefix part but those two, typed `never`, so a
+ * misspelled option (`stpe`) is an error on that entry. Like
+ * {@link RefsKeyGuard}, a guard on the config: in the indexes' constraint it
+ * loses the editor's completions.
+ */
+export type ZOrderEntriesGuard<TIndexes, TFields> = {
+  readonly [K in keyof TIndexes]: TIndexes[K] extends { readonly sk: infer SK }
+    ? { readonly sk: ZOrderHalfGuard<SK, TFields> }
+    : unknown
+}
+
+/** @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name. */
+export type EntityIndexesGuard<TModel extends Schema.Top, TRefs, TIndexes> = ZOrderEntriesGuard<
+  TIndexes,
+  KeyFields<TModel, RefsOrNone<TRefs>>
+>
+
+type ZOrderHalfGuard<SK, TFields> = (SK extends { readonly zorder: infer Z }
+  ? {
+      readonly zorder: {
+        readonly [I in keyof Z]: Z[I] extends string
+          ? unknown
+          : { readonly [P in Exclude<keyof Z[I], AllowedEntryKeys<Z[I], TFields>>]: never }
+      }
+    }
+  : unknown) &
+  (SK extends { readonly prefix: infer P }
+    ? {
+        readonly prefix: {
+          readonly [I in keyof P]: P[I] extends string
+            ? unknown
+            : { readonly [Q in Exclude<keyof P[I], "field" | "hash">]: never }
+        }
+      }
+    : unknown)
+
+/**
+ * @internal The refs `Entity.make` was given, or `undefined` when it was given
+ * none. `TRefs` has no default so that, while an editor completes inside
+ * `refs`, it falls back to its constraint (which lists the model's fields)
+ * instead of to a default of `undefined` (which lists nothing); left out, it
+ * resolves to that constraint, which includes `undefined` and maps here to
+ * `undefined`.
+ */
+export type RefsOrNone<TRefs> = undefined extends TRefs ? undefined : TRefs
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the time-series clock and append input. */
+export type EntityTimeSeriesConfig<TModel extends Schema.Top> = TimeSeriesConfig<
+  Schema.Top,
+  ModelFieldName<TModel>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: the auto-generated id field. */
+export type EntityGeneratedIdConfig<TModel extends Schema.Top> = GeneratedIdConfig<
+  ModelFieldName<TModel>
+>
+
+/** @internal See {@link EntityPrimaryKeyConfig}: vector indexes over model fields. */
+export type EntityVectorIndexesConfig<TModel extends Schema.Top> = globalThis.Record<
+  string,
+  VectorIndexConfig<ModelFieldName<TModel>>
+>
+
+/**
+ * @internal A `timeSeries.appendInput` field that is not a model field: its
+ * name, as a type error on `appendInput` (`never` when every field is one).
+ */
+export type AppendInputFields<TModel extends Schema.Top, TTimeSeries> = TTimeSeries extends {
+  readonly appendInput: infer A extends Schema.Top
+}
+  ? string extends ModelFieldName<A>
+    ? unknown
+    : [Exclude<ModelFieldName<A>, ModelFieldName<TModel>>] extends [never]
+      ? unknown
+      : {
+          readonly appendInput: `EDD-9013: appendInput field "${Exclude<
+            ModelFieldName<A>,
+            ModelFieldName<TModel>
+          >}" is not a model field`
+        }
+  : unknown
 
 // ---------------------------------------------------------------------------
 // EntityDefinition — the pure half of an Entity (no AWS operations)
@@ -436,6 +626,21 @@ export const buildEntityDefinition = (config: {
   // ---------------------------------------------------------------------------
 
   const primaryIndex = config.indexes.primary
+  // Z-order sort keys are secondary-index only (#171): the primary key is
+  // string-composed, and a misplaced `zorder` must not reach the composers.
+  for (const half of [primaryIndex.pk, primaryIndex.sk] as ReadonlyArray<object>) {
+    if ("zorder" in half || "prefix" in half || "zorderHalf" in half) {
+      throw new Error(
+        `[EDD-9086] Entity "${config.entityType}": the primary key can't be a Z-order key — ` +
+          `zorder / prefix belong on a secondary index's sort key.`,
+      )
+    }
+  }
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    if (indexDef.collection !== undefined && isZOrderHalf(indexDef.sk)) {
+      throw zorderInCollection(config.entityType, indexName)
+    }
+  }
   if (primaryIndex.pk.composite.length === 0 && primaryIndex.sk.composite.length === 0) {
     throw new Error(
       `[EDD-9001] Entity "${config.entityType}": primary key must have at least one composite attribute in pk or sk`,
@@ -647,6 +852,31 @@ export const buildEntityDefinition = (config: {
           throw new Error(
             `[EDD-9014] Entity "${config.entityType}": timeSeries.appendInput must not include ref-derived ` +
               `"${fieldName}Id" — refs cannot be reassigned via .append(). Use .update() to change a ref.`,
+          )
+        }
+      }
+    }
+    for (const field of appendInputFields) {
+      if (!(field in modelFields)) {
+        throw new Error(
+          `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput field "${field}" is not a ` +
+            `model field. .append() writes each appendInput field to the current item. ` +
+            `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
+        )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validate unique constraint fields (EDD-9002)
+  // ---------------------------------------------------------------------------
+  if (config.unique) {
+    for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
+      for (const field of resolveUniqueFields(constraintDef)) {
+        if (!(field in modelFields)) {
+          throw new Error(
+            `[EDD-9002] Entity "${config.entityType}": unique constraint "${constraintName}" references ` +
+              `unknown attribute "${field}". Valid attributes: ${Object.keys(modelFields).sort().join(", ")}`,
           )
         }
       }
@@ -918,6 +1148,23 @@ export const buildEntityDefinition = (config: {
     for (const ttl of configuredTtls) normalizeTtlSeconds(ttl)
   }
 
+  // Bind every Z-order sort key (#171): resolve each dimension's storage from
+  // the field's schema (EDD-9088), check the bit budget (EDD-9089) and lay the
+  // address out. Unbound halves never reach the composers. Runs after the
+  // composite checks above (EDD-9002, 9025, 9072, 9022 — which read the derived
+  // `composite`), so a prefix composite or dimension reports those codes first.
+  const inputFields = getSchemaFields(schemas.inputSchema as Schema.Top) ?? modelFields
+  for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
+    if (!isZOrderHalf(indexDef.sk)) continue
+    initialIndexes[indexName] = {
+      ...indexDef,
+      sk: bindZOrderHalf(config.entityType, indexName, indexDef.sk, (field) => ({
+        schema: inputFields[field],
+        encoding: fieldEncodings[field] ?? optionalFieldEncoding(modelFields[field]),
+      })),
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
@@ -991,6 +1238,77 @@ export const buildEntityDefinition = (config: {
 }
 
 // ---------------------------------------------------------------------------
+// Z-order binding (#171)
+// ---------------------------------------------------------------------------
+
+/**
+ * The date encoding of an optional field's value schema. `buildFieldEncodings`
+ * reads the top-level field schema, so `Schema.optional(DynamoModel.DateString)`
+ * has no entry there; a dateTime dimension over it still needs its storage.
+ */
+const optionalFieldEncoding = (schema: Schema.Top | undefined): DynamoEncoding | undefined => {
+  const inner = schema === undefined ? undefined : optionalField(schema)?.inner
+  return inner === undefined ? undefined : (resolveFieldEncoding(inner, undefined) ?? undefined)
+}
+
+/** `[EDD-9090]`: a Z-order index is never a collection member. */
+export const zorderInCollection = (entityType: string, indexName: string): Error =>
+  new Error(
+    `[EDD-9090] Entity "${entityType}": index "${indexName}" has a Z-order sort key and ` +
+      `can't belong to a collection — a collection's members share sort-key text, and a ` +
+      `Z-order key is a binary address. Query it through its own accessor.`,
+  )
+
+/**
+ * Bind a normalised Z-order sort key to an entity's fields: resolve each
+ * declared dimension against its field (`[EDD-9087]`, `[EDD-9088]`), check the
+ * bit budget (`[EDD-9089]`) and lay the address out.
+ */
+const bindZOrderHalf = (
+  entityType: string,
+  indexName: string,
+  half: ZOrderSkPart,
+  fieldOf: (field: string) => DimensionField,
+): ZOrderSkPart => {
+  const bound: Array<BoundDimension> = []
+  for (const declared of half.zorderHalf.dimensions) {
+    const { spec, storage } = resolveDimension(
+      entityType,
+      indexName,
+      declared,
+      fieldOf(declared.field),
+    )
+    const limit = MAX_DIMENSION_BITS[spec.kind]
+    if (spec.bits > limit) {
+      throw new Error(
+        `[EDD-9089] Entity "${entityType}": index "${indexName}" dimension ` +
+          `"${spec.field}" needs ${spec.bits} bits; a ${dimensionLabel(spec.kind)} dimension ` +
+          `takes at most ${limit}. ${
+            spec.kind === "int" || spec.kind === "float"
+              ? "Widen its step or narrow its range."
+              : spec.kind === "string"
+                ? "Lower its bytes."
+                : "Lower its bits."
+          }`,
+      )
+    }
+    bound.push(bindDimension(spec, storage))
+  }
+  const layout = makeLayout(bound)
+  if (layout.bits > MAX_ADDRESS_BITS) {
+    throw new Error(
+      `[EDD-9089] Entity "${entityType}": index "${indexName}" interleaves ${layout.bits} bits; ` +
+        `a Z-order address takes at most ${MAX_ADDRESS_BITS} (${MAX_ADDRESS_BITS / 8} bytes). ` +
+        `Coarsen a dimension's step or drop a dimension.`,
+    )
+  }
+  return { ...half, zorderHalf: { ...half.zorderHalf, layout } }
+}
+
+const dimensionLabel = (kind: BoundDimension["spec"]["kind"]): string =>
+  kind === "int" || kind === "float" ? "range" : kind === "dateTime" ? "date-time" : kind
+
+// ---------------------------------------------------------------------------
 // Pure decode helper used by the definition's `_decodeRecord` is AWS-coupled
 // (it lives in the runtime package). The pure definition exposes only
 // `_attachPrototype`, which is pure.
@@ -1033,30 +1351,28 @@ const buildAttachPrototype = (data: EntityDefinitionData): ((decoded: any) => an
 export const make = <
   TModel extends Schema.Top,
   const TEntityType extends string,
-  const TPrimaryKey extends PrimaryKeyDef,
-  const TGsiIndexes extends globalThis.Record<string, GsiConfig> = {},
+  const TRefs extends EntityRefsConfig<TModel> | undefined,
+  const TPrimaryKey extends EntityPrimaryKeyConfig<TModel, RefsOrNone<TRefs>>,
+  const TGsiIndexes extends EntityIndexesConfig<TModel, RefsOrNone<TRefs>> = {},
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-  const TUnique extends UniqueConfig | undefined = undefined,
-  const TRefs extends globalThis.Record<string, AnyRefValue> | undefined = undefined,
-  const TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
-  const TGeneratedId extends GeneratedIdConfig | undefined = undefined,
-  const TVectorIndexes extends
-    | globalThis.Record<string, VectorIndexConfig<any>>
-    | undefined = undefined,
+  const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
+  const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
+  const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
+  const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
   const TAttrs extends {} = {},
 >(config: {
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes
+  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
-  readonly refs?: TRefs
-  readonly timeSeries?: TTimeSeries
+  readonly refs?: TRefs & RefsKeyGuard<TModel, TRefs>
+  readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
 }): EntityDefinition<
@@ -1067,7 +1383,7 @@ export const make = <
   TVersioned,
   TSoftDelete,
   TUnique,
-  TRefs,
+  RefsOrNone<TRefs>,
   ExtractIdentifier<ConfiguredModel<TModel, TAttrs>>,
   TTimeSeries,
   TGeneratedId,
@@ -1077,7 +1393,7 @@ export const make = <
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
     for (const [name, gsi] of Object.entries(config.indexes)) {
-      gsiIndexes[name] = normalizeGsiConfig(gsi)
+      gsiIndexes[name] = normalizeGsiConfig(gsi as unknown as GsiConfig)
     }
   }
   const indexes = { primary: config.primaryKey, ...gsiIndexes } as globalThis.Record<
@@ -1139,6 +1455,7 @@ const makeDefinitionImpl = (config: {
       tableTag = injectedTableTag
     },
     _injectIndex: (name: string, def: IndexDefinition) => {
+      if (isZOrderHalf(def.sk)) throw zorderInCollection(data.entityType, name)
       const refused = packedIndexRefusal(data.entityType, data.packedFields, name, def)
       if (refused !== undefined) throw new Error(refused)
       allIndexes = { ...allIndexes, [name]: def }

@@ -67,8 +67,8 @@ const baseConfig = {
   },
   root: { entityType: "MatchItem" },
   edges: {
-    venue: Aggregate.one("venue", { entityType: "MatchVenue" }),
-    players: Aggregate.many("players", {
+    venue: Aggregate.one({ entityType: "MatchVenue" }),
+    players: Aggregate.many({
       entityType: "MatchPlayer",
       sk: { composite: ["playerId"] },
     }),
@@ -106,7 +106,7 @@ class Fixture extends Schema.Class<Fixture>("Fixture")({
 const SquadSub = Aggregate.make(Squad, {
   root: { entityType: "MatchSquad" },
   edges: {
-    players: Aggregate.many("players", {
+    players: Aggregate.many({
       entityType: "MatchPlayer",
       sk: { composite: ["playerId"] },
     }),

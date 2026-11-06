@@ -149,8 +149,8 @@ describe("@effect-dynamodb/schema use-case", () => {
     // failed to type-check ("Property 'get' is missing"). The tsconfig.test.json
     // gate type-checks this file, so a regression fails the build.
     const refEdge = Aggregate.ref(Teams)
-    const oneEdge = Aggregate.one("captain", { entityType: "Player", entity: Players })
-    const manyEdge = Aggregate.many("players", { entityType: "Player", entity: Players })
+    const oneEdge = Aggregate.one({ entityType: "Player", entity: Players })
+    const manyEdge = Aggregate.many({ entityType: "Player", entity: Players })
     expect(refEdge._tag).toBe("RefEdge")
     expect(oneEdge._tag).toBe("OneEdge")
     expect(manyEdge._tag).toBe("ManyEdge")

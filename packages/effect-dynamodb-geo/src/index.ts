@@ -2,6 +2,7 @@ export type {
   BoundGeoIndex,
   Coordinates,
   GeoEntity,
+  GeoFieldName,
   GeoFields,
   GeoIndex as GeoIndexType,
   NearbyOptions,

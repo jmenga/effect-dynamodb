@@ -33,6 +33,7 @@ export {
   ItemDeleted,
   ItemNotDeleted,
   ItemNotFound,
+  ItemNotMoved,
   makeCompositeKeyHoleError,
   makeCompositeNullableError,
   OptimisticLockError,
@@ -70,7 +71,14 @@ export type {
   SystemFieldsType,
   VectorErrors,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
-export type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
+export type {
+  GsiConfig,
+  IndexDefinition,
+  KeyPart,
+  KeyValue,
+  ZOrderKeyPart,
+  ZOrderSkPart,
+} from "@effect-dynamodb/schema/KeyComposer.js"
 export * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 export type { ProjectionResult } from "@effect-dynamodb/schema/Projection.js"
 export * as Projection from "@effect-dynamodb/schema/Projection.js"
@@ -84,6 +92,21 @@ export type {
   VectorSourceConfig,
 } from "@effect-dynamodb/schema/VectorIndex.js"
 export * as VectorIndex from "@effect-dynamodb/schema/VectorIndex.js"
+export type * as ZOrder from "@effect-dynamodb/schema/ZOrder.js"
+export type {
+  AnyDimension,
+  DateTimeDimension,
+  DateTimeUnit,
+  Dimension,
+  DimensionFor,
+  DimensionKind,
+  ListedLiteralsDimension,
+  LiteralsDimension,
+  LiteralValue,
+  NumericDimension,
+  PrefixPart,
+  StringDimension,
+} from "@effect-dynamodb/schema/ZOrder.js"
 export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "./Aggregate.js"
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"
@@ -123,8 +146,16 @@ export * as Expression from "./Expression.js"
 export type {
   BoundQuery,
   BoundQueryBase,
+  BoundQueryWithin,
   BoundQueryWithWhere,
+  BoundQueryZOrder,
+  DimensionBound,
+  RangeBound,
   SkConditionOps,
+  WithinKind,
+  WithinOptions,
+  WithinSpec,
+  ZOrderApplied,
 } from "./internal/BoundQuery.js"
 export { makeBoundQuery } from "./internal/BoundQuery.js"
 export type {
@@ -158,6 +189,7 @@ export type {
 } from "./internal/PathBuilder.js"
 export { compilePath, createPathBuilder, isPath } from "./internal/PathBuilder.js"
 export * as Marshaller from "./Marshaller.js"
+export type { PlanMode, QueryExplain, QueryRequestEvent, ZOrderOptions } from "./Query.js"
 export * as Query from "./Query.js"
 export * as StorageEncoding from "./StorageEncoding.js"
 export type { Table as TableType, TableConfig } from "./Table.js"

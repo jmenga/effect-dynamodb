@@ -8,20 +8,21 @@ test.describe("Navigation", () => {
     await expect(page.locator("h1")).toContainText("Introduction")
     const content = page.locator("main")
     await expect(content).toBeVisible()
-    await expect(content.getByText("Core Concepts")).toBeVisible()
+    await expect(content.getByRole("heading", { name: "Core Concepts" })).toBeVisible()
   })
 
   test("sidebar contains Introduction and Getting Started", async ({ page }) => {
     await page.goto(`${BASE}/`)
     const sidebar = page.locator("nav[aria-label='Main']")
     await expect(sidebar.getByText("Introduction")).toBeVisible()
-    await expect(sidebar.getByText("Getting Started")).toBeVisible()
+    // "Getting Started" also labels the first tutorial — match the top-level page by its link
+    await expect(sidebar.locator(`a[href="${BASE}/getting-started/"]`)).toBeVisible()
   })
 
   test("Getting Started link navigates from sidebar", async ({ page }) => {
     await page.goto(`${BASE}/`)
     const sidebar = page.locator("nav[aria-label='Main']")
-    await sidebar.getByText("Getting Started").click()
+    await sidebar.locator(`a[href="${BASE}/getting-started/"]`).click()
     await expect(page).toHaveURL(/getting-started/)
     await expect(page.locator("h1")).toContainText("Getting Started")
   })
@@ -31,12 +32,14 @@ test.describe("Navigation", () => {
     const sidebar = page.locator("nav[aria-label='Main']")
     await expect(sidebar.getByText("Modeling")).toBeVisible()
     await expect(sidebar.getByText("Indexes & Collections")).toBeVisible()
+    await expect(sidebar.getByText("Z-order Indexes")).toBeVisible()
     await expect(sidebar.getByText("Queries")).toBeVisible()
     await expect(sidebar.getByText("Expressions")).toBeVisible()
     await expect(sidebar.getByText("Data Integrity")).toBeVisible()
     await expect(sidebar.getByText("Lifecycle")).toBeVisible()
     await expect(sidebar.getByText("Aggregates & Refs")).toBeVisible()
     await expect(sidebar.getByText("Geospatial")).toBeVisible()
+    await expect(sidebar.getByText("Upgrading from 1.36")).toBeVisible()
     await expect(sidebar.getByText("Advanced")).toBeVisible()
   })
 
@@ -52,11 +55,13 @@ test.describe("Navigation", () => {
     const guides = [
       { path: "guides/modeling/", heading: "Modeling" },
       { path: "guides/indexes/", heading: "Indexes" },
+      { path: "guides/zorder/", heading: "Z-order Indexes" },
       { path: "guides/queries/", heading: "Queries" },
       { path: "guides/data-integrity/", heading: "Data Integrity" },
       { path: "guides/lifecycle/", heading: "Lifecycle" },
       { path: "guides/aggregates/", heading: "Aggregates" },
       { path: "guides/geospatial/", heading: "Geospatial" },
+      { path: "guides/upgrading/", heading: "Upgrading from 1.36" },
       { path: "guides/advanced/", heading: "Advanced" },
     ]
 

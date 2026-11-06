@@ -1,13 +1,17 @@
 /**
  * @internal BoundQuery — Fluent query builder with pre-resolved services.
  *
- * `BoundQuery<Model, SkRemaining, A>` wraps a `Query<A>` with a pre-resolved
+ * `BoundQuery<Model, SkRemaining, A, W>` wraps a `Query<A>` with a pre-resolved
  * `provide` function so all terminals return `Effect` with `R = never`.
  *
  * - Combinators return a new `BoundQuery` (immutable).
- * - `where` consumes `SkRemaining` → `BoundQuery<Model, never, A>`.
+ * - `where` consumes `SkRemaining` → `BoundQuery<Model, never, A, never>`.
  * - `where` is only available when `SkRemaining` is not `never`.
- * - Terminals: `fetch`, `collect`, `paginate`, `count`.
+ * - `within` (#171) bounds the sort key composites `W` names; it and `where`
+ *   exclude each other. On a Z-order accessor it bounds the dimensions and
+ *   prefix composites, and `zorder` chooses how the box is read.
+ * - Terminals: `fetch`, `collect`, `paginate`, `count`; `explain` describes
+ *   the plan without sending anything.
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
@@ -51,13 +55,13 @@ const renamePaths = (node: unknown, resolve: (name: string) => string): unknown 
  *   `"todo" | "done"`) widen to `string`, so open bounds and `beginsWith`
  *   prefixes that are not themselves valid values still typecheck.
  * - **Every other composite** keeps its own type. That is the point of
- *   issue #114: `serializeValue` zero-pads numbers to 16 digits and bigints
- *   to 38 on the write path, so a stringly-typed `"42"` compares against
- *   `"0000000000000042"` and sorts *after* every stored value — a silent
- *   mismatch. Requiring the composite's own type also lets the operand run
- *   through the composite's own codec, which is what makes a transformed
- *   composite (`Schema.BigIntFromString`) compare against the value that was
- *   actually stored.
+ *   issue #114: `serializeValue` encodes numbers and bigints in numeric order
+ *   on the write path (`42` as `"0000000000000042"`), so a stringly-typed
+ *   `"42"` compares against that text and sorts *after* every stored value —
+ *   a silent mismatch. Requiring the composite's own type also lets the
+ *   operand run through the composite's own codec, which is what makes a
+ *   transformed composite (`Schema.BigIntFromString`) compare against the
+ *   value that was actually stored.
  */
 export type SkOperand<V> = [V] extends [string] ? string : V
 
@@ -116,8 +120,8 @@ export interface SkConditionOps<SK = Record<string, unknown>> {
  * composing keys — and then composes, so both sides of the comparison come out
  * of one pipeline (issues #114 and the encoded/decoded gap it exposed).
  * Without a hook there is no model to consult, so `KeyComposer.serializeValue`
- * is applied directly: the same zero-padding / ISO formatting the write path
- * uses. Casing is never applied here — it belongs to key composition.
+ * is applied directly: the same numeric encoding / ISO formatting the write
+ * path uses. Casing is never applied here — it belongs to key composition.
  *
  * The callback is invoked synchronously and exactly once, so a closed-over
  * mutable slot is safe here.
@@ -189,13 +193,18 @@ const buildSkAccessor = (fields: ReadonlyArray<string>): Record<string, string> 
 // BoundQuery interface — base methods (always available)
 // ---------------------------------------------------------------------------
 
-export interface BoundQueryBase<Model, SkRemaining, A> {
+export interface BoundQueryBase<
+  Model,
+  SkRemaining,
+  A,
+  W extends WithinSpec<any, WithinKind> = never,
+> {
   /** Add a filter expression (post-read). Callback or shorthand. */
   readonly filter: {
     (
       fn: (t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr,
-    ): BoundQuery<Model, SkRemaining, A>
-    (shorthand: ConditionShorthand): BoundQuery<Model, SkRemaining, A>
+    ): BoundQuery<Model, SkRemaining, A, W>
+    (shorthand: ConditionShorthand): BoundQuery<Model, SkRemaining, A, W>
   }
 
   /**
@@ -218,7 +227,7 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
    *
    * Cannot be combined with `.select()` — see EDD-9054.
    */
-  readonly filterBy: (predicate: (item: A) => boolean) => BoundQuery<Model, SkRemaining, A>
+  readonly filterBy: (predicate: (item: A) => boolean) => BoundQuery<Model, SkRemaining, A, W>
 
   /** Select specific attributes (projection). Callback or string array. */
   readonly select: {
@@ -226,41 +235,65 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
       fn: (
         t: PathBuilder<Model, Model, never>,
       ) => ReadonlyArray<Path<Model, any, any> | PackedPath<Model, any, any>>,
-    ): BoundQuery<Model, SkRemaining, Record<string, unknown>>
-    (attributes: ReadonlyArray<string>): BoundQuery<Model, SkRemaining, Record<string, unknown>>
+    ): BoundQuery<Model, SkRemaining, Record<string, unknown>, W>
+    (attributes: ReadonlyArray<string>): BoundQuery<Model, SkRemaining, Record<string, unknown>, W>
   }
 
   /**
    * Return at most `n` items — a contract on results. The query accumulates
    * across as many requests as it takes, which is what makes it work under a
-   * `.filter()`. Use `.pageSize()` to size the requests themselves.
+   * `.filter()`, sizing each request from the pass rate the earlier ones
+   * showed. Use `.pageSize()` to size the requests themselves, or
+   * `.pageSize("natural")` for 1.36's sizing; a query with `.maxPages()` keeps
+   * 1.36's sizing too.
    */
-  readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A>
+  readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A, W>
 
   /**
    * Fetch in batches of `n` — sets DynamoDB's `Limit` (rows examined per
-   * request). A contract on round trips, not on what comes back.
+   * request). A contract on round trips, not on what comes back. `"natural"`
+   * sizes requests exactly as 1.36 did (natural 1 MB pages under a filter);
+   * any other string throws `[EDD-9095]`.
    */
-  readonly pageSize: (n: number) => BoundQuery<Model, SkRemaining, A>
+  readonly pageSize: (size: number | "natural") => BoundQuery<Model, SkRemaining, A, W>
+
+  /**
+   * Run `observer` after every request a terminal sends, with the `Limit` sent
+   * and the rows DynamoDB examined, the filter kept and the query accepted
+   * (`Query.QueryRequestEvent`). Its failure is a defect; DynamoDB calls it
+   * makes are not charged to the query's consumed capacity.
+   */
+  readonly onRequest: (
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ) => BoundQuery<Model, SkRemaining, A, W>
 
   /** Set the maximum number of DynamoDB pages to fetch. */
-  readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A>
+  readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A, W>
 
   /** Reverse the sort order (ScanIndexForward = false). */
-  readonly reverse: () => BoundQuery<Model, SkRemaining, A>
+  readonly reverse: () => BoundQuery<Model, SkRemaining, A, W>
 
-  /** Resume pagination from an opaque cursor. */
-  readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A>
+  /**
+   * Resume pagination from an opaque cursor. The cursor is decoded when a
+   * terminal runs: a malformed one fails it with a `ValidationError`
+   * (`[EDD-9094]`), as does a `.within()` cursor on a query without
+   * `.within()`. A `.within()` query also refuses one from another plan
+   * (other bounds, partition, direction or index declaration) or positioned
+   * outside its own. A query without `.within()` can't recognise another
+   * query's well-formed cursor: DynamoDB may reject it
+   * (`DynamoValidationError`) or the query resumes from it.
+   */
+  readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A, W>
 
   /**
    * Enable consistent reads. DynamoDB rejects them on a GSI, which it reads
    * only eventually consistently: the query then fails with a
    * `ValidationError` naming the index.
    */
-  readonly consistentRead: () => BoundQuery<Model, SkRemaining, A>
+  readonly consistentRead: () => BoundQuery<Model, SkRemaining, A, W>
 
   /** Skip the __edd_e__ entity type filter. */
-  readonly ignoreOwnership: () => BoundQuery<Model, SkRemaining, A>
+  readonly ignoreOwnership: () => BoundQuery<Model, SkRemaining, A, W>
 
   /** Execute a single page. Returns items + opaque cursor. */
   readonly fetch: () => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
@@ -280,6 +313,15 @@ export interface BoundQueryBase<Model, SkRemaining, A> {
    * that is why the error channel carries `ValidationError` (decode can fail).
    */
   readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
+
+  /**
+   * Describe what the terminals would send — the plan (`key`, `skip-scan`,
+   * `filter`, or a Z-order `naive` / `jump` / `precise` / `empty`), why it
+   * was chosen, the key ranges known up front, the fields
+   * checked per row and how requests are sized — without sending anything.
+   * A `startFrom` cursor is not read: the plan is described from its start.
+   */
+  readonly explain: () => Effect.Effect<Query.QueryExplain, never, never>
 }
 
 // ---------------------------------------------------------------------------
@@ -298,15 +340,167 @@ export interface BoundQueryWithWhere<Model, SkRemaining, A> {
    */
   readonly where: (
     fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => RawSortKeyCondition,
-  ) => BoundQuery<Model, never, A>
+  ) => BoundQuery<Model, never, A, never>
+}
+
+// ---------------------------------------------------------------------------
+// Within method — only available when W names bounds (#171)
+// ---------------------------------------------------------------------------
+
+/** Which accessor a `.within()` belongs to. */
+export type WithinKind = "composite" | "zorder"
+
+/** What `.within()` accepts on an accessor (`bounds`), and the kind of accessor. */
+export interface WithinSpec<B, K extends WithinKind> {
+  readonly bounds: B
+  readonly kind: K
+}
+
+/** `.within()` consumed on a Z-order accessor: `.zorder()` stays available. */
+export type ZOrderApplied = WithinSpec<never, "zorder">
+
+type BoundOperator = "eq" | "between" | "gt" | "gte" | "lt" | "lte" | "in"
+
+/**
+ * `T`, every other operator ruled out — so `{ eq, gte }` or `{ lt, lte }` is
+ * a type error rather than a union member that excess property checks pass.
+ */
+type Only<T> = T & { readonly [K in Exclude<BoundOperator, keyof T>]?: never }
+
+/** A lower bound: `gt` or `gte`, not both. */
+export type LowerBound<V> = Only<{ readonly gt: V }> | Only<{ readonly gte: V }>
+
+/** An upper bound: `lt` or `lte`, not both. */
+export type UpperBound<V> = Only<{ readonly lt: V }> | Only<{ readonly lte: V }>
+
+/**
+ * A `.within()` bound on one field: a value, an inclusive pair, or one or two
+ * open ends. Bounds are compared in key form — the value composed into the
+ * sort key (numbers padded, dates as stored, strings cased).
+ */
+export type RangeBound<V> =
+  | Only<{ readonly eq: V }>
+  | Only<{ readonly between: readonly [V, V] }>
+  | LowerBound<V>
+  | UpperBound<V>
+  | Only<{ readonly gt: V; readonly lt: V }>
+  | Only<{ readonly gt: V; readonly lte: V }>
+  | Only<{ readonly gte: V; readonly lt: V }>
+  | Only<{ readonly gte: V; readonly lte: V }>
+
+/**
+ * The members of a literals dimension entry `D` over a field of type `V`: its
+ * declared `values`, else the field's members. `never` for any other entry (a
+ * range, a date-time window, a byte width).
+ */
+type LiteralsEntryMembers<D, V> = D extends string
+  ? Exclude<V, undefined>
+  : D extends
+        | { readonly min: unknown }
+        | { readonly max: unknown }
+        | { readonly from: unknown }
+        | { readonly unit: unknown }
+        | { readonly bytes: unknown }
+    ? never
+    : D extends { readonly values: ReadonlyArray<infer L> }
+      ? L
+      : Exclude<V, undefined>
+
+/**
+ * A `.within()` bound on one dimension of a Z-order sort key (#171), declared
+ * as entry `D` over a field of type `V`: a {@link RangeBound} in the field's
+ * own type — for a literals dimension by its members' order — and, for a
+ * literals dimension only, a set of members.
+ */
+export type DimensionBound<D, V> = [LiteralsEntryMembers<D, V>] extends [never]
+  ? RangeBound<V>
+  :
+      | RangeBound<LiteralsEntryMembers<D, V>>
+      | Only<{ readonly in: ReadonlyArray<LiteralsEntryMembers<D, V>> }>
+
+export interface WithinOptions {
+  /**
+   * Skip-scan probe budget per terminal call. After this many probes, the
+   * rest of the range is read once with the bounds checked per row. `0`
+   * never skips. Default 32.
+   */
+  readonly maxSkips?: number | undefined
+}
+
+export interface BoundQueryWithin<Model, A, W extends WithinSpec<any, WithinKind>> {
+  /**
+   * Bound the sort key composites the accessor left open — any of them, not
+   * only the leading one:
+   *
+   * ```ts
+   * db.entities.Listings.byCategory({ category: "bikes" })
+   *   .within({ price: { gte: 100, lte: 500 } })
+   *   .collect()
+   * ```
+   *
+   * The bounds the key condition can reach are read by key. When open
+   * composites lie before the first bound, the query *skip-scans*: a one-row
+   * probe finds each distinct value of them (a *tuple*), and only that tuple's
+   * matching range is read — results come back in sort key order. Bounds the
+   * key condition can't express are checked on each row. A free-form string
+   * composite before the bound, or an index that also holds history rows,
+   * can't be skipped soundly: the range is read once with every bound checked
+   * per row (`explain()` says which plan runs, and why).
+   *
+   * On a Z-order accessor (#171), the dimensions bound a box — any of them, in
+   * the fields' own types (`in` for a `literals` dimension) — and the prefix
+   * composites take one exact value each. The box is read as address ranges
+   * (`.zorder()` picks how); a prefix composite left out is skip-scanned.
+   * Every bound is exact: a `FilterExpression` where DynamoDB's comparison
+   * agrees with the dimension's order, a per-row check where it doesn't.
+   *
+   * Excludes `.where()`. Values are the composites' own types.
+   */
+  readonly within: (
+    bounds: W["bounds"],
+    options?: WithinOptions,
+  ) => BoundQuery<Model, never, A, W["kind"] extends "zorder" ? ZOrderApplied : never>
+}
+
+// ---------------------------------------------------------------------------
+// ZOrder method — only on a Z-order accessor (#171)
+// ---------------------------------------------------------------------------
+
+export interface BoundQueryZOrder<Model, SkRemaining, A, W extends WithinSpec<any, WithinKind>> {
+  /**
+   * How the box `.within()` bounds is read — before or after `.within()`;
+   * later calls merge over earlier ones:
+   *
+   * ```ts
+   * db.entities.Listings.byFacets({ region: "north" })
+   *   .within({ price: { lte: 500_000 }, bedrooms: { gte: 3 } })
+   *   .zorder({ strategy: "precise", maxRanges: 32 })
+   *   .collect()
+   * ```
+   *
+   * An unknown `strategy`, or a `maxRanges` / `concurrency` that isn't a
+   * positive integer, throws `[EDD-9095]`.
+   */
+  readonly zorder: (options: Query.ZOrderOptions) => BoundQuery<Model, SkRemaining, A, W>
 }
 
 // ---------------------------------------------------------------------------
 // BoundQuery — conditional type that includes `where` only when SkRemaining != never
 // ---------------------------------------------------------------------------
 
-export type BoundQuery<Model, SkRemaining, A> = BoundQueryBase<Model, SkRemaining, A> &
-  ([SkRemaining] extends [never] ? {} : BoundQueryWithWhere<Model, SkRemaining, A>)
+export type BoundQuery<
+  Model,
+  SkRemaining,
+  A,
+  W extends WithinSpec<any, WithinKind> = never,
+> = BoundQueryBase<Model, SkRemaining, A, W> &
+  ([SkRemaining] extends [never] ? {} : BoundQueryWithWhere<Model, SkRemaining, A>) &
+  ([W] extends [never] ? {} : [W["bounds"]] extends [never] ? {} : BoundQueryWithin<Model, A, W>) &
+  ([W] extends [never]
+    ? {}
+    : W["kind"] extends "zorder"
+      ? BoundQueryZOrder<Model, SkRemaining, A, W>
+      : {})
 
 // ---------------------------------------------------------------------------
 // BoundQuery config — passed to impl at construction
@@ -337,12 +531,36 @@ export interface BoundQueryConfig<Model> {
    *
    * `field` is the SK composite name the caller targeted (`t.status` →
    * `"status"`), or `undefined` when the callback did not go through the sk
-   * accessor.
+   * accessor. `undefined` when no stored key satisfies the condition: the
+   * query plans `empty` and sends nothing (#171).
    */
   readonly composeSkCondition?: (
     condition: RawSortKeyCondition,
     field: string | undefined,
-  ) => Query.SortKeyCondition
+  ) => Query.SortKeyCondition | undefined
+  /**
+   * Optional: the 1.36 key `.where()`'s condition also reads (#171) — for an
+   * `eq` / `beginsWith` that extends an accessor's pins, the key 1.36
+   * composed for them. Called after {@link composeSkCondition} accepted the
+   * condition; `undefined` reads only the current key.
+   */
+  readonly where136?: (
+    condition: RawSortKeyCondition,
+    field: string | undefined,
+  ) => Query.KeyPass | undefined
+  /**
+   * Optional: plan `.within(bounds)` on the query (#171) — an accessor's own
+   * composites and encoders turn the bounds into key ranges and row checks.
+   * Throws `[EDD-9093]` / `[EDD-9050]` for bounds it can't use. Without it,
+   * `.within()` is refused (collections, scans).
+   */
+  readonly planWithin?: <X>(
+    query: Query.Query<X>,
+    bounds: Record<string, unknown>,
+    options: WithinOptions | undefined,
+  ) => Query.Query<X>
+  /** Optional: the accessor reads a Z-order sort key, so `.zorder()` applies (#171). */
+  readonly zorder?: boolean | undefined
   /**
    * Optional: how `collect()` shapes the items — a collection groups them by
    * member. Carried through every combinator, so `.filter().collect()` groups
@@ -524,17 +742,65 @@ const ABSENT_ATTRIBUTE = "__edd_absent__"
 // BoundQuery implementation
 // ---------------------------------------------------------------------------
 
+/** `[EDD-9093]`: `.where()` and `.within()` exclude each other, and `.within()` applies once. */
+const refuseWithin = (what: string): never => {
+  throw new Error(
+    `[EDD-9093] .${what}: a query takes one sort key constraint — either .where() on the ` +
+      `next open composite, or one .within() bounding any of them.`,
+  )
+}
+
+const ZORDER_STRATEGIES: ReadonlySet<unknown> = new Set(["auto", "naive", "jump", "precise"])
+
+/**
+ * `.zorder(options)`'s options (#171), the ones given: library options that
+ * can't be honoured throw `[EDD-9095]`; `pageSize` is DynamoDB's `Limit`,
+ * passed on unchecked as `pageSize(n)`'s number is.
+ */
+const zorderOptions = (options: Query.ZOrderOptions): Query.ZOrderOptions => {
+  const refuse = (what: string): never => {
+    throw new Error(`[EDD-9095] .zorder() ${what}`)
+  }
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    return refuse("takes an object of options: { strategy, pageSize, maxRanges, concurrency }.")
+  }
+  const given = Object.fromEntries(
+    Object.entries(options).filter(([, value]) => value !== undefined),
+  ) as Query.ZOrderOptions
+  const unknown = Object.keys(given).filter(
+    (key) => !["strategy", "pageSize", "maxRanges", "concurrency"].includes(key),
+  )
+  if (unknown.length > 0) {
+    return refuse(`has no option ${unknown.map((key) => JSON.stringify(key)).join(", ")}.`)
+  }
+  if (given.strategy !== undefined && !ZORDER_STRATEGIES.has(given.strategy)) {
+    return refuse(
+      `strategy ${JSON.stringify(given.strategy)} is not one of "auto", "naive", "jump", "precise".`,
+    )
+  }
+  for (const key of ["maxRanges", "concurrency"] as const) {
+    const value = given[key]
+    if (value !== undefined && !(Number.isInteger(value) && value > 0)) {
+      return refuse(`${key} ${JSON.stringify(value)} is not a positive integer.`)
+    }
+  }
+  return given
+}
+
 /** @internal */
 export class BoundQueryImpl<Model, SkRemaining, A> {
   constructor(
     readonly _query: Query.Query<A>,
     readonly _config: BoundQueryConfig<Model>,
+    /** The sort key constraint already applied: `.where()` and `.within()` exclude each other. */
+    readonly _applied?: "where" | "within" | undefined,
   ) {}
 
   // --- where ---
   where(
     fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => RawSortKeyCondition,
   ): BoundQueryImpl<Model, never, A> {
+    if (this._applied === "within") refuseWithin("where() after .within()")
     const skAccessor = (
       this._config.skFields ? buildSkAccessor(this._config.skFields) : {}
     ) as SkRemaining
@@ -543,9 +809,57 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     const finalCondition = this._config.composeSkCondition
       ? this._config.composeSkCondition(condition, targetField())
       : serializeRawCondition(condition)
+    if (finalCondition === undefined) {
+      return new BoundQueryImpl<Model, never, A>(
+        Query.planEmpty(this._query),
+        this._config,
+        "where",
+      )
+    }
+    const key136 = this._config.where136?.(condition, targetField())
     return new BoundQueryImpl<Model, never, A>(
-      Query.where(this._query, finalCondition),
+      Query.alsoRead136(Query.where(this._query, finalCondition), key136),
       this._config,
+      "where",
+    )
+  }
+
+  // --- within ---
+  within(
+    bounds: Record<string, unknown>,
+    options?: WithinOptions,
+  ): BoundQueryImpl<Model, never, A> {
+    if (this._applied !== undefined) {
+      refuseWithin(this._applied === "where" ? "within() after .where()" : "a second .within()")
+    }
+    const maxSkips = options?.maxSkips
+    if (maxSkips !== undefined && !(Number.isInteger(maxSkips) && maxSkips >= 0)) {
+      throw new Error(
+        `[EDD-9095] .within() maxSkips ${JSON.stringify(maxSkips)} is not a probe budget: ` +
+          `pass a non-negative integer (0 never skips; the default is 32).`,
+      )
+    }
+    const plan = this._config.planWithin
+    if (plan === undefined) refuseWithin("within() on a query without sort key composites to bound")
+    return new BoundQueryImpl<Model, never, A>(
+      plan!(this._query, bounds, options),
+      this._config,
+      "within",
+    )
+  }
+
+  // --- zorder ---
+  zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    if (this._config.zorder !== true) {
+      throw new Error(
+        `[EDD-9095] .zorder() applies only to a Z-order index accessor: this query's index ` +
+          `has no Z-order sort key.`,
+      )
+    }
+    return new BoundQueryImpl(
+      Query.plan(this._query, { zorder: zorderOptions(options) }),
+      this._config,
+      this._applied,
     )
   }
 
@@ -562,12 +876,12 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
           parseSimpleShorthand(fnOrShorthand as Record<string, unknown>)
     // Paths name the stored attributes of renamed fields.
     const stored = this._config.renameExpr === undefined ? expr : this._config.renameExpr(expr)
-    return new BoundQueryImpl(Query.filterExpr(this._query, stored), this._config)
+    return new BoundQueryImpl(Query.filterExpr(this._query, stored), this._config, this._applied)
   }
 
   // --- filterBy ---
   filterBy(predicate: (item: A) => boolean): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.filterBy(this._query, predicate), this._config)
+    return new BoundQueryImpl(Query.filterBy(this._query, predicate), this._config, this._applied)
   }
 
   // --- select ---
@@ -588,37 +902,43 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
           ]
         : [fnOrAttrs.map((attr) => [attr]), "attributes" as const]
     const select = this._config.selectAs ?? plainSelect
-    return new BoundQueryImpl(select(this._query, paths, form), this._config)
+    return new BoundQueryImpl(select(this._query, paths, form), this._config, this._applied)
   }
 
   // --- pagination & ordering ---
   limit(n: number): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.limit(this._query, n), this._config)
+    return new BoundQueryImpl(Query.limit(this._query, n), this._config, this._applied)
   }
 
-  pageSize(n: number): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.pageSize(this._query, n), this._config)
+  pageSize(size: number | "natural"): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.pageSize(this._query, size), this._config, this._applied)
+  }
+
+  onRequest(
+    observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
+  ): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.onRequest(this._query, observer), this._config, this._applied)
   }
 
   maxPages(n: number): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.maxPages(this._query, n), this._config)
+    return new BoundQueryImpl(Query.maxPages(this._query, n), this._config, this._applied)
   }
 
   reverse(): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.reverse(this._query), this._config)
+    return new BoundQueryImpl(Query.reverse(this._query), this._config, this._applied)
   }
 
   startFrom(cursor: string): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.startFrom(this._query, cursor), this._config)
+    return new BoundQueryImpl(Query.startFrom(this._query, cursor), this._config, this._applied)
   }
 
   // --- read options ---
   consistentRead(): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.consistentRead(this._query), this._config)
+    return new BoundQueryImpl(Query.consistentRead(this._query), this._config, this._applied)
   }
 
   ignoreOwnership(): BoundQueryImpl<Model, SkRemaining, A> {
-    return new BoundQueryImpl(Query.ignoreOwnership(this._query), this._config)
+    return new BoundQueryImpl(Query.ignoreOwnership(this._query), this._config, this._applied)
   }
 
   // --- terminals ---
@@ -680,6 +1000,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   count(): Effect.Effect<number, DynamoClientError | ValidationError, never> {
     return this._run(Query.count(this._query))
+  }
+
+  /** No I/O, so no operation, span or client: the plan is described from the query alone. */
+  explain(): Effect.Effect<Query.QueryExplain, never, never> {
+    return Query.explain(this._query)
   }
 }
 

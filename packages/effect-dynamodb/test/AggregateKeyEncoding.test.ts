@@ -112,6 +112,69 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  class Stop extends Schema.Class<Stop>("Stop")({
+    label: Schema.String,
+    note: Schema.String,
+  }) {}
+
+  class Route extends Schema.Class<Route>("Route")({
+    id: Schema.String,
+    area: Schema.String,
+    stops: Schema.Array(Stop),
+  }) {}
+
+  // #171: every sort key composite escapes U+0000–U+0025 — the collection
+  // sort key's and a many edge's. The partition key does not.
+  const RouteAggregate = Aggregate.make(Route, {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { index: "lsi1", name: "routes", sk: { field: "lsi1sk", composite: ["area"] } },
+    root: { entityType: "RouteItem" },
+    edges: {
+      stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
+    },
+  })
+
+  it.effect("sort key composites escape characters up to '%'; the partition key does not", () =>
+    Effect.gen(function* () {
+      mockTransactWrite.mockResolvedValue({})
+      yield* RouteAggregate.create({
+        id: "r 1#x",
+        area: "North East",
+        stops: [
+          { label: "a#b", note: "n" },
+          { label: "new york", note: "n" },
+          { label: "50%", note: "n" },
+        ],
+      } as never)
+      const items = mockTransactWrite.mock.calls.flatMap(
+        ([input]) =>
+          (
+            input as {
+              TransactItems: Array<{ Put?: { Item: Record<string, { S?: string }> } }>
+            }
+          ).TransactItems,
+      )
+      const keys = items.map((item) => ({
+        pk: item.Put!.Item.pk!.S,
+        sk: item.Put!.Item.sk!.S,
+        lsi1sk: item.Put!.Item.lsi1sk?.S,
+      }))
+      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r 1#x"]))
+      expect(keys.map((key) => key.sk).sort()).toEqual([
+        "$aggkeys#v1#routeitem",
+        "$aggkeys#v1#routestop#50%25",
+        "$aggkeys#v1#routestop#a%23b",
+        "$aggkeys#v1#routestop#new%20york",
+      ])
+      // The root's collection sort key: `area`, escaped.
+      expect(keys.find((key) => key.sk === "$aggkeys#v1#routeitem")?.lsi1sk).toBe(
+        "$aggkeys#v1#routes#north%20east",
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("DateEpochMs composes the EPOCH — changed from the previous ISO form", () =>
     Effect.gen(function* () {
       mockTransactWrite.mockResolvedValue({})

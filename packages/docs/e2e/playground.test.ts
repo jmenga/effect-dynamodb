@@ -80,13 +80,13 @@ test.describe("Playground", () => {
   })
 
   test("editing entity attribute values updates keys", async ({ page }) => {
-    // Default taskId is "task-001" — visible in the key visualizer spans
+    // Default taskId is "task-001" — its key segment carries the attribute label
     const keyViz = page.locator("text=Generated Keys").locator("..")
-    await expect(keyViz.getByText("task-001", { exact: true })).toBeVisible()
+    await expect(keyViz.getByText("taskid_task-001", { exact: true })).toBeVisible()
 
     await page.locator("#field-taskId").fill("task-xyz")
 
-    await expect(keyViz.getByText("task-xyz", { exact: true })).toBeVisible()
+    await expect(keyViz.getByText("taskid_task-xyz", { exact: true })).toBeVisible()
   })
 
   test("output tabs switch between views", async ({ page }) => {

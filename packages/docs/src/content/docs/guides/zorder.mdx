@@ -1,0 +1,425 @@
+---
+title: "Z-order Indexes"
+description: "Range over several attributes at once: interleaved binary sort keys, .within() box queries, read strategies, cursors, write cost and when Z-order pays"
+---
+
+A DynamoDB query can range over one thing: the sort key. A composite sort key `[status, price]` ranges over `status`, and over `price` only once `status` is fixed. Every other bound ("price between X and Y, at least 3 bedrooms, listed this week") becomes a `FilterExpression`, which runs after the read: every row in the key range is read and paid for, including the rows the filter drops.
+
+A **Z-order index** packs several attributes into one sort key. Each attribute is quantized to a fixed number of bits, and the bits are interleaved into one binary value. A box query over those attributes becomes a few short key ranges that skip most of the rows outside the box.
+
+## How a Z-address works
+
+Interleave the bits of each dimension, most significant first. With two 3-bit dimensions and `x` first, the address is `z = x₂ y₂ x₁ y₁ x₀ y₀`. Take the box `x ∈ [3, 4], y ∈ [2, 3]`:
+
+| Point | x | y | z bits | z |
+|---|---|---|---|---|
+| (3, 2) | `011` | `010` | `001110` | 14 |
+| (3, 3) | `011` | `011` | `001111` | 15 |
+| (4, 2) | `100` | `010` | `100100` | 36 |
+| (4, 3) | `100` | `011` | `100101` | 37 |
+
+The four points are not contiguous. There are three ways to read them:
+
+- **Naive:** one range, `BETWEEN 14 AND 37`. That is 24 addresses for 4 points; 16 to 35 are all outside the box (16 is `010000`, the point (0, 4)).
+- **Jump:** read from 14. The read reaches 16, which is outside the box, so compute the smallest in-box address above 16 (**BIGMIN**, Tropf and Herzog's algorithm), which is 36, and start a new range there. Two requests, and the rows between 16 and 35 are not read.
+- **Precise:** split the box into its gap-free ranges up front, `[14, 15]` and `[36, 37]`, and read both.
+
+A real index works the same way over more bits. The library chooses between the three for you (see [Strategies](#strategies)), checks every bound exactly on the rows it reads, and pages through the ranges with the usual `limit` and cursor contracts.
+
+## Declaring a Z-order index
+
+A Z-order index is a GSI whose sort key half declares `zorder` (and optionally `prefix`) instead of `composite`. The partition key half is an ordinary composite.
+
+```typescript region="models" example="guide-zorder.ts"
+class Listing extends Schema.Class<Listing>("Listing")({
+  listingId: Schema.String,
+  region: Schema.String,
+  agencyId: Schema.String,
+  title: Schema.String,
+  price: Schema.Number,
+  bedrooms: Schema.Number,
+  listedAt: DynamoModel.DateString,
+}) {}
+
+const RentalStatus = {
+  Available: "available",
+  Leased: "leased",
+  Pending: "pending",
+  Withdrawn: "withdrawn",
+} as const
+
+class Rental extends Schema.Class<Rental>("Rental")({
+  rentalId: Schema.String,
+  agencyId: Schema.String,
+  status: Schema.Literals(Object.values(RentalStatus)),
+  price: Schema.Number,
+}) {}
+```
+
+```typescript region="zorder-entity" example="guide-zorder.ts"
+const Listings = Entity.make({
+  model: Listing,
+  entityType: "Listing",
+  primaryKey: {
+    pk: { field: "pk", composite: ["listingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    search: {
+      name: "gsi1",
+      // Exact-match facets, as for any index: one partition per region.
+      pk: { field: "gsi1pk", composite: ["region"] },
+      sk: {
+        field: "gsi1sk", // a binary (B) attribute
+        prefix: ["agencyId"], // exact-match, in front of the address
+        zorder: [
+          // Declaration order is interleave priority.
+          { field: "price", min: 0, max: 5_000_000, step: 1_000 }, // 13 bits
+          { field: "bedrooms", min: 0, max: 15 }, // 4 bits
+          { field: "listedAt", from: "2024-01-01", unit: "hours", bits: 16 }, // 16 bits
+        ],
+      },
+    },
+  },
+})
+```
+
+### Dimensions
+
+`sk.zorder` lists the **dimensions**: model fields, each mapped onto a fixed number of levels. Declaration order is interleave priority: each dimension's most significant bit enters the address in the first round, then the next bit of each, and so on, so every dimension has coarse control near the top of the address.
+
+Each entry names a model field, and the field's type in the model decides which options the entry takes. The entry doesn't restate the type; it only says how to quantize the values:
+
+| Field type | Entry | Levels |
+|---|---|---|
+| `number` or `bigint` | `{ field, min, max, step? }` | `(max - min) / step + 1` (`step` defaults to 1). Integer arithmetic when `min`, `max` and `step` are all integers, float otherwise; a `bigint` field takes integer options only |
+| a date with a known storage format: a `DynamoModel` date schema (`DateString`, `DateEpochMs`, `DateEpochSeconds`, `DateTimeZoned`, …) or an Effect date schema | `{ field, from, unit, bits }` | `2^bits` of one `unit` each, from `from` |
+| a literal union, or `boolean` | the bare name, or `{ field, values?, bits? }` (a string union also takes a byte width, a number union a range) | one per member, in the schema's order (`false`, `true` for a boolean). `values` reorders them and must list every member |
+| `string` | `{ field, bytes }` | the first `bytes` (1 to 16) UTF-8 bytes |
+| a plain `string` whose values you know | `{ field, values, bits? }` | one per listed value; a value outside the list fails the write. A plain `number` takes a range only (`values` on it is `EDD-9088`): its order is the numbers' own |
+
+A literal union field needs no options at all:
+
+```typescript
+// status: Schema.Literals(["available", "leased", "pending", "withdrawn"])
+zorder: ["status", { field: "price", min: 0, max: 2_000, step: 10 }]
+```
+
+These are the dimensions of a **literals** kind: one level per value, ranges over the value order. A dimension takes as many bits as its levels need, unless `bits` says otherwise. Values below `min` or above `max` share the edge levels, so a box that reaches an edge still reads them, and the exact bound check removes any that fall outside it. Fewer levels means fewer bits and a smaller search space, so pick the coarsest `step` your queries can live with.
+
+`Entity.make` types every entry from the model: the editor completes the field names and each field's options, and a misspelled field, a misspelled option (`stpe` beside `min` and `max`), an option of another kind (`from` on a `number` field), or a bare name on a field with no members is a compile error on that entry. The same holds for a hashed prefix part, which takes `field` and `hash` only. An entry declared outside `Entity.make` (in a shared array, say) needs `as const` to keep its field name a literal.
+
+The same rules hold at runtime, for untyped callers, when `Entity.make` runs:
+
+- `EDD-9086`: a malformed Z-order half. `zorder` belongs on a GSI sort key only, not on a partition key half or the primary key (both are also type errors); no `composite` beside `zorder`; no `type: "clustered"`; no field listed twice; each entry a field name or an object naming one.
+- `EDD-9087`: options an entry can't use: a bound, `step`, `bits`, `from`, `bytes` or `values` list out of range, options of two kinds, or an option no entry of its kind takes (a misspelled `stpe` is refused, not ignored); on a prefix part, a `hash` outside 1 to 8 or a key other than `field` and `hash`.
+- `EDD-9088`: an entry that doesn't fit its field, such as a range over a `string` field, `values` over a plain `number` field, or a time window over a plain `number` or `string`, whose order is unknown.
+- `EDD-9089`: a dimension over its kind's bit limit (53, or 128 for a byte width), or more than 512 bits in all.
+- `EDD-9090`: a Z-order index can't be a `collection` member.
+
+### Prefix composites
+
+`sk.prefix` puts exact-match composites in the sort key, in front of the address. Use one when a facet is matched exactly but shouldn't split the partition:
+
+- **Broad queries stay in one partition.** With `region` in the partition key and `agencyId` in the prefix, a region-wide search is one partition, and an agency search is a narrow range inside it.
+- **The facet can be left out.** A partition key composite is required on every query. A prefix composite can be omitted, and the query then [skip-scans](#reading-across-prefix-values) over its values.
+- **Hierarchies.** `prefix: ["agencyId", "officeId"]` serves agency-only and agency-plus-office queries.
+
+Each prefix value is stored as its byte length and its UTF-8 bytes, after the index's casing, so prefix matching is case-insensitive like any composite and no value is a prefix of another. For long IDs, `{ field: "officeId", hash: 8 }` stores the first `n` bytes (1 to 8) of the value's FNV-1a-64 hash instead; queries then check the value on each row, since two values can share a hash.
+
+### The binary attribute
+
+The stored sort key is a binary (`B`) attribute: the prefix segments, then the address, padded to whole bytes. It carries no schema or entity prefix; the partition key already separates entities. `Table.definition` declares the attribute as `B`, so a table created from it (or with `db.tables.<name>.create()`) is ready:
+
+```typescript region="table-definition" example="guide-zorder.ts"
+// A Z-order sort key is a binary attribute: Table.definition declares it as "B".
+// (client is the raw DynamoClient service; tableName the physical table name.)
+const definition = Table.definition(MainTable)
+const gsi1sk = definition.AttributeDefinitions.find((a) => a.AttributeName === "gsi1sk")
+// gsi1sk?.AttributeType → "B"
+
+yield* client.createTable({
+  TableName: tableName,
+  BillingMode: "PAY_PER_REQUEST",
+  ...definition,
+})
+```
+
+DynamoDB fixes one type per key attribute, table-wide, so a `B` sort key can't share its attribute name with a string key half. `Table.make` and `Table.definition` refuse that with `EDD-9091`, naming both declarers. Several entities can share one Z-order GSI (each with its own dimensions); their partition keys keep their addresses apart.
+
+The whole value counts against DynamoDB's 1,024-byte sort key limit. The address is a few bytes; long unhashed prefix values are what grow it. The library doesn't check the size before writing: DynamoDB rejects an oversized key, and the write fails with an error naming the item and the key.
+
+Writes need no special call: `put`, batch and transactional writes compose the key like any other. An index whose prefix composites and dimensions are not all present on an item is skipped for that item, as a sparse index is. A value a dimension can't place (`NaN`, an unparseable date, a value outside a `literals` list) fails the write with a `ValidationError` (`EDD-9092`).
+
+## Querying with `.within()`
+
+A Z-order index's accessor takes the partition key composites. `.within()` bounds the box:
+
+```typescript region="within" example="guide-zorder.ts"
+const march10 = DateTime.makeUnsafe("2024-03-10T00:00:00Z")
+
+// One agency: a box over all three dimensions, read as a few key ranges.
+const agencyMatches = yield* db.entities.Listings.search({ region: "north" })
+  .within({
+    agencyId: "ag-2",
+    price: { between: [600_000, 900_000] },
+    bedrooms: { gte: 3 },
+    listedAt: { gte: march10 },
+  })
+  .collect()
+
+// Every agency: the prefix is skip-scanned, then the same box in each.
+const regionMatches = yield* db.entities.Listings.search({ region: "north" })
+  .within({
+    price: { between: [600_000, 900_000] },
+    bedrooms: { gte: 3 },
+    listedAt: { gte: march10 },
+  })
+  .collect()
+```
+
+- **Dimension bounds** are in the field's own type: `number` for `price`, `DateTime.Utc` for a `DateString` field. Each is one of `{ eq }`, `{ between: [low, high] }`, or a lower end (`gt` / `gte`) and / or an upper end (`lt` / `lte`). A literals dimension's ranges follow **its order**, the schema's member order or the `values` list (`{ gte: "pending" }` is every value at or after `"pending"`), and it also takes `{ in: [...] }`.
+- **Prefix composites** take one exact value each.
+- **A dimension left out** means its full range. `.within({})` changes nothing.
+- **Every bound is exact.** Quantization lets rows just outside the box share a level with rows inside it, so the library checks every bound on the rows it reads: with a `FilterExpression` where DynamoDB's comparison of the stored attribute agrees with the dimension's order, and on each row in the client where it doesn't (a `Schema.NumberFromString` field stored as text, a `DateTimeZoned` field, a hashed prefix).
+- **Bad bounds throw at `.within()`**, before anything is sent: a value that can't be encoded (`EDD-9050`), one a dimension can't place (`EDD-9092`), or a misuse reachable from untyped code, such as an unknown field or a range on a prefix composite (`EDD-9093`).
+
+`.where()` is not offered on a Z-order accessor: the sort key is a binary address, with no text order to compare against.
+
+### Result order
+
+Results come back in **sort key order**, which for a Z-order index is Z-order: not sorted by price, bedrooms or date. Sort them yourself if you need another order. `.reverse()` returns the same rows in reverse Z-order.
+
+### Reading across prefix values
+
+When a prefix composite is left out, as in `regionMatches` above, the query **skip-scans**: a one-row probe finds the first agency in the partition, the box is read inside that agency, and the next probe starts past it. Each distinct agency costs one probe (plus one that finds nothing at the end), and only in-box rows are read in each.
+
+Prefix values come back in their **stored** order: by byte length after casing, then by bytes. So `"b"` comes before `"aa"`. A hashed prefix value comes back in hash order, which means nothing. Skip-scan has a probe budget, `maxSkips` (default 32), passed as `.within(bounds, { maxSkips })`: past it, the rest of the partition is read once with every bound checked per row.
+
+## Strategies
+
+`.zorder()` chooses how the box is read. It is available on Z-order accessors only, before or after `.within()`; later calls merge over earlier ones.
+
+| Strategy | Requests | Rows read outside the box | Best when |
+|---|---|---|---|
+| `naive` | One range from the box's lowest to its highest address | Many | The box covers most of the space, or the partition is small |
+| `jump` | One range at a time; each page's last examined key decides whether to continue or jump to the next in-box address | Few: about one short page into each gap | Unknown density; few round trips in flight |
+| `precise` | One per planned range (at most `maxRanges`), up to `concurrency` in flight (4 with a `limit`, 1 without) | None in exact ranges; some where small gaps were merged to fit the cap | Dense data, where latency matters more than requests |
+
+The default, `"auto"`, reads with `precise` when the box's exact plan fits `maxRanges`, and with `jump` otherwise.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `strategy` | `"auto"` | `"auto"`, `"naive"`, `"jump"` or `"precise"` |
+| `maxRanges` | 16 | The cap on `precise` ranges, and on the exact plan `auto` accepts |
+| `pageSize` | sized from the run | A fixed `Limit` for `jump` requests. Unset, each starts at 16 and doubles while pages end inside the box, up to 1,000 |
+| `concurrency` | 4 with a `limit`, 1 without | Planned ranges in flight at once (see [Throughput](#shared-partition-throughput)) |
+
+An exact plan needs the box's edges to fall on large power-of-two blocks of addresses. With fine-grained dimensions most boxes don't, and `auto` reads them with `jump`. `explain()` tells you which, and why.
+
+### Comparing strategies: `explain()` and `onRequest()`
+
+`.explain()` describes what a query would send, without sending anything:
+
+```typescript region="explain" example="guide-zorder.ts"
+const query = db.entities.Listings.search({ region: "north" }).within({
+  agencyId: "ag-2",
+  price: { between: [600_000, 750_000] },
+  bedrooms: { between: [3, 4] },
+})
+
+const explained = yield* query.explain()
+// explained.plan          → "jump"
+// explained.reason        → "exact plan over maxRanges"
+// explained.keyConditions → [{ lower: "0x0004…", upper: "0x0004…", exact: false }]
+// explained.filter        → "(price >= 600000) AND (price <= 750000) AND (bedrooms >= 3) AND (bedrooms <= 4)"
+// explained.zorder        → { bits: 33, box: [...], fill: 0.0136, exactRanges: "over-cap" }
+```
+
+`zorder.box` lists the levels the box selects per dimension, `fill` the share of the addresses between the box's corners that lie inside it, and `exactRanges` the size of the exact plan (or `"over-cap"`). Binary key bounds are shown as `0x…` hex.
+
+`.onRequest(observer)` runs after every request a terminal sends, with what it examined (`scannedCount`) and what became items (`accepted`). Σ `scannedCount` against Σ `accepted` is what a query read against what it returned:
+
+```typescript region="strategies" example="guide-zorder.ts"
+// Rows examined (ScannedCount) against items returned, per strategy.
+const measure = (strategy: "naive" | "jump" | "precise") =>
+  Effect.gen(function* () {
+    const events: Array<Query.QueryRequestEvent> = []
+    const items = yield* query
+      .zorder({ strategy })
+      .onRequest((event) => Effect.sync(() => void events.push(event)))
+      .collect()
+    const examined = events.reduce((sum, event) => sum + event.scannedCount, 0)
+    return { strategy, requests: events.length, examined, returned: items.length }
+  })
+
+const naive = yield* measure("naive")
+const jump = yield* measure("jump")
+const precise = yield* measure("precise")
+// Same listings from each. naive: 1 request, most rows examined; jump: a few
+// requests, fewer rows; precise: one request per planned range, fewest rows.
+```
+
+On the example's 80 listings per agency:
+
+| Strategy | Requests | Rows examined | Returned |
+|---|---|---|---|
+| `naive` | 1 | 74 | 3 |
+| `jump` | 3 | 32 | 3 |
+| `precise` | 16 | 12 | 3 |
+
+On a partition this small, `naive` is the cheapest in read units: 74 small rows are one request's worth, while every request costs at least 0.5 RCU even when it returns nothing, so 16 precise ranges cost at least 8 RCU. Z-order pays on large partitions, where the rows outside the box are most of the partition. Measure on your data.
+
+Every query has `explain()` and `onRequest()`, not only Z-order ones. See [Queries](/effect-dynamodb/guides/queries/#inspecting-a-query-explain-and-onrequest).
+
+## Cursors
+
+`fetch()` and `.startFrom()` page through a box as through any query:
+
+```typescript region="fetch-chain" example="guide-zorder.ts"
+const box = db.entities.Listings.search({ region: "north" })
+  .within({ price: { between: [600_000, 900_000] }, bedrooms: { gte: 3 } })
+  .limit(8)
+
+// Each page's cursor resumes the box exactly where that page stopped; the stream
+// ends at the page without one.
+const paged = yield* Stream.paginate(box, (query) =>
+  query.fetch().pipe(
+    Effect.map((page) =>
+      [page.items, Option.map(page.cursor, (cursor) => box.startFrom(cursor))] as const,
+    ),
+  ),
+).pipe(Stream.runCollect)
+```
+
+A page's `cursor` is an `Option<string>`, `None` on the last page, so mapping it to the next query gives the stream its stop signal. To hand pages to a client one request at a time, run `box.startFrom(cursor).fetch()` with the cursor it sent back. To read every item in one process, `box.paginate()` streams them directly.
+
+A Z-order cursor records a **position**: how far through the box the query has got (and, while skip-scanning, which prefix value it is in), never a range to read. Resuming recomputes the plan and starts it at that position. So a cursor stays valid when you change `strategy`, `maxRanges` or `concurrency` between pages, and the chain of pages returns exactly what one `collect()` would.
+
+A cursor belongs to its query. A `.within()` query refuses one from a different box, partition, direction or index declaration, and a query without `.within()` refuses a box's cursor: the terminal fails with a `ValidationError` (`EDD-9094`). See [Cursor-Based Pagination](/effect-dynamodb/guides/queries/#cursor-based-pagination) for what a query without `.within()` can check.
+
+## Updates move entries
+
+Every prefix composite and dimension is key material. An update that changes one by at least one level writes a new address, which **moves** the index entry:
+
+```typescript region="update-moves" example="guide-zorder.ts"
+// cheap is a listing of agency ag-2 outside the box (priced under 600,000).
+// Every prefix composite and dimension is key material: carry them all,
+// and a change of at least one level moves the entry to a new address.
+yield* db.entities.Listings.update({ listingId: cheap.listingId }).set({
+  agencyId: cheap.agencyId,
+  price: 750_000,
+  bedrooms: 4,
+  listedAt: DateTime.makeUnsafe("2024-03-20T09:00:00Z"),
+})
+
+const nowInBox = yield* db.entities.Listings.search({ region: "north" })
+  .within({
+    agencyId: "ag-2",
+    price: { between: [600_000, 900_000] },
+    bedrooms: { gte: 3 },
+    listedAt: { gte: march10 },
+  })
+  .collect()
+// nowInBox includes the updated listing (once the GSI has caught up)
+```
+
+A Z-order sort key is **all or nothing**. An update recomposes it only when every prefix composite and dimension is in the update (or the primary key). Otherwise the index's [`indexPolicy`](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) decides: under `"preserve"` (the default) the stored address is left alone and may go stale; under `"sparse"` the item leaves the index; `.remove([field])` of one of them removes the key either way. An update that touches none of them leaves the key alone. A partial address is meaningless, so the key is never truncated. A change within one level writes the same bytes, and the entry stays where it is.
+
+- **Choose steps so values change rarely.** The step sets how often the entry moves. A "last seen" timestamp at minute resolution would move the entry on almost every write; quantize it to hours or days, or leave it out of the address.
+- **Each move costs two index writes.** DynamoDB deletes the old entry and puts the new one, on the GSI's partition key: `region` here, shared by every listing in it, at 1,000 WCU per second per partition. When a GSI's writes are throttled, DynamoDB throttles writes to the **base table** as well, so frequent moves can throttle unrelated writes. Coarser steps, or a more selective GSI partition key, reduce it.
+- **One writer per sort key.** A writer that owns `price` but not `listedAt` can't recompose the address. Give the dimensions to one writer, as the [multi-writer design rule](/effect-dynamodb/guides/index-policy/#multi-writer-entity-design-rule) says for any index half.
+
+## Skip-scan on composite indexes
+
+`.within()` also works on ordinary composite sort keys, with no Z-order involved. The `Rentals` entity sorts by `status`, then `price`:
+
+```typescript region="composite-entity" example="guide-zorder.ts"
+const Rentals = Entity.make({
+  model: Rental,
+  entityType: "Rental",
+  primaryKey: {
+    pk: { field: "pk", composite: ["rentalId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // An ordinary composite sort key: status first, then weekly price.
+    byStatus: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["agencyId"] },
+      sk: { field: "gsi2sk", composite: ["status", "price"] },
+    },
+  },
+})
+```
+
+`.where()` can't bound `price` without pinning `status`. `.within()` can:
+
+```typescript region="skip-scan" example="guide-zorder.ts"
+// byStatus sorts by status, then price. A price bound alone skip-scans:
+// one probe finds each status, then only that status's price range is read.
+const affordable = db.entities.Rentals.byStatus({ agencyId: "ag-1" }).within({
+  price: { between: [500, 650] },
+})
+
+const plan = yield* affordable.explain()
+// plan.plan → "skip-scan"
+const rentalsInRange = yield* affordable.collect()
+
+// maxSkips caps the probes; past it, the rest is read once and checked per row.
+const filtered = yield* db.entities.Rentals.byStatus({ agencyId: "ag-1" })
+  .within({ price: { between: [500, 650] } }, { maxSkips: 0 })
+  .collect()
+```
+
+Skip-scan pays when the skipped composite has few distinct values relative to the rows (statuses, categories). The [Queries guide](/effect-dynamodb/guides/queries/#bounding-any-sort-key-composite-within) covers when it applies and when the query reads with a filter instead.
+
+## Costs and limits
+
+### Shared-partition throughput
+
+`concurrency` bounds requests in flight, not read units per second. Every range of one search shares one GSI partition key, and a partition serves at most 3,000 RCU per second (on-demand tables too). A natural 1 MB page read eventually consistently costs 128 RCU; at about 20 ms per request, one slot in flight drives about 6,400 RCU per second, so 4 slots draining natural pages would ask for about 25,600 RCU per second, more than eight times what the partition serves. DynamoDB can split a hot partition by sort key range over time, but not within one query.
+
+That is why the default is 4 only for reads with a `limit` (sized pages, usually far below 1 MB) and 1 for drains without one. `concurrency` trades latency for throttling risk; use `concurrency: 1` on a table near its partition limits.
+
+The library adds no retry of its own: each request goes through the SDK's retry strategy, as every query does. A request that still fails fails `collect()`, `count()` and `paginate()`. `fetch()` is the exception: if a range read alongside earlier ones is throttled, it returns the items the earlier ranges produced, with a cursor that retries the throttled range on the next call.
+
+### Empty ranges and probes
+
+- **Every request costs at least 0.5 RCU**, even when it returns nothing. 16 precise ranges cost at least 8 RCU.
+- **A probe costs the size of the row it reads**, rounded up to 4 KB (0.5 RCU per 4 KB eventually consistent), not a fixed small amount. A `ProjectionExpression` doesn't reduce consumed capacity. With 40 KB items, 32 probes cost about 160 RCU. Budget `maxSkips` by item size × distinct prefix (or leading composite) values, not by probe count alone.
+
+Probes and planned reads are counted in the query's [consumed capacity](/effect-dynamodb/guides/consumed-capacity/) report, under `Entity.query`.
+
+### Consistency
+
+Every dimension is key material, so an ordinary field update that crosses a level moves the GSI entry. While a multi-request plan runs (or between `fetch()` calls), an item that moves can be returned twice (read in one range, then again in a range read later) or missed (moved from an unread range into one already read). Plain DynamoDB pagination has the same anomaly for sort key changes; Z-order turns ordinary field updates into sort key changes. Deduplicate by primary key where it matters.
+
+GSIs are also eventually consistent: a `.within()` right after an update may not see the move yet. GSI reads can't be strongly consistent.
+
+## When Z-order doesn't pay
+
+- **Important dimensions left unbounded.** A box that leaves a high-priority dimension open spans most of the address space, and reads close to what a filter would. Z-order wins for the queries that bound the dimensions declared first.
+- **High-cardinality exact-match IDs.** IDs matched exactly belong in the partition key or the prefix, never in the interleave: a dimension's bits are only useful for ranges.
+- **Dimension order.** Put the most selective and most often bounded dimensions first.
+- **Small partitions.** When one request reads the whole partition, a filter over it costs less than several ranges.
+- **Fast-changing values.** Each level change moves the entry (see [Updates move entries](#updates-move-entries)).
+
+## Changing a declaration
+
+The stored bytes mean what the declaration says: dimension order, `min` / `max` / `step`, `from` / `unit` / `bits`, `bytes`, a literals dimension's values and their order, and the prefix list (and its `hash` options). For a bare literal-union entry the order is the schema's, so reordering the union's members is a declaration change too. Changing any of them changes what every stored address means, so it needs a **new index** (or a rewrite of every item), not an edit of the old one. Cursors a `.within()` query took under the old declaration fail with `EDD-9094`. Appending a member is safe only while the values fit the dimension's `bits`; reserve room with `{ field: "status", bits: 4 }`.
+
+### Adding a Z-order index to an existing table
+
+DynamoDB types a key attribute table-wide and can't change a GSI's key types in place. To add a Z-order index to a table that has data:
+
+1. Use a **new attribute name** for the `B` sort key and a **new GSI**. Never reuse an attribute that already holds `S` values (from a string index being converted, or from items the library didn't write): DynamoDB's backfill silently leaves items whose attribute has the wrong type out of the new index, and later writes that carry an `S` value there are rejected. `EDD-9091` sees only the entities you register, not stored data.
+2. Take the new GSI's spec and its `AttributeDefinitions` (with `AttributeType: "B"`) from `Table.definition(table)`, and pass them to `db.tables.<name>.update({ AttributeDefinitions, GlobalSecondaryIndexUpdates: [{ Create: … }] })`.
+3. Rewrite existing items: a `put`, or an `update` carrying every prefix composite and dimension, composes the new key. Until then an item is absent from the new index.
+
+## What's Next?
+
+- [Queries](/effect-dynamodb/guides/queries/) -- Request sizing, `.within()` on composite indexes, `explain()` and `onRequest()`
+- [indexPolicy](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) -- How updates treat a Z-order sort key
+- [Indexes & Collections](/effect-dynamodb/guides/indexes/) -- Composite index declarations and collections
+- [Consumed Capacity](/effect-dynamodb/guides/consumed-capacity/) -- What each query cost

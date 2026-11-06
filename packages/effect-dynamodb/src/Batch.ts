@@ -25,7 +25,7 @@ import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./internal/ItemSize.js"
 import {
   batchRejectReason,
-  composePrimaryKey,
+  composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
   rejectUnsupportedOp,
@@ -135,10 +135,12 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
 
     // Compose each position's primary key. `BatchGetItem` does not preserve
     // order, so `batchGetRaw` matches responses back to positions by key.
-    const requests = infos.map((info) => ({
-      tableName: tableNames.get(info.entity)!,
-      key: toAttributeMap(composePrimaryKey(info.entity, info.key!)),
-    }))
+    const requests = yield* Effect.forEach(infos, (info) =>
+      Effect.map(composePrimaryKeyOrFail(info.entity, info.key!, "batchGet"), (key) => ({
+        tableName: tableNames.get(info.entity)!,
+        key: toAttributeMap(key),
+      })),
+    )
     const fetched = yield* batchGetRaw(client, requests, {
       maxRetries,
       baseDelayMs,
@@ -148,6 +150,43 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
         return { entityType, source: `get ${position} (${entityType})` }
       },
     })
+
+    // Items still under their 1.36 keys (#171): one more BatchGetItem, for the
+    // misses whose key text changed. Another value's 1.36 row at an item's key
+    // is a miss too.
+    const owned = (position: number, at: Record<string, unknown>) => {
+      const item = fetched[position]
+      const info = infos[position]!
+      if (item !== undefined && !info.entity._ownsRow136(info.key!, at, item)) {
+        fetched[position] = undefined
+      }
+    }
+    for (const [position, request] of requests.entries()) {
+      owned(position, fromAttributeMap(request.key) as Record<string, unknown>)
+    }
+    const misses = fetched.flatMap((item, position) => {
+      if (item !== undefined) return []
+      const old = infos[position]!.entity._primaryKey136(infos[position]!.key!)
+      return old === undefined
+        ? []
+        : [{ position, tableName: requests[position]!.tableName, key: toAttributeMap(old) }]
+    })
+    if (misses.length > 0) {
+      const found = yield* batchGetRaw(client, misses, {
+        maxRetries,
+        baseDelayMs,
+        describe: (j) => {
+          const position = misses[j]!.position
+          const entityType = infos[position]!.entity.entityType
+          return { entityType, source: `get ${position} (${entityType}, at its 1.36 key)` }
+        },
+      })
+      for (const [j, item] of found.entries()) {
+        const position = misses[j]!.position
+        fetched[position] = item
+        owned(position, fromAttributeMap(misses[j]!.key) as Record<string, unknown>)
+      }
+    }
 
     const results: Array<unknown> = new Array(items.length).fill(undefined)
     for (let i = 0; i < fetched.length; i++) {
@@ -299,6 +338,34 @@ export const write = (
 ): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
   Capacity.operation("Batch.write", undefined, writeCore(operations, config))
 
+/**
+ * `Entity._alias136` (#171): a put first moves another value's 1.36 row out
+ * of its way (`_clearAlias136`), its rare `ConcurrentModification` — such rows
+ * still holding each other's keys after every move — the `ValidationError` it
+ * is to a batch.
+ */
+const aliasOf = (
+  entity: TransactableInfo["entity"],
+  key: Record<string, unknown>,
+  op: "put" | "delete",
+) =>
+  Effect.gen(function* () {
+    if (op === "put") yield* entity._clearAlias136(key, "batchWrite")
+    return yield* entity._alias136(key, op === "delete")
+  }).pipe(
+    Effect.catchTag("ConcurrentModification", (cause) =>
+      Effect.fail(
+        new ValidationError({
+          entityType: entity.entityType,
+          operation: "batchWrite",
+          cause:
+            "Batch.write: rows 1.36 wrote for other values kept the item's key while they " +
+            `were moved (${JSON.stringify(cause.key)}). The batch was not sent; retry it.`,
+        }),
+      ),
+    ),
+  )
+
 const writeCore = (
   operations: ReadonlyArray<BatchWriteOp>,
   config?: BatchRetryConfig,
@@ -331,13 +398,20 @@ const writeCore = (
       const primary = entity.indexes.primary!
       return JSON.stringify([tableName, item[primary.pk.field], item[primary.sk.field]])
     }
-    const writeRequests: Array<{
+    type WriteRequest = {
       tableName: string
       request: Record<string, any>
       entityType: string
       keyFields: ReadonlyArray<string>
       keys: () => KeyAttributes
-    }> = []
+    }
+    const writeRequests: Array<WriteRequest> = []
+    // The 1.36 keys puts leave behind (#171), deleted once every request
+    // above is written: BatchWriteItem is not atomic, so a Delete sent beside
+    // its Put could land without it. A key another put of the batch writes is
+    // that item's, and left alone.
+    const leftBehind: Array<WriteRequest & { readonly at: string }> = []
+    const putAt = new Set<string>()
 
     for (const op of operations) {
       const info = extractTransactable(op)
@@ -397,6 +471,7 @@ const writeCore = (
         // window between a check and the write.
         const key = keyOf(tableName, entity, built.marshalled)
         touched.set(key, (touched.get(key) ?? 0) + 1)
+        putAt.add(key)
         if (entity._incarnationToken) {
           versionedKeys.set(key, entity.entityType)
           const transactItem: TransactWriteItem = {
@@ -426,18 +501,71 @@ const writeCore = (
             keys,
           })
         }
+        // An item still under its 1.36 key (#171): a put replaces it, so the
+        // 1.36 key is deleted; a versioned put is create-only, so that key
+        // must be empty too (a separate check, which a chunk boundary can
+        // split from its put). At a key another value's 1.36 row can share,
+        // that row is moved out of the way first, and that value's row at the
+        // item's 1.36 key is left alone.
+        const alias = yield* aliasOf(entity, info.input!, "put")
+        const old = alias.old ? undefined : entity._primaryKey136(info.input!)
+        if (old !== undefined && entity._incarnationToken) {
+          const transactItem: TransactWriteItem = {
+            ConditionCheck: {
+              TableName: tableName,
+              Key: toAttributeMap(old),
+              ConditionExpression: "attribute_not_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": entity.indexes.primary!.pk.field },
+            },
+          }
+          versionedPuts.push({
+            tableName,
+            entityType: entity.entityType,
+            transactItem,
+            keyFields,
+            keys,
+            bytes: transactItemBytes(transactItem),
+          })
+        } else if (old !== undefined) {
+          const oldKey = toAttributeMap(old)
+          leftBehind.push({
+            tableName,
+            request: { DeleteRequest: { Key: oldKey } },
+            entityType: entity.entityType,
+            keyFields,
+            keys,
+            at: keyOf(tableName, entity, oldKey),
+          })
+        }
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
-        const composed = toAttributeMap(composePrimaryKey(entity, info.key!))
+        const composed = toAttributeMap(
+          yield* composePrimaryKeyOrFail(entity, info.key!, "batchWrite.delete"),
+        )
         const key = keyOf(tableName, entity, composed)
         touched.set(key, (touched.get(key) ?? 0) + 1)
-        writeRequests.push({
-          tableName,
-          request: { DeleteRequest: { Key: composed } },
-          entityType: entity.entityType,
-          keyFields,
-          keys,
-        })
+        // The item is deleted wherever it is (#171) — not another value's row
+        // at either of its keys.
+        const alias = yield* aliasOf(entity, info.key!, "delete")
+        if (alias.held === undefined) {
+          writeRequests.push({
+            tableName,
+            request: { DeleteRequest: { Key: composed } },
+            entityType: entity.entityType,
+            keyFields,
+            keys,
+          })
+        }
+        const old = alias.old ? undefined : entity._primaryKey136(info.key!)
+        if (old !== undefined) {
+          writeRequests.push({
+            tableName,
+            request: { DeleteRequest: { Key: toAttributeMap(old) } },
+            entityType: entity.entityType,
+            keyFields,
+            keys,
+          })
+        }
       } else {
         return yield* new ValidationError({
           entityType: entity.entityType,
@@ -561,98 +689,105 @@ const writeCore = (
       }
     }
 
-    // Process in chunks of MAX_BATCH_WRITE
-    for (let chunkStart = 0; chunkStart < writeRequests.length; chunkStart += MAX_BATCH_WRITE) {
-      const chunk = writeRequests.slice(chunkStart, chunkStart + MAX_BATCH_WRITE)
+    // Process in chunks of MAX_BATCH_WRITE: the requests, then the 1.36 keys
+    // their puts left behind.
+    const phases = [writeRequests, leftBehind.filter((request) => !putAt.has(request.at))]
+    const total = phases[0]!.length + phases[1]!.length
+    let before = 0
+    for (const requests of phases) {
+      for (let chunkStart = 0; chunkStart < requests.length; chunkStart += MAX_BATCH_WRITE) {
+        const chunk = requests.slice(chunkStart, chunkStart + MAX_BATCH_WRITE)
 
-      // Group by table name
-      let requestItems: Record<string, Array<Record<string, any>>> = {}
-      for (const item of chunk) {
-        if (!requestItems[item.tableName]) {
-          requestItems[item.tableName] = []
+        // Group by table name
+        let requestItems: Record<string, Array<Record<string, any>>> = {}
+        for (const item of chunk) {
+          if (!requestItems[item.tableName]) {
+            requestItems[item.tableName] = []
+          }
+          requestItems[item.tableName]!.push(item.request)
         }
-        requestItems[item.tableName]!.push(item.request)
-      }
 
-      // Retry loop for unprocessed items
-      let retries = 0
-      while (Object.keys(requestItems).length > 0) {
-        const sentItems = requestItems
-        // What the batch had written before this request: every versioned
-        // chunk, the earlier chunks, and this chunk's requests processed on
-        // earlier attempts (all but the unprocessed ones being retried).
-        const sentCount = Object.values(sentItems).reduce(
-          (sum, requests) => sum + requests.length,
-          0,
-        )
-        const committed = committedBeforeRequest(
-          versionedChunks,
-          chunkStart + chunk.length - sentCount,
-          writeRequests.length - chunkStart - chunk.length,
-        )
-        const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
-          // An oversized item or over-long sort key (#144), named, with what
-          // the batch had already written: Batch.write was never atomic.
-          diagnoseFailure({
-            sent: () => {
-              // The request's entries, in request order, matched back to the
-              // batch's own records (by request object) to name them.
-              const sources = new Map(chunk.map((item) => [item.request, item]))
-              const ordered = Object.values(sentItems).flatMap((requests) =>
-                requests.map((request) => sources.get(request)),
-              )
-              const items = batchEntries(sentItems)
-              return {
-                _tag: "Batch",
-                items,
-                targets: () =>
-                  items.map((item, index) => {
-                    const source = ordered[index]
-                    return transactItemTarget(
-                      item,
-                      source?.tableName ?? "",
-                      source?.keyFields ?? [],
-                      source?.entityType ?? "unknown",
-                      source === undefined
-                        ? `request ${index} of the batch`
-                        : `the ${item.Put !== undefined ? "put" : "delete"} of ${source.entityType}`,
-                    )
-                  }),
+        // Retry loop for unprocessed items
+        let retries = 0
+        while (Object.keys(requestItems).length > 0) {
+          const sentItems = requestItems
+          // What the batch had written before this request: every versioned
+          // chunk, the earlier chunks, and this chunk's requests processed on
+          // earlier attempts (all but the unprocessed ones being retried).
+          const sentCount = Object.values(sentItems).reduce(
+            (sum, requests) => sum + requests.length,
+            0,
+          )
+          const committed = committedBeforeRequest(
+            versionedChunks,
+            before + chunkStart + chunk.length - sentCount,
+            total - before - chunkStart - chunk.length,
+          )
+          const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
+            // An oversized item or over-long sort key (#144), named, with what
+            // the batch had already written: Batch.write was never atomic.
+            diagnoseFailure({
+              sent: () => {
+                // The request's entries, in request order, matched back to the
+                // batch's own records (by request object) to name them.
+                const sources = new Map(chunk.map((item) => [item.request, item]))
+                const ordered = Object.values(sentItems).flatMap((requests) =>
+                  requests.map((request) => sources.get(request)),
+                )
+                const items = batchEntries(sentItems)
+                return {
+                  _tag: "Batch",
+                  items,
+                  targets: () =>
+                    items.map((item, index) => {
+                      const source = ordered[index]
+                      return transactItemTarget(
+                        item,
+                        source?.tableName ?? "",
+                        source?.keyFields ?? [],
+                        source?.entityType ?? "unknown",
+                        source === undefined
+                          ? `request ${index} of the batch`
+                          : `the ${item.Put !== undefined ? "put" : "delete"} of ${source.entityType}`,
+                      )
+                    }),
+                }
+              },
+              keys: () => mergeKeyAttributes(...chunk.map((item) => item.keys())),
+              rewrite: (diagnosis, original) =>
+                diagnosedValidationError(diagnosis, original, {
+                  operation: "batchWrite",
+                  entityType: chunk[0]?.entityType ?? "unknown",
+                  committed,
+                }),
+            }),
+          )
+
+          // Check for unprocessed items
+          const unprocessed: Record<string, Array<Record<string, any>>> = {}
+          if (response.UnprocessedItems) {
+            for (const [tableName, tableItems] of Object.entries(response.UnprocessedItems)) {
+              if (tableItems.length > 0) {
+                unprocessed[tableName] = tableItems as Array<Record<string, any>>
               }
-            },
-            keys: () => mergeKeyAttributes(...chunk.map((item) => item.keys())),
-            rewrite: (diagnosis, original) =>
-              diagnosedValidationError(diagnosis, original, {
-                operation: "batchWrite",
-                entityType: chunk[0]?.entityType ?? "unknown",
-                committed,
-              }),
-          }),
-        )
-
-        // Check for unprocessed items
-        const unprocessed: Record<string, Array<Record<string, any>>> = {}
-        if (response.UnprocessedItems) {
-          for (const [tableName, tableItems] of Object.entries(response.UnprocessedItems)) {
-            if (tableItems.length > 0) {
-              unprocessed[tableName] = tableItems as Array<Record<string, any>>
             }
           }
+
+          if (Object.keys(unprocessed).length === 0) break
+
+          retries++
+          if (retries > maxRetries) {
+            return yield* new DynamoError({
+              operation: "BatchWriteItem",
+              cause: new Error(`Unprocessed items remain after ${maxRetries} retries`),
+            })
+          }
+
+          // Exponential backoff
+          yield* Effect.sleep(`${baseDelayMs * 2 ** (retries - 1)} millis`)
+          requestItems = unprocessed
         }
-
-        if (Object.keys(unprocessed).length === 0) break
-
-        retries++
-        if (retries > maxRetries) {
-          return yield* new DynamoError({
-            operation: "BatchWriteItem",
-            cause: new Error(`Unprocessed items remain after ${maxRetries} retries`),
-          })
-        }
-
-        // Exponential backoff
-        yield* Effect.sleep(`${baseDelayMs * 2 ** (retries - 1)} millis`)
-        requestItems = unprocessed
       }
+      before += requests.length
     }
   })

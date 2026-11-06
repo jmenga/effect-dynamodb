@@ -5,8 +5,8 @@
  * Used two ways, neither of them a pre-check:
  *
  * - by strategies that pick a request that fits — `Entity`'s wide-update split
- *   and its strongest-guard fallback ({@link expressionFits}) — refusing
- *   nothing;
+ *   and its strongest-guard fallback ({@link expressionFits}), the guard on a
+ *   1.36 row's move ({@link asReadGuard}) — refusing nothing;
  * - by `WriteDiagnosis.ts`, to confirm DynamoDB's rejection of an expression
  *   against the request that was sent and name it.
  *
@@ -15,6 +15,8 @@
  * rejected; an `IN` of 100 operands accepted and 101 rejected. The length is
  * the expression string's own, placeholders unexpanded.
  */
+
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 
 /** DynamoDB's limit on one expression's length, in characters. */
 export const EXPRESSION_MAX_LENGTH = 4096
@@ -93,4 +95,48 @@ export const expressionFits = (
     cost.operators <= EXPRESSION_MAX_OPERATORS &&
     largestInOperands(expression) <= IN_MAX_OPERANDS
   )
+}
+
+/**
+ * The condition that a stored row is still as it was read (#171): it exists,
+ * and every attribute but its table key (`pkField`, `sk`) holds the value
+ * read — `prefer`'s first (an `updatedAt`), then the rest by name, as many as
+ * fit DynamoDB's limits on one expression (all of any row but a very wide
+ * one). A Delete of a 1.36 row carries it, so a row a write changed in
+ * between cancels the move instead of being lost. `absent` names attributes
+ * the read did not have that a write may add without changing any other (an
+ * outbox drainer's claim): each must still be absent.
+ */
+export const asReadGuard = (
+  stored: Record<string, AttributeValue>,
+  pkField: string,
+  prefer: ReadonlyArray<string>,
+  absent: ReadonlyArray<string> = [],
+): {
+  readonly ConditionExpression: string
+  readonly ExpressionAttributeNames: Record<string, string>
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue>
+} => {
+  const names: Record<string, string> = { "#gpk": pkField }
+  const values: Record<string, AttributeValue> = {}
+  let expression = "attribute_exists(#gpk)"
+  for (const [i, attr] of absent.filter((attr) => stored[attr] === undefined).entries()) {
+    names[`#ga${i}`] = attr
+    expression = `${expression} AND attribute_not_exists(#ga${i})`
+  }
+  const attrs = [...new Set([...prefer, ...Object.keys(stored).sort()])].filter(
+    (attr) => attr !== pkField && attr !== "sk" && stored[attr] !== undefined,
+  )
+  for (const [i, attr] of attrs.entries()) {
+    const clause = `#g${i} = :g${i}`
+    if (!expressionFits(`${expression} AND ${clause}`)) continue
+    names[`#g${i}`] = attr
+    values[`:g${i}`] = stored[attr]!
+    expression = `${expression} AND ${clause}`
+  }
+  return {
+    ConditionExpression: expression,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+  }
 }

@@ -100,7 +100,7 @@ class Office extends Schema.Class<Office>("Office")({
 }) {}
 ```
 
-Note that `salary` is a `String` — we store it as zero-padded `"000150.00"` for correct lexicographic sort key ordering. This is a domain modeling choice for this example; in practice, numeric composites are automatically zero-padded by KeyComposer (16 digits for numbers, 38 for bigints).
+Note that `salary` is a `String` — we store it as zero-padded `"000150.00"` for correct lexicographic sort key ordering. This is a domain modeling choice for this example; in practice, a `number` or `bigint` composite is written as key text that sorts in numeric order automatically (see [Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)).
 
 ---
 

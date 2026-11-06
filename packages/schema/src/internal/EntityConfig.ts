@@ -89,9 +89,12 @@ export type SoftDeleteConfig =
  *
  * Mutually exclusive with `versioned` (EDD-9012) and `softDelete` (EDD-9015).
  */
-export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
+export type TimeSeriesConfig<
+  TAppendInput extends Schema.Top = Schema.Top,
+  F extends string = string,
+> = {
   /** Model attribute used as the monotonic clock for CAS and event SK decoration. Required. */
-  readonly orderBy: string
+  readonly orderBy: F
   /** TTL applied to event items (not current). Omit for retention-forever. */
   readonly ttl?: Duration.Duration | string
   /**
@@ -124,21 +127,24 @@ export type TimeSeriesConfig<TAppendInput extends Schema.Top = Schema.Top> = {
  *
  * - `version` — `"v4"` (default, random) or `"v7"` (time-ordered).
  */
-export type GeneratedIdConfig = {
-  readonly field: string
+export type GeneratedIdConfig<F extends string = string> = {
+  readonly field: F
   readonly version?: "v4" | "v7"
 }
 
-/** An array of model field names that together form a unique constraint. */
-export type UniqueFieldsDef = ReadonlyArray<string>
+/**
+ * An array of model field names that together form a unique constraint. `F`
+ * is the model's field names on `Entity.make`.
+ */
+export type UniqueFieldsDef<F extends string = string> = ReadonlyArray<F>
 
 /**
  * A unique constraint definition — either a simple field list or an object
  * with additional options like TTL for sentinel items.
  */
-export type UniqueConstraintDef =
-  | UniqueFieldsDef
-  | { readonly fields: UniqueFieldsDef; readonly ttl?: Duration.Duration | string | undefined }
+export type UniqueConstraintDef<F extends string = string> =
+  | UniqueFieldsDef<F>
+  | { readonly fields: UniqueFieldsDef<F>; readonly ttl?: Duration.Duration | string | undefined }
 
 /**
  * Map of named unique constraints. Each key is the constraint name,
@@ -146,7 +152,10 @@ export type UniqueConstraintDef =
  *
  * Enforced via DynamoDB transaction sentinel items.
  */
-export type UniqueConfig = globalThis.Record<string, UniqueConstraintDef>
+export type UniqueConfig<F extends string = string> = globalThis.Record<
+  string,
+  UniqueConstraintDef<F>
+>
 
 /**
  * Per-ref cascade index configuration. Tells Entity.make() which physical GSI

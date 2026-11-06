@@ -13,6 +13,7 @@
  */
 
 import { getFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import type { ModelFieldName } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { Schema } from "effect"
 
@@ -46,11 +47,15 @@ export interface CollectionMember<E extends CollectionEntityLike = CollectionEnt
  * Bind an entity to a collection with its SK composite attributes.
  *
  * @param entity - The entity to bind
- * @param sk - SK composite attribute names for this entity within the collection
+ * @param sk - SK composite attribute names for this entity within the collection:
+ *   fields of its model, so a misspelled one is a type error
  */
-export const member = <E extends CollectionEntityLike>(
+export const member = <
+  E extends CollectionEntityLike,
+  const SK extends ReadonlyArray<ModelFieldName<E["model"]>>,
+>(
   entity: E,
-  sk: ReadonlyArray<string>,
+  sk: SK,
 ): CollectionMember<E> => ({
   _tag: "CollectionMember" as const,
   entity,
@@ -74,17 +79,28 @@ export interface CollectionIndex {
   readonly sk: string
 }
 
+/**
+ * The fields every member's model has: what a collection's shared PK
+ * composites may name.
+ */
+export type SharedMemberFields<TMembers extends Record<string, CollectionMember>> = {
+  readonly [K in keyof TMembers]: (field: ModelFieldName<TMembers[K]["entity"]["model"]>) => void
+}[keyof TMembers] extends (field: infer F) => void
+  ? F & string
+  : never
+
 /** Collection configuration passed to `Collections.make()`. */
 export interface CollectionConfig<
   TName extends string,
   TMembers extends Record<string, CollectionMember>,
+  TComposite extends ReadonlyArray<string> = ReadonlyArray<SharedMemberFields<TMembers>>,
 > {
   /** Collection name — used as SK prefix in clustered mode. Changing this breaks existing data. */
   readonly name: TName
   /** Physical GSI definition: index name + PK/SK field names. */
   readonly index: CollectionIndex
-  /** Shared PK composite attributes (e.g., `["employee"]`). */
-  readonly composite: ReadonlyArray<string>
+  /** Shared PK composite attributes (e.g., `["employee"]`): fields every member's model has. */
+  readonly composite: TComposite
   /** Collection type: `"clustered"` (default) or `"isolated"`. */
   readonly type?: CollectionType
   /** Named record mapping member names to `Collections.member()` declarations. */
@@ -169,8 +185,9 @@ type PickFieldType<M extends Schema.Top, K extends string> =
 export const make = <
   const TName extends string,
   const TMembers extends Record<string, CollectionMember>,
+  const TComposite extends ReadonlyArray<SharedMemberFields<TMembers>>,
 >(
-  config: CollectionConfig<TName, TMembers>,
+  config: CollectionConfig<TName, TMembers, TComposite>,
 ): Collection<TName, TMembers> => {
   const memberEntries = Object.entries(config.members)
   const collectionType = config.type ?? "isolated"

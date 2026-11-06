@@ -53,6 +53,7 @@ export {
   ItemDeleted,
   ItemNotDeleted,
   ItemNotFound,
+  ItemNotMoved,
   makeCompositeKeyHoleError,
   makeCompositeNullableError,
   OptimisticLockError,
@@ -90,7 +91,14 @@ export type {
   SystemFieldsType,
   VectorErrors,
 } from "./internal/EntityTypes.js"
-export type { GsiConfig, IndexDefinition, KeyPart } from "./KeyComposer.js"
+export type {
+  GsiConfig,
+  IndexDefinition,
+  KeyPart,
+  KeyValue,
+  ZOrderKeyPart,
+  ZOrderSkPart,
+} from "./KeyComposer.js"
 export * as KeyComposer from "./KeyComposer.js"
 export type { ProjectionResult } from "./Projection.js"
 export * as Projection from "./Projection.js"
@@ -104,3 +112,18 @@ export type {
   VectorSourceConfig,
 } from "./VectorIndex.js"
 export * as VectorIndex from "./VectorIndex.js"
+export type * as ZOrder from "./ZOrder.js"
+export type {
+  AnyDimension,
+  DateTimeDimension,
+  DateTimeUnit,
+  Dimension,
+  DimensionFor,
+  DimensionKind,
+  ListedLiteralsDimension,
+  LiteralsDimension,
+  LiteralValue,
+  NumericDimension,
+  PrefixPart,
+  StringDimension,
+} from "./ZOrder.js"

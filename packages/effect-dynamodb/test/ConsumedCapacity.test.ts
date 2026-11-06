@@ -127,7 +127,7 @@ const PurchaseOrders = Aggregate.make(PurchaseOrder, {
   collection: { index: "lsi1", name: "purchaseOrder", sk: { field: "lsi1sk", composite: [] } },
   root: { entityType: "PurchaseOrderItem" },
   edges: {
-    lines: Aggregate.many("lines", {
+    lines: Aggregate.many({
       entityType: "PurchaseOrderLine",
       sk: { composite: ["lineId"] },
     }),
@@ -974,6 +974,28 @@ describe("nesting", () => {
       expect(tracer.named().map((s) => s.name)).toEqual([
         "effect-dynamodb.Query.collect",
         "effect-dynamodb.Entity.query",
+      ])
+    }),
+  )
+
+  it.effect("a query's onRequest observer runs outside it: its reads are not charged (#171)", () =>
+    Effect.gen(function* () {
+      const { service } = inMemory()
+      const { reports, onOperation } = collectReports()
+      yield* Effect.gen(function* () {
+        yield* Orders.put(order(1))
+        const db = yield* DynamoClient.make({ entities: { Orders } })
+        yield* db.entities.Orders.byCustomer({ customerId: "c-1" })
+          .onRequest(() =>
+            db.entities.Orders.get({ orderId: "o-1" }).asEffect().pipe(Effect.orDie, Effect.asVoid),
+          )
+          .collect()
+      }).pipe(Effect.provide(Layer.mergeAll(clientLayer(service), enabled({ onOperation }))))
+      // The observer's get is its own root, reported before the query ends.
+      expect(reports.map((r) => [r.operation, r.requests, r.nested])).toEqual([
+        ["Entity.put", 1, []],
+        ["Entity.get", 1, []],
+        ["Entity.query", 1, []],
       ])
     }),
   )

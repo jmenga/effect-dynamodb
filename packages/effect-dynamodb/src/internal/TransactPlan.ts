@@ -23,7 +23,7 @@ import type {
   UpdateItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Data, Effect, Exit } from "effect"
+import { Context, Data, Effect, Exit } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
 import type { PutVerdict, WriteCancellationReason } from "../Entity.js"
 import { attributeValueEquals } from "./AttributeValueEquals.js"
@@ -103,6 +103,17 @@ const asUpdate = (input: UpdateItemCommandInput): TransactWriteItem => ({
 const asDelete = (input: DeleteItemCommandInput): TransactWriteItem => ({
   Delete: { TableName: input.TableName, Key: input.Key, ...conditionOf(input) },
 })
+
+/**
+ * Whether the running op is being planned by {@link planWrite}: its first
+ * write is recorded, not sent, so it must not write anything of its own
+ * first. An op that would move its item from its 1.36 key (#171) leaves the
+ * item where it is instead, and its plan says the item has not moved.
+ */
+export const Planning: Context.Reference<boolean> = Context.Reference<boolean>(
+  "effect-dynamodb/TransactPlan/Planning",
+  { defaultValue: () => false },
+)
 
 /**
  * Run `effect` (one entity op) with its writes recorded instead of sent, and
@@ -201,7 +212,12 @@ export const planWrite = <A, E, R>(
       transactWriteItems: (input) => record("TransactWriteItems", input.TransactItems ?? []),
       batchWriteItem: () => Effect.die(new UnplannableWrite({ operation })),
     }
-    const exit = yield* Effect.exit(effect.pipe(Effect.provideService(DynamoClient, recording)))
+    const exit = yield* Effect.exit(
+      effect.pipe(
+        Effect.provideService(DynamoClient, recording),
+        Effect.provideService(Planning, true),
+      ),
+    )
     // Checked first: the op may have swallowed the defect, but a plan of only
     // its first write would silently drop the second.
     if (wroteTwice) return yield* Effect.die(new UnplannableWrite({ operation }))

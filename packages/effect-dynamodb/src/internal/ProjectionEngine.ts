@@ -46,9 +46,15 @@ import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
+import { asReadGuard } from "./ExpressionLimits.js"
 import {
+  OUTBOX_CLAIM as CLAIM_TOKEN,
+  OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
   generateTimestampPrimitive,
+  KEY_TEXT,
+  OUTBOX_ROW_PK as ROW_PK,
+  OUTBOX_ROW_SK as ROW_SK,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
 
@@ -108,10 +114,6 @@ export const outboxMarker = (entityType: string): string => `${entityType}#outbo
 
 /** Attribute names the engine owns on tombstones and outbox items. */
 export const REMOVED_AT = "__edd_removed__"
-const CLAIM_TOKEN = "__edd_claim__"
-const CLAIMED_UNTIL = "__edd_claimed_until__"
-const ROW_PK = "__edd_row_pk__"
-const ROW_SK = "__edd_row_sk__"
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -140,6 +142,31 @@ export interface EngineEntity {
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
   readonly _multiItemWriteFeatures?: ReadonlyArray<string> | undefined
   readonly schemas: any
+  // Rows still under their 1.36 keys (#171) — see `Entity`.
+  readonly _primaryKey136: (
+    key: Record<string, unknown>,
+    force?: boolean,
+  ) => Record<string, string> | undefined
+  readonly _ownsRow136: (
+    key: Record<string, unknown>,
+    at: Record<string, unknown>,
+    row: Record<string, AttributeValue>,
+  ) => boolean
+  readonly _spells136: (key: Record<string, unknown>) => boolean
+  readonly _currentKeyOf136: (
+    stored: Record<string, unknown>,
+    force?: boolean,
+  ) => { readonly current: Record<string, string> } | "same" | undefined
+  readonly _clearAlias136: (
+    key: Record<string, unknown>,
+    operation: string,
+  ) => Effect.Effect<any, any, any>
+  readonly _displaceValueless136: (
+    tableName: string,
+    keys: { readonly pk: string; readonly sk: string },
+    row: Record<string, AttributeValue>,
+    operation: string,
+  ) => Effect.Effect<boolean, any, any>
 }
 
 /** @internal One source a row engine reads. */
@@ -305,6 +332,10 @@ interface Row {
   readonly values: Record<string, unknown>
   readonly tombstone: boolean
   readonly createdAt: unknown
+  /** The row's 1.36 key, when it was read there (#171): the write moves it. */
+  readonly at136?: Record<string, string> | undefined
+  /** The row as stored, when it was read at its 1.36 key: the move deletes it only while it is so. */
+  readonly stored?: Record<string, AttributeValue> | undefined
 }
 
 /** @internal */
@@ -354,22 +385,53 @@ export const makeEngine = (config: EngineConfig) => {
     }
   }
 
+  // An outbox on another table: that table's `rekey` moves its items (#171).
+  if (config.outbox?.table !== undefined) {
+    ;(readModel as { _projectionOutbox?: unknown })._projectionOutbox = {
+      table: config.outbox.table,
+      pk: config.outbox.pk,
+      sk: config.outbox.sk,
+    }
+  }
+
   const tableName = Effect.suspend(() =>
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )
 
-  /** The row, read strongly consistent — raw, so a tombstone reads as one. */
+  /**
+   * The row, read strongly consistent — raw, so a tombstone reads as one. A
+   * row 1.36 wrote under a key whose text changed (#171) is read there when
+   * its current key holds none, as the read model's own reads do: judged by
+   * its values (`_ownsRow136`; a tombstone, which holds none, by its key and
+   * `KEY_TEXT`), another value's 1.36 row at the current key is no row, nor
+   * is that value's current row at the 1.36 key. A row found at its 1.36 key
+   * carries it (`at136`), so the write moves it.
+   */
   const readRow = (key: unknown): Effect.Effect<Option.Option<Row>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
-      const result = yield* client.getItem({
-        TableName,
-        Key: toAttributeMap(composePrimaryKey(readModel as any, key as Record<string, unknown>)),
-        ConsistentRead: true,
-      })
-      const item = result.Item
+      const rowKey = key as Record<string, unknown>
+      const read = (at: Record<string, unknown>) =>
+        client
+          .getItem({ TableName, Key: toAttributeMap(at), ConsistentRead: true })
+          .pipe(Effect.map((result) => result.Item))
+      const current = composePrimaryKey(readModel as any, rowKey)
+      let item = yield* read(current)
+      if (item !== undefined && !readModel._ownsRow136(rowKey, current, item)) item = undefined
+      let at136: Record<string, string> | undefined
+      if (item === undefined) {
+        const old = readModel._primaryKey136(rowKey)
+        if (old !== undefined) {
+          const held = yield* read(old)
+          if (held !== undefined && readModel._ownsRow136(rowKey, old, held)) {
+            item = held
+            at136 = old
+          }
+        }
+      }
       if (item === undefined) return Option.none<Row>()
+      const moving = at136 === undefined ? {} : { at136, stored: item }
       if (item.__edd_e__?.S === tombstoneMarker(entityType)) {
         const raw = fromAttributeMap(item) as Record<string, unknown>
         const values: Record<string, unknown> = {}
@@ -377,7 +439,7 @@ export const makeEngine = (config: EngineConfig) => {
           const v = raw[dbName(f)]
           if (v !== undefined) values[f] = v
         }
-        return Option.some<Row>({ values, tombstone: true, createdAt: undefined })
+        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, ...moving })
       }
       const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
         string,
@@ -392,6 +454,7 @@ export const makeEngine = (config: EngineConfig) => {
         values: readModel._attachPrototype?.(values) ?? values,
         tombstone: false,
         createdAt: createdAtField === null ? undefined : decoded[createdAtField],
+        ...moving,
       })
     })
 
@@ -593,6 +656,7 @@ export const makeEngine = (config: EngineConfig) => {
     rowKey: Record<string, unknown>,
     revision: number,
     enqueued: ReadonlyArray<Enqueued>,
+    marked: boolean,
   ): Effect.Effect<ReadonlyArray<Record<string, AttributeValue>>, ValidationError> =>
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
@@ -618,6 +682,7 @@ export const makeEngine = (config: EngineConfig) => {
           streamId: e.event.streamId,
           version: e.event.version,
           eventType: e.event.eventType,
+          ...(marked && { [KEY_TEXT]: 1 }),
         }
         if (outbox.index !== undefined) {
           item[outbox.index.pk] = outboxMarker(entityType)
@@ -627,13 +692,16 @@ export const makeEngine = (config: EngineConfig) => {
       }),
     )
 
-  /** A lost race, from a single write's or a transaction's failure. */
+  /**
+   * A lost race, from a single write's or a transaction's failure: the row's
+   * Put, or — moving it from its 1.36 key — that row's Delete, cancelled.
+   */
   const lostRaceOf = (error: unknown, transaction: boolean): boolean => {
     const cause = (error as { readonly cause?: unknown })?.cause
     if (!transaction) return isAwsConditionalCheckFailed(cause)
     return (
       isAwsTransactionCancelled(cause) &&
-      cause.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed"
+      (cause.CancellationReasons ?? []).some((reason) => reason?.Code === "ConditionalCheckFailed")
     )
   }
 
@@ -652,8 +720,16 @@ export const makeEngine = (config: EngineConfig) => {
       const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
       const condition = guard(row)
       const createdAt = Option.isSome(row) ? row.value.createdAt : undefined
+      // A tombstone or outbox item holds no values: one under a key whose
+      // text differs from 1.36's is marked as written under its current key
+      // (#171, `KEY_TEXT`) — whatever the fallback is set to, since `rekey`
+      // reads every key — and one under unchanged text is as 1.36 wrote it.
+      const marked = readModel._primaryKey136(key as Record<string, unknown>, true) !== undefined
 
-      // The row's item: the entity's own `put` (no outbox), or built for a transaction.
+      // The row's item: the entity's own `put` (no outbox), or built for a
+      // transaction. A row over a tombstone under a key whose text changed is
+      // built too: the entity's `put` would judge the tombstone by values it
+      // doesn't hold, and moves it unmarked from its 1.36 key (#171).
       let rowItem: Record<string, AttributeValue> | undefined
       if (Option.isNone(target)) {
         // A tombstone: the key, the kept checkpoint fields, the revision.
@@ -663,6 +739,7 @@ export const makeEngine = (config: EngineConfig) => {
           ...rowKey,
           __edd_e__: tombstoneMarker(entityType),
           [REMOVED_AT]: DateTime.formatIso(now),
+          ...(marked && { [KEY_TEXT]: 1 }),
         }
         for (const [f, v] of Object.entries(kept)) tomb[dbName(f)] = v
         if (config.removal?.ttl !== undefined) {
@@ -671,7 +748,12 @@ export const makeEngine = (config: EngineConfig) => {
           )
         }
         rowItem = toAttributeMap(tomb)
-      } else if (enqueued.length > 0) {
+      } else if (
+        enqueued.length > 0 ||
+        (Option.isSome(row) &&
+          row.value.tombstone &&
+          readModel._primaryKey136(key as Record<string, unknown>) !== undefined)
+      ) {
         const built = yield* validateAndBuildPutItem(
           readModel as any,
           target.value,
@@ -713,42 +795,102 @@ export const makeEngine = (config: EngineConfig) => {
         return Option.some(written)
       }
 
+      // A row read at its 1.36 key (#171) moves in the same write: put at its
+      // current key, where nothing may be, and deleted at its 1.36 key only
+      // while it is as read. Another value's 1.36 row at the current key fails
+      // a write that expects nothing there: it is moved out of the way, as the
+      // entity's own writes move it, and the write is read again. So is
+      // another value's outbox item 1.36 left where one of this write's goes:
+      // a key that reads back as another value's 1.36 key can hold them, so
+      // there each Put requires its key empty.
+      const at136 = Option.isSome(row) ? row.value.at136 : undefined
+      const OutboxTable = yield* outboxTable
+      const keys = outboxKeys()
+      const sharedKey = typeof readModel._currentKeyOf136(rowKey) === "object"
+      const moved: ReadonlyArray<TransactWriteItem> =
+        at136 === undefined
+          ? []
+          : [
+              {
+                Delete: {
+                  TableName,
+                  Key: toAttributeMap(at136),
+                  ...asReadGuard(
+                    (row as Option.Some<Row>).value.stored!,
+                    primary.pk.field,
+                    config.revision === undefined ? [] : [dbName(config.revision.field)],
+                  ),
+                },
+              },
+            ]
+      const outboxAt = 1 + moved.length
+      const lostRace = (error: unknown, transaction: boolean) =>
+        lostRaceOf(error, transaction)
+          ? Effect.gen(function* () {
+              if (Option.isNone(row) || at136 !== undefined) {
+                yield* readModel._clearAlias136(key as Record<string, unknown>, config.label)
+              }
+              const reasons = transaction
+                ? ((error as { readonly cause?: { readonly CancellationReasons?: any } }).cause
+                    ?.CancellationReasons ?? [])
+                : []
+              for (const reason of reasons.slice(outboxAt)) {
+                if (reason?.Code === "ConditionalCheckFailed" && reason.Item !== undefined) {
+                  yield* readModel._displaceValueless136(
+                    OutboxTable,
+                    keys,
+                    reason.Item,
+                    config.label,
+                  )
+                }
+              }
+              return yield* Effect.fail(new LostRace(key))
+            })
+          : Effect.fail(error)
       const rowPut = {
         Put: {
           TableName,
           Item: rowItem,
-          ConditionExpression: condition.raw.expression,
-          ExpressionAttributeNames: condition.raw.names,
-          ...(Object.keys(condition.raw.values).length > 0
-            ? { ExpressionAttributeValues: condition.raw.values }
-            : {}),
+          ...(at136 === undefined
+            ? {
+                ConditionExpression: condition.raw.expression,
+                ExpressionAttributeNames: condition.raw.names,
+                ...(Object.keys(condition.raw.values).length > 0
+                  ? { ExpressionAttributeValues: condition.raw.values }
+                  : {}),
+              }
+            : {
+                ConditionExpression: "attribute_not_exists(#g)",
+                ExpressionAttributeNames: { "#g": primary.pk.field },
+              }),
         },
       } satisfies TransactWriteItem
-      if (enqueued.length === 0) {
-        yield* client.putItem(rowPut.Put).pipe(
-          Effect.catchIf(
-            (error) => lostRaceOf(error, false),
-            () => Effect.fail(new LostRace(key)),
-          ),
-        )
+      if (enqueued.length === 0 && at136 === undefined) {
+        yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error, false)))
       } else {
-        const OutboxTable = yield* outboxTable
-        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued)
+        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, marked)
         yield* client
           .transactWriteItems({
             TransactItems: [
               rowPut,
+              ...moved,
               ...items.map(
-                (Item) => ({ Put: { TableName: OutboxTable, Item } }) satisfies TransactWriteItem,
+                (Item) =>
+                  ({
+                    Put: {
+                      TableName: OutboxTable,
+                      Item,
+                      ...(sharedKey && {
+                        ConditionExpression: "attribute_not_exists(#opk)",
+                        ExpressionAttributeNames: { "#opk": keys.pk },
+                        ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+                      }),
+                    },
+                  }) satisfies TransactWriteItem,
               ),
             ],
           })
-          .pipe(
-            Effect.catchIf(
-              (error) => lostRaceOf(error, true),
-              () => Effect.fail(new LostRace(key)),
-            ),
-          )
+          .pipe(Effect.catch((error) => lostRace(error, true)))
       }
       return target
     })
@@ -1186,13 +1328,29 @@ export const makeEngine = (config: EngineConfig) => {
   // -------------------------------------------------------------------------
 
   /**
+   * A key a row's outbox items are under (#171): its current key, or its 1.36
+   * key. `only` when that key can also hold another row's items: the row's
+   * there are the `marked` ones (written under its current key), or the
+   * `unmarked` ones (1.36's).
+   */
+  interface OutboxAt {
+    readonly pk: string
+    readonly sk: string
+    readonly only?: "marked" | "unmarked" | undefined
+  }
+
+  /**
    * Deliver a row's pending effects in order: claim the head item, deliver it,
    * delete it, repeat. A claim another drainer holds stops the drain; a crash
    * leaves a claim that expires, so the effect is delivered again.
+   *
+   * `rows` are the keys the row's items are under: its current key, and its
+   * 1.36 key when its items can still be there (#171). The head is the first
+   * pending item of them all, by revision and position, so a row's effects
+   * are delivered in one order wherever they are.
    */
   const drainRaw = <E, R>(
-    rowPk: string,
-    rowSk: string,
+    rows: ReadonlyArray<OutboxAt>,
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
   ): Effect.Effect<DrainResult<E>, any, any> =>
     Effect.gen(function* () {
@@ -1200,17 +1358,51 @@ export const makeEngine = (config: EngineConfig) => {
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
       const keys = outboxKeys()
+      /** The row's first item under `at`. */
+      const firstAt = (at: OutboxAt) =>
+        Effect.gen(function* () {
+          const request = {
+            TableName,
+            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)",
+            ExpressionAttributeNames: {
+              "#pk": keys.pk,
+              "#sk": keys.sk,
+              ...(at.only !== undefined && { "#kt": KEY_TEXT }),
+            },
+            ExpressionAttributeValues: toAttributeMap({ ":pk": at.pk, ":sk": `${at.sk}#outbox#` }),
+            ConsistentRead: true,
+          }
+          if (at.only === undefined) {
+            return (yield* client.query({ ...request, Limit: 1 })).Items?.[0]
+          }
+          // Read past another row's items under the same key.
+          let start: Record<string, AttributeValue> | undefined
+          do {
+            const page = yield* client.query({
+              ...request,
+              FilterExpression:
+                at.only === "marked" ? "attribute_exists(#kt)" : "attribute_not_exists(#kt)",
+              ...(start !== undefined && { ExclusiveStartKey: start }),
+            })
+            const first = page.Items?.[0]
+            if (first !== undefined) return first
+            start = page.LastEvaluatedKey
+          } while (start !== undefined)
+          return undefined
+        })
       let delivered = 0
       while (true) {
-        const page = yield* client.query({
-          TableName,
-          KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)",
-          ExpressionAttributeNames: { "#pk": keys.pk, "#sk": keys.sk },
-          ExpressionAttributeValues: toAttributeMap({ ":pk": rowPk, ":sk": `${rowSk}#outbox#` }),
-          ConsistentRead: true,
-          Limit: 1,
-        })
-        const head = page.Items?.[0]
+        let head: Record<string, AttributeValue> | undefined
+        let headAt = ""
+        for (const at of rows) {
+          const first = yield* firstAt(at)
+          // `#outbox#<revision>#<n>`: fixed widths, so text order is delivery order.
+          const suffix = first?.[keys.sk]?.S?.slice(at.sk.length) ?? ""
+          if (first !== undefined && (head === undefined || suffix < headAt)) {
+            head = first
+            headAt = suffix
+          }
+        }
         if (head === undefined) return { delivered, undelivered: Option.none() }
         const raw = fromAttributeMap(head) as Record<string, unknown>
         const now = DateTime.toEpochMillis(yield* DateTime.now)
@@ -1285,12 +1477,36 @@ export const makeEngine = (config: EngineConfig) => {
       }
     })
 
+  /**
+   * Drain the row at `key`: under its current key, and — while the fallback is
+   * on (#171) — its 1.36 key, where 1.36 left the items it wrote. A key that
+   * can also hold another value's items is read for the row's own: its
+   * current key when it reads back as another value's 1.36 key (`foo bar`'s
+   * is `foo%20bar`'s) for the marked ones, its 1.36 key when that can be
+   * another value's current key (`_spells136`) for the unmarked ones.
+   */
   const drain = <E, R>(
     key: unknown,
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
   ) => {
-    const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
-    return drainRaw(String(rowKey[primary.pk.field]), String(rowKey[primary.sk.field]), deliver)
+    const record = key as Record<string, unknown>
+    const rowKey = composePrimaryKey(readModel as any, record)
+    const rows: Array<OutboxAt> = [
+      {
+        pk: String(rowKey[primary.pk.field]),
+        sk: String(rowKey[primary.sk.field]),
+        only: typeof readModel._currentKeyOf136(rowKey) === "object" ? "marked" : undefined,
+      },
+    ]
+    const old = readModel._primaryKey136(record)
+    if (old !== undefined) {
+      rows.unshift({
+        pk: old[primary.pk.field]!,
+        sk: old[primary.sk.field]!,
+        only: readModel._spells136(record) ? "unmarked" : undefined,
+      })
+    }
+    return drainRaw(rows, deliver)
   }
 
   /** Every row with pending effects, through the outbox's sparse index, drained. */
@@ -1308,7 +1524,8 @@ export const makeEngine = (config: EngineConfig) => {
       }
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
-      const rows = new Map<string, readonly [string, string]>()
+      /** The row keys items name, and whether marked and unmarked items name each. */
+      const rows = new Map<string, { pk: string; sk: string; marked: boolean; unmarked: boolean }>()
       let start: Record<string, AttributeValue> | undefined
       do {
         const page = yield* client.query({
@@ -1323,14 +1540,44 @@ export const makeEngine = (config: EngineConfig) => {
           const raw = fromAttributeMap(item) as Record<string, unknown>
           const pk = String(raw[ROW_PK])
           const sk = String(raw[ROW_SK])
-          rows.set(`${pk}\u0000${sk}`, [pk, sk])
+          const id = `${pk}\u0000${sk}`
+          const named = rows.get(id) ?? { pk, sk, marked: false, unmarked: false }
+          if (raw[KEY_TEXT] === undefined) named.unmarked = true
+          else named.marked = true
+          rows.set(id, named)
         }
         start = page.LastEvaluatedKey
       } while (start !== undefined)
+      // A row's items under its 1.36 key (#171) are drained with those under
+      // its current key, in one order: the key an item 1.36 wrote names is
+      // read back as 1.36 text (`_currentKeyOf136`) to find where the row is
+      // now. When that is another row (`foo%20bar`'s 1.36 key is `foo bar`'s
+      // current key), the key's unmarked items are that row's, and its
+      // marked ones the row of the key.
+      const byRow = new Map<string, Array<OutboxAt>>()
+      const add = (rowPk: string, rowSk: string, at: OutboxAt) => {
+        const id = `${rowPk}\u0000${rowSk}`
+        byRow.set(id, [...(byRow.get(id) ?? []), at])
+      }
+      for (const { pk, sk, marked, unmarked } of rows.values()) {
+        const placed = readModel._currentKeyOf136({
+          [primary.pk.field]: pk,
+          [primary.sk.field]: sk,
+        })
+        if (typeof placed !== "object") {
+          add(pk, sk, { pk, sk })
+          continue
+        }
+        if (unmarked) {
+          const current = placed.current
+          add(current[primary.pk.field]!, current[primary.sk.field]!, { pk, sk, only: "unmarked" })
+        }
+        if (marked) add(pk, sk, { pk, sk, only: "marked" })
+      }
       let delivered = 0
       const undelivered: Array<{ readonly meta: OutboxMeta; readonly error: E }> = []
-      for (const [pk, sk] of rows.values()) {
-        const result = yield* drainRaw(pk, sk, deliver)
+      for (const keys of byRow.values()) {
+        const result = yield* drainRaw(keys, deliver)
         delivered += result.delivered
         if (Option.isSome(result.undelivered)) undelivered.push(result.undelivered.value)
       }

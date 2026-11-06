@@ -1,7 +1,8 @@
 import { it as effectIt } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { describe, expect, it } from "vitest"
+import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 
 describe("Table", () => {
@@ -659,6 +660,141 @@ describe("Table", () => {
           Projection: { ProjectionType: "ALL" },
         },
       ])
+    })
+  })
+
+  // #171: a Z-order sort key is a binary (`B`) attribute, and DynamoDB types an
+  // attribute once per table.
+  describe("key attribute types (#171, EDD-9091)", () => {
+    class Listing extends Schema.Class<Listing>("Listing")({
+      listingId: Schema.String,
+      region: Schema.String,
+      price: Schema.Number,
+      bedrooms: Schema.Number,
+    }) {}
+    const facets = [
+      { field: "price", min: 0, max: 5_000_000, step: 1_000 },
+      { field: "bedrooms", min: 0, max: 15 },
+    ] as const
+    const listingsWith = (entityType: string, sk: Record<string, unknown>) =>
+      Entity.make({
+        model: Listing,
+        entityType,
+        primaryKey: {
+          pk: { field: "pk", composite: ["listingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byRegion: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["region"] },
+            sk: { field: "gsi1sk", ...sk } as { field: string; zorder: typeof facets },
+          },
+        },
+      })
+    const Listings = listingsWith("Listing", { zorder: facets })
+
+    const typeOf = (def: Table.TableDefinition, name: string) =>
+      def.AttributeDefinitions.find((attr) => attr.AttributeName === name)?.AttributeType
+
+    it("defines a Z-order sort key attribute as B, every other key attribute as S", () => {
+      const def = Table.definition(Table.make({ schema, entities: { Listings } }))
+      expect(def.AttributeDefinitions).toEqual([
+        { AttributeName: "gsi1pk", AttributeType: "S" },
+        { AttributeName: "gsi1sk", AttributeType: "B" },
+        { AttributeName: "pk", AttributeType: "S" },
+        { AttributeName: "sk", AttributeType: "S" },
+      ])
+      expect(def.GlobalSecondaryIndexes).toEqual([
+        {
+          IndexName: "gsi1",
+          KeySchema: [
+            { AttributeName: "gsi1pk", KeyType: "HASH" },
+            { AttributeName: "gsi1sk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ])
+    })
+
+    it("lets two entities share one Z-order GSI", () => {
+      const Rentals = listingsWith("Rental", { zorder: facets })
+      const def = Table.definition(Table.make({ schema, entities: { Listings, Rentals } }))
+      expect(def.GlobalSecondaryIndexes).toHaveLength(1)
+      expect(def.AttributeDefinitions.filter((a) => a.AttributeName === "gsi1sk")).toEqual([
+        { AttributeName: "gsi1sk", AttributeType: "B" },
+      ])
+    })
+
+    it("[EDD-9091] refuses a Z-order sort key and a string key half on one attribute", () => {
+      const Notes = listingsWith("Note", { composite: ["price"] })
+      const message =
+        /\[EDD-9091\] Attribute "gsi1sk" is declared with type "B" \(a Z-order sort key\) by entity "Listing" \(index "byRegion"\) and with type "S" by entity "Note" \(index "byRegion"\)\. DynamoDB types an attribute once per table/
+      expect(() => Table.make({ schema, entities: { Listings, Notes } })).toThrow(message)
+      // The synthetic tables `DynamoClient.make` assembles reach
+      // `Table.definition` without `Table.make`: it refuses them too.
+      const table = {
+        ...Table.make({ schema }),
+        entities: { Listings, Notes },
+      } as unknown as Table.Table
+      expect(() => Table.definition(table)).toThrow(message)
+      // Either order names both declarers.
+      expect(() => Table.make({ schema, entities: { Notes, Listings } })).toThrow(
+        /declared with type "S" by entity "Note" \(index "byRegion"\) and with type "B" \(a Z-order sort key\) by entity "Listing"/,
+      )
+    })
+
+    it("[EDD-9091] refuses a key attribute and a vector filter attribute of different types", () => {
+      class Product extends Schema.Class<Product>("Product")({
+        productId: Schema.String,
+        name: Schema.String,
+        rank: Schema.Number,
+      }) {}
+      const Products = Entity.make({
+        model: Product,
+        entityType: "Product",
+        primaryKey: {
+          pk: { field: "pk", composite: ["productId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        vectorIndexes: {
+          byName: {
+            name: "vec1",
+            dimensions: 4,
+            distance: "cosine",
+            source: { fields: ["name"] },
+            filters: ["rank"],
+          },
+        },
+      })
+      class Ranking extends Schema.Class<Ranking>("Ranking")({
+        rankingId: Schema.String,
+        board: Schema.String,
+      }) {}
+      // Its GSI partition key attribute is named `rank`: an S key attribute.
+      const Rankings = Entity.make({
+        model: Ranking,
+        entityType: "Ranking",
+        primaryKey: {
+          pk: { field: "pk", composite: ["rankingId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byBoard: {
+            name: "gsi2",
+            pk: { field: "rank", composite: ["board"] },
+            sk: { field: "gsi2sk", composite: [] },
+          },
+        },
+      })
+      expect(() => Table.make({ schema, entities: { Rankings, Products } })).toThrow(
+        /\[EDD-9091\] Attribute "rank" is declared with type "S" by entity "Ranking" \(index "byBoard"\) and with type "N" by vector index "vec1" \(entity "Product"\)/,
+      )
+      // Apart, each defines its attribute with its own type.
+      const products = Table.definition(Table.make({ schema, entities: { Products } }))
+      expect(typeOf(products, "rank")).toBe("N")
+      const rankings = Table.definition(Table.make({ schema, entities: { Rankings } }))
+      expect(typeOf(rankings, "rank")).toBe("S")
     })
   })
 })
