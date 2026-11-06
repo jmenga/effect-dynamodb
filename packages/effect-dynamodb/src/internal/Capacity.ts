@@ -19,6 +19,10 @@ import type {
   Capacity as SdkCapacity,
   ConsumedCapacity as SdkConsumedCapacity,
 } from "@aws-sdk/client-dynamodb"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
+import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
 
@@ -517,10 +521,53 @@ const runIn = <A, E, R>(
 }
 
 /**
- * Run `effect` as the named library operation. With reporting off — or
- * inside an observer — `effect` runs unchanged.
+ * A value the library refuses to compose or send, thrown where there's no error channel to fail
+ * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`),
+ * no DynamoDB form (`[EDD-9124]`).
  */
-export const operation = <A, E, R>(
+export const isRefusedValue = (u: unknown): boolean =>
+  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u)
+
+/** The `ValidationError` for a {@link isRefusedValue} a cause dies of, if it dies of one. */
+const refusalOf = (
+  name: string,
+  options: OperationOptions | undefined,
+  cause: Cause.Cause<unknown>,
+): ValidationError | undefined => {
+  const died = cause.reasons.find(
+    (reason) => reason._tag === "Die" && isRefusedValue(reason.defect),
+  )
+  return died === undefined
+    ? undefined
+    : new ValidationError({
+        entityType: options?.target ?? name,
+        operation: name,
+        cause: (died as Cause.Die).defect,
+      })
+}
+
+/**
+ * A caller's value that can't be composed or sent is the caller's error, on every path, never a
+ * defect: anything thrown below an operation fails it with a `ValidationError`, which each operation
+ * that takes a value has in its error channel. Thrown by the composer or the marshaller, it means
+ * nothing was sent for that item.
+ */
+export const refusalsFail = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.catchCause(effect, (cause) => {
+    const refusal = refusalOf(name, options, cause)
+    return refusal === undefined ? Effect.failCause(cause) : (Effect.fail(refusal) as never)
+  })
+
+/**
+ * Run `effect` as a named operation of the caller's own (`ConsumedCapacity.withOperation`):
+ * it fails and dies as it would have. With reporting off — or inside an observer — `effect`
+ * runs unchanged.
+ */
+export const scoped = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   effect: Effect.Effect<A, E, R>,
@@ -538,6 +585,14 @@ export const operation = <A, E, R>(
     if (current === SUPPRESSED) return effect
     return runScope(name, options, settings, liveScope(current), effect)
   })
+
+/** Run `effect` as the named library operation: {@link scoped}, with {@link refusalsFail}. */
+export const operation = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  effect: Effect.Effect<A, E, R>,
+  captured?: Settings | undefined,
+): Effect.Effect<A, E, R> => scoped(name, options, refusalsFail(name, options, effect), captured)
 
 /**
  * Run `body` as the named library operation with reporting on whatever the
@@ -574,14 +629,16 @@ export const delegate = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> =>
-  Effect.withFiber((fiber) => {
+): Effect.Effect<A, E, R> => {
+  const body = refusalsFail(name, options, effect)
+  return Effect.withFiber((fiber) => {
     const settings = fiber.getRef(Reporting)
-    if (!settings.enabled) return effect
+    if (!settings.enabled) return body
     const current = fiber.getRef(CurrentOperation)
-    if (current === SUPPRESSED || liveScope(current) !== undefined) return effect
-    return runScope(name, options, settings, undefined, effect)
+    if (current === SUPPRESSED || liveScope(current) !== undefined) return body
+    return runScope(name, options, settings, undefined, body)
   })
+}
 
 /**
  * The stream form, as an effect to run where the stream is BUILT — inside a
@@ -591,7 +648,7 @@ export const delegate = <A, E, R>(
  * run (each run is one operation), and carries the resolved setting and
  * scope to every page pull, which happens later from the consumer's fiber.
  */
-export const operationStream = <A, E, R>(
+export const scopedStream = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   stream: Stream.Stream<A, E, R>,
@@ -612,24 +669,41 @@ export const operationStream = <A, E, R>(
             return Effect.succeed(Stream.provideService(withSettings, CurrentOperation, parent))
           return Effect.gen(function* () {
             const scope = newScope(name, options, settings, parent)
-            let scoped = Stream.provideService(withSettings, CurrentOperation, scope)
+            let scopedRun = Stream.provideService(withSettings, CurrentOperation, scope)
             if (settings.spans) {
               const span = yield* Effect.makeSpanScoped(spanName(name), {
                 kind: spanKind(scope),
                 attributes: startAttributes(scope),
               })
               scope.span = span
-              scoped = Stream.provideService(scoped, Tracer.ParentSpan, span)
+              scopedRun = Stream.provideService(scopedRun, Tracer.ParentSpan, span)
             }
             // Added after the span, so it runs first: the span is annotated
             // before it ends.
             yield* Effect.addFinalizer((exit) => finish(scope, exit))
-            return scoped
+            return scopedRun
           })
         }),
       ),
     )
   })
+
+/** {@link scopedStream} as a library operation, with {@link refusalsFail}'s rule. */
+export const operationStream = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  stream: Stream.Stream<A, E, R>,
+  mode: "operation" | "delegate" = "operation",
+): Effect.Effect<Stream.Stream<A, E, R>> =>
+  scopedStream(
+    name,
+    options,
+    Stream.catchCause(stream, (cause) => {
+      const refusal = refusalOf(name, options, cause)
+      return refusal === undefined ? Stream.failCause(cause) : (Stream.fail(refusal) as never)
+    }),
+    mode,
+  )
 
 /**
  * Strip per-call state from a context captured for later use: the current

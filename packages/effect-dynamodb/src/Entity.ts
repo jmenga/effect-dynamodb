@@ -3816,6 +3816,20 @@ const makeImpl = <
     return [...indexedDefaultFields()].some((name) => record[name] === undefined)
   }
 
+  /** A field an upsert keeps from the stored row (`if_not_exists`), where it isn't in the key anyway. */
+  const keptByUpsert = (field: string) =>
+    !isPrimaryComposite(field) && (field === systemFields.createdAt || immutableFields.has(field))
+
+  /** A secondary index's halves: the key attribute, and what's composed into it. */
+  const halvesOf = (index: {
+    readonly pk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+    readonly sk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+    readonly shards?: { readonly by?: ReadonlyArray<string> | undefined } | undefined
+  }): ReadonlyArray<readonly [string, ReadonlyArray<string>]> => [
+    [index.pk.field, [...index.pk.composite, ...(index.shards?.by ?? [])]],
+    [index.sk.field, index.sk.composite],
+  ]
+
   /**
    * A value with no stored form is an absent attribute, so an upsert's replaces what the row
    * holds. A field left unset (an optional `undefined`) doesn't, nor does an immutable one.
@@ -3825,44 +3839,79 @@ const makeImpl = <
     !immutableFields.has(field)
 
   /**
-   * What an upsert writes to the secondary keys it composed, where a key holds a value it keeps from
-   * the stored row: `createdAt` and immutable fields are `if_not_exists`, and one `UpdateItem` can't
-   * splice what's stored into a key (`DESIGN.md` §7, "An upsert over a value it keeps"). By half:
+   * The keys an upsert writes: `composed`, plus a half of an index it can't compose whole, where the
+   * input has all that half holds and some of it can change. A half of nothing but primary composites
+   * and kept values says what it always said, so it isn't written: an upsert writes no more attributes
+   * than it must.
+   */
+  const upsertKeys = (
+    record: globalThis.Record<string, unknown>,
+    composed: globalThis.Record<string, KeyComposer.KeyValue>,
+  ) =>
+    composeKeysOrFail(entityType, "upsert", () => {
+      const keys = { ...composed }
+      const form = keyForm(record)
+      for (const [indexName, index] of Object.entries(allIndexes)) {
+        if (indexName === "primary" || index.pk.field in composed) continue
+        const known = KeyComposer.composeKnownHalves(schema, entityType, entityVersion, index, form)
+        for (const [field, composites] of halvesOf(index)) {
+          const value = known[field]
+          if (
+            value !== undefined &&
+            composites.some((attr) => !keptByUpsert(attr) && !isPrimaryComposite(attr))
+          ) {
+            keys[field] = value
+          }
+        }
+      }
+      return keys
+    })
+
+  /**
+   * What an upsert does about the secondary keys it can't simply write, because one `UpdateItem`
+   * can't splice what's stored into a key (`DESIGN.md` §7, "An upsert over a value it keeps" and "An
+   * upsert leaving out a composite"). By half:
    *
-   * - **`keep`**: the key stays too (`if_not_exists`), where nothing else in the half can change or
-   *   its `createdAt` isn't in the input, so the key can't be written. The write holds on an existing
-   *   row only where it has the key and everything in `same`, what else the half holds, is what the
-   *   input says: the key is then already right.
+   * - **`keep`**: the key holds a value the upsert keeps (`createdAt`, immutable fields), and stays too
+   *   (`if_not_exists`), where nothing else in the half can change or its `createdAt` isn't in the
+   *   input, so the key can't be written. The write holds on an existing row only where it has the key
+   *   and everything in `same`, what else the half holds, is what the input says: the key is then
+   *   already right.
    * - **`matches`**: the input has every value, so the key is written, and the write holds only where
    *   each kept value is stored as the input has it.
+   * - **`same`** also holds what the input names of a half it can't compose, as that half can only
+   *   stay if none of it changes. A value it doesn't name changes nothing: an upsert leaves it, and the
+   *   key that says it, as stored. So a stamped `updatedAt` isn't held to this, and the half lags until
+   *   a write composes it, as on an update. One the input supplies is, and moves the key.
    *
    * A rejected write returns the row at no read, and the upsert composes from that
-   * (`guardedUpsert`): an input that contradicts it, a row without the key, or a changed `same`.
+   * (`guardedUpsert`, by the per-half policy for what the row can't supply): an input that contradicts
+   * it, a row without the key, or a changed `same`.
    */
   const upsertKeyPlan = (
     composed: globalThis.Record<string, unknown>,
+    input: globalThis.Record<string, unknown>,
     suppliedCreatedAt: boolean,
   ): {
     readonly keep: ReadonlySet<string>
     readonly same: ReadonlySet<string>
     readonly matches: ReadonlySet<string>
   } => {
-    const kept = (field: string) =>
-      !isPrimaryComposite(field) && (field === systemFields.createdAt || immutableFields.has(field))
     const keep = new Set<string>()
     const same = new Set<string>()
     const matches = new Set<string>()
     for (const [indexName, index] of Object.entries(allIndexes)) {
       if (indexName === "primary") continue
-      const halves: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
-        [index.pk.field, [...index.pk.composite, ...(index.shards?.by ?? [])]],
-        [index.sk.field, index.sk.composite],
-      ]
-      for (const [field, composites] of halves) {
-        if (!(field in composed)) continue
-        const held = composites.filter(kept)
+      for (const [field, composites] of halvesOf(index)) {
+        const others = composites.filter((attr) => !keptByUpsert(attr) && !isPrimaryComposite(attr))
+        if (!(field in composed)) {
+          for (const attr of others) {
+            if (input[attr] !== undefined) same.add(attr)
+          }
+          continue
+        }
+        const held = composites.filter(keptByUpsert)
         if (held.length === 0) continue
-        const others = composites.filter((attr) => !kept(attr) && !isPrimaryComposite(attr))
         if (
           others.length === 0 ||
           (!suppliedCreatedAt && held.includes(systemFields.createdAt ?? ""))
@@ -9605,16 +9654,14 @@ const makeImpl = <
           // Every index's keys, composed before anything is marshalled: a
           // composite with no key text (`NaN`, `[EDD-9096]`) or Z-order level
           // (`[EDD-9092]`) fails the upsert with a `ValidationError`.
-          const allKeys = yield* composeAllKeys(
-            {
-              ...item,
-              ...writeStamps(upsertedUpdatedAt, undefined),
-              ...(systemFields.createdAt ? { [systemFields.createdAt]: upsertedCreatedAt } : {}),
-            },
-            "upsert",
-          )
+          const stamped = {
+            ...item,
+            ...writeStamps(upsertedUpdatedAt, undefined),
+            ...(systemFields.createdAt ? { [systemFields.createdAt]: upsertedCreatedAt } : {}),
+          }
+          const allKeys = yield* upsertKeys(stamped, yield* composeAllKeys(stamped, "upsert"))
           yield* refuseUncomposed(encodedInput, "upsert")
-          const keyPlan = upsertKeyPlan(allKeys, suppliedCreatedAt !== undefined)
+          const keyPlan = upsertKeyPlan(allKeys, item, suppliedCreatedAt !== undefined)
           const primaryKey = composePrimaryKey(item)
           const marshalledKey = toAttributeMap(primaryKey)
           // Build UpdateExpression with if_not_exists for immutable fields + createdAt
@@ -9847,15 +9894,15 @@ const makeImpl = <
           }
           // A new row takes the key. An existing one keeps its own, so it must have one, and one
           // that still says what this input says.
-          if (keptKeyNames.length > 0) {
+          const stays = [
+            ...keptKeyNames.map((nameKey) => `attribute_exists(${nameKey})`),
+            ...[...keyPlan.same].map((attr) => {
+              const [nameKey, valKey] = placeholders.get(attr)!
+              return `${nameKey} = ${valKey}`
+            }),
+          ]
+          if (stays.length > 0) {
             names["#kpk"] = config.indexes.primary.pk.field
-            const stays = [
-              ...keptKeyNames.map((nameKey) => `attribute_exists(${nameKey})`),
-              ...[...keyPlan.same].map((attr) => {
-                const [nameKey, valKey] = placeholders.get(attr)!
-                return `${nameKey} = ${valKey}`
-              }),
-            ]
             keyGuards.push(`(attribute_not_exists(#kpk) OR (${stays.join(" AND ")}))`)
           }
           condParts.push(...keyGuards)
@@ -10313,11 +10360,7 @@ const makeImpl = <
       if (createdAtKeyed) {
         for (const [indexName, index] of Object.entries(allIndexes)) {
           if (indexName === "primary") continue
-          const halves: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
-            [index.pk.field, [...index.pk.composite, ...(index.shards?.by ?? [])]],
-            [index.sk.field, index.sk.composite],
-          ]
-          for (const [field, composites] of halves) {
+          for (const [field, composites] of halvesOf(index)) {
             if (!(field in gsiUpdate.sets) || !composites.includes(systemFields.createdAt!)) {
               continue
             }
@@ -10804,7 +10847,7 @@ const makeImpl = <
       appendCore(input, givenCondition, skipFollowUp, removeAttrs),
     )
 
-  const history = (key: unknown) => {
+  const historyQuery = (key: unknown) => {
     if (!timeSeriesConfig) {
       throw new Error(
         `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
@@ -10860,6 +10903,15 @@ const makeImpl = <
     }).pipe(Query.where({ beginsWith: prefix }))
   }
 
+  /**
+   * The query `build` makes, or one refused for a key value it can't compose: building
+   * a query has no error channel, so its terminals fail instead.
+   */
+  const refusingQuery = <A>(name: string, build: () => Query.Query<A>): Query.Query<A> =>
+    Query.orRefusal({ name, target: entityType }, build, (refusal) =>
+      Query.refused<A>(undefined, refusal),
+    )
+
   // ---------------------------------------------------------------------------
   // query namespace
   // ---------------------------------------------------------------------------
@@ -10873,7 +10925,7 @@ const makeImpl = <
     // The bound definition: a Z-order half carries its layout (#171).
     const indexDef = data.initialIndexes[indexName] ?? config.indexes[indexName]!
     const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
-    queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) => {
+    const indexQuery = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
       // and same function the write path uses (see `CompositeCodec`).
       const pkKeyForm = keyForm(rawPk)
@@ -10935,6 +10987,12 @@ const makeImpl = <
         : query
       return pinned
     }
+    queryNamespace[indexName] = (rawPk: globalThis.Record<string, unknown>) =>
+      Query.orRefusal(
+        { name: "Entity.query", target: entityType },
+        () => indexQuery(rawPk),
+        (refusal) => Query.refused(indexDef.index, refusal),
+      )
   }
 
   // ---------------------------------------------------------------------------
@@ -11014,7 +11072,7 @@ const makeImpl = <
   // versions operation
   // ---------------------------------------------------------------------------
 
-  const versions = (key: unknown) => {
+  const versionsQuery = (key: unknown) => {
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
@@ -11154,7 +11212,7 @@ const makeImpl = <
       key as globalThis.Record<string, unknown>,
     )
 
-  const deletedList = (key: unknown) => {
+  const deletedListQuery = (key: unknown) => {
     const encodedKey = keyForm(encodeKeySync(key))
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
@@ -13723,15 +13781,15 @@ const makeImpl = <
     // operation name consumed-capacity reports use (#174).
     getVersion: (key: unknown, versionNumber: number) =>
       namedOp(getVersion(key, versionNumber), "Entity.getVersion"),
-    versions,
+    versions: (key: unknown) => refusingQuery("Entity.versions", () => versionsQuery(key)),
     restore: (key: unknown) => namedOp(restore(key), "Entity.restore"),
     purge: (key: unknown) => namedOp(purge(key), "Entity.purge"),
     deleted: {
       get: (key: unknown) => namedOp(deletedGet(key), "Entity.deleted.get"),
-      list: deletedList,
+      list: (key: unknown) => refusingQuery("Entity.deleted.list", () => deletedListQuery(key)),
     },
     append,
-    history,
+    history: (key: unknown) => refusingQuery("Entity.history", () => historyQuery(key)),
 
     set,
     expectedVersion,

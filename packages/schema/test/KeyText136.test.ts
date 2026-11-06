@@ -144,8 +144,16 @@ describe("the default composes the golden vectors from the published 1.36.0", ()
 
   it("a composite value's text", () => {
     const schema = DynamoSchema.make({ name: "app", version: 1 })
+    const of136 = KeyText136.schema136(schema)
     for (const { value, text } of vectors.serializeValue) {
-      expect(KeyComposer.compositeText(schema, revive(value)), JSON.stringify(value)).toBe(text)
+      const revived = revive(value)
+      expect(KeyComposer.compositeText(of136, revived), JSON.stringify(value)).toBe(text)
+      // The one vector the default refuses: nothing can be stored under it from here on.
+      if (typeof revived === "number" && Number.isNaN(revived)) {
+        expect(() => KeyComposer.compositeText(schema, revived)).toThrow("[EDD-9096]")
+      } else {
+        expect(KeyComposer.compositeText(schema, revived), JSON.stringify(value)).toBe(text)
+      }
     }
   })
 

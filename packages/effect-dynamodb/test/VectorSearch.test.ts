@@ -764,6 +764,24 @@ describe("vector search read path", () => {
     }).pipe(Effect.provide(makeEmulatedLayer(capture)))
   })
 
+  it.effect("a partition no key can hold fails with a ValidationError, nothing sent", () => {
+    const capture: Capture = { scanItems: [] }
+    setVector("boots", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      const error: any = yield* Effect.flip(
+        db.entities.Products.byDescription("boots")
+          .partition({ tenantId: Number.NaN as never })
+          .collect(),
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect(error.cause.message).toContain("EDD-9096")
+    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+  })
+
   it.effect("scopes results to the composed partition value", () => {
     const capture: Capture = {
       scanItems: [

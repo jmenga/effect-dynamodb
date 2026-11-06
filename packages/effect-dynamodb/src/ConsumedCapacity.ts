@@ -108,7 +108,7 @@ export const withOperation: {
     self: Effect.Effect<A, E, R>,
     name: string,
     options?: Capacity.OperationOptions,
-  ): Effect.Effect<A, E, R> => Capacity.operation(name, options, self),
+  ): Effect.Effect<A, E, R> => Capacity.scoped(name, options, self),
 )
 
 /**
@@ -131,7 +131,7 @@ export const withOperationStream: {
     self: Stream.Stream<A, E, R>,
     name: string,
     options?: Capacity.OperationOptions,
-  ): Stream.Stream<A, E, R> => Stream.unwrap(Capacity.operationStream(name, options, self)),
+  ): Stream.Stream<A, E, R> => Stream.unwrap(Capacity.scopedStream(name, options, self)),
 )
 
 /** Span attribute names, so applications and tests need no string literals. */

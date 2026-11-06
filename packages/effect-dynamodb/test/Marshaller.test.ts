@@ -216,6 +216,44 @@ describe("values with no stored form", () => {
 })
 
 describe("Marshaller", () => {
+  describe("[EDD-9124] a value with no DynamoDB form", () => {
+    const refused = [
+      ["NaN", Number.NaN],
+      ["Infinity", Number.POSITIVE_INFINITY],
+      ["-Infinity", Number.NEGATIVE_INFINITY],
+      ["a number past MAX_SAFE_INTEGER", 1e21],
+      ["an empty set", new Set()],
+    ] as const
+
+    for (const [name, value] of refused) {
+      it(`${name}: both ways in, nested or not`, () => {
+        for (const attempt of [
+          () => toAttributeValue(value),
+          () => toAttributeMap({ a: value }),
+          () => toAttributeMap({ a: { b: [value] } }),
+        ]) {
+          let thrown: unknown
+          try {
+            attempt()
+          } catch (error) {
+            thrown = error
+          }
+          expect(thrown).toBeInstanceOf(UnstorableValueError)
+          expect(isUnstorableValueError(thrown)).toBe(true)
+          expect((thrown as UnstorableValueError).message).toContain("[EDD-9124]")
+          expect((thrown as UnstorableValueError).cause).toBeInstanceOf(Error)
+        }
+      })
+    }
+
+    it("anything else isn't one", () => {
+      expect(isUnstorableValueError(new Error("x"))).toBe(false)
+      expect(isUnstorableValueError(undefined)).toBe(false)
+      expect(toAttributeValue(0)).toEqual({ N: "0" })
+      expect(toAttributeValue(10n ** 30n)).toEqual({ N: String(10n ** 30n) })
+    })
+  })
+
   describe("toAttributeMap / fromAttributeMap", () => {
     it("round-trips a simple object", () => {
       const obj = { name: "Alice", age: 30, active: true }

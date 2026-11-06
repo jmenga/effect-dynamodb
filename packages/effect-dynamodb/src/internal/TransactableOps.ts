@@ -10,15 +10,13 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
-import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
-import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
-import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
 import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshaller.js"
+import { isRefusedValue } from "./Capacity.js"
 import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 
 /**
@@ -445,7 +443,7 @@ export const composeKeysOrFail = <A>(
 ): Effect.Effect<A, ValidationError> =>
   Effect.try({ try: compose, catch: (error) => error }).pipe(
     Effect.catch((error) =>
-      isZOrderValueError(error) || isKeyValueError(error) || isShardSourceError(error)
+      isRefusedValue(error)
         ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
         : Effect.die(error),
     ),
@@ -477,7 +475,7 @@ export const marshalOrFail = <A>(
               cause: `${error.describe(options.fieldOf)} ${options.outcome ?? "Nothing was written."}`,
             }),
           )
-        : isZOrderValueError(error) || isKeyValueError(error) || isShardSourceError(error)
+        : isRefusedValue(error)
           ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
           : Effect.die(error),
     ),

@@ -1355,7 +1355,23 @@ export const makeEngine = (config: EngineConfig) => {
       return { delivered, undelivered }
     })
 
-  return { readRow, applyRow, drain, drainPending, call }
+  return {
+    readRow,
+    // A key the row can't compose is that row's failure, not the batch's.
+    applyRow: (
+      key: unknown,
+      work: ReadonlyArray<InstanceWork>,
+      options?: { readonly fromScratch?: boolean | undefined },
+    ): Effect.Effect<RowResult, any, any> =>
+      Capacity.refusalsFail(
+        `${config.label}.apply`,
+        { target: entityType },
+        applyRow(key, work, options),
+      ),
+    drain,
+    drainPending,
+    call,
+  }
 }
 
 /** What `deliver` is told about an effect. */

@@ -3619,3 +3619,94 @@ describe("a cleared composite, by canonical GSI-composite shape", () => {
     expect(compose("preserve", ["bedrooms"]).removes).toEqual(["gsk"])
   })
 })
+
+describe("composeKnownHalves", () => {
+  const schema = DynamoSchema.make({ name: "myapp", version: 1 })
+  const Rows = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      region: Schema.optional(Schema.String),
+      score: Schema.optional(Schema.Number),
+      price: Schema.optional(Schema.Number),
+    }),
+    entityType: "Row",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byOwner: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["owner"] },
+        sk: { field: "gsi1sk", composite: ["note", "score"] },
+      },
+      bySharded: {
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: [] },
+        sk: { field: "gsi2sk", composite: ["region", "note"] },
+        shards: { count: 8, by: ["region"] },
+      },
+      byConstant: {
+        name: "gsi3",
+        pk: { field: "gsi3pk", composite: ["owner"] },
+        sk: { field: "gsi3sk", composite: [] },
+      },
+      byPrice: {
+        name: "gsi4",
+        pk: { field: "gsi4pk", composite: ["owner"] },
+        sk: { field: "gsi4sk", zorder: [{ field: "price", min: 0, max: 100 }] },
+      },
+    },
+  })
+  const halves = (index: keyof typeof Rows.indexes, record: Record<string, unknown>) =>
+    KeyComposer.composeKnownHalves(schema, "Row", 1, Rows.indexes[index], record)
+
+  it("composes both halves when every composite has a value", () => {
+    const record = { owner: "o1", note: "n1", score: 2 }
+    expect(halves("byOwner", record)).toEqual({
+      gsi1pk: KeyComposer.composePk(schema, "Row", Rows.indexes.byOwner, record),
+      gsi1sk: KeyComposer.composeSk(schema, "Row", 1, Rows.indexes.byOwner, record),
+    })
+  })
+
+  it("composes the one half that has them, and only that one", () => {
+    expect(Object.keys(halves("byOwner", { owner: "o1", note: "n1" }))).toEqual(["gsi1pk"])
+    expect(Object.keys(halves("byOwner", { note: "n1", score: 2 }))).toEqual(["gsi1sk"])
+    expect(halves("byOwner", { note: "n1" })).toEqual({})
+  })
+
+  it("takes null and undefined for no value, and 0 and an empty string for values", () => {
+    expect(Object.keys(halves("byOwner", { owner: null, note: undefined, score: 2 }))).toEqual([])
+    expect(Object.keys(halves("byOwner", { owner: "", note: "", score: 0 }))).toEqual([
+      "gsi1pk",
+      "gsi1sk",
+    ])
+  })
+
+  it("a half with no composites always composes", () => {
+    expect(halves("byConstant", {})).toEqual({ gsi3sk: "$myapp#v1#row" })
+    expect(Object.keys(halves("byConstant", { owner: "o1" }))).toEqual(["gsi3pk", "gsi3sk"])
+  })
+
+  it("a sharded partition key needs what its shard is computed from", () => {
+    expect(Object.keys(halves("bySharded", { note: "n1" }))).toEqual([])
+    expect(Object.keys(halves("bySharded", { region: "eu" }))).toEqual(["gsi2pk"])
+    expect(Object.keys(halves("bySharded", { note: "n1", region: "eu" }))).toEqual([
+      "gsi2pk",
+      "gsi2sk",
+    ])
+  })
+
+  it("a Z-order half composes its bytes, or nothing", () => {
+    expect(Object.keys(halves("byPrice", { owner: "o1" }))).toEqual(["gsi4pk"])
+    expect(halves("byPrice", { owner: "o1", price: 7 }).gsi4sk).toBeInstanceOf(Uint8Array)
+  })
+
+  it("a value with no key text is refused, not left out", () => {
+    expect(() => halves("byOwner", { owner: "o1", note: "n1", score: Number.NaN })).toThrow(
+      "EDD-9096",
+    )
+  })
+})

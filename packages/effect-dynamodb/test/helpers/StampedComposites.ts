@@ -2928,6 +2928,789 @@ export const aggregateScenarios: ReadonlyArray<RepairScenario> = [
   }),
 ]
 
+// ---------------------------------------------------------------------------
+// An upsert leaving out a composite: it leaves the value, and the key holding it, as stored
+// ---------------------------------------------------------------------------
+
+const Noted = Schema.Struct({
+  id: Schema.String,
+  owner: Schema.optional(Schema.String),
+  a: Schema.optional(Schema.String),
+  b: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+})
+
+const notedWorld = (on: boolean, indexes: Record<string, unknown>, extra = {}) =>
+  looseWorld(on, { N: { model: Noted, indexes, ...extra } })
+
+/** What the row says, with the keys' text cut to what they hold. */
+const keysOf = (row: StoredRow) => ({
+  pk: row.gsi1pk?.S?.split("#n#")[1] ?? row.gsi1pk?.S?.split("$stamped#v1#n#")[1],
+  sk: row.gsi1sk?.S?.split("$stamped#v1#n#")[1],
+})
+
+const requestOf = (table: RepairTable, at = 0) => updatesOf(table)[at]!.input
+
+export const upsertOmittedScenarios: ReadonlyArray<RepairScenario> = [
+  ...bothSettings("a changed half is written, the half it can't compose is left", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["note"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", note: "n1" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o2" }).asEffect()
+        // One write, no read, no condition: nothing it names is in the half it leaves.
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(requestOf(table).ConditionExpression).toBeUndefined()
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.owner.S).toBe("o2")
+        expect(row.note.S).toBe("n1")
+        expect(keysOf(row)).toEqual({ pk: "owner_o2", sk: "note_n1" })
+        expectKeysOfValues(w, row, w.entities.N, "N")
+        expect(yield* db.entities.N.byOwner({ owner: "o2" }).collect()).toHaveLength(1)
+        expect(yield* db.entities.N.byOwner({ owner: "o1" }).collect()).toHaveLength(0)
+      }),
+    )
+  }),
+  ...bothSettings("the other half, the other way round", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["note"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", note: "n1" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", note: "n2" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: "note_n2" })
+      }),
+    )
+  }),
+  ...bothSettings("a row without the other half isn't in the index until it has both", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["note"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1" }).asEffect()
+        let row = typeOf(yield* table.rows(), "N")
+        expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: undefined })
+        expect(yield* db.entities.N.byOwner({ owner: "o1" }).collect()).toHaveLength(0)
+        yield* db.entities.N.upsert({ id: "a", owner: "o2" }).asEffect()
+        row = typeOf(yield* table.rows(), "N")
+        expect(keysOf(row)).toEqual({ pk: "owner_o2", sk: undefined })
+        yield* db.entities.N.upsert({ id: "a", note: "n1" }).asEffect()
+        row = typeOf(yield* table.rows(), "N")
+        expect(keysOf(row)).toEqual({ pk: "owner_o2", sk: "note_n1" })
+        expect(yield* db.entities.N.byOwner({ owner: "o2" }).collect()).toHaveLength(1)
+      }),
+    )
+  }),
+  ...bothSettings("rekey finds nothing to do on a row holding one half", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["note"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1" }).asEffect()
+        const before = yield* table.rows()
+        const report = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(report.moved.item).toBe(0)
+        expect(report.indexKeysRewritten).toBe(0)
+        expect(yield* table.rows()).toEqual(before)
+      }),
+    )
+  }),
+  ...bothSettings("a half that can't change isn't written on its own", (h, on) => {
+    const w = looseWorld(on, {
+      OverKey: {
+        model: Noted,
+        indexes: { byId: { name: "gsi1", pk: half(1, ["id"]), sk: sortHalf(1, ["note"]) } },
+      },
+      Empty: {
+        model: Noted,
+        indexes: { byNote: { name: "gsi1", pk: half(1, []), sk: sortHalf(1, ["note"]) } },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        for (const name of ["OverKey", "Empty"]) {
+          table.clear()
+          yield* db.entities[name].upsert({ id: "a", owner: "o" }).asEffect()
+          const row = typeOf(yield* table.rows(), name)
+          expect(row.gsi1pk, name).toBeUndefined()
+          expect(row.gsi1sk, name).toBeUndefined()
+          expect(requestOf(table).ConditionExpression, name).toBeUndefined()
+          // Given the value, both halves are written, as ever.
+          yield* db.entities[name].upsert({ id: "a", note: "n" }).asEffect()
+          expectKeysOfValues(w, typeOf(yield* table.rows(), name), w.entities[name], name)
+        }
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a half it names part of stays, in one write, while what it names doesn't change",
+    (h, on) => {
+      const w = notedWorld(on, byOwnerOver(["a", "b"]))
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1", b: "2" }).asEffect()
+          table.clear()
+          yield* db.entities.N.upsert({ id: "a", a: "1", note: "x" }).asEffect()
+          expect(commands(table)).toEqual(["updateItem"])
+          expect(requestOf(table).ConditionExpression).toContain("attribute_not_exists(#kpk)")
+          expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({ pk: "owner_o", sk: "a_1#b_2" })
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a change to it composes from what the row returned, with no read", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["a", "b"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1", b: "2" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "9" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.a.S).toBe("9")
+        expect(keysOf(row)).toEqual({ pk: "owner_o", sk: "a_9#b_2" })
+        expectKeysOfValues(w, row, w.entities.N, "N")
+      }),
+    )
+  }),
+  ...bothSettings("a new row takes what it can, in one write", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["a", "b"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.a.S).toBe("1")
+        expect(keysOf(row)).toEqual({ pk: "owner_o", sk: undefined })
+        // It holds no `b`, so a second one is held to `a` alone.
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "1", b: "2" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({ pk: "owner_o", sk: "a_1#b_2" })
+      }),
+    )
+  }),
+  ...["sparse", "preserve"].flatMap((policy) =>
+    bothSettings(`what the row can't supply goes by its policy: ${policy}`, (h, on) => {
+      const w = notedWorld(on, {
+        byOwner: {
+          name: "gsi1",
+          pk: half(1, ["owner"]),
+          sk: sortHalf(1, ["a", "b"]),
+          indexPolicy: { pk: policy, sk: policy },
+        },
+      })
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1", b: "2" }).asEffect()
+          const { a: _a, ...withoutA } = typeOf(yield* table.rows(), "N")
+          yield* table.seed(withoutA)
+          table.clear()
+          // A hole: `b` is new and the row has no `a` to compose it under.
+          yield* db.entities.N.upsert({ id: "a", b: "9" }).asEffect()
+          expect(commands(table)).toEqual(["updateItem", "updateItem"])
+          const row = typeOf(yield* table.rows(), "N")
+          expect(row.b.S).toBe("9")
+          expect(keysOf(row).sk).toBe(policy === "sparse" ? undefined : "a_1#b_2")
+        }),
+      )
+    }),
+  ),
+  ...bothSettings("a row with no trailing value takes the key an update gives it", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["a", "b"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const seeded = (id: string) =>
+          Effect.gen(function* () {
+            yield* db.entities.N.upsert({ id, owner: "o", a: "1", b: "2" }).asEffect()
+            const { b: _b, ...withoutB } = typeOf(yield* table.rows(), "N", id)
+            yield* table.seed(withoutB)
+          })
+        yield* seeded("a")
+        yield* seeded("b")
+        yield* db.entities.N.upsert({ id: "a", a: "9" }).asEffect()
+        yield* db.entities.N.update({ id: "b" }).set({ a: "9" }).asEffect()
+        const rows = yield* table.rows()
+        expect(keysOf(typeOf(rows, "N", "a")).sk).toBe("a_9")
+        expect(keysOf(typeOf(rows, "N", "a"))).toEqual(keysOf(typeOf(rows, "N", "b")))
+      }),
+    )
+  }),
+  ...bothSettings("a sharded partition half needs what it hashes", (h, on) => {
+    const w = notedWorld(on, {
+      byOwner: {
+        name: "gsi1",
+        pk: half(1, ["owner"]),
+        sk: sortHalf(1, ["a"]),
+        shards: { count: 8, by: ["a"] },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", a: "x" }).asEffect()
+        const first = typeOf(yield* table.rows(), "N")
+        expectKeysOfValues(w, first, w.entities.N, "N")
+        // Nothing to hash: the partition half can't compose, and stays while `owner` does.
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", note: "x" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(typeOf(yield* table.rows(), "N").gsi1pk).toEqual(first.gsi1pk)
+        // `owner` changing moves it, composed from the row's `a`.
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o2" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        let row = typeOf(yield* table.rows(), "N")
+        expect(row.gsi1pk.S).toContain("owner_o2")
+        expectKeysOfValues(w, row, w.entities.N, "N")
+        // `a` changing moves it too, the shard being its hash.
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "y" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        row = typeOf(yield* table.rows(), "N")
+        expect(row.a.S).toBe("y")
+        expectKeysOfValues(w, row, w.entities.N, "N")
+      }),
+    )
+  }),
+  ...bothSettings("a Z-order half is all or nothing", (h, on) => {
+    const Facets = Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      price: Schema.optional(Schema.Number),
+      beds: Schema.optional(Schema.Number),
+    })
+    const w = looseWorld(on, {
+      N: {
+        model: Facets,
+        indexes: {
+          byOwner: {
+            name: "gsi1",
+            pk: half(1, ["owner"]),
+            sk: {
+              field: "gsi1sk",
+              zorder: [
+                { field: "price", min: 0, max: 255 },
+                { field: "beds", min: 0, max: 15 },
+              ],
+            },
+          },
+        },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", price: 10 }).asEffect()
+        expect(typeOf(yield* table.rows(), "N").gsi1sk).toBeUndefined()
+        yield* db.entities.N.upsert({ id: "a", price: 10, beds: 2 }).asEffect()
+        const whole = typeOf(yield* table.rows(), "N")
+        expectKeysOfValues(w, whole, w.entities.N, "N")
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", price: 10 }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(typeOf(yield* table.rows(), "N").gsi1sk).toEqual(whole.gsi1sk)
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", price: 200 }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        const moved = typeOf(yield* table.rows(), "N")
+        expect(moved.gsi1sk).not.toEqual(whole.gsi1sk)
+        expectKeysOfValues(w, moved, w.entities.N, "N")
+      }),
+    )
+  }),
+  ...bothSettings("the caller's condition still decides", (h, on) => {
+    const w = notedWorld(on, byOwnerOver(["a", "b"]))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1", b: "2" }).asEffect()
+        const before = yield* table.rows()
+        const refused = yield* Effect.flip(
+          db.entities.N.upsert({ id: "a", a: "9" }).condition({ owner: "other" }).asEffect(),
+        )
+        expect((refused as { readonly _tag: string })._tag).toBe("ConditionalCheckFailed")
+        expect(yield* table.rows()).toEqual(before)
+        yield* db.entities.N.upsert({ id: "a", a: "9" }).condition({ owner: "o" }).asEffect()
+        expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({ pk: "owner_o", sk: "a_9#b_2" })
+      }),
+    )
+  }),
+  ...bothSettings("a renamed field is held to its stored name", (h, on) => {
+    const Renamed = DynamoModel.configure(Noted, { a: { field: "storedA" } })
+    const w = looseWorld(on, { N: { model: Renamed, indexes: byOwnerOver(["a", "b"]) } })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o", a: "1", b: "2" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "1" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const names = Object.values(requestOf(table).ExpressionAttributeNames as object)
+        expect(names).toContain("storedA")
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "9" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.storedA.S).toBe("9")
+        expect(keysOf(row).sk).toBe("a_9#b_2")
+      }),
+    )
+  }),
+  ...bothSettings("a kept value beside a changing one, its partner left out", (h, on) => {
+    const Fixed = DynamoModel.configure(Noted, { a: { immutable: true } })
+    const w = looseWorld(on, {
+      N: {
+        model: Fixed,
+        indexes: { byOwner: { name: "gsi1", pk: half(1, ["a", "owner"]), sk: sortHalf(1, ["b"]) } },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", a: "1", owner: "o1", b: "2" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "1", owner: "o2" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({
+          pk: "a_1#owner_o2",
+          sk: "b_2",
+        })
+        // Another `a` contradicts the row, which keeps its own: composed from that.
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "9", owner: "o3" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({
+          pk: "a_1#owner_o3",
+          sk: "b_2",
+        })
+      }),
+    )
+  }),
+  ...bothSettings("a kept value alone in a half isn't written on its own", (h, on) => {
+    const Fixed = DynamoModel.configure(Noted, { a: { immutable: true } })
+    const w = looseWorld(on, {
+      N: {
+        model: Fixed,
+        indexes: { byA: { name: "gsi1", pk: half(1, ["a"]), sk: sortHalf(1, ["note"]) } },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", a: "1" }).asEffect()
+        expect(typeOf(yield* table.rows(), "N").gsi1pk).toBeUndefined()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", a: "1", owner: "x" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+      }),
+    )
+  }),
+  ...bothSettings("a half over nothing but updatedAt moves, the other half left out", (h, on) => {
+    const Stamped = Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      updatedAt: Schema.optional(Schema.DateTimeUtc),
+    })
+    const w = looseWorld(on, {
+      N: { model: Stamped, timestamps: true, indexes: byOwnerOver(["updatedAt"]) },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1" }).asEffect()
+        const first = typeOf(yield* table.rows(), "N")
+        yield* tick
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.gsi1sk).not.toEqual(first.gsi1sk)
+        expect(row.gsi1pk).toEqual(first.gsi1pk)
+        expectKeysOfValues(w, row, w.entities.N, "N")
+      }),
+    )
+  }),
+  ...bothSettings("an updatedAt the input supplies moves the half, from the row", (h, on) => {
+    const Stamped = Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      updatedAt: Schema.optional(Schema.DateTimeUtc),
+    })
+    const w = looseWorld(on, {
+      N: { model: Stamped, timestamps: true, indexes: byOwnerOver(["note", "updatedAt"]) },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", note: "n" }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", updatedAt: SUPPLIED }).asEffect()
+        // The first is rejected on the value it names, and its row says what the key needs.
+        expect(commands(table)).toEqual(["updateItem", "updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.updatedAt.S).toBe(SUPPLIED)
+        expect(keysOf(row).sk).toBe(`note_n#updatedat_${SUPPLIED.toLowerCase()}`)
+      }),
+    )
+  }),
+  ...bothSettings("an updatedAt in the half it can't compose lags, as on an update", (h, on) => {
+    const Stamped = Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      updatedAt: Schema.optional(Schema.DateTimeUtc),
+    })
+    const w = looseWorld(on, {
+      N: { model: Stamped, timestamps: true, indexes: byOwnerOver(["updatedAt", "note"]) },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", owner: "o1", note: "n" }).asEffect()
+        const first = typeOf(yield* table.rows(), "N")
+        yield* tick
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", owner: "o2" }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        expect(requestOf(table).ConditionExpression).toBeUndefined()
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.gsi1sk).toEqual(first.gsi1sk)
+        expect(keysOf(row).pk).toBe("owner_o2")
+      }),
+    )
+  }),
+  ...bothSettings("a time-series append leaving one out is per half already", (h, on) => {
+    const Meter = Schema.Struct({
+      id: Schema.String,
+      at: Schema.Number,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+    })
+    const w = looseWorld(on, {
+      N: {
+        model: Meter,
+        indexes: byOwnerOver(["note"]),
+        timeSeries: { orderBy: "at", appendInput: Meter },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.append({ id: "a", at: 1, owner: "o1", note: "n1" }).asEffect()
+        yield* db.entities.N.append({ id: "a", at: 2, owner: "o2" }).asEffect()
+        const row = (yield* table.rows()).find(
+          (candidate) => candidate.owner?.S === "o2" && !candidate.sk.S.includes("#e#"),
+        )!
+        expect(keysOf(row)).toEqual({ pk: "owner_o2", sk: "note_n1" })
+      }),
+    )
+  }),
+]
+
+// ---------------------------------------------------------------------------
+// A many edge with a custom decompose: its rows hold what its elements do
+// ---------------------------------------------------------------------------
+
+const Line = Schema.Struct({
+  sku: Schema.String,
+  qty: Schema.Number,
+  at: Schema.optional(Schema.DateTimeUtc),
+  ...Dates,
+})
+type LineValue = { readonly sku: string }
+const byValues = {
+  decompose: (value: unknown) => Object.values(value as Record<string, LineValue>),
+  assemble: (items: ReadonlyArray<unknown>) =>
+    Object.fromEntries((items as ReadonlyArray<LineValue>).map((item) => [item.sku, item])),
+}
+const LineEntity = () =>
+  Entity.make({
+    model: Line,
+    entityType: "LineEntity",
+    primaryKey: { pk: { field: "pk", composite: ["sku"] }, sk: { field: "sk", composite: [] } },
+  })
+
+const decomposeWorld = (on: boolean, model: unknown, edge: Record<string, unknown>) =>
+  aggregateWorld(on, (make) => ({
+    Orders: make("Order", model, {
+      edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: ["sku"] }, ...edge }) },
+    }),
+  }))
+
+const OrderOfRecord = Schema.Struct({
+  id: Schema.String,
+  lines: Schema.Record(Schema.String, Line),
+})
+
+export const decomposeScenarios: ReadonlyArray<RepairScenario> = [
+  ...[
+    ["no entity", {}],
+    ["an entity", { entity: LineEntity() }],
+  ].flatMap(([label, edge]) =>
+    bothSettings(`a record's values, with ${label as string}, stamped and read back`, (h, on) => {
+      const w = decomposeWorld(on, OrderOfRecord, { ...byValues, ...(edge as object) })
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          const created = yield* db.aggregates.Orders.create({
+            id: "o",
+            lines: { a: { sku: "a", qty: 1 } },
+          })
+          const stamped = created.lines.a.updatedAt
+          expect(DateTime.isDateTime(stamped)).toBe(true)
+          const line = (yield* table.rows()).find((row) => row.sku?.S === "a")!
+          expect(line.updatedAt.S).toBe(DateTime.formatIso(stamped))
+          expect(line.createdAt.S).toBe(DateTime.formatIso(created.lines.a.createdAt))
+          const read = yield* db.aggregates.Orders.get({ id: "o" })
+          expect(read.lines.a.qty).toBe(1)
+          expect(DateTime.formatIso(read.lines.a.updatedAt)).toBe(DateTime.formatIso(stamped))
+          yield* tick
+          const updated = yield* db.aggregates.Orders.update({ id: "o" }, ({ state }: any) => ({
+            ...state,
+            lines: {
+              ...state.lines,
+              a: { ...state.lines.a, qty: 2 },
+              b: { sku: "b", qty: 3 },
+            },
+          }))
+          expect(updated.lines.a.qty).toBe(2)
+          expect(DateTime.isDateTime(updated.lines.b.updatedAt)).toBe(true)
+          const rows = yield* table.rows()
+          expect(rows.find((row) => row.sku?.S === "b")!.updatedAt.S).toBe(
+            DateTime.formatIso(updated.lines.b.updatedAt),
+          )
+        }),
+      )
+    }),
+  ),
+  ...bothSettings("a supplied date wins, and a date field is stored as its own form", (h, on) => {
+    const w = decomposeWorld(on, OrderOfRecord, byValues)
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const created = yield* db.aggregates.Orders.create({
+          id: "o",
+          lines: { a: { sku: "a", qty: 1, at: SUPPLIED, updatedAt: SUPPLIED } },
+        })
+        expect(DateTime.formatIso(created.lines.a.updatedAt)).toBe(SUPPLIED)
+        const line = (yield* table.rows()).find((row) => row.sku?.S === "a")!
+        expect(line.at.S).toBe(SUPPLIED)
+        expect(line.updatedAt.S).toBe(SUPPLIED)
+        const read = yield* db.aggregates.Orders.get({ id: "o" })
+        expect(DateTime.formatIso(read.lines.a.at)).toBe(SUPPLIED)
+      }),
+    )
+  }),
+  ...bothSettings("an array with its own decompose and assemble", (h, on) => {
+    const Order = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+    const assembled: Array<number> = []
+    const w = decomposeWorld(on, Order, {
+      decompose: (value: unknown) => [...(value as ReadonlyArray<unknown>)],
+      assemble: (items: ReadonlyArray<unknown>) => {
+        assembled.push(items.length)
+        return [...items]
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const created = yield* db.aggregates.Orders.create({
+          id: "o",
+          lines: [{ sku: "a", qty: 1 }],
+        })
+        expect(assembled[0]).toBe(1)
+        expect(DateTime.isDateTime(created.lines[0].updatedAt)).toBe(true)
+        expect((yield* table.rows()).find((row) => row.sku?.S === "a")!.updatedAt.S).toBe(
+          DateTime.formatIso(created.lines[0].updatedAt),
+        )
+      }),
+    )
+  }),
+  ...bothSettings("a value its decompose can't take apart is left for the schema", (h, on) => {
+    const w = decomposeWorld(on, OrderOfRecord, {
+      ...byValues,
+      decompose: (value: unknown) => {
+        if (typeof value !== "object" || value === null || "bad" in value) {
+          throw new Error("not a record")
+        }
+        return Object.values(value)
+      },
+    })
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const error: any = yield* Effect.flip(
+          db.aggregates.Orders.create({ id: "o", lines: { bad: { sku: "a", qty: 1 } } }),
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause?.message ?? error.cause)).toContain("Missing key")
+      }),
+    )
+  }),
+  ...bothSettings("an assemble that can't take the input yet is left for the schema", (h, on) => {
+    const w = decomposeWorld(on, OrderOfRecord, {
+      ...byValues,
+      assemble: (items: ReadonlyArray<any>) =>
+        Object.fromEntries(items.map((item) => [item.updatedAt.toISOString(), item])),
+    })
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const error: any = yield* Effect.flip(
+          db.aggregates.Orders.create({ id: "o", lines: { a: { sku: "a", qty: 1 } } }),
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause?.message ?? error.cause)).toContain("Missing key")
+      }),
+    )
+  }),
+  ...[
+    ["no assemble", { decompose: (value: unknown) => [...(value as ReadonlyArray<unknown>)] }],
+    ["no decompose", { assemble: (items: ReadonlyArray<unknown>) => [...items] }],
+  ].flatMap(([label, edge]) =>
+    bothSettings(`an array with ${label as string} is still filled`, (h, on) => {
+      const Order = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+      const w = decomposeWorld(on, Order, edge as Record<string, unknown>)
+      return h.on(w, () =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          const created = yield* db.aggregates.Orders.create({
+            id: "o",
+            lines: [{ sku: "a", qty: 1 }],
+          })
+          expect(DateTime.isDateTime(created.lines[0].updatedAt)).toBe(true)
+        }),
+      )
+    }),
+  ),
+  ...bothSettings("rows with nothing to add aren't taken apart and put back", (h, on) => {
+    const Plain = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
+    const Order = Schema.Struct({ id: Schema.String, lines: Schema.Record(Schema.String, Plain) })
+    const assembled: Array<number> = []
+    const w = decomposeWorld(on, Order, {
+      decompose: byValues.decompose,
+      assemble: (items: ReadonlyArray<unknown>) => {
+        assembled.push(items.length)
+        return byValues.assemble(items)
+      },
+    })
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        // The key isn't the one `assemble` gives, so a round trip would change the value.
+        const created = yield* db.aggregates.Orders.create({
+          id: "o",
+          lines: { x: { sku: "a", qty: 1 } },
+        })
+        expect(assembled).toEqual([])
+        expect(Object.keys(created.lines)).toEqual(["x"])
+      }),
+    )
+  }),
+  ...bothSettings("an edge left out isn't taken apart", (h, on) => {
+    const Order = Schema.Struct({
+      id: Schema.String,
+      lines: Schema.optional(Schema.Record(Schema.String, Line)),
+    })
+    const given: Array<unknown> = []
+    const w = decomposeWorld(on, Order, {
+      ...byValues,
+      decompose: (value: unknown) => {
+        given.push(value)
+        return value === undefined ? [] : byValues.decompose(value)
+      },
+    })
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.aggregates.Orders.create({ id: "o" })
+        expect(given).not.toContain(undefined)
+      }),
+    )
+  }),
+  ...bothSettings("with no assemble, a record's rows can't be put back", (h, on) => {
+    const w = decomposeWorld(on, OrderOfRecord, { decompose: byValues.decompose })
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const error: any = yield* Effect.flip(
+          db.aggregates.Orders.create({ id: "o", lines: { a: { sku: "a", qty: 1 } } }),
+        )
+        expect(error._tag).toBe("ValidationError")
+      }),
+    )
+  }),
+  ...bothSettings("an optional record left out", (h, on) => {
+    const Order = Schema.Struct({
+      id: Schema.String,
+      lines: Schema.optional(Schema.Record(Schema.String, Line)),
+    })
+    const w = decomposeWorld(on, Order, byValues)
+    return h.on(w, () =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const created = yield* db.aggregates.Orders.create({ id: "o" })
+        expect(created.lines).toBeUndefined()
+        yield* db.aggregates.Orders.create({ id: "p", lines: { a: { sku: "a", qty: 1 } } })
+        const read = yield* db.aggregates.Orders.get({ id: "p" })
+        expect(DateTime.isDateTime(read.lines.a.updatedAt)).toBe(true)
+      }),
+    )
+  }),
+  ...bothSettings(
+    "an opaque value: its rows' dates are the library's, not the element's",
+    (h, on) => {
+      // Nothing says what the rows hold: `Schema.Unknown` has no element to read. They're stamped and
+      // the stamps are stripped on the read, so they don't reach the value.
+      const Order = Schema.Struct({ id: Schema.String, lines: Schema.Unknown })
+      const w = decomposeWorld(on, Order, byValues)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.aggregates.Orders.create({ id: "o", lines: { a: { sku: "a", qty: 1 } } })
+          expect((yield* table.rows()).find((row) => row.sku?.S === "a")!.updatedAt).toBeDefined()
+          const read = yield* db.aggregates.Orders.get({ id: "o" })
+          expect(read.lines).toEqual({ a: { sku: "a", qty: 1 } })
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a one edge with no entity takes the value, its dates stamped", (h, on) => {
+    const Match = Schema.Struct({
+      id: Schema.String,
+      venue: Schema.Struct({ name: Schema.String, ...Dates }),
+    })
+    const w = aggregateWorld(on, (make) => ({
+      Matches: make("Match", Match, { edges: { venue: Aggregate.one({ entityType: "Venue" }) } }),
+    }))
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const created = yield* db.aggregates.Matches.create({ id: "m", venue: { name: "v" } })
+        expect(created.venue.name).toBe("v")
+        expect(DateTime.isDateTime(created.venue.updatedAt)).toBe(true)
+        expect((yield* table.rows()).find((row) => row.name?.S === "v")!.updatedAt.S).toBe(
+          DateTime.formatIso(created.venue.updatedAt),
+        )
+      }),
+    )
+  }),
+]
+
 export const ALL_SCENARIOS: ReadonlyArray<readonly [string, ReadonlyArray<RepairScenario>]> = [
   ["shapes 16 to 18", writeScenarios],
   ["an append", appendScenarios],
@@ -2936,4 +3719,6 @@ export const ALL_SCENARIOS: ReadonlyArray<readonly [string, ReadonlyArray<Repair
   ["an upsert over a value it keeps", upsertScenarios],
   ["an append's requests", appendRequestScenarios],
   ["aggregates", aggregateScenarios],
+  ["an upsert leaving out a composite", upsertOmittedScenarios],
+  ["a custom decompose, and a one edge with no entity", decomposeScenarios],
 ]

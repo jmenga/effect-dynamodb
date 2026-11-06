@@ -983,10 +983,11 @@ const withinEnds = (
  *   where it doesn't (numbers stored as strings, zoned dates, a `literals`
  *   selection too large for `IN`) and for hashed prefix values (collisions).
  *
- * Throws `[EDD-9093]` for misuse from untyped code, `[EDD-9050]` for a value
- * that doesn't reach key form and `[EDD-9092]` for one no level holds — at
- * `.within()`, so every terminal (and `explain`) has a valid box. `{}` plans
- * nothing: the query is returned as it is.
+ * Throws `[EDD-9093]` for misuse from untyped code and `[EDD-9050]` for a value
+ * that doesn't reach key form, at `.within()`, so every terminal (and `explain`)
+ * has a valid box. A value no level holds throws `ZOrderValueError` (`[EDD-9092]`),
+ * which `.within()` turns into the query's `ValidationError`. `{}` plans nothing:
+ * the query is returned as it is.
  */
 const planZOrderWithin = <A>(args: {
   readonly entityLike: EntityLike
@@ -1178,27 +1179,21 @@ const planZOrderWithin = <A>(args: {
     return Array.from({ length: Math.max(0, hi - lo + 1) }, (_, i) => lo + i)
   }
   const { box, selections } = (() => {
-    try {
-      const quantized = ZOrderCurve.quantizeBounds(
-        layout,
-        Object.fromEntries(
-          dimensions
-            .filter((dim) => bounded.has(dim.field))
-            .map((dim) => [dim.field, quantizable(dim)]),
-        ),
-      )
-      const selected = new Map(
+    const quantized = ZOrderCurve.quantizeBounds(
+      layout,
+      Object.fromEntries(
         dimensions
-          .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
-          .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
-      )
-      const none = [...selected.values()].some((members) => members.length === 0)
-      return { box: none ? ("empty" as const) : quantized, selections: selected }
-    } catch (error) {
-      // A value that reaches key form but no level (§3.3): thrown, like EDD-9050.
-      if (ZOrderCurve.isZOrderValueError(error)) throw new Error(error.message)
-      throw error
-    }
+          .filter((dim) => bounded.has(dim.field))
+          .map((dim) => [dim.field, quantizable(dim)]),
+      ),
+    )
+    const selected = new Map(
+      dimensions
+        .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
+        .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
+    )
+    const none = [...selected.values()].some((members) => members.length === 0)
+    return { box: none ? ("empty" as const) : quantized, selections: selected }
   })()
 
   // -- exact bounds (§11): a FilterExpression where DynamoDB's order agrees, else row checks --
@@ -2611,7 +2606,7 @@ const makeFromConfig = (config: {
         : undefined
       const zorderPlans = zorderLayout === undefined ? undefined : makeZOrderPlans(zorderLayout)
 
-      return (rawComposites: Record<string, unknown>) => {
+      const accessor = (rawComposites: Record<string, unknown>) => {
         if (zorder) {
           const misplaced = indexDef.sk.composite.filter(
             (attr) => rawComposites[attr] !== undefined,
@@ -2865,6 +2860,26 @@ const makeFromConfig = (config: {
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
       }
+
+      return (rawComposites: Record<string, unknown>) => {
+        const operation = {
+          name: "Entity.query",
+          target: entityLike.entityType,
+          index: _indexName,
+        }
+        return Query.orRefusal(
+          operation,
+          () => accessor(rawComposites) as BoundQueryImpl<unknown, unknown, unknown>,
+          (refusal) =>
+            new BoundQueryImpl(Query.refused(indexDef.index, refusal), {
+              pathBuilder: createPathBuilder(),
+              conditionOps: createConditionOps(),
+              provide,
+              ...entityNaming(entityLike._resolveDbName),
+              operation,
+            }),
+        )
+      }
     }
 
     // 2. Bind entities + build entity query accessors
@@ -2994,7 +3009,7 @@ const makeFromConfig = (config: {
         members.map((m) => ({ key: m.entityKey, index: m.indexDef })),
       )
 
-      boundCollections[collName] = (composites: Record<string, unknown>) => {
+      const collectionAccessor = (composites: Record<string, unknown>) => {
         // Use the first member for PK composition — verified above to agree
         // with every other member.
         const firstMember = members[0]!
@@ -3129,6 +3144,21 @@ const makeFromConfig = (config: {
           operation: { name: "Collection.query", target: collName },
         }
         return new BoundQueryImpl(query, bqConfig)
+      }
+
+      boundCollections[collName] = (composites: Record<string, unknown>) => {
+        const operation = { name: "Collection.query", target: collName }
+        return Query.orRefusal(
+          operation,
+          () => collectionAccessor(composites) as BoundQueryImpl<unknown, unknown, unknown>,
+          (refusal) =>
+            new BoundQueryImpl(Query.refused(members[0]!.indexDef.index, refusal), {
+              pathBuilder: createPathBuilder(),
+              conditionOps: createConditionOps(),
+              provide,
+              operation,
+            }),
+        )
       }
     }
 

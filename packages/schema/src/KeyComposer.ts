@@ -571,11 +571,19 @@ export const serializeValue136 = (value: unknown): string =>
     (n) => String(n).padStart(38, "0"),
   )
 
-/** A composite value's serialized text under the schema's setting, before casing and escaping. */
-export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string =>
-  schema.escapeKeys === true || schema.numericKeyText === true
-    ? serializeValue(value)
-    : serializeValue136(value)
+/**
+ * A composite value's serialized text under the schema's setting, before casing and escaping. `NaN`
+ * has no place in key order under any setting: `[EDD-9096]`. With `escapeKeys` off every other value
+ * keeps the text 1.36 gave it, and only {@link DynamoSchema.DynamoSchema.text136} composes 1.36's for
+ * `NaN` too, for `rekey` to find a row stored under it.
+ */
+export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string => {
+  if (schema.escapeKeys === true || schema.numericKeyText === true) return serializeValue(value)
+  if (schema.text136 !== true && typeof value === "number" && Number.isNaN(value)) {
+    return serializeValue(value)
+  }
+  return serializeValue136(value)
+}
 
 /** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
@@ -1120,6 +1128,31 @@ export const tryComposeIndexKeys = (
     composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
   if (!present(index.pk.composite) || !present(index.sk.composite)) return undefined
   return composeIndexKeys(schema, entityType, entityVersion, index, record)
+}
+
+/**
+ * The halves of a secondary index `record` holds every value of, for a write that leaves what it
+ * doesn't name as it's stored (an upsert). A half missing a value is left out, never truncated; a
+ * sharded index's partition half also needs what it hashes.
+ */
+export const composeKnownHalves = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): Record<string, KeyValue> => {
+  const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
+  const complete = (composite: ReadonlyArray<string>) =>
+    composite.every((attr) => hasValue(record[attr]))
+  return {
+    ...(complete([...index.pk.composite, ...shardSource])
+      ? { [index.pk.field]: composePk(schema, entityType, index, record) }
+      : {}),
+    ...(complete(index.sk.composite)
+      ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
+      : {}),
+  }
 }
 
 /**
