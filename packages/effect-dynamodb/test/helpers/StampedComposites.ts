@@ -480,6 +480,48 @@ export const writeScenarios: ReadonlyArray<RepairScenario> = [
       )
     },
   ),
+  ...bothSettings(
+    "an update that reads first leaves what it can't compose, and doesn't guard on what it stamps",
+    (h, on) => {
+      const w = ticketWorld(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.Tickets.put({
+            id: "a",
+            owner: "o",
+            status: "open",
+            price: 10,
+          }).asEffect()
+          // A key with no `status` behind it: nothing here can compose it again.
+          const { status: _status, ...stored } = rowOf(yield* table.rows(), "a")
+          yield* table.seed(stored)
+          yield* tick
+          table.clear()
+          // A computed index composite takes the branch that reads the item first.
+          yield* db.entities.Tickets.update({ id: "a" }).add({ price: 1 }).asEffect()
+          const after = rowOf(yield* table.rows(), "a")
+          expect(after.price.N).toBe("11")
+          // Left under either policy, as the standard path leaves it.
+          expect(after.gsi3sk).toEqual(stored.gsi3sk)
+          expect(after.gsi4sk).toEqual(stored.gsi4sk)
+          // And what it can compose moves.
+          expect(after.gsi2sk.S.toLowerCase()).toContain(
+            `updatedat_${after.updatedAt.S.toLowerCase()}`,
+          )
+          expect(after.gsi10sk).not.toEqual(stored.gsi10sk)
+          // A key over `updatedAt` is written, and a concurrent write moving it changes nothing
+          // the key was composed from: the guard names what was read, not what's stamped.
+          const write = table.requests().find((request) => request.command === "updateItem")!
+          const guarded = Object.entries(write.input.ExpressionAttributeNames as object)
+            .filter(([placeholder]) => placeholder.startsWith("#g"))
+            .map(([, attribute]) => attribute)
+          expect(guarded).toContain("price")
+          expect(guarded).not.toContain("updatedAt")
+        }),
+      )
+    },
+  ),
   ...bothSettings("restoring a soft delete writes the keys of the values it restores", (h, on) => {
     const w = ticketWorld(on, { softDelete: true })
     return h.on(w, (table) =>
@@ -900,6 +942,85 @@ export const adjacentScenarios: ReadonlyArray<RepairScenario> = [
       )
     },
   ),
+  ...bothSettings("an upsert moves a key over `updatedAt`, in its one write", (h, on) => {
+    const w = looseWorld(on, {
+      Upserted: {
+        model: Schema.Struct({
+          id: Schema.String,
+          owner: Schema.String,
+          status: Schema.optional(Schema.String),
+          updatedAt: Schema.DateTimeUtc,
+        }),
+        timestamps: true,
+        indexes: {
+          ...byOwnerOver(["updatedAt"]),
+          byStatus: { name: "gsi2", pk: half(2, ["owner"]), sk: sortHalf(2, ["status", "updatedAt"]) },
+        },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.Upserted.upsert({ id: "a", owner: "o", status: "open" }).asEffect()
+        const first = typeOf(yield* table.rows(), "Upserted")
+        expect(first.gsi1sk.S.toLowerCase()).toContain(
+          `updatedat_${first.updatedAt.S.toLowerCase()}`,
+        )
+        expect(first.gsi2sk.S.toLowerCase()).toContain(
+          `status_open#updatedat_${first.updatedAt.S.toLowerCase()}`,
+        )
+        yield* tick
+        table.clear()
+        yield* db.entities.Upserted.upsert({ id: "a", owner: "o" }).asEffect()
+        expect(table.requests().map((request) => request.command)).toEqual(["updateItem"])
+        const second = typeOf(yield* table.rows(), "Upserted")
+        expect(second.updatedAt).not.toEqual(first.updatedAt)
+        expect(second.gsi1sk.S.toLowerCase()).toContain(
+          `updatedat_${second.updatedAt.S.toLowerCase()}`,
+        )
+        // No `status` in the input to compose it from, so it stays, as an update leaves it.
+        expect(second.status).toEqual(first.status)
+        expect(second.gsi2sk).toEqual(first.gsi2sk)
+      }),
+    )
+  }),
+  ...bothSettings("a guarded put keeps a renamed `createdAt` in the key", (h, on) => {
+    const w = looseWorld(on, {
+      Guarded: {
+        model: DynamoModel.configure(
+          Schema.Struct({
+            id: Schema.String,
+            owner: Schema.String,
+            createdAt: Schema.DateTimeUtc,
+          }),
+          { createdAt: { field: "created_at" } },
+        ),
+        timestamps: true,
+        versioned: true,
+        indexes: byOwnerOver(["createdAt"]),
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.Guarded.put({ id: "a", owner: "o" }).asEffect()
+        const first = typeOf(yield* table.rows(), "Guarded")
+        expect(first.gsi1sk.S.toLowerCase()).toContain(first.created_at.S.toLowerCase())
+        yield* tick
+        yield* db.entities.Guarded.put({ id: "a", owner: "o" }).asEffect()
+        const second = typeOf(yield* table.rows(), "Guarded")
+        expect(second.version.N).toBe("2")
+        expect(second.created_at).toEqual(first.created_at)
+        expect(second.gsi1sk).toEqual(first.gsi1sk)
+        yield* tick
+        yield* Transaction.transactWrite([db.entities.Guarded.put({ id: "a", owner: "o" })])
+        const third = typeOf(yield* table.rows(), "Guarded")
+        expect(third.version.N).toBe("3")
+        expect(third.created_at).toEqual(first.created_at)
+        expect(third.gsi1sk).toEqual(first.gsi1sk)
+      }),
+    )
+  }),
   ...bothSettings("an aggregate's list key holds what its root row holds", (h, on) => {
     const schema = DynamoSchema.make({ name: "stamped", version: 1, escapeKeys: on })
     const Filler = Entity.make({
