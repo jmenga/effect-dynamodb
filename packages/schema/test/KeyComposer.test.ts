@@ -1679,17 +1679,17 @@ describe("KeyComposer", () => {
           1,
           {
             primary: indexes.primary!,
-            byNote: {
-              index: "gsi2",
-              pk: { field: "gsi2pk", composite: ["note"] },
-              sk: { field: "sk", composite: ["note"] },
+            local: {
+              index: "lsi",
+              pk: { field: "pk", composite: ["tenant"] },
+              sk: { field: "lsk", composite: ["note"] },
             },
           },
           {},
           key,
-          { removedSet: new Set(["note"]) },
+          { removedSet: new Set(["tenant", "note"]) },
         )
-        expect(result).toEqual({ sets: {}, removes: ["gsi2pk"] })
+        expect(result).toEqual({ sets: {}, removes: ["lsk"] })
       })
 
       it("every other shape is untouched when the map holds no primary index", () => {

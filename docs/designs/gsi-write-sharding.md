@@ -872,7 +872,7 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
 |---|---|---|
 | Which write paths can leave a 1.36 sort key in a shard? | `update`, `Transaction.transactWrite`, `append`, retain, `put`, `Batch.write`, the 1.37 move, `rekey` | §9.3's table. Each is covered by a test on a recording table and on DynamoDB Local |
 | Which key attributes can a half on a sharded index overwrite? | Table `pk` and `sk`; another index's `pk` or `sk`; its own `sk`; a sharded one with another count, source, composites, casing or collection; a Z-order half with another layout | All refused (§17.3, §17.7), and so is the same with nothing sharded (§17.8). What's provably the same stays legal, including an index half that is the table's own (§17.16) |
-| Which paths write or strip a table key attribute through an index half? | `composeIndexKeys`, the update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first four did, all fixed (§17.9, §17.16), and the dropped entry is gone (§17.14). `rekey` never rewrites one, whatever it composes (D58). The move composes no such half now (D62) |
+| Which paths write or strip a table key attribute through an index half? | `composeIndexKeys`, the update composer, `gsiKeyFields` (snapshots, tombstones, events), the retain path's dropped entry, `rekey`'s in-place rewrite, the move | The first four did, all fixed (§17.9, §17.16), and the dropped entry is gone (§17.14). `rekey` can't reach one now, so its guard is gone (§17.16). The move composes no such half (D62) |
 | Which definitions reach a client without `Table.make`? | `_configure` is called only by `Table.make` and `carryConfigure`, which copies its result | None (§17.7) |
 | Which halves can a row lose the value of and keep the text of? | An unsharded index's sort key and partition key; a sharded index's sort key; a sharded partition key; a vector partition | All left with no conflict, and pinned on both tables (D58, §17.10), but for a sharded partition key in another layout, which is `"uncomposable"` |
 | Which paths compose every index from a whole row, where an attribute two accessors share goes to the later one? | The move, the retain path, `put` and its kin | Every definition that could reach them is refused now (D61, §17.8), so halves in one attribute compose the same bytes and the order doesn't matter. `rekey`'s in-place pass doesn't compose a whole row: it judges each half by itself (§9.2) |
@@ -994,6 +994,17 @@ listed), `.maxPages`, `.zorder()` and Z-order `by`.
   table key attribute. A vector partition and three guards run on the recording table alone, and a sharded partition key
   reported as uncomposable in the current layout fails only there. An earlier run, with D60 in, found that a sharded
   partition key moving between layouts had no test on DynamoDB Local, which is closed.
+  A check of D61 and D62 with what's left of the earlier rounds, over 51 reverts, 47 of them on the connected suite too, all
+  fail a test now, with no survivor. For D61: the shard filter back, which fails 20 schema tests, 2 on the recording table
+  and 1 on DynamoDB Local, each stage refusing nothing, and a stand-in with nothing to escape. For D62: nothing bound, only
+  one attribute bound, a sharded index's sort key bound, a half written through the index, each text form left out of a
+  composer, of a key segment or of `.where()` and `.within()`, a half truncating, in `.where()`, in `.within()` and in each
+  1.36 condition, a `gt` stopping at the delimiter, no `EDD-9107`, a `.within()` over an earlier composite taking one range,
+  and a tupled `.within()` parsing the key. The first run found four survivors, all closed. Comparing composites when
+  binding a half was redundant with the proof, which accounted for two of them, so it's gone. `rekey`'s guard on a table key
+  attribute can't fire now (§17.16), so it's gone too. A `.within()` treating the half as truncating showed only with the
+  fallback off, which now has scenarios. 11 fail on the unit suites only: refusals, bytes that come out the same through
+  the index, a needless 1.36 request, and paths a definable row doesn't reach on a real table.
 - **On AWS:** a one-off run at `2fc7bc6`, not CI (§12). DynamoDB Local shows keys, merges and cursors,
   never throughput.
 
@@ -1438,12 +1449,13 @@ same effective casing as the table half stored there, is that table key.
 - **The table's own key text doesn't change.** Stored bytes for a string with nothing to escape are identical across 1.36,
   1.37 and this release.
 
-**Where it is.** `bindTableKeyHalves` sets `IndexDefinition.tableKey` where `Entity.make` normalises a definition, and the
-composers read that one property (`partitionKeyComposites`, `sortKeyComposites`, `sortKeyTruncates`), with
-`composeIndexKeys` leaving such a half out. `EDD-9106` needs no case for it: §17.7's proof judges the text the composers
-produce, so a pair like this passes, and a casing mismatch, a collection's label, a sharded partition key or a Z-order
-half still differs and is refused. An index half in the table's attribute of the same kind (a local index's partition key,
-a sort key shared with the table) gets the property too, and composes what it always did.
+**Where it is.** `bindTableKeyHalves` sets `IndexDefinition.tableKey` where `Entity.make` normalises a definition, for any
+half in a table key attribute: the attribute alone decides. The composers read that one property (`partitionKeyComposites`,
+`sortKeyComposites`, `sortKeyTruncates`), with `composeIndexKeys` leaving such a half out. `EDD-9106` needs no case for it,
+and is what holds the rest of the rule: §17.7's proof judges the text the composers produce, so a half with the table half's
+composites, order and casing passes, and other composites or order, another casing, a collection's label, a sharded
+partition key or a Z-order half differs and is refused. A half in the table's attribute of the same kind (a local index's
+partition key, a sort key shared with the table) gets the property too, and composes what it always did.
 
 **What stays refused:** shape 13, two GSIs swapping each other's attributes, a table-key half with other composites, order
 or casing, and a sharded index's sort key in the table's partition key, which D62 doesn't cover as anything sharded stays
@@ -1469,9 +1481,11 @@ the table's partition key text is already ambiguous there. U+0000 in a key condi
 1.36 pass then and only then: two queries for `a b`, one request with identical bytes for a plain value. `KeyText136` needed
 one change, the same truncation rule, so a raw half sends no needless second pass.
 
-**`rekey`.** No change. The half is the table's key, so a table key move carries the index with it: `moved.item: 1`,
-`indexKeysRewritten: 0`, no conflicts, and afterwards `get` and the inverted query find the row with the fallback off.
-`rekey` had no code that only served shape 13.
+**`rekey`.** The half is the table's key, so a table key move carries the index with it: `moved.item: 1`,
+`indexKeysRewritten: 0`, no conflicts, and afterwards `get` and the inverted query find the row with the fallback off. The
+one change is a removal. Its guard against rewriting a table key attribute can't fire now, as such a half holds the table's
+text: on a row under its current table key that's what it composes, a row under its 1.36 key moves first, and a row under
+any other key isn't read for index keys.
 
 **A row 1.37.0 already overwrote** isn't repaired. Pinned on a recording table and on DynamoDB Local, with `pk` holding
 `userid_u%201` for `userId: "u 1"`:
@@ -1481,7 +1495,7 @@ one change, the same truncation rule, so a raw half sends no needless second pas
 | `get`, or a query pinning the row's `userId` | `ItemNotFound`, and no rows |
 | An inverted query with no pin | Lists it |
 | `delete` of `userId: "u 1"` | Reports success and leaves it, as before |
-| `rekey` | Moves nothing, rewrites nothing and reports no conflict. The row is unchanged |
+| `rekey` | Moves nothing, rewrites nothing and reports no conflict, counting it in `skipped.unrecognizedKey`. The row is unchanged |
 | A re-put of the item | Writes a correct second row, which `get` and the pin find. **The old row stays**, and the inverted query with no pin lists both |
 | `delete({ userId: "u%201", groupId: "plain" })` | Removes the old row, as partition key text isn't escaped, so the stored text can be spelled |
 
