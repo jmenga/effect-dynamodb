@@ -11,6 +11,10 @@
  *
  * `[EDD-9108]`: one entity using one physical index twice. An item has one key in an index,
  * so the second accessor can't have one of its own.
+ *
+ * `[EDD-9109]` and `[EDD-9112]`: a value stored in a table key attribute. The library never
+ * sets any part of the primary key: a `Put` carrying it replaces the item's key with the
+ * value, and DynamoDB refuses an update that names it.
  */
 
 import * as DynamoSchema from "../DynamoSchema.js"
@@ -194,5 +198,47 @@ export const refuseRepeatedIndex = (
       )
     }
     seen.set(index.index, owner)
+  }
+}
+
+/**
+ * `[EDD-9109]`: `Entity.make` refuses an attribute it would store in a table key attribute: a
+ * model field, under a `field:` rename or by its own name, or a system timestamp or version
+ * field.
+ */
+export const refuseStoredInTableKey = (
+  entityType: string,
+  primary: IndexDefinition,
+  stored: ReadonlyArray<readonly [name: string, attribute: string]>,
+): void => {
+  for (const [name, attribute] of stored) {
+    if (attribute !== primary.pk.field && attribute !== primary.sk.field) continue
+    throw new Error(
+      `[EDD-9109] Entity "${entityType}": "${name}" would be stored in "${attribute}", an ` +
+        "attribute of the table's primary key. The library never sets any part of the primary " +
+        `key: a write would replace the item's key with the value. Store "${name}" under ` +
+        "another attribute with `DynamoModel.configure(model, { field: { field: ... } })`, or " +
+        "name the key attributes something else.",
+    )
+  }
+}
+
+/**
+ * `[EDD-9112]`: `Aggregate.make` refuses a key it would store in a table key attribute: its
+ * list key, or its collection sort key. Aggregate rows are `Put`s, so one would replace the
+ * row's own key.
+ */
+export const refuseAggregateKeyInTableKey = (
+  aggregate: string,
+  tableKeys: ReadonlyArray<string | undefined>,
+  keys: ReadonlyArray<readonly [what: string, attribute: string]>,
+): void => {
+  for (const [what, attribute] of keys) {
+    if (!tableKeys.includes(attribute)) continue
+    throw new Error(
+      `[EDD-9112] Aggregate "${aggregate}": ${what} is stored in "${attribute}", an attribute of ` +
+        "the table's primary key. The library never sets any part of the primary key: each " +
+        "row's write would replace its key with this one. Store it in an attribute of its own.",
+    )
   }
 }

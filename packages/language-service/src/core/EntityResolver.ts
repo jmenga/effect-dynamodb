@@ -55,7 +55,7 @@ export interface SchemaConfig {
   readonly name: string
   readonly version: number
   readonly casing: Casing
-  readonly escapeKeys?: false | undefined
+  readonly escapeKeys?: true | undefined
 }
 
 export interface ResolvedEntity {
@@ -429,7 +429,7 @@ function resolveDynamoSchema(
   ts: typeof import("typescript"),
   expr: ts.Expression,
 ): SchemaConfig | undefined {
-  // Match: DynamoSchema.make({ name: "...", version: N, casing?: "...", escapeKeys?: false })
+  // Match: DynamoSchema.make({ name: "...", version: N, casing?: "...", escapeKeys?: true })
   if (!ts.isCallExpression(expr)) return undefined
   const callee = expr.expression
   if (!ts.isPropertyAccessExpression(callee)) return undefined
@@ -443,7 +443,7 @@ function resolveDynamoSchema(
   let name: string | undefined
   let version: number | undefined
   let casing: Casing = "lowercase"
-  let escapeKeys: false | undefined
+  let escapeKeys: true | undefined
 
   for (const prop of configObj.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
@@ -458,13 +458,13 @@ function resolveDynamoSchema(
         casing = (extractStringLiteral(ts, prop.initializer) as Casing) ?? "lowercase"
         break
       case "escapeKeys":
-        if (prop.initializer.kind === ts.SyntaxKind.FalseKeyword) escapeKeys = false
+        if (prop.initializer.kind === ts.SyntaxKind.TrueKeyword) escapeKeys = true
         break
     }
   }
 
   if (!name || version === undefined) return undefined
-  return { name, version, casing, ...(escapeKeys === false ? { escapeKeys } : {}) }
+  return { name, version, casing, ...(escapeKeys === true ? { escapeKeys } : {}) }
 }
 
 function resolveIndexes(

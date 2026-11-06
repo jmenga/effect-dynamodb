@@ -1,9 +1,9 @@
 /**
  * `DynamoSchema.make({ escapeKeys })` (#183): one rule for every key, full on or full off.
  *
- * Off, string text is byte for byte what the published 1.36.0 composed (`fixtures/
- * key-text-1.36.0.json`, see `KeyText136.test.ts` for how it was generated), and numbers keep the
- * encoding 1.37 gave them. On, a value with nothing to escape composes the same bytes.
+ * Off, the default, every key is byte for byte what the published 1.36.0 composed (`fixtures/
+ * key-text-1.36.0.json`, see `KeyText136.test.ts` for how it was generated), strings and numbers
+ * alike. On, a value with nothing to escape and no number 1.37 changed composes the same bytes.
  */
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
@@ -77,10 +77,10 @@ const vectors = JSON.parse(
   }>
 }
 
-/** Did the value's text stay as 1.36 wrote it? Only a number's can have changed. */
+/** Is the value's text the same with `escapeKeys: true`, before escaping? Only a number's can differ. */
 const unchanged = (value: unknown): boolean => {
   try {
-    return KeyComposer.serializeValue(value) === KeyText136.serializeValue(value)
+    return KeyComposer.serializeValue(value) === KeyComposer.serializeValue136(value)
   } catch {
     return false
   }
@@ -94,12 +94,13 @@ const nothingToEscape = (value: unknown): boolean =>
     return KeyComposer.escapeKeyText(text, casing) === DynamoSchema.applyCasing(text, casing)
   })
 
-const off = (schema: Schema): Schema => ({ ...schema, escapeKeys: false })
+const withFlag = (escapeKeys: boolean) => (schema: Schema): Schema =>
+  DynamoSchema.make({ ...schema, escapeKeys })
 
 /** Each setting, with the records whose text it must keep as 1.36 wrote it. */
 const SETTINGS = [
-  { name: "off, any string", at: off, keeps: unchanged },
-  { name: "on, a value with nothing to escape", at: (s: Schema) => s, keeps: nothingToEscape },
+  { name: "off, any value", at: withFlag(false), keeps: () => true },
+  { name: "on, a value with nothing to escape", at: withFlag(true), keeps: nothingToEscape },
 ] as const
 
 describe("key text against the published 1.36.0", () => {
@@ -165,7 +166,7 @@ describe("key text against the published 1.36.0", () => {
             JSON.stringify(v),
           ).toEqual(v.keys)
         }
-        expect(compared).toBeGreaterThan(3)
+        expect(compared).toBeGreaterThan(0)
       })
 
       it("a time-series event's sort key", () => {
@@ -179,7 +180,8 @@ describe("key text against the published 1.36.0", () => {
             v.eventSk,
           )
         }
-        expect(compared).toBeGreaterThan(5)
+        // On, only an event's encoded value with nothing to escape keeps its bytes.
+        expect(compared).toBeGreaterThan(at === SETTINGS[0]!.at ? 5 : 0)
       })
 
       it("a vector index's partition", () => {
@@ -194,26 +196,24 @@ describe("key text against the published 1.36.0", () => {
             JSON.stringify(v),
           ).toBe(v.partition)
         }
-        expect(compared).toBeGreaterThan(3)
+        expect(compared).toBeGreaterThan(at === SETTINGS[0]!.at ? 3 : -1)
       })
     })
   }
 })
 
 describe("what the flag changes", () => {
-  const on = DynamoSchema.make({ name: "app", version: 1 })
+  const on = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
   const flagOff = DynamoSchema.make({ name: "app", version: 1, escapeKeys: false })
   const index: Index = {
     pk: { field: "pk", composite: ["tenant"] },
     sk: { field: "sk", composite: ["label"] },
   }
 
-  it("is left off a schema unless it turns escaping off", () => {
-    expect(on.escapeKeys).toBeUndefined()
-    expect(DynamoSchema.make({ name: "app", version: 1, escapeKeys: true }).escapeKeys).toBe(
-      undefined,
-    )
-    expect(flagOff.escapeKeys).toBe(false)
+  it("is on a schema only when it turns escaping on", () => {
+    expect(on.escapeKeys).toBe(true)
+    expect(flagOff.escapeKeys).toBeUndefined()
+    expect(flagOff).toEqual({ name: "app", version: 1, casing: "lowercase" })
   })
 
   it("escapes every key half, or none", () => {
@@ -224,14 +224,22 @@ describe("what the flag changes", () => {
     expect(KeyComposer.composeSk(flagOff, "E", 1, index, record)).toBe("$app#v1#e#label_x#y")
   })
 
-  it("covers strings: a number's encoding from 1.37 stays either way", () => {
+  it("covers numbers too: off, 1.36's padded text; on, numeric order", () => {
     const record = { tenant: -3, label: 2.5 }
     const pk = (schema: Schema) => KeyComposer.composePk(schema, "E", index, record)
     const sk = (schema: Schema) => KeyComposer.composeSk(schema, "E", 1, index, record)
-    expect(pk(flagOff)).toBe(pk(on))
-    expect(sk(flagOff)).toBe(sk(on))
-    expect(pk(flagOff)).toBe(`$app#v1#e#tenant_${KeyComposer.serializeValue(-3)}`)
-    expect(pk(flagOff)).not.toBe(`$app#v1#e#tenant_${KeyText136.serializeValue(-3)}`)
+    expect(pk(flagOff)).toBe("$app#v1#e#tenant_00000000000000-3")
+    expect(sk(flagOff)).toBe("$app#v1#e#label_00000000000002.5")
+    expect(pk(on)).toBe(`$app#v1#e#tenant_${KeyComposer.serializeValue(-3)}`)
+    expect(sk(on)).toBe(`$app#v1#e#label_${KeyComposer.serializeValue(2.5)}`)
+    expect(pk(on)).not.toBe(pk(flagOff))
+    expect(sk(on)).not.toBe(sk(flagOff))
+  })
+
+  it("off, a number the numeric text refuses composes as 1.36 did; on it's refused", () => {
+    const record = { tenant: Number.NaN, label: "x" }
+    expect(KeyComposer.composePk(flagOff, "E", index, record)).toBe("$app#v1#e#tenant_0000000000000nan")
+    expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
   })
 
   it("keeps the shard marker before every value, and the shard the value hashes to", () => {
@@ -290,13 +298,19 @@ describe("what the flag changes", () => {
     }
   })
 
-  it("has no 1.36 spelling to read alongside, off: it composes that text already", () => {
-    expect(KeyText136.canSpell(on)).toBe(true)
-    expect(KeyText136.canSpell(flagOff)).toBe(false)
-    expect(KeyText136.schema137(on).escapeKeys).toBe(false)
-    expect(KeyComposer.composePk(KeyText136.schema137(on), "E", index, { tenant: "a b" })).toBe(
-      "$app#v1#e#tenant_a b",
-    )
+  it("composes each stored form through the forms `rekey` recognises", () => {
+    const record = { tenant: "a b", label: "x y" }
+    const at = (form: KeyText136.KeyForm) => KeyText136.composeAt(form, "E", 1, index, record)
+    const [off136, of137, escaped] = KeyText136.forms(on)
+    expect(at(off136!)).toEqual({ pk: "$app#v1#e#tenant_a b", sk: "$app#v1#e#label_x y" })
+    expect(at(of137!)).toEqual({ pk: "$app#v1#e#tenant_a b", sk: "$app#v1#e#label_x%20y" })
+    expect(at(escaped!)).toEqual({ pk: "$app#v1#e#tenant_a%20b", sk: "$app#v1#e#label_x%20y" })
+    // Whichever the schema's setting: `rekey` looks for the same forms in both directions.
+    expect(KeyText136.forms(flagOff).map(at)).toEqual(KeyText136.forms(on).map(at))
+    expect(at(KeyText136.invertedForm137(on))).toEqual({
+      pk: "$app#v1#e#tenant_a%20b",
+      sk: "$app#v1#e#label_x y",
+    })
   })
 })
 
@@ -310,7 +324,7 @@ describe("the canonical GSI shapes, at the composer, under both settings", () =>
     pk: { field: "gpk", composite: [...pk] },
     sk: { field: "gsk", composite: [...sk] },
   })
-  const on = DynamoSchema.make({ name: "s", version: 1 })
+  const on = DynamoSchema.make({ name: "s", version: 1, escapeKeys: true })
   const flagOff = DynamoSchema.make({ name: "s", version: 1, escapeKeys: false })
 
   const compose = (

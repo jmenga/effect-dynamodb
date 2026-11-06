@@ -728,7 +728,7 @@ describe("DynamoClient", () => {
   // -------------------------------------------------------------------------
 
   describe(".where() sort key conditions", () => {
-    const AppSchema = DynamoSchema.make({ name: "wheretest", version: 1 })
+    const AppSchema = DynamoSchema.make({ name: "wheretest", version: 1, escapeKeys: true })
 
     /** Build a client layer that captures `query` inputs into the provided array. */
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
@@ -1322,7 +1322,7 @@ describe("DynamoClient", () => {
   // -------------------------------------------------------------------------
 
   describe("sort key prefix + operand serialization", () => {
-    const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1 })
+    const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1, escapeKeys: true })
 
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
       mockDynamoClientLayer({

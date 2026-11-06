@@ -517,8 +517,28 @@ export const tryExtractComposites = (
   return values
 }
 
+/** A value's composite text, its numbers by `number` and `bigint`. */
+const serializeWith = (
+  value: unknown,
+  number: (n: number) => string,
+  bigint: (n: bigint) => string,
+): string => {
+  if (typeof value === "string") return value
+  if (typeof value === "number") return number(value)
+  if (typeof value === "bigint") return bigint(value)
+  if (typeof value === "boolean") return value ? "true" : "false"
+  // DateTime types → ISO string (Zoned normalized to UTC for sort order)
+  if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
+    return DateTime.formatIso(value)
+  }
+  // Native Date
+  if (value instanceof Date) return value.toISOString()
+  return String(value)
+}
+
 /**
- * Serialize a value for use in a composite key.
+ * Serialize a value for a composite key under `escapeKeys: true`. {@link compositeText} is the
+ * text under a schema's setting.
  *
  * Numeric values are encoded so their key text sorts in numeric order
  * (`internal/NumericKey.ts` has the format):
@@ -535,19 +555,26 @@ export const tryExtractComposites = (
  * - DateTime.Utc → ISO string
  * - Date → ISO string
  */
-export const serializeValue = (value: unknown): string => {
-  if (typeof value === "string") return value
-  if (typeof value === "number") return encodeNumber(value)
-  if (typeof value === "bigint") return encodeBigInt(value)
-  if (typeof value === "boolean") return value ? "true" : "false"
-  // DateTime types → ISO string (Zoned normalized to UTC for sort order)
-  if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
-    return DateTime.formatIso(value)
-  }
-  // Native Date
-  if (value instanceof Date) return value.toISOString()
-  return String(value)
-}
+export const serializeValue = (value: unknown): string =>
+  serializeWith(value, encodeNumber, encodeBigInt)
+
+/**
+ * A composite value's text with `escapeKeys` off, the text 1.36 composed: a number zero-padded to
+ * 16 characters and a bigint to 38 (`String(n)` padded, so `-3` is `00000000000000-3` and `2.5` is
+ * `00000000000002.5`). Never throws: `NaN` is `0000000000000NaN`.
+ */
+export const serializeValue136 = (value: unknown): string =>
+  serializeWith(
+    value,
+    (n) => String(n).padStart(16, "0"),
+    (n) => String(n).padStart(38, "0"),
+  )
+
+/** A composite value's serialized text under the schema's setting, before casing and escaping. */
+export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string =>
+  schema.escapeKeys === true || schema.numericKeyText === true
+    ? serializeValue(value)
+    : serializeValue136(value)
 
 /** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
@@ -585,33 +612,57 @@ export const escapeKeyText = (text: string, casing: DynamoSchema.Casing): string
   return from === 0 ? cased : `${escaped}${cased.slice(from)}`
 }
 
+/** The text {@link escapeKeyText} escaped back, cased: for `rekey`, reading a value out of a key. */
+export const unescapeKeyText = (text: string): string =>
+  text.replace(/%([0-9a-fA-F]{2})/g, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
+
 /**
- * {@link escapeKeyText}, unless the schema turns escaping off (`escapeKeys: false`): every
- * key composite's serialized text passes through here, in every key.
+ * @deprecated since 1.38.0: escaping is `escapeKeys: true`'s, in every key. Use {@link keyText},
+ * which follows the setting, or {@link escapeKeyText}, the same function under its new name.
+ */
+export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string =>
+  escapeKeyText(text, casing)
+
+/**
+ * @deprecated since 1.38.0: escaping is `escapeKeys: true`'s, in every key. Use
+ * {@link keyValueText}, which follows the setting.
+ */
+export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
+  escapeKeyText(serializeValue(value), casing)
+
+/**
+ * A composite's serialized text in a key: cased, and with `escapeKeys: true`
+ * {@link escapeKeyText}. Every key composite passes through here, in every key.
  */
 export const keyText = (
   schema: DynamoSchema.DynamoSchema,
   text: string,
   casing: DynamoSchema.Casing,
-): string => (schema.escapeKeys === false ? applyCasing(text, casing) : escapeKeyText(text, casing))
+): string => (schema.escapeKeys === true ? escapeKeyText(text, casing) : applyCasing(text, casing))
 
-/** A composite value's text in a key: {@link serializeValue}, then {@link keyText}. */
+/** A composite value's text in a key: {@link compositeText}, then {@link keyText}. */
 export const keyValueText = (
   schema: DynamoSchema.DynamoSchema,
   value: unknown,
   casing: DynamoSchema.Casing,
-): string => keyText(schema, serializeValue(value), casing)
+): string => keyText(schema, compositeText(schema, value), casing)
 
-/** {@link extractComposites} for a key half: each value's {@link keyText}. */
-const extractKeyComposites = (
+/** {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. */
+export const extractKeyComposites = (
   schema: DynamoSchema.DynamoSchema,
-  index: { readonly casing?: DynamoSchema.Casing },
+  index: { readonly casing?: DynamoSchema.Casing | undefined },
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
 ): ReadonlyArray<string> =>
-  extractComposites(composite, record).map((text) =>
-    keyText(schema, text, index.casing ?? schema.casing),
-  )
+  composite.map((attr) => {
+    const value = record[attr]
+    if (value === undefined || value === null) {
+      throw new Error(`Missing composite attribute "${attr}" in record`)
+    }
+    return keyValueText(schema, value, index.casing ?? schema.casing)
+  })
 
 /**
  * Compose a partition key for an entity index.
@@ -697,7 +748,7 @@ const composedShardMarker = (
 
 /**
  * `index` as its unsharded layout: what a `previous: 1` migration reads, and the
- * only layout rows under 1.36 key text can be in. Reads only.
+ * only layout rows under another setting's key text can be in. Reads only.
  */
 export const unshardedView = (index: IndexDefinition): IndexDefinition => {
   if (index.shards === undefined) return index
@@ -827,8 +878,6 @@ export interface ReadFanOut {
    * any shard.
    */
   readonly everyPartition: ReadonlyArray<string> | undefined
-  /** The partition of the unsharded layout, when `previous` is `1`. */
-  readonly unsharded: string | undefined
 }
 
 /**
@@ -893,7 +942,6 @@ export const composeReadPartitions = (
       previous: shards.previous,
       pruned,
       everyPartition: pruned ? [...layout(shards.count), ...previous] : undefined,
-      unsharded,
     },
   }
 }
@@ -1770,12 +1818,25 @@ export const composeSortKeyBeginsWith = (
 export const SORT_KEY_MAX = "\uFFFF"
 
 /**
- * The condition selecting a complete sort key prefix on a secondary index: the
- * key itself, where the structural rule truncates a row whose trailing composites
- * are absent (`DESIGN.md §7`), and every key below it. A longer sibling value stays
- * out: its text extends the prefix with a character above the delimiter (escaping
+ * The condition selecting a complete sort key prefix on a secondary index, with
+ * `escapeKeys: true`: the key itself, where the structural rule truncates a row whose
+ * trailing composites are absent (`DESIGN.md §7`), and every key below it. A longer sibling
+ * value stays out: its text extends the prefix with a character above the delimiter (escaping
  * puts everything up to `%` out of reach of a value).
+ *
+ * With `escapeKeys` off that range would hold `new york` for `new`, so a pin sends 1.36's
+ * `begins_with` on the prefix and the delimiter, and a row truncated at the prefix isn't among
+ * what it reads, as in 1.36.
  */
+export const pinCondition = (
+  schema: DynamoSchema.DynamoSchema,
+  prefix: string,
+): { readonly beginsWith: string } | { readonly between: readonly [string, string] } =>
+  schema.escapeKeys === true
+    ? subtreeCondition(prefix)
+    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+
+/** The range {@link pinCondition} sends with `escapeKeys: true`. */
 export const subtreeCondition = (
   prefix: string,
 ): { readonly between: readonly [string, string] } => ({
@@ -1801,7 +1862,7 @@ export const subtreePrefix = (condition: object): string | undefined => {
  *   matching `"ab"`, and `seq: 3` matching 3.14 and 3.5, whose key text
  *   extends 3's. On the primary index `=` also leaves out the item's history
  *   rows, whose keys extend the current one.
- * - **Partial prefix, secondary index** — {@link subtreeCondition}: a row
+ * - **Partial prefix, secondary index** — {@link pinCondition}: with `escapeKeys: true` a row
  *   truncated at this prefix belongs to these pins, and `begins_with` on the
  *   prefix and delimiter can't reach it (the key ends where the operand goes on).
  * - **Partial prefix, primary index** — `{ beginsWith }` on
@@ -1823,7 +1884,7 @@ export const composeSortKeyCondition = (
   if (availableSkCount(index, record) === index.sk.composite.length) return { eq: prefix }
   return index.index === undefined
     ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
-    : subtreeCondition(prefix)
+    : pinCondition(schema, prefix)
 }
 
 /**
@@ -1892,14 +1953,39 @@ const EVENT_SK_INFIX = "e"
  *
  * Given `currentSk = "$app#v1#telemetry_1"` and `orderByValue = 42`, returns
  * `"$app#v1#telemetry_1#e#0000000000000042"` (with default lowercase casing).
+ * `orderByValue` is what {@link eventOrderByValue} picks for the schema's setting.
  */
-export const composeEventSk = (
+export const composeEventSk: {
+  (
+    schema: DynamoSchema.DynamoSchema,
+    currentSk: string,
+    orderByValue: unknown,
+    casing?: DynamoSchema.Casing,
+  ): string
+  /**
+   * @deprecated since 1.38.0: pass the schema first, so `escapeKeys` is followed. Without it, the
+   * value is escaped and `casing` defaults to `"lowercase"`, as in 1.37.
+   */
+  (currentSk: string, orderByValue: unknown, casing?: DynamoSchema.Casing): string
+} = (first: DynamoSchema.DynamoSchema | string, ...rest: ReadonlyArray<unknown>): string => {
+  if (typeof first === "string") {
+    const casing = (rest[1] ?? "lowercase") as DynamoSchema.Casing
+    return `${first}#${applyCasing(EVENT_SK_INFIX, casing)}#${escapeKeyText(serializeValue(rest[0]), casing)}`
+  }
+  const casing = (rest[2] ?? first.casing) as DynamoSchema.Casing
+  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(first, rest[1], casing)}`
+}
+
+/**
+ * The value of the `orderBy` attribute an event's sort key holds: its key form with numeric key
+ * text, its encoded value (a `NumberFromString` `"10"` as the string `10`) with `escapeKeys` off,
+ * as 1.36 composed it.
+ */
+export const eventOrderByValue = (
   schema: DynamoSchema.DynamoSchema,
-  currentSk: string,
-  orderByValue: unknown,
-  casing: DynamoSchema.Casing = schema.casing,
-): string =>
-  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(schema, orderByValue, casing)}`
+  encoded: unknown,
+  keyForm: unknown,
+): unknown => (schema.escapeKeys === true || schema.numericKeyText === true ? keyForm : encoded)
 
 /**
  * Compose the prefix used to scope `.history()` queries to event items only.

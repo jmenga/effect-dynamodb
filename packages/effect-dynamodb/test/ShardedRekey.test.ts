@@ -16,9 +16,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
-import { serveRows } from "./helpers/ShardedDevices.js"
 
 class Device extends Schema.Class<Device>("Device")({
   channel: Schema.String,
@@ -28,8 +26,8 @@ class Device extends Schema.Class<Device>("Device")({
   status: Schema.optional(Schema.String),
 }) {}
 
-const on = DynamoSchema.make({ name: "fleet-db", version: 1 })
-const off = DynamoSchema.make({ name: "fleet-db", version: 1, legacyKeys: false })
+const on = DynamoSchema.make({ name: "fleet-db", version: 1, escapeKeys: true })
+const off = DynamoSchema.make({ name: "fleet-db", version: 1, escapeKeys: false })
 
 /** The entity as a deployment declares it: `shards` unset is the unsharded layout. */
 const declared = (shards?: number | Record<string, unknown>, schema = on) => {
@@ -204,7 +202,7 @@ describe("adopting from an unsharded index", () => {
     }),
   )
 
-  it.effect("works with the 1.36 fallback off", () =>
+  it.effect("works with escapeKeys off", () =>
     Effect.gen(function* () {
       const old = declared(undefined, off)
       const table = yield* seeded(old)
@@ -363,14 +361,14 @@ describe("a row whose values can no longer compose a key (`uncomposable`)", () =
   )
 })
 
-describe("rows under 1.36 key text", () => {
+describe("rows under another key text", () => {
   class Meter extends Schema.Class<Meter>("Meter")({
     site: Schema.String,
     meterId: Schema.Number,
     zone: Schema.String,
     level: Schema.Number,
   }) {}
-  const meters = (shards?: number | Record<string, unknown>) => {
+  const meters = (shards: number | Record<string, unknown> | undefined, schema = on) => {
     const Meters = Entity.make({
       model: Meter,
       entityType: "Meter",
@@ -381,21 +379,27 @@ describe("rows under 1.36 key text", () => {
       indexes: {
         byLevel: {
           name: "gsi1",
-          // A number in the partition key: its 1.36 text differs from its text now.
+          // A number in the partition key: its text differs between the settings.
           pk: { field: "gsi1pk", composite: ["level"] },
           sk: { field: "gsi1sk", composite: ["meterId"] },
           ...(shards === undefined ? {} : { shards }),
         },
       },
     } as any) as any
-    return { Meters, MeterTable: Table.make({ schema: on, entities: { Meters } }) }
+    return { Meters, MeterTable: Table.make({ schema, entities: { Meters } }) }
   }
   type MeterWorld = ReturnType<typeof meters>
   const record = { site: "s", meterId: -7, zone: "z", level: -2.5 }
 
-  const tableWith136 = (w: MeterWorld, value = record) => {
+  /** A table holding the meter unsharded, with its keys under `schema`'s text. */
+  const tableAt = (w: MeterWorld, schema: DynamoSchema.DynamoSchema, value = record) => {
     const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
-    const keys = KeyText136.composeAllKeys(on, "Meter", 1, w.Meters.indexes, value)
+    const form = { pk: schema, sk: schema }
+    const { shards: _shards, ...unsharded } = w.Meters.indexes.byLevel
+    const keys = {
+      ...KeyText136.composeAt(form, "Meter", 1, w.Meters.indexes.primary, value),
+      ...KeyText136.composeAt(form, "Meter", 1, unsharded, value),
+    }
     expect(keys.gsi1pk).not.toContain("#!")
     table.items.set(
       `${keys.pk}|${keys.sk}`,
@@ -419,109 +423,94 @@ describe("rows under 1.36 key text", () => {
       Effect.provide(Layer.merge(table.layer, w.MeterTable.layer({ name: "t" }))),
     ) as Effect.Effect<A, E>
 
-  const adopting = meters({ count: 8, previous: 1 })
+  for (const [setting, schema, other] of [
+    ["on", on, off],
+    ["off", off, on],
+  ] as const) {
+    const adopting = meters({ count: 8, previous: 1 }, schema)
 
-  it.effect("with `previous: 1`, a read holds N + 1 + the 1.36 text", () =>
-    Effect.gen(function* () {
-      const table = tableWith136(adopting)
-      const explained: any = yield* useMeters(adopting, table, (db) =>
-        db.entities.Meters.byLevel({ level: -2.5 }).explain(),
-      )
-      const partitions: ReadonlyArray<string> = explained.fanOut.partitions
-      expect(partitions).toHaveLength(10)
-      expect(partitions.filter((pk) => pk.includes("#!8."))).toHaveLength(8)
-      expect(partitions.filter((pk) => !pk.includes("#!"))).toHaveLength(2)
-    }),
-  )
+    it.effect(`${setting}: \`previous: 1\` reads the shards and the one unsharded partition`, () =>
+      Effect.gen(function* () {
+        const table = tableAt(adopting, other)
+        const explained: any = yield* useMeters(adopting, table, (db) =>
+          db.entities.Meters.byLevel({ level: -2.5 }).explain(),
+        )
+        const partitions: ReadonlyArray<string> = explained.fanOut.partitions
+        expect(partitions).toHaveLength(9)
+        expect(partitions.filter((pk) => pk.includes("#!8."))).toHaveLength(8)
+        const { shards: _shards, ...unsharded } = adopting.Meters.indexes.byLevel
+        expect(partitions.filter((pk) => !pk.includes("#!"))).toEqual([
+          KeyComposer.composePk(schema, "Meter", unsharded, record),
+        ])
+      }),
+    )
 
-  it.effect("each item is found once, with a selection borrowing what its row check reads", () => {
-    const row = () => {
-      const keys = KeyText136.composeAllKeys(on, "Meter", 1, adopting.Meters.indexes, record)
-      return toAttributeMap({ ...record, ...keys, __edd_e__: "Meter" })
-    }
-    // This one applies the projection, so a row check that reads an attribute the
-    // selection left out would reject the row.
-    const server = serveRows([row()], {
-      pkField: "gsi1pk",
-      skField: "gsi1sk",
-      keyFields: ["gsi1pk", "gsi1sk", "pk", "sk"],
-    })
-    return Effect.gen(function* () {
-      const db = yield* DynamoClient.make({
-        entities: { Meters: adopting.Meters },
-        tables: { MeterTable: adopting.MeterTable },
-      })
-      const meters: any = db.entities.Meters
-      const found: any = yield* meters.byLevel({ level: -2.5 }).collect()
-      expect(found).toHaveLength(1)
-      expect(found[0].meterId).toBe(-7)
-      const selected: any = yield* meters.byLevel({ level: -2.5 }).select(["zone"]).collect()
-      expect(selected).toEqual([{ zone: "z" }])
-      const page: any = yield* meters.byLevel({ level: -2.5 }).select(["zone"]).limit(1).fetch()
-      expect(page.items).toEqual([{ zone: "z" }])
-    }).pipe(
-      Effect.provide(
-        Layer.merge(
-          mockDynamoClientLayer({ query: server.query }),
-          adopting.MeterTable.layer({ name: "t" }),
-        ),
-      ),
-    ) as Effect.Effect<void, unknown>
-  })
+    it.effect(`${setting}: without \`previous\`, only the shards are read`, () =>
+      Effect.gen(function* () {
+        const w = meters(8, schema)
+        const explained: any = yield* useMeters(w, tableAt(w, other), (db) =>
+          db.entities.Meters.byLevel({ level: -2.5 }).explain(),
+        )
+        expect(explained.fanOut.partitions).toHaveLength(8)
+      }),
+    )
 
-  it.effect("without `previous`, no 1.36 partition is read", () =>
-    Effect.gen(function* () {
-      const w = meters(8)
-      const table = tableWith136(w)
-      const explained: any = yield* useMeters(w, table, (db) =>
-        db.entities.Meters.byLevel({ level: -2.5 }).explain(),
-      )
-      expect(explained.fanOut.partitions).toHaveLength(8)
-    }),
-  )
+    it.effect(`${setting}: \`previous\` above 1 reads both layouts' shards`, () =>
+      Effect.gen(function* () {
+        const w = meters({ count: 8, previous: 4 }, schema)
+        const explained: any = yield* useMeters(w, tableAt(w, other), (db) =>
+          db.entities.Meters.byLevel({ level: -2.5 }).explain(),
+        )
+        expect(explained.fanOut.partitions).toHaveLength(12)
+      }),
+    )
 
-  it.effect("with `previous` above 1, no 1.36 partition is read", () =>
-    Effect.gen(function* () {
-      const w = meters({ count: 8, previous: 4 })
-      const table = tableWith136(w)
-      const explained: any = yield* useMeters(w, table, (db) =>
-        db.entities.Meters.byLevel({ level: -2.5 }).explain(),
-      )
-      expect(explained.fanOut.partitions).toHaveLength(12)
-    }),
-  )
+    it.effect(`${setting}: \`rekey\` moves the table key and lands the index key sharded`, () =>
+      Effect.gen(function* () {
+        const table = tableAt(adopting, other)
+        const dry: Table.RekeyReport = yield* useMeters(
+          adopting,
+          table,
+          (db) => db.tables.MeterTable.rekey({ dryRun: true }) as Effect.Effect<Table.RekeyReport>,
+        )
+        expect(dry.moved.item).toBe(1)
+        const report: Table.RekeyReport = yield* useMeters(
+          adopting,
+          table,
+          (db) => db.tables.MeterTable.rekey() as Effect.Effect<Table.RekeyReport>,
+        )
+        expect(report.moved.item).toBe(1)
+        const [row] = [...table.items.values()]
+        expect(row!.gsi1pk?.S).toContain("#!8.")
+        expect(row!.sk?.S).toBe(
+          KeyComposer.composeSk(schema, "Meter", 1, adopting.Meters.indexes.primary, record),
+        )
+        const found: any = yield* useMeters(adopting, table, (db) =>
+          db.entities.Meters.byLevel({ level: -2.5 }).collect(),
+        )
+        expect(found).toHaveLength(1)
+        const again: Table.RekeyReport = yield* useMeters(
+          adopting,
+          table,
+          (db) => db.tables.MeterTable.rekey() as Effect.Effect<Table.RekeyReport>,
+        )
+        expect(again.moved.item).toBe(0)
+        expect(again.unchanged).toBe(1)
+      }),
+    )
 
-  it.effect("`rekey` moves the table key and lands the index key sharded", () =>
-    Effect.gen(function* () {
-      const table = tableWith136(adopting)
-      const report: Table.RekeyReport = yield* useMeters(
-        adopting,
-        table,
-        (db) => db.tables.MeterTable.rekey() as Effect.Effect<Table.RekeyReport>,
-      )
-      expect(report.moved.item).toBe(1)
-      const [row] = [...table.items.values()]
-      expect(row!.gsi1pk?.S).toContain("#!8.")
-      expect(row!.pk?.S).toBe(
-        KeyComposer.composePk(on, "Meter", adopting.Meters.indexes.primary, record),
-      )
-      const found: any = yield* useMeters(adopting, table, (db) =>
-        db.entities.Meters.byLevel({ level: -2.5 }).collect(),
-      )
-      expect(found).toHaveLength(1)
-    }),
-  )
-
-  it.effect("an update of a 1.36 row moves it, and lands it sharded", () =>
-    Effect.gen(function* () {
-      const table = tableWith136(adopting)
-      yield* useMeters(adopting, table, (db) =>
-        db.entities.Meters.update({ site: "s", meterId: -7 }).set({ zone: "y" }),
-      )
-      const rows = [...table.items.values()]
-      expect(rows).toHaveLength(1)
-      expect(rows[0]!.zone?.S).toBe("y")
-      expect(rows[0]!.gsi1pk?.S).toContain("#!8.")
-    }),
-  )
+    it.effect(
+      `${setting}: until \`rekey\`, an update doesn't find the row and doesn't move it`,
+      () =>
+        Effect.gen(function* () {
+          const table = tableAt(adopting, other)
+          const before = [...table.items.entries()]
+          const outcome: any = yield* useMeters(adopting, table, (db) =>
+            db.entities.Meters.update({ site: "s", meterId: -7 }).set({ zone: "y" }).asEffect(),
+          ).pipe(Effect.flip)
+          expect(outcome._tag).toBe("ItemNotFound")
+          expect([...table.items.entries()]).toEqual(before)
+        }),
+    )
+  }
 })

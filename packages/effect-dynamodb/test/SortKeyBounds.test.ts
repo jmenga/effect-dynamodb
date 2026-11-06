@@ -225,7 +225,7 @@ const definitionsOf = (entity: unknown) =>
   (entity as { readonly indexes: Record<string, KeyComposer.IndexDefinition> }).indexes
 
 const makePlaces = (casing: Casing) => {
-  const schema = DynamoSchema.make({ name: "places", version: 1, casing })
+  const schema = DynamoSchema.make({ name: "places", version: 1, casing, escapeKeys: true })
   const gsis = Object.fromEntries(
     Object.entries(indexes).map(([name, def], n) => [
       name,
@@ -261,7 +261,7 @@ const makePlaces = (casing: Casing) => {
 }
 
 const makeReadings = (casing: Casing) => {
-  const schema = DynamoSchema.make({ name: "places", version: 1, casing })
+  const schema = DynamoSchema.make({ name: "places", version: 1, casing, escapeKeys: true })
   const Readings = Entity.make({
     model: Reading,
     entityType: "Reading",
@@ -841,7 +841,7 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
     },
     ({ a, b, plainA, plainB, n, m }) => {
       for (const casing of casings) {
-        const schema = DynamoSchema.make({ name: "app", version: 1, casing })
+        const schema = DynamoSchema.make({ name: "app", version: 1, casing, escapeKeys: true })
         const escaped = (value: unknown) =>
           `${DynamoSchema.applyCasing("city", casing)}_${KeyComposer.keyValueText(schema, value, casing)}`
         // 1.36's segment: the value as it was, cased.

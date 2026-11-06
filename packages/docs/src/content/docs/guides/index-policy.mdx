@@ -226,6 +226,8 @@ const atCity = yield* db.entities.Assets.byLocation({
 }).collect()
 ```
 
+That pin returns the truncated row with `escapeKeys: true`. With it off (the default) a pin on a composite that isn't the last is a `begins_with` that stops at the next segment, so it returns what's under `city_sf` but not the row that stops there; a pin on `region` alone returns it either way ([the limitations](/effect-dynamodb/guides/indexes/#limitations-with-escapekeys-off)).
+
 ## 8. The two drop triggers (recap)
 
 | Trigger | Granularity | Where it lives | Intent |

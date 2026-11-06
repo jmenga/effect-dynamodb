@@ -1,18 +1,22 @@
 /**
- * The rule (#183, DESIGN.md "Never set a table key attribute"): no update the library sends
- * names an attribute of the table's primary key, whatever the index definitions, on any write
- * path. DynamoDB refuses such an update, so it would fail in production on the rows that reach
- * it. This records every `UpdateItem` and transactional `Update` and fails if any target one.
+ * The rule (#183, DESIGN.md "Never set a table key attribute"): the library sets no part of the
+ * table's primary key, whatever the index definitions, on any write path. DynamoDB refuses an
+ * update naming one, so it would fail in production on the rows that reach it, and a `Put`
+ * carrying another value in one replaces the item's key with it. This records every `UpdateItem`
+ * and transactional `Update` and fails if any target one, and checks every `Put` carries the key
+ * its own values compose. `TableKeyAttributes.test.ts` has the definitions refused at load.
  */
 
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import { toAttributeMap } from "../src/Marshaller.js"
+import * as EventStore from "../src/EventStore.js"
+import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import {
@@ -21,20 +25,25 @@ import {
   multiCompositeScenarios,
   numberAndDateScenarios,
   off136Scenarios,
+  overwritten137Scenarios,
   row136Scenarios,
   textScenarios,
   writePathScenarios,
 } from "./helpers/InvertedIndexes.js"
 import { makeRecordingTable, type Request } from "./helpers/RecordingTable.js"
 import {
-  aggregateScenario,
+  aggregateAliasScenarios,
+  aggregateScenarios,
+  bothKeysScenarios,
+  chainScenarios,
   historyScenarios,
   indexKeyScenarios,
+  invertedRowScenarios,
   itemScenarios,
-  limitScenarios,
+  number136Scenarios,
   type Harness as Rows137Harness,
-  sentinelScenario,
-  streamScenario,
+  sentinelScenarios,
+  streamScenarios,
 } from "./helpers/Rows137.js"
 import {
   keptEntryScenarios,
@@ -83,6 +92,55 @@ const updatesIn = (requests: ReadonlyArray<Request>): ReadonlyArray<Record<strin
     )
   })
 
+/** Every item put among `requests`: alone, in a batch or in a transaction. */
+const putsIn = (requests: ReadonlyArray<Request>): ReadonlyArray<Record<string, any>> =>
+  requests.flatMap((request) => {
+    if (request.command === "PutItem") return [request.input.Item]
+    if (request.command === "BatchWriteItem") {
+      return Object.values<ReadonlyArray<Record<string, any>>>(
+        request.input.RequestItems,
+      ).flatMap((writes) => writes.flatMap((write) => write.PutRequest?.Item ?? []))
+    }
+    if (request.command !== "TransactWriteItems") return []
+    return (request.input.TransactItems as ReadonlyArray<Record<string, any>>).flatMap(
+      (item) => item.Put?.Item ?? [],
+    )
+  })
+
+/**
+ * Every item put holds the table key its own values compose. A sentinel holds its owner's, under
+ * a key of its own, and a history row its item's partition, under a sort key of its own.
+ */
+const expectPutsKeepTheirKeys = (
+  requests: ReadonlyArray<Request>,
+  world: { readonly schema: DynamoSchema.DynamoSchema; readonly Rows: any },
+) => {
+  const primary = world.Rows.indexes.primary
+  const composed = (values: Record<string, unknown>) => ({
+    pk: KeyComposer.composePk(world.schema, "Row", primary, values),
+    sk: KeyComposer.composeSk(world.schema, "Row", 1, primary, values),
+  })
+  const puts = putsIn(requests)
+  for (const item of puts) {
+    const values = fromAttributeMap(item) as Record<string, unknown>
+    if (item._entity_pk !== undefined) {
+      const owner = composed({ tenant: key.tenant, id: key.id })
+      expect(item._entity_pk.S).toBe(owner.pk)
+      expect(item._entity_sk.S).toBe(owner.sk)
+      expect(item.pk.S).not.toBe(owner.pk)
+      continue
+    }
+    const own = composed(values)
+    expect(item.pk.S).toBe(own.pk)
+    const history =
+      item.sk.S.startsWith(`${own.sk}#e#`) ||
+      /#row#(v|deleted)#/.test(item.sk.S) ||
+      /#ROW#(V|DELETED)#/.test(item.sk.S)
+    expect(history || item.sk.S === own.sk, `${item.pk.S} ${item.sk.S}`).toBe(true)
+  }
+  return puts.length
+}
+
 const expectNoTableKeyWrite = (requests: ReadonlyArray<Request>) => {
   for (const update of updatesIn(requests)) {
     const written = writtenBy(update)
@@ -124,6 +182,24 @@ describe("what the recorder reads", () => {
         { command: "PutItem", input: {} },
       ]),
     ).toEqual([update, update])
+  })
+
+  it("reads a put alone, in a batch or in a transaction", () => {
+    const item = { pk: { S: "a" } }
+    expect(
+      putsIn([
+        { command: "PutItem", input: { Item: item } },
+        {
+          command: "BatchWriteItem",
+          input: { RequestItems: { t: [{ PutRequest: { Item: item } }, { DeleteRequest: {} }] } },
+        },
+        {
+          command: "TransactWriteItems",
+          input: { TransactItems: [{ Put: { Item: item } }, { Update: {} }, { Delete: {} }] },
+        },
+        { command: "UpdateItem", input: {} },
+      ]),
+    ).toEqual([item, item, item])
   })
 
   it("names a key attribute written by alias or by name", () => {
@@ -194,9 +270,9 @@ const DEFINITIONS: Record<string, unknown> = {
 const worldOf = (
   indexes: unknown,
   options: Record<string, unknown>,
-  schemaOptions: { readonly escapeKeys?: boolean; readonly legacyKeys?: boolean } = {},
+  schemaOptions: { readonly escapeKeys?: boolean } = {},
 ) => {
-  const schema = DynamoSchema.make({ name: "nokey", version: 1, ...schemaOptions })
+  const schema = DynamoSchema.make({ name: "nokey", version: 1, escapeKeys: true, ...schemaOptions })
   const Rows = Entity.make({
     model: Row,
     entityType: "Row",
@@ -244,6 +320,7 @@ const LIFECYCLES: ReadonlyArray<{
     run: (db, Rows) =>
       Effect.gen(function* () {
         yield* Batch.write([Rows.put(row)]).pipe(Effect.ignore)
+        yield* Transaction.transactWrite([Rows.put(row)])
         yield* db.entities.Rows.put(row).asEffect()
         yield* Transaction.transactWrite([Rows.update(key).pipe(Entity.set({ note: "t" }))])
         yield* Transaction.transactWrite([Rows.update(key).pipe(Entity.set({ status: "t u" }))])
@@ -312,7 +389,7 @@ const SETTINGS = [
   { name: "escapeKeys off", schema: { escapeKeys: false } },
 ] as const
 
-describe("no update names a table key attribute", () => {
+describe("no write sets a table key attribute", () => {
   for (const [definition, indexes] of Object.entries(DEFINITIONS)) {
     for (const setting of SETTINGS) {
       describe(`${definition}, ${setting.name}`, () => {
@@ -327,6 +404,7 @@ describe("no update names a table key attribute", () => {
               } as never)) as any
               yield* lifecycle.run(db, world.Rows)
               expectNoTableKeyWrite(table.requests)
+              expectPutsKeepTheirKeys(table.requests, world)
               // The recorder reads what's there: a lifecycle sends writes of some kind.
               expect(table.requests.length).toBeGreaterThan(0)
             }).pipe(
@@ -360,6 +438,48 @@ describe("no update names a table key attribute", () => {
             yield* db.tables.MainTable.rekey()
             yield* db.tables.MainTable.rekey()
             expectNoTableKeyWrite(table.requests.slice(before))
+            expectPutsKeepTheirKeys(table.requests.slice(before), world)
+          }).pipe(
+            Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "t" }))),
+          ) as never
+        })
+        it.effect("writes beside rows 1.36 wrote", () => {
+          const world = worldOf(indexes, { unique: { contact: ["email"] } }, setting.schema)
+          const table = tableFor(indexes as Record<string, any>)
+          return Effect.gen(function* () {
+            const db = (yield* DynamoClient.make({
+              entities: { Rows: world.Rows },
+              tables: { MainTable: world.MainTable },
+            } as never)) as any
+            const to136 = () => {
+              for (const [at, item] of [...table.items.entries()]) {
+                table.items.delete(at)
+                const old = Object.fromEntries(
+                  Object.entries(item).map(([name, value]) => [
+                    name,
+                    /k$/.test(name) && value.S !== undefined
+                      ? { S: value.S.replaceAll("%20", " ") }
+                      : value,
+                  ]),
+                ) as Record<string, any>
+                table.items.set(`${old.pk.S}|${old.sk.S}`, old)
+              }
+            }
+            yield* db.entities.Rows.put(row).asEffect()
+            to136()
+            const before = table.requests.length
+            yield* db.entities.Rows.put({ ...row, note: "beside" }).asEffect()
+            expect(expectPutsKeepTheirKeys(table.requests.slice(before), world)).toBeGreaterThan(0)
+            expectNoTableKeyWrite(table.requests.slice(before))
+            to136()
+            const again = table.requests.length
+            // Doesn't find a row whose text changed, and sets nothing either way.
+            yield* db.entities.Rows.update(key)
+              .set({ note: "moved again" })
+              .asEffect()
+              .pipe(Effect.ignore)
+            expectPutsKeepTheirKeys(table.requests.slice(again), world)
+            expectNoTableKeyWrite(table.requests.slice(again))
           }).pipe(
             Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "t" }))),
           ) as never
@@ -408,7 +528,7 @@ describe("no update names a table key attribute", () => {
   })
 
   it.effect("an aggregate's rekey sets no table key, with a list key and a local index", () => {
-    const schema = DynamoSchema.make({ name: "nokey", version: 1 })
+    const schema = DynamoSchema.make({ name: "nokey", version: 1, escapeKeys: true })
     const Item = Schema.Struct({ id: Schema.String, area: Schema.String })
     const Owner = Entity.make({
       model: Item,
@@ -461,6 +581,20 @@ describe("no update names a table key attribute", () => {
         area: "n m",
         stops: [{ label: "x y", note: "o" }],
       })
+      yield* db.aggregates.Routes.update({ id: "a b" }, ({ state }: any) => ({
+        ...state,
+        stops: [...state.stops, { label: "z w", note: "p" }],
+      }))
+      const expectRoutePuts = (requests: ReadonlyArray<Request>) => {
+        const puts = putsIn(requests)
+        for (const item of puts) {
+          expect(item.pk.S).toBe("$nokey#v1#routes#a%20b")
+          expect(["$nokey#v1#routeitem", "$nokey#v1#routestop#x%20y", "$nokey#v1#routestop#z%20w"])
+            .toContain(item.sk.S)
+        }
+        return puts.length
+      }
+      expect(expectRoutePuts(table.requests)).toBeGreaterThan(0)
       for (const [at, item] of [...table.items.entries()]) {
         table.items.delete(at)
         const old = Object.fromEntries(
@@ -478,7 +612,56 @@ describe("no update names a table key attribute", () => {
       expect(report.moved.aggregate).toBeGreaterThan(0)
       yield* db.tables.MainTable.rekey()
       expectNoTableKeyWrite(table.requests.slice(before))
-      expect((yield* db.aggregates.Routes.get({ id: "a b" })).stops).toHaveLength(1)
+      expect(expectRoutePuts(table.requests.slice(before))).toBeGreaterThan(0)
+      expect((yield* db.aggregates.Routes.get({ id: "a b" })).stops).toHaveLength(2)
+    }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" })))) as never
+  })
+
+  it.effect("a stream's puts hold its partition, moved by rekey or not", () => {
+    const schema = DynamoSchema.make({ name: "nokey", version: 1, escapeKeys: true })
+    const Owner = Entity.make({
+      model: Schema.Struct({ id: Schema.String, area: Schema.String }),
+      entityType: "Owner",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+    }) as any
+    const MainTable = Table.make({ schema, entities: { Owner } }) as any
+    class Added extends Schema.TaggedClass<Added>()("Added", { value: Schema.Number }) {}
+    const Events = EventStore.makeStream({
+      table: MainTable,
+      streamName: "Events",
+      events: [Added],
+      streamId: { composite: ["id"] },
+      snapshot: { schema: Schema.Struct({ total: Schema.Number }) },
+    } as never) as any
+    const table = makeRecordingTable()
+    const pk = "$nokey#v1#events#a%20b"
+    return Effect.gen(function* () {
+      const db = (yield* DynamoClient.make({
+        entities: { Owner },
+        tables: { MainTable },
+      } as never)) as any
+      yield* Events.append({ id: "a b" }, [new Added({ value: 1 })], 0)
+      yield* Events.append({ id: "a b" }, [new Added({ value: 2 }), new Added({ value: 3 })], 1)
+      yield* Events.writeSnapshot({ id: "a b" }, { total: 6 }, 3)
+      const written = putsIn(table.requests)
+      expect(written.length).toBeGreaterThanOrEqual(4)
+      for (const item of written) expect(item.pk.S).toBe(pk)
+      for (const [at, item] of [...table.items.entries()]) {
+        table.items.delete(at)
+        const old = { ...item, pk: { S: item.pk!.S!.replace("%20", " ") } }
+        table.items.set(`${old.pk.S}|${item.sk!.S}`, old)
+      }
+      const before = table.requests.length
+      const report = yield* db.tables.MainTable.rekey({ streams: [Events] })
+      expect(report.moved.stream).toBeGreaterThan(0)
+      const moved = putsIn(table.requests.slice(before))
+      expect(moved.length).toBeGreaterThan(0)
+      for (const item of moved) expect(item.pk.S).toBe(pk)
+      expectNoTableKeyWrite(table.requests)
+      expect(yield* Events.currentVersion({ id: "a b" })).toBe(3)
     }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" })))) as never
   })
 })
@@ -565,6 +748,7 @@ describe("no update in the suites over these definitions names one", () => {
     ...multiCompositeOffScenarios,
     ...row136Scenarios,
     ...off136Scenarios,
+    ...overwritten137Scenarios,
   ]) {
     it.effect(`inverted: ${scenario.name}`, () => scenario.run(inverted))
   }
@@ -605,11 +789,15 @@ describe("no update in the suites over these definitions names one", () => {
     ...itemScenarios,
     ...indexKeyScenarios,
     ...historyScenarios,
-    ...limitScenarios,
+    ...sentinelScenarios,
+    ...streamScenarios,
+    ...aggregateScenarios,
+    ...aggregateAliasScenarios,
+    ...number136Scenarios,
+    ...chainScenarios,
+    ...bothKeysScenarios,
+    ...invertedRowScenarios,
   ]) {
     it.effect(`1.37 rows: ${scenario.name}`, () => scenario.run(rows137))
   }
-  it.effect("1.37 rows: a unique sentinel", () => sentinelScenario(rows137))
-  it.effect("1.37 rows: a stream", () => streamScenario(rows137))
-  it.effect("1.37 rows: an aggregate", () => aggregateScenario(rows137))
 })

@@ -22,6 +22,7 @@ import {
   off136Scenarios,
   overwritten137OffScenario,
   overwritten137Scenario,
+  overwritten137Scenarios,
   row136Scenarios,
   textScenarios,
   unchanged136Scenario,
@@ -97,7 +98,10 @@ describe("an inverted index (shape 14)", () => {
     }
   })
   it.effect("a row 1.37.0 overwrote is at its key", () => overwritten137Scenario(harness))
-  it.effect("escapeKeys off doesn't find an escaped key", () => overwritten137OffScenario(harness))
+  it.effect("off moves a row 1.37.0 overwrote back", () => overwritten137OffScenario(harness))
+  for (const scenario of overwritten137Scenarios) {
+    it.effect(`a row 1.37.0 overwrote, ${scenario.name}`, () => scenario.run(harness))
+  }
 })
 
 describe("what an inverted query sends", () => {
@@ -106,7 +110,7 @@ describe("what an inverted query sends", () => {
     userId: Schema.String,
     groupId: Schema.String,
   }) {}
-  const schema = DynamoSchema.make({ name: "sent", version: 1 })
+  const schema = DynamoSchema.make({ name: "sent", version: 1, escapeKeys: true })
   const definition = {
     model: Member,
     entityType: "Member",
@@ -158,17 +162,12 @@ describe("what an inverted query sends", () => {
     }),
   )
 
-  it.effect("a value whose text changed adds its 1.36 key", () =>
+  it.effect("a value with something to escape is one request, under its escaped key", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "a b", tenant: "x y" }).collect(),
       )
       expect(sent.map((input) => key(input).sort())).toEqual([
-        [
-          "$sent#v1#member#groupid_a b",
-          "$sent#v1#member#tenant_x y",
-          "$sent#v1#member#tenant_x y#\uFFFF",
-        ],
         [
           "$sent#v1#member#groupid_a%20b",
           "$sent#v1#member#tenant_x%20y",
@@ -178,7 +177,7 @@ describe("what an inverted query sends", () => {
     }),
   )
 
-  it.effect("escapeKeys off: one key, in 1.36 text", () =>
+  it.effect("escapeKeys off: one request, as 1.36 sent it", () =>
     Effect.gen(function* () {
       const off = DynamoSchema.make({ name: "sent", version: 1, escapeKeys: false })
       const Unescaped = Entity.make(definition)
@@ -196,25 +195,25 @@ describe("what an inverted query sends", () => {
       const sent = table.requests
         .filter((request) => request.command === "Query")
         .map((request) => request.input)
-      expect(sent.map((input) => key(input).sort())).toEqual([
-        [
-          "$sent#v1#member#groupid_a b",
-          "$sent#v1#member#tenant_x y",
-          "$sent#v1#member#tenant_x y#\uFFFF",
-        ],
+      expect(sent).toHaveLength(1)
+      expect(sent[0]!.KeyConditionExpression).toContain("begins_with")
+      expect(key(sent[0]!).sort()).toEqual([
+        "$sent#v1#member#groupid_a b",
+        "$sent#v1#member#tenant_x y#",
       ])
     }),
   )
 
-  it.effect("a `.where()` equal on a composite before the last, in both texts", () =>
+  it.effect("a `.where()` equal on a composite before the last is one request", () =>
     Effect.gen(function* () {
       const sent = yield* queries((db) =>
         db.entities.Members.byGroup({ groupId: "g" })
           .where((t: any, o: any) => o.eq(t.tenant, "x y"))
           .collect(),
       )
-      expect(sent.flatMap((input) => key(input))).toEqual(
-        expect.arrayContaining(["$sent#v1#member#tenant_x y", "$sent#v1#member#tenant_x%20y"]),
+      expect(sent).toHaveLength(1)
+      expect(key(sent[0]!)).toEqual(
+        expect.arrayContaining(["$sent#v1#member#tenant_x%20y"]),
       )
     }),
   )

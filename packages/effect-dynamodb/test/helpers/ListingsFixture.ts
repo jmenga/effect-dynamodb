@@ -37,6 +37,8 @@ export interface ListingsOptions {
   readonly on?: "gsi" | "primary" | undefined
   /** The GSI's key casing (default: the schema's, lowercase). */
   readonly casing?: DynamoSchema.Casing | undefined
+  /** The schema's `escapeKeys`. */
+  readonly escapeKeys?: boolean | undefined
   /** `versioned: { retain: true }`: the primary key also holds version snapshots. */
   readonly versioned?: boolean | undefined
 }
@@ -68,7 +70,11 @@ export interface Listings {
 const encoder = new TextEncoder()
 
 export const makeListings = (options: ListingsOptions = {}): Listings => {
-  const schema = DynamoSchema.make({ name: "shop", version: 1 })
+  const schema = DynamoSchema.make({
+    name: "shop",
+    version: 1,
+    ...(options.escapeKeys === undefined ? {} : { escapeKeys: options.escapeKeys }),
+  })
   const statuses = options.statuses ?? ["active", "pending", "sold"]
   const sk = options.sk ?? ["status", "price", "listingId"]
   const on = options.on ?? "gsi"

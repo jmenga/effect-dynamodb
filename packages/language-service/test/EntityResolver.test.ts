@@ -117,7 +117,7 @@ describe("EntityResolver", () => {
       expect(entities[1]!.softDelete).toBe(true)
     })
 
-    it("should resolve DynamoSchema with escapeKeys off, and leave it off the default", () => {
+    it("should resolve DynamoSchema with escapeKeys on, and leave it off by default", () => {
       const resolve = (options: string) => {
         const source = `
           const AppSchema = DynamoSchema.make({ name: "MyApp", version: 1${options} })
@@ -135,8 +135,8 @@ describe("EntityResolver", () => {
         `
         return resolveEntities(ts, parseSource(source))[0]!.schema
       }
-      expect(resolve(", escapeKeys: false").escapeKeys).toBe(false)
-      expect(resolve(", escapeKeys: true").escapeKeys).toBeUndefined()
+      expect(resolve(", escapeKeys: true").escapeKeys).toBe(true)
+      expect(resolve(", escapeKeys: false").escapeKeys).toBeUndefined()
       expect(resolve("").escapeKeys).toBeUndefined()
     })
 

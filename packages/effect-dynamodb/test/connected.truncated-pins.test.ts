@@ -5,7 +5,9 @@
  * a row of its own and the parent of `city_sf#block_1`. A pin on a composite that
  * isn't the last means that row and everything under it, and nothing else: a
  * `begins_with` on `city_sf#` missed the row itself, while one on `city_sf` would
- * catch the sibling `city_sfx`. Each read below runs on real writes and a real index.
+ * catch the sibling `city_sfx`. That holds with `escapeKeys: true`: off, a pin reads
+ * `begins_with(city_sf#)` as 1.36 did, and the truncated row isn't under it, which is pinned
+ * here too. Each read below runs on real writes and a real index.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -14,8 +16,6 @@
 
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Config, Effect, Layer, Option, Schema, Stream } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -73,7 +73,7 @@ const ClientLayer = DynamoClient.layer({
   credentials: { accessKeyId: "local", secretAccessKey: "local" },
 })
 
-const AppSchema = DynamoSchema.make({ name: "truncated", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "truncated", version: 1, escapeKeys: true })
 const On = placesOn(AppSchema)
 const onTable = `truncated-on-${stamp}`
 const provideOn = Effect.provide(Layer.mergeAll(ClientLayer, On.MainTable.layer({ name: onTable })))
@@ -82,9 +82,8 @@ const onClient = DynamoClient.make({
   tables: { MainTable: On.MainTable },
 })
 
-// No 1.36 rows can exist here: the same reads, with no fallback at all.
-const CleanSchema = DynamoSchema.make({ name: "truncated", version: 1, legacyKeys: false })
-const Off = placesOn(CleanSchema)
+const OffSchema = DynamoSchema.make({ name: "truncated", version: 1, escapeKeys: false })
+const Off = placesOn(OffSchema)
 const offTable = `truncated-off-${stamp}`
 const provideOff = Effect.provide(
   Layer.mergeAll(ClientLayer, Off.MainTable.layer({ name: offTable })),
@@ -131,10 +130,7 @@ const seedPlace = (places: any, row: Place) =>
 const ALL_ORDER = ["parent", "own", "child-1", "child-2", "spaced", "extends", "other"]
 const CITY_ORDER = ["own", "child-1", "child-2"]
 
-const worlds = [
-  { name: "the fallback on", client: onClient, provide: provideOn, world: On, table: onTable },
-  { name: "the fallback off", client: offClient, provide: provideOff, world: Off, table: offTable },
-] as const
+const worlds = [{ client: onClient, provide: provideOn, world: On, table: onTable }] as const
 
 describeConnected("#183 a pin on a truncated row's own level", () => {
   beforeAll(async () => {
@@ -165,7 +161,7 @@ describeConnected("#183 a pin on a truncated row's own level", () => {
     }
   }, 30_000)
 
-  for (const { name, client, provide, table } of worlds) {
+  for (const { client, provide, table } of worlds) {
     const places = <A, E>(
       body: (places: any, db: any) => Effect.Effect<A, E, any>,
     ): Effect.Effect<void, unknown> =>
@@ -174,7 +170,7 @@ describeConnected("#183 a pin on a truncated row's own level", () => {
         yield* body(db.entities.Places, db)
       }).pipe(provide as never) as Effect.Effect<void, unknown>
 
-    describe(`with ${name}`, () => {
+    describe("with escapeKeys: true", () => {
       it.live(
         "stored keys: truncated at the last present composite",
         () =>
@@ -354,17 +350,115 @@ describeConnected("#183 a pin on a truncated row's own level", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Rows still under their 1.36 key text. It didn't escape: `city_new york` sorts
-// between `city_new` and `city_new#`, so it lies inside the subtree's BETWEEN.
+// Off, a pin on a composite that isn't the last reads `begins_with(city_sf#)`, as 1.36 did
 // ---------------------------------------------------------------------------
 
-describeConnected("#183 a pin on a truncated row's own level, over 1.36 key text", () => {
-  const legacyTable = `truncated-136-${stamp}`
-  const provide = Effect.provide(
-    Layer.mergeAll(ClientLayer, On.MainTable.layer({ name: legacyTable })),
+describeConnected("#183 a pin on a truncated row's own level, with escapeKeys: false", () => {
+  const places = <A, E>(body: (places: any) => Effect.Effect<A, E, any>) =>
+    Effect.gen(function* () {
+      const db = yield* offClient as unknown as Effect.Effect<any, never, any>
+      yield* body(db.entities.Places)
+    }).pipe(provideOff as never) as Effect.Effect<void, unknown>
+
+  beforeAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const raw = yield* DynamoClient
+        yield* raw.createTable({
+          TableName: offTable,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(Off.MainTable as never),
+        })
+        const db = yield* offClient as unknown as Effect.Effect<any, never, any>
+        for (const row of seedRows) yield* seedPlace(db.entities.Places, row)
+      }).pipe(provideOff as never) as Effect.Effect<void, unknown>,
+    )
+  }, 60_000)
+
+  afterAll(async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const raw = yield* DynamoClient
+        yield* raw.deleteTable({ TableName: offTable })
+      }).pipe(provideOff as never, Effect.ignore) as Effect.Effect<void>,
+    )
+  }, 30_000)
+
+  it.live("a value's key text sorts as it is: `sf x` before `sf`'s children", () =>
+    places((devices) =>
+      Effect.gen(function* () {
+        expect(ids(yield* devices.byPlace({ region: REGION }).collect())).toEqual([
+          "parent",
+          "own",
+          "spaced",
+          "child-1",
+          "child-2",
+          "extends",
+          "other",
+        ])
+      }),
+    ),
   )
 
-  const legacyRows: ReadonlyArray<Place> = [
+  it.live("a pin returns its subtree, and not a truncated row at its own level", () =>
+    places((devices) =>
+      Effect.gen(function* () {
+        const pinned = (city: string) =>
+          devices.byPlace({ region: REGION, country: "us", city }).collect()
+        expect(ids(yield* pinned("sf"))).toEqual(["child-1", "child-2"])
+        expect(ids(yield* pinned("sfx"))).toEqual([])
+        expect(ids(yield* pinned("sf x"))).toEqual([])
+      }),
+    ),
+  )
+
+  it.live("`.where(eq)` and `.within()` on a composite that isn't the last mean the same", () =>
+    places((devices) =>
+      Effect.gen(function* () {
+        const under = () => devices.byPlace({ region: REGION, country: "us" })
+        const where = yield* under()
+          .where((t: any, { eq }: any) => eq(t.city, "sf"))
+          .collect()
+        expect(ids(where)).toEqual(["child-1", "child-2"])
+        expect(
+          ids(
+            yield* under()
+              .within({ city: { eq: "sf" } })
+              .collect(),
+          ),
+        ).toEqual(["child-1", "child-2"])
+      }),
+    ),
+  )
+
+  it.live("a full pin is the one row", () =>
+    places((devices) =>
+      Effect.gen(function* () {
+        const found = yield* devices
+          .byPlace({ region: REGION, country: "us", city: "sf", block: "1" })
+          .collect()
+        expect(ids(found)).toEqual(["child-1"])
+      }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Rows written with the flag off, moved by `rekey`. Unescaped, `city_new york` sorts between
+// `city_new` and `city_new#`, so until it moves it lies inside the subtree's BETWEEN.
+// ---------------------------------------------------------------------------
+
+describeConnected("#183 a pin on a truncated row's own level, after rekey", () => {
+  const movedTable = `truncated-moved-${stamp}`
+  const provide = Effect.provide(
+    Layer.mergeAll(
+      ClientLayer,
+      On.MainTable.layer({ name: movedTable }),
+      Off.MainTable.layer({ name: movedTable }),
+    ),
+  )
+
+  const offRows: ReadonlyArray<Place> = [
     new Place({ siteId: "own", region: REGION, country: "us", city: "new" }),
     new Place({ siteId: "child", region: REGION, country: "us", city: "new", block: "1" }),
     new Place({ siteId: "sibling", region: REGION, country: "us", city: "new york" }),
@@ -375,43 +469,27 @@ describeConnected("#183 a pin on a truncated row's own level, over 1.36 key text
       city: "new york",
       block: "1",
     }),
-    new Place({ siteId: "after", region: REGION, country: "us", city: "newark" }),
   ]
-
-  /** The row as written, its index sort key rewritten under the text 1.36 composes. */
-  const demote = (place: Place) =>
-    Effect.gen(function* () {
-      const client = yield* DynamoClient
-      const keys = KeyComposer.composeAllKeys(AppSchema, "Place", 1, On.Places.indexes, {
-        siteId: place.siteId,
-      })
-      yield* client.updateItem({
-        TableName: legacyTable,
-        Key: { pk: { S: keys.pk as string }, sk: { S: keys.sk as string } },
-        UpdateExpression: "SET #sk = :sk",
-        ExpressionAttributeNames: { "#sk": "gsi1sk" },
-        ExpressionAttributeValues: {
-          ":sk": {
-            S: KeyText136.composeSortKeyPrefix(AppSchema, "Place", 1, On.Places.indexes.byPlace, {
-              ...place,
-            }),
-          },
-        },
-      })
-    })
 
   beforeAll(async () => {
     await Effect.runPromise(
       Effect.gen(function* () {
         const raw = yield* DynamoClient
         yield* raw.createTable({
-          TableName: legacyTable,
+          TableName: movedTable,
           BillingMode: "PAY_PER_REQUEST",
           ...Table.definition(On.MainTable as never),
         })
-        const db = yield* onClient
-        for (const row of legacyRows) yield* seedPlace(db.entities.Places, row)
-        for (const row of legacyRows) yield* demote(row)
+        const off = yield* offClient as unknown as Effect.Effect<any, never, any>
+        for (const row of offRows) yield* seedPlace(off.entities.Places, row)
+        const { Items = [] } = yield* raw.scan({ TableName: movedTable })
+        expect(Items.find((item) => item.siteId?.S === "sibling")?.gsi1sk?.S).toBe(
+          "$truncated#v1#place#country_us#city_new york",
+        )
+        const db = yield* onClient as unknown as Effect.Effect<any, never, any>
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+        expect(report.conflicts).toEqual([])
+        expect(report.indexKeysRewritten).toBe(2)
       }).pipe(provide as never) as Effect.Effect<void, unknown>,
     )
   }, 60_000)
@@ -420,29 +498,29 @@ describeConnected("#183 a pin on a truncated row's own level, over 1.36 key text
     await Effect.runPromise(
       Effect.gen(function* () {
         const raw = yield* DynamoClient
-        yield* raw.deleteTable({ TableName: legacyTable })
+        yield* raw.deleteTable({ TableName: movedTable })
       }).pipe(provide as never, Effect.ignore) as Effect.Effect<void>,
     )
   }, 30_000)
 
   const run = <A, E>(body: (places: any) => Effect.Effect<A, E, any>) =>
     Effect.gen(function* () {
-      const db = yield* onClient
+      const db = yield* onClient as unknown as Effect.Effect<any, never, any>
       yield* body(db.entities.Places)
     }).pipe(provide as never) as Effect.Effect<void, unknown>
 
   it.live(
-    "the demoted row really is under the unescaped text",
+    "the row is under the escaped text",
     () =>
       Effect.gen(function* () {
         const raw = yield* DynamoClient
-        const { Items = [] } = yield* raw.scan({ TableName: legacyTable })
+        const { Items = [] } = yield* raw.scan({ TableName: movedTable })
         const sibling = Items.find((item) => item.siteId?.S === "sibling")
-        expect(sibling?.gsi1sk?.S).toBe("$truncated#v1#place#country_us#city_new york")
+        expect(sibling?.gsi1sk?.S).toBe("$truncated#v1#place#country_us#city_new%20york")
       }).pipe(provide as never) as Effect.Effect<void, unknown>,
   )
 
-  it.live("a pin keeps its row and subtree, and not the sibling inside the range", () =>
+  it.live("a pin keeps its row and subtree, and not the sibling", () =>
     run((places) =>
       Effect.gen(function* () {
         const found = yield* places
@@ -453,7 +531,7 @@ describeConnected("#183 a pin on a truncated row's own level, over 1.36 key text
     ),
   )
 
-  it.live("a pin whose text changed reads the row once, and its subtree", () =>
+  it.live("a pin on the escaped value finds its row and subtree", () =>
     run((places) =>
       Effect.gen(function* () {
         const found = yield* places
@@ -485,42 +563,18 @@ describeConnected("#183 a pin on a truncated row's own level, over 1.36 key text
     ),
   )
 
-  it.live("`.where(eq)` keeps out the sibling", () =>
+  it.live("`.where(eq)` and `.within()` keep out the sibling", () =>
     run((places) =>
       Effect.gen(function* () {
-        const found = yield* places
-          .byPlace({ region: REGION, country: "us" })
+        const under = () => places.byPlace({ region: REGION, country: "us" })
+        const where = yield* under()
           .where((t: any, { eq }: any) => eq(t.city, "new"))
           .collect()
-        expect(ids(found).sort()).toEqual(["child", "own"])
-      }),
-    ),
-  )
-
-  it.live("`.within()` on an equal composite keeps out the sibling", () =>
-    run((places) =>
-      Effect.gen(function* () {
-        const found = yield* places
-          .byPlace({ region: REGION, country: "us" })
+        expect(ids(where).sort()).toEqual(["child", "own"])
+        const within = yield* under()
           .within({ city: { eq: "new" } })
           .collect()
-        expect(ids(found).sort()).toEqual(["child", "own"])
-      }),
-    ),
-  )
-
-  it.live("a write moves the row to its current text, and the pin still finds it once", () =>
-    run((places) =>
-      Effect.gen(function* () {
-        yield* places.update({ siteId: "sibling" }).set({ note: "touched" }).asEffect()
-        const found = yield* places
-          .byPlace({ region: REGION, country: "us", city: "new york" })
-          .collect()
-        expect(ids(found).sort()).toEqual(["sibling", "sibling-child"])
-        const beside = yield* places
-          .byPlace({ region: REGION, country: "us", city: "new" })
-          .collect()
-        expect(ids(beside).sort()).toEqual(["child", "own"])
+        expect(ids(within).sort()).toEqual(["child", "own"])
       }),
     ),
   )

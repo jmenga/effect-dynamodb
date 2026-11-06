@@ -1,5 +1,6 @@
 /**
- * `internal/KeyText136.ts` composes exactly the key text 1.36.0 wrote.
+ * With `escapeKeys` off, the default, the real composers compose exactly the key text 1.36.0 wrote,
+ * and `internal/KeyText136.ts` reads a stored key back under each form `rekey` recognises.
  *
  * `fixtures/key-text-1.36.0.json` holds golden vectors generated ONCE from the
  * PUBLISHED packages — `effect-dynamodb@1.36.0` and
@@ -121,7 +122,10 @@ const vectors = JSON.parse(
   }>
 }
 
-describe("KeyText136 — golden vectors from the published 1.36.0", () => {
+/** What a schema that doesn't set the flag composes: the fixture's own schemas, through `make`. */
+const defaulted = (schema: Schema): Schema => DynamoSchema.make(schema)
+
+describe("the default composes the golden vectors from the published 1.36.0", () => {
   it("the fixture says how it was generated and covers every key kind", () => {
     expect(vectors.generated).toContain("effect-dynamodb@1.36.0")
     expect(vectors.serializeValue.length).toBeGreaterThan(300)
@@ -138,31 +142,32 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
     }
   })
 
-  it("serializeValue", () => {
+  it("a composite value's text", () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1 })
     for (const { value, text } of vectors.serializeValue) {
-      expect(KeyText136.serializeValue(revive(value)), JSON.stringify(value)).toBe(text)
+      expect(KeyComposer.compositeText(schema, revive(value)), JSON.stringify(value)).toBe(text)
     }
   })
 
   it("partition keys, sort keys, sort key prefixes and begins_with operands", () => {
     for (const v of vectors.keys) {
+      const schema = defaulted(v.schema)
       const record = revived(v.record)
       const partial = { ...record }
       for (const name of v.index.sk.composite.slice(v.leading)) delete partial[name]
       const at = JSON.stringify(v)
-      expect(KeyText136.composePk(v.schema, v.entityType, v.index, record), at).toBe(v.pk)
+      expect(KeyComposer.composePk(schema, v.entityType, v.index, record), at).toBe(v.pk)
+      expect(KeyComposer.composeSk(schema, v.entityType, v.entityVersion, v.index, record), at).toBe(
+        v.sk,
+      )
       expect(
-        KeyText136.composeSk(v.schema, v.entityType, v.entityVersion, v.index, record),
-        at,
-      ).toBe(v.sk)
-      expect(
-        KeyText136.composeSortKeyPrefix(v.schema, v.entityType, v.entityVersion, v.index, partial),
+        KeyComposer.composeSortKeyPrefix(schema, v.entityType, v.entityVersion, v.index, partial),
         at,
       ).toBe(v.prefix)
       if (v.beginsWith !== null) {
         expect(
-          KeyText136.composeSortKeyBeginsWith(
-            v.schema,
+          KeyComposer.composeSortKeyBeginsWith(
+            schema,
             v.entityType,
             v.entityVersion,
             v.index,
@@ -174,7 +179,7 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
     }
   })
 
-  it("a key read back: one reading, which composes it and the values' 1.37 key", () => {
+  it("a key read back: one reading, which composes it and the values' key under each setting", () => {
     const kinds: Record<string, KeyText136.ValueKind> = {
       number: "number",
       bigint: "bigint",
@@ -182,9 +187,11 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
     }
     for (const v of vectors.keys) {
       const at = JSON.stringify(v)
+      const schema = defaulted(v.schema)
+      const form = { pk: schema, sk: schema }
       const record = revived(v.record)
       const read = KeyText136.readIndexKeys(
-        v.schema,
+        form,
         v.entityType,
         v.entityVersion,
         v.index,
@@ -192,25 +199,19 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
         (attr) => kinds[v.record[attr]!.t] ?? "string",
       )
       expect(read, at).toBeDefined()
-      expect(
-        KeyText136.composeIndexKeys(v.schema, v.entityType, v.entityVersion, v.index, read!),
-        at,
-      ).toEqual({ [v.index.pk.field]: v.pk, [v.index.sk.field]: v.sk })
+      expect(KeyText136.composeAt(form, v.entityType, v.entityVersion, v.index, read!), at).toEqual(
+        { [v.index.pk.field]: v.pk, [v.index.sk.field]: v.sk },
+      )
+      const on = DynamoSchema.make({ ...v.schema, escapeKeys: true })
       let current: Record<string, unknown> | undefined
       try {
-        current = KeyComposer.composeIndexKeys(
-          v.schema,
-          v.entityType,
-          v.entityVersion,
-          v.index,
-          record,
-        )
+        current = KeyComposer.composeIndexKeys(on, v.entityType, v.entityVersion, v.index, record)
       } catch {
-        // `NaN` has no 1.37 key ([EDD-9096]).
+        // `NaN` has no key with `escapeKeys: true` ([EDD-9096]).
         continue
       }
       expect(
-        KeyComposer.composeIndexKeys(v.schema, v.entityType, v.entityVersion, v.index, read!),
+        KeyComposer.composeIndexKeys(on, v.entityType, v.entityVersion, v.index, read!),
         at,
       ).toEqual(current)
     }
@@ -219,8 +220,8 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
   it("every index's keys, sparse GSIs left out", () => {
     for (const v of vectors.allKeys) {
       expect(
-        KeyText136.composeAllKeys(
-          v.schema,
+        KeyComposer.composeAllKeys(
+          defaulted(v.schema),
           v.entityType,
           v.entityVersion,
           v.indexes,
@@ -232,88 +233,101 @@ describe("KeyText136 — golden vectors from the published 1.36.0", () => {
   })
 
   it("time-series event keys carry the encoded orderBy value", () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1 })
     for (const v of vectors.eventSk) {
-      expect(KeyText136.composeEventSk(v.currentSk, revive(v.orderBy), v.casing)).toBe(v.eventSk)
-      // The prefix is structural: unchanged in 1.37.
+      expect(KeyComposer.composeEventSk(schema, v.currentSk, revive(v.orderBy), v.casing)).toBe(
+        v.eventSk,
+      )
       expect(KeyComposer.composeEventSkPrefix(v.currentSk, v.casing)).toBe(v.prefix)
     }
   })
 
   it("unique-constraint sentinels", () => {
     for (const v of vectors.unique) {
+      const schema = defaulted(v.schema)
       expect(
-        KeyText136.composeUniqueKey(v.schema, "User", v.constraintName, v.values.map(revive)),
+        DynamoSchema.composeUniqueKey(
+          schema,
+          "User",
+          v.constraintName,
+          v.values.map((value) => KeyComposer.keyValueText(schema, revive(value), schema.casing)),
+        ),
         JSON.stringify(v),
       ).toEqual({ pk: v.pk, sk: v.sk })
     }
   })
 
-  it("version snapshot and tombstone keys, through the 1.36 live sort key", () => {
+  it("version snapshot and tombstone keys, through the live sort key", () => {
     for (const v of vectors.history) {
-      const liveSk = KeyText136.composeSk(v.schema, "Doc", 1, v.primary, revived(v.record))
+      const schema = defaulted(v.schema)
+      const liveSk = KeyComposer.composeSk(schema, "Doc", 1, v.primary, revived(v.record))
       expect(liveSk).toBe(v.liveSk)
-      // The item segment and the history layout are structural: unchanged.
-      const item = KeyComposer.composeHistoryItemSegment(v.schema, "Doc", 1, v.primary, liveSk)
+      const item = KeyComposer.composeHistoryItemSegment(schema, "Doc", 1, v.primary, liveSk)
       expect(item ?? null).toBe(v.item)
       const options = item === undefined ? undefined : { item }
-      expect(DynamoSchema.composeVersionKey(v.schema, "Doc", v.version, options)).toBe(v.versionKey)
-      expect(DynamoSchema.composeDeletedKey(v.schema, "Doc", v.timestamp, options)).toBe(
-        v.deletedKey,
-      )
+      expect(DynamoSchema.composeVersionKey(schema, "Doc", v.version, options)).toBe(v.versionKey)
+      expect(DynamoSchema.composeDeletedKey(schema, "Doc", v.timestamp, options)).toBe(v.deletedKey)
     }
   })
 
   it("vector index partitions", () => {
     for (const v of vectors.vectorPartition) {
       expect(
-        KeyText136.tryComposeVectorPartition(v.schema, "Doc", v.index, revived(v.record)),
+        KeyComposer.tryComposeVectorPartition(defaulted(v.schema), "Doc", v.index, revived(v.record)),
       ).toBe(v.partition)
     }
   })
 
   it("aggregate and EventStore keys: collection, list and stream keys", () => {
     for (const v of vectors.collection) {
+      const schema = defaulted(v.schema)
       const options = v.casing === null ? undefined : { casing: v.casing }
-      const composites = KeyText136.extractComposites(v.composite, revived(v.record))
-      expect(DynamoSchema.composeCollectionKey(v.schema, "Match", composites, options)).toBe(
+      // These keys cased their values once, by their own rule: the composer's casing is the key's.
+      const composites = KeyComposer.extractKeyComposites(
+        schema,
+        { casing: "preserve" },
+        v.composite,
+        revived(v.record),
+      )
+      expect(DynamoSchema.composeCollectionKey(schema, "Match", composites, options)).toBe(
         v.collectionKey,
       )
       expect(
         DynamoSchema.composeKey(
-          v.schema,
+          schema,
           "Innings",
-          v.values.flatMap((value, j) => [`d${j}`, KeyText136.serializeValue(revive(value))]),
+          v.values.flatMap((value, j) => [`d${j}`, KeyComposer.compositeText(schema, revive(value))]),
           options,
         ),
       ).toBe(v.key)
-      expect(DynamoSchema.composeKey(v.schema, "Account", composites, options)).toBe(v.streamKey)
+      expect(DynamoSchema.composeKey(schema, "Account", composites, options)).toBe(v.streamKey)
     }
   })
 })
 
-describe("KeyText136 — what changed in 1.37", () => {
-  const schema = DynamoSchema.make({ name: "app", version: 1 })
+describe("KeyText136 — the forms `rekey` recognises", () => {
+  const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: false })
+  const on = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
   const primary: Index = {
     pk: { field: "pk", composite: ["tenant"] },
     sk: { field: "sk", composite: ["seq"] },
   }
-  const current = (record: Record<string, unknown>) =>
-    KeyComposer.composeIndexKeys(schema, "Item", 1, primary, record)
 
-  it("a key whose text did not change has no 1.36 key to fall back to", () => {
+  it("a value with nothing to escape and no number 1.37 changed has one key under every form", () => {
     for (const record of [
       { tenant: "acme", seq: "a" },
       { tenant: "acme", seq: 0 },
       { tenant: "acme", seq: Number.MAX_SAFE_INTEGER },
       { tenant: "acme", seq: 99_999_999_999_999_999_999_999_999_999_999_999_999n },
     ]) {
-      expect(
-        KeyText136.changedPrimaryKey(schema, "Item", 1, primary, record, current(record)),
-      ).toBeUndefined()
+      const keys = KeyText136.forms(schema).map((form) =>
+        JSON.stringify(KeyText136.composeAt(form, "Item", 1, primary, record)),
+      )
+      expect(new Set(keys).size).toBe(1)
     }
   })
 
-  it("a changed number or an escaped key value has its 1.36 key", () => {
+  it("a changed number or an escaped key value has a key of its own under some form", () => {
     for (const record of [
       { tenant: "new york", seq: 42 },
       { tenant: "acme", seq: -3 },
@@ -323,96 +337,46 @@ describe("KeyText136 — what changed in 1.37", () => {
       { tenant: "acme", seq: "new york" },
       { tenant: -1, seq: "a" },
     ]) {
-      expect(
-        KeyText136.changedPrimaryKey(schema, "Item", 1, primary, record, current(record)),
-      ).toEqual(KeyText136.composeIndexKeys(schema, "Item", 1, primary, record))
+      const keys = KeyText136.forms(schema).map((form) =>
+        JSON.stringify(KeyText136.composeAt(form, "Item", 1, primary, record)),
+      )
+      expect(new Set(keys).size).toBeGreaterThan(1)
     }
     expect(
-      KeyText136.changedPrimaryKey(
-        schema,
-        "Item",
-        1,
-        primary,
-        { tenant: "acme", seq: -3 },
-        current({ tenant: "acme", seq: -3 }),
-      ),
+      KeyText136.composeAt(KeyText136.forms(schema)[0]!, "Item", 1, primary, {
+        tenant: "acme",
+        seq: -3,
+      }),
     ).toEqual({ pk: "$app#v1#item#tenant_acme", sk: "$app#v1#item#seq_00000000000000-3" })
   })
 
-  it("legacyKeys: false turns the fallback off", () => {
-    const off = DynamoSchema.make({ name: "app", version: 1, legacyKeys: false })
-    expect(KeyText136.enabled(off)).toBe(false)
-    expect(KeyText136.enabled(schema)).toBe(true)
-    expect(schema).toEqual({ name: "app", version: 1, casing: "lowercase" })
-    const record = { tenant: "acme", seq: -3 }
-    expect(
-      KeyText136.changedPrimaryKey(off, "Item", 1, primary, record, current(record)),
-    ).toBeUndefined()
-  })
-
-  it("a query's pins and its eq / beginsWith bound under 1.36's text", () => {
-    const byPlace: Index = {
-      index: "gsi1",
-      pk: { field: "gsi1pk", composite: ["tenant"] },
-      sk: { field: "gsi1sk", composite: ["city", "seq"] },
-    }
-    const full = { tenant: "acme", city: "new york", seq: -3 }
-    const sk136 = KeyText136.composeSk(schema, "Item", 1, byPlace, full)
-    // The pins: a complete key is `eq`; a partial one the prefix and what's below it.
-    expect(KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, full)).toEqual({
-      eq: sk136,
-    })
-    const pinned = KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, {
-      city: "new york",
-    })
-    expect(pinned).toEqual({
-      between: ["$app#v1#item#city_new york", "$app#v1#item#city_new york#\uFFFF"],
-    })
-    expect(sk136.startsWith("$app#v1#item#city_new york#")).toBe(true)
-    // On the primary index, nothing is truncated: the prefix ending on the delimiter.
-    const { index: _gsi, ...primary } = byPlace
-    expect(
-      KeyText136.composeSortKeyCondition(schema, "Item", 1, primary, { city: "new york" }),
-    ).toEqual({ beginsWith: "$app#v1#item#city_new york#" })
-    expect(
-      KeyText136.composeBoundCondition(schema, "Item", 1, primary, {}, "city", { eq: "new york" }),
-    ).toEqual({ beginsWith: "$app#v1#item#city_new york#" })
-    // Text that did not change composes as the current composer does.
-    const same = { city: "boston" }
-    expect(KeyText136.composeSortKeyCondition(schema, "Item", 1, byPlace, same)).toEqual(
-      KeyComposer.composeSortKeyCondition(schema, "Item", 1, byPlace, same),
+  it("a row holding no values is marked only under text off doesn't compose", () => {
+    const plain = { tenant: "acme", seq: 1 }
+    const spelled = { tenant: "a b", seq: 1 }
+    expect(KeyText136.markOf(schema, "Item", 1, primary, spelled)).toBeUndefined()
+    expect(KeyText136.markOf(on, "Item", 1, primary, plain)).toBeUndefined()
+    expect(KeyText136.markOf(on, "Item", 1, primary, spelled)).toBe(2)
+    expect(KeyText136.composeAt(KeyText136.formOfMark(on, "2"), "Item", 1, primary, spelled)).toEqual(
+      KeyText136.composeAt({ pk: on, sk: on }, "Item", 1, primary, spelled),
     )
-    // A bound: `eq` on the last composite is its key; on another, its subtree.
-    const bound = (field: string, value: { eq: unknown } | { beginsWith: unknown }) =>
-      KeyText136.composeBoundCondition(
-        schema,
-        "Item",
-        1,
-        byPlace,
-        field === "seq" ? { city: "new york" } : {},
-        field,
-        value,
-      )
-    expect(bound("seq", { eq: -3 })).toEqual({ eq: sk136 })
-    expect(bound("city", { eq: "new york" })).toEqual(pinned)
-    // A string `beginsWith` is a text prefix; a number has none, so it is `eq`.
-    expect(bound("city", { beginsWith: "new " })).toEqual({
-      beginsWith: "$app#v1#item#city_new ",
-    })
-    expect(bound("seq", { beginsWith: -3 })).toEqual({ eq: sk136 })
+    expect(
+      KeyText136.composeAt(KeyText136.formOfMark(on, undefined), "Item", 1, primary, spelled),
+    ).toEqual(KeyText136.composeAt({ pk: schema, sk: schema }, "Item", 1, primary, spelled))
+    expect(KeyText136.formOfMark(on, "1").pk).toEqual(KeyText136.schema137(on))
   })
 
-  it("a key is read back only as the 1.36 text of exactly one set of values", () => {
+  it("a key is read back only as the text of exactly one set of values", () => {
+    const form = { pk: schema, sk: schema }
     const kindOf = (attr: string): KeyText136.ValueKind => (attr === "seq" ? "number" : "string")
     const read = (pk: string, sk: string) =>
-      KeyText136.readIndexKeys(schema, "Item", 1, primary, { pk, sk }, kindOf)
+      KeyText136.readIndexKeys(form, "Item", 1, primary, { pk, sk }, kindOf)
     // 1.36's padded text of a number, and a sort key value as it was stored, cased.
     expect(read("$app#v1#item#tenant_acme", "$app#v1#item#seq_00000000000000-3")).toEqual({
       tenant: "acme",
       seq: -3,
     })
     // 1.37's text of a changed number is no 1.36 text.
-    const moved = current({ tenant: "acme", seq: -3 })
+    const moved = KeyComposer.composeIndexKeys(on, "Item", 1, primary, { tenant: "acme", seq: -3 })
     expect(read(String(moved.pk), String(moved.sk))).toBeUndefined()
     // A string holding the delimiter and the next label reads two ways.
     const two: Index = {
@@ -421,7 +385,7 @@ describe("KeyText136 — what changed in 1.37", () => {
     }
     expect(
       KeyText136.readIndexKeys(
-        schema,
+        form,
         "Item",
         1,
         two,
@@ -431,7 +395,7 @@ describe("KeyText136 — what changed in 1.37", () => {
     ).toBeUndefined()
     expect(
       KeyText136.readIndexKeys(
-        schema,
+        form,
         "Item",
         1,
         two,
@@ -442,25 +406,5 @@ describe("KeyText136 — what changed in 1.37", () => {
     // Another entity's key, or text past the key, is not this one's.
     expect(read("$app#v1#other#tenant_acme", "$app#v1#item#seq_0000000000000001")).toBeUndefined()
     expect(read("$app#v1#item#tenant_acme", "$app#v1#item#seq_0000000000000001#x")).toBeUndefined()
-  })
-
-  it("a Z-order index has no 1.36 key", () => {
-    const indexes: Record<string, Index> = {
-      primary,
-      near: {
-        index: "gsi1",
-        pk: { field: "gsi1pk", composite: ["tenant"] },
-        sk: {
-          field: "gsi1sk",
-          composite: ["x", "y"],
-          zorderHalf: { prefix: [], dimensions: [], layout: undefined },
-        },
-      },
-    }
-    expect(
-      Object.keys(
-        KeyText136.composeAllKeys(schema, "Item", 1, indexes, { tenant: "a", seq: 1, x: 1, y: 2 }),
-      ),
-    ).toEqual(["pk", "sk"])
   })
 })

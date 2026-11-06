@@ -252,7 +252,9 @@ const Assets = Entity.make({
   },
 })
 
-const HierTable = Table.make({ schema: AppSchema, entities: { Assets } })
+// A pin finds a row truncated at its own level only with `escapeKeys: true`.
+const HierSchema = DynamoSchema.make({ name: "indexpolicy-demo", version: 1, escapeKeys: true })
+const HierTable = Table.make({ schema: HierSchema, entities: { Assets } })
 
 const scenario3 = Effect.gen(function* () {
   const db = yield* DynamoClient.make({

@@ -48,7 +48,7 @@ try {
 
 const describeConnected = dynamoAvailable ? describe : describe.skip
 
-const AppSchema = DynamoSchema.make({ name: "event-keys", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "event-keys", version: 1, escapeKeys: true })
 const tableName = `event-keys-${Date.now()}`
 
 const makeMeters = <S extends Schema.Top>(seq: S, entityType = "Reading") => {

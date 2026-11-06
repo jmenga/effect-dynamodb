@@ -621,7 +621,7 @@ describeConnected("#183 canonical shapes — shape 2, PK-composites-only (#43)",
 })
 
 describeConnected("#183 canonical shapes — shape 3, hierarchical", () => {
-  it.live("a truncated key keeps the marker, and is found at its level", () =>
+  it.live("a truncated key keeps the marker, and with escapeKeys is found at its level", () =>
     onFleet(
       (fleet, tableName) =>
         Effect.gen(function* () {
@@ -630,9 +630,10 @@ describeConnected("#183 canonical shapes — shape 3, hierarchical", () => {
           expect(row.gsi3pk?.S).toContain(`#!8.${keyShard}#region_r`)
           expect(row.gsi3sk?.S).toBe("$sharding#v1#fleet#country_c")
           expect(ids(yield* fleet.byPlace({ region: "r" }).collect())).toEqual(["device-1"])
-          expect(ids(yield* fleet.byPlace({ region: "r", country: "c" }).collect())).toEqual([
-            "device-1",
-          ])
+          // Off, a pin reads `country_c#`, as 1.36 did, which the truncated key isn't under.
+          expect(ids(yield* fleet.byPlace({ region: "r", country: "c" }).collect())).toEqual(
+            schema.escapeKeys === true ? ["device-1"] : [],
+          )
         }),
       { region: "r", country: "c", city: "x" },
     ),
@@ -1458,9 +1459,9 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
     for (const scenario of RekeyComparison.sharedTableKeyMoveScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
-    it.live("two accessors over one sharded partition key", () =>
-      RekeyComparison.sharedShardMoveScenario(harness),
-    )
+    for (const scenario of RekeyComparison.sharedShardMoveScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
   })
   for (const scenario of RekeyComparison.labelScenarios) {
     it.live(scenario.name, () => scenario.run(harness))
@@ -1610,9 +1611,12 @@ describeConnected("#183 an inverted index (shape 14), on real writes", () => {
   it.live("a row 1.37.0 overwrote is at its key", () =>
     InvertedIndexes.overwritten137Scenario(harness),
   )
-  it.live("escapeKeys off doesn't find an escaped key", () =>
+  it.live("off moves a row 1.37.0 overwrote back", () =>
     InvertedIndexes.overwritten137OffScenario(harness),
   )
+  for (const scenario of InvertedIndexes.overwritten137Scenarios) {
+    it.live(`a row 1.37.0 overwrote, ${scenario.name}`, () => scenario.run(harness))
+  }
 })
 
 describeConnected(".remove() of a primary key composite, on a real table", () => {

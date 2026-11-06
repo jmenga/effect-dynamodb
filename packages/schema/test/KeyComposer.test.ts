@@ -7,6 +7,8 @@ import * as KeyComposer from "../src/KeyComposer.js"
 
 describe("KeyComposer", () => {
   const schema = DynamoSchema.make({ name: "myapp", version: 1 })
+  const schemaOn = DynamoSchema.make({ name: "myapp", version: 1, escapeKeys: true })
+  const schemaOff = DynamoSchema.make({ name: "myapp", version: 1, escapeKeys: false })
 
   describe("extractComposites", () => {
     it("extracts values in order", () => {
@@ -1731,8 +1733,18 @@ describe("KeyComposer", () => {
       it("update touching the PK half → empty SK half ALSO emits SET (constant prefix)", () => {
         // The exact #46 reproducer scenario. Pre-v1.7.3: gsi3pk SET,
         // gsi3sk silently skipped. Post-v1.7.3: both halves SET.
+        const escaped = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schemaOn,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(escaped.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
+        expect(escaped.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+          schemaOn,
           "Vehicle",
           1,
           emptySkIndexes(),
@@ -1742,6 +1754,17 @@ describe("KeyComposer", () => {
         expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         expect(result.removes).toEqual([])
+        const off = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schemaOff,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(off.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(off.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        expect(off.removes).toEqual([])
       })
 
       it("update with empty payload (untouched PK) still evaluates empty SK half (constant prefix)", () => {
@@ -1820,7 +1843,7 @@ describe("KeyComposer", () => {
         // { kind: 'set', length: 0 } regardless of policy. The skip-
         // predicate now reaches that branch even under sparse.
         const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+          schemaOn,
           "Vehicle",
           1,
           emptySkIndexes({ pk: "sparse", sk: "sparse" }),
@@ -2837,11 +2860,11 @@ describe("KeyComposer", () => {
         pk: { field: "gsi1pk", composite: ["deviceId"] },
         sk: { field: "gsi1sk", composite: ["seq", "part"] },
       }
-      const operand = KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, {
+      const operand = KeyComposer.composeSortKeyBeginsWith(schemaOn, "Reading", 1, numericSk, {
         seq: 42,
       })
       expect(operand).toBe("$myapp#v1#reading#seq_0000000000000042#")
-      const fraction = KeyComposer.composeSk(schema, "Reading", 1, numericSk, {
+      const fraction = KeyComposer.composeSk(schemaOn, "Reading", 1, numericSk, {
         seq: 42.5,
         part: "a",
       })
@@ -2896,24 +2919,33 @@ describe("KeyComposer", () => {
         ...collection,
       }) as KeyComposer.IndexDefinition
 
-    it("partial prefix on a secondary index — the prefix and everything below it", () => {
+    it("partial prefix on a secondary index, escaped — the prefix and everything below it", () => {
       const index = onIndex(["status", "taskId"])
-      const prefix = KeyComposer.composeSortKeyPrefix(schema, "Task", 1, index, { status: "done" })
+      const prefix = KeyComposer.composeSortKeyPrefix(schemaOn, "Task", 1, index, {
+        status: "done",
+      })
       expect(
-        KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, { status: "done" }),
+        KeyComposer.composeSortKeyCondition(schemaOn, "Task", 1, index, { status: "done" }),
       ).toEqual({ between: [prefix, `${prefix}#\uFFFF`] })
+    })
+
+    it("partial prefix on a secondary index, off — begins_with, as 1.36 sent it", () => {
+      const index = onIndex(["status", "taskId"])
+      expect(
+        KeyComposer.composeSortKeyCondition(schemaOff, "Task", 1, index, { status: "done" }),
+      ).toEqual({ beginsWith: "$myapp#v1#task#status_done#" })
     })
 
     it("partial prefix on a secondary index selects the truncated row and no sibling", () => {
       const index = onIndex(["city", "site"])
-      const composed = KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, {
+      const composed = KeyComposer.composeSortKeyCondition(schemaOn, "Task", 1, index, {
         city: "sf",
       }) as { between: readonly [string, string] }
       const [low, high] = composed.between
       const selects = (key: string) => low <= key && key <= high
       const at = (city: string, site?: string) =>
         KeyComposer.composeSkPrefixUpTo(
-          schema,
+          schemaOn,
           "Task",
           1,
           index,
@@ -2966,14 +2998,14 @@ describe("KeyComposer", () => {
     for (const [shape, collection] of shapes) {
       it(`${shape}: a pinned number matches neither its fractions nor longer digits`, () => {
         const index = onIndex(["tag", "seq"], collection)
-        const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        const condition = KeyComposer.composeSortKeyCondition(schemaOn, "Reading", 1, index, {
           tag: "a",
           seq: 3,
         })
         expect("eq" in condition).toBe(true)
         const eq = (condition as { readonly eq: string }).eq
         const stored = (seq: number) =>
-          KeyComposer.composeSk(schema, "Reading", 1, index, { tag: "a", seq })
+          KeyComposer.composeSk(schemaOn, "Reading", 1, index, { tag: "a", seq })
         expect(stored(3)).toBe(eq)
         for (const sibling of [3.14, 3.5, 30, -3, -3.14]) {
           expect(stored(sibling) === eq, String(sibling)).toBe(false)
@@ -2988,8 +3020,8 @@ describe("KeyComposer", () => {
       // `:0381` (1e38) is a prefix of `:03815` (1.5e38) and `:03812` (1.2e38).
       const index = onIndex(["level"])
       const stored = (level: bigint) =>
-        KeyComposer.composeSk(schema, "Reading", 1, index, { level })
-      const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        KeyComposer.composeSk(schemaOn, "Reading", 1, index, { level })
+      const condition = KeyComposer.composeSortKeyCondition(schemaOn, "Reading", 1, index, {
         level: 10n ** 38n,
       })
       expect(condition).toEqual({ eq: stored(10n ** 38n) })

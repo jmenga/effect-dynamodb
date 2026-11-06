@@ -40,7 +40,6 @@ export const makeWorld = (
   schemaOptions: {
     readonly casing: Casing
     readonly escapeKeys?: boolean
-    readonly legacyKeys?: boolean
   },
 ) => {
   const { Schema, DynamoSchema, Entity, Table, EventStore, Aggregate, DynamoClient } = lib

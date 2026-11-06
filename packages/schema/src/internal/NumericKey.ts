@@ -115,6 +115,51 @@ const complement = (text: string): string =>
 const negate = (text: string): string =>
   text.startsWith(":") ? `-*${complement(text.slice(1))}:` : `-${complement(text)}:`
 
+/** The text of magnitude `x` from the text of `-x`; `undefined` when it is no such text. */
+const magnitudeOf = (text: string): string | undefined => {
+  if (!text.startsWith("-")) return text
+  if (!text.endsWith(":")) return undefined
+  const body = text.slice(1, -1)
+  return body.startsWith("*") ? `:${complement(body.slice(1))}` : complement(body)
+}
+
+/** The value of a large magnitude's text `:eee digits`, as `0.<digits> x 10^(eee + 1)`. */
+const splitLarge = (text: string): { readonly digits: string; readonly point: number } => ({
+  digits: text.slice(4),
+  point: Number(text.slice(1, 4)) + 1,
+})
+
+/**
+ * The `number` {@link encodeNumber} composed `text` from, for `rekey`, which reads a value back out
+ * of a row holding only its key. `NaN` when `text` is no such text; a caller checks by composing
+ * the value again.
+ */
+export const decodeNumber = (text: string): number => {
+  if (text === POSITIVE_INFINITY) return Number.POSITIVE_INFINITY
+  if (text === NEGATIVE_INFINITY) return Number.NEGATIVE_INFINITY
+  const magnitudeText = magnitudeOf(text)
+  if (magnitudeText === undefined || magnitudeText === "") return Number.NaN
+  const large = magnitudeText.startsWith(":") ? splitLarge(magnitudeText) : undefined
+  const value =
+    large === undefined ? Number(magnitudeText) : Number(`0.${large.digits}e${large.point}`)
+  return text.startsWith("-") ? -value : value
+}
+
+/** The `bigint` {@link encodeBigInt} composed `text` from; `undefined` when it is no such text. */
+export const decodeBigInt = (text: string): bigint | undefined => {
+  const magnitudeText = magnitudeOf(text)
+  if (magnitudeText === undefined || magnitudeText === "") return undefined
+  const large = magnitudeText.startsWith(":") ? splitLarge(magnitudeText) : undefined
+  try {
+    const value = BigInt(
+      large === undefined ? magnitudeText : large.digits.padEnd(large.point, "0"),
+    )
+    return text.startsWith("-") ? -value : value
+  } catch {
+    return undefined
+  }
+}
+
 /** The key text of a `number`. Throws {@link KeyValueError} (`[EDD-9096]`) for `NaN`. */
 export const encodeNumber = (n: number): string => {
   if (Number.isNaN(n)) return refuse(n, "NaN", "NaN has no numeric order")

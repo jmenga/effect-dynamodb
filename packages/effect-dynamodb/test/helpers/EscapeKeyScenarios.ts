@@ -112,11 +112,8 @@ const escapedForm = (
   )
 }
 
-const writes = (h: Harness, casing: Casing, escapeKeys: boolean | undefined, values: Values) => {
-  const world = makeWorld(library, {
-    casing,
-    ...(escapeKeys === undefined ? {} : { escapeKeys }),
-  })
+const writes = (h: Harness, casing: Casing, escapeKeys: boolean, values: Values) => {
+  const world = makeWorld(library, { casing, escapeKeys })
   return h.on(world.MainTable, (rows) =>
     Effect.gen(function* () {
       yield* writeEveryKey(library, world, values) as Effect.Effect<void, unknown, any>
@@ -138,7 +135,7 @@ export const everyKeyScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casin
     name: `${casing}, on: a value with nothing to escape stores what 1.36.0 stored`,
     run: (h: Harness) =>
       Effect.gen(function* () {
-        expect(yield* writes(h, casing, undefined, PLAIN)).toEqual(stored(casing, "plain"))
+        expect(yield* writes(h, casing, true, PLAIN)).toEqual(stored(casing, "plain"))
       }),
   },
   {
@@ -147,7 +144,7 @@ export const everyKeyScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casin
       Effect.gen(function* () {
         const expected = escapedForm(stored(casing, "spelled"), casing)
         expect(expected).not.toEqual(stored(casing, "spelled"))
-        expect(yield* writes(h, casing, undefined, SPELLED)).toEqual(expected)
+        expect(yield* writes(h, casing, true, SPELLED)).toEqual(expected)
       }),
   },
 ])
@@ -203,16 +200,13 @@ const expectNothingMoved = (report: Table.RekeyReport) => {
 export const findsEveryKeyScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casing) =>
   (
     [
-      ["on", undefined],
+      ["on", true],
       ["off", false],
     ] as const
   ).map(([label, escapeKeys]) => ({
     name: `${casing}, ${label}: each key path finds what it wrote, and rekey leaves it`,
     run: (h: Harness) => {
-      const world = makeWorld(library, {
-        casing,
-        ...(escapeKeys === undefined ? {} : { escapeKeys }),
-      })
+      const world = makeWorld(library, { casing, escapeKeys })
       return h.on(world.MainTable, () =>
         Effect.gen(function* () {
           yield* writeEveryKey(library, world, SPELLED) as Effect.Effect<void, unknown, any>
@@ -225,18 +219,35 @@ export const findsEveryKeyScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((
   })),
 )
 
-/** Turning escaping on over rows stored with it off, which are the rows 1.36 stored. */
+/** Nothing of `SPELLED` is found by any key path, under the setting that didn't write it. */
+const findsNothing = (world: ReturnType<typeof makeWorld>) =>
+  Effect.gen(function* () {
+    const db: any = yield* world.client()
+    const v = SPELLED
+    const gone = yield* db.entities.Items.get({ tenant: v.a, n: 5, label: v.b, s: 7 })
+      .asEffect()
+      .pipe(Effect.flip)
+    expect((gone as any)._tag).toBe("ItemNotFound")
+    expect(yield* db.entities.Items.byRegion({ region: v.c, zone: v.d }).collect()).toEqual([])
+    expect(yield* world.Accounts.read({ tenant: v.a, n: 5 })).toHaveLength(0)
+    const route = yield* db.aggregates.Routes.get({ id: v.a }).pipe(Effect.flip)
+    expect((route as any)._tag).toBe("AggregateAssemblyError")
+  })
+
+/**
+ * Turning escaping on or off over stored rows: until `rekey` moves them no read finds a row whose
+ * text changed, and after it the stored bytes are what a fresh write under the setting stores.
+ */
 export const flipScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casing) => [
   {
-    name: `${casing}, off to on: each key path reads through the fallback, rekey moves all of it`,
+    name: `${casing}, off to on: nothing is found, rekey moves all of it`,
     run: (h: Harness) => {
       const off = makeWorld(library, { casing, escapeKeys: false })
-      const on = makeWorld(library, { casing })
-      const fallbackOff = makeWorld(library, { casing, legacyKeys: false })
+      const on = makeWorld(library, { casing, escapeKeys: true })
       return h.on(off.MainTable, (rows, as) =>
         Effect.gen(function* () {
           yield* writeEveryKey(library, off, SPELLED) as Effect.Effect<void, unknown, any>
-          yield* as(on.MainTable, readsEveryKey(on, SPELLED))
+          yield* as(on.MainTable, findsNothing(on))
           const report = yield* as(on.MainTable, rekeyOf(on))
           expect(report.conflicts).toEqual([])
           expect(report.skipped.unrecognizedKey).toBe(0)
@@ -244,63 +255,63 @@ export const flipScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casing) =
           expect(keysOf(yield* rows())).toEqual(escapedForm(stored(casing, "spelled"), casing))
           yield* as(on.MainTable, readsEveryKey(on, SPELLED))
           expectNothingMoved(yield* as(on.MainTable, rekeyOf(on)))
-          yield* as(fallbackOff.MainTable, readsEveryKey(fallbackOff, SPELLED))
+          yield* as(on.MainTable, readsEveryKey(on, SPELLED))
         }),
       )
     },
   },
   {
-    name: `${casing}, on to off: a row with something escaped isn't found, one without is`,
+    name: `${casing}, on to off: rekey moves it all back, to what the published 1.36.0 stored`,
     run: (h: Harness) => {
-      const on = makeWorld(library, { casing })
+      const on = makeWorld(library, { casing, escapeKeys: true })
+      const off = makeWorld(library, { casing, escapeKeys: false })
+      return h.on(on.MainTable, (rows, as) =>
+        Effect.gen(function* () {
+          yield* writeEveryKey(library, on, SPELLED) as Effect.Effect<void, unknown, any>
+          yield* as(off.MainTable, findsNothing(off))
+          const report = yield* as(off.MainTable, rekeyOf(off))
+          expect(report.conflicts).toEqual([])
+          expect(report.skipped.unrecognizedKey).toBe(0)
+          expect(keysOf(yield* rows())).toEqual(stored(casing, "spelled"))
+          yield* as(off.MainTable, readsEveryKey(off, SPELLED))
+          expectNothingMoved(yield* as(off.MainTable, rekeyOf(off)))
+          yield* as(off.MainTable, readsEveryKey(off, SPELLED))
+        }),
+      )
+    },
+  },
+  {
+    name: `${casing}, a value with nothing to escape: found under either setting, nothing moves`,
+    run: (h: Harness) => {
+      const on = makeWorld(library, { casing, escapeKeys: true })
       const off = makeWorld(library, { casing, escapeKeys: false })
       return h.on(on.MainTable, (_rows, as) =>
         Effect.gen(function* () {
-          yield* writeEveryKey(library, on, SPELLED) as Effect.Effect<void, unknown, any>
           yield* writeEveryKey(library, on, PLAIN) as Effect.Effect<void, unknown, any>
-          yield* as(
-            off.MainTable,
-            Effect.gen(function* () {
-              const db: any = yield* off.client()
-              const key = { n: 5, s: 7 }
-              const gone = yield* db.entities.Items.get({
-                ...key,
-                tenant: SPELLED.a,
-                label: SPELLED.b,
-              })
-                .asEffect()
-                .pipe(Effect.flip)
-              expect((gone as any)._tag).toBe("ItemNotFound")
-              expect(
-                yield* db.entities.Items.get({
-                  ...key,
-                  tenant: PLAIN.a,
-                  label: PLAIN.b,
-                }).asEffect(),
-              ).toMatchObject({ zone: PLAIN.d })
-              expect(yield* off.Accounts.read({ tenant: SPELLED.a, n: 5 })).toHaveLength(0)
-              expect(yield* off.Accounts.read({ tenant: PLAIN.a, n: 5 })).toHaveLength(1)
-            }),
-          )
+          yield* as(off.MainTable, readsEveryKey(off, PLAIN))
+          expectNothingMoved(yield* as(off.MainTable, rekeyOf(off)))
+          expectNothingMoved(yield* as(on.MainTable, rekeyOf(on)))
+          yield* as(on.MainTable, readsEveryKey(on, PLAIN))
         }),
       )
     },
   },
 ])
 
-/** A unique sentinel 1.36 stored, on an item whose primary key text didn't change. */
+/** A unique sentinel at the other setting's text, on an item whose primary key text didn't change. */
 export const sentinelScenarios: ReadonlyArray<Scenario> = (() => {
   const setup = (
     h: Harness,
-    body: (on: ReturnType<typeof makeWorld>) => Effect.Effect<void, unknown, any>,
+    from: boolean,
+    body: (now: ReturnType<typeof makeWorld>) => Effect.Effect<void, unknown, any>,
   ) => {
-    const off = makeWorld(library, { casing: "lowercase", escapeKeys: false })
-    const on = makeWorld(library, { casing: "lowercase" })
-    return h.on(off.MainTable, (_rows, as) =>
+    const before = makeWorld(library, { casing: "lowercase", escapeKeys: from })
+    const now = makeWorld(library, { casing: "lowercase", escapeKeys: !from })
+    return h.on(before.MainTable, (_rows, as) =>
       Effect.gen(function* () {
-        const db: any = yield* off.client()
+        const db: any = yield* before.client()
         yield* db.entities.Users.put({ id: "plain", email: "e f" }).asEffect()
-        yield* as(on.MainTable, body(on))
+        yield* as(now.MainTable, body(now))
       }),
     )
   }
@@ -311,55 +322,75 @@ export const sentinelScenarios: ReadonlyArray<Scenario> = (() => {
         Effect.flip,
         Effect.map((error: any) => error._tag),
       )
-  return [
-    {
-      name: "a sentinel under its old text still refuses a duplicate",
-      run: (h: Harness) =>
-        setup(h, (on) =>
-          Effect.gen(function* () {
-            const db: any = yield* on.client()
-            expect(yield* claim(db, "e f")).toBe("UniqueConstraintViolation")
-          }),
-        ),
-    },
-    {
-      name: "changing the value releases the old text",
-      run: (h: Harness) =>
-        setup(h, (on) =>
-          Effect.gen(function* () {
-            const db: any = yield* on.client()
-            yield* db.entities.Users.update({ id: "plain" }).set({ email: "g h" }).asEffect()
-            yield* db.entities.Users.put({ id: "other", email: "e f" }).asEffect()
-            expect(yield* claim(db, "g h")).toBe("UniqueConstraintViolation")
-          }),
-        ),
-    },
-    {
-      name: "rekey moves it, leaving the item where it is, and it keeps refusing",
-      run: (h: Harness) =>
-        setup(h, (on) =>
-          Effect.gen(function* () {
-            const db: any = yield* on.client()
-            const report = yield* rekeyOf(on)
-            expect(report.moved.item).toBe(0)
-            expect(report.sentinelsMoved).toBe(1)
-            expect(yield* claim(db, "e f")).toBe("UniqueConstraintViolation")
-            expectNothingMoved(yield* rekeyOf(on))
-          }),
-        ),
-    },
-    {
-      name: "deleting the item releases the old text",
-      run: (h: Harness) =>
-        setup(h, (on) =>
-          Effect.gen(function* () {
-            const db: any = yield* on.client()
-            yield* db.entities.Users.purge({ id: "plain" })
-            yield* db.entities.Users.put({ id: "other", email: "e f" }).asEffect()
-          }),
-        ),
-    },
-  ]
+  return [true, false].flatMap((from) => {
+    const label = from ? "on to off" : "off to on"
+    return [
+      {
+        name: `${label}: until rekey it refuses nothing, and rekey reports the value taken twice`,
+        run: (h: Harness) =>
+          setup(h, from, (now) =>
+            Effect.gen(function* () {
+              const db: any = yield* now.client()
+              yield* db.entities.Users.put({ id: "other", email: "e f" }).asEffect()
+              const report = yield* rekeyOf(now)
+              expect(report.sentinelsMoved).toBe(0)
+              expect(report.conflicts.length).toBeGreaterThan(0)
+              const third = yield* db.entities.Users.put({ id: "third", email: "e f" })
+                .asEffect()
+                .pipe(Effect.flip)
+              expect((third as any)._tag).toBe("UniqueConstraintViolation")
+            }),
+          ),
+      },
+      {
+        name: `${label}: rekey moves it, leaving the item where it is, and it refuses`,
+        run: (h: Harness) =>
+          setup(h, from, (now) =>
+            Effect.gen(function* () {
+              const db: any = yield* now.client()
+              const dry = yield* (db.tables.MainTable.rekey({ dryRun: true }) as Effect.Effect<
+                Table.RekeyReport,
+                unknown,
+                any
+              >)
+              expect(dry.sentinelsMoved).toBe(1)
+              const report = yield* rekeyOf(now)
+              expect(report.moved.item).toBe(0)
+              expect(report.sentinelsMoved).toBe(1)
+              expect(yield* claim(db, "e f")).toBe("UniqueConstraintViolation")
+              expectNothingMoved(yield* rekeyOf(now))
+            }),
+          ),
+      },
+      {
+        name: `${label}: after rekey, changing the value releases it`,
+        run: (h: Harness) =>
+          setup(h, from, (now) =>
+            Effect.gen(function* () {
+              const db: any = yield* now.client()
+              yield* rekeyOf(now)
+              yield* db.entities.Users.update({ id: "plain" }).set({ email: "g h" }).asEffect()
+              yield* db.entities.Users.put({ id: "other", email: "e f" }).asEffect()
+              yield* db.entities.Users.delete({ id: "other" }).asEffect()
+              yield* db.entities.Users.put({ id: "next", email: "e f" }).asEffect()
+              expect(yield* claim(db, "g h")).toBe("UniqueConstraintViolation")
+            }),
+          ),
+      },
+      {
+        name: `${label}: after rekey, purging the item releases it`,
+        run: (h: Harness) =>
+          setup(h, from, (now) =>
+            Effect.gen(function* () {
+              const db: any = yield* now.client()
+              yield* rekeyOf(now)
+              yield* db.entities.Users.purge({ id: "plain" })
+              yield* db.entities.Users.put({ id: "other", email: "e f" }).asEffect()
+            }),
+          ),
+      },
+    ]
+  })
 })()
 
 // ---------------------------------------------------------------------------
@@ -567,9 +598,10 @@ const shapesFor = (world: Fleets, label: string): ReadonlyArray<Scenario> => {
           expect(storedRow(yield* rows()).gsi3sk).toBe(
             `$shapes#v1#fleet#country_${text(world, "5%")}`,
           )
+          // Off, a pin selects below the level, as in 1.36, so the row truncated at it isn't found.
           expect(
             deviceIds(yield* fleets.byPlace({ region: "r s", country: "5%" }).collect()),
-          ).toEqual([DEVICE])
+          ).toEqual(label === "on" ? [DEVICE] : [])
           expect(deviceIds(yield* fleets.byPlace({ region: "r s" }).collect())).toEqual([DEVICE])
         }),
     ),
@@ -819,13 +851,13 @@ export const cursorScenarios: ReadonlyArray<Scenario> = [
     }),
   ),
   {
-    name: "a cursor from before escaping went on resumes, in the rows under the old key",
+    name: "a cursor from before escaping went on finds no rows of another partition",
     run: (h) =>
       flipped(h, false, (page, resume) =>
         Effect.gen(function* () {
           const first: any = yield* page(byOwner)
           expect(idsOf(first.items)).toEqual(["1", "2"])
-          expect(idsOf(yield* resume(byOwner, first.cursor.value))).toEqual(["3", "4", "5"])
+          yield* expectNoRows(resume(byOwner, first.cursor.value))
         }),
       ),
   },
@@ -840,30 +872,32 @@ export const cursorScenarios: ReadonlyArray<Scenario> = [
         }),
       ),
   },
-  {
-    name: "a range bound reads nothing of a partition whose text changed until rekey moves it",
-    run: (h) => {
-      const off = tracksOf(false)
-      const on = tracksOf(true)
-      return h.on(off.MainTable, (_rows, as) =>
-        Effect.gen(function* () {
-          const before: any = yield* off.client
-          yield* writeTracks(before, "a b")
-          yield* as(
-            on.MainTable,
-            Effect.gen(function* () {
-              const db: any = yield* on.client
-              expect(yield* fromTwo(db).collect()).toEqual([])
-              // A query with no bound reads both keys.
-              expect(idsOf(yield* byOwner(db).collect())).toEqual(TRACKS)
-              yield* db.tables.MainTable.rekey()
-              expect(idsOf(yield* fromTwo(db).collect())).toEqual(["2", "3", "4", "5"])
-            }),
-          )
-        }),
-      ) as never
-    },
-  },
+  ...[true, false].map(
+    (from): Scenario => ({
+      name: `a query reads nothing of a partition whose text changed until rekey moves it, from ${from ? "on" : "off"}`,
+      run: (h) => {
+        const before = tracksOf(from)
+        const now = tracksOf(!from)
+        return h.on(before.MainTable, (_rows, as) =>
+          Effect.gen(function* () {
+            const writer: any = yield* before.client
+            yield* writeTracks(writer, "a b")
+            yield* as(
+              now.MainTable,
+              Effect.gen(function* () {
+                const db: any = yield* now.client
+                expect(yield* fromTwo(db).collect()).toEqual([])
+                expect(yield* byOwner(db).collect()).toEqual([])
+                yield* db.tables.MainTable.rekey()
+                expect(idsOf(yield* fromTwo(db).collect())).toEqual(["2", "3", "4", "5"])
+                expect(idsOf(yield* byOwner(db).collect())).toEqual(TRACKS)
+              }),
+            )
+          }),
+        ) as never
+      },
+    }),
+  ),
   {
     name: "a cursor from under escaping finds no rows of another partition once it is off",
     run: (h) =>

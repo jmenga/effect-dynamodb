@@ -565,7 +565,9 @@ export const validateAndBuildPutItem = (
       for (const def of Object.values(entity.unique ?? {})) {
         for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
           const value = (encoded as Record<string, unknown>)[field]
-          if (value !== undefined && value !== null) KeyComposer.serializeValue(value)
+          if (value !== undefined && value !== null) {
+            KeyComposer.compositeText(entity._schema, value)
+          }
         }
       }
     })

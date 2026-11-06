@@ -5268,8 +5268,8 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
         // SK SET to truncated leading prefix.
         expect(item.gsi1sk as string).toBe("$ip-test#v1#hierasset#country_us#city_sf")
 
-        // Found from each level above it, and from its own: a pin on `city` is the row
-        // at that level and its subtree.
+        // Found from each level above it, and with escapeKeys from its own: a pin on `city`
+        // is the row at that level and its subtree. Off, it reads `city_sf#`, as 1.36 did.
         const atRegion = yield* db.entities.HierAssets.byLocation({
           region: "americas",
         }).collect()
@@ -5279,7 +5279,7 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
           country: "us",
           city: "sf",
         }).collect()
-        expect(atCity.some((a) => a.assetId === "rack-9")).toBe(true)
+        expect(atCity.some((a) => a.assetId === "rack-9")).toBe(AppSchema.escapeKeys === true)
       }).pipe(provideHier),
   )
 
@@ -5646,7 +5646,9 @@ describeConnected("Empty-composite-half GSI shape (closes #46)", () => {
         })
         expect(raw.Item).toBeDefined()
         expect(raw.Item!.gsi3pk?.S).toBe(
-          "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud%23dev-46-1",
+          vehicleSchema.escapeKeys === true
+            ? "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud%23dev-46-1"
+            : "$vehicle-empty#v1#vehiclebydevice#devicebinding_cloud#dev-46-1",
         )
         // The empty-composite half — gsi3sk MUST be the constant entity prefix.
         expect(raw.Item!.gsi3sk?.S).toBe("$vehicle-empty#v1#vehiclebydevice")

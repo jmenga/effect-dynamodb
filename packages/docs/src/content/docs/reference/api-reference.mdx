@@ -144,7 +144,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Export | Type | Description |
 |--------|------|-------------|
-| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, `escapeKeys: false` to turn off string escaping in every key ([Key text](/effect-dynamodb/guides/indexes/#turning-key-escaping-off)), and `legacyKeys: false` to turn off the 1.36 key fallback once `rekey` has moved every row ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136), [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
+| `make` | `(config) => DynamoSchema` | Create a schema with name, version, optional casing, and `escapeKeys: true` to escape strings in every key and give numbers numeric key text. It's off by default for all of 1.x, which composes the key text 1.36 did ([Key text](/effect-dynamodb/guides/indexes/#key-text), [its limitations](/effect-dynamodb/guides/indexes/#limitations-with-escapekeys-off), [Upgrading](/effect-dynamodb/guides/upgrading/)) |
 | `prefix` | `(schema) => string` | Build schema prefix: `$name#vN` |
 | `applyCasing` | `(value, casing) => string` | Apply a casing to a key part — labels and composite values alike |
 | `composeKey` | `(schema, entityType, composites) => string` | Compose entity key: `$schema#vN#entity_type#composites` |
@@ -161,7 +161,7 @@ import { DynamoSchema } from "effect-dynamodb"
 
 | Type | Description |
 |------|-------------|
-| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, escapeKeys?: false, legacyKeys?: false }` |
+| `DynamoSchema` | Interface: `{ name: string, version: number, casing: Casing, escapeKeys?: boolean }` |
 | `Casing` | `"lowercase" \| "uppercase" \| "preserve"` |
 
 ### Usage
@@ -215,7 +215,7 @@ The typed client's `db.tables.<Table>` binds the table's operations:
 | `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
 | `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
 | `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
-| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row 1.36 wrote whose key text changed to its current key: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, so a concurrent write wins, and conflicts are reported and left; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading from 1.36](/effect-dynamodb/guides/upgrading/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row under key text the schema's `escapeKeys` setting doesn't compose (1.36's, 1.37.0's, or the other setting's) to the text it does, in either direction: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, nothing is overwritten or merged, and conflicts are reported and left; a row it can't place is counted in `skipped.unrecognizedKey`; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 
@@ -568,7 +568,7 @@ Combinators are immutable — each call returns a new `BoundQuery`. Terminals ex
 
 | Method | Description |
 |--------|-------------|
-| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. Bounds compare composite values: sort key text is escaped, so key order is value order and each bound is one exact key condition (see [Sort Key Conditions](/effect-dynamodb/guides/queries/#sort-key-conditions)). |
+| `.where((t, ops) => …)` | Type-safe sort key condition on remaining SK composites. Only available when SK composites have not all been consumed. Consumes `SkRemaining` (cannot be called twice). Operators: `eq`, `lt`, `lte`, `gt`, `gte`, `between`, `beginsWith`. With `escapeKeys: true`, bounds compare composite values: sort key text is escaped, so key order is value order and each bound is one exact key condition. With it off (the default), bounds compare key text, with [these limitations](/effect-dynamodb/guides/indexes/#limitations-with-escapekeys-off) (see [Sort Key Conditions](/effect-dynamodb/guides/queries/#sort-key-conditions)). |
 | `.filter((t, ops) => …)` | Post-read filter expression via callback. Type-safe attribute paths via `t`, condition operators via `ops`. An empty filter (`and()`) is no filter. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before sending. An `isIn` with no values is sent, and DynamoDB's rejection is a `ValidationError` (`operation: "query.filter"`) naming it. |
 | `.filter(shorthand)` | Post-read filter via an equality shorthand object: `{ status: "active" }` ANDs `status = "active"` for each key. For other comparisons use the callback form. |
 | `.select((t) => […paths])` | Projection expression via callback. Returns `BoundQuery<…, Record<string, unknown>>`. |
@@ -1047,17 +1047,24 @@ import { KeyComposer } from "effect-dynamodb"
 | `composeAllKeys` | `(schema, entity, indexes, record) => Record` | Compose keys for all indexes |
 | `composeGsiKeysForUpdatePolicyAware` | `(schema, entity, indexes, updates, keyRecord, { removedSet? }) => { sets, removes }` | Policy-aware GSI key composition for update/append. Implements v3 per-half structural composition + policy-aware hole detection (see `indexPolicy` guide). |
 | `composeSortKeyPrefix` | `(schema, entity, index, composites) => string` | The composed SK up to the last composite supplied, with no trailing delimiter |
-| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith } \| { between }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied; else, on a secondary index, `subtreeCondition(prefix)`, and on the primary key `{ beginsWith: prefix + "#" }`. A value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
+| `composeSortKeyCondition` | `(schema, entityType, entityVersion, index, composites) => { eq } \| { beginsWith } \| { between }` | The accessor's sort key condition: `{ eq: key }` when every SK composite is supplied; else, on a secondary index, `pinCondition(schema, prefix)`, and on the primary key `{ beginsWith: prefix + "#" }`. A value never matches a longer sibling (`3` never `3.5`, `alice` never `alicex`) |
+| `pinCondition` | `(schema, prefix) => { between } \| { beginsWith }` | A pin on a composite of a secondary index: `subtreeCondition(prefix)` with `escapeKeys: true`, and `{ beginsWith: prefix + "#" }` with it off |
 | `subtreeCondition` | `(prefix) => { between: [prefix, prefix + "#\uFFFF"] }` | A composite value's row and everything under it: the row truncated at that level and its subtree, and no longer sibling |
 | `subtreePrefix` | `(condition) => string \| undefined` | The prefix a `subtreeCondition` selects; `undefined` for any other condition |
 | `SORT_KEY_MAX` | `"\uFFFF"` | The character above any composed key text, used as a range's upper end |
 | `tryComposeStructuralKeys` | `(schema, entityType, entityVersion, index, record) => { pk, sk } \| undefined` | The keys an update's structural rule composes from `record`, truncated at the last present composite; `undefined` when a hole or an absent leading composite leaves nothing to compose |
 | `extractComposites` | `(keyPart, record) => string[]` | Extract composite attribute values from a record |
 | `tryExtractComposites` | `(keyPart, record) => string[] \| undefined` | Non-throwing variant |
-| `serializeValue` | `(value) => string` | Serialize a value for key composition. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
+| `serializeValue` | `(value) => string` | A value's text with `escapeKeys: true`. Numbers and bigints become text that sorts in numeric order ([Numeric composites](/effect-dynamodb/guides/indexes/#numeric-composites)); throws `EDD-9096` for `NaN` and for a bigint of more than 1,000 digits |
+| `serializeValue136` | `(value) => string` | A value's text with `escapeKeys` off, as up to 1.36: a number zero-padded to 16 characters, a bigint to 38. Never throws |
+| `compositeText` | `(schema, value) => string` | `serializeValue` or `serializeValue136`, by the schema's setting |
+| `extractKeyComposites` | `(schema, { casing? }, keyPart, record) => string[]` | The composites' key text, by the schema's setting |
+| `unescapeKeyText` | `(text) => string` | The inverse of `escapeKeyText`'s escapes |
 | `escapeKeyText` | `(text, casing) => string` | A composite's text escaped: cased, then each code point U+0000–U+0025 as `%` and two hex digits ([Key text](/effect-dynamodb/guides/indexes/#key-text)) |
-| `keyText` | `(schema, text, casing) => string` | `escapeKeyText`, or the cased text under `escapeKeys: false` |
-| `keyValueText` | `(schema, value, casing) => string` | `serializeValue`, then `keyText` |
+| `keyText` | `(schema, text, casing) => string` | `escapeKeyText` with `escapeKeys: true`, or the cased text with it off |
+| `sortKeyText` | `(text, casing) => string` | Deprecated name of `escapeKeyText` |
+| `serializeSortKeyValue` | `(value, casing) => string` | Deprecated: `serializeValue`, then `escapeKeyText` |
+| `keyValueText` | `(schema, value, casing) => string` | `compositeText`, then `keyText` |
 | `effectiveCasing` | `(schema, index) => Casing` | The casing an index composes with: its own `casing`, else the schema's |
 | `assertCollectionCasingAgreement` | `(collectionName, members) => void` | Throw `EDD-9055` when a collection's members would compose its keys with different casings |
 
@@ -1361,7 +1368,7 @@ Read models folded from DynamoDB Streams in version order, gap-filled from the e
 | `EventStore.processBatch(records, { projections, streams?, ...options })` | One feed, several projections: each record decoded once (bound projections under their own context) and routed to every projection of its stream (others skipped); `outcomes` per projection name, `positions` indexing `records`; one response across all. `streams` names streams whose events come back in `unrouted` (`{ position, stream, event }`), whether or not a projection also reads them. A marker shared by two streams dies with `[EDD-9082]` |
 | `EventStore.bindProjection(projection)` | Resolve the client, both tables, `evolve`'s requirements and the `Compression` registry; every operation then has `R = never`. Checks the stream's codecs as `bind` does (`[EDD-9078]`) |
 | `projection` options `revision`, `removal`, `outbox` | `revision`: a numeric model field the library owns, set one higher by every write and conditioned on (`attribute_not_exists` when absent); may be an existing write counter; required by `outbox`. `removal: { ttl? }`: `evolve` may return `EventStore.removeRow`, and the row becomes a tombstone at its own key (`__edd_e__` `<entityType>#tombstone`) keeping the checkpoint and revision, absent to every entity read by key (the read model's `create` may replace it, carrying its checkpoints over). `outbox: { schema, effects(event, next, context), table?, keys?, index?, claimFor? }`: effects written as outbox items (`<entityType>#outbox`) in the same `TransactWriteItems` as the row. `removal` / `outbox` on a read model with `unique` constraints, and `outbox` without `revision`, throw `[EDD-9081]` — see [Multi-source Projections, Tombstones and the Outbox](/effect-dynamodb/guides/projections-advanced/) |
-| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. Through 1.37.x both deliver a row's effects under its current key and under its 1.36 key in one order ([Migrating rows written by 1.36](/effect-dynamodb/guides/indexes/#migrating-rows-written-by-136)). `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
+| `projection.drain(key, deliver)` / `drainPending(deliver)` | Deliver a row's outbox effects strictly in order — claim the head item, `deliver(effect, meta)`, delete it, repeat — at least once (`claimFor`). `{ delivered, undelivered }`; a `deliver` failure leaves the effect at the head. `drainPending` sweeps every row with pending effects through `outbox.index`. `deliver` on `applyBatch` / `processBatch` drains each row right after its write (`undelivered` per outcome) |
 | `EventStore.multiProjection({ readModel, initial, sources: (source) => ({ name: source(stream, { key, evolve, mode?, terminal? }) }), checkpoints: { field?, sources? }, revision, toItem?, retry?, removal?, outbox?, sourcesOf? })` | A read model fed by several streams: a checkpoint per source instance (`checkpoints.field`, a `Record<string, number>` keyed `<source>#<streamId>`; or per-source `{ field, offset?, instanceField }` for legacy rows — another instance goes to the map, or fails with `ProjectionSourceConflict`), each write guarded by `revision`. Every checkpoint, instance, map and revision field may be optional in the model: absent reads as none, and an empty map is not written. `mode: "fold"` (gap-filled) or `"latest"` (newest event per instance, falling back newest-first past `terminal` rejections; older ones `superseded`). An instance whose `evolve` fails (not `terminal`) is left out of the write and reported as its own `Failed` outcome; the row's other instances apply. `revision: { field, initial }` sets a new row's first value. `applyBatch` takes decoder-style `{ stream: <source>, event }` events; `catchUp(rowKey)`; `rebuild(rowKey, { instances })` (or `sourcesOf`); `processBatch`; `drain` / `drainPending`. `bindProjection` and `EventStore.processBatch` accept it next to single-source projections |
 | `EventStore.removeRow` | Returned by `evolve` to remove the row (with `removal`) |
 | `EventStore.skipEvent` | Returned by `evolve` to skip the event: reported in `skipped` (never `applied`), no outbox effects, and no write when the row's events are all skipped or already applied. The instance's checkpoint stops at its last applied or rejected event, so a skipped event above it is decided again later. In `"latest"` mode a skip falls back to the next older event |
@@ -1548,7 +1555,7 @@ import {
   ItemNotFound, ConditionalCheckFailed,
   ValidationError, TransactionCancelled, TransactionOverflow,
   UniqueConstraintViolation, OptimisticLockError,
-  ItemDeleted, ItemNotDeleted, ItemNotMoved, StaleAppend,
+  ItemDeleted, ItemNotDeleted, StaleAppend,
   ConcurrentModification, UpdateAppliedButUnreadable, DeleteAppliedButUnreadable,
   CompositeKeyHoleError, CompositeNullableError,
   RefNotFound, AggregateAssemblyError,
@@ -1581,8 +1588,7 @@ import {
 | `UpdateAppliedButUnreadable` | `"UpdateAppliedButUnreadable"` | A retain update WAS applied at `version`, but another write replaced the item before it could be read back, and no snapshot proves what this update wrote. Don't retry a non-idempotent update on this error; read the item instead (`entityType`, `key`, `version`, `reason`) |
 | `StaleAppend` | `"StaleAppend"` | A time-series `append` lost to a newer one: the current item's `orderByField` is already at or past `attemptedOrderBy`. Expected under newer-wins concurrency; `current` holds the winning item (`Option.none()` after `.skipFollowUp()`, where a failed `.condition()` also raises it) |
 | `ItemDeleted` | `"ItemDeleted"` | Item is soft-deleted (get returns this instead of the item) |
-| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted, or still lives under its 1.36 key) |
-| `ItemNotMoved` | `"ItemNotMoved"` | EDD-9097 — a `Transaction.transactWrite` (or `EventStore` `additionalItems`) op whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row, which a transaction can't move (`entityType`, `key`, `operation`: the item to write first). Nothing was written: write that item once through the entity, or run [`rekey`](/effect-dynamodb/guides/upgrading/), then run the transaction again |
+| `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
@@ -1618,9 +1624,9 @@ Each operation declares a fixed error union, whatever the entity's configuration
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `purge` | `ValidationError` |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound`, `ItemNotMoved` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ItemNotMoved` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors) | `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 
 ### Usage
 

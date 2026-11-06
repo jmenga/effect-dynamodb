@@ -58,9 +58,9 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 // Model
 // ---------------------------------------------------------------------------
 
-const AppSchema = DynamoSchema.make({ name: "sk-escape", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "sk-escape", version: 1, escapeKeys: true })
 /** The same places keyed in uppercase, in the same table under their own schema name. */
-const UpperSchema = DynamoSchema.make({ name: "sk-escape-upper", version: 1, casing: "uppercase" })
+const UpperSchema = DynamoSchema.make({ name: "sk-escape-upper", version: 1, casing: "uppercase", escapeKeys: true })
 const tableName = `sk-escape-${Date.now()}`
 
 class Place extends Schema.Class<Place>("Place")({

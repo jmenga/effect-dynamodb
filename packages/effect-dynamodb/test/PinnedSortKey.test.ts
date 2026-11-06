@@ -29,7 +29,7 @@ import * as Table from "../src/Table.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 import { makePartition, type Row } from "./helpers/PartitionMock.js"
 
-const AppSchema = DynamoSchema.make({ name: "pinned", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "pinned", version: 1, escapeKeys: true })
 
 // ---------------------------------------------------------------------------
 // Accessors given every sort key composite

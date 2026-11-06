@@ -1,18 +1,18 @@
 /**
- * @internal Rekey — move the rows 1.36 wrote whose key text changed to their
- * current keys (#171, DESIGN.md §7 "Rows written by 1.36", "rekey").
+ * @internal Rekey — move rows to the key text the schema's `escapeKeys` setting composes (#171,
+ * #183, DESIGN.md §7 "`rekey`"). It is the only migration of key text: no other operation looks
+ * at a key under other text.
  *
  * This module is the driver: a scan of the table — in parallel segments — that
  * hands each row to the member owning it (an entity, an aggregate or an event
  * stream, by `__edd_e__`), merges what each did into one report, and builds a
  * resume token from each segment's `LastEvaluatedKey`. The members move their
- * own rows with the code their 1.37 operations move them with (the
- * {@link RekeyHandler} that `Entity.make`, `Aggregate.make` and
+ * own rows (the {@link RekeyHandler} that `Entity.make`, `Aggregate.make` and
  * `EventStore.makeStream` attach), so a row `rekey` moves ends up exactly where
  * a write of it would have put it.
  *
- * A row is moved only when it is stored under the key 1.36 composed for its
- * values and that key differs from the one its values compose now; a row under
+ * A row is moved only when it is stored under the key its values compose under some other text
+ * (`KeyText136.forms`: up to 1.36 and `escapeKeys` off, 1.37.0, `escapeKeys: true`); a row under
  * its current key is left alone, and one under neither is reported
  * (`unrecognizedKey`). That makes a run idempotent: a rerun finds every moved
  * row current. Conflicts — a row under both keys, a current key another row
@@ -21,7 +21,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Option } from "effect"
+import { Deferred, Effect, Option } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
   RekeyConflict,
@@ -54,7 +54,22 @@ export interface RekeyRowContext {
    * for this run: `true` for the first row that claims it, `false` after.
    */
   readonly claim: (unit: string) => boolean
+  /**
+   * Do the work of a unit of rows that move together, once per run: the first caller runs it and
+   * gets its tally. A later caller waits for that run to finish and gets an empty one, so a move
+   * that needs another unit out of its way goes on once it is.
+   */
+  readonly once: <E, R>(
+    unit: string,
+    work: Effect.Effect<RekeyTally, E, R>,
+  ) => Effect.Effect<RekeyTally, E, R>
 }
+
+/**
+ * How many rows still to move a row's own move goes through first: one chain, `foo%20bar`'s row
+ * where `foo bar`'s belongs and so on. Past it the row is reported, and the next run goes on.
+ */
+export const DISPLACE_DEPTH = 4
 
 /** What a handler did with one scanned row (and the rows that moved with it). */
 export interface RekeyTally {
@@ -79,6 +94,12 @@ export interface RekeyMember {
     row: Item,
     ctx: RekeyRowContext,
   ) => Effect.Effect<RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig>
+  /** After the scan: rows it could judge only with everything scanned. */
+  readonly finish?:
+    | ((
+        ctx: RekeyRowContext,
+      ) => Effect.Effect<RekeyTally, DynamoClientError, DynamoClient | TableConfig>)
+    | undefined
 }
 
 const CLIENT_ERROR_TAGS: ReadonlySet<string> = new Set([
@@ -156,6 +177,7 @@ class Totals {
   indexKeysRewritten = 0
   sentinelsMoved = 0
   conflicts: Array<RekeyConflict> = []
+  private readonly conflicted = new Set<string>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
     notLibrary: 0,
     unregistered: 0,
@@ -193,8 +215,14 @@ class Totals {
     const sentinels = tally.sentinelsMoved ?? 0
     this.sentinelsMoved += sentinels
     if (into !== undefined) into.sentinelsMoved += sentinels
-    for (const conflict of tally.conflicts ?? []) this.conflicts.push(conflict)
-    if (into !== undefined) into.conflicts += tally.conflicts?.length ?? 0
+    for (const conflict of tally.conflicts ?? []) {
+      // A row that can't move is met again by what wants its key, and by the scan.
+      const row = `${conflict.member}\u0000${conflict.kind}\u0000${JSON.stringify(conflict.key)}`
+      if (this.conflicted.has(row)) continue
+      this.conflicted.add(row)
+      this.conflicts.push(conflict)
+      if (into !== undefined) into.conflicts += 1
+    }
     for (const reason of SKIP_REASONS) this.skipped[reason] += tally.skipped?.[reason] ?? 0
   }
 
@@ -334,6 +362,7 @@ export const run = (args: {
       )
 
       const claimed = new Set<string>()
+      const running = new Map<string, Deferred.Deferred<void>>()
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
@@ -342,6 +371,14 @@ export const run = (args: {
           claimed.add(unit)
           return true
         },
+        once: (unit, work) =>
+          Effect.suspend(() => {
+            const under = running.get(unit)
+            if (under !== undefined) return Effect.as(Deferred.await(under), {})
+            const done = Deferred.makeUnsafe<void>()
+            running.set(unit, done)
+            return Effect.ensuring(work, Deferred.succeed(done, undefined))
+          }),
       }
       const totals = new Totals()
 
@@ -399,6 +436,9 @@ export const run = (args: {
         scanSegment,
         { concurrency: "unbounded", discard: true },
       )
+      for (const member of members) {
+        if (member.finish !== undefined) totals.add(member.name, yield* member.finish(ctx))
+      }
       return snapshot()
     }),
   )

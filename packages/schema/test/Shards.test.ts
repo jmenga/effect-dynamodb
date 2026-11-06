@@ -555,20 +555,18 @@ describe("composeReadPartitions", () => {
   })
 
   it("`previous: 1` adds the unsharded partition", () => {
-    const { partitions, fanOut } = read(index(defaultSource(2, 1)), { tenantId: "t" })
+    const { partitions } = read(index(defaultSource(2, 1)), { tenantId: "t" })
     expect(partitions).toEqual([
       "$fleet-db#v1#devicestate#!2.0#tenantid_t",
       "$fleet-db#v1#devicestate#!2.1#tenantid_t",
       "$fleet-db#v1#devicestate#tenantid_t",
     ])
-    expect(fanOut?.unsharded).toBe("$fleet-db#v1#devicestate#tenantid_t")
   })
 
   it("`previous: m` adds m partitions: N + M, all distinct", () => {
-    const { partitions, fanOut } = read(index(defaultSource(4, 2)), { tenantId: "t" })
+    const { partitions } = read(index(defaultSource(4, 2)), { tenantId: "t" })
     expect(shardsOf(partitions)).toEqual(["!4.0", "!4.1", "!4.2", "!4.3", "!2.0", "!2.1"])
     expect(new Set(partitions).size).toBe(6)
-    expect(fanOut?.unsharded).toBeUndefined()
   })
 
   it("prunes the current layout, never `previous`", () => {

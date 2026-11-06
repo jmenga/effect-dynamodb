@@ -171,7 +171,7 @@ function buildQueryParams(
   // Mirrors `KeyComposer.composeSortKeyCondition`: a complete key is an exact
   // `=` — `begins_with` on it would also match longer values (`seq: 3`
   // matching 3.14) — and a partial prefix selects its subtree.
-  const pinned = isZOrderHalf(index.sk) ? 0 : availableSkSlots(index, args).length
+  const pinned = isZOrderHalf(index.sk) ? 0 : availableSkSlots(entity.schema, index, args).length
   const accessor =
     pinned > 0 && args
       ? accessorSkCondition(entity.schema, entity.entityType, index, args)
@@ -352,17 +352,24 @@ function schemaPrefix(schema: SchemaConfig): string {
   return `$${applyCasing(schema.name, schema.casing)}#v${schema.version}`
 }
 
-/** Mirrors `KeyComposer.serializeValue` for the values a source literal can hold. */
-function serializeValue(value: unknown): string {
+/**
+ * Mirrors `KeyComposer.compositeText` for the values a source literal can hold: numbers zero-padded
+ * as they have always been, or in numeric order with `escapeKeys: true`.
+ */
+function serializeValue(schema: SchemaConfig, value: unknown): string {
   if (typeof value === "string") return value
-  if (typeof value === "number") return encodeNumber(value)
-  if (typeof value === "bigint") return encodeBigInt(value)
+  if (typeof value === "number") {
+    return schema.escapeKeys === true ? encodeNumber(value) : String(value).padStart(16, "0")
+  }
+  if (typeof value === "bigint") {
+    return schema.escapeKeys === true ? encodeBigInt(value) : String(value).padStart(38, "0")
+  }
   if (typeof value === "boolean") return value ? "true" : "false"
   return String(value)
 }
 
-// Mirrors `@effect-dynamodb/schema/internal/NumericKey.ts`, which documents the
-// format: numeric key text that sorts in numeric order, keeping the zero-padded
+// With `escapeKeys: true`, mirrors `@effect-dynamodb/schema/internal/NumericKey.ts`, which documents
+// the format: numeric key text that sorts in numeric order, keeping the zero-padded
 // text of a non-negative integer below the pad width. A hover never throws, so
 // what the library refuses (`NaN`, a bigint past 1,000 digits) is shown as is.
 
@@ -470,12 +477,12 @@ function composeIsolatedSortKey(
 }
 
 /**
- * Mirrors `KeyComposer.keyText`: a key composite's text cased, then each code
- * point U+0000–U+0025 escaped as `%` and two hex digits (lower case under
- * `"lowercase"` casing), unless the schema has `escapeKeys: false`.
+ * Mirrors `KeyComposer.keyText`: a key composite's text cased and, with
+ * `escapeKeys: true`, each code point U+0000–U+0025 escaped as `%` and two hex
+ * digits (lower case under `"lowercase"` casing).
  */
 function keyText(schema: SchemaConfig, text: string, casing: Casing): string {
-  if (schema.escapeKeys === false) return applyCasing(text, casing)
+  if (schema.escapeKeys !== true) return applyCasing(text, casing)
   let escaped = ""
   for (const char of applyCasing(text, casing)) {
     const code = char.charCodeAt(0)
@@ -523,7 +530,7 @@ function composePkValue(
   record: Record<string, unknown> | undefined,
 ): string {
   const casing = index.casing ?? schema.casing
-  const slots = extractCompositeSlots(index.pk.composite, record).map((slot) =>
+  const slots = extractCompositeSlots(schema, index.pk.composite, record).map((slot) =>
     slot.placeholder ? slot : { ...slot, value: keyText(schema, slot.value, casing) },
   )
   const collection = index.collection
@@ -564,12 +571,13 @@ function composeSkValue(
     schema,
     entityType,
     index,
-    extractCompositeSlots(index.sk.composite, record),
+    extractCompositeSlots(schema, index.sk.composite, record),
   )
 }
 
 /** Leading SK composites present in `record`, stopping at the first missing one. */
 function availableSkSlots(
+  schema: SchemaConfig,
   index: IndexDefinition,
   record: Record<string, unknown> | undefined,
 ): ReadonlyArray<CompositeSlot> {
@@ -577,7 +585,7 @@ function availableSkSlots(
   for (const attr of index.sk.composite) {
     const value = record?.[attr]
     if (value === undefined || value === null) break
-    slots.push({ name: attr, value: serializeValue(value), placeholder: false })
+    slots.push({ name: attr, value: serializeValue(schema, value), placeholder: false })
   }
   return slots
 }
@@ -591,7 +599,7 @@ function composeSkPrefixValue(
 ): string {
   // A Z-order sort key has no text prefix.
   if (isZOrderHalf(index.sk)) return ""
-  return composeSkFromSlots(schema, entityType, index, availableSkSlots(index, record))
+  return composeSkFromSlots(schema, entityType, index, availableSkSlots(schema, index, record))
 }
 
 /**
@@ -607,7 +615,7 @@ function composeSkBeginsWithValue(
 ): string {
   // A Z-order sort key has no text prefix.
   if (isZOrderHalf(index.sk)) return ""
-  const slots = availableSkSlots(index, record)
+  const slots = availableSkSlots(schema, index, record)
   const prefix = composeSkFromSlots(schema, entityType, index, slots)
   return slots.length === index.sk.composite.length ? prefix : `${prefix}#`
 }
@@ -616,9 +624,9 @@ function composeSkBeginsWithValue(
  * The sort key condition an accessor sends for the composites it is given —
  * mirrors the library's accessor (`KeyComposer.composeSortKeyCondition`): none
  * when no composite is given (or the key is Z-order), `=` on the complete key
- * when every one is, on a leading prefix a `BETWEEN` of the prefix and all below
- * it on a secondary index, whose rows can be truncated there, and a terminated
- * `begins_with` on the primary index.
+ * when every one is, on a leading prefix a terminated `begins_with` — or, with
+ * `escapeKeys: true` on a secondary index, whose rows can be truncated there, a
+ * `BETWEEN` of the prefix and all below it.
  */
 function accessorSkCondition(
   schema: SchemaConfig,
@@ -640,7 +648,7 @@ function accessorSkCondition(
         name: index.sk.field,
         values: { ":sk": composeSkValue(schema, entityType, index, args) },
       }
-    : index.index === undefined
+    : index.index === undefined || schema.escapeKeys !== true
       ? {
           keyCondition: " AND begins_with(#sk, :skPrefix)",
           name: index.sk.field,
@@ -668,6 +676,7 @@ function composePrimaryKey(
 }
 
 function extractCompositeSlots(
+  schema: SchemaConfig,
   composite: ReadonlyArray<string>,
   record: Record<string, unknown> | undefined,
 ): ReadonlyArray<CompositeSlot> {
@@ -676,7 +685,7 @@ function extractCompositeSlots(
     if (value === undefined || value === null) {
       return { name: attr, value: `{${attr}}`, placeholder: true }
     }
-    return { name: attr, value: serializeValue(value), placeholder: false }
+    return { name: attr, value: serializeValue(schema, value), placeholder: false }
   })
 }
 

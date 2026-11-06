@@ -13,13 +13,8 @@ import type {
   QueryCommandOutput,
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
-import { KEY_DELIMITER } from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import {
-  type ReadFanOut,
-  type ReadPartitions,
-  subtreePrefix,
-} from "@effect-dynamodb/schema/KeyComposer.js"
+import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
@@ -42,12 +37,8 @@ import {
   fnv1a32,
   JUMP_INITIAL,
   JUMP_MAX_LIMIT,
-  type KeyPass,
-  type KeyPassesSpec,
   type KeyRange,
   keyConditionHolds,
-  keyPassChecks,
-  keyPassesPlanner,
   type PlannerFactory,
   type ProbeStep,
   type RangePlanner,
@@ -64,8 +55,6 @@ import { fromAttributeMap, toAttributeValue } from "./Marshaller.js"
 // ---------------------------------------------------------------------------
 // Sort key condition types
 // ---------------------------------------------------------------------------
-
-export type { KeyPass, KeyPassRows } from "./internal/RangePlanner.js"
 
 /**
  * Sort key condition for narrowing query results within a partition.
@@ -239,12 +228,6 @@ interface QueryState {
   readonly planner: PlannerFactory | undefined
   /** @internal The skip-scan probe budget `.within()` was given (default 32). */
   readonly maxSkips: number | undefined
-  /**
-   * @internal The key 1.36 composed for the query's pins, when its text
-   * differs from the query's own (#171, see {@link alsoRead136}): a terminal
-   * reads it as a second key pass.
-   */
-  readonly key136: KeyPass | undefined
   /** @internal `.zorder()` options, merged over each other (#171). */
   readonly zorderOptions: ZOrderOptions | undefined
   /** @internal Set by {@link prepared}: the resolved planner and the step the terminal starts at. */
@@ -291,10 +274,9 @@ interface QueryState {
   /**
    * Run once at the start of each terminal, against the resolved table: may
    * swap the sort key `begins_with` operand and add a row filter (`keep`)
-   * applied, like {@link liveRows}, to rows before they are decoded, or swap
-   * the partition key. An entity's `versions` uses it to read history written
-   * by an earlier release alongside its own (#133); an event stream, to read
-   * a stream still under its 1.36 key there (#171).
+   * applied, like {@link liveRows}, to rows before they are decoded. An entity's
+   * `versions` uses it to read history written by an earlier release alongside
+   * its own (#133).
    */
   readonly prepare: QueryPrepare | undefined
   /** @internal Set by {@link prepare}: rows outside it are dropped before decode. */
@@ -333,7 +315,6 @@ interface FanOutSpec extends ReadFanOut {
 interface FanOutPartition {
   readonly pkValue: string
   readonly condition: KeyCondition | undefined
-  readonly rowCheck: RowCheck | undefined
 }
 
 /** @internal A prepared fan-out: its partitions, and the merge resumed from a cursor. */
@@ -430,11 +411,6 @@ export type QueryPrepare = (tableName: string) => Effect.Effect<
     /** Replace a `begins_with` sort key condition on `from` with one on `to`. */
     readonly replaceBeginsWith?: { readonly from: string; readonly to: string } | undefined
     readonly keep?: ((row: Record<string, AttributeValue>) => boolean) | undefined
-    /**
-     * Read this partition instead: an event stream still under its 1.36 key
-     * is read there (#171).
-     */
-    readonly pkValue?: string | undefined
   },
   DynamoClientError,
   DynamoClient
@@ -559,7 +535,6 @@ export const make = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
-    key136: undefined,
     zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
@@ -627,7 +602,6 @@ export const makeScan = <A>(config: {
     cursorText: undefined,
     planner: undefined,
     maxSkips: undefined,
-    key136: undefined,
     zorderOptions: undefined,
     plan: undefined,
     rowCheck: undefined,
@@ -660,7 +634,6 @@ const withSortKeyCondition = <A>(state: QueryState, condition: SortKeyCondition)
   new QueryImpl<A>({
     ...state,
     skConditions: state.skField === undefined ? [] : [{ field: state.skField, condition }],
-    key136: undefined,
     keepRow: undefined,
   })
 
@@ -705,60 +678,6 @@ export const whereUnderPins = <A>(self: Query<A>, condition: SortKeyCondition): 
   if (!state.skField) return self
   return withSortKeyCondition(state, condition)
 }
-
-/** @internal Do two sort key conditions select the same keys, operand for operand? */
-const sameCondition = (a: KeyCondition | undefined, b: KeyCondition | undefined): boolean =>
-  JSON.stringify(a) === JSON.stringify(b)
-
-/**
- * @internal Also read the key 1.36 composed for this query's pins (#171,
- * DESIGN.md §7 "Rows written by 1.36"): its partition key and its `eq` /
- * `beginsWith` sort key condition (or none). A row 1.36 wrote whose key text
- * changed in 1.37 sits there until it is written again or `rekey` moves it.
- * A terminal reads both keys as two passes of one plan
- * (`RangePlanner.keyPassesPlanner`): the 1.36 key first, or last under
- * {@link reverse}. A key equal to the query's own adds nothing — unless its
- * rows are split by form (`KeyPass.rows.split`) — so a query whose key text
- * did not change sends exactly what it always sent. Such a query's subtree
- * (`KeyComposer.subtreeCondition`) can still hold a longer sibling in 1.36's
- * unescaped text (`new york` after `new`): it is left out by its key text, and
- * nothing more is read. Installed after the pins' {@link where}, which clears it.
- */
-export const alsoRead136 = <A>(self: Query<A>, key: KeyPass | undefined): Query<A> => {
-  const state = self._state
-  if (key === undefined || state.isScan) return self
-  // On a sharded index (#183) 1.36 text comes from the unsharded layout, by a
-  // migration from it (`previous: 1`). Leaving that takes a `rekey` that reports no
-  // conflicts, so no later layout holds it.
-  if (state.fanOut !== undefined && state.fanOut.unsharded === undefined) return self
-  const own = state.skConditions[0]?.condition
-  const same =
-    key.pkValue === (state.fanOut?.unsharded ?? state.pkValue) && sameCondition(key.condition, own)
-  if (same && key.rows?.split !== true) {
-    const prefix = own === undefined ? undefined : subtreePrefix(own)
-    const skField = state.skField
-    if (prefix === undefined || skField === undefined) return self
-    const below = `${prefix}${KEY_DELIMITER}`
-    return new QueryImpl<A>({
-      ...state,
-      keepRow: (row) => {
-        const text = row[skField]?.S
-        return text === undefined || text === prefix || text.startsWith(below)
-      },
-    })
-  }
-  return new QueryImpl<A>({ ...state, key136: key })
-}
-
-/**
- * @internal {@link alsoRead136} for a query whose 1.36 key differs in its
- * partition key alone (a collection, a partition's tombstones): the 1.36
- * partition under the query's own sort key condition.
- */
-export const alsoReadPartition136 = <A>(self: Query<A>, pkValue: string | undefined): Query<A> =>
-  pkValue === undefined
-    ? self
-    : alsoRead136(self, { pkValue, condition: self._state.skConditions[0]?.condition })
 
 /**
  * @internal Read a sharded index's partitions and merge them (#183): what
@@ -1908,14 +1827,6 @@ const prepared = (
       return resumed instanceof ValidationError ? Effect.fail(resumed) : Effect.succeed(resumed)
     })
   }
-  // A query that also reads its 1.36 key (#171) plans both passes from the
-  // prepared state: the prepare step may swap its own condition.
-  if (state.key136 !== undefined && state.planner === undefined) {
-    return Effect.flatMap(applyPrepare(state, tableName), (ready) => {
-      const resumed = resume(ready)
-      return resumed instanceof ValidationError ? Effect.fail(resumed) : Effect.succeed(resumed)
-    })
-  }
   const resumed = resume(state)
   if (resumed instanceof ValidationError) return Effect.fail(resumed)
   return applyPrepare(resumed, tableName)
@@ -1933,7 +1844,6 @@ const applyPrepare = (
         return {
           ...state,
           prepare: undefined,
-          pkValue: prep.pkValue ?? state.pkValue,
           keepRow: prep.keep,
           skConditions:
             swap === undefined
@@ -1944,22 +1854,6 @@ const applyPrepare = (
                     : c,
                 ),
         }
-      })
-
-/**
- * @internal The plan of a query that also reads its 1.36 key (#171): its own
- * key and the 1.36 key, as two passes. `undefined` without one.
- */
-const keyPasses = (state: QueryState): PlannerFactory | undefined =>
-  state.key136 === undefined || state.isScan
-    ? undefined
-    : keyPassesPlanner({
-        entityType: state.entityTypes.join(", ") || "unknown",
-        index: state.indexName ?? "primary",
-        pkField: state.pkField,
-        skField: state.skField,
-        current: { pkValue: state.pkValue, condition: state.skConditions[0]?.condition },
-        legacy: state.key136,
       })
 
 /** @internal The planner a `.within()` installed, resolved against the final state. */
@@ -1986,22 +1880,9 @@ const resume = (state: QueryState): QueryState | ValidationError => {
   if (cursor?.z !== undefined) {
     return cursorRefusal(entityType, "it comes from a query of a sharded index, and this isn't one")
   }
-  const factory = state.planner ?? keyPasses(state)
+  const factory = state.planner
   if (factory === undefined) {
     if (cursor === undefined) return state
-    if (cursor.p !== undefined) {
-      // From the same query while it also read its 1.36 key (#171) — the
-      // fallback since turned off: a position under the current key resumes.
-      if (cursor.p === 1) {
-        return cursorRefusal(
-          entityType,
-          "it reads rows under their 1.36 key, and this query no longer does",
-        )
-      }
-      return cursor.k === undefined
-        ? state
-        : { ...state, exclusiveStartKey: Cursor.keyFromWire(cursor.k) }
-    }
     if (
       cursor.k === undefined ||
       cursor.f !== undefined ||
@@ -2031,7 +1912,6 @@ const plannedConditions = (state: QueryState, range: KeyRange): QueryState["skCo
 /** @internal The state one planned read is sent with: its range and its row check. */
 const readState = (state: QueryState, step: ReadStep): QueryState => ({
   ...state,
-  pkValue: step.pkValue ?? state.pkValue,
   skConditions: plannedConditions(state, step.range),
   rowCheck: step.rowCheck,
 })
@@ -3418,7 +3298,7 @@ export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, n
   Effect.sync(() => {
     const state = self._state
     if (state.fanOut !== undefined) return explainFanOut(state, state.fanOut)
-    const factory = state.planner ?? keyPasses(state)
+    const factory = state.planner
     if (factory === undefined) {
       const [lower, upper] = displayKeyCondition(state.skConditions[0]?.condition)
       return {
@@ -3483,52 +3363,10 @@ export const asParams = <A>(
 // Sharded indexes (#183, docs/designs/gsi-write-sharding.md §6)
 // ---------------------------------------------------------------------------
 
-/**
- * @internal The partitions a fan-out reads, in merge order: its layouts', and with
- * `previous: 1` and the fallback on, the 1.36 key too when its text differs.
- *
- * A write that moves a row out of the unsharded layout composes its partition key
- * and can leave its sort key: an update that names none of the sort key's composites
- * sends no read, and `rekey` leaves a key an index policy left. So under `previous: 1`
- * a shard holds 1.36 sort key text as well, and when the pins' text differs each one
- * is read under both conditions (design §9.3). The row checks return each row once,
- * from the pass its key belongs to, and say nothing of the merge: each pass is in
- * stored byte order, and the merge is on stored bytes.
- */
+/** @internal The partitions a fan-out reads, in merge order: its layouts'. */
 const fanOutPartitions = (state: QueryState, spec: FanOutSpec): ReadonlyArray<FanOutPartition> => {
-  const own = state.skConditions[0]?.condition
-  const legacy = state.key136
-  const unsharded = spec.unsharded
-  if (legacy === undefined || unsharded === undefined) {
-    return spec.partitions.map((pkValue) => ({ pkValue, condition: own, rowCheck: undefined }))
-  }
-  const passes: KeyPassesSpec = {
-    entityType: state.entityTypes.join(", ") || "unknown",
-    index: state.indexName ?? "primary",
-    pkField: state.pkField,
-    skField: state.skField,
-    current: { pkValue: unsharded, condition: own },
-    legacy,
-  }
-  const inLayout = keyPassChecks(passes)
-  const inShard = keyPassChecks({ ...passes, shard: true })
-  return [
-    ...spec.partitions.map((pkValue) => ({
-      pkValue,
-      condition: own,
-      rowCheck: pkValue === unsharded ? inLayout.current : inShard.current,
-    })),
-    ...(sameCondition(legacy.condition, own)
-      ? []
-      : spec.partitions
-          .filter((pkValue) => pkValue !== unsharded)
-          .map((pkValue) => ({
-            pkValue,
-            condition: legacy.condition,
-            rowCheck: inShard.legacy,
-          }))),
-    { pkValue: legacy.pkValue, condition: legacy.condition, rowCheck: inLayout.legacy },
-  ]
+  const condition = state.skConditions[0]?.condition
+  return spec.partitions.map((pkValue) => ({ pkValue, condition }))
 }
 
 /** @internal What a sharded query's cursor must have come from. */
@@ -3664,7 +3502,7 @@ const partitionState = (state: QueryState, partition: FanOutPartition): QuerySta
     partition.condition === undefined || state.skField === undefined
       ? []
       : [{ field: state.skField, condition: partition.condition }],
-  rowCheck: partition.rowCheck,
+  rowCheck: undefined,
 })
 
 /** @internal The `ExclusiveStartKey` a boundary resumes from. */
@@ -4024,9 +3862,9 @@ const explainFanOut = (state: QueryState, spec: FanOutSpec): QueryExplain => {
       spec.pruned && partitions.length === 1
         ? "every shard source attribute pinned: one shard"
         : `one key condition on each of ${partitions.length} partitions, merged`,
-    keyConditions: partitions.map(({ condition, rowCheck }) => {
+    keyConditions: partitions.map(({ condition }) => {
       const [lower, upper] = displayKeyCondition(condition)
-      return { lower, upper, exact: rowCheck === undefined }
+      return { lower, upper, exact: true }
     }),
     filter: undefined,
     rowChecks: [],

@@ -5,17 +5,14 @@
  * tests pin, including the paths the issue's list doesn't name.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { shardMarker, shardOf } from "@effect-dynamodb/schema/internal/Shards.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Schema } from "effect"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
-import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
@@ -460,63 +457,5 @@ describe("a missing source fails, and nothing is written", () => {
         expect(row.status?.S).toBe("off")
       }),
     )
-  })
-})
-
-describe("rows under 1.36 key text (finding 7)", () => {
-  class Meter extends Schema.Class<Meter>("Meter")({
-    site: Schema.String,
-    meterId: Schema.Number,
-    zone: Schema.optional(Schema.String),
-    label: Schema.optional(Schema.String),
-  }) {}
-  const Meters = Entity.make({
-    model: Meter,
-    entityType: "Meter",
-    primaryKey: {
-      pk: { field: "pk", composite: ["site"] },
-      sk: { field: "sk", composite: ["meterId"] },
-    },
-    indexes: {
-      byZone: {
-        name: "gsi1",
-        pk: { field: "gsi1pk", composite: ["zone"] },
-        sk: { field: "gsi1sk", composite: ["meterId"] },
-        shards: { count: 8, previous: 1 },
-      },
-    },
-  })
-  const MeterTable = Table.make({ schema, entities: { Meters } })
-  const meterClient = DynamoClient.make({ entities: { Meters }, tables: { MeterTable } })
-  const record = { site: "s", meterId: -7, zone: "z", label: "a" }
-  const layerFor = (table: Recording) =>
-    Layer.merge(table.layer, MeterTable.layer({ name: "meters" }))
-
-  /** A meter as 1.36 wrote it: unsharded, and its number in 1.36's text. */
-  const seed136 = (table: Recording) => {
-    const keys = KeyText136.composeAllKeys(schema, "Meter", 1, Meters.indexes, record)
-    table.items.set(`${keys.pk}|${keys.sk}`, {
-      ...toAttributeMap({ ...record, ...keys, __edd_e__: "Meter" }),
-    } as Record<string, AttributeValue>)
-    return keys
-  }
-
-  it("the 1.36 composer stays unsharded", () => {
-    const keys = KeyText136.composeAllKeys(schema, "Meter", 1, Meters.indexes, record)
-    expect(keys.gsi1pk).toBe("$fleet-db#v1#meter#zone_z")
-  })
-
-  it.effect("the move path lands a row sharded", () => {
-    const table = fresh()
-    seed136(table)
-    return Effect.gen(function* () {
-      const db = yield* meterClient
-      yield* db.entities.Meters.update({ site: "s", meterId: -7 }).set({ label: "b" })
-      const current = KeyComposer.composeAllKeys(schema, "Meter", 1, Meters.indexes, record)
-      const row = table.items.get(`${current.pk}|${current.sk}`)
-      expect(row).toBeDefined()
-      expect(row!.gsi1pk?.S).toBe(current.gsi1pk)
-      expect(row!.gsi1pk?.S).toMatch(/#!8\.\d#zone_z$/)
-    }).pipe(Effect.provide(layerFor(table)))
   })
 })

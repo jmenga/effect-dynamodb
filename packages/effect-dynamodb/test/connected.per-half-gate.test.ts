@@ -343,7 +343,7 @@ describeConnected("#183 the per-half gate", () => {
         ])
       }))
 
-    test("shape 3, hierarchical: `.remove` truncates, and the pin on the level finds it", (db) =>
+    test("shape 3, hierarchical: `.remove` truncates, and with escapeKeys the pin on the level finds it", (db) =>
       Effect.gen(function* () {
         const channel = nextChannel()
         const fleets = db.entities.Fleets
@@ -355,9 +355,10 @@ describeConnected("#183 the per-half gate", () => {
           .remove(["city"])
           .asEffect()
         expect(indexKeys(yield* storedOf("fleet", channel)).gsi3sk).toBe("$gate#v1#fleet#country_c")
-        expect(deviceIds(yield* fleets.byPlace({ region, country: "c" }).collect())).toEqual([
-          "d-1",
-        ])
+        // Off, a pin reads `country_c#`, as 1.36 did, which the truncated key isn't under.
+        expect(deviceIds(yield* fleets.byPlace({ region, country: "c" }).collect())).toEqual(
+          AppSchema.escapeKeys === true ? ["d-1"] : [],
+        )
         expect(deviceIds(yield* fleets.byPlace({ region }).collect())).toEqual(["d-1"])
       }))
 

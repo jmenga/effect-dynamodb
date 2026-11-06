@@ -61,7 +61,6 @@ import {
   AppendTooLarge,
   type ConcurrentModification,
   DuplicateCommand,
-  type ItemNotMoved,
   isAwsConditionalCheckFailed,
   isAwsTransactionCancelled,
   isAwsValidationError,
@@ -96,7 +95,7 @@ import type { DynamoClient, DynamoClientError, DynamoClientService } from "./Dyn
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
-import { type Expr, eq, or } from "./internal/Expr.js"
+import { type Expr, eq } from "./internal/Expr.js"
 import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
 import {
@@ -794,7 +793,6 @@ export type AppendError =
   | UniqueConstraintViolation
   | OptimisticLockError
   | ConcurrentModification
-  | ItemNotMoved
 
 // ---------------------------------------------------------------------------
 // Read options
@@ -1383,12 +1381,9 @@ const SEALED_ATTRIBUTE = "__edd_sealed__"
 const WRITE_TOKEN_ATTRIBUTE = "__edd_wt__"
 
 /**
- * @internal Set by `rekey` (#171) on the first event of a stream it moved
- * from its 1.36 partition key, once every row is copied to the current one:
- * the stream lives there from then on. `locateStream` reads it; an append
- * located at the 1.36 key checks it is absent (`AppendParts.locationCheck`),
- * so a writer that located the stream before the move fails with
- * `VersionConflict` instead of writing where nothing reads.
+ * @internal Set by `rekey` on the first event of a stream it moved, once every
+ * row is copied to its current partition key: what is left under the old key
+ * is then deleted, and a run stopped partway resumes from there.
  */
 const MOVED_ATTRIBUTE = "__edd_moved__"
 
@@ -1486,7 +1481,7 @@ const putItemReason = (cause: unknown): string | undefined => {
 
 /**
  * @internal What a cancelled append means for one stream, from the reasons of
- * its own items: `[0, guardCount)` the contiguity and location checks,
+ * its own items: `[0, guardCount)` the contiguity check,
  * `[guardCount, guardCount + eventCount)` the event puts, and the snapshot at
  * `snapshotIndex` (`-1`: none). `StreamSealed` when the contiguity check, the
  * first event put or the snapshot failed and returned a sealed item (#166);
@@ -1580,12 +1575,8 @@ const STREAM_INDEX_CONFIG_KEYS: ReadonlyArray<string> = [
  * stream index several streams (or stream ids) share (#149). The table's `pk`
  * is projected into every index, whatever its projection.
  */
-const streamPkFilter = (streamPk: string, streamPk136?: string): Expr => {
-  const pk = createPathBuilder<{ readonly pk: string }>().pk
-  // A stream still under its 1.36 key (#171) has its items there: either
-  // key, since a stream is never split across the two.
-  return streamPk136 === undefined ? eq(pk, streamPk) : or(eq(pk, streamPk), eq(pk, streamPk136))
-}
+const streamPkFilter = (streamPk: string): Expr =>
+  eq(createPathBuilder<{ readonly pk: string }>().pk, streamPk)
 
 /**
  * @internal Validate `makeStream({ indexes })` at definition time.
@@ -2470,8 +2461,7 @@ export interface EventStream<
  * @internal The `TransactWriteItems` request of an append, laid out for
  * positional cancellation mapping:
  *
- * - `[0, guardCount)` — the version-contiguity `ConditionCheck`, then the
- *   1.36 location check (`AppendParts.locationCheck`, #171): 0 to 2 items
+ * - `[0, guardCount)` — the version-contiguity `ConditionCheck`: 0 or 1 items
  * - `[guardCount, guardCount + eventCount)` — the event puts
  * - then the `additional` items (caller op order preserved)
  * - then, at `sentinelIndex`, the idempotency sentinel `Put`
@@ -2512,14 +2502,6 @@ interface AppendParts {
   readonly tableName: string
   readonly streamIdStr: string
   readonly contiguityCheck: TransactWriteItem | undefined
-  /**
-   * An append to a stream still under its 1.36 partition key (#171): that
-   * `rekey` has not moved it — its first event is not marked moved. Laid out
-   * right after the contiguity check, in the guard range: its failure is a
-   * `VersionConflict`. Folded into the contiguity check when that reads the
-   * first event too.
-   */
-  readonly locationCheck: TransactWriteItem | undefined
   readonly eventItems: ReadonlyArray<TransactWriteItem>
   readonly sentinelPut: TransactWriteItem | undefined
   readonly snapshotPut: TransactWriteItem | undefined
@@ -2892,87 +2874,16 @@ export const makeStream = <
     streamId: Record<string, unknown>,
   ): string => {
     // A stream's own casing, if it has one: its escapes' hex digits are in it too.
-    const composites = KeyComposer.extractComposites(compositeFields, streamId).map((text) =>
-      KeyComposer.keyText(under, text, config.casing ?? under.casing),
+    const composites = KeyComposer.extractKeyComposites(
+      under,
+      { casing: config.casing },
+      compositeFields,
+      streamId,
     )
     return DynamoSchema.composeKey(under, keyLabel, composites, keyOptions)
   }
   const composeStreamPk = (streamId: Record<string, unknown>): string =>
     composeStreamPkUnder(schema, streamId)
-
-  /**
-   * The partition key 1.36 composed for `streamId`, when the 1.36 key
-   * fallback is on and its text differs from {@link composeStreamPk}'s — a
-   * number stream id composite whose text changed (#171), or a value that
-   * escapes. `force` answers
-   * with the fallback off too: `rekey` moves streams whatever it is set to.
-   */
-  const composeStreamPk136 = (
-    streamId: Record<string, unknown>,
-    force = false,
-  ): string | undefined => {
-    if (!force && !KeyText136.enabled(schema)) return undefined
-    const composites = KeyText136.extractComposites(compositeFields, streamId)
-    const pk136 = DynamoSchema.composeKey(schema, keyLabel, composites, keyOptions)
-    return pk136 === composeStreamPk(streamId) ? undefined : pk136
-  }
-
-  /**
-   * The partition key a stream lives under (#171, DESIGN.md §7 "Rows written
-   * by 1.36"): its current key, unless that key's text changed since 1.36 and
-   * the stream's first event is under its 1.36 key. A stream 1.36 started is
-   * read and appended there — its events, snapshot, seal and command
-   * sentinels — until `rekey` moves it whole (and marks its first event
-   * there moved); a stream is never split across the two keys, and a new one
-   * starts under its current key. A stream whose key text did not change
-   * costs no request; one whose did, one consistent `GetItem` of the first
-   * event's key.
-   */
-  const locateStream = (
-    streamId: Record<string, unknown>,
-  ): Effect.Effect<string, DynamoClientError, DynamoClient | TableConfig> =>
-    composeStreamPk136(streamId) === undefined
-      ? Effect.succeed(composeStreamPk(streamId))
-      : Effect.gen(function* () {
-          const { name: tableName } = yield* config.table.Tag
-          return yield* locateStreamIn(tableName, streamId)
-        })
-
-  /** {@link locateStream} in the table named `tableName`. */
-  const locateStreamIn = (
-    tableName: string,
-    streamId: Record<string, unknown>,
-  ): Effect.Effect<string, DynamoClientError, DynamoClient> => {
-    const current = composeStreamPk(streamId)
-    const pk136 = composeStreamPk136(streamId)
-    if (pk136 === undefined) return Effect.succeed(current)
-    return Effect.gen(function* () {
-      const client = yield* Capacity.client
-      const first = yield* client.getItem({
-        TableName: tableName,
-        Key: toAttributeMap({ pk: pk136, sk: composeEventSk(1) }),
-        ConsistentRead: true,
-        ProjectionExpression: "#pk, #moved",
-        ExpressionAttributeNames: { "#pk": "pk", "#moved": MOVED_ATTRIBUTE },
-      })
-      return first.Item === undefined || first.Item[MOVED_ATTRIBUTE] !== undefined ? current : pk136
-    })
-  }
-
-  /**
-   * The `prepare` step of a query of the stream's partition: read it where
-   * the stream lives ({@link locateStream}). Only a stream whose key text
-   * changed has one.
-   */
-  const locatedPrepare = (
-    streamId: Record<string, unknown>,
-  ): { readonly prepare?: Query.QueryPrepare } =>
-    composeStreamPk136(streamId) === undefined
-      ? {}
-      : {
-          prepare: (tableName) =>
-            Effect.map(locateStreamIn(tableName, streamId), (pkValue) => ({ pkValue })),
-        }
 
   const composeEventSk = (version: number): string =>
     DynamoSchema.composeEventVersionKey(schema, eventKeyLabel, version, keyOptions)
@@ -3593,8 +3504,6 @@ export const makeStream = <
    */
   const buildSnapshotItem = (
     streamId: Record<string, unknown>,
-    /** The partition the stream lives under ({@link locateStream}). */
-    pk: string,
     state: unknown,
     asOfVersion: number,
     now: string,
@@ -3613,7 +3522,7 @@ export const makeStream = <
               operation: `${operation}.packed`,
             })
       const item: Record<string, unknown> = {
-        pk,
+        pk: composeStreamPk(streamId),
         sk: snapshotSk,
         __edd_e__: snapshotEntityType,
         streamId: composeStreamIdString(streamId),
@@ -3665,8 +3574,6 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options: AppendOptions<unknown, unknown> | undefined,
-    /** Where the stream lives ({@link locateStream}); its current key when not given. */
-    streamPk?: string | undefined,
   ): Effect.Effect<AppendParts | undefined, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems ?? []
@@ -3850,7 +3757,7 @@ export const makeStream = <
         })
       }
 
-      const pk = streamPk ?? composeStreamPk(streamId as Record<string, unknown>)
+      const pk = composeStreamPk(streamId as Record<string, unknown>)
       // Clock-backed timestamp (deterministic under TestClock; wall-clock in prod).
       const nowDateTime = yield* DateTime.now
       const now = DateTime.formatIso(nowDateTime)
@@ -4051,7 +3958,6 @@ export const makeStream = <
       if (snapshotState !== undefined) {
         const item = yield* buildSnapshotItem(
           streamId as Record<string, unknown>,
-          pk,
           snapshotState,
           expectedVersion + events.length,
           now,
@@ -4106,54 +4012,22 @@ export const makeStream = <
        * costs nothing; `ALL_OLD` returns the item on failure (response bytes
        * only), so a sealed one is reported as `StreamSealed`.
        */
-      // A stream still under its 1.36 key (#171) must not have been moved
-      // since it was located: `rekey` marks its first event once the stream
-      // is copied (`MOVED_ATTRIBUTE`). Checked on the first event — by the
-      // contiguity check when it reads that event — for an append that
-      // writes anything into the stream's partition: events onto the
-      // stream, or a command sentinel alone (a command that decided no
-      // events, recorded for exactly-once), which would otherwise land where
-      // nothing reads it. An append writing events from version 0 needs no
-      // check: its first Put fails on its own, the first event being there.
-      const located136 =
-        streamPk !== undefined &&
-        streamPk !== composeStreamPk(streamId as Record<string, unknown>) &&
-        (events.length > 0 ? expectedVersion > 0 : sentinelPut !== undefined)
-      const foldLocation = located136 && needsContiguityCheck && expectedVersion === 1
       const contiguityCheck: TransactWriteItem | undefined = needsContiguityCheck
         ? {
             ConditionCheck: {
               TableName: tableName,
               Key: toAttributeMap({ pk, sk: composeEventSk(expectedVersion) }),
-              ConditionExpression: foldLocation
-                ? "attribute_exists(#pk) AND attribute_not_exists(#sealed) AND attribute_not_exists(#moved)"
-                : "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
-              ExpressionAttributeNames: {
-                "#pk": "pk",
-                "#sealed": SEALED_ATTRIBUTE,
-                ...(foldLocation && { "#moved": MOVED_ATTRIBUTE }),
-              },
+              ConditionExpression: "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+              ExpressionAttributeNames: { "#pk": "pk", "#sealed": SEALED_ATTRIBUTE },
               ReturnValuesOnConditionCheckFailure: "ALL_OLD",
             },
           }
         : undefined
-      const locationCheck: TransactWriteItem | undefined =
-        located136 && !foldLocation
-          ? {
-              ConditionCheck: {
-                TableName: tableName,
-                Key: toAttributeMap({ pk, sk: composeEventSk(1) }),
-                ConditionExpression: "attribute_exists(#pk) AND attribute_not_exists(#moved)",
-                ExpressionAttributeNames: { "#pk": "pk", "#moved": MOVED_ATTRIBUTE },
-              },
-            }
-          : undefined
 
       const parts: AppendParts = {
         tableName,
         streamIdStr,
         contiguityCheck,
-        locationCheck,
         eventItems,
         sentinelPut,
         snapshotPut,
@@ -4190,26 +4064,16 @@ export const makeStream = <
         })
       }
 
-      // A stream 1.36 started is appended where it lives (#171).
-      const pk = yield* locateStream(streamId as Record<string, unknown>)
-      const parts = yield* buildAppend(streamId, events, expectedVersion, options, pk)
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
       if (parts === undefined) return { version: expectedVersion, events: [] }
-      const {
-        tableName,
-        streamIdStr,
-        contiguityCheck,
-        locationCheck,
-        eventItems,
-        sentinelPut,
-        snapshotPut,
-      } = parts
+      const { tableName, streamIdStr, contiguityCheck, eventItems, sentinelPut, snapshotPut } =
+        parts
 
       const client = yield* Capacity.client
 
       /**
        * Lay out the append's one transaction — see {@link AppendTransaction}:
-       *   [0, C)                version-contiguity ConditionCheck, then the
-       *                         1.36 location check (#171) — C is 0 to 2
+       *   [0, C)                version-contiguity ConditionCheck — C is 0 or 1
        *   [C, C + E)            event puts
        *   [C + E, C + E + A)    additional ITEMS (caller op order preserved)
        *   then                  idempotency sentinel, then inline snapshot
@@ -4232,9 +4096,6 @@ export const makeStream = <
         }
         if (contiguityCheck !== undefined) {
           pushStreamItem(contiguityCheck, entityType, "the version-contiguity check")
-        }
-        if (locationCheck !== undefined) {
-          pushStreamItem(locationCheck, entityType, "the check that rekey has not moved the stream")
         }
         const guardCount = items.length
         for (const [i, item] of eventItems.entries()) {
@@ -4369,7 +4230,6 @@ export const makeStream = <
         events,
         expectedVersion,
         options as AppendOptions<unknown, unknown> | undefined,
-        yield* locateStream(streamId as Record<string, unknown>),
       ))!
       const items: Array<TransactWriteItem> = []
       const sources: Array<[string, string]> = []
@@ -4377,10 +4237,6 @@ export const makeStream = <
       if (parts.contiguityCheck !== undefined) {
         items.push(parts.contiguityCheck)
         sources.push([entityType, `${label}: the version-contiguity check`])
-      }
-      if (parts.locationCheck !== undefined) {
-        items.push(parts.locationCheck)
-        sources.push([entityType, `${label}: the check that rekey has not moved the stream`])
       }
       const guardCount = items.length
       for (const [i, item] of parts.eventItems.entries()) {
@@ -4494,7 +4350,6 @@ export const makeStream = <
       const now = DateTime.formatIso(yield* DateTime.now)
       const item = yield* buildSnapshotItem(
         streamId as Record<string, unknown>,
-        composeStreamPk(streamId as Record<string, unknown>),
         state,
         asOfVersion,
         now,
@@ -4674,90 +4529,48 @@ export const makeStream = <
           entityType: snapshotEntityType,
         })
 
-      // A stream located under its 1.36 key (#171) that `rekey` moves after
-      // the locate is written at its current key on a second pass.
-      for (let pass = 0; pass < 2; pass++) {
-        const pk = yield* locateStream(streamId as Record<string, unknown>)
-        // Packed per `snapshot.storedAs` (#147): the diagnosis below measures
-        // the stored bytes.
-        const item = yield* buildSnapshotItem(
-          streamId as Record<string, unknown>,
-          pk,
-          state,
-          asOfVersion,
-          now,
-          "EventStore.writeSnapshot",
-        )
+      // Packed per `snapshot.storedAs` (#147): the diagnosis below measures
+      // the stored bytes.
+      const item = yield* buildSnapshotItem(
+        streamId as Record<string, unknown>,
+        state,
+        asOfVersion,
+        now,
+        "EventStore.writeSnapshot",
+      )
 
-        const put = {
-          TableName: tableName,
-          Item: item,
-          // Monotonic: never regress the cache. Losing this race is a no-op,
-          // not an error — the events it summarises are already durable.
-          ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
-          ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
-          ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
-        }
-        const target = (written: TransactWriteItem) => () =>
-          transactItemTarget(written, tableName, ["pk", "sk"], snapshotEntityType, "the snapshot")
-        if (pk === composeStreamPk(streamId as Record<string, unknown>)) {
-          return yield* client.putItem(put).pipe(
-            Effect.catchIf(
-              (error) => isAwsConditionalCheckFailed(error.cause),
-              () => Effect.void,
-            ),
-            // An oversized snapshot is DynamoDB's to reject (#144); named here.
-            diagnoseFailure({
-              sent: () => ({ _tag: "Item", item: { Put: put }, target: target({ Put: put }) }),
-              keys,
-              rewrite,
-            }),
-          )
-        }
-        // Under its 1.36 key, the snapshot is written there only while the
-        // stream is — checked on its first event, as an append checks it.
-        const items: ReadonlyArray<TransactWriteItem> = [
-          { Put: put },
-          {
-            ConditionCheck: {
-              TableName: tableName,
-              Key: toAttributeMap({ pk, sk: composeEventSk(1) }),
-              ConditionExpression: "attribute_exists(#pk) AND attribute_not_exists(#moved)",
-              ExpressionAttributeNames: { "#pk": "pk", "#moved": MOVED_ATTRIBUTE },
-            },
-          },
-        ]
-        const moved = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
-          Effect.as(false),
-          Effect.catch((error: DynamoClientError) => {
-            if (!isAwsTransactionCancelled(error.cause)) return Effect.fail(error)
-            const reasons = error.cause.CancellationReasons ?? []
-            if (reasons[1]?.Code === "ConditionalCheckFailed") return Effect.succeed(true)
-            return reasons[0]?.Code === "ConditionalCheckFailed"
-              ? Effect.succeed(false)
-              : Effect.fail(error)
-          }),
-          diagnoseFailure({
-            sent: () => ({
-              _tag: "Transaction",
-              items,
-              targets: () => [
-                target(items[0]!)(),
-                transactItemTarget(
-                  items[1]!,
-                  tableName,
-                  ["pk", "sk"],
-                  entityType,
-                  "the check that rekey has not moved the stream",
-                ),
-              ],
-            }),
-            keys,
-            rewrite,
-          }),
-        )
-        if (!moved) return
+      const put = {
+        TableName: tableName,
+        Item: item,
+        // Monotonic: never regress the cache. Losing this race is a no-op,
+        // not an error — the events it summarises are already durable.
+        ConditionExpression: "attribute_not_exists(#pk) OR #asOfVersion < :asOfVersion",
+        ExpressionAttributeNames: { "#pk": "pk", "#asOfVersion": "asOfVersion" },
+        ExpressionAttributeValues: toAttributeMap({ ":asOfVersion": asOfVersion }),
       }
+      yield* client.putItem(put).pipe(
+        Effect.catchIf(
+          (error) => isAwsConditionalCheckFailed(error.cause),
+          () => Effect.void,
+        ),
+        // An oversized snapshot is DynamoDB's to reject (#144); named here.
+        diagnoseFailure({
+          sent: () => ({
+            _tag: "Item",
+            item: { Put: put },
+            target: () =>
+              transactItemTarget(
+                { Put: put },
+                tableName,
+                ["pk", "sk"],
+                snapshotEntityType,
+                "the snapshot",
+              ),
+          }),
+          keys,
+          rewrite,
+        }),
+      )
     }) as Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /**
@@ -4814,7 +4627,7 @@ export const makeStream = <
       const result = yield* client.getItem({
         TableName: tableName,
         Key: toAttributeMap({
-          pk: yield* locateStream(streamId as Record<string, unknown>),
+          pk: composeStreamPk(streamId as Record<string, unknown>),
           sk: snapshotSk,
         }),
         ...(consistentRead ? { ConsistentRead: true } : {}),
@@ -4842,7 +4655,7 @@ export const makeStream = <
       const result = yield* client.getItem({
         TableName: tableName,
         Key: toAttributeMap({
-          pk: yield* locateStream(streamId as Record<string, unknown>),
+          pk: composeStreamPk(streamId as Record<string, unknown>),
           sk: composeEventSk(version),
         }),
         ...(consistentRead ? { ConsistentRead: true } : {}),
@@ -4956,7 +4769,7 @@ export const makeStream = <
         FilterExpression: "#e IN (:eventType, :snapshotType)",
         ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk", "#e": "__edd_e__" },
         ExpressionAttributeValues: toAttributeMap({
-          ":pk": yield* locateStream(streamId as Record<string, unknown>),
+          ":pk": composeStreamPk(streamId as Record<string, unknown>),
           ":first": eventSkPrefix,
           ":snapshot": snapshotSk,
           ":eventType": entityType,
@@ -5052,7 +4865,7 @@ export const makeStream = <
       const { name: tableName } = yield* config.table.Tag
       const result = yield* client.getItem({
         TableName: tableName,
-        Key: toAttributeMap({ pk: yield* locateStream(streamId), sk: composeCommandSk(commandId) }),
+        Key: toAttributeMap({ pk: composeStreamPk(streamId), sk: composeCommandSk(commandId) }),
         ConsistentRead: true,
         ProjectionExpression: "#pk",
         ExpressionAttributeNames: { "#pk": "pk" },
@@ -5085,8 +4898,6 @@ export const makeStream = <
       // Consumed capacity reports these queries under the stream name, as
       // every `EventStream.*` operation does (#174).
       operationTarget: config.streamName,
-      // A stream 1.36 started is read where it lives (#171).
-      ...locatedPrepare(streamId as Record<string, unknown>),
       // Bound to the event SK range so non-event items in the stream partition
       // (the snapshot) are excluded at the key-condition level. A caller-supplied
       // `Query.where` replaces this — the `__edd_e__` filter still applies.
@@ -5177,9 +4988,6 @@ export const makeStream = <
       },
       keyFields: [idx.pk, idx.sk, "pk", "sk"],
       operationTarget: config.streamName,
-      // A stream-scoped index of a stream 1.36 started is read in the 1.36
-      // partition, as its events are (#171).
-      ...(derived ? {} : locatedPrepare(streamId as Record<string, unknown>)),
       // A "keys" index holds no events: an LSI has DynamoDB fetch them
       // (`Select: ALL_ATTRIBUTES`), a GSI fetches each page's with
       // `BatchGetItem` on the table key.
@@ -5192,12 +5000,7 @@ export const makeStream = <
           }
         : {}),
     })
-    return derived
-      ? Query.filterExpr(
-          query,
-          streamPkFilter(streamPk, composeStreamPk136(streamId as Record<string, unknown>)),
-        )
-      : query
+    return derived ? Query.filterExpr(query, streamPkFilter(streamPk)) : query
   }
 
   /**
@@ -5302,18 +5105,18 @@ export const makeStream = <
   // is safe because all operations correctly require DynamoClient | TableConfig at
   // runtime — the user must provide these layers.
   // ---------------------------------------------------------------------------
-  // rekey (#171): the stream's part in `db.tables.<Table>.rekey()`
+  // rekey: the stream's part in `db.tables.<Table>.rekey()`
   //
-  // A stream 1.36 started under a partition key whose text changed (a number
-  // stream id composite) moves whole, while writers keep appending: every row
-  // is COPIED to the current key — where nothing is, or a snapshot over an
-  // older one; one transaction then FLIPS it — marks its first event moved,
-  // conditioned on the head and the snapshot being as copied — so
-  // `locateStream` reads the current key from then on, and an append or
-  // snapshot write that located the 1.36 key before fails its location
-  // check; the 1.36 rows are DELETED last, each while it is as read, the
-  // events from the head down and the first event last. A flip or delete
-  // that loses to a write reads again.
+  // A stream under a partition key other text composed for its id moves whole:
+  // every row is COPIED to the current key, where nothing is, or a snapshot over
+  // an older one; one transaction then FLIPS it, marking its first event moved,
+  // conditioned on the head and the snapshot being as copied, so a run stopped
+  // after that resumes by finishing the delete; the old rows are DELETED last,
+  // each while it is as read, the events from the head down and the first event
+  // last. A flip or delete that loses to a write reads again. Another stream's
+  // rows at the current key, themselves under other text, move first. Rows of
+  // another stream id that landed in the same partition are its own: nothing is
+  // merged.
   // ---------------------------------------------------------------------------
 
   /** Attributes holding the stream's partition key: a GSI index's partition. */
@@ -5350,7 +5153,7 @@ export const makeStream = <
         const part = parts[i]!
         const values: Array<unknown> = [part]
         const n = Number(part)
-        if (part.trim() !== "" && Number.isFinite(n) && String(n) === part) values.push(n)
+        if (part.trim() !== "" && String(n) === part) values.push(n)
         if (/^-?\d+$/.test(part) && String(BigInt(part)) === part) values.push(BigInt(part))
         candidates = candidates.flatMap((candidate) =>
           values.map((value) => ({ ...candidate, [field]: value })),
@@ -5361,29 +5164,41 @@ export const makeStream = <
   }
 
   /**
-   * Where a stream row belongs now and where an earlier release put it, from
-   * its `streamId`: the readings of the id whose keys hold the row's partition
-   * key, in 1.36's text or 1.37's (its strings unescaped, its numbers as now).
-   * `"ambiguous"` when readings disagree on where it belongs.
+   * Where a stream row belongs now, from its `streamId`: the readings of the id
+   * that compose the row's partition key under some key text. `"ambiguous"` when
+   * readings disagree on where it belongs; `undefined` when none composes it.
    */
   const streamKeys = (
     row: Record<string, AttributeValue>,
-  ): { readonly current: string; readonly old: string } | "ambiguous" | undefined => {
+  ): { readonly current: string } | "ambiguous" | undefined => {
     const pk = row.pk?.S
     const text = row.streamId?.S
     if (pk === undefined || text === undefined) return undefined
-    let found: { readonly current: string; readonly old: string } | undefined
-    for (const candidate of streamIdCandidates(text)) {
+    const undersNow = [
+      KeyText136.schema136(schema),
+      KeyText136.schema137(schema),
+      KeyText136.schemaEscaped(schema),
+    ]
+    const holds = (under: DynamoSchema.DynamoSchema, candidate: Record<string, unknown>) => {
       try {
-        const current = composeStreamPk(candidate)
-        const pk137 = composeStreamPkUnder(KeyText136.schema137(schema), candidate)
-        const old: string = pk === pk137 ? pk137 : (composeStreamPk136(candidate, true) ?? current)
-        if (pk !== current && pk !== old) continue
-        if (found === undefined) found = { current, old }
-        else if (found.current !== current || found.old !== old) return "ambiguous"
+        return composeStreamPkUnder(under, candidate) === pk
       } catch {
-        // Not this reading of the id.
+        // No key text for it under this form.
+        return false
       }
+    }
+    let found: { readonly current: string } | undefined
+    for (const candidate of streamIdCandidates(text)) {
+      if (!undersNow.some((under) => holds(under, candidate))) continue
+      let current: string
+      try {
+        current = composeStreamPk(candidate)
+      } catch {
+        // `NaN` under `escapeKeys: true`: no key now.
+        continue
+      }
+      if (found === undefined) found = { current }
+      else if (found.current !== current) return "ambiguous"
     }
     return found
   }
@@ -5402,10 +5217,10 @@ export const makeStream = <
   const STREAM_MOVE_ATTEMPTS = 8
 
   /**
-   * Move the stream under `from` to `to` — or, when its first event is no
-   * longer under `from` (moved by an earlier run), the rows left there.
-   * Command sentinels whose TTL has passed are gone, whether or not DynamoDB
-   * has deleted them yet.
+   * Move the stream `streamIdText` under `from` to `to` — or, when its first
+   * event is no longer under `from` (moved by an earlier run), the rows left
+   * there. Command sentinels whose TTL has passed are gone, whether or not
+   * DynamoDB has deleted them yet.
    */
   const moveStream = (
     ctx: Rekey.RekeyRowContext,
@@ -5413,7 +5228,8 @@ export const makeStream = <
     to: string,
     streamIdText: string,
     ttlAttribute: string,
-  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient> =>
+    depth: number,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const firstSk = composeEventSk(1)
@@ -5447,6 +5263,15 @@ export const makeStream = <
           if (copy[attr]?.S === from) copy[attr] = { S: to }
         }
         return copy
+      }
+      /** This stream's rows left under the old key: another id's there are its own to move. */
+      const readOwn = Effect.map(readAll(from), (rows) =>
+        rows.filter((row) => row.streamId?.S === streamIdText),
+      )
+      /** A row at `to` that belongs elsewhere: another stream's, under other key text. */
+      const elsewhere = (row: Record<string, AttributeValue>) => {
+        const keys = streamKeys(row)
+        return typeof keys === "object" && keys.current !== to
       }
       const skOf = (row: Record<string, AttributeValue>) => row.sk?.S ?? ""
       const versionOf = (row: Record<string, AttributeValue>) =>
@@ -5506,17 +5331,16 @@ export const makeStream = <
       /**
        * Bring every row still under `from` over, once the stream lives at
        * `to`: a row `to` lacks is copied (a command sentinel written beside
-       * the flip, a row an append that located the stream before the flip
-       * wrote), a snapshot newer than `to`'s copied over it, and then each is
-       * deleted while it is as read — the events from the head down, the
-       * other rows, and the first event last: until it goes, the stream is
-       * located here, and an append that located it here fails its check. A
-       * row `to` holds differently (an event or sentinel written under both
-       * keys) is a conflict, and the rows are left as they are. `undefined`
-       * when a write landed in between: read again.
+       * the flip), a snapshot newer than `to`'s copied over it, and then each
+       * is deleted while it is as read — the events from the head down, the
+       * other rows, and the first event last: until it goes, the next run
+       * finds the stream here and finishes the move. A row `to` holds
+       * differently (an event or sentinel written under both keys) is a
+       * conflict, and the rows are left as they are. `undefined` when a write
+       * landed in between: read again.
        */
       const drain = Effect.gen(function* () {
-        const left = yield* readAll(from)
+        const left = yield* readOwn
         const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
         const differing: Array<Record<string, AttributeValue>> = []
         for (const row of left) {
@@ -5531,7 +5355,7 @@ export const makeStream = <
               conflict(
                 "bothKeys",
                 "a row of it is under both partition keys, and the two differ; the rows " +
-                  "under its 1.36 key are left as they are.",
+                  "under its old key are left as they are.",
                 skOf(row),
               ),
             ),
@@ -5558,37 +5382,72 @@ export const makeStream = <
         return { moved: { stream: left.length } } satisfies Rekey.RekeyTally
       })
 
+      let tally: Rekey.RekeyTally = {}
       for (let attempt = 0; attempt < STREAM_MOVE_ATTEMPTS; attempt++) {
-        const rows = yield* readAll(from)
+        const rows = yield* readOwn
         // Moved since the scan read it.
-        if (rows.length === 0) return {}
+        if (rows.length === 0) return tally
         const first = rows.find((row) => skOf(row) === firstSk)
         // Flipped by an earlier attempt or run — or never started here: the
         // stream lives at `to`, and the rows left move to it.
         const flipped = first === undefined || first[MOVED_ATTRIBUTE] !== undefined
         if (!flipped) {
-          const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
+          const atTarget = yield* readAll(to)
+          // Another stream under other key text moves out first. A dry run counts it when the
+          // scan reaches it.
+          const stale = atTarget.find(elsewhere)
+          if (stale !== undefined && !ctx.dryRun) {
+            if (depth >= Rekey.DISPLACE_DEPTH) {
+              return Rekey.mergeTallies(
+                tally,
+                conflict(
+                  "contended",
+                  "too many streams under other key text hold each other's current keys.",
+                ),
+              )
+            }
+            tally = Rekey.mergeTallies(tally, (yield* rekeyStreamRow(stale, ctx, depth + 1)) ?? {})
+            if ((yield* readAll(to)).some(elsewhere)) {
+              return Rekey.mergeTallies(
+                tally,
+                conflict("taken", "rows of another stream are under its current partition key."),
+              )
+            }
+            continue
+          }
+          const there = new Map(
+            atTarget.filter((row) => !elsewhere(row)).map((row) => [skOf(row), row]),
+          )
           const here = new Map(rows.map((row) => [skOf(row), row]))
-          // Rows under the current key are copies of an earlier attempt —
-          // anything else is another stream's: a row this one does not have,
-          // or one it has differently (a snapshot only grows newer).
+          // Rows under the current key are copies of an earlier attempt, or a stream written
+          // there meanwhile: anything else is a conflict, a row this one does not have, or
+          // one it has differently (a snapshot only grows newer).
           for (const [sk, row] of there) {
             const own = here.get(sk)
             if (own === undefined) {
-              return conflict(
-                "taken",
-                "rows of another stream are under its current partition key.",
+              const same = row.streamId?.S === streamIdText
+              return Rekey.mergeTallies(
+                tally,
+                conflict(
+                  same ? "bothKeys" : "taken",
+                  same
+                    ? "the stream has rows under both partition keys."
+                    : "rows of another stream are under its current partition key.",
+                ),
               )
             }
             if (sk !== snapshotSk && !sameRow(copyOf(own), row)) {
-              return conflict(
-                "bothKeys",
-                "rows of another stream are under its current partition key.",
-                sk,
+              return Rekey.mergeTallies(
+                tally,
+                conflict(
+                  "bothKeys",
+                  "the stream has rows under both partition keys, and the two differ.",
+                  sk,
+                ),
               )
             }
           }
-          if (ctx.dryRun) return { moved: { stream: rows.length } }
+          if (ctx.dryRun) return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
           // COPY
           let copiedAll = true
           for (const row of rows) {
@@ -5681,54 +5540,68 @@ export const makeStream = <
           // A write landed in between: copy again.
           if (!won) continue
         } else if (ctx.dryRun) {
-          return { moved: { stream: rows.length } }
+          return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
         }
         // DELETE
         const drained = yield* drain
-        if (drained !== undefined) return drained
+        if (drained !== undefined) return Rekey.mergeTallies(tally, drained)
       }
-      return conflict("contended", "writes changed it on every attempt to move it.")
+      return Rekey.mergeTallies(
+        tally,
+        conflict("contended", "writes changed it on every attempt to move it."),
+      )
+    })
+
+  /** One scanned row of the stream — or one at a key another stream's move needs. */
+  const rekeyStreamRow = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+    depth: number,
+  ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const tableConfig = yield* config.table.Tag
+      if (tableConfig.name !== ctx.tableName) return undefined
+      const keys = streamKeys(row)
+      if (keys === undefined) return { skipped: { unrecognizedKey: 1 } }
+      if (keys === "ambiguous") {
+        return {
+          conflicts: [
+            {
+              member: config.streamName,
+              kind: "stream" as const,
+              reason: "failed" as const,
+              key: { pk: row.pk?.S, sk: row.sk?.S },
+              target: undefined,
+              message:
+                `Stream ${JSON.stringify(row.streamId?.S ?? "")}: its stored stream id reads ` +
+                "as more than one id of the stream's composites, and they disagree on where " +
+                "it belongs.",
+            },
+          ],
+        }
+      }
+      const from = row.pk!.S!
+      if (from === keys.current) return { unchanged: 1 }
+      // A stream moves whole, once per run, from whichever of its rows the scan reaches
+      // first, and rows left there after it moved move after it.
+      const streamIdText = row.streamId?.S ?? ""
+      return yield* ctx.once(
+        `${config.streamName}\u0000${from}\u0000${streamIdText}`,
+        moveStream(
+          ctx,
+          from,
+          keys.current,
+          streamIdText,
+          resolveTtlAttributeName(tableConfig),
+          depth,
+        ),
+      )
     })
 
   const rekeyHandler: Rekey.RekeyMember = {
     name: config.streamName,
     types: [entityType, snapshotEntityType, commandEntityType],
-    row: (row, ctx) =>
-      Effect.gen(function* () {
-        const tableConfig = yield* config.table.Tag
-        if (tableConfig.name !== ctx.tableName) return undefined
-        const keys = streamKeys(row)
-        if (keys === undefined) return { skipped: { unrecognizedKey: 1 } }
-        if (keys === "ambiguous") {
-          return {
-            conflicts: [
-              {
-                member: config.streamName,
-                kind: "stream" as const,
-                reason: "failed" as const,
-                key: { pk: row.pk?.S, sk: row.sk?.S },
-                target: undefined,
-                message:
-                  `Stream ${JSON.stringify(row.streamId?.S ?? "")}: its stored stream id reads ` +
-                  "as more than one id of the stream's composites, and they disagree on where " +
-                  "it belongs.",
-              },
-            ],
-          }
-        }
-        if (row.pk?.S === keys.current) return { unchanged: 1 }
-        // A stream under its 1.36 key moves whole, once per run, from
-        // whichever of its rows the scan reaches first — and rows left there
-        // after it moved move after it.
-        if (!ctx.claim(`${config.streamName}\u0000${keys.old}`)) return {}
-        return yield* moveStream(
-          ctx,
-          keys.old,
-          keys.current,
-          row.streamId?.S ?? "",
-          resolveTtlAttributeName(tableConfig),
-        )
-      }),
+    row: (row, ctx) => rekeyStreamRow(row, ctx, 0),
   }
 
   return {

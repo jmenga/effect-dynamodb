@@ -21,7 +21,7 @@ import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import { calls, hooks, InMemoryClient, resetStore, sent, store } from "./helpers/InMemoryTables.js"
 
-const AppSchema = DynamoSchema.make({ name: "tsnum", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "tsnum", version: 1, escapeKeys: true })
 
 const makeMeters = <S extends Schema.Top>(seq: S) => {
   const Reading = Schema.Struct({

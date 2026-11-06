@@ -9,11 +9,10 @@ import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
-import * as KeyText136 from "../src/internal/KeyText136.js"
 import { refuseSharedKeyAttribute } from "../src/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
-const schema = DynamoSchema.make({ name: "halves", version: 1 })
+const schema = DynamoSchema.make({ name: "halves", version: 1, escapeKeys: true })
 
 class Row extends Schema.Class<Row>("Row")({
   tenant: Schema.String,
@@ -191,13 +190,14 @@ describe("an inverted index builds the table's text, with the flag on or off", (
     }
   })
 
-  it("1.36's text of each role is the other's too", () => {
+  it("off, each role's text is the other's too", () => {
+    const off = DynamoSchema.make({ name: "halves", version: 1, escapeKeys: false })
     const record = recordOf("a b")
-    expect(KeyText136.composePk(schema, "Row", index, record)).toBe(
-      KeyText136.composeSk(schema, "Row", 1, primary, record),
+    expect(KeyComposer.composePk(off, "Row", index, record)).toBe(
+      KeyComposer.composeSk(off, "Row", 1, primary, record),
     )
-    expect(KeyText136.composeSk(schema, "Row", 1, index, record)).toBe(
-      KeyText136.composePk(schema, "Row", primary, record),
+    expect(KeyComposer.composeSk(off, "Row", 1, index, record)).toBe(
+      KeyComposer.composePk(off, "Row", primary, record),
     )
   })
 })
@@ -235,8 +235,7 @@ describe("one entity can't use a physical index twice (EDD-9108)", () => {
 
 /**
  * Every definition's key text, spelled out under both settings. `off` is byte for byte what the
- * real 1.36.0 package composes for these strings; `numbers` is the one that differs, as the
- * number encoding of 1.37 stays on either way.
+ * real 1.36.0 package composes, strings and numbers alike.
  */
 describe("every definition's bytes", () => {
   const record = {
@@ -299,8 +298,8 @@ describe("every definition's bytes", () => {
         gsk: "$halves#v1#row#n_-9999999999999996:",
       },
       {
-        gpk: "$halves#v1#row#n_-9999999999999996:",
-        gsk: "$halves#v1#row#n_-9999999999999996:",
+        gpk: "$halves#v1#row#n_00000000000000-3",
+        gsk: "$halves#v1#row#n_00000000000000-3",
       },
     ],
     [

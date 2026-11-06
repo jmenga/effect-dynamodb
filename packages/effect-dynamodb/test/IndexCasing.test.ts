@@ -15,7 +15,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
-const AppSchema = DynamoSchema.make({ name: "App", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "App", version: 1, escapeKeys: true })
 
 class Device extends Schema.Class<Device>("Device")({
   deviceId: Schema.String,

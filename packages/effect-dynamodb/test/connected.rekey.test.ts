@@ -13,14 +13,14 @@
  *   conflict and the skipped rows; a rerun moves nothing;
  * - a run interrupted mid-scan resumes from the last token it delivered;
  * - a soft-deleted item's kept reservations move to, and name, its current
- *   key: its values stay taken and it restores with the fallback off;
+ *   key: its values stay taken and it restores;
  * - an aggregate update or delete that lands while `rekey` moves the
- *   aggregate wins: the move is conditional, and is read again;
+ *   aggregate overwrites nothing, and the run ends with the move done;
  * - an aggregate whose edge keys alias (one's current key is another's 1.36
  *   key) moves along the chain;
- * - a stream moves while a writer keeps appending to it, and ends up whole;
- *   a command-only append that located it before it moved fails; a stream id
- *   holding `#` moves.
+ * - a writer appending while a stream moves overwrites nothing and loses
+ *   nothing; a stream written beside its old rows is reported and left; a
+ *   stream id holding `#` moves.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -65,7 +65,9 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 // Models
 // ---------------------------------------------------------------------------
 
-const AppSchema = DynamoSchema.make({ name: "rekey", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "rekey", version: 1, escapeKeys: true })
+/** What wrote the rows `rekey` moves below: 1.36, and `escapeKeys` off. */
+const Old = KeyText136.schema136(AppSchema)
 
 class Meter extends Schema.Class<Meter>("Meter")({
   site: Schema.String,
@@ -251,17 +253,6 @@ const Readings = Entity.make({
 const MainTable = Table.make({
   schema: AppSchema,
   entities: { Meters, Notes, Docs, Gauges, Badges, Cards, Readings },
-})
-
-/** The same table, read with the 1.36 key fallback off. */
-const OffSchema = DynamoSchema.make({ name: "rekey", version: 1, legacyKeys: false })
-const OffTable = Table.make({
-  schema: OffSchema,
-  entities: { Badges: badges(), Cards: cards() },
-})
-const makeOffDb = DynamoClient.make({
-  entities: OffTable.entities,
-  tables: { OffTable },
 })
 
 class Stop extends Schema.Class<Stop>("Stop")({
@@ -463,7 +454,10 @@ const meterKeys = (record: Record<string, unknown>) => ({
     string,
     string
   >,
-  old: KeyText136.composeAllKeys(AppSchema, "Meter", 1, Meters.indexes, record),
+  old: KeyComposer.composeAllKeys(Old, "Meter", 1, Meters.indexes, record) as Record<
+    string,
+    string
+  >,
 })
 
 const primaryOf = (keys: Record<string, string>) => ({ pk: keys.pk!, sk: keys.sk! })
@@ -473,7 +467,9 @@ const uniqueKeys = (entityType: string, constraint: string, value: string | numb
   const current = DynamoSchema.composeUniqueKey(AppSchema, entityType, constraint, [
     KeyComposer.serializeValue(value),
   ])
-  const old = KeyText136.composeUniqueKey(AppSchema, entityType, constraint, [value])
+  const old = DynamoSchema.composeUniqueKey(Old, entityType, constraint, [
+    KeyComposer.serializeValue136(value),
+  ])
   return { current: { pk: current.pk, sk: current.sk }, old: { pk: old.pk, sk: old.sk } }
 }
 
@@ -510,7 +506,10 @@ const seedReading = (seq: number, label: string, deleted = false) =>
       string,
       string
     >
-    const old = KeyText136.composeIndexKeys(AppSchema, "Reading", 1, primary, record)
+    const old = KeyComposer.composeIndexKeys(Old, "Reading", 1, primary, record) as Record<
+      string,
+      string
+    >
     expect(old.sk).not.toBe(now.sk)
     const segment = (liveSk: string) => ({
       item: KeyComposer.composeHistoryItemSegment(AppSchema, "Reading", 1, primary, liveSk)!,
@@ -547,7 +546,7 @@ const seedReading = (seq: number, label: string, deleted = false) =>
 
 const routePk = (id: number) => ({
   now: DynamoSchema.composeCollectionKey(AppSchema, "routes", [KeyComposer.serializeValue(id)]),
-  old: DynamoSchema.composeCollectionKey(AppSchema, "routes", [KeyText136.serializeValue(id)]),
+  old: DynamoSchema.composeCollectionKey(Old, "routes", [KeyComposer.serializeValue136(id)]),
 })
 const stopSk = (label: string) =>
   DynamoSchema.composeKey(AppSchema, "RouteStop", [KeyComposer.escapeKeyText(label, "lowercase")])
@@ -557,27 +556,27 @@ const trailStopSk = (label: string) =>
 const trailStopSk136 = (label: string) => DynamoSchema.composeKey(AppSchema, "TrailStop", [label])
 const cardPk = {
   now: KeyComposer.composePk(AppSchema, "Card", Cards.indexes.primary, { cardId: -3 }),
-  old: KeyText136.composePk(AppSchema, "Card", Cards.indexes.primary, { cardId: -3 }),
+  old: KeyComposer.composePk(Old, "Card", Cards.indexes.primary, { cardId: -3 }),
 }
 
 const streamPk = (id: number) => ({
   now: DynamoSchema.composeKey(AppSchema, "Ledger", [KeyComposer.serializeValue(id)]),
-  old: DynamoSchema.composeKey(AppSchema, "Ledger", [KeyText136.serializeValue(id)]),
+  old: DynamoSchema.composeKey(Old, "Ledger", [KeyComposer.serializeValue136(id)]),
 })
 const docPk = {
   now: KeyComposer.composePk(AppSchema, "Doc", Docs.indexes.primary, { docId: -5 }),
-  old: KeyText136.composePk(AppSchema, "Doc", Docs.indexes.primary, { docId: -5 }),
+  old: KeyComposer.composePk(Old, "Doc", Docs.indexes.primary, { docId: -5 }),
 }
 const gaugePk = {
   now: KeyComposer.composePk(AppSchema, "Gauge", Gauges.indexes.primary, { gaugeId: -6 }),
-  old: KeyText136.composePk(AppSchema, "Gauge", Gauges.indexes.primary, { gaugeId: -6 }),
+  old: KeyComposer.composePk(Old, "Gauge", Gauges.indexes.primary, { gaugeId: -6 }),
 }
 const noteKeys = {
   current: KeyComposer.composeIndexKeys(AppSchema, "Note", 1, Notes.indexes.primary, {
     owner: "o",
     title: "new york",
   }) as Record<string, string>,
-  old: KeyText136.composeIndexKeys(AppSchema, "Note", 1, Notes.indexes.primary, {
+  old: KeyComposer.composeIndexKeys(Old, "Note", 1, Notes.indexes.primary, {
     owner: "o",
     title: "new york",
   }),
@@ -598,7 +597,7 @@ const seedRoute = Effect.gen(function* () {
         : {
             gsi1sk: {
               S: DynamoSchema.composeCollectionKey(AppSchema, "routelist", [
-                KeyText136.serializeValue(-5),
+                KeyComposer.serializeValue136(-5),
               ]),
             },
           }),
@@ -905,7 +904,7 @@ describeConnected("#171 rekey — connected", () => {
 
   // Live: the writer paces its appends on the real clock.
   it.live(
-    "a stream moves whole while a writer keeps appending to it",
+    "a writer appending while a stream moves overwrites nothing and loses nothing",
     () =>
       withTable(() =>
         Effect.gen(function* () {
@@ -934,25 +933,74 @@ describeConnected("#171 rekey — connected", () => {
           const [, report] = yield* Effect.all([writer, run({ pageSize: 10 })], {
             concurrency: "unbounded",
           })
-          // The run moved it, or — had the writer won every flip — reported it
-          // contended for a later run, which finds it quiet.
-          expect(report.conflicts.every((c) => c.reason === "contended")).toBe(true)
-          const finish = yield* run()
-          expect(finish.conflicts).toEqual([])
-          expect(report.moved.stream + finish.moved.stream).toBeGreaterThan(0)
-          // Whatever the interleaving: the stream is under its current key, whole.
-          expect(yield* partition(streamPk(-4).old)).toEqual([])
-          const events = yield* Ledger.read(ledger(-4))
-          expect(events.map((e) => e.version)).toEqual(
-            Array.from({ length: seeded + appends }, (_, i) => i + 1),
+          // The writer finds only what is at the current key, so it lands on a copy or beside the
+          // rows. `rekey` copies only where nothing is and reports the rest.
+          for (const conflict of [...report.conflicts, ...(yield* run()).conflicts]) {
+            expect(["contended", "bothKeys"]).toContain(conflict.reason)
+          }
+          const rows = [
+            ...(yield* partition(streamPk(-4).old)),
+            ...(yield* partition(streamPk(-4).now)),
+          ]
+          const amounts = new Set(rows.map((row) => Number(row.data?.M?.amount?.N)))
+          for (let i = 1; i <= seeded; i++) expect(amounts.has(i), String(i)).toBe(true)
+          for (let n = 0; n < appends; n++) expect(amounts.has(1000 + n), String(n)).toBe(true)
+        }),
+      ),
+    60_000,
+  )
+
+  it.effect(
+    "an event appended once a stream is copied, before the flip, moves with it",
+    () =>
+      withTable(() =>
+        Effect.gen(function* () {
+          yield* Ledger.append(
+            ledger(-4),
+            [1, 2, 3].map((amount) => new Deposited({ amount })),
+            0,
           )
-          expect(
-            events
-              .map((e) => e.data.amount)
-              .filter((amount) => amount >= 1000)
-              .sort((a, b) => a - b),
-          ).toEqual(Array.from({ length: appends }, (_, n) => 1000 + n))
-          expect(yield* partition(streamPk(-4).now)).toHaveLength(seeded + appends)
+          yield* demotePartition(streamPk(-4).now, streamPk(-4).old)
+          const flip = (input: TransactInput) =>
+            (input.TransactItems ?? []).some(
+              (item) => item.Update?.UpdateExpression === "SET #moved = :to",
+            )
+          const report = yield* run().pipe(
+            Effect.provide(
+              racing(flip, Ledger.append(ledger(-4), [new Deposited({ amount: 4 })], 3)),
+            ),
+          )
+          expect(report.conflicts).toEqual([])
+          expect(report.moved.stream).toBe(3)
+          expect(yield* partition(streamPk(-4).old)).toEqual([])
+          expect((yield* Ledger.read(ledger(-4))).map((event) => event.data.amount)).toEqual([
+            1, 2, 3, 4,
+          ])
+        }),
+      ),
+    60_000,
+  )
+
+  it.effect(
+    "a stream written beside its old rows is reported, and both are left as they are",
+    () =>
+      withTable(() =>
+        Effect.gen(function* () {
+          yield* Ledger.append(
+            ledger(-4),
+            [1, 2, 3].map((amount) => new Deposited({ amount })),
+            0,
+          )
+          yield* demotePartition(streamPk(-4).now, streamPk(-4).old)
+          // No read finds the old rows, so this append is version 1 at the current key.
+          yield* Ledger.append(ledger(-4), [new Deposited({ amount: 9 })], 0)
+          const dry = yield* run({ dryRun: true })
+          const report = yield* run()
+          expect(report.conflicts.map((c) => c.reason)).toEqual(["bothKeys"])
+          expect(dry.conflicts).toEqual(report.conflicts)
+          expect(report.moved.stream).toBe(0)
+          expect(yield* partition(streamPk(-4).old)).toHaveLength(3)
+          expect((yield* Ledger.read(ledger(-4))).map((event) => event.data.amount)).toEqual([9])
         }),
       ),
     60_000,
@@ -961,7 +1009,7 @@ describeConnected("#171 rekey — connected", () => {
   it.effect(
     "a soft-deleted item's kept reservations move to, and name, its current key",
     () =>
-      withTable((tableName) =>
+      withTable(() =>
         Effect.gen(function* () {
           const db = yield* makeDb
           yield* db.entities.Badges.put({ owner: "o", tag: "plain", code: -77 }).asEffect()
@@ -987,26 +1035,19 @@ describeConnected("#171 rekey — connected", () => {
           expect(yield* getRaw(code.old)).toBeUndefined()
           expect((yield* getRaw(name.current))?._entity_pk?.S).toBe(cardPk.now)
 
-          // With the fallback off: the values are still taken, and both restore.
-          const off = yield* Effect.gen(function* () {
-            const offDb = yield* makeOffDb
-            const badgeTaken = yield* offDb.entities.Badges.put({ owner: "p", tag: "x", code: -77 })
-              .asEffect()
-              .pipe(Effect.flip)
-            const cardTaken = yield* offDb.entities.Cards.put({ cardId: 4, name: "plain" })
-              .asEffect()
-              .pipe(Effect.flip)
-            return {
-              badgeTaken,
-              cardTaken,
-              badge: yield* offDb.entities.Badges.restore({ owner: "o", tag: "plain" }),
-              card: yield* offDb.entities.Cards.restore({ cardId: -3 }),
-            }
-          }).pipe(Effect.provide(OffTable.layer({ name: tableName })))
-          expect(off.badgeTaken._tag).toBe("UniqueConstraintViolation")
-          expect(off.cardTaken._tag).toBe("UniqueConstraintViolation")
-          expect(off.badge.code).toBe(-77)
-          expect(off.card.name).toBe("plain")
+          // The values are still taken, and both restore.
+          const badgeTaken = yield* db.entities.Badges.put({ owner: "p", tag: "x", code: -77 })
+            .asEffect()
+            .pipe(Effect.flip)
+          const cardTaken = yield* db.entities.Cards.put({ cardId: 4, name: "plain" })
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(badgeTaken._tag).toBe("UniqueConstraintViolation")
+          expect(cardTaken._tag).toBe("UniqueConstraintViolation")
+          const badge = yield* db.entities.Badges.restore({ owner: "o", tag: "plain" })
+          const card = yield* db.entities.Cards.restore({ cardId: -3 })
+          expect(badge.code).toBe(-77)
+          expect(card.name).toBe("plain")
 
           const again = yield* run()
           expect(again.sentinelsMoved).toBe(0)
@@ -1016,31 +1057,32 @@ describeConnected("#171 rekey — connected", () => {
     60_000,
   )
 
+  // Nothing is promised to a write that lands before the move is done: the root moves last, so it
+  // finds the edges moved so far and no root. What these pin is that nothing is overwritten and the
+  // run ends with the move done.
   it.effect(
-    "an aggregate update that lands while rekey moves the aggregate is kept",
+    "an aggregate update landing while rekey moves the aggregate finds no root and writes nothing",
     () =>
       withTable(() =>
         Effect.gen(function* () {
           yield* seedRoute
+          let error: { readonly _tag: string } | undefined
           const update = Effect.gen(function* () {
             const db = yield* makeDb
-            yield* db.aggregates.Routes.update({ id: -5 }, ({ current }) =>
-              Route.make({
-                ...current,
-                stops: current.stops.map((stop) =>
-                  stop.label === "c" ? Stop.make({ label: "c", note: "app" }) : stop,
-                ),
-              }),
+            error = yield* db.aggregates.Routes.update({ id: -5 }, ({ current }) => current).pipe(
+              Effect.flip,
             )
           })
           const report = yield* run().pipe(Effect.provide(racing(writes("RouteItem"), update)))
+          expect(error?._tag).toBe("AggregateAssemblyError")
           expect(report.conflicts).toEqual([])
+          expect(report.moved.aggregate).toBe(3)
           expect(yield* partition(routePk(-5).old)).toEqual([])
           const db = yield* makeDb
           const route = yield* db.aggregates.Routes.get({ id: -5 })
           expect(route.stops.map((s) => [s.label, s.note]).sort()).toEqual([
             ["a b", "1"],
-            ["c", "app"],
+            ["c", "2"],
           ])
           expect(
             (yield* db.aggregates.Routes.list({ area: "north" })).data.map((r) => r.id),
@@ -1051,7 +1093,7 @@ describeConnected("#171 rekey — connected", () => {
   )
 
   it.effect(
-    "an aggregate delete that lands while rekey moves the aggregate stays deleted",
+    "an aggregate delete landing while rekey moves the aggregate deletes what is at its current key",
     () =>
       withTable(() =>
         Effect.gen(function* () {
@@ -1062,9 +1104,11 @@ describeConnected("#171 rekey — connected", () => {
           })
           const report = yield* run().pipe(Effect.provide(racing(writes("RouteItem"), remove)))
           expect(report.conflicts).toEqual([])
-          expect(report.moved.aggregate).toBe(0)
-          const left = (yield* scanAll).filter((row) => row.__edd_e__?.S?.startsWith("Route"))
-          expect(left).toEqual([])
+          expect(yield* partition(routePk(-5).old)).toEqual([])
+          // The edges had moved and are gone; the root was still on its way.
+          expect((yield* partition(routePk(-5).now)).map((row) => row.__edd_e__?.S)).toEqual([
+            "RouteItem",
+          ])
         }),
       ),
     60_000,
@@ -1111,88 +1155,43 @@ describeConnected("#171 rekey — connected", () => {
           const again = yield* run()
           expect(again.moved.aggregate).toBe(0)
           expect(again.conflicts).toEqual([])
-        }),
-      ),
-    60_000,
-  )
-
-  it.effect(
-    "an aggregate update over aliasing edge keys moves both edges and keeps them apart",
-    () =>
-      withTable(() =>
-        Effect.gen(function* () {
-          const db = yield* makeDb
-          const labels = ["a b", "a%20b"]
-          yield* db.aggregates.Trails.create({
-            name: "t",
-            stops: labels.map((label, i) => Stop.make({ label, note: String(i) })),
-          })
-          for (const label of labels) {
-            const row = (yield* scanAll).find((r) => r.sk?.S === trailStopSk(label))!
-            yield* rewrite(row, { ...row, sk: { S: trailStopSk136(label) } })
-          }
-          // Through the fallback: the update moves both edges.
+          // An update after the move finds both edges, and keeps them apart.
           yield* db.aggregates.Trails.update({ name: "t" }, ({ current }) =>
             Trail.make({
               ...current,
               stops: current.stops.map((stop) => Stop.make({ ...stop, note: `${stop.note}!` })),
             }),
           )
-          const rows = (yield* scanAll).filter((row) => row.__edd_e__?.S === "TrailStop")
-          expect(rows.map((row) => [row.sk?.S, row.note?.S]).sort()).toEqual(
-            labels.map((label, i) => [trailStopSk(label), `${i}!`]).sort(),
-          )
-          const report = yield* run()
-          expect(report.moved.aggregate).toBe(0)
-          expect(report.conflicts).toEqual([])
+          expect(
+            (yield* scanAll)
+              .filter((row) => row.__edd_e__?.S === "TrailStop")
+              .map((row) => [row.sk?.S, row.note?.S])
+              .sort(),
+          ).toEqual(labels.map((label, i) => [trailStopSk(label), `${i}!`]).sort())
         }),
       ),
     60_000,
   )
 
   it.effect(
-    "a command-only append that located a stream before rekey moved it writes nothing",
-    () =>
-      withTable(() =>
-        Effect.gen(function* () {
-          yield* Ledger.append(
-            ledger(-4),
-            [1, 2, 3].map((amount) => new Deposited({ amount })),
-            0,
-          )
-          yield* demotePartition(streamPk(-4).now, streamPk(-4).old)
-          // `rekey` moves the stream between the append's locate and its write.
-          const error = yield* Ledger.append(ledger(-4), [], 3, {
-            idempotency: { commandId: "c-1" },
-          }).pipe(Effect.flip, Effect.provide(racing(writes("ledger.command"), run())))
-          expect(error._tag).toBe("VersionConflict")
-          expect(yield* partition(streamPk(-4).old)).toEqual([])
-          expect(
-            (yield* partition(streamPk(-4).now)).filter((row) => row.commandId !== undefined),
-          ).toEqual([])
-          // Retried, it lands where the stream lives now.
-          yield* Ledger.append(ledger(-4), [], 3, { idempotency: { commandId: "c-1" } })
-          expect(
-            (yield* partition(streamPk(-4).now)).filter((row) => row.commandId?.S === "c-1"),
-          ).toHaveLength(1)
-        }),
-      ),
-    60_000,
-  )
-
-  it.effect(
-    "retained items written through the fallback leave a dry run nothing to move or report",
+    "retained items move with their snapshots, and every write finds them afterwards",
     () =>
       withTable(() =>
         Effect.gen(function* () {
           const db = yield* makeDb
           const key = (seq: number) => ({ deviceId: "dev-r", seq })
-          // Each put once by 1.36 (version 1 and its snapshot under the 1.36 key),
-          // then written by 1.37 with the fallback on.
           const seeded = [
             ...(yield* Effect.forEach([-20, -21, -23, -24], (seq) => seedReading(seq, `l${-seq}`))),
             yield* seedReading(-40, "r", true),
           ]
+          const report = yield* run()
+          expect(report.conflicts).toEqual([])
+          // Nothing left under a 1.36 key: the items moved, each with its snapshot.
+          const rows = yield* partition(seeded[0]!.old.pk!)
+          for (const { old, versions136 } of seeded) {
+            expect(rows.filter((row) => row.sk!.S === old.sk)).toEqual([])
+            expect(rows.filter((row) => row.sk!.S!.startsWith(versions136))).toEqual([])
+          }
           yield* db.entities.Readings.put({ ...key(-20), label: "x2", serial: -2000 }).asEffect()
           yield* db.entities.Readings.delete(key(-21)).asEffect()
           yield* db.entities.Readings.update(key(-23)).set({ label: "u2" }).asEffect()
@@ -1210,12 +1209,6 @@ describeConnected("#171 rekey — connected", () => {
               versions.map((r) => [versionOf(r), r.label]),
               String(seq),
             ).toEqual([[1, label]])
-          }
-          // Nothing left under a 1.36 key: the items moved, each with its snapshot.
-          const rows = yield* partition(seeded[0]!.old.pk!)
-          for (const { old, versions136 } of seeded) {
-            expect(rows.filter((row) => row.sk!.S === old.sk)).toEqual([])
-            expect(rows.filter((row) => row.sk!.S!.startsWith(versions136))).toEqual([])
           }
           const dry = yield* run({ dryRun: true })
           expect(dry.conflicts).toEqual([])
@@ -1255,7 +1248,7 @@ describeConnected("#171 rekey — connected", () => {
             ]),
             old: DynamoSchema.composeKey(AppSchema, "Accounts", [
               "a#b",
-              KeyText136.serializeValue(-3),
+              KeyComposer.serializeValue136(-3),
             ]),
           }
           yield* demotePartition(pk.now, pk.old)

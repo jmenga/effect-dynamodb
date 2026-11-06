@@ -54,6 +54,11 @@ const indexes = {
   },
 } satisfies Record<string, IndexDefinition>
 
+// The mirror follows the setting, so every case runs under both.
+type Flag = { readonly escapeKeys?: true }
+const flags: ReadonlyArray<Flag> = [{}, { escapeKeys: true }]
+const labelOf = (flag: Flag) => (flag.escapeKeys === true ? ", escapeKeys on" : "")
+
 const record = {
   orgId: "Org-A",
   seq: 42,
@@ -65,10 +70,10 @@ const record = {
   active: true,
 }
 
-const entityFor = (casing: Casing): ResolvedEntity => ({
+const entityFor = (casing: Casing, flag: Flag = {}): ResolvedEntity => ({
   variableName: "Tickets",
   entityType: "Ticket",
-  schema: { name: "Help-Desk", version: 3, casing },
+  schema: { name: "Help-Desk", version: 3, casing, ...flag },
   indexes,
   timestamps: false,
   versioned: false,
@@ -77,10 +82,13 @@ const entityFor = (casing: Casing): ResolvedEntity => ({
 })
 
 describe("key composition parity with @effect-dynamodb/schema", () => {
-  for (const casing of ["lowercase", "uppercase", "preserve"] as const) {
-    describe(`casing: "${casing}"`, () => {
-      const entity = entityFor(casing)
-      const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing })
+  const settings = (["lowercase", "uppercase", "preserve"] as const).flatMap((casing) =>
+    flags.map((flag) => ({ casing, flag })),
+  )
+  for (const { casing, flag } of settings) {
+    describe(`casing: "${casing}"${labelOf(flag)}`, () => {
+      const entity = entityFor(casing, flag)
+      const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing, ...flag })
 
       describe("a sharded index", () => {
         const library = {
@@ -189,11 +197,18 @@ describe("key composition parity with @effect-dynamodb/schema", () => {
           )
           if (args.status !== undefined) {
             const expected = KeyComposer.composeSortKeyCondition(schema, "Ticket", 1, index, args)
-            expect(params.KeyConditionExpression).toContain("BETWEEN :skLow AND :skHigh")
-            expect([
-              params.ExpressionAttributeValues![":skLow"],
-              params.ExpressionAttributeValues![":skHigh"],
-            ]).toEqual("between" in expected ? expected.between : [])
+            if (flag.escapeKeys === true) {
+              expect(params.KeyConditionExpression).toContain("BETWEEN :skLow AND :skHigh")
+              expect([
+                params.ExpressionAttributeValues![":skLow"],
+                params.ExpressionAttributeValues![":skHigh"],
+              ]).toEqual("between" in expected ? expected.between : [])
+            } else {
+              expect(params.KeyConditionExpression).toContain("begins_with(#sk, :skPrefix)")
+              expect(params.ExpressionAttributeValues![":skPrefix"]).toBe(
+                "beginsWith" in expected ? expected.beginsWith : undefined,
+              )
+            }
           } else {
             expect(params.ExpressionAttributeValues![":skPrefix"]).toBe(
               KeyComposer.composeSortKeyBeginsWith(schema, "Ticket", 1, index, args),
@@ -377,12 +392,6 @@ describe("numeric key text parity with @effect-dynamodb/schema", () => {
       sk: { field: "sk", composite: ["b", "n"] },
     },
   } satisfies Record<string, IndexDefinition>
-  const schema = DynamoSchema.make({ name: "Help-Desk", version: 3 })
-  const entity: ResolvedEntity = {
-    ...entityFor("lowercase"),
-    indexes: numericIndexes,
-  }
-
   // A deterministic xorshift spread: doubles from raw bit patterns (every
   // exponent, subnormals included) and bigints of up to 60 digits.
   let state = 0x2545f491
@@ -436,30 +445,38 @@ describe("numeric key text parity with @effect-dynamodb/schema", () => {
   ]
   const bigEdges = [0n, 1n, -1n, 10n ** 38n - 1n, 10n ** 38n, 10n ** 38n + 1n, -(10n ** 38n)]
 
-  it("put composes the library's keys for every value", () => {
-    for (const n of [...edges, ...doubles]) {
-      for (const b of [...bigEdges, ...bigints.slice(0, 3)]) {
-        const record = { n, b }
-        const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
-        const expected = KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record)
-        expect(params.Item!.pk, String(n)).toBe(expected.pk)
-        expect(params.Item!.sk, `${b} ${n}`).toBe(expected.sk)
+  for (const flag of flags) {
+    const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, ...flag })
+    const entity: ResolvedEntity = {
+      ...entityFor("lowercase", flag),
+      indexes: numericIndexes,
+    }
+
+    it(`put composes the library's keys for every value${labelOf(flag)}`, () => {
+      for (const n of [...edges, ...doubles]) {
+        for (const b of [...bigEdges, ...bigints.slice(0, 3)]) {
+          const record = { n, b }
+          const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+          const expected = KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record)
+          expect(params.Item!.pk, String(n)).toBe(expected.pk)
+          expect(params.Item!.sk, `${b} ${n}`).toBe(expected.sk)
+        }
       }
-    }
-    for (const b of bigints) {
-      const record = { n: 1, b }
-      const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
-      expect(params.Item!.sk, String(b)).toBe(
-        KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record).sk,
-      )
-    }
-  })
+      for (const b of bigints) {
+        const record = { n: 1, b }
+        const params = buildParamsOrThrow({ entity, type: "put", arguments: record })
+        expect(params.Item!.sk, String(b)).toBe(
+          KeyComposer.composeAllKeys(schema, "Ticket", 1, numericIndexes, record).sk,
+        )
+      }
+    })
+  }
 })
 
 describe("key text escaping parity with @effect-dynamodb/schema (#171, #183)", () => {
   // Every escaped code point (U+0000–U+0025), the first one that isn't, and
-  // values casing maps unevenly: every key escapes them, or with `escapeKeys:
-  // false` none does.
+  // values casing maps unevenly: with `escapeKeys: true` every key escapes them,
+  // and without it none does.
   const values = [
     ...Array.from({ length: 0x27 }, (_, code) => `a${String.fromCharCode(code)}b`),
     "New York",
@@ -485,19 +502,13 @@ describe("key text escaping parity with @effect-dynamodb/schema (#171, #183)", (
     },
   } satisfies Record<string, IndexDefinition>
 
-  const settings = (["lowercase", "uppercase", "preserve"] as const).flatMap((casing) => [
-    { casing, label: casing, flag: {} },
-    { casing, label: `${casing}, escapeKeys off`, flag: { escapeKeys: false as const } },
-  ])
+  const settings = (["lowercase", "uppercase", "preserve"] as const).flatMap((casing) =>
+    flags.map((flag) => ({ casing, label: `${casing}${labelOf(flag)}`, flag })),
+  )
 
   for (const { casing, label, flag } of settings) {
     const schema = DynamoSchema.make({ name: "Help-Desk", version: 3, casing, ...flag })
-    const base = entityFor(casing)
-    const entity: ResolvedEntity = {
-      ...base,
-      schema: { ...base.schema, ...flag },
-      indexes: textIndexes,
-    }
+    const entity: ResolvedEntity = { ...entityFor(casing, flag), indexes: textIndexes }
 
     it(`put, a pin's bounds and the exact key match the library (${label})`, () => {
       for (const status of values) {
@@ -514,19 +525,26 @@ describe("key text escaping parity with @effect-dynamodb/schema (#171, #183)", (
             indexName: "byStatus",
             arguments: { teamId: "Team-B", status },
           })
-          expect(
-            [
-              partial.ExpressionAttributeValues![":skLow"],
-              partial.ExpressionAttributeValues![":skHigh"],
-            ],
-            JSON.stringify(status),
-          ).toEqual(
-            KeyComposer.subtreeCondition(
-              KeyComposer.composeSortKeyPrefix(schema, "Ticket", 1, textIndexes.byStatus, {
-                status,
-              }),
-            ).between,
+          const prefix = KeyComposer.composeSortKeyPrefix(
+            schema,
+            "Ticket",
+            1,
+            textIndexes.byStatus,
+            { status },
           )
+          if (flag.escapeKeys === true) {
+            expect(
+              [
+                partial.ExpressionAttributeValues![":skLow"],
+                partial.ExpressionAttributeValues![":skHigh"],
+              ],
+              JSON.stringify(status),
+            ).toEqual(KeyComposer.subtreeCondition(prefix).between)
+          } else {
+            expect(partial.ExpressionAttributeValues![":skPrefix"], JSON.stringify(status)).toBe(
+              `${prefix}#`,
+            )
+          }
           const complete = buildParamsOrThrow({
             entity,
             type: "query",

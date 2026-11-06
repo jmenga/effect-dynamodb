@@ -52,6 +52,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:escape-on": "vitest run --config vitest.escape-on.ts",
     "test:watch": "vitest",
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "biome check .",
