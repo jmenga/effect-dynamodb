@@ -29,11 +29,15 @@ Other behaviour that changes:
 **Values that can't be stored are now a `ValidationError`, on every path, with nothing sent.**
 
 - A `NaN` key composite is refused with `EDD-9096` with `escapeKeys` off, as it is with it on. The stored text of every other value is unchanged. Up to now it composed `0000000000000NaN`, so `get` and `delete` looked for a key nothing holds, `purge`, a query, a batch and a transactional delete reported success having sent it, and a `put` died in the marshaller. A `NumberFromString` row 1.36 stored under that text still decodes on a scan, and `rekey` leaves it (`skipped.unrecognizedKey`). 1.37 and 1.38 refused it too.
-- A value with no DynamoDB form, `NaN`, `Infinity`, a number past `Number.MAX_SAFE_INTEGER` or an empty set, is a `ValidationError` (`EDD-9124`) from any write, condition or filter, where it was a defect. `Expression.condition`, a plain builder, throws the tagged `UnstorableValueError`.
+- A value with no DynamoDB form, `NaN`, `Infinity` or a number past `Number.MAX_SAFE_INTEGER`, is a `ValidationError` (`EDD-9124`) from any write, condition or filter, where it was a defect. `Expression.condition`, a plain builder, throws the tagged `UnstorableValue`.
 - **A query accessor, `.where()` or `.within()` given such a value no longer throws when called.** It returns a builder whose terminal fails with the `ValidationError`, nothing sent, and whose `.explain()` is the `empty` plan with the reason. That includes `versions`, `deleted.list`, `history`, collections, and a Z-order bound a dimension can't place (`EDD-9092`). Code catching the throw should handle the failure instead. A missing composite and other misuse the types catch still throw.
 - Aggregates, event stores and `GeoIndex.nearby` return the `ValidationError` too, where they died. A projection's row key with no text is that row's `Failed` outcome, not the batch's.
 
 **`upsert` omitting an optional composite no longer leaves the other half stale.** With `pk: [owner]`, `sk: [note]`, `upsert({ owner: "o2" })` stored `owner: o2` under `owner_o1`. Each half is now judged alone, with no read and, when nothing the input names is in a half it leaves, no condition. A half it names part of holds on those values, a rejected write returns the row free and composes from it, and what neither supplies goes by the half's policy. A new row given one half now has that key attribute, without being in the index.
+
+**An `upsert` clearing a secondary index composite no longer leaves its key behind.** `upsert({ ..., und: undefined })` on a `Schema.UndefinedOr` composite removed the attribute and kept the key that held it. It now reads first, and leaves what `.set(...).remove(["und"])` would: the half gone, or truncated to its parents. An `undefined` on a field that's merely optional still keeps the attribute and the key, in one write, and a clear of what no key holds stays one write.
+
+`.remove()` of a `createdAt` or `updatedAt` that isn't a date now compiles, as it always ran: that field is the caller's. So is `Schema.UndefinedOr` of a date, which nothing stamps, so `put`'s type asks for it as the runtime does. A date under `Schema.optional`, or required, stays a compile error and a `ValidationError`, since the library stamps it.
 
 **Aggregates:**
 
