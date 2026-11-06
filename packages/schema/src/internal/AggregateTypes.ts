@@ -330,21 +330,19 @@ export type AggregateEdgesGuard<TSchema extends Schema.Top, TEdges> = {
 }
 
 /**
- * What a many edge's rows are: an array's elements, or a record's or map's values (a custom
- * `decompose`). Any other object has rows only its own `decompose` knows the shape of.
+ * What a many edge's rows are: an array's elements, or a record's values (a custom `decompose`).
+ * Any other object has rows only its own `decompose` knows the shape of.
  */
 type ManyElement<T> =
   T extends ReadonlyArray<infer El>
     ? El
-    : T extends ReadonlyMap<unknown, infer V>
-      ? V
-      : T extends object
-        ? T extends Readonly<Record<string, infer V>>
-          ? string extends keyof T
-            ? V
-            : unknown
+    : T extends object
+      ? T extends Readonly<Record<string, infer V>>
+        ? string extends keyof T
+          ? V
           : unknown
-        : never
+        : unknown
+      : never
 
 /**
  * The attribute paths of a many edge's element that `sk.composite` may name:

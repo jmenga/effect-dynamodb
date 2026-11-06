@@ -134,7 +134,7 @@ describe("the input of an aggregate with `timestamps`", () => {
       expect(accepts(Optional, { ...edges, ...stamps }, input)).toBe(true)
     })
 
-    it("a keyed many edge of plain values, or a map, is as the model has it", () => {
+    it("a keyed many edge of plain values is as the model has it", () => {
       const edges = {
         edges: {
           lines: Aggregate.many({ entityType: "Line", decompose: () => [], assemble: () => ({}) }),
@@ -145,19 +145,6 @@ describe("the input of an aggregate with `timestamps`", () => {
         lines: Schema.Record(Schema.String, Schema.String),
       })
       expect(accepts(Plain, { ...edges, ...stamps }, { lines: { a: "x" } })).toBe(true)
-      const Mapped = Schema.Struct({
-        id: Schema.String,
-        lines: Schema.ReadonlyMap(Schema.String, Child),
-      })
-      expect(accepts(Mapped, { ...edges, ...stamps }, { lines: [["a", { name: "n" }]] })).toBe(
-        false,
-      )
-      const dated = {
-        name: "n",
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      }
-      expect(accepts(Mapped, { ...edges, ...stamps }, { lines: [["a", dated]] })).toBe(true)
     })
 
     it("a many element", () => {

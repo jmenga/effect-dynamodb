@@ -128,15 +128,11 @@ describe("SchemaAccessors typed accessors", () => {
   describe("extractKeyedValue", () => {
     const Value = Schema.Struct({ a: Schema.String })
 
-    it("is the value of a record or a map, under optional too", () => {
-      for (const keyed of [
-        Schema.Record(Schema.String, Value),
-        Schema.ReadonlyMap(Schema.String, Value),
-      ]) {
-        expect(extractKeyedValue(keyed)).toBe(Value)
-        expect(extractKeyedValue(Schema.optional(keyed))).toBe(Value)
-        expect(extractKeyedValue(Schema.optionalKey(keyed))).toBe(Value)
-      }
+    it("is the value of a record, under optional too", () => {
+      const keyed = Schema.Record(Schema.String, Value)
+      expect(extractKeyedValue(keyed)).toBe(Value)
+      expect(extractKeyedValue(Schema.optional(keyed))).toBe(Value)
+      expect(extractKeyedValue(Schema.optionalKey(keyed))).toBe(Value)
     })
 
     it("nothing else has one, whatever it holds in `.value`", () => {

@@ -516,7 +516,7 @@ describe("definition attribute names are typed from the model", () => {
       })
     })
 
-    it("a many sk over a record's or a map's values, as a custom decompose takes them", () => {
+    it("a many sk over a record's values, as a custom decompose takes them", () => {
       const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
       const base = {
         table,
@@ -529,20 +529,12 @@ describe("definition attribute names are typed from the model", () => {
         id: Schema.String,
         lines: Schema.Record(Schema.String, Line),
       })
-      const ByMap = Schema.Struct({
-        id: Schema.String,
-        lines: Schema.ReadonlyMap(Schema.String, Line),
-      })
       const ByStruct = Schema.Struct({
         id: Schema.String,
         lines: Schema.Struct({ first: Line, second: Line }),
       })
       const ByText = Schema.Struct({ id: Schema.String, lines: Schema.String })
       Aggregate.make(ByRecord, {
-        ...base,
-        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }) },
-      })
-      Aggregate.make(ByMap, {
         ...base,
         edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }) },
       })
@@ -557,15 +549,6 @@ describe("definition attribute names are typed from the model", () => {
           ...base,
           edges: {
             // @ts-expect-error a record's value has no `skuu`
-            lines: Aggregate.many({ entityType: "L", sk: { composite: ["skuu"] } }),
-          },
-        }),
-      )
-      typeOnly(() =>
-        Aggregate.make(ByMap, {
-          ...base,
-          edges: {
-            // @ts-expect-error a map's value has no `skuu`
             lines: Aggregate.many({ entityType: "L", sk: { composite: ["skuu"] } }),
           },
         }),

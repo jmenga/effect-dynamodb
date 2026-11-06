@@ -53,6 +53,7 @@ import {
   extractArrayElement,
   getSchemaFields,
   hasEncodingTransformation,
+  refuseReadonlyMaps,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -155,6 +156,7 @@ import {
   refuseAggregateKeyOverMovingValue,
   refuseManySortKeysOverMovingValue,
   resolveAggregateStamps,
+  unwrapModel,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
@@ -734,6 +736,7 @@ export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
 ): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>> {
+  refuseReadonlyMaps(`Aggregate "${config.root.entityType}"`, unwrapModel(schema))
   if (!("table" in config) || config.table === undefined) {
     // Sub-aggregate form
     return makeSubAggregate(schema, config as SubAggregateConfig)

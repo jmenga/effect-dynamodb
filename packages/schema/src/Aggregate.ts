@@ -25,6 +25,7 @@ import {
   getSchemaFields,
   refuseAggregateKeyOverMovingValue,
   refuseManySortKeysOverMovingValue,
+  unwrapModel,
 } from "./internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
@@ -36,6 +37,7 @@ import type {
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
 import type { ModelFieldName } from "./internal/EntityTypes.js"
+import { refuseReadonlyMaps } from "./internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "./internal/SharedKeyAttribute.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
@@ -252,6 +254,7 @@ export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
 ): SubAggregate<TSchema> | AggregateDefinition<TSchema> {
+  refuseReadonlyMaps(`Aggregate "${config.root.entityType}"`, unwrapModel(schema))
   if (!("table" in config) || config.table === undefined) {
     return makeSubAggregate(schema, config as SubAggregateConfig)
   }

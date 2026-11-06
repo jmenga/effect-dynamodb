@@ -73,6 +73,7 @@ import type {
   PrefixFieldNames,
   VersionFieldName,
 } from "./internal/EntityTypes.js"
+import { refuseReadonlyMaps } from "./internal/SchemaAccessors.js"
 import { isShardSourceError } from "./internal/Shards.js"
 import {
   refuseRepeatedIndex,
@@ -903,6 +904,7 @@ export const buildEntityDefinition = (config: {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
   const rawModel = configured ? configured.model : (config.model as Schema.Top)
+  refuseReadonlyMaps(`Entity "${config.entityType}"`, rawModel)
   const configuredAttributes = configured?.attributes ?? {}
   // Schema.Class is a constructable function whose AST is a `Declaration`.
   // The `typeof` check alone is not enough: since Effect 4.0.0-rc,
