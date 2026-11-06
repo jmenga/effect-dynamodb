@@ -214,9 +214,12 @@ const devices = (escapeKeys: boolean) => {
 }
 
 /** The secondary indexes a recording table needs to answer the scenarios' queries. */
-export const RECORDING_INDEXES = Object.fromEntries(
-  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => [`gsi${n}`, { pk: `gsi${n}pk`, sk: `gsi${n}sk` }]),
-)
+export const RECORDING_INDEXES = {
+  ...Object.fromEntries(
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => [`gsi${n}`, { pk: `gsi${n}pk`, sk: `gsi${n}sk` }]),
+  ),
+  lsi1: { pk: "pk", sk: "lsi1sk" },
+}
 
 const seedAll = (table: RepairTable, ids: ReadonlyArray<string> = FIXTURE_IDS) =>
   Effect.forEach(ids, (id) => table.seed(stored138(id)), { discard: true })

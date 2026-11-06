@@ -14,7 +14,7 @@
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Schema } from "effect"
+import { DateTime, Schema } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -303,5 +303,146 @@ describe("aggregate write error unions are exported (#134)", () => {
     expectTypeOf<
       Extract<AggregateWriteError, { readonly _tag: "TransactionCancelled" }>
     >().not.toBeNever()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dates the library stamps: optional on the input, per node, and only with `timestamps`
+// ---------------------------------------------------------------------------
+
+describe("Aggregate input: dates the library stamps", () => {
+  const Dates = { createdAt: Schema.DateTimeUtc, updatedAt: Schema.DateTimeUtc }
+  const base = {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "stamped" },
+    root: { entityType: "Stamped" },
+  } as const
+  const Root = Schema.Struct({ id: Schema.String, title: Schema.String, ...Dates })
+  const Rooted = Aggregate.make(Root, { ...base, edges: {}, timestamps: true })
+  const Bare = Aggregate.make(Root, { ...base, edges: {} })
+  type RootedInput = Aggregate.Input<typeof Rooted>
+  type BareInput = Aggregate.Input<typeof Bare>
+
+  it("a root's are optional with `timestamps`", () => {
+    const left: RootedInput = { title: "t" }
+    const given: RootedInput = {
+      title: "t",
+      createdAt: DateTime.makeUnsafe(0),
+      updatedAt: DateTime.makeUnsafe(0),
+    }
+    expectTypeOf(left).toExtend<RootedInput>()
+    expectTypeOf(given).toExtend<RootedInput>()
+    // @ts-expect-error `title` isn't stamped: it's still required
+    const _noTitle: RootedInput = {}
+    const _wrong: RootedInput = {
+      title: "t",
+      // @ts-expect-error a stamped date is still a date
+      createdAt: "yesterday",
+    }
+  })
+
+  it("and required without", () => {
+    // @ts-expect-error no `timestamps`: nothing stamps them
+    const _left: BareInput = { title: "t" }
+    expectTypeOf<BareInput["createdAt"]>().toEqualTypeOf<DateTime.Utc>()
+  })
+
+  it("under another name, a field of the default name is the caller's", () => {
+    const Updated = Aggregate.make(Root, {
+      ...base,
+      edges: {},
+      timestamps: { updated: { field: "changed" } },
+    })
+    type Input = Aggregate.Input<typeof Updated>
+    const left: Input = { title: "t", updatedAt: DateTime.makeUnsafe(0) }
+    expectTypeOf(left).toExtend<Input>()
+    // @ts-expect-error the stamp is `changed`, so `updatedAt` is the caller's
+    const _left: Input = { title: "t" }
+  })
+
+  it("under a configured name", () => {
+    const Named = Schema.Struct({ id: Schema.String, made: Schema.DateTimeUtc, ...Dates })
+    const Custom = Aggregate.make(Named, {
+      ...base,
+      edges: {},
+      timestamps: { created: { field: "made" } },
+    })
+    type Input = Aggregate.Input<typeof Custom>
+    const left: Input = {
+      createdAt: DateTime.makeUnsafe(0),
+      updatedAt: DateTime.makeUnsafe(0),
+    }
+    expectTypeOf(left).toExtend<Input>()
+    // @ts-expect-error `createdAt` isn't the stamp here
+    const _left: Input = {}
+  })
+
+  it("a field of that name of another type stays required", () => {
+    const Owned = Schema.Struct({ id: Schema.String, createdAt: Schema.String })
+    const Own = Aggregate.make(Owned, { ...base, edges: {}, timestamps: true })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = { createdAt: "mine" }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error the caller's
+    const _left: Input = {}
+  })
+
+  it("a root field of that name of another type turns the stamp off below it too", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Sub = Aggregate.make(Child, { root: { entityType: "Sub" }, edges: {} })
+    const Nested = Schema.Struct({ id: Schema.String, createdAt: Schema.String, sub: Child })
+    const Own = Aggregate.make(Nested, {
+      ...base,
+      edges: { sub: Sub.with({ discriminator: { slot: "a" } }) },
+      timestamps: true,
+    })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = {
+      createdAt: "mine",
+      sub: { name: "n", createdAt: DateTime.makeUnsafe(0) },
+    }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error `createdAt` isn't stamped on any row, so the sub-aggregate's is required
+    const _left: Input = { createdAt: "mine", sub: { name: "n" } }
+  })
+
+  it("a many element and a sub-aggregate root's too; a one edge's input is its id", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Sub = Aggregate.make(Child, { root: { entityType: "Sub" }, edges: {} })
+    const Nested = Schema.Struct({
+      id: Schema.String,
+      venue: Child,
+      lines: Schema.Array(Child),
+      sub: Child,
+    })
+    const edges = {
+      venue: Aggregate.one({ entityType: "Venue" }),
+      lines: Aggregate.many({ entityType: "Line", sk: { composite: ["name"] } }),
+      sub: Sub.with({ discriminator: { slot: "a" } }),
+    }
+    const Stamped = Aggregate.make(Nested, { ...base, edges, timestamps: true })
+    const Unstamped = Aggregate.make(Nested, { ...base, edges })
+    type Input = Aggregate.Input<typeof Stamped>
+    type UnstampedInput = Aggregate.Input<typeof Unstamped>
+    const left: Input = {
+      venueId: "v" as never,
+      lines: [{ name: "n" }],
+      sub: { name: "n" },
+    }
+    expectTypeOf(left).toExtend<Input>()
+    const _noName: Input = {
+      venueId: "v" as never,
+      lines: [],
+      // @ts-expect-error `name` isn't stamped
+      sub: {},
+    }
+    const _unstamped: UnstampedInput = {
+      venueId: "v" as never,
+      lines: [],
+      // @ts-expect-error nothing stamps them
+      sub: { name: "n" },
+    }
   })
 })
