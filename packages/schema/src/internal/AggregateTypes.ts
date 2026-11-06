@@ -7,7 +7,14 @@
 import type { DateTime, Schema } from "effect"
 import type { DiscriminatorConfig, UpdateContext } from "./AggregateCursor.js"
 import type { AggregateEdge, ManyEdge, OneEdge, RefEdge, RefEntity } from "./AggregateEdges.js"
-import type { ModelFieldName, ModelFields, RefEntityIdentifierValue } from "./EntityTypes.js"
+import type {
+  CreatedAtFieldName,
+  ManagedDateField,
+  ModelFieldName,
+  ModelFields,
+  RefEntityIdentifierValue,
+  UpdatedAtFieldName,
+} from "./EntityTypes.js"
 
 // ---------------------------------------------------------------------------
 // Sub-aggregate / Bound sub-aggregate
@@ -101,6 +108,7 @@ type _EdgeIdValue<Edge> =
  * - BoundSubAggregate fields → recursed
  * - ManyEdge fields → array elements recursed for ref replacement
  * - PK composites → omitted
+ * - A date `timestamps` stamps (`TStamps`, at any level) → optional, as on an entity
  * - Everything else → kept as-is
  *
  * Edge id fields resolve to the referenced entity's branded primary-key
@@ -112,6 +120,7 @@ export type AggregateInputType<
   TModel,
   TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
   TPK extends ReadonlyArray<string>,
+  TStamps = never,
 > = _Simplify<
   // Regular fields: not an edge, not a PK composite
   {
@@ -119,7 +128,18 @@ export type AggregateInputType<
       ? never
       : K extends TPK[number]
         ? never
-        : K]: _StripUndefined<TModel[K]>
+        : K extends ManagedDateField<TModel, TStamps>
+          ? never
+          : K]: _StripUndefined<TModel[K]>
+  } & {
+    // A date the library stamps: never the input's to supply, and a supplied one wins
+    readonly [K in keyof TModel as K extends keyof TEdges
+      ? never
+      : K extends TPK[number]
+        ? never
+        : K extends ManagedDateField<TModel, TStamps>
+          ? K
+          : never]?: _StripUndefined<TModel[K]>
   } & {
     // Required OneEdge / RefEdge fields → ${name}Id: <entity branded id>
     readonly [K in keyof TEdges as TEdges[K] extends OneEdge<any> | RefEdge<any>
@@ -141,7 +161,7 @@ export type AggregateInputType<
         ? never
         : K
       : never]: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-      ? AggregateInputType<Schema.Schema.Type<S>, E, []>
+      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps>
       : never
   } & {
     // Optional BoundSubAggregate fields → recurse
@@ -150,7 +170,7 @@ export type AggregateInputType<
         ? K
         : never
       : never]?: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-      ? AggregateInputType<Schema.Schema.Type<S>, E, []>
+      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps>
       : never
   } & {
     // Required ManyEdge fields → transform array elements
@@ -162,7 +182,7 @@ export type AggregateInputType<
           ? IF
           : K
       : never]: K extends keyof TModel
-      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>>
+      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>, TStamps>
       : never
   } & {
     // Optional ManyEdge fields → transform array elements
@@ -173,10 +193,25 @@ export type AggregateInputType<
           : K
         : never
       : never]?: K extends keyof TModel
-      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>>
+      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>, TStamps>
       : never
   }
 >
+
+/**
+ * The field names an aggregate's `timestamps` stamps. A root field of that name that isn't a date is
+ * the caller's, and no row of the aggregate is stamped (`resolveSystemFields`, rule b).
+ */
+export type AggregateStampNames<TModel, TTimestamps> = _NotCallersOwn<
+  TModel,
+  CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>
+>
+
+type _NotCallersOwn<TModel, TNames> = TNames extends keyof TModel
+  ? TNames extends ManagedDateField<TModel, TNames>
+    ? TNames
+    : never
+  : TNames
 
 /** Detect ref-like types: objects with an `id: string` property (Schema.Class entities) */
 type _IsRefLike<T> = T extends { readonly id: string }
@@ -210,12 +245,19 @@ type _RefFieldsToIds<T, Id> = _Simplify<{
  * - When the element wraps the ref (`Array<{ player: Player, ... }>`), the nested
  *   ref field is rewritten to `${field}Id: Id`.
  */
-type _TransformManyEdge<T, Id> =
+type _TransformManyEdge<T, Id, TStamps = never> =
   T extends ReadonlyArray<infer E>
     ? _IsRefLike<E> extends true
       ? ReadonlyArray<Id>
-      : ReadonlyArray<_RefFieldsToIds<E, Id>>
+      : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id>, TStamps>>
     : T
+
+/** `T` with the dates the library stamps optional. */
+type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]
+  ? T
+  : _Simplify<
+      Omit<T, ManagedDateField<T, TStamps>> & Partial<Pick<T, ManagedDateField<T, TStamps>>>
+    >
 
 /** Check if key K is an optional property of T */
 type _IsOptionalIn<T, K> = K extends keyof T ? ({} extends Pick<T, K> ? true : false) : false

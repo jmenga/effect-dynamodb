@@ -166,7 +166,8 @@ type TimestampFieldName<C, Default extends string> = [C] extends [undefined]
       ? F
       : Default
 
-type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
+/** @internal The attribute `timestamps` keeps `created` in. */
+export type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
   ? never
   : TTimestamps extends true
     ? "createdAt"
@@ -174,7 +175,8 @@ type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
       ? TimestampFieldName<C, "createdAt">
       : "createdAt"
 
-type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
+/** @internal The attribute `timestamps` keeps `updated` in. */
+export type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
   undefined | false,
 ]
   ? [TTimestamps] extends [undefined | false]
@@ -199,7 +201,7 @@ export type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | fal
  * The fields of `K` the library manages: the dates. Any other model field of that name is the
  * caller's, required or not as the model says (`resolveSystemFields`, rule b).
  */
-type ManagedDateField<T, K> = {
+export type ManagedDateField<T, K> = {
   [P in K & keyof T]: [Exclude<T[P], undefined>] extends [DateTime.DateTime | Date] ? P : never
 }[K & keyof T]
 

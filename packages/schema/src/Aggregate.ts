@@ -20,11 +20,16 @@ import type { Schema } from "effect"
 import type * as DynamoSchemaModule from "./DynamoSchema.js"
 import type { DiscriminatorConfig } from "./internal/AggregateCursor.js"
 import type { AggregateEdge } from "./internal/AggregateEdges.js"
-import { deriveAggregateSchemas } from "./internal/AggregateSchemas.js"
+import {
+  deriveAggregateSchemas,
+  getSchemaFields,
+  refuseAggregateKeyOverMovingValue,
+} from "./internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
   AggregateEdgesGuard,
   AggregateInputType,
+  AggregateStampNames,
   BoundSubAggregate,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
@@ -211,12 +216,22 @@ export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
+    readonly timestamps?: TTimestamps
   },
-): AggregateDefinition<TSchema, AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>>
+): AggregateDefinition<
+  TSchema,
+  AggregateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+  >
+>
 export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
@@ -279,7 +294,18 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
           ]),
     ],
   )
-  const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
+  refuseAggregateKeyOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.pk.composite,
+  )
+  const derivedSchemas = deriveAggregateSchemas(
+    schema,
+    config.edges,
+    config.pk.composite,
+    config.timestamps,
+  )
 
   return {
     [TypeId]: TypeId,

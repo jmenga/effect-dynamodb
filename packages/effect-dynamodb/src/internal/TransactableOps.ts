@@ -455,7 +455,8 @@ export const composeKeysOrFail = <A>(
  * Marshal an item holding a caller's values. A value DynamoDB can't store (an
  * empty set in a list, `NaN`, a number past `Number.MAX_SAFE_INTEGER`, …) fails with
  * a `ValidationError` naming the field; `fieldOf` names a stored attribute by its
- * model field. Any other throw stays a defect.
+ * model field. So does a value it composes into a key and can't place, as
+ * {@link composeKeysOrFail} says. Any other throw stays a defect.
  */
 export const marshalOrFail = <A>(
   entityType: string,
@@ -476,7 +477,9 @@ export const marshalOrFail = <A>(
               cause: `${error.describe(options.fieldOf)} ${options.outcome ?? "Nothing was written."}`,
             }),
           )
-        : Effect.die(error),
+        : isZOrderValueError(error) || isKeyValueError(error) || isShardSourceError(error)
+          ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
+          : Effect.die(error),
     ),
   )
 
