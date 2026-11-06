@@ -745,17 +745,19 @@ without an exponent, so `0.1` is `.1`; trailing zeros are dropped. The leading b
 orders the forms (`-` < digits < `:` < `;`; under `-`, `)` < `*` < digits), and a
 negative's `:` terminator sorts its shorter text last, so `-3.14 < -3.1 < -3`. Every
 byte is above the `#` delimiter and none is a letter, so casing never changes it and
-a composite that continues with `#<next>` keeps the order. `NaN` has no order and a
-bigint of more than 1,000 digits overflows the exponent: with `escapeKeys: true` both throw
-`[EDD-9096]` (`KeyValueError`). Where that surfaces:
+a composite that continues with `#<next>` keeps the order. `NaN` has no order, so it throws
+`[EDD-9096]` (`KeyValueError`) under either setting. A bigint of more than 1,000 digits overflows
+the exponent, and throws it with `escapeKeys: true`. Where that surfaces:
 
 | Path | Result |
 |---|---|
 | Entity writes and key-taking operations: `put`, `create`, `upsert`, `update` (key, or a `.set()` index composite), `get`, `delete`, `restore`, `purge`, time-series `append` (key or `orderBy`); unique-constraint values on `put`, `create`, `upsert` and `restore` | `ValidationError` for the operation, cause the `KeyValueError`, before anything is marshalled or sent (`composeKeysOrFail`) |
 | `Batch.get` / `Batch.write`, `Transaction.transactGet` / `transactWrite` | `ValidationError`, nothing sent (`composePrimaryKeyOrFail`, and the put builder's unique-value check) |
-| Query accessors, `.where()` and `.within()` operands | Thrown when called, as other unusable accessor composites are |
-| `Aggregate`, `EventStore` | Not converted: a defect |
-| A `NaN` in a number attribute that is not a key composite | Refused by the marshaller (a defect), as in 1.36 |
+| Query accessors (`versions`, `deleted.list`, `history` and collections too), `.where()`, `.within()` and `GeoIndex.nearby`'s `pkFilter` | The builder is returned refused, and its terminal fails with a `ValidationError`, nothing sent (`Query.orRefusal`). `.explain()` returns the `empty` plan with the reason, and `asParams` fails the same way. Misuse the types catch (a missing composite, `EDD-9053`, `EDD-9093`) still throws |
+| `Aggregate`, `EventStore` and every other operation | `ValidationError` for the operation, from the operation's scope (`Capacity.operation`, `delegate`, `operationStream`). A projection's row key is that row's `Failed` outcome, not the batch's |
+| A value with no DynamoDB form outside a key: `NaN`, `±Infinity` or a number past `Number.MAX_SAFE_INTEGER` in an attribute, a condition or a filter, an empty set | `ValidationError` over `UnstorableValueError` (`EDD-9124`), from the same scopes, nothing sent |
+
+`Capacity.withOperation` (`ConsumedCapacity.withOperation`, the public one) doesn't convert: what the caller's effect dies of is the caller's. `Expression.condition`, a plain builder the caller invokes with no error channel, throws the tagged `UnstorableValueError`. A bigint DynamoDB can't hold is DynamoDB's to refuse: `Schema.BigInt` of 1,001 digits fails with its `DynamoValidationError`, typed, with `escapeKeys` off, and a `BigIntFromString` stores as ever there.
 
 Up to 1.36, and with `escapeKeys` off, a number's text is `String(n).padStart(16, "0")`
 (38 for a bigint), which sorts `-3` above `-5`, `10.5` below `3.14`, `1e-7` above `3` and
@@ -763,10 +765,13 @@ Up to 1.36, and with `escapeKeys` off, a number's text is `String(n).padStart(16
 every other number (negative, fractional, `≥ 1e16`, `±Infinity`), every negative or
 `≥ 1e38` bigint, and `DateEpochMs` and `DateEpochSeconds` composites before 1970 differ.
 
-**Off composes exactly what 1.36 composed**, so a row 1.36 stored stays where a read looks:
-`NaN` is `0000000000000NaN` (then cased), a very long bigint its digits, and neither is
-refused. A `NaN` shard source is `EDD-9096` under either setting: there was no sharding in
-1.36, so no text to keep. A `NaN` in a number attribute dies in the marshaller either way.
+**Off composes what 1.36 composed**, so a row 1.36 stored stays where a read looks: a very long
+bigint is its digits and `Infinity` is `00000000infinity` (then cased), and neither is refused.
+`NaN` alone isn't composed, since no order or lookup can use it. `KeyText136.schema136` still
+composes `0000000000000NaN` for the fixture and for `rekey`, `text136` being what lets it: no write
+or query has that text. Only a `NumberFromString` ever stored it (the marshaller refused a number),
+and 1.37 and 1.38 refused it too. Such a row still decodes on a scan. `rekey` leaves it: its own key
+holding `NaN` is `skipped.unrecognizedKey`, and an index key holding it has no difference to judge.
 
 **History.** 1.37.0 composed numeric text unconditionally, and 1.38.0 kept it. Since 1.39.0
 it belongs to `escapeKeys: true`.
@@ -1097,7 +1102,7 @@ that is no form's text for its row's values; a sentinel with no row behind it, o
 compose no such sentinel; an aggregate's rows below no root in their partition, including what a 1.37.0
 or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
 under no text; a projection tombstone or outbox item whose key reads as more than one set of values; a
-row holding `NaN` in a key under `escapeKeys: true`. `conflicts`, `failed`: a row whose Z-order value no
+row holding `NaN` in its own key. `conflicts`, `failed`: a row whose Z-order value no
 longer places a key; a stream id whose rows read as two different ids. `skipped.rootNotSeen`: an aggregate's
 rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
 say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
@@ -1588,11 +1593,22 @@ A new row takes the composed key. A write that doesn't stand is rejected with `R
 
 With a primary key over an unsupplied `createdAt` there's no existing item to name, so an upsert creates.
 
+**An upsert leaving out a composite.** An upsert that omits an optional composite leaves that attribute as stored, so nothing on the input alone composes a half holding it, and if that made the whole index unwritable, the other half went stale: `pk: [owner]`, `sk: [note]`, `upsert({ owner: "o2" })` stored `owner: o2` under `owner_o1`. Each half is now judged alone (`upsertKeys`, `upsertKeyPlan`, `KeyComposer.composeKnownHalves`):
+
+| Half | Written | Stands on an existing row when |
+|---|---|---|
+| The input has all it holds | SET from the input | Always, or as the tables above say. On a new row this half is written alone: the row isn't in the index until the other half is, and `rekey` finds nothing to repair |
+| The input has all it holds, but it's all primary composites, kept values or `composite: []` | Not written alone: it says what it always said | Always |
+| The input has some of what it holds | Not written | Each value it names is what's stored. A stamped `updatedAt` isn't named, so the half lags, as on an update. One the input supplies is, and moves the key |
+| The input has none of what it holds | Not written | Always: nothing it holds changed, so one write and no condition |
+
+So the ordinary upsert stays one write, no read and no condition. A rejected write returns the row at no read (`ALL_OLD`), and the upsert composes from the row merged with the input (`guardedUpsert`). What the row can't supply either goes through the per-half policy, as on an update: a hole in a half (`[a, b]` with `a` absent, `b` present) is `'sparse'` REMOVE or `'preserve'` noop, and a trailing absence truncates. Nothing here reads: the reads an upsert has are still those of `unique`, `retain` and an omitted defaulted composite.
+
 A time-series `append` has no `updatedAt` (`orderBy` is its clock), and it does the same over `createdAt`: every half holding it is `if_not_exists`, and the CAS also requires the key and that the half's other values are the ones written (`keptValues`). A rejection returns the row. If the key can't stay, the append composes from the row and sends again, guarded on the `orderBy` it was handed (`appendOverRead`); otherwise the rejection was the CAS or the caller's condition, as it always was, and the row saves that follow-up read. With `skipFollowUp` an append over `createdAt` sends no read at all.
 
 **Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Any other is the caller's (rule b, above), and the types agree: `WithSystemCollisions` makes only a managed date optional. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
 
-**Aggregates.** See "Aggregate System Timestamps" (§11). An aggregate's list key and collection sort key compose from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree. A partition key over a stamped `updatedAt` and a `many` edge's sort key over one are refused (`EDD-9121`): both name rows, and neither can move.
+**Aggregates.** See "Aggregate System Timestamps" (§11). An aggregate's list key and collection sort key compose from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree. A partition key over a stamped `updatedAt` and a `many` edge's sort key over one are refused (`EDD-9121`), by the pure `Aggregate.make` in `@effect-dynamodb/schema` and the operational one alike (`refuseManySortKeysOverMovingValue`): both name rows, and neither can move.
 
 **Repair.** `judgeIndexHalf` judges these halves like any other (see "Index keys that differ"): a row 1.38 wrote with no key is `missing`, and a key that only lags `updatedAt` is no difference.
 
@@ -3766,6 +3782,8 @@ configuration that could add one (#98).
    rewritten row is stamped, and a row the diff left keeps its value. When a node
    declares a stamp, the result is assembled from the rows written, with no I/O. When
    none does, it's the decoded value, and nothing extra runs.
+7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap` field isn't a fill problem and stays out: it doesn't survive `update` here, or read back on an entity, in any release, for want of a stored form.
+8. **The input matches what `create` takes, at every row.** A `one` edge with an `entity` takes an id (`venueId`), which `create` fetches and denormalises. One with no `entity` has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
 
 **A key with no value.** A composite of an aggregate key can be optional. What happens without a value depends on what the key does:
 
@@ -5438,11 +5456,11 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9089` | `Entity.ts` (schema) | Bit budget: a dimension over its kind's limit (53 bits for `int` / `float` / `dateTime` / `literals`, 128 for `string`), or `Σ bits > 512` (64 address bytes) |
 | `EDD-9090` | `Entity.ts` (schema, runtime `_injectIndex`) | A Z-order index declares `collection`, or a collection injects one |
 | `EDD-9091` | `Table.ts` (`Table.make`, `Table.definition`) | One physical attribute is declared with two types across table members: a Z-order (`B`) half and a string (`S`) key half, or a key attribute and a vector filter attribute |
-| `EDD-9092` | `internal/ZOrderCurve.ts`: through the write paths as a `ValidationError` (put, update, upsert, restore, append, transactional and batch writes); thrown at `.within()` (`DynamoClient.ts`) for a query bound | A value a Z-order dimension can't place: `NaN`, an unparseable date, a value outside a `literals` list |
+| `EDD-9092` | `internal/ZOrderCurve.ts`: through the write paths as a `ValidationError` (put, update, upsert, restore, append, transactional and batch writes); for a query bound, `.within()` returns the builder refused and its terminal fails with a `ValidationError`, nothing sent (`Query.orRefusal`) | A value a Z-order dimension can't place: `NaN`, an unparseable date, a value outside a `literals` list |
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
 | `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). On a sharded index (#183): also a wrong position count or shape, an unexpected attribute in a position, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query (`docs/designs/gsi-write-sharding.md` §6.6). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
-| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`), with `escapeKeys: true`, and for a shard source under either setting: a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text"). Off composes the 1.36 text and doesn't refuse | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
+| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`), and `KeyComposer.compositeText` for `NaN` with `escapeKeys` off: a `ValidationError` before anything is sent, on every path that composes a key ("Numeric key text"). Off refuses `NaN` and composes the 1.36 text of everything else; only `KeyText136.schema136` (`text136`) has text for it | A key composite or bound with no numeric key text: `NaN` (no order) under either setting, or, with `escapeKeys: true`, a bigint of more than 1,000 digits (past the 3-digit exponent) |
 | `EDD-9097` | — | **Retired** in #183 (`ItemNotMoved`, a transaction over an item still under its 1.36 key): nothing reads or moves a row under other text but `rekey`. Do not reuse |
 | `EDD-9098` | `internal/Rekey.ts` (`ValidationError`, `entityType: "Table"`, `operation: "rekey"`) | A `rekey` option that is not a positive integer (`segments`, `concurrency`, `pageSize`, `maxPages`), a malformed resume token, a token of another table, or a `segments` other than the token's. Nothing is read |
 
@@ -5459,11 +5477,12 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
 | `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 
-| `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make` (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, and the many edge check in `effect-dynamodb`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
+| `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make`, pure and operational (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, `refuseManySortKeysOverMovingValue`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
+| `EDD-9124` | `Marshaller.ts` (`UnstorableValueError`), through `Capacity.operation` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an empty set, an unsupported type. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. |
 
-Next free code: **`EDD-9124`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9125`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

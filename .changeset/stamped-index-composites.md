@@ -25,3 +25,19 @@ Other behaviour that changes:
 - **An optional composite in an aggregate key with no value no longer dies with a defect.** In a `list` key, sharded or not, the row is left out of that list, as a sparse index on an entity leaves it out. In a collection sort key or the partition key it's a `ValidationError` (`EDD-9123`) before anything is written, since a root outside the collection index can't be read back; `delete` reports it as `AggregateAssemblyError`. A `list` filter that leaves out a composite of the list's partition key is the same `ValidationError`.
 - **These aggregate definitions now fail at load** (`EDD-9121`): a partition key or a `many` edge's sort key over a stamped `updatedAt`. Both name the row, so every update wrote a new row and left the old one.
 - `put`'s type no longer offers a plain `createdAt: Schema.String` as optional: the runtime always required it. An update may name one, as the runtime always let it.
+
+**Values that can't be stored are now a `ValidationError`, on every path, with nothing sent.**
+
+- A `NaN` key composite is refused with `EDD-9096` with `escapeKeys` off, as it is with it on. The stored text of every other value is unchanged. Up to now it composed `0000000000000NaN`, so `get` and `delete` looked for a key nothing holds, `purge`, a query, a batch and a transactional delete reported success having sent it, and a `put` died in the marshaller. A `NumberFromString` row 1.36 stored under that text still decodes on a scan, and `rekey` leaves it (`skipped.unrecognizedKey`). 1.37 and 1.38 refused it too.
+- A value with no DynamoDB form, `NaN`, `Infinity`, a number past `Number.MAX_SAFE_INTEGER` or an empty set, is a `ValidationError` (`EDD-9124`) from any write, condition or filter, where it was a defect. `Expression.condition`, a plain builder, throws the tagged `UnstorableValueError`.
+- **A query accessor, `.where()` or `.within()` given such a value no longer throws when called.** It returns a builder whose terminal fails with the `ValidationError`, nothing sent, and whose `.explain()` is the `empty` plan with the reason. That includes `versions`, `deleted.list`, `history`, collections, and a Z-order bound a dimension can't place (`EDD-9092`). Code catching the throw should handle the failure instead. A missing composite and other misuse the types catch still throw.
+- Aggregates, event stores and `GeoIndex.nearby` return the `ValidationError` too, where they died. A projection's row key with no text is that row's `Failed` outcome, not the batch's.
+
+**`upsert` omitting an optional composite no longer leaves the other half stale.** With `pk: [owner]`, `sk: [note]`, `upsert({ owner: "o2" })` stored `owner: o2` under `owner_o1`. Each half is now judged alone, with no read and, when nothing the input names is in a half it leaves, no condition. A half it names part of holds on those values, a rejected write returns the row free and composes from it, and what neither supplies goes by the half's policy. A new row given one half now has that key attribute, without being in the index.
+
+**Aggregates:**
+
+- `create` stamps a `Schema.Record` `many` edge with a custom `decompose` and `assemble`, and its dates are stored in their own form. It failed with `Missing key` before, or with no `entity` stored a date as a map no read could decode. The input type and `inputSchema` make those dates optional.
+- `sk.composite` on a `Schema.Record` `many` edge now compiles, and each name is checked against the record's value. It had been a compile error whatever the name, since the check read only an array's element.
+- A `one` edge with no `entity` takes its value in the input, as `create` always did. The type and `inputSchema` asked for an id it can't use.
+- `@effect-dynamodb/schema`'s `Aggregate.make` refuses a `many` sort key over a stamped `updatedAt` (`EDD-9121`), as the operational one does.

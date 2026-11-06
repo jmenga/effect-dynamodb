@@ -251,7 +251,7 @@ Every row is moved or counted. These are counted on every run, and left as they 
 | An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey`; a run bounded by `maxPages` or started from `resume` says `skipped.rootNotSeen` instead, since the root could be on a page it didn't read |
 | An aggregate root under no text its values composed | `skipped.unrecognizedKey` |
 | A projection tombstone or outbox item whose key reads as more than one set of values | `skipped.unrecognizedKey` |
-| A row holding `NaN` in a key, under `escapeKeys: true` (it has no key text there) | `skipped.unrecognizedKey` |
+| A row holding `NaN` in its own key (it has no key text) | `skipped.unrecognizedKey` |
 | A row whose Z-order value no longer places a key | `conflicts`, `failed` |
 | A stream id whose rows read as two different ids | `conflicts`, `failed` |
 | A stream with another stream id's event right after its last, from a write that landed on it before `rekey` | `conflicts`, `contended` |

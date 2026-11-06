@@ -377,7 +377,15 @@ That row then works like an entity:
 - A field of that name that isn't a date is yours, on that row, and the library leaves it
   alone. On the root it turns that stamp off for every row.
 - A partition key or a `many` edge's sort key over a stamped `updatedAt` is refused at
-  `Aggregate.make` (`EDD-9121`): those keys name rows, and it moves on every write.
+  `Aggregate.make` (`EDD-9121`), in `@effect-dynamodb/schema` too: those keys name rows, and it
+  moves on every write.
+- A `many` edge held as a `Schema.Record`, with a custom `decompose` and `assemble`, is filled the
+  same way: its rows are taken apart, filled and put back, and the input type makes the date
+  optional there too. Its `sk.composite` names are checked against the record's value. With a
+  `decompose` and no `assemble`, an array still fills and anything else must supply its dates, since
+  nothing says how to put its rows back.
+- A `one` edge with no entity of its own takes its value in the input under its field name, with
+  the date optional. Only an edge with an `entity` takes an id (`venueId`).
 
 #### Do You Need a Secondary Index?
 

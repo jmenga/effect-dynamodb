@@ -506,6 +506,7 @@ const shut = yield* db.entities.Tickets.byStatus({ owner: "ana" })
   | `[status, createdAt]`, `createdAt` not supplied | One write | Two writes |
 
   The rejected write is charged write capacity, so if every upsert of a row changes `status`, passing the stored `createdAt` in the input costs less: it's then one write. With the primary key over an unsupplied `createdAt`, nothing can name an existing item, so it creates one.
+- **An `upsert` leaving out an optional composite** keeps that attribute as stored, and each half of the key is judged alone. With `pk: [owner]`, `sk: [note]`, an `upsert({ owner: "o2" })` writes the partition key and leaves the sort key, in one write, with no read. A half the input names only part of holds if those values are what's stored. If one changed, the write is rejected, returns the row at no cost in reads, and the key is composed from the row and the input. What neither supplies goes by the half's policy, as on an update. A new row given only one half has that key attribute but isn't in the index until a write supplies the other.
 - **A time-series `.append()`** has no `updatedAt`: the `orderBy` attribute is its clock. An index over `createdAt` works the same way: no read before the write, and a rejected transaction and a second one where the rest of the key changed.
 
 Rows an earlier release wrote have no key in these indexes unless the caller supplied the value, because `put` composed before stamping. `rekey({ repairIndexKeys: true })` [brings them in](/effect-dynamodb/guides/upgrading/#repairing-index-keys).

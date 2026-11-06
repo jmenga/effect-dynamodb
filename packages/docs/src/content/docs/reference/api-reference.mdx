@@ -497,7 +497,7 @@ import { Query } from "effect-dynamodb"
 | `paginate` | `Effect<Stream<Array<A>>>` | Execute and return a Stream of pages for lazy pagination |
 | `count` | `Effect<number>` | Execute with `SELECT COUNT` — returns total matching items (respects `maxPages`) |
 | `explain` | `Effect<QueryExplain, never, never>` | Describe the plan, its reason, the key ranges known up front, the fields checked per row and the request sizing, without sending anything. A `startFrom` cursor is not read |
-| `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send |
+| `asParams` | `Effect<Record<string, unknown>, ValidationError>` | Return built DynamoDB command input without executing — useful for debugging. Fails with a `ValidationError` for a filter the query would refuse to send, or a value no key can hold |
 
 ### Filter Operators
 
@@ -1042,6 +1042,7 @@ import { KeyComposer } from "effect-dynamodb"
 | `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
 | `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
 | `composeSkValue` | `(schema, entityType, entityVersion, index, record) => KeyValue` | `composeSk` for a string half, `composeZOrderSk` for a Z-order half |
+| `composeKnownHalves` | `(schema, entityType, entityVersion, index, record) => Record` | The halves of an index `record` has every value of, each composed alone, and nothing for the rest. A half with no composites always composes |
 | `isZOrderHalf` | `(part) => part is ZOrderSkPart` | Is this sort key half a Z-order one? |
 | `composeIndexKeys` | `(schema, entity, index, record) => Record` | Compose all key attributes for an index |
 | `tryComposeIndexKeys` | `(schema, entity, index, record) => Record \| undefined` | Non-throwing variant for sparse GSIs |
@@ -1592,6 +1593,7 @@ import {
 | `ItemNotDeleted` | `"ItemNotDeleted"` | `restore` found a live item under the key as well as the soft-deleted one (for example, the item was recreated after it was deleted) |
 | `CompositeKeyHoleError` | `"CompositeKeyHoleError"` | EDD-9024 — **deprecated in v1.7.1**, no longer thrown at runtime. Class export retained for back-compat with consumers who type-imported it for `Effect.catchTag` handlers. Hole patterns now collapse into the unified per-half can't-compose rule (drop under sparse, noop-or-cascade-override under preserve). |
 | `CompositeNullableError` | `"CompositeNullableError"` | EDD-9025 — composite attribute Schema includes `null`. Raised at `Entity.make()` time. Carries `entityType`, `surface` (e.g. `"primaryKey"`, `"index:..."`, `"unique:..."`), `compositeAttribute`, `schemaPath`. |
+| `Marshaller.UnstorableValueError` | `"UnstorableValueError"` | EDD-9124 — a value with no DynamoDB form: `NaN`, `±Infinity`, a number past `Number.MAX_SAFE_INTEGER`, an empty set. Operations report it as the `cause` of a `ValidationError`, nothing sent. Thrown by the plain builder `Expression.condition`, which has no error channel |
 | `RefNotFound` | `"RefNotFound"` | Referenced entity not found during ref hydration (`entity`, `field`, `refEntity`, `refId`) |
 | `AggregateAssemblyError` | `"AggregateAssemblyError"` | Aggregate read path failed — missing items, structural violations, or decode errors (`aggregate`, `reason`, `key`) |
 | `AggregateDecompositionError` | `"AggregateDecompositionError"` | Aggregate write path failed — schema validation or structural error (`aggregate`, `member`, `reason`) |

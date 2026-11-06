@@ -182,7 +182,8 @@ const regionMatches = yield* db.entities.Listings.search({ region: "north" })
 - **Prefix composites** take one exact value each.
 - **A dimension left out** means its full range. `.within({})` changes nothing.
 - **Every bound is exact.** Quantization lets rows just outside the box share a level with rows inside it, so the library checks every bound on the rows it reads: with a `FilterExpression` where DynamoDB's comparison of the stored attribute agrees with the dimension's order, and on each row in the client where it doesn't (a `Schema.NumberFromString` field stored as text, a `DateTimeZoned` field, a hashed prefix).
-- **Bad bounds throw at `.within()`**, before anything is sent: a value that can't be encoded (`EDD-9050`), one a dimension can't place (`EDD-9092`), or a misuse reachable from untyped code, such as an unknown field or a range on a prefix composite (`EDD-9093`).
+- **A value a dimension can't place** (`EDD-9092`) fails the query at its terminal with a `ValidationError`, before anything is sent, and `.explain()` says why.
+- **Other bad bounds throw at `.within()`**, before anything is sent: a value that can't be encoded (`EDD-9050`), or a misuse reachable from untyped code, such as an unknown field or a range on a prefix composite (`EDD-9093`).
 
 `.where()` is not offered on a Z-order accessor: the sort key is a binary address, with no text order to compare against.
 
