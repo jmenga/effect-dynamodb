@@ -529,7 +529,7 @@ class Paired extends Schema.Class<Paired>("Paired")({
   note: Schema.optional(Schema.String),
 }) {}
 
-const pairedWorld = (shared: boolean) =>
+const pairedWorld = () =>
   worldOf(Paired, primaryKey, {
     byRegion: {
       name: "gsi",
@@ -537,31 +537,29 @@ const pairedWorld = (shared: boolean) =>
       sk: { field: "gsk", composite: ["tenant"] },
     },
     byGroup: {
-      name: shared ? "gsi" : "gsi2",
-      pk: { field: shared ? "gpk" : "gpk2", composite: ["group"] },
-      sk: { field: shared ? "gsk" : "gsk2", composite: ["extra"] },
+      name: "gsi2",
+      pk: { field: "gpk2", composite: ["group"] },
+      sk: { field: "gsk2", composite: ["extra"] },
     },
   })
 
 /**
- * Canonical shape 13: two accessors storing their halves in one attribute, on a row that
- * holds composites of both. Nothing on the row says which owns the attribute, so `rekey`
- * never asks: a half is rewritten only when the stored key is its own 1.36 text. Each runs
- * with the attributes shared and, as a control, with them apart.
+ * Two accessors on a row holding composites of both, each in its own attributes: a half is
+ * rewritten only when the stored key is its own 1.36 text, and the other accessor's keys say
+ * nothing about it. (In one attribute they're refused: shape 13, `EDD-9106`.)
  */
-export const sharedPairScenarios: ReadonlyArray<{
+export const separatePairScenarios: ReadonlyArray<{
   readonly name: string
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
-}> = [true, false].flatMap((shared) => {
-  const suffix = shared ? "" : " (control: attributes apart)"
+}> = (() => {
   const stays = (
     name: string,
     write: (db: any) => Effect.Effect<unknown, unknown, any>,
     pin: any,
   ) => ({
-    name: `${name}${suffix}`,
+    name,
     run: (h: Harness) =>
-      h.on(pairedWorld(shared), (db, table) =>
+      h.on(pairedWorld(), (db, table) =>
         Effect.gen(function* () {
           yield* write(db)
           expect(yield* db.entities.Rows.byRegion(pin).collect()).toHaveLength(1)
@@ -595,9 +593,9 @@ export const sharedPairScenarios: ReadonlyArray<{
       { region: "east" },
     ),
     {
-      name: `a put holding every composite: the later accessor's keys stay${suffix}`,
+      name: "a put holding every composite: both accessors' keys stay",
       run: (h: Harness) =>
-        h.on(pairedWorld(shared), (db, table) =>
+        h.on(pairedWorld(), (db, table) =>
           Effect.gen(function* () {
             yield* db.entities.Rows.put({
               ...key,
@@ -612,9 +610,9 @@ export const sharedPairScenarios: ReadonlyArray<{
         ),
     },
     {
-      name: `a sort key that is its own 1.36 text is rewritten, the other half left${suffix}`,
+      name: "a sort key that is its own 1.36 text is rewritten, the other half left",
       run: (h: Harness) => {
-        const world = pairedWorld(shared)
+        const world = pairedWorld()
         const values = { tenant: "a b", id: "1", region: "west", group: "team" }
         const index = world.Rows.indexes.byRegion
         const gsk = KeyText136.composeSk(on, "Row", 1, index, values)
@@ -638,9 +636,9 @@ export const sharedPairScenarios: ReadonlyArray<{
       },
     },
     {
-      name: `the later accessor's own 1.36 text is rewritten, and only its own${suffix}`,
+      name: "one accessor's own 1.36 text is rewritten, and the other's unrelated keys left",
       run: (h: Harness) => {
-        const world = pairedWorld(shared)
+        const world = pairedWorld()
         const values = { tenant: "t", id: "1", region: "west", group: "team", extra: "x y" }
         const index = world.Rows.indexes.byGroup
         const gsk = KeyText136.composeSk(on, "Row", 1, index, values)
@@ -649,23 +647,15 @@ export const sharedPairScenarios: ReadonlyArray<{
         return h.on(world, (db, table) =>
           Effect.gen(function* () {
             yield* table.seed(
-              rowOf(
-                world,
-                values,
-                shared
-                  ? { gpk, gsk }
-                  : { gpk: "unrelated", gsk: "unrelated", gpk2: gpk, gsk2: gsk },
-              ),
+              rowOf(world, values, { gpk: "unrelated", gsk: "unrelated", gpk2: gpk, gsk2: gsk }),
             )
             const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
             expect(report.indexKeysRewritten).toBe(1)
             expect(report.conflicts).toEqual([])
             const [row] = yield* table.rows()
-            expect(row![shared ? "gpk" : "gpk2"].S).toBe(gpk)
-            expect(row![shared ? "gsk" : "gsk2"].S).toBe(
-              KeyComposer.composeSk(on, "Row", 1, index, values),
-            )
-            if (!shared) expect(row!.gsk.S).toBe("unrelated")
+            expect(row!.gpk2.S).toBe(gpk)
+            expect(row!.gsk2.S).toBe(KeyComposer.composeSk(on, "Row", 1, index, values))
+            expect(row!.gsk.S).toBe("unrelated")
             const pin = { group: "team", extra: "x y" }
             expect(yield* db.entities.Rows.byGroup(pin).collect()).toHaveLength(1)
           }),
@@ -673,7 +663,7 @@ export const sharedPairScenarios: ReadonlyArray<{
       },
     },
     {
-      name: `a partition key that is its own 1.36 text is rewritten${suffix}`,
+      name: "a partition key that is its own 1.36 text is rewritten",
       run: (h: Harness) => {
         const world = worldOf(Paired, primaryKey, {
           byScore: {
@@ -682,9 +672,9 @@ export const sharedPairScenarios: ReadonlyArray<{
             sk: { field: "gsk", composite: ["tenant"] },
           },
           byGroup: {
-            name: shared ? "gsi" : "gsi2",
-            pk: { field: shared ? "gpk" : "gpk2", composite: ["group"] },
-            sk: { field: shared ? "gsk" : "gsk2", composite: ["extra"] },
+            name: "gsi2",
+            pk: { field: "gpk2", composite: ["group"] },
+            sk: { field: "gsk2", composite: ["extra"] },
           },
         })
         const values = { ...key, region: "west", score: -3, group: "team" }
@@ -706,7 +696,7 @@ export const sharedPairScenarios: ReadonlyArray<{
       },
     },
   ]
-})
+})()
 
 /**
  * Two accessors over one sharded partition key: `EDD-9106` has proved they compose the
@@ -949,47 +939,50 @@ export const shardLayoutMoveScenario = (h: Harness) => {
 }
 
 /**
- * A half stored in a table key attribute is the table's to hold: DynamoDB refuses the
- * update. An inverted index's sort key in `pk` is the case that gets as far as asking: its
- * text is its own 1.36 text, as a partition key's value isn't escaped and 1.36's sort
- * key's wasn't either, and that isn't its current text.
+ * A half stored in a table key attribute is the table's key: its text is the row's whatever
+ * the values hold, so `rekey` has nothing to compare it with (D62). A local index's partition
+ * key, a sort key shared with the table, and an inverted index's halves, whose kinds differ
+ * from the table's they're stored in.
  */
 export const tableKeyAttributeScenarios: ReadonlyArray<{
   readonly name: string
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
 }> = [
   {
-    name: "another accessor's half",
+    name: "a local index's partition key",
     index: {
-      name: "gsi",
-      pk: { field: "gpk", composite: ["note"] },
-      sk: { field: "sk", composite: ["note"] },
+      name: "lsi",
+      pk: { field: "pk", composite: ["tenant"] },
+      sk: { field: "lsk", composite: ["status"] },
     },
-    values: { ...key, status: "s", count: 1, note: "n" },
-    keys: { gpk: "$compared#v1#row#note_n" },
-    own136: false,
+    keys: { lsk: "$compared#v1#row#status_s" },
   },
   {
-    name: "an inverted index's sort key, its own 1.36 text",
+    name: "a sort key shared with the table",
+    index: {
+      name: "gsi",
+      pk: { field: "gpk", composite: ["status"] },
+      sk: { field: "sk", composite: ["id"] },
+    },
+    keys: { gpk: "$compared#v1#row#status_s" },
+  },
+  {
+    name: "an inverted index",
     index: {
       name: "gsi",
       pk: { field: "sk", composite: ["id"] },
       sk: { field: "pk", composite: ["tenant"] },
     },
-    values: { ...key, tenant: "a b", status: "s", count: 1 },
     keys: {},
-    own136: true,
   },
-].map(({ name, index, values, keys, own136 }) => ({
+].map(({ name, index, keys }) => ({
   name,
   run: (h: Harness) => {
     const world = worldOf(Flat, primaryKey, { byNote: index })
+    const values = { tenant: "a b", id: "c d", status: "s", count: 1 }
     const row = rowOf(world, values, keys)
     const half = world.Rows.indexes.byNote
-    if (own136) {
-      expect(KeyText136.composeSk(on, "Row", 1, half, values)).toBe(row.pk.S)
-      expect(KeyComposer.composeSk(on, "Row", 1, half, values)).not.toBe(row.pk.S)
-    }
+    expect(half.tableKey).toBeDefined()
     return h.on(world, (db, table) =>
       Effect.gen(function* () {
         yield* table.seed(row)

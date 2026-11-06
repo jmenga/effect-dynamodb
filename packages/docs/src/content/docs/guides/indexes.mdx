@@ -83,6 +83,40 @@ GSI access patterns are defined directly on the entity via the `indexes` propert
 
 Several entities can overload one physical GSI (`gsi1` serving `byProject` on one entity and `byTenant` on another), but one physical index has one key schema. Every member of a table that declares it, including the auto-generated `_cascade_<field>` indexes and an aggregate's collection and list indexes, must name the same `pk.field` / `sk.field` and agree on GSI versus LSI. Entities on one table must also declare the same primary-key fields. `Table.make` and `Table.definition` throw `[EDD-9069]`, naming both declarers, when they differ; earlier releases silently kept the first declaration, so the other member's items never reached the index.
 
+### Sharing a key attribute
+
+Give each key half its own attribute. Two halves of one entity may share one only when they provably compose the same text for every item. A row can't show which half owns the attribute, so the one written last would overwrite the other, and an update would corrupt even a row that only used one. Anything else throws `EDD-9106` when the definition loads: `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema.
+
+```typescript
+// Refused: one attribute, two different texts
+byRegion: { name: "gsi1", pk: { field: "gpk", composite: ["region"] }, sk: { field: "gsk", composite: ["id"] } },
+byGroup: { name: "gsi1", pk: { field: "gpk", composite: ["group"] }, sk: { field: "gsk", composite: ["extra"] } },
+```
+
+Give each its own attribute, which means a new index, and re-put existing rows. The check runs per entity, so several entities can still overload one index.
+
+An index half with the same composites, in the same order and casing, as the table half stored in its attribute **is** that table key. That's a local index's partition key, a sort key shared with the table, and an inverted index:
+
+```typescript
+primaryKey: {
+  pk: { field: "pk", composite: ["userId"] },
+  sk: { field: "sk", composite: ["groupId"] },
+},
+indexes: {
+  byGroup: {
+    name: "inverted",
+    pk: { field: "sk", composite: ["groupId"] },
+    sk: { field: "pk", composite: ["userId"] },
+  },
+},
+```
+
+The table's own composition is the only writer of such a half, and a query through it composes the table half's text, so an inverted index stays in step with `get` for any value. Its sort key holds partition key text, which isn't escaped:
+
+- It has no truncated form, so a partial pin is a `begins_with`, as on a primary key.
+- It isn't in value order before its last composite (`x y#...` sorts below `x#...`), so a `.where()` range on a composite before the last throws `EDD-9107`. `.within()` can read one: it reads what's pinned and judges the rows.
+- A value holding `#` can match the `begins_with` of another value, as the table's partition key text is already ambiguous there.
+
 ### Z-order Sort Keys
 
 A secondary index's sort key half can declare `zorder` instead of `composite`: a list of dimensions whose values are bit-interleaved into one binary (`B`) sort key, so a single query can bound several attributes at once with `.within()`. Optional `prefix` composites are exact-match and sit in front of the address:

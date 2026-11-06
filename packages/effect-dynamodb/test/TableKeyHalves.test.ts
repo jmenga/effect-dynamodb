@@ -1,0 +1,180 @@
+/**
+ * An index half that is a half of the table's key (#183, D62), on a table that stores what
+ * it is sent. The scenarios are in `helpers/TableKeyHalves.ts`; `connected.sharding.test.ts`
+ * runs them on DynamoDB Local. `packages/schema/test/TableKeyHalves.test.ts` covers the
+ * composers and the definitions.
+ */
+
+import { describe, expect, it } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import type * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Effect, Layer, Schema } from "effect"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import {
+  clientOf,
+  type Harness,
+  multiCompositeScenarios,
+  number136Scenario,
+  numberAndDateScenarios,
+  overwritten137Scenario,
+  row136Scenarios,
+  textScenarios,
+  unchanged136Scenario,
+  writePathScenarios,
+} from "./helpers/TableKeyHalves.js"
+
+const harness: Harness = {
+  on: (world, body) => {
+    const indexes: Record<string, { readonly pk: string; readonly sk: string }> = {}
+    for (const index of Object.values<KeyComposer.IndexDefinition>(world.Rows.indexes)) {
+      if (index.index !== undefined) {
+        indexes[index.index] = { pk: index.pk.field, sk: index.sk.field }
+      }
+    }
+    const table = makeRecordingTable({ indexes })
+    return Effect.gen(function* () {
+      const db = yield* clientOf(world)
+      return yield* body(db, {
+        seed: (row) =>
+          Effect.sync(() => {
+            table.items.set(`${row.pk.S}|${row.sk.S}`, row)
+          }),
+        rows: () => Effect.sync(() => [...table.items.values()]),
+        as: (other, inner) =>
+          Effect.gen(function* () {
+            const current = yield* clientOf(other)
+            return yield* inner(current)
+          }).pipe(Effect.provide(other.MainTable.layer({ name: "halves" }))),
+      })
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "halves" }))),
+    ) as never
+  },
+}
+
+describe("an inverted index is the table's key (shape 14)", () => {
+  describe("what any value does through it", () => {
+    for (const scenario of textScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("number and date composites", () => {
+    for (const scenario of numberAndDateScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("every other write path", () => {
+    for (const scenario of writePathScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a sort key of several composites, in partition key text", () => {
+    for (const scenario of multiCompositeScenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a row 1.36 wrote", () => {
+    for (const scenario of row136Scenarios) {
+      it.effect(scenario.name, () => scenario.run(harness))
+    }
+    it.effect("whose text didn't change", () => unchanged136Scenario(harness))
+    it.effect("of numbers and dates", () => number136Scenario(harness))
+  })
+  it.effect("a row 1.37.0 overwrote stays where it is", () => overwritten137Scenario(harness))
+})
+
+describe("what an inverted query sends", () => {
+  class Member extends Schema.Class<Member>("Member")({
+    tenant: Schema.String,
+    userId: Schema.String,
+    groupId: Schema.String,
+  }) {}
+  const schema = DynamoSchema.make({ name: "sent", version: 1 })
+  const Members = Entity.make({
+    model: Member,
+    entityType: "Member",
+    primaryKey: {
+      pk: { field: "pk", composite: ["tenant", "userId"] },
+      sk: { field: "sk", composite: ["groupId"] },
+    },
+    indexes: {
+      byGroup: {
+        name: "inverted",
+        pk: { field: "sk", composite: ["groupId"] },
+        sk: { field: "pk", composite: ["tenant", "userId"] },
+      },
+    },
+  })
+  const MainTable = Table.make({ schema, entities: { Members } })
+
+  const queries = (
+    body: (db: any) => Effect.Effect<unknown, unknown, any>,
+  ): Effect.Effect<ReadonlyArray<Record<string, any>>, unknown> => {
+    const table = makeRecordingTable({ indexes: { inverted: { pk: "sk", sk: "pk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Members }, tables: { MainTable } })
+      yield* body(db)
+      return table.requests
+        .filter((request) => request.command === "Query")
+        .map((request) => request.input)
+    }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "sent" })))) as never
+  }
+
+  const key = (input: Record<string, any>) =>
+    Object.values<{ readonly S: string }>(input.ExpressionAttributeValues)
+      .map((value) => value.S)
+      .filter((text) => text.startsWith("$"))
+
+  it.effect("a partial pin on plain values: one request, begins_with on the table's text", () =>
+    Effect.gen(function* () {
+      const sent = yield* queries((db) =>
+        db.entities.Members.byGroup({ groupId: "g", tenant: "t" }).collect(),
+      )
+      expect(sent).toHaveLength(1)
+      expect(sent[0]!.KeyConditionExpression).toContain("begins_with")
+      expect(key(sent[0]!).sort()).toEqual([
+        "$sent#v1#member#groupid_g",
+        "$sent#v1#member#tenant_t#",
+      ])
+    }),
+  )
+
+  it.effect("a value whose text changed adds the 1.36 partition, and no pass for the pins", () =>
+    Effect.gen(function* () {
+      const sent = yield* queries((db) =>
+        db.entities.Members.byGroup({ groupId: "a b", tenant: "x y" }).collect(),
+      )
+      expect(sent.map((input) => key(input).sort())).toEqual([
+        ["$sent#v1#member#groupid_a b", "$sent#v1#member#tenant_x y#"],
+        ["$sent#v1#member#groupid_a%20b", "$sent#v1#member#tenant_x y#"],
+      ])
+    }),
+  )
+
+  it.effect("a `.where()` equal on a composite before the last, in 1.36 text too", () =>
+    Effect.gen(function* () {
+      const sent = yield* queries((db) =>
+        db.entities.Members.byGroup({ groupId: "g" })
+          .where((t: any, o: any) => o.eq(t.tenant, "x y"))
+          .collect(),
+      )
+      expect(sent).toHaveLength(1)
+      expect(sent[0]!.KeyConditionExpression).toContain("begins_with")
+      expect(key(sent[0]!)).toContain("$sent#v1#member#tenant_x y#")
+    }),
+  )
+
+  it.effect("a one-sided range under a pin takes the longer value below the delimiter", () =>
+    Effect.gen(function* () {
+      const sent = yield* queries((db) =>
+        db.entities.Members.byGroup({ groupId: "g", tenant: "t" })
+          .where((t: any, o: any) => o.gt(t.userId, "a"))
+          .collect(),
+      )
+      expect(key(sent[0]!)).toContain("$sent#v1#member#tenant_t#userid_a\u0000")
+    }),
+  )
+})

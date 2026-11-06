@@ -207,3 +207,12 @@ With it off, no request names a 1.36 key, and no operation pays for the fallback
 <Aside type="caution">
 `rekey` moves the rows of the members the client knows. A table shared with a service that registers other entities, aggregates or streams reports their rows as `unregistered`: run `rekey` there too, with a client that knows them.
 </Aside>
+
+## Key attributes in 1.38
+
+`EDD-9106` judges every pair of key halves in one entity from 1.38.0, sharded or not. If a definition now throws it at load, two of its halves share an attribute without provably composing the same text, so an item could be unreachable through one of them. Give each half its own attribute, which means a new index on the table, then re-put existing rows, or the new index holds none of them. See [Sharing a key attribute](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute).
+
+An inverted index, and any other index half with the same composites, order and casing as the table half in its attribute, keeps working, with no change to the table's key text. 1.38.0 also fixes what 1.37.0 did to an inverted index over strings, where a value with a space, `%` or another character a sort key escapes overwrote a table key:
+
+- **`sk` stored unescaped**, as for a `groupId` of `50%`: that's the row's 1.36 text, so the fallback finds it, and `rekey` moves it.
+- **`pk` stored escaped**, as `userid_u%201` for a `userId` of `u 1`: not repaired. `get`, a pin on `userId`, `delete` and `rekey` don't reach the row, though an inverted query with no pin lists it. Re-put the item, which writes a correct second row, then delete the old one by spelling its stored text: `delete({ userId: "u%201", groupId })`. Partition key text isn't escaped, so that composes the stored key.

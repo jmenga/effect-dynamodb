@@ -230,12 +230,22 @@ const SK_MAX_SENTINEL = KeyComposer.SORT_KEY_MAX
 const valueText = (casing: DynamoSchema.Casing, keyForm: unknown): string =>
   KeyComposer.serializeSortKeyValue(keyForm, casing)
 
-/** A sort key composite's segment as key composition writes it: `<name>_<value>`, cased. */
+/**
+ * A sort key composite's segment as key composition writes it: `<name>_<value>`, cased.
+ * `partitionText`: the half is the table's partition key, whose values aren't escaped
+ * (`KeyComposer.sortKeyHoldsPartitionText`).
+ */
 export const compositeSegment = (
   casing: DynamoSchema.Casing,
   field: string,
   keyForm: unknown,
-): string => `${DynamoSchema.applyCasing(field, casing)}_${valueText(casing, keyForm)}`
+  partitionText = false,
+): string =>
+  `${DynamoSchema.applyCasing(field, casing)}_${
+    partitionText
+      ? DynamoSchema.applyCasing(KeyComposer.serializeValue(keyForm), casing)
+      : valueText(casing, keyForm)
+  }`
 
 /** `bound` with each operand mapped — into its key form, say. */
 const mapBound = (
@@ -254,7 +264,7 @@ const mapBound = (
 /**
  * Does a composite's value satisfy `bound`, compared as key text (§11)? Key
  * forms. Escaped key text sorts as the cased value, so this is the order the
- * key condition reads in.
+ * key condition reads in, and it's the same order for a value in unescaped text.
  */
 const boundHolds = (
   casing: DynamoSchema.Casing,
@@ -301,14 +311,20 @@ const boundHolds = (
  * composite then ends at the greatest key text below the bound
  * (`keyJustBelow`), BETWEEN being inclusive.
  *
+ * `partitionText` (a half that is the table's partition key): the values aren't escaped,
+ * so a range is exact on the last composite alone, where nothing follows the value.
+ * Callers don't send one over an earlier composite: `.where()` refuses it (`[EDD-9107]`),
+ * and `.within()` judges it on the row.
+ *
  * Shared by `.where()` and `.within()` (#171), so the two can't drift.
  */
 export const composeRangeUnder = (
   index: {
     readonly casing: DynamoSchema.Casing
     readonly isLast: boolean
-    /** A secondary index: a row may be truncated at a value (`subtreeCondition`). */
+    /** A row may be truncated at a value (`KeyComposer.sortKeyTruncates`). */
     readonly secondary: boolean
+    readonly partitionText?: boolean
   },
   prefixText: string,
   field: string,
@@ -320,7 +336,7 @@ export const composeRangeUnder = (
   const compose = (value: unknown): string =>
     value === undefined || value === null
       ? prefixText.slice(0, -1)
-      : `${prefixText}${compositeSegment(index.casing, field, value)}`
+      : `${prefixText}${compositeSegment(index.casing, field, value, index.partitionText)}`
 
   /**
    * `begins_with` operand matching exactly the keys whose composite equals
@@ -338,10 +354,13 @@ export const composeRangeUnder = (
    * `compose(v)￿` alone would sort below `compose(v + "0")`, which is a
    * strictly greater value that must stay inside a `gt`. `compose(v)#￿` sits
    * above `compose(v)` and below every longer value because `#` is lower than
-   * every character a composite's escaped text holds.
+   * every character a composite's escaped text holds. Unescaped text holds lower
+   * ones, so there the bound is the least text above `compose(v)`.
    */
   const aboveSubtree = (value: unknown): string =>
-    `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
+    index.partitionText === true
+      ? `${compose(value)}\u0000`
+      : `${compose(value)}${DynamoSchema.KEY_DELIMITER}${SK_MAX_SENTINEL}`
 
   /** Inclusive upper bound covering the whole subtree of `value`. */
   const upper = (value: unknown): string => (index.isLast ? compose(value) : aboveSubtree(value))
@@ -408,6 +427,7 @@ export const composeIntervalUnder = (
     readonly casing: DynamoSchema.Casing
     readonly isLast: boolean
     readonly secondary: boolean
+    readonly partitionText?: boolean
   },
   prefixText: string,
   field: string,
@@ -669,7 +689,10 @@ const planCompositeWithin = <A>(args: {
 
   // -- composition --
   const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
-  const segment = (i: number, keyForm: unknown) => compositeSegment(casing, sk[i]!, keyForm)
+  const partitionText = KeyComposer.sortKeyHoldsPartitionText(indexDef)
+  const secondary = KeyComposer.sortKeyTruncates(indexDef)
+  const segment = (i: number, keyForm: unknown) =>
+    compositeSegment(casing, sk[i]!, keyForm, partitionText)
   const label = (i: number) => `${DynamoSchema.applyCasing(sk[i]!, casing)}_`
 
   /**
@@ -678,7 +701,7 @@ const planCompositeWithin = <A>(args: {
    */
   const composeBound = (prefixText: string, i: number): Query.SortKeyCondition | undefined => {
     const bound = bounds.get(i)!
-    const index = { casing, isLast: i === n - 1, secondary: indexDef.index !== undefined }
+    const index = { casing, isLast: i === n - 1, secondary, partitionText }
     return bound._tag === "eq"
       ? composeRangeUnder(index, prefixText, sk[i]!, { eq: bound.value }, { clampToPrefix: true })
       : composeIntervalUnder(index, prefixText, sk[i]!, bound.lower, bound.upper)
@@ -716,6 +739,11 @@ const planCompositeWithin = <A>(args: {
         i++
         continue
       }
+      // Unescaped text doesn't sort as its value before the last composite (`x y#…` is
+      // below `x#…`), so no one range is the bound: read the prefix, judge each row.
+      if (partitionText && i < n - 1) {
+        return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
+      }
       return {
         condition: composeBound(q, i),
         checked: [...bounds.keys()].filter((j) => j > i),
@@ -725,7 +753,7 @@ const planCompositeWithin = <A>(args: {
     // index a row truncated there belongs too; the range that takes it also holds
     // a longer sibling in 1.36's unescaped text (`new york` after `new`), so while
     // such rows can exist the last eq is judged on the row.
-    if (indexDef.index === undefined) {
+    if (!secondary) {
       return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
     }
     const judged = KeyText136.enabled(entityLike._schema) ? i - 1 : i
@@ -806,11 +834,15 @@ const planCompositeWithin = <A>(args: {
       }
     : { _tag: "none" }
   // Any tuple composite parses soundly from the key text: escaped values
-  // hold no delimiter (§7.3). History rows don't parse as tuples.
-  const ineligible =
-    tupled && indexDef.index === undefined && entityLike._liveRows?.() !== undefined
-      ? "history rows on the primary index"
-      : undefined
+  // hold no delimiter (§7.3). History rows don't parse as tuples, and nor does
+  // partition key text, whose values can hold one.
+  const ineligible = !tupled
+    ? undefined
+    : partitionText
+      ? "the sort key holds the table's partition key text, which isn't escaped"
+      : indexDef.index === undefined && entityLike._liveRows?.() !== undefined
+        ? "history rows on the primary index"
+        : undefined
 
   return Query.plan(args.query, {
     planner: compositePlanner({
@@ -2706,6 +2738,7 @@ const makeFromConfig = (config: {
         // sort key value the same way `put` composes the stored one
         // (`composeRangeUnder`).
         const skComposites = indexDef.sk.composite
+        const partitionText = KeyComposer.sortKeyHoldsPartitionText(indexDef)
         const composeSkCondition = (
           condition: RawSortKeyCondition,
           field: string | undefined,
@@ -2781,6 +2814,23 @@ const makeFromConfig = (config: {
               : pinnedCount
           const targetAttr = skComposites[targetIndex]!
 
+          // Partition key text isn't escaped, so a composite before the last doesn't sort
+          // as its value (`x y#…` is below `x#…`): no key condition is exact.
+          if (
+            partitionText &&
+            targetIndex < skComposites.length - 1 &&
+            !("eq" in condition || "beginsWith" in condition)
+          ) {
+            throw new Error(
+              `[EDD-9107] .where() on sort key composite "${targetAttr}" of index ` +
+                `"${_indexName}" of entity "${entityLike.entityType}": the index's sort key is ` +
+                `the table's partition key, whose text isn't escaped, so a range over a ` +
+                `composite before the last isn't one key range. Bound it with .within(), which ` +
+                `judges each row by its value; eq and beginsWith work here, and a range on ` +
+                `"${skComposites[skComposites.length - 1]}" does.`,
+            )
+          }
+
           // Every composite to the left of the target must already be pinned by
           // the accessor — otherwise the composed operand would have a hole and
           // silently compare against the wrong prefix.
@@ -2824,7 +2874,8 @@ const makeFromConfig = (config: {
             {
               casing: KeyComposer.effectiveCasing(entityLike._schema, indexDef),
               isLast: targetIndex === skComposites.length - 1,
-              secondary: indexDef.index !== undefined,
+              secondary: KeyComposer.sortKeyTruncates(indexDef),
+              partitionText,
             },
             prefixText,
             targetAttr,

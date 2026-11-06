@@ -1,12 +1,13 @@
 /**
- * `[EDD-9106]`: two key halves stored in one attribute, one of them on a sharded
- * index (#183). Whichever is written last overwrites the other, so they may share
- * it only when they provably compose the same bytes for every item.
+ * `[EDD-9106]`: two key halves of one entity stored in one attribute (#183, D61). A row
+ * can't show which of them owns the attribute: whichever is written last overwrites the
+ * other, and a later update corrupts a row that only ever used one. So they may share it
+ * only when they provably compose the same bytes for every item.
  *
- * A pair of unsharded halves isn't judged. Whether two different texts clash depends
- * on data a definition can't show: two accessors on one physical index over composites
- * no item holds together work, and they predate sharding. A pair with a sharded half
- * can only be in a new definition, so refusing it breaks nothing.
+ * The composers decide, through `textForm`. An index half that is a half of the table's
+ * key (`bindTableKeyHalves`, D62) composes the table half's text, so a pair like that
+ * passes here and has no bytes of its own to write. The check runs per entity, so one
+ * index overloaded across entity types is unaffected.
  */
 
 import type { Schema } from "effect"
@@ -69,9 +70,8 @@ const textForm = (
   standIns: Map<string, string>,
   { half, index }: KeyHalf,
 ): string => {
-  const composites = half === "pk" ? index.pk.composite : index.sk.composite
   const record: Record<string, string> = {}
-  for (const attr of composites) {
+  for (const attr of compositesOf({ half, index } as KeyHalf)) {
     if (!standIns.has(attr)) {
       const mark = String.fromCharCode(0xe000 + standIns.size)
       standIns.set(attr, holdsOnlyNumbers(fields, attr) ? mark : `${mark}aB%`)
@@ -120,7 +120,7 @@ const composeTheSame = (
   )
 }
 
-/** Every pair of halves in one attribute with a sharded index among them. */
+/** Every pair of an entity's key halves stored in one attribute. */
 const sharedHalves = (
   indexes: Readonly<Record<string, IndexDefinition>>,
 ): ReadonlyArray<readonly [KeyHalf, KeyHalf]> => {
@@ -133,13 +133,16 @@ const sharedHalves = (
   return halves.flatMap((a, i) =>
     halves
       .slice(i + 1)
-      .filter(
-        (b) =>
-          a.field === b.field && (a.index.shards !== undefined || b.index.shards !== undefined),
-      )
+      .filter((b) => a.field === b.field)
       .map((b) => [a, b] as const),
   )
 }
+
+const compositesOf = ({ half, index }: KeyHalf): ReadonlyArray<string> =>
+  half === "pk" ? index.pk.composite : index.sk.composite
+
+const sameComposites = (a: KeyHalf, b: KeyHalf): boolean =>
+  JSON.stringify(compositesOf(a)) === JSON.stringify(compositesOf(b))
 
 const refusal = (
   entityType: string,
@@ -160,12 +163,16 @@ const refusal = (
           ? `they compose with the casings "${casingA}" and "${casingB}"`
           : isZOrder(a)
             ? "their Z-order layouts differ"
-            : "they compose different composites or text"
+            : a.half !== b.half && sameComposites(a, b)
+              ? "a sort key escapes what a partition key doesn't, so their text differs"
+              : "they compose different composites or text"
   return new Error(
     `[EDD-9106] Entity "${entityType}": ${describe(a)} and ${describe(b)} are both stored in the ` +
-      `attribute "${a.field}", and aren't provably the same text: ${why}. The one written last ` +
-      `overwrites the other, so an item would be unreachable through the other key. Give each ` +
-      `its own attribute.`,
+      `attribute "${a.field}", and aren't provably the same text: ${why}. A row can't show which ` +
+      `owns the attribute: the one written last overwrites the other, and an update corrupts ` +
+      `even a row that only used one, so an item would be unreachable through the other key. ` +
+      `Give each its own attribute. A half may share a table key attribute only with the same ` +
+      `composites, in the same order and casing, as the table's half stored there.`,
   )
 }
 

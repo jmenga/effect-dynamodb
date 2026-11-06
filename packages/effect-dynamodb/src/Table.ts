@@ -180,9 +180,9 @@ export const make = <
   // can't share its attribute with a string key half or a vector filter
   // attribute of another type (EDD-9091).
   resolveKeyAttributeTypes(entities, aggregates, primary)
-  // Two key halves in one attribute, one of them on a sharded index, must compose the
-  // same bytes (EDD-9106). `Entity.make` refused what no schema can reconcile; a casing
-  // an index leaves to the schema resolves only here.
+  // Two of an entity's key halves in one attribute must compose the same bytes (EDD-9106).
+  // `Entity.make` refused what no schema can reconcile; a casing an index leaves to the
+  // schema resolves only here.
   for (const entity of Object.values(entities)) {
     refuseSharedKeyAttribute(
       config.schema,

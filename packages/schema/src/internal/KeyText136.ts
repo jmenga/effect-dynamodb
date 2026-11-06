@@ -46,6 +46,7 @@ import {
   effectiveCasing,
   type IndexDefinition,
   isZOrderHalf,
+  sortKeyTruncates,
   subtreeCondition,
 } from "../KeyComposer.js"
 
@@ -301,9 +302,9 @@ export const composeSortKeyCondition = (
   | { readonly between: readonly [string, string] } => {
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
   if (leadingSupplied(index, record) === index.sk.composite.length) return { eq: prefix }
-  return index.index === undefined
-    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
-    : subtreeCondition(prefix)
+  return sortKeyTruncates(index)
+    ? subtreeCondition(prefix)
+    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
 }
 
 /**
@@ -339,9 +340,9 @@ export const composeBoundCondition = (
   const value = "eq" in bound ? bound.eq : bound.beginsWith
   const last = index.sk.composite.indexOf(field) === index.sk.composite.length - 1
   if (last) return { eq: segment(value) }
-  return index.index === undefined
-    ? { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
-    : subtreeCondition(segment(value))
+  return sortKeyTruncates(index)
+    ? subtreeCondition(segment(value))
+    : { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
 }
 
 /**

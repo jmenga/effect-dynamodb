@@ -66,7 +66,7 @@ const Devices = Entity.make({
 
 Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
 
-A sharded partition key needs an attribute of its own. Stored in the table's `pk`, or in another key's attribute, it would overwrite that key, so `Entity.make` refuses it (`EDD-9106`), and the type system refuses the cases it can see. Any key half on a sharded index may share an attribute only when the two provably compose the same bytes: the same composites, casing and layout. `Table.make` decides a casing left to the schema, so an index that spells out `casing: "uppercase"` over the table's `sk` is refused on a lowercase schema and accepted on an uppercase one. Two indexes with no shards aren't judged.
+A sharded partition key needs an attribute of its own. Stored in the table's `pk`, or in another key's attribute, it would overwrite that key, so `Entity.make` refuses it (`EDD-9106`), and the type system refuses the cases it can see. Any key half on a sharded index may share an attribute only when the two provably compose the same bytes: the same composites, casing and layout. `Table.make` decides a casing left to the schema, so an index that spells out `casing: "uppercase"` over the table's `sk` is refused on a lowercase schema and accepted on an uppercase one. The same rule covers indexes with no shards: see [Sharing a key attribute](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute).
 
 ### The stored key
 
@@ -437,7 +437,7 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 | `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
 | `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
 | `EDD-9105` | `concurrency` isn't a positive integer | The call |
-| `EDD-9106` | Two key halves stored in one attribute, one of them on a sharded index, aren't provably the same bytes | Types, where they can see it, `Entity.make`, and `Table.make` for a casing left to the schema |
+| `EDD-9106` | Two key halves of one entity stored in one attribute, sharded or not, aren't provably the same bytes | Types, for a sharded half they can see, `Entity.make`, and `Table.make` for a casing left to the schema |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
 
 ## What's Next?

@@ -33,6 +33,7 @@ import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as RekeyComparison from "./helpers/RekeyComparison.js"
 import * as SharedKeys from "./helpers/SharedKeyAttributes.js"
+import * as TableKeyHalves from "./helpers/TableKeyHalves.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -1444,8 +1445,8 @@ describeConnected("#183 what `rekey` compares, on real writes", () => {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
-  describe("two accessors sharing attributes (shape 13)", () => {
-    for (const scenario of RekeyComparison.sharedPairScenarios) {
+  describe("two accessors over one row, each in its own attributes", () => {
+    for (const scenario of RekeyComparison.separatePairScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })
@@ -1499,16 +1500,67 @@ describeConnected("#183 key halves sharing an attribute, on real writes", () => 
     for (const scenario of SharedKeys.keptEntryScenarios) {
       it.live(`an entry \`preserve\` keeps: ${scenario.name}`, () => scenario.run(harness))
     }
-    for (const scenario of SharedKeys.removedCompositeScenarios) {
-      it.live(`removing a composite of one: ${scenario.name}`, () => scenario.run(harness))
-    }
   })
 
   it.live("a casing the table's schema agrees with: every read finds the row", () =>
     SharedKeys.agreeingCasingScenario(harness),
   )
+})
 
-  it.live("two unsharded accessors over composites no item holds together", () =>
-    SharedKeys.exclusiveAccessorsScenario(harness),
+describeConnected("#183 an inverted index is the table's key (shape 14), on real writes", () => {
+  const harness: TableKeyHalves.Harness = {
+    on: (world, body) =>
+      withTable(
+        world.MainTable,
+        (tableName) =>
+          Effect.gen(function* () {
+            const db = yield* TableKeyHalves.clientOf(world)
+            return yield* body(db, {
+              seed: (row) =>
+                Effect.gen(function* () {
+                  const client = yield* DynamoClient
+                  yield* client.putItem({ TableName: tableName, Item: row })
+                }),
+              rows: () => scanAll(tableName),
+              as: (other, inner) =>
+                Effect.gen(function* () {
+                  const current = yield* TableKeyHalves.clientOf(other)
+                  return yield* inner(current)
+                }).pipe(Effect.provide(other.MainTable.layer({ name: tableName }))),
+            })
+          }),
+        (tableName) => world.MainTable.layer({ name: tableName }),
+      ),
+  }
+
+  describe("what any value does through it", () => {
+    for (const scenario of TableKeyHalves.textScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("number and date composites", () => {
+    for (const scenario of TableKeyHalves.numberAndDateScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("every other write path", () => {
+    for (const scenario of TableKeyHalves.writePathScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a sort key of several composites, in partition key text", () => {
+    for (const scenario of TableKeyHalves.multiCompositeScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("a row 1.36 wrote", () => {
+    for (const scenario of TableKeyHalves.row136Scenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+    it.live("whose text didn't change", () => TableKeyHalves.unchanged136Scenario(harness))
+    it.live("of numbers and dates", () => TableKeyHalves.number136Scenario(harness))
+  })
+  it.live("a row 1.37.0 overwrote stays where it is", () =>
+    TableKeyHalves.overwritten137Scenario(harness),
   )
 })

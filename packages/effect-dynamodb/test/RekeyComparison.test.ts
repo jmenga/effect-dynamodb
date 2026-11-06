@@ -23,8 +23,8 @@ import {
   labelScenarios,
   otherWritePathScenarios,
   sameBytesMoveScenarios,
+  separatePairScenarios,
   shardLayoutMoveScenario,
-  sharedPairScenarios,
   sharedShardMoveScenario,
   sharedTableKeyMoveScenarios,
   tableKeyAttributeScenarios,
@@ -88,8 +88,8 @@ describe("what `rekey` compares", () => {
   }
 })
 
-describe("two accessors sharing attributes (shape 13)", () => {
-  for (const scenario of sharedPairScenarios) {
+describe("two accessors over one row, each in its own attributes", () => {
+  for (const scenario of separatePairScenarios) {
     it.effect(scenario.name, () => scenario.run(harness))
   }
 })

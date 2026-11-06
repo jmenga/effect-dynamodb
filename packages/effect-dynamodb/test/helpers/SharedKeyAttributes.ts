@@ -1,8 +1,8 @@
 /**
- * Key halves sharing an attribute (#183): definitions that work and have to keep
- * working. These scenarios run on a recording table and on DynamoDB Local, through
- * a {@link Harness}; only the real one refuses an update to a table key attribute,
- * so the recording one checks the expression instead.
+ * Key halves sharing an attribute that `EDD-9106` lets through (#183): definitions that
+ * work and have to keep working. These scenarios run on a recording table and on DynamoDB
+ * Local, through a {@link Harness}; only the real one refuses an update to a table key
+ * attribute, so the recording one checks the expression instead.
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -54,32 +54,6 @@ export const clientOf = (world: { readonly MainTable: any; readonly Rows: any })
     entities: { Rows: world.Rows },
     tables: { MainTable: world.MainTable },
   }) as Effect.Effect<any, never, any>
-
-/** Two accessors on one physical index, over composites no item holds together. */
-export const exclusiveAccessorsScenario = (h: Harness) => {
-  const world = worldOf({
-    byRegion: {
-      name: "gsi",
-      pk: { field: "gpk", composite: ["tenant"] },
-      sk: { field: "gsk", composite: ["region"] },
-    },
-    byGroup: {
-      name: "gsi",
-      pk: { field: "gpk", composite: ["tenant"] },
-      sk: { field: "gsk", composite: ["group"] },
-    },
-  })
-  return h.on(world, (db) =>
-    Effect.gen(function* () {
-      yield* db.entities.Rows.put({ tenant: "t", id: "1", region: "r" }).asEffect()
-      yield* db.entities.Rows.put({ tenant: "t", id: "2", group: "g" }).asEffect()
-      const inRegion = yield* db.entities.Rows.byRegion({ tenant: "t", region: "r" }).collect()
-      const inGroup = yield* db.entities.Rows.byGroup({ tenant: "t", group: "g" }).collect()
-      expect(inRegion.map((row: Row) => row.id)).toEqual(["1"])
-      expect(inGroup.map((row: Row) => row.id)).toEqual(["2"])
-    }),
-  )
-}
 
 const VARIANTS = {
   "a sharded index's sort key in the table's": {
@@ -257,17 +231,6 @@ export const offIndexScenarios: ReadonlyArray<{
       },
     },
   },
-  {
-    name: "a half in the table's, of a composite the row lacks",
-    pin: { note: "n" },
-    indexes: {
-      byNote: {
-        name: "gsi",
-        pk: { field: "gpk", composite: ["note"] },
-        sk: { field: "sk", composite: ["note"] },
-      },
-    },
-  },
 ].map(({ name, pin, indexes }) => ({
   name,
   run: (h: Harness) =>
@@ -278,40 +241,6 @@ export const offIndexScenarios: ReadonlyArray<{
         expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "x" })
         expect((yield* db.entities.Rows.byNote(pin).collect()).length).toBe(0)
       }),
-    ),
-}))
-
-/**
- * Removing a composite of a half stored in a table key attribute drops the entry, which
- * takes the other half: the attribute stays, as DynamoDB refuses to remove it and the row
- * can't be found without it.
- */
-export const removedCompositeScenarios: ReadonlyArray<{
-  readonly name: string
-  readonly run: (h: Harness) => Effect.Effect<void, unknown>
-}> = [
-  { name: "an update", options: {} },
-  { name: "a retained update", options: { versioned: { retain: true } } },
-].map(({ name, options }) => ({
-  name,
-  run: (h: Harness) =>
-    h.on(
-      worldOf(
-        {
-          byNote: {
-            name: "gsi",
-            pk: { field: "gpk", composite: ["note"] },
-            sk: { field: "sk", composite: ["note"] },
-          },
-        },
-        options,
-      ),
-      (db) =>
-        Effect.gen(function* () {
-          yield* db.entities.Rows.put(key).asEffect()
-          yield* db.entities.Rows.update(key).set({ extra: "x" }).remove(["note"]).asEffect()
-          expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "x" })
-        }),
     ),
 }))
 

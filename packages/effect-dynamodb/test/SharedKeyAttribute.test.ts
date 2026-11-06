@@ -1,8 +1,8 @@
 /**
  * Key halves sharing an attribute (#183, `EDD-9106`): what `Table.make` can judge that
- * `Entity.make` can't, and that the definitions it lets through work. The rule itself
- * is checked against the composers in `packages/schema/test/Shards.test.ts`; these
- * scenarios also run on DynamoDB Local (`connected.sharding.test.ts`).
+ * `Entity.make` can't, what's refused, and that the definitions it lets through work. The
+ * rule itself is checked against the composers in `packages/schema/test/Shards.test.ts`;
+ * these scenarios also run on DynamoDB Local (`connected.sharding.test.ts`).
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -16,12 +16,10 @@ import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import {
   agreeingCasingScenario,
   clientOf,
-  exclusiveAccessorsScenario,
   type Harness,
   keptEntryScenarios,
   leavingIndexScenarios,
   offIndexScenarios,
-  removedCompositeScenarios,
   tableKeyScenarios,
 } from "./helpers/SharedKeyAttributes.js"
 
@@ -132,7 +130,7 @@ describe("Table.make resolves a casing an index leaves to the schema", () => {
     expect(() => Table.make({ schema: lower, entities: { Texted } })).toThrow("[EDD-9106]")
   })
 
-  it("two unsharded halves are left alone, whatever they compose", () => {
+  it("unsharded numeric Z-order halves too: their bytes are the same whatever the casing", () => {
     const Numeric = Entity.make({
       model: Schema.Struct({ tenant: Schema.String, id: Schema.String, x: Schema.Number }),
       entityType: "Numeric",
@@ -240,23 +238,78 @@ describe("a half stored in a table key attribute", () => {
     }
   })
 
-  describe("removing a composite of one", () => {
-    for (const scenario of removedCompositeScenarios) {
-      it.effect(scenario.name, () => {
-        const { h, written } = harness()
-        return Effect.gen(function* () {
-          yield* scenario.run(h)
-          expect(written()).not.toContain("sk")
-        })
-      })
-    }
-  })
-
   it.effect("under a casing the schema agrees with", () => agreeingCasingScenario(harness().h))
 })
 
-describe("two unsharded accessors over composites no item holds together", () => {
-  it.effect("put and query work: this is why such a pair isn't refused", () =>
-    exclusiveAccessorsScenario(harness().h),
-  )
+describe("two accessors sharing an attribute (shape 13)", () => {
+  const model = Schema.Struct({
+    tenant: Schema.String,
+    id: Schema.String,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+  })
+  const shape13 = {
+    model,
+    entityType: "Paired",
+    primaryKey: definition.primaryKey,
+    indexes: {
+      byRegion: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: ["region"] },
+      },
+      byGroup: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: ["group"] },
+      },
+    },
+  } as const
+
+  it("Entity.make refuses them, on the runtime and the pure definition", () => {
+    const refused =
+      /\[EDD-9106\].*index "byRegion"'s sort key and index "byGroup"'s sort key.*"gsk"/
+    expect(() => Entity.make(shape13)).toThrow(refused)
+    expect(() => PureEntity.make(shape13)).toThrow(refused)
+  })
+
+  it("Table.make refuses a pair only its schema can judge", () => {
+    const cased = {
+      ...shape13,
+      indexes: {
+        byRegion: {
+          name: "gsi",
+          pk: { field: "gpk", composite: ["tenant"] },
+          sk: { field: "gsk", composite: ["region"] },
+          casing: "uppercase",
+        },
+        byGroup: {
+          name: "gsi2",
+          pk: { field: "gpk", composite: ["tenant"] },
+          sk: { field: "gsk2", composite: ["group"] },
+        },
+      },
+    } as const
+    const Paired = Entity.make(cased)
+    expect(() => Table.make({ schema: lower, entities: { Paired } })).toThrow(
+      /\[EDD-9106\].*"gpk".*"uppercase" and "lowercase"|\[EDD-9106\].*"gpk".*"lowercase" and "uppercase"/,
+    )
+    expect(Table.make({ schema: upper, entities: { Paired } }).schema).toBe(upper)
+  })
+
+  it("in their own attributes, each is its own index", () => {
+    const apart = {
+      ...shape13,
+      indexes: {
+        byRegion: shape13.indexes.byRegion,
+        byGroup: {
+          name: "gsi2",
+          pk: { field: "gpk2", composite: ["tenant"] },
+          sk: { field: "gsk2", composite: ["group"] },
+        },
+      },
+    } as const
+    const Paired = Entity.make(apart)
+    expect(Table.make({ schema: lower, entities: { Paired } }).schema).toBe(lower)
+  })
 })

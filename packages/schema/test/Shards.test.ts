@@ -975,24 +975,36 @@ describe("EDD-9106: two key halves in one attribute", () => {
     })
   })
 
-  describe("a pair with nothing sharded isn't judged", () => {
-    // What two different texts do depends on data a definition can't show, and these
-    // all predate sharding: refusing them at load would break working definitions.
+  describe("a pair with nothing sharded is judged too (D61)", () => {
     it.each([
       ["the table's partition key", { pk: { field: "pk", composite: ["region"] } }],
       ["the table's sort key", { pk: { field: "sk", composite: ["region"] } }],
       ["the table's sort key, as a sort key", { sk: { field: "sk", composite: ["region"] } }],
-    ])("%s", (_name, overrides) => {
-      expect(() => make({ byRegion: gsi(overrides) })).not.toThrow()
+      ["the table's partition key, as a sort key", { sk: { field: "pk", composite: ["region"] } }],
+    ])("%s, over other composites", (_name, overrides) => {
+      expect(() => make({ byRegion: gsi(overrides) })).toThrow("[EDD-9106]")
     })
 
-    it("two accessors on one index, whichever composites an item holds", () => {
+    it("two accessors on one index, whichever composites an item holds (shape 13)", () => {
       expect(() =>
         make({
           byRegion: gsi(),
           byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
         }),
-      ).not.toThrow()
+      ).toThrow("[EDD-9106]")
+    })
+
+    it("two indexes swapping each other's attributes", () => {
+      expect(() =>
+        make({
+          a: gsi(),
+          b: gsi({
+            name: "gsi2",
+            pk: { field: "gsk", composite: ["tenant"] },
+            sk: { field: "gpk", composite: ["region"] },
+          }),
+        }),
+      ).toThrow("[EDD-9106]")
     })
 
     it("a difference of casing", () => {
@@ -1005,29 +1017,29 @@ describe("EDD-9106: two key halves in one attribute", () => {
             casing: "lowercase",
           }),
         }),
-      ).not.toThrow()
+      ).toThrow(/\[EDD-9106\].*"uppercase" and "lowercase"/)
     })
 
-    it("a sharded index elsewhere doesn't bring them in", () => {
+    it("a partition key and a sort key over the same composites, outside the table's key", () => {
       expect(() =>
         make({
-          sharded: gsi({ name: "gsi3", pk: { field: "spk", composite: ["tenant"] }, shards: 8 }),
-          byRegion: gsi(),
-          byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
-        }),
-      ).toThrow("[EDD-9106]")
-      expect(() =>
-        make({
-          sharded: gsi({
-            name: "gsi3",
-            pk: { field: "spk", composite: ["tenant"] },
-            sk: { field: "ssk", composite: ["region"] },
-            shards: 8,
+          a: gsi({ pk: { field: "shared", composite: ["region"] } }),
+          b: gsi({
+            name: "gsi2",
+            pk: { field: "gpk2", composite: ["tenant"] },
+            sk: { field: "shared", composite: ["region"] },
           }),
+        }),
+      ).toThrow(/\[EDD-9106\].*a sort key escapes what a partition key doesn't/)
+    })
+
+    it("names the attribute and says what to do, for an unsharded pair too", () => {
+      expect(() =>
+        make({
           byRegion: gsi(),
           byGroup: gsi({ sk: { field: "gsk", composite: ["group"] } }),
         }),
-      ).not.toThrow()
+      ).toThrow(/"gsk".*overwrites the other.*Give each its own attribute/)
     })
   })
 })
@@ -1222,8 +1234,7 @@ describe("EDD-9106: a shared attribute needs provably the same bytes", () => {
         expect(String(error)).toContain("[EDD-9106]")
         refused = true
       }
-      const judged = a.def.shards !== undefined || b.def.shards !== undefined
-      if (refused !== (judged && !same)) wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
+      if (refused !== !same) wrong.push(`${nameA} / ${nameB}: refused ${refused}`)
     }
     expect(wrong).toEqual([])
   })
