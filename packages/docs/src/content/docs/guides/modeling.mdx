@@ -119,6 +119,8 @@ Use `Schema.Record` for a keyed collection of values. A `Schema.ReadonlyMap` is 
 
 A `Map` in your domain model is fine as long as its encoded side isn't one: decode it from a `Schema.Record` with `Schema.decodeTo`, or wrap it in `Schema.toCodecJson`.
 
+`EventStore.makeStream` applies the same rule to each event, to `metadata` and to the snapshot state, and `EventStore.projection` and `EventStore.multiProjection` to `outbox.schema`.
+
 #### Container checks
 
 A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.
