@@ -21,9 +21,6 @@ const roots = [
   join(packages, "effect-dynamodb-geo", "src"),
 ]
 
-/** Sends that aren't an SDK client's: `file` + the call, written as the source has it. */
-const notSdkSends = new Set(["effect-dynamodb/src/Entity.ts args.send(sent)"])
-
 /** Strip comments and string / template contents, keeping line structure. */
 const code = (source: string): string =>
   source
@@ -95,19 +92,10 @@ describe("abort signal static guard", () => {
     for (const form of fine) expect([form, offenders(form).length]).toEqual([form, 0])
   })
 
-  it("every send it lets through is still there", () => {
-    const seen = new Set(
-      sources().flatMap(({ name, source }) => sendsIn(source).map(({ call }) => `${name} ${call}`)),
-    )
-    for (const allowed of notSdkSends) expect([allowed, seen.has(allowed)]).toEqual([allowed, true])
-  })
-
   it("every SDK send in src passes the abort signal", () => {
     const found: Array<string> = []
     for (const { name, source } of sources()) {
-      for (const { line, call } of offenders(source)) {
-        if (!notSdkSends.has(`${name} ${call}`)) found.push(`${name}:${line}: ${call}`)
-      }
+      for (const { line, call } of offenders(source)) found.push(`${name}:${line}: ${call}`)
     }
     expect(found).toEqual([])
   })
