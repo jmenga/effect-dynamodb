@@ -1507,6 +1507,42 @@ describeConnected("#183 key halves sharing an attribute, on real writes", () => 
   )
 })
 
+describeConnected("#183 two accessors sharing an attribute (shape 13)", () => {
+  // Refused where the definition loads, so nothing reaches the table. It's here so that
+  // this suite, which holds the same accessors with their attributes apart, can't pass
+  // while the pair itself is allowed.
+  it("Entity.make refuses the pair whose attributes this suite keeps apart", () => {
+    class Paired extends Schema.Class<Paired>("Paired")({
+      id: Schema.String,
+      region: Schema.optional(Schema.String),
+      group: Schema.optional(Schema.String),
+      extra: Schema.optional(Schema.String),
+    }) {}
+    expect(() =>
+      Entity.make({
+        model: Paired,
+        entityType: "Paired",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byRegion: {
+            name: "gsi1",
+            pk: { field: "gpk", composite: ["region"] },
+            sk: { field: "gsk", composite: ["id"] },
+          },
+          byGroup: {
+            name: "gsi1",
+            pk: { field: "gpk", composite: ["group"] },
+            sk: { field: "gsk", composite: ["extra"] },
+          },
+        },
+      }),
+    ).toThrow(/\[EDD-9106\]/)
+  })
+})
+
 describeConnected("#183 an inverted index is the table's key (shape 14), on real writes", () => {
   const harness: TableKeyHalves.Harness = {
     on: (world, body) =>

@@ -56,6 +56,7 @@ type Scenario = {
 }
 
 const on = DynamoSchema.make({ name: "halves", version: 1 })
+const noFallback = DynamoSchema.make({ name: "halves", version: 1, legacyKeys: false })
 
 const worldOf = (
   model: unknown,
@@ -406,10 +407,15 @@ const expectSame = (found: ReadonlyArray<Member>, pick: Pick) =>
  * so a value can hold what sorts below the delimiter (`new york#…` before `new#…`). The rows
  * picked by value are the rows returned, whichever plan reads them.
  */
-const membersWorld = () => worldOf(Member, memberKey, invertedMembers)
+const membersWorld = (schema: DynamoSchema.DynamoSchema) =>
+  worldOf(Member, memberKey, invertedMembers, {}, schema)
 
-const withMembers = (h: Harness, body: (db: any) => Effect.Effect<void, unknown, any>) => {
-  const world = membersWorld()
+const withMembers = (
+  h: Harness,
+  body: (db: any) => Effect.Effect<void, unknown, any>,
+  schema: DynamoSchema.DynamoSchema = on,
+) => {
+  const world = membersWorld(schema)
   return h.on(world, (db) =>
     Effect.gen(function* () {
       yield* Batch.write(MEMBERS.map((member) => world.Rows.put(member)))
@@ -527,17 +533,27 @@ export const multiCompositeScenarios: ReadonlyArray<Scenario> = [
         (m: Member) => above("a")(m.userId),
       ],
     ] as const
-  ).map(
-    ([name, bounds, picked]): Scenario => ({
-      name: `.within(): ${name}`,
-      run: (h) =>
-        withMembers(h, (db) =>
-          Effect.gen(function* () {
-            const found = yield* db.entities.Rows.byGroup(group).within(bounds).collect()
-            expectSame(found, picked)
-          }),
-        ),
-    }),
+  ).flatMap(
+    ([name, bounds, picked]): ReadonlyArray<Scenario> =>
+      (
+        [
+          ["", on],
+          // Nothing judges a row for the fallback's sake, so a range too wide shows.
+          [", the fallback off", noFallback],
+        ] as const
+      ).map(([label, schema]) => ({
+        name: `.within(): ${name}${label}`,
+        run: (h) =>
+          withMembers(
+            h,
+            (db) =>
+              Effect.gen(function* () {
+                const found = yield* db.entities.Rows.byGroup(group).within(bounds).collect()
+                expectSame(found, picked)
+              }),
+            schema,
+          ),
+      })),
   ),
   {
     name: ".within() past an unbounded composite is a filter plan, whatever the value holds",
@@ -560,8 +576,6 @@ const rowKeyOf = (primary: KeyComposer.IndexDefinition, values: Record<string, u
 
 const seededEdge = (values: { readonly userId: string; readonly groupId: string }) =>
   toAttributeMap({ ...values, ...rowKeyOf(primaryOfEdges, values), __edd_e__: "Edge" }) as StoredRow
-
-const noFallback = DynamoSchema.make({ name: "halves", version: 1, legacyKeys: false })
 
 /**
  * A row 1.36 wrote: found with the fallback on, moved by `rekey` (the index follows, as its
@@ -696,6 +710,7 @@ export const overwritten137Scenario = (h: Harness) => {
       expect(report.moved.item).toBe(0)
       expect(report.indexKeysRewritten).toBe(0)
       expect(report.conflicts).toEqual([])
+      expect(report.skipped.unrecognizedKey).toBe(1)
       expect((yield* table.rows()).map((stored) => stored.pk.S)).toEqual([row.pk.S])
 
       yield* db.entities.Rows.put(values).asEffect()

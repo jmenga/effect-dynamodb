@@ -1435,7 +1435,7 @@ same effective casing as the table half stored there, is that table key.
   `put`, batch, transactions, update, append, retain, soft delete, restore, moves and `rekey`. Nothing strips it either.
 - **Everything reading through it composes the table half's text.** An index partition key in the table's `sk` composes
   sort key text, and an index sort key in the table's `pk` composes partition key text.
-- **The table's own key text doesn't change.** Stored bytes for values with nothing to escape are identical across 1.36,
+- **The table's own key text doesn't change.** Stored bytes for a string with nothing to escape are identical across 1.36,
   1.37 and this release.
 
 **Where it is.** `bindTableKeyHalves` sets `IndexDefinition.tableKey` where `Entity.make` normalises a definition, and the

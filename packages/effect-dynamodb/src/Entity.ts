@@ -13718,14 +13718,16 @@ const makeImpl = <
    *
    * An unsharded partition key, a sort key or a vector partition is rewritten only when
    * it is exactly its own 1.36 text and that isn't the current text. Each half is judged
-   * by itself and by its bytes, with no question of which accessor owns an attribute two
-   * of them share, which a row's values couldn't answer. So it can't tell a healthy key
-   * from another half's 1.36 text when the bytes match (design §15). A sort key missing
-   * a trailing composite is judged by the composites before the gap, which is what a row
-   * truncated under 1.36 stores (D43). Anything else is left, with no conflict: a key an
-   * index policy kept, one lagging its values, one cleared of them. So is a key that
-   * isn't stored (under `sparse` its absence can be deliberate), and a table key
-   * attribute, which is the table's to hold.
+   * by itself and by its bytes: halves in one attribute compose the same bytes
+   * (`EDD-9106`), so none can be another's 1.36 text. A sort key missing a trailing
+   * composite is judged by the composites before the gap, which is what a row truncated
+   * under 1.36 stores (D43). Anything else is left, with no conflict: a key an index
+   * policy kept, one lagging its values, one cleared of them. So is a key that isn't
+   * stored (under `sparse` its absence can be deliberate).
+   *
+   * A half that is the table's key (D62) never gets as far as a rewrite. This reads a row
+   * under its current table key, where such a half holds what it composes; a row under
+   * its 1.36 table key moves first, and a row under any other key isn't read here.
    *
    * A sharded index's partition key is the exception (D24): moving rows into the layout
    * is the feature, so it is composed and compared whatever it holds, and `EDD-9106`
@@ -13751,7 +13753,6 @@ const makeImpl = <
     const olds: globalThis.Record<string, string> = {}
     const composites = new Set<string>()
     const rewrite = (field: string, text: string, attrs: ReadonlyArray<string>) => {
-      if (isTableKeyField(field)) return
       sets[field] = text
       olds[field] = row[field]!.S!
       for (const attr of attrs) composites.add(resolveDbName(attr))

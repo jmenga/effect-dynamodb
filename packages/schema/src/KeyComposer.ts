@@ -262,28 +262,20 @@ export const effectiveCasing = (
  * an index sort key in the table's partition key composes partition key text. The table's
  * own text doesn't change.
  *
- * The composites alone decide this, so the composers read one property. `[EDD-9106]`
- * refuses, from what the composers then produce, what agrees in composites and not in
- * bytes: another casing, a collection's label, a sharded partition key, a Z-order address.
- * A sharded index's sort key can't be the table's partition key: it keeps its own text, so
- * that's refused too.
+ * The attribute alone decides here, so the composers read one property. `[EDD-9106]` then
+ * refuses, from what the composers produce, whatever doesn't compose the table half's bytes:
+ * other composites or another order, another casing, a collection's label, a sharded
+ * partition key, a Z-order address. A sharded index's sort key can't be the table's
+ * partition key: it keeps its own text, so that's refused too.
  */
 export const bindTableKeyHalves = (
   index: IndexDefinition,
   primary: IndexDefinition,
 ): IndexDefinition => {
-  const tableHalf = (part: {
-    readonly field: string
-    readonly composite: ReadonlyArray<string>
-  }): "pk" | "sk" | undefined => {
-    const same = (table: typeof part) =>
-      table.field === part.field &&
-      table.composite.length === part.composite.length &&
-      table.composite.every((attr, i) => attr === part.composite[i])
-    return same(primary.pk) ? "pk" : same(primary.sk) ? "sk" : undefined
-  }
-  const pk = tableHalf(index.pk)
-  const held = tableHalf(index.sk)
+  const tableHalf = (field: string): "pk" | "sk" | undefined =>
+    field === primary.pk.field ? "pk" : field === primary.sk.field ? "sk" : undefined
+  const pk = tableHalf(index.pk.field)
+  const held = tableHalf(index.sk.field)
   const sk = held === "pk" && index.shards !== undefined ? undefined : held
   return pk === undefined && sk === undefined
     ? index
