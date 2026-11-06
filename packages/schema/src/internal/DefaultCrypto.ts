@@ -1,12 +1,12 @@
 /**
- * @internal Default `Crypto` service for the typed client.
+ * @internal Default `SecureRandom` service for the typed client.
  *
- * `DynamoClient.make()` bundles a default {@link Crypto.Crypto} service into the
- * captured context so that bound entity operations (e.g. auto-generated UUID
- * primary keys via `generatedId`) can resolve a cryptographically-secure source
- * WITHOUT widening the public `R` of bound methods. Bound `put` stays
- * `R = never` — the service is provided from the bundled context, never
- * surfaced as a requirement.
+ * `DynamoClient.make()` bundles a default {@link SecureRandom.SecureRandom}
+ * service into the captured context so that bound entity operations (e.g.
+ * auto-generated UUID primary keys via `generatedId`) can resolve a
+ * cryptographically-secure source WITHOUT widening the public `R` of bound
+ * methods. Bound `put` stays `R = never` — the service is provided from the
+ * bundled context, never surfaced as a requirement.
  *
  * The implementation is a thin wrapper over the global Web Crypto API
  * (`globalThis.crypto`), available on Node 19+ (Node 18 only with
@@ -15,29 +15,16 @@
  * `@effect/platform-node`) may override it via `DynamoClient.make({ crypto })`.
  */
 
-import { Crypto, Effect, PlatformError } from "effect"
+import { SecureRandom } from "effect/crypto"
 
 /**
- * Build the default `Crypto` service backed by `globalThis.crypto`.
+ * Build the default `SecureRandom` service backed by `globalThis.crypto`.
  *
- * `randomBytes` uses `crypto.getRandomValues` (synchronous, CSPRNG). `digest`
- * delegates to `crypto.subtle.digest` — unused by the ORM today but required by
- * `Crypto.make`'s constructor contract.
+ * `crypto.getRandomValues` is synchronous and a CSPRNG. Each service orders its
+ * own UUIDv7s and ULIDs, so a client gets its own ordering.
  */
-export const makeDefaultCrypto = (): Crypto.Crypto => {
+export const makeDefaultCrypto = (): SecureRandom.SecureRandom["Service"] => {
   const webCrypto = globalThis.crypto
-  return Crypto.make({
-    // Crypto.make requires a fresh array per call (it mutates UUID bytes).
-    randomBytes: (size) => webCrypto.getRandomValues(new Uint8Array(size)),
-    digest: (algorithm, data) =>
-      Effect.tryPromise({
-        try: () => webCrypto.subtle.digest(algorithm, data as unknown as ArrayBuffer),
-        catch: (cause) =>
-          PlatformError.badArgument({
-            module: "Crypto",
-            method: "digest",
-            description: `digest failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-          }),
-      }).pipe(Effect.map((buf) => new Uint8Array(buf))),
-  })
+  // SecureRandom.make requires a fresh array per call (it mutates UUID bytes).
+  return SecureRandom.make((size) => webCrypto.getRandomValues(new Uint8Array(size)))
 }

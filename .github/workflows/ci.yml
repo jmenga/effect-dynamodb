@@ -49,6 +49,17 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # package.json is not what gets published: `pnpm pack` rewrites it. Check the
+      # packed manifests with the same mechanism `release.yml` publishes from, so a
+      # range that mixes lockstep package versions fails here, not at publish time.
+      - name: Packed manifests pin the lockstep packages
+        run: |
+          mkdir -p /tmp/packed
+          for dir in packages/schema packages/effect-dynamodb packages/effect-dynamodb-geo packages/language-service; do
+            (cd "$dir" && pnpm pack --silent --pack-destination /tmp/packed)
+          done
+          node .github/scripts/check-lockstep-pins.mjs /tmp/packed/*.tgz
+
       - name: Type check
         run: pnpm check
 

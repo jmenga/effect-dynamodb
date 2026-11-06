@@ -133,9 +133,7 @@ export const UNSENTINELED_DEFAULTS = "__edd_d__"
 const incarnationCrypto = makeDefaultCrypto()
 
 /** @internal A fresh incarnation token. */
-export const freshIncarnationToken: Effect.Effect<string> = Effect.orDie(
-  incarnationCrypto.randomUUIDv4,
-)
+export const freshIncarnationToken: Effect.Effect<string> = incarnationCrypto.uuidV4()
 
 /**
  * Generate a wire-form timestamp value for the configured encoding from a
@@ -240,9 +238,9 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  * **What this gate covers.** Cases that are silently wrong (`upsert` — see
  * `PutKind`) or that cannot be working for anyone today: a `refs` entity writes
  * an item whose ref attribute is absent, so every later read fails to decode; a
- * `generatedId` entity whose id was NOT supplied dies outright (no `Crypto` in
+ * `generatedId` entity whose id was NOT supplied dies outright (no `SecureRandom` in
  * scope) — one supplied on the input is written as given, since that is the case
- * `Entity.put` also handles without `Crypto` (#120); a vector-indexed entity
+ * `Entity.put` also handles without `SecureRandom` (#120); a vector-indexed entity
  * writes an item with no embedding, so it silently drops out of the index.
  *
  * **The multi-item lifecycle features split by direction (#113).** `unique`,
@@ -375,7 +373,7 @@ export const rejectUnsupportedOp = (
     )
   }
   // Unlike the two gates around it, this one depends on the INPUT rather than
-  // the configuration. `Entity.put` only reaches `Crypto` when the caller
+  // the configuration. `Entity.put` only reaches `SecureRandom` when the caller
   // omitted the field — `fillGeneratedId` returns the input untouched when it
   // is present — so a caller who supplies the id needs nothing this path lacks.
   // Rejecting them named a dependency that did not apply, and pointed at a
@@ -394,7 +392,7 @@ export const rejectUnsupportedOp = (
       return Effect.fail(
         fail(
           `an omitted generated id ("${idField}")`,
-          "generating one needs the Crypto service, which is not in scope here. Supply " +
+          "generating one needs the SecureRandom service, which is not in scope here. Supply " +
             `"${idField}" on the input and this path writes it as given — only the ` +
             "generating case is unsupported.",
         ),

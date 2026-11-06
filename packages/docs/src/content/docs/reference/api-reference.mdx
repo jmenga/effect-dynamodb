@@ -755,7 +755,7 @@ yield* Transaction.transactWrite(
 |---|---|
 | `upsert()` | An `UpdateItem` using `if_not_exists` for `createdAt`, immutable fields and the version counter. A `Put` would reset all three |
 | `put()` / `create()` of an entity with `refs` | Write-time ref hydration reads the referenced entity; the put compile step cannot, so the ref attribute would be written empty. (An `update()` is planned from the entity's own update, which hydrates refs as it does standalone.) |
-| `generatedId` | Id generation needs the `Crypto` service |
+| `generatedId` | Id generation needs the `SecureRandom` service |
 | `vectorIndexes` | Computing the embedding needs the `Embedder` service; the item would drop out of the index |
 | `update()` with `.cascade(...)` | **EDD-9059.** A cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
 | `update()` / `delete()` with a `.returnValues(...)` mode that returns an item | **EDD-9060.** A transaction returns no item attributes. (A delete with such a mode is not a transact op at the type level either.) |

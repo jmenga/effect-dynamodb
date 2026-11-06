@@ -23,16 +23,15 @@
 import {
   Config,
   Console,
-  Crypto,
   Data,
   DateTime,
   Duration,
   Effect,
   Layer,
   Option,
-  PlatformError,
   Schema,
 } from "effect"
+import { SecureRandom } from "effect/crypto"
 
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -1234,11 +1233,11 @@ const program = Effect.gen(function* () {
 
   // #region handler-event-metadata
   // One ULID per event: its time comes from the Clock, its random bits from
-  // the Crypto service.
-  const crypto = yield* Crypto.Crypto
+  // the SecureRandom service.
+  const random = yield* SecureRandom.SecureRandom
   const mintEventIds = (correlationId: string, events: ReadonlyArray<MatchEvent>) =>
     Effect.forEach(events, () =>
-      Effect.map(crypto.randomULID, (eventId) => ({ correlationId, eventId })),
+      Effect.map(random.ulid, (eventId) => ({ correlationId, eventId })),
     )
 
   // Idempotent: a redelivered command fails with DuplicateCommand, so the ids
@@ -1751,24 +1750,6 @@ const program = Effect.gen(function* () {
 // 12. Provide dependencies and run
 // ---------------------------------------------------------------------------
 
-// #region crypto-layer
-// Effect core ships no default Crypto service. This one is backed by the Web
-// Crypto API (`globalThis.crypto`): Node 19+ (Node 18 only with
-// --experimental-global-webcrypto), browsers and edge runtimes.
-const WebCrypto = Layer.succeed(
-  Crypto.Crypto,
-  Crypto.make({
-    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
-    digest: (algorithm, data) =>
-      Effect.tryPromise({
-        try: () => globalThis.crypto.subtle.digest(algorithm, new Uint8Array(data)),
-        catch: (cause) =>
-          PlatformError.badArgument({ module: "Crypto", method: "digest", cause }),
-      }).pipe(Effect.map((digest) => new Uint8Array(digest))),
-  }),
-)
-// #endregion
-
 // #region layer-setup
 const AppLayer = Layer.mergeAll(
   DynamoClient.layerConfig({
@@ -1782,7 +1763,7 @@ const AppLayer = Layer.mergeAll(
   SeriesTable.layer({ name: "event-sourcing-series" }),
   RecordTable.layer({ name: "event-sourcing-records" }),
   LedgerTable.layer({ name: "event-sourcing-ledgers" }),
-  WebCrypto,
+  SecureRandom.layerWebCrypto,
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

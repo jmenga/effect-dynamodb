@@ -2060,7 +2060,7 @@ export const buildDerivedSchemas = (
   if (systemFields.updatedAtCollision && systemFields.updatedAt)
     optionalOnCollide.add(systemFields.updatedAt)
   // Auto-generated id: optional in input (caller may omit and let the library
-  // fill it from the Crypto service) but required in recordSchema (a decoded
+  // fill it from the SecureRandom service) but required in recordSchema (a decoded
   // record always carries it). Reuses the system-collision optionality path.
   if (generatedIdField) optionalOnCollide.add(generatedIdField)
   const strippedFromInput = new Set<string>()

@@ -68,7 +68,6 @@ import { deriveSourceText } from "@effect-dynamodb/schema/VectorIndex.js"
 import {
   Cause,
   Context,
-  Crypto,
   Data,
   DateTime,
   type Duration,
@@ -78,6 +77,7 @@ import {
   Schema,
   Stream,
 } from "effect"
+import { SecureRandom } from "effect/crypto"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
 import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
@@ -3171,14 +3171,16 @@ const makeImpl = <
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
-   * absent. Sources a UUID from the bundled `Crypto` service. Caller-supplied
+   * absent. Sources a UUID from the bundled `SecureRandom` service. Caller-supplied
    * values are respected (never overwritten). Returns the input unchanged when
-   * `generatedId` is not configured — entities without it never touch Crypto.
+   * `generatedId` is not configured — entities without it never touch SecureRandom.
    *
-   * `Crypto.Crypto` is provided from the context `DynamoClient.make` bundles,
+   * `SecureRandom` is provided from the context `DynamoClient.make` bundles,
    * so the bound `put` stays `R = never` despite this yield.
    */
-  const fillGeneratedId = (input: unknown): Effect.Effect<unknown, never, Crypto.Crypto> => {
+  const fillGeneratedId = (
+    input: unknown,
+  ): Effect.Effect<unknown, never, SecureRandom.SecureRandom> => {
     if (!generatedIdField) return Effect.succeed(input)
     if (typeof input !== "object" || input === null) return Effect.succeed(input)
     const rec = input as globalThis.Record<string, unknown>
@@ -3186,16 +3188,10 @@ const makeImpl = <
       return Effect.succeed(input)
     }
     return Effect.gen(function* () {
-      const crypto = yield* Crypto.Crypto
-      const id =
-        generatedIdVersion === "v7" ? yield* crypto.randomUUIDv7 : yield* crypto.randomUUIDv4
+      const random = yield* SecureRandom.SecureRandom
+      const id = generatedIdVersion === "v7" ? yield* random.uuidV7() : yield* random.uuidV4()
       return { ...rec, [generatedIdField]: id }
-    }).pipe(
-      // randomUUIDv4/v7 surface a PlatformError; the global Crypto wrapper never
-      // fails in practice, so collapse it to a defect rather than widening the
-      // put error channel.
-      Effect.orDie,
-    )
+    })
   }
 
   /**
@@ -7165,7 +7161,7 @@ const makeImpl = <
           // Auto-generated id: fill the configured primary-key field with a
           // fresh UUID BEFORE the encode, but only when the caller omitted it —
           // a caller-supplied value is always respected. The id is sourced from
-          // the bundled Crypto service (`DynamoClient.make` provides a default),
+          // the bundled SecureRandom service (`DynamoClient.make` provides a default),
           // so this keeps the bound `put` at `R = never`. The filled id then
           // flows through input validation → key composition → stored item →
           // returned record in this same pass.
@@ -14555,21 +14551,21 @@ export const bind = <
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
-    // Bundle a default `Crypto` service into the captured context. This is how
+    // Bundle a default `SecureRandom` service into the captured context. This is how
     // `generatedId` put auto-fills a UUID while keeping bound `put` at
-    // `R = never`: the entity op yields `Crypto.Crypto`, and `provide` supplies
+    // `R = never`: the entity op yields `SecureRandom`, and `provide` supplies
     // it from this bundled context rather than surfacing it as a requirement.
-    // The `provide` helper is widened to admit `Crypto.Crypto` so the
-    // Crypto-requiring entity ops typecheck. A platform override supplied via
+    // The `provide` helper is widened to admit `SecureRandom` so the
+    // SecureRandom-requiring entity ops typecheck. A platform override supplied via
     // `DynamoClient.make({ crypto })` is already in `baseCtx` and is respected
     // (we only fill the default when absent). See `DESIGN.md`.
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
-    const ctx = Option.isSome(Context.getOption(baseCtx, Crypto.Crypto))
-      ? (baseCtx as Context.Context<DynamoClient | TableConfig | Crypto.Crypto>)
-      : Context.add(baseCtx, Crypto.Crypto, makeDefaultCrypto())
+    const ctx = Option.isSome(Context.getOption(baseCtx, SecureRandom.SecureRandom))
+      ? (baseCtx as Context.Context<DynamoClient | TableConfig | SecureRandom.SecureRandom>)
+      : Context.add(baseCtx, SecureRandom.SecureRandom, makeDefaultCrypto())
     const provide = <A, E>(
-      effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
+      effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     type Key = EntityKeyType<TModel, TIndexes>

@@ -1284,15 +1284,15 @@ const sourceIds = importedEvents.map((event) => event.metadata?.sourceId)
 
 A handler's per-call `metadata` is fixed before `decide` runs, so it cannot know how many events it must cover. Its `eventMetadata` is a function of the [`Decision`](#step-16-inline-projections), the same one a function-form `additionalItems` receives, returning one entry per event directly or as an `Effect`.
 
-The example mints each event's id as a [ULID](https://github.com/ulid/spec) with Effect's `Crypto` service, and the metadata schema checks it with `Schema.isULID()`. `crypto.randomULID` takes the id's time from the `Clock` and its 80 random bits from `Crypto`, so ids sort by when they were minted, and a test that provides a `TestClock` and a `Crypto` whose `randomBytes` returns fixed bytes gets the same ids on every run. When a standard UUID is needed, `crypto.randomUUIDv7` works the same way. Effect provides no default `Crypto` service; the example builds one on the Web Crypto API (see [Layer Setup](#layer-setup)).
+The example mints each event's id as a [ULID](https://github.com/ulid/spec) with Effect's `SecureRandom` service, and the metadata schema checks it with `Schema.isULID()`. `random.ulid` takes the id's time from the `Clock` and its 80 random bits from `SecureRandom`, and within one millisecond it increments the previous id's random part, so ids from one service always sort by when they were minted. A test that provides a `TestClock` and builds a fresh `SecureRandom.make` over fixed bytes for each run gets the same ids on every run. When a standard UUID is needed, `random.uuidV7()` works the same way. Effect provides no default `SecureRandom` service; the example uses the one backed by the Web Crypto API (see [Layer Setup](#layer-setup)).
 
 ```typescript region="handler-event-metadata" example="event-sourcing.ts"
 // One ULID per event: its time comes from the Clock, its random bits from
-// the Crypto service.
-const crypto = yield* Crypto.Crypto
+// the SecureRandom service.
+const random = yield* SecureRandom.SecureRandom
 const mintEventIds = (correlationId: string, events: ReadonlyArray<MatchEvent>) =>
   Effect.forEach(events, () =>
-    Effect.map(crypto.randomULID, (eventId) => ({ correlationId, eventId })),
+    Effect.map(random.ulid, (eventId) => ({ correlationId, eventId })),
   )
 
 // Idempotent: a redelivered command fails with DuplicateCommand, so the ids
@@ -2246,25 +2246,7 @@ The client reads its endpoint from the `DYNAMODB_ENDPOINT` config value, default
 
 ### Layer Setup
 
-The command handler in [Step 20](#metadata-from-the-command-handler) mints ids through Effect's `Crypto` service, which Effect does not provide by default. The example backs it with the Web Crypto API. (`DynamoClient.make` bundles a `Crypto` for its own bound operations only, such as `generatedId`; your own effects need one in their layer.)
-
-```typescript title="main.ts" region="crypto-layer" example="event-sourcing.ts"
-// Effect core ships no default Crypto service. This one is backed by the Web
-// Crypto API (`globalThis.crypto`): Node 19+ (Node 18 only with
-// --experimental-global-webcrypto), browsers and edge runtimes.
-const WebCrypto = Layer.succeed(
-  Crypto.Crypto,
-  Crypto.make({
-    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
-    digest: (algorithm, data) =>
-      Effect.tryPromise({
-        try: () => globalThis.crypto.subtle.digest(algorithm, new Uint8Array(data)),
-        catch: (cause) =>
-          PlatformError.badArgument({ module: "Crypto", method: "digest", cause }),
-      }).pipe(Effect.map((digest) => new Uint8Array(digest))),
-  }),
-)
-```
+The command handler in [Step 20](#metadata-from-the-command-handler) mints ids through Effect's `SecureRandom` service, which Effect does not provide by default. The example adds `SecureRandom.layerWebCrypto` from `effect/crypto`, backed by the Web Crypto API (`globalThis.crypto`): Node 19+ (Node 18 only with `--experimental-global-webcrypto`), browsers and edge runtimes. (`DynamoClient.make` bundles a `SecureRandom` for its own bound operations only, such as `generatedId`; your own effects need one in their layer.)
 
 ```typescript title="main.ts" region="layer-setup" example="event-sourcing.ts"
 const AppLayer = Layer.mergeAll(
@@ -2279,7 +2261,7 @@ const AppLayer = Layer.mergeAll(
   SeriesTable.layer({ name: "event-sourcing-series" }),
   RecordTable.layer({ name: "event-sourcing-records" }),
   LedgerTable.layer({ name: "event-sourcing-ledgers" }),
-  WebCrypto,
+  SecureRandom.layerWebCrypto,
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

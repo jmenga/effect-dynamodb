@@ -15,7 +15,6 @@ import {
 import {
   Cause,
   Context,
-  Crypto,
   Data,
   DateTime,
   Duration,
@@ -29,6 +28,7 @@ import {
   Schema,
   SchemaGetter,
 } from "effect"
+import { SecureRandom } from "effect/crypto"
 import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -119,7 +119,7 @@ const Registrations = Entity.make({
 // #120 — a read model keyed by a framework-generated id. The "commit the read
 // model atomically with the events that produced it" pattern (#100) was barred
 // outright for this shape, even when the caller supplied the id and so needed
-// no `Crypto` at all.
+// no `SecureRandom` at all.
 class AuditRecord extends Schema.Class<AuditRecord>("AuditRecord")({
   auditId: Schema.String,
   note: Schema.String,
@@ -8386,7 +8386,7 @@ describe("EventStore per-event metadata (#144)", () => {
     )
 
     it.effect(
-      "ids minted with Crypto.randomULID are deterministic under TestClock and a fixed Crypto",
+      "ids minted with SecureRandom's ulid are deterministic under TestClock and a fixed SecureRandom",
       () =>
         Effect.gen(function* () {
           mockQuery.mockResolvedValue({ Items: [startedItem()] })
@@ -8394,32 +8394,29 @@ describe("EventStore per-event metadata (#144)", () => {
           yield* TestClock.setTime(epochMs)
 
           // The documented pattern (tutorials/event-sourcing.mdx, Step 20): one
-          // ULID per event from the Crypto service.
+          // ULID per event from the SecureRandom service.
           const program = Effect.gen(function* () {
-            const crypto = yield* Crypto.Crypto
+            const random = yield* SecureRandom.SecureRandom
             return yield* EventStore.commandHandler(twoEvents, Audited)(
               { matchId: "m-1" },
               completeInnings,
               {
                 eventMetadata: ({ events }) =>
-                  Effect.forEach(events, () =>
-                    Effect.map(crypto.randomULID, (eventId) => meta(eventId)),
-                  ),
+                  Effect.forEach(events, () => Effect.map(random.ulid, (eventId) => meta(eventId))),
               },
             )
           })
-          // A test Crypto: call n returns n-filled bytes; the time is the TestClock's.
+          // A test SecureRandom: call n returns n-filled bytes; the time is the
+          // TestClock's, so the second id falls in the first one's millisecond and
+          // increments its random part instead of drawing fresh bytes.
           let calls = 0
-          const fixedCrypto = Crypto.make({
-            randomBytes: (size) => new Uint8Array(size).fill(++calls),
-            digest: () => Effect.succeed(new Uint8Array(0)),
-          })
-          yield* Effect.provideService(program, Crypto.Crypto, fixedCrypto)
+          const fixedRandom = SecureRandom.make((size) => new Uint8Array(size).fill(++calls))
+          yield* Effect.provideService(program, SecureRandom.SecureRandom, fixedRandom)
 
           const ids = eventPutsOf(mockTransactWriteItems.mock.calls[0]![0]).map(
             (item) => (item.metadata as { eventId: string }).eventId,
           )
-          expect(ids).toEqual(["01HK153X00040G2081040G2081", "01HK153X00081040G2081040G2"])
+          expect(ids).toEqual(["01HK153X00040G2081040G2081", "01HK153X00040G2081040G2082"])
           const isUlid = Schema.is(Schema.String.check(Schema.isULID()))
           expect(ids.every((id) => isUlid(id))).toBe(true)
         }).pipe(Effect.provide(TestLayer)),

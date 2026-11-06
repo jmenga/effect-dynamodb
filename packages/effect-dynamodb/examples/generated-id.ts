@@ -5,9 +5,9 @@
  * auto-filled with a cryptographically-secure UUID at write time when the
  * caller omits it. A caller-supplied value is always respected.
  *
- * The id is sourced from the bundled `Crypto` service — `DynamoClient.make`
+ * The id is sourced from the bundled `SecureRandom` service — `DynamoClient.make`
  * provides a default `globalThis.crypto`-backed implementation, so bound `put`
- * stays `R = never` (no Crypto layer required in your program).
+ * stays `R = never` (no SecureRandom layer required in your program).
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -72,7 +72,7 @@ const WidgetsTable = Table.make({ schema: AppSchema, entities: { Widgets } })
 // ---------------------------------------------------------------------------
 
 const program = Effect.gen(function* () {
-  // The typed client bundles a default Crypto service — no Crypto layer needed.
+  // The typed client bundles a default SecureRandom service — no layer needed.
   const db = yield* DynamoClient.make({
     entities: { Widgets },
     tables: { WidgetsTable },
@@ -86,7 +86,7 @@ const program = Effect.gen(function* () {
   yield* Console.log("Table created: generated-id-demo\n")
 
   // #region put
-  // No `widgetId` supplied — the library fills it from the Crypto service.
+  // No `widgetId` supplied — the library fills it from the SecureRandom service.
   const created = yield* db.entities.Widgets.put({
     owner: "alice",
     label: "Sprocket",

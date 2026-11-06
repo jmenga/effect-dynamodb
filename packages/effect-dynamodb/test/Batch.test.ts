@@ -980,12 +980,12 @@ describe("Batch", () => {
     // #120 — the generatedId gate reads the INPUT, not the configuration.
     // -----------------------------------------------------------------------
     //
-    // `Entity.put` reaches `Crypto` only when the field is absent, so a caller
+    // `Entity.put` reaches `SecureRandom` only when the field is absent, so a caller
     // who supplies the id needs nothing `BatchWriteItem` lacks. Gating on the
     // configuration barred the entity from `Batch.write` outright, citing a
     // dependency that did not apply to the call being rejected.
 
-    it.effect("rejects a put whose generated id was OMITTED — that needs Crypto", () =>
+    it.effect("rejects a put whose generated id was OMITTED — that needs SecureRandom", () =>
       Effect.gen(function* () {
         const error = yield* Batch.write([GenDocs.put({ title: "T" } as never)]).pipe(Effect.flip)
 
