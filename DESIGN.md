@@ -1016,11 +1016,15 @@ it would write, judging what the move would leave for a row that moves.
 
 `ambiguous` is written by nothing: a `sparse` half with two or more composites outside the primary key and no
 key is byte for byte the documented drop (§7, "Telemetry (no alert)"), so a repair could re-admit an alert a
-writer ended. Not judged: a half in a table key attribute (no write names one); a half with a library-stamped
-composite (`put` composes before stamping, and `updatedAt` moves on every update), including as the other half of
-an index with no key; a half whose values compose no key; a sharded partition key already stored, or without its
-shard source (the text rewrite owns those). A Z-order half compares bytes and never truncates. For the same
-reason a move keeps a half absent that's `ambiguous` or holds a stamped composite (`keptAbsent` in `movedRowOf`).
+writer ended. Stamped composites don't count towards that two: no writer leaves one out. A half holding
+`timestamps.updated` is compared without that composite's text (`lagTolerated`, §7 "Composites the library
+stamps"), since an update that can't compose the half leaves it: a key that only lags is no difference, on any run,
+and one holding anything else is rewritten once from the row's value and is then fine whatever `updatedAt` does.
+A Z-order half holding it can't be read apart, so any address is fine and only a missing one is written. Not
+judged: a half in a table key attribute (no write names one); a half whose values compose no key; a sharded
+partition key already stored, or without its shard source (the text rewrite owns those). Otherwise a Z-order half
+compares bytes and never truncates. For the same reason a move keeps a half absent that's `ambiguous`
+(`keptAbsent` in `movedRowOf`).
 Aggregates compose their own rows and never called the gate; sentinels and history rows have no index keys.
 
 **A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
@@ -1559,6 +1563,26 @@ Composer option `onMissingShardSource: "keep"` turns the failing cases into a no
 
 A `put` missing a `by` value writes no index entry at all (`tryComposeIndexKeys`, sparse as ever), never an unsharded key.
 
+#### Composites the library stamps
+
+`timestamps.created`, `timestamps.updated` and, under `retain`, the `versioned` attribute can be index composites. The rule that keeps the key and the row together differs for each, because a write knows each differently.
+
+**A write that builds a whole item stamps first and composes from what it stamped.** `put`, `create`, `upsert` of a new item, `restore`, `Batch.write`, `transactWrite`, `EventStore` additional items and a projection's rows all go through `stampsOf` or `validateAndBuildPutItem`. A value the caller supplied wins over the stamp, and the key holds it. A guarded put over an existing item carries its stored `createdAt` and next version forward, then recomposes the keys holding them (`planPut`'s `composeKeys`). A retain snapshot strips its keys as ever. A vector partition follows the same order.
+
+**An update stamps `updatedAt`, and the stamp is not a claim on the half.** `composeGsiKeysForUpdatePolicyAware` takes `stamped` (in key form), and a half holding one is gated by `writerLeavesStampedHalf`, not the skip-predicate: only its *other* composites count. If one of them is on neither the payload nor the `keyRecord`, and none of them is cleared by name, the half is left, under either policy, and its key lags until a write can compose it. Otherwise it's evaluated with the stamp merged in, by the usual rules. Counting the stamp as touching the half would make `[status, updatedAt]` "touched but can't compose" on every unrelated `.set({ note })`, which under `sparse` drops the row: exactly what #183 stopped. Pure `[updatedAt]` has no other composite, so it always moves. A half with two others and one named (`[status, region, updatedAt]`, `.set({ status })`) is left whole rather than truncated as the same half without the stamp would be: the stamp at the end means no prefix of it is a key a query would look for. `.remove()` still cascades (`hasRemoved` runs first), a named clear falls to the half's policy, and a caller's `updatedAt` in the payload changes nothing about any of this.
+
+**`createdAt` is an ordinary, stable composite.** An update doesn't stamp it and can't name it (it's stripped from the update schema), so the skip-predicate applies: `[createdAt]` is left, and `[status, createdAt]` on `.set({ status })` truncates to `status_b` under both policies, the existing partial-payload rule. `rekey({ repairIndexKeys: true })` restores it. A read-first path (retain, a unique rotation) has the value, and composes the whole key.
+
+**`version` isn't known without a read**, so an index over it is refused (`EDD-9121`, at `Entity.make` and at the type level) unless `retain`, whose every write reads the item. On that path the next version is a stamp like `updatedAt`. A primary key over `updatedAt` or `version`, and `shards.by` over either, are refused whatever `retain` says: a primary key never changes, and a shard would go stale on every write. `createdAt` is allowed in both.
+
+**Reading first where one `UpdateItem` can't say.** An `upsert` writes `createdAt = if_not_exists(...)` and an immutable field likewise, so a key composed from the input would disagree with what the write keeps. With either as a secondary index composite it takes the guarded path (`upsertKeyDependsOnStored`). With a primary key over an unsupplied `createdAt` there's no existing item to name, so it creates. A time-series `append` has no `updatedAt` (`orderBy` is its clock); an index over `createdAt` makes it read the row first and compose for what it finds, guarded on the `orderBy` it read, and it re-reads when a concurrent append moves it.
+
+**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Any other is the caller's (rule b, above), and the types agree: `WithSystemCollisions` makes only a managed date optional. An aggregate's stamp overwrites what a caller supplied, so its optional dates stay the caller's. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
+
+**Aggregates.** An aggregate's list key composes from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree.
+
+**Repair.** `judgeIndexHalf` judges these halves like any other (see "Index keys that differ"): a row 1.38 wrote with no key is `missing`, and a key that only lags `updatedAt` is no difference.
+
 #### Canonical GSI-composite test-fixture shapes
 
 Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only, and as the v1.7.2 matrix did with empty-composite halves) leads to consumer-facing regressions. Future work in this area must verify each shape:
@@ -1603,6 +1627,14 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 14. **An index half with the same definition as the table half in its attribute** (#183) — above all an inverted index, `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`, and also a local index's partition key and a sort key shared with the table. **Supported, not encouraged:** the library's principle is that index keys go in dedicated GSI attributes. It needs no case of its own: one rule composes every key, so both roles build identical text with `escapeKeys` on or off, and `EDD-9106` holds the rest by comparing definitions. No update writes it ("Never set a table key attribute", below). **The regression scenario from 1.37.0 and 1.38.0**, in which a sort key's escaping overwrote `pk`, so `get` failed for a value with a space, and a `put` of a value with one in `sk` failed. Cover values with a space, `%`, `#`, mixed case and non-ASCII, numbers and dates, each write path, under both flag settings, rows 1.36, 1.37.0 and 1.38.0 wrote through `rekey`, and that no other definition's bytes change.
 
 15. **Both halves of one index over one composite, holding only what a key escapes** (#183) — `pk: [tag], sk: [tag]` with `tag` of `#`, `%`, `%23`, `%25`, a space or `# #`. Each value has its own key under both flag settings, and a value spelled like another's escape isn't it. Cover on the composer, the entity and DynamoDB Local (`test/helpers/EscapeKeyScenarios.ts`, `schema/test/EscapeKeys.test.ts`).
+
+16. **`sk: [updatedAt]`** — the half holds only the stamp. It moves on every update, including a `.set({ note })` naming nothing of it, under both policies. A partition half over it (`pk: [updatedAt]`) does the same. Shape 2 analogue: `[id, updatedAt]` with `id` in the primary key always moves. Shape 6 analogue: an empty partition half is evaluated and the stamped sort half moves.
+
+17. **`sk: [status, updatedAt]`** — with `status` in the payload or the `keyRecord` it moves with the new stamp; with neither, it's left under both policies, never dropped and never truncated. **This is the trap:** treating the stamp as touching the half drops the row under `sparse` on every unrelated update. `.remove(["status"])` still REMOVEs it. 17a: `[status, region, updatedAt]` with one of the two named is left whole. 17b: a Z-order half with `updatedAt` as a dimension is all-or-nothing on the same rule: every other dimension and prefix composite known means SET the address, otherwise left, under either policy.
+
+18. **`sk: [createdAt]` and `pk: [createdAt]`** — written by whichever write builds the item, from the stamp or the supplied value, and left by every update: the key survives an update, an `upsert` (which reads first), a guarded `put` over an existing item and a `restore`. 18a: `[status, createdAt]` on `.set({ status })` truncates to `status_b` under both policies, the partial-payload rule.
+
+All three are covered on the composer (`schema/test/KeyComposer.test.ts`), through the entity on a recording table (`IndexPolicyV3.test.ts`) and on DynamoDB Local (`connected.test.ts`), both from `test/helpers/StampedComposites.ts`, under both `escapeKeys` settings.
 
 #### Never set a table key attribute
 
@@ -5392,7 +5424,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
 | `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 
-Next free code: **`EDD-9114`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+| `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by` (§7 "Composites the library stamps") |
+| `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
+
+Next free code: **`EDD-9123`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

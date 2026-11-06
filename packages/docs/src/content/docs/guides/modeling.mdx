@@ -346,6 +346,8 @@ softDelete: { ttl: Duration.days(30), preserveUnique: true }
 
 See [Lifecycle](/effect-dynamodb/guides/lifecycle/) for details on versioning and soft delete.
 
+An index or a primary key can be composed from `createdAt`, and an index from `updatedAt`: see [Keys over values the library stamps](/effect-dynamodb/guides/index-policy/#keys-over-values-the-library-stamps). A model field named like a timestamp is stamped if it's a date, optional or not, and otherwise stays yours. To store the version under another name use `versioned: { field }`: a `configure` `field:` rename of it is refused (`EDD-9122`), while `createdAt` and `updatedAt` may be renamed either way.
+
 ### Generated IDs
 
 Opt into auto-generated UUID primary keys with `generatedId`. The named field is filled with a cryptographically-secure UUID at write time **when the caller omits it** — a caller-supplied value is always respected. The field MUST exist in the model AND participate in the primary key (pk or sk composite); violating either throws `EDD-9008` at `make()` time.

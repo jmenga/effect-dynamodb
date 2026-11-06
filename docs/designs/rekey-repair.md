@@ -70,8 +70,9 @@ Released `effect-dynamodb@1.38.0` on DynamoDB Local, reading the rows back with 
 
 - The documented drop above, reachable only with two or more composites outside the primary key (decision 1).
 - A second writer with no read: the same state, and it can't be told apart.
-- A composite the library stamps (`createdAt`, `updatedAt`, `version`): `put` composes keys from its input *before*
-  stamping, so a healthy row has the value and no key. This one is under either policy.
+- A composite the library stamps (`createdAt`, `updatedAt`, `version`): `put` composed keys from its input *before*
+  stamping, so a row had the value and no key, under either policy. No longer healthy: `put` stamps first now (DESIGN.md
+  §7, "Composites the library stamps"), so such a row is `missing` and repaired.
 
 So "what `put` would write" needs narrowing, below.
 
@@ -104,8 +105,12 @@ Each half of each secondary index, using `put`'s composers through the key form:
 | A hole, or none leading | None | Nothing | Nothing |
 | A hole, or none leading | Any | REMOVE | Nothing |
 
-Never judged: a half in a table key attribute (no write ever names one, D70); a half with a library-stamped
-composite; a half whose values compose no key (`NaN`, a Z-order value a dimension can't place), which `put` would
+A half holding `updatedAt` is compared without that composite's text, since an update that can't compose it leaves it:
+a key that only lags is `fine` on every run, and any other difference is rewritten once from the row's value and is
+`fine` from then on. A Z-order half can't be read apart, so any address it holds is `fine`. Stamped composites don't
+count as outside the primary key, since no writer leaves one out.
+
+Never judged: a half in a table key attribute (no write ever names one, D70); a half whose values compose no key (`NaN`, a Z-order value a dimension can't place), which `put` would
 refuse too; a sharded partition key that can't compute its shard, which `rekey` already reports or leaves. A ref's
 id is read from the stored ref, as `.within()` does: without that, a `sparse` half on one would be REMOVEd from every
 row.
@@ -126,7 +131,8 @@ length limit) is a `failed` conflict, and the run goes on.
 
 **A move.** A table key move recomposes as an update naming everything would, so it re-admits a dropped row, a row
 with stamped composites and no key, whether or not the option is set. That's a bug in the released move, found
-measuring this. It keeps those halves absent now; anything else it already catches up, as §9.2 of the sharding design
+measuring this. It keeps a dropped half absent now (a row with a stamped composite and no key is `missing`, since `put`
+stamps first); anything else it already catches up, as §9.2 of the sharding design
 says.
 
 ## Cost

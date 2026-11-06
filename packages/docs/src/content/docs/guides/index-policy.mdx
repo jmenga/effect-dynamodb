@@ -403,7 +403,7 @@ The presence of an `indexPolicy` declaration does **not** force evaluation of ev
 
 ## Interaction with `put()`
 
-`put()` does NOT consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." Unchanged from prior versions.
+`put()` does NOT consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." It composes from the values it stores, so a `createdAt` or `updatedAt` it [stamps](#keys-over-values-the-library-stamps) counts as present.
 
 ## Interaction with time-series `.append()`
 
@@ -412,6 +412,95 @@ v1.7.x unifies `.append()` with `.update()` — both call the same composer with
 For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on `primaryKey: [channel, deviceId]`), the half is always touched via keyRecord membership and the structural rule composes from the immutable PK values on every append. The resulting SET is idempotent. (v1.7.0 / v1.7.1 silently skipped these GSIs — see the *byChannel* pitfall above; closes [#43](https://github.com/jmenga/effect-dynamodb/issues/43).)
 
 A multi-writer entity should declare its GSI shape so each half is owned by a single writer's domain — that's the design rule and the natural fit with per-half policy.
+
+## Keys over values the library stamps
+
+An index can be composed from `createdAt` and `updatedAt`, whether the model declares them or not. Declare them as dates (`Schema.DateTimeUtc`, also under `Schema.optional`) and the library stamps each one unless the caller supplies it. A field of that name that isn't a date, such as a plain `Schema.String`, stays the caller's: it's required or optional as the model says, nothing stamps it, and an update may name it.
+
+```typescript region="stamped-entity" example="guide-index-policy.ts"
+class Ticket extends Schema.Class<Ticket>("Ticket")({
+  ticketId: Schema.String,
+  owner: Schema.String,
+  status: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+  createdAt: Schema.DateTimeUtc,
+  updatedAt: Schema.DateTimeUtc,
+}) {}
+
+const Tickets = Entity.make({
+  model: Ticket,
+  entityType: "Ticket",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ticketId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Oldest first. Written once: `createdAt` never changes.
+    byCreated: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["owner"] },
+      sk: { field: "gsi1sk", composite: ["createdAt"] },
+    },
+    // Most recently touched first. Every update moves it.
+    byUpdated: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["owner"] },
+      sk: { field: "gsi2sk", composite: ["updatedAt"] },
+    },
+    // Within a status. Moves when an update can compose it, and otherwise waits.
+    byStatus: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["owner"] },
+      sk: { field: "gsi3sk", composite: ["status", "updatedAt"] },
+    },
+  },
+  timestamps: true,
+})
+```
+
+Every write that builds a whole item (`put`, `create`, `upsert` of a new item, `restore`, a batch, a transaction, an event store's additional items) stamps first and composes from what it stamped.
+
+An update stamps `updatedAt` and leaves `createdAt`. Under either policy:
+
+| Half | `.set({ note })` | `.set({ status })` |
+|---|---|---|
+| `[updatedAt]` | Moves | Moves |
+| `[status, updatedAt]`, status on neither the payload nor the primary key | **Left as it is**, and the row stays in the index | Moves, with the new `updatedAt` |
+| `[status, region, updatedAt]`, the same | Left as it is | Left as it is, whole: not truncated |
+| `[id, updatedAt]`, `id` in the primary key | Moves | Moves |
+| `[createdAt]` | Left as it is | Left as it is |
+| `[status, createdAt]` | Left as it is | **Truncated to `status_b`**, the partial-payload rule below |
+
+```typescript region="stamped-demo" example="guide-index-policy.ts"
+// Neither timestamp is supplied: the put stamps them and composes every key from what it stamped.
+yield* db.entities.Tickets.put({ ticketId: "t-1", owner: "ana", status: "open" })
+const created = yield* db.entities.Tickets.byCreated({ owner: "ana" }).collect()
+const updated = yield* db.entities.Tickets.byUpdated({ owner: "ana" }).collect()
+const open = yield* db.entities.Tickets.byStatus({ owner: "ana" }).collect()
+
+// An unrelated update: `byUpdated` moves with it. `byStatus` can't be composed, since this write
+// doesn't know the status, so its key stays where it is and the row stays in the index.
+yield* db.entities.Tickets.update({ ticketId: "t-1" }).set({ note: "called back" })
+const stillOpen = yield* db.entities.Tickets.byStatus({ owner: "ana" })
+  .where((t, { beginsWith }) => beginsWith(t.status, "open"))
+  .collect()
+
+// An update naming the status can compose it, with the new `updatedAt`.
+yield* db.entities.Tickets.update({ ticketId: "t-1" }).set({ status: "shut" })
+const shut = yield* db.entities.Tickets.byStatus({ owner: "ana" })
+  .where((t, { beginsWith }) => beginsWith(t.status, "shut"))
+  .collect()
+```
+
+- **`updatedAt` never counts as touching a half.** Every update stamps it, so it says nothing about who owns the half, and counting it would make every unrelated update drop a `sparse` row. A half whose other composites are all known moves; otherwise its key lags until a write can compose it. So `byStatus` orders by when a row last changed status, or last had its status written, not by its `updatedAt`.
+- **`.remove()` and a named clear still decide.** `.remove(["status"])` takes the row out of `[status, updatedAt]` under both policies. `.set({ status: undefined })` follows the half's policy, as for any hole.
+- **`[status, createdAt]` on `.set({ status })` truncates.** It's the [partial-payload rule](#5-the-structural-rule-longest-valid-leading-prefix): `status` is in the payload and `createdAt` isn't, and an update can't name `createdAt`, so the key becomes `status_b` under either policy until `rekey({ repairIndexKeys: true })` restores it. An entity whose update reads the item first (`retain`, or a `unique` rotation) has `createdAt` and composes the whole key.
+- **A stamped Z-order dimension** follows the same rule. With every other dimension and prefix composite known the address moves; otherwise it's left under either policy. It's never truncated, since a partial address means nothing.
+- **`version`:** the library adds one to it without reading the item, so no key can follow it, and `Entity.make` refuses it as a composite (`EDD-9121`). `versioned: { retain: true }` reads the item on every write, so there it works and moves with each write. It's refused in a primary key and in `shards.by` whatever `retain` says, and so is `updatedAt`.
+- **An `upsert` over `createdAt` or an `immutable` composite reads the item first.** One `UpdateItem` can't keep the stored value and compose a key from it. With the primary key over an unsupplied `createdAt`, nothing can name an existing item, so it creates one.
+- **A time-series `.append()`** has no `updatedAt`: the `orderBy` attribute is its clock. An index over `createdAt` reads the row first, for the same reason.
+
+Rows an earlier release wrote have no key in these indexes unless the caller supplied the value, because `put` composed before stamping. `rekey({ repairIndexKeys: true })` [brings them in](/effect-dynamodb/guides/upgrading/#repairing-index-keys).
 
 ## Multi-writer entity design rule
 

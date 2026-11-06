@@ -9,10 +9,11 @@
  *   - `Entity.remove([attr])` — explicit signal that a composite is gone;
  *     the library REMOVEs the half(s) containing the cleared attribute.
  *
- * Three runnable scenarios, each backing a worked example in the docs:
+ * Four runnable scenarios, each backing a worked example in the docs:
  *   1. Single-writer sparse — alert lifecycle on a hybrid GSI.
  *   2. Multi-writer preserve + sparse — full rejoin-without-re-firing flow.
  *   3. Hierarchical truncation — set surviving + remove leaf demotes the SK.
+ *   4. Keys over values the library stamps — createdAt and updatedAt composites.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -309,7 +310,88 @@ const scenario3 = Effect.gen(function* () {
 })
 
 // =============================================================================
-// 6. Layer + run
+// 6. Scenario 4 — Keys over values the library stamps
+// =============================================================================
+
+// #region stamped-entity
+class Ticket extends Schema.Class<Ticket>("Ticket")({
+  ticketId: Schema.String,
+  owner: Schema.String,
+  status: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+  createdAt: Schema.DateTimeUtc,
+  updatedAt: Schema.DateTimeUtc,
+}) {}
+
+const Tickets = Entity.make({
+  model: Ticket,
+  entityType: "Ticket",
+  primaryKey: {
+    pk: { field: "pk", composite: ["ticketId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    // Oldest first. Written once: `createdAt` never changes.
+    byCreated: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["owner"] },
+      sk: { field: "gsi1sk", composite: ["createdAt"] },
+    },
+    // Most recently touched first. Every update moves it.
+    byUpdated: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["owner"] },
+      sk: { field: "gsi2sk", composite: ["updatedAt"] },
+    },
+    // Within a status. Moves when an update can compose it, and otherwise waits.
+    byStatus: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["owner"] },
+      sk: { field: "gsi3sk", composite: ["status", "updatedAt"] },
+    },
+  },
+  timestamps: true,
+})
+// #endregion
+
+const TicketTable = Table.make({ schema: AppSchema, entities: { Tickets } })
+
+const scenario4 = Effect.gen(function* () {
+  const db = yield* DynamoClient.make({
+    entities: { Tickets },
+    tables: { TicketTable },
+  })
+
+  yield* Console.log("\n=== Scenario 4: Keys over values the library stamps ===")
+
+  // #region stamped-demo
+  // Neither timestamp is supplied: the put stamps them and composes every key from what it stamped.
+  yield* db.entities.Tickets.put({ ticketId: "t-1", owner: "ana", status: "open" })
+  const created = yield* db.entities.Tickets.byCreated({ owner: "ana" }).collect()
+  const updated = yield* db.entities.Tickets.byUpdated({ owner: "ana" }).collect()
+  const open = yield* db.entities.Tickets.byStatus({ owner: "ana" }).collect()
+  assertEq([created.length, updated.length, open.length], [1, 1, 1], "scenario 4 — indexed")
+
+  // An unrelated update: `byUpdated` moves with it. `byStatus` can't be composed, since this write
+  // doesn't know the status, so its key stays where it is and the row stays in the index.
+  yield* db.entities.Tickets.update({ ticketId: "t-1" }).set({ note: "called back" })
+  const stillOpen = yield* db.entities.Tickets.byStatus({ owner: "ana" })
+    .where((t, { beginsWith }) => beginsWith(t.status, "open"))
+    .collect()
+  assertEq(stillOpen.length, 1, "scenario 4 — still under its status")
+
+  // An update naming the status can compose it, with the new `updatedAt`.
+  yield* db.entities.Tickets.update({ ticketId: "t-1" }).set({ status: "shut" })
+  const shut = yield* db.entities.Tickets.byStatus({ owner: "ana" })
+    .where((t, { beginsWith }) => beginsWith(t.status, "shut"))
+    .collect()
+  assertEq(shut.length, 1, "scenario 4 — moved to its new status")
+  // #endregion
+  yield* Console.log("  byUpdated moved on every update; byStatus moved when it could compose")
+})
+
+// =============================================================================
+// 7. Layer + run
 // =============================================================================
 
 // #region run
@@ -324,6 +406,7 @@ const HierLayer = Layer.mergeAll(
   ClientLayer,
   HierTable.layer({ name: "indexpolicy-demo-hier" }),
 )
+const TicketLayer = Layer.mergeAll(ClientLayer, TicketTable.layer({ name: "indexpolicy-demo-tickets" }))
 
 const main = Effect.gen(function* () {
   // Setup tables.
@@ -350,13 +433,27 @@ const main = Effect.gen(function* () {
     yield* db.tables.HierTable.create()
   }).pipe(Effect.provide(HierLayer))
 
+  const setupTickets = Effect.gen(function* () {
+    const db = yield* DynamoClient.make({
+      entities: { Tickets },
+      tables: { TicketTable },
+    })
+    // Start clean: drop the table a failed earlier run may have left behind
+    yield* db.tables.TicketTable.delete().pipe(
+      Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+    )
+    yield* db.tables.TicketTable.create()
+  }).pipe(Effect.provide(TicketLayer))
+
   yield* setupApp
   yield* setupHier
+  yield* setupTickets
 
   // Run scenarios.
   yield* scenario1.pipe(Effect.provide(AppLayer))
   yield* scenario2.pipe(Effect.provide(AppLayer))
   yield* scenario3.pipe(Effect.provide(HierLayer))
+  yield* scenario4.pipe(Effect.provide(TicketLayer))
 
   // Teardown.
   const teardownApp = Effect.gen(function* () {
@@ -374,8 +471,17 @@ const main = Effect.gen(function* () {
     yield* db.tables.HierTable.delete()
   }).pipe(Effect.provide(HierLayer))
 
+  const teardownTickets = Effect.gen(function* () {
+    const db = yield* DynamoClient.make({
+      entities: { Tickets },
+      tables: { TicketTable },
+    })
+    yield* db.tables.TicketTable.delete()
+  }).pipe(Effect.provide(TicketLayer))
+
   yield* teardownApp
   yield* teardownHier
+  yield* teardownTickets
 
   yield* Console.log("\nAll v1.7.1 indexPolicy scenarios passed.")
 })
