@@ -104,6 +104,7 @@ packages/effect-dynamodb/src/
 │   ├── BoundCrud.ts    # Bound CRUD builders (BoundPut/Update/Delete/Append) + BoundGet (an Effect), all carrying BoundOpTypeId for the one unwrap protocol
 │   ├── BoundVectorQuery.ts # BoundVectorQuery — SearchVectors builder (.collect() is the only terminal)
 │   ├── Capacity.ts     # Consumed-capacity choke point: `Capacity.client` (instrumented DynamoClient view), operation scopes, summing, reports
+│   ├── ClientOptions.ts # What the DynamoClient and DynamoStreamsClient layers share (#190): requestHandler + maxAttempts options, their Config form, the SDK client's life inside a layer
 │   ├── EntityOps.ts    # Entity operation intermediates + UpdateState (record + path-based)
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
@@ -172,7 +173,7 @@ db.entities.Tasks.byProject({ project: "alpha" }).filter(...).limit(10).collect(
     → unmarshall → Schema.decode(Entity.Record) per item
 
 db.collections.assignments({ employee: "dfinlay" }).collect()
-  → queries each member entity's table (parallel for cross-table collections)
+  → one Query on the shared index, on the first member's table
   → groups results by member name: { Employees: [...], Tasks: [...] }
 ```
 
@@ -287,6 +288,7 @@ Do NOT:
 - Pre-check a limit DynamoDB enforces (item size, transaction count/size, key length) — send the write and diagnose the rejection through `internal/WriteDiagnosis.ts`
 - Extract `A`/`E`/`R` from entity ops via `Effect.Effect<infer A>` — match against `EntityOp<infer A, ...>` instead
 - Resolve the raw client (`yield* DynamoClient`, `Effect.service(DynamoClient)`, …) in library `src/` — use `yield* Capacity.client`, or capacity is never reported (`test/capacity-guard.test.ts`; allowlist: `internal/Capacity.ts`, `DynamoClient.ts`, `internal/TransactPlan.ts`, `VectorSearchEmulation.ts`)
+- Call an SDK client's `.send(` without `{ abortSignal: signal }` — an interrupted fiber's request then runs on unseen, retries included (#190, `test/abort-signal-guard.test.ts`)
 
 ### TypeScript Conventions
 
@@ -321,6 +323,7 @@ Do NOT:
 - Pagination handled via `Stream.paginate`. Batch retry handled in `batchGet`/`batchWrite`.
 - `ConditionalCheckFailedException` is expected control flow, not exceptional.
 - Transactions: up to 100 items, 2x WCU for writes.
+- Interrupting aborts the request (#190): the connection closes and the SDK makes no further attempt, but a write already sent may still be applied. Timeouts are the application's to set (`requestHandler`, `maxAttempts` on the layers, no defaults; never import a platform handler). A timeout or abort is a `DynamoError` with the SDK's error as `cause`; Node's handler also names a dropped connection `TimeoutError`, and `cause.code` tells them apart.
 - AWS's reply to a signature or credential refusal can quote the session token. Anything that keeps an AWS SDK error as a `cause` must pass it through `redactCredentialRefusal` (`internal/CredentialRefusal.ts`) first, including any new SDK client (#186).
 
 **Key Limits:** Max item 400 KB | BatchWrite 25 | BatchGet 100 | Transaction 100 | GSIs 20 | Query/Scan response 1 MB | Per-partition 3,000 RCU / 1,000 WCU

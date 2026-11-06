@@ -11,6 +11,8 @@
  *   - Entity.create() for safe inserts
  *   - Entity-level expressions (condition, filter, select)
  *   - Low-level Expression builders
+ *   - Timeouts, retries and cancelling a request
+ *   - Settling a write whose wait ended early
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -19,7 +21,7 @@
  *   npx tsx examples/guide-advanced.ts
  */
 
-import { Config, Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as Batch from "../src/Batch.js"
@@ -391,6 +393,82 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Condition: ${cond.expression}`)
   yield* Console.log(`Filter: ${filter.expression}`)
   yield* Console.log(`Update: ${upd.expression}\n`)
+
+  // --- Timeouts and cancelling requests ---
+  yield* Console.log("=== Timeouts and cancelling requests ===\n")
+
+  // #region cancel-request
+  // Past 5 seconds this interrupts the call, which aborts its request.
+  const answered = yield* db.entities.Products.get({ productId: "p-1" }).pipe(
+    Effect.timeoutOption("5 seconds"),
+  )
+  // #endregion
+  yield* Console.log(`Answered in time: ${Option.isSome(answered)}`)
+
+  // #region settle-write
+  const order = {
+    productId: "p-order-1",
+    name: "Ordered",
+    price: 10,
+    stock: 1,
+    viewCount: 0,
+    tags: [],
+    category: "orders",
+    categories: new Set(["orders"]),
+  }
+  const create = db.entities.Products.create(order).asEffect()
+
+  const first = yield* create.pipe(Effect.timeoutOption("5 seconds"))
+  if (Option.isNone(first)) {
+    // The wait ended, not the request: the write may have been applied or may still be.
+    // Writing again settles it, because only one create can succeed.
+    yield* create.pipe(
+      Effect.catchTag("ConditionalCheckFailed", () =>
+        Effect.logInfo("The first attempt had been applied"),
+      ),
+    )
+  }
+  // #endregion
+  yield* Console.log(`Created in time: ${Option.isSome(first)}`)
+
+  const endpoint = yield* Config.String("DYNAMODB_ENDPOINT").pipe(
+    Config.withDefault("http://localhost:8000"),
+  )
+  const credentials = { accessKeyId: "local", secretAccessKey: "local" }
+
+  // #region request-timeouts
+  const WithTimeouts = DynamoClient.layer({
+    region: "us-east-1",
+    endpoint,
+    credentials,
+    requestHandler: {
+      connectionTimeout: 1_000, // to open the connection
+      socketTimeout: 5_000, // with no bytes moving on it
+    },
+    maxAttempts: 2, // the first included
+  })
+  // #endregion
+
+  // #region request-timeouts-config
+  const FromConfig = DynamoClient.layerConfig({
+    region: Config.String("AWS_REGION").pipe(Config.withDefault("us-east-1")),
+    endpoint: Config.succeed(endpoint),
+    credentials: Config.succeed(credentials),
+    requestHandler: {
+      connectionTimeout: Config.Int("DYNAMODB_CONNECTION_TIMEOUT_MS"),
+      socketTimeout: Config.Int("DYNAMODB_SOCKET_TIMEOUT_MS"),
+    },
+    maxAttempts: Config.Int("DYNAMODB_MAX_ATTEMPTS"),
+  })
+  // #endregion
+
+  const describe = Effect.gen(function* () {
+    const client = yield* DynamoClient
+    return yield* client.describeTable({ TableName: "advanced-demo-table" })
+  })
+  yield* describe.pipe(Effect.provide(WithTimeouts))
+  yield* describe.pipe(Effect.provide(FromConfig))
+  yield* Console.log("Both clients answered.\n")
 
   // --- Cleanup ---
   yield* Console.log("=== Cleanup ===\n")
