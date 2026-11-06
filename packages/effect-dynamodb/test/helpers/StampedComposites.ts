@@ -3711,6 +3711,755 @@ export const decomposeScenarios: ReadonlyArray<RepairScenario> = [
   }),
 ]
 
+// ---------------------------------------------------------------------------
+// Clearing a field, against what the library stamps: one form, and a stamp is never touched by it
+// ---------------------------------------------------------------------------
+
+const Clearing = Schema.Struct({
+  id: Schema.String,
+  owner: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+  createdAt: Schema.DateTimeUtc,
+  updatedAt: Schema.DateTimeUtc,
+})
+
+const POLICIES = ["sparse", "preserve"] as const
+const CLEARS = [
+  ["`.set({ status: undefined })`", (u: any) => u.set({ status: undefined })],
+  ['`.remove(["status"])`', (u: any) => u.remove(["status"])],
+] as const
+const UNRELATED = [
+  ["`.set({ note: undefined })`", (u: any) => u.set({ note: undefined })],
+  ['`.remove(["note"])`', (u: any) => u.remove(["note"])],
+] as const
+
+const clearingWorld = (
+  on: boolean,
+  composite: ReadonlyArray<string>,
+  policy: string,
+  extra: Record<string, unknown> = {},
+) =>
+  looseWorld(on, {
+    N: {
+      model: Clearing,
+      timestamps: true,
+      indexes: {
+        byOwner: {
+          name: "gsi1",
+          pk: half(1, ["owner"]),
+          sk: sortHalf(1, composite),
+          indexPolicy: { pk: policy, sk: policy },
+        },
+      },
+      ...extra,
+    },
+  })
+
+const seeded = { id: "a", owner: "o", status: "s", note: "n" }
+
+/** The clear's outcome, for each form and policy: the sort key's text as `expected` says of the row. */
+const clearScenario = (
+  name: string,
+  composite: ReadonlyArray<string>,
+  forms: typeof CLEARS | typeof UNRELATED,
+  expected: (before: StoredRow, after: StoredRow) => void,
+  extra: Record<string, unknown> = {},
+): ReadonlyArray<RepairScenario> =>
+  POLICIES.flatMap((policy) =>
+    forms.flatMap(([form, clear]) =>
+      bothSettings(`${name}: ${form}, ${policy}`, (h, on) => {
+        const w = clearingWorld(on, composite, policy, extra)
+        return h.on(w, (table) =>
+          Effect.gen(function* () {
+            const db = yield* w.client
+            yield* db.entities.N.put(seeded).asEffect()
+            const before = typeOf(yield* table.rows(), "N")
+            yield* tick
+            yield* clear(db.entities.N.update({ id: "a" })).asEffect()
+            const after = typeOf(yield* table.rows(), "N")
+            expect(after.updatedAt.S).not.toBe(before.updatedAt.S)
+            expect(after.createdAt.S).toBe(before.createdAt.S)
+            expected(before, after)
+          }),
+        )
+      }),
+    ),
+  )
+
+const REFUSED_NAMES = [
+  ['`.remove(["createdAt"])`', (u: any) => u.remove(["createdAt"])],
+  ["`.set({ createdAt: undefined })`", (u: any) => u.set({ createdAt: undefined })],
+  ['`.remove(["updatedAt"])`', (u: any) => u.remove(["updatedAt"])],
+  ['`.pathRemove(["createdAt"])`', (u: any) => u.pathRemove(["createdAt"])],
+  ['`.pathRemove(["updatedAt"])`', (u: any) => u.pathRemove(["updatedAt"])],
+] as const
+
+const DATES = [
+  ["a required date", Schema.DateTimeUtc],
+  ["a `Schema.optional` date", Schema.optional(Schema.DateTimeUtc)],
+  ["a `Schema.optionalKey` date", Schema.optionalKey(Schema.DateTimeUtc)],
+] as const
+
+const datedWorld = (on: boolean, field: Schema.Top) =>
+  looseWorld(on, {
+    N: {
+      model: Schema.Struct({
+        id: Schema.String,
+        note: Schema.optional(Schema.String),
+        createdAt: field,
+        updatedAt: field,
+      } as never),
+      timestamps: true,
+    },
+  })
+
+export const clearScenarios: ReadonlyArray<RepairScenario> = [
+  ...clearScenario(
+    "a half over `updatedAt` loses its key with its value",
+    ["status", "updatedAt"],
+    CLEARS,
+    (_, after) => {
+      expect(after.status).toBeUndefined()
+      expect(after.gsi1sk).toBeUndefined()
+      expect(after.gsi1pk.S).toContain("owner_o")
+    },
+  ),
+  ...clearScenario(
+    "the same, read first",
+    ["status", "updatedAt"],
+    CLEARS,
+    (_, after) => {
+      expect(after.status).toBeUndefined()
+      expect(after.gsi1sk).toBeUndefined()
+    },
+    { versioned: { retain: true } },
+  ),
+  ...clearScenario(
+    "a half over `createdAt` loses its key with its value",
+    ["status", "createdAt"],
+    CLEARS,
+    (_, after) => {
+      expect(after.status).toBeUndefined()
+      expect(after.gsi1sk).toBeUndefined()
+    },
+  ),
+  ...clearScenario(
+    "the parent the library stamps is enough to truncate to",
+    ["updatedAt", "status"],
+    CLEARS,
+    (_, after) => {
+      expect(after.status).toBeUndefined()
+      expect(after.gsi1sk.S).toContain(`updatedat_${after.updatedAt.S.toLowerCase()}`)
+      expect(after.gsi1sk.S).not.toContain("status_")
+    },
+  ),
+  ...clearScenario(
+    "clearing what isn't in the half doesn't touch it, stamp or no stamp",
+    ["status", "updatedAt"],
+    UNRELATED,
+    (before, after) => {
+      expect(after.note).toBeUndefined()
+      expect(after.gsi1sk.S).toBe(before.gsi1sk.S)
+      expect(after.gsi1pk.S).toBe(before.gsi1pk.S)
+    },
+  ),
+  ...clearScenario(
+    "...read first it composes whole, so the stamp moves it",
+    ["status", "updatedAt"],
+    UNRELATED,
+    (before, after) => {
+      expect(after.note).toBeUndefined()
+      expect(after.gsi1sk.S).not.toBe(before.gsi1sk.S)
+      expect(after.gsi1sk.S).toContain(`updatedat_${after.updatedAt.S.toLowerCase()}`)
+    },
+    { versioned: { retain: true } },
+  ),
+  ...clearScenario(
+    "a half of nothing but the stamp moves on any clear",
+    ["updatedAt"],
+    UNRELATED,
+    (before, after) => {
+      expect(after.note).toBeUndefined()
+      expect(after.gsi1sk.S).not.toBe(before.gsi1sk.S)
+    },
+  ),
+  ...DATES.flatMap(([name, field]) =>
+    REFUSED_NAMES.flatMap(([form, clear]) =>
+      bothSettings(`${name} the library stamps can't be cleared: ${form}`, (h, on) => {
+        const w = datedWorld(on, field)
+        return h.on(w, (table) =>
+          Effect.gen(function* () {
+            const db = yield* w.client
+            yield* db.entities.N.put({ id: "a" }).asEffect()
+            const before = yield* table.rows()
+            table.clear()
+            const error: any = yield* Effect.flip(
+              clear(db.entities.N.update({ id: "a" })).asEffect() as Effect.Effect<unknown, any>,
+            )
+            expect(error._tag).toBe("ValidationError")
+            expect(String(error.cause)).toContain("managed by the library")
+            expect(commands(table)).toEqual([])
+            expect(yield* table.rows()).toEqual(before)
+          }),
+        )
+      }),
+    ),
+  ),
+  ...DATES.flatMap(([name, field]) =>
+    bothSettings(`${name}: \`.set({ updatedAt: undefined })\` means stamp it`, (h, on) => {
+      const w = datedWorld(on, field)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.put({ id: "a" }).asEffect()
+          const before = typeOf(yield* table.rows(), "N")
+          yield* tick
+          yield* db.entities.N.update({ id: "a" }).set({ updatedAt: undefined }).asEffect()
+          const after = typeOf(yield* table.rows(), "N")
+          expect(after.updatedAt.S).not.toBe(before.updatedAt.S)
+          expect(after.createdAt.S).toBe(before.createdAt.S)
+        }),
+      )
+    }),
+  ),
+  ...[
+    ['`.remove(["createdAt"])`', (u: any) => u.remove(["createdAt"])],
+    ["`.set({ createdAt: undefined })`", (u: any) => u.set({ createdAt: undefined })],
+    ['`.remove(["updatedAt"])`', (u: any) => u.remove(["updatedAt"])],
+    ["`.set({ updatedAt: undefined })`", (u: any) => u.set({ updatedAt: undefined })],
+  ].flatMap(([form, clear]: any) =>
+    bothSettings(`a field of that name of another type is the caller's: ${form}`, (h, on) => {
+      const w = datedWorld(on, Schema.optional(Schema.String))
+      const name = form.includes("createdAt") ? "createdAt" : "updatedAt"
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.put({ id: "a", createdAt: "c", updatedAt: "u" }).asEffect()
+          yield* clear(db.entities.N.update({ id: "a" })).asEffect()
+          const row = typeOf(yield* table.rows(), "N")
+          expect(row[name]).toBeUndefined()
+          expect(yield* db.entities.N.get({ id: "a" })).not.toHaveProperty(name)
+        }),
+      )
+    }),
+  ),
+  ...bothSettings("a required field of that name of another type can't be cleared", (h, on) => {
+    const w = datedWorld(on, Schema.String)
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.put({ id: "a", createdAt: "c", updatedAt: "u" }).asEffect()
+        const before = yield* table.rows()
+        const error: any = yield* Effect.flip(
+          db.entities.N.update({ id: "a" }).remove(["createdAt"]).asEffect() as Effect.Effect<
+            unknown,
+            any
+          >,
+        )
+        expect(String(error.cause)).toContain("the model requires")
+        expect(yield* table.rows()).toEqual(before)
+      }),
+    )
+  }),
+  ...bothSettings("an append's `.remove` of a stamped date is refused", (h, on) => {
+    const Series = Schema.Struct({
+      id: Schema.String,
+      at: Schema.Number,
+      note: Schema.optional(Schema.String),
+      createdAt: Schema.optional(Schema.DateTimeUtc),
+    })
+    const w = looseWorld(on, {
+      N: {
+        model: Series,
+        timestamps: true,
+        timeSeries: {
+          orderBy: "at",
+          appendInput: Schema.Struct({ id: Schema.String, at: Schema.Number }),
+        },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.append({ id: "a", at: 1 }).asEffect()
+        const before = yield* table.rows()
+        const error: any = yield* Effect.flip(
+          db.entities.N.append({ id: "a", at: 2 })
+            .remove(["createdAt"])
+            .asEffect() as Effect.Effect<unknown, any>,
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("managed by the library")
+        expect(yield* table.rows()).toEqual(before)
+      }),
+    )
+  }),
+  ...[
+    ["a required date", Schema.DateTimeUtc],
+    ["a `Schema.optional` date", Schema.optional(Schema.DateTimeUtc)],
+  ].flatMap(([name, field]: any) =>
+    [
+      [
+        "leaving `createdAt` out",
+        ({ state }: any) => {
+          const { createdAt: _, ...rest } = state
+          return { ...rest, note: "m1" }
+        },
+      ],
+      [
+        "setting `createdAt` to undefined",
+        ({ state }: any) => ({ ...state, createdAt: undefined, note: "m2" }),
+      ],
+      [
+        "leaving `updatedAt` out",
+        ({ state }: any) => {
+          const { updatedAt: _, ...rest } = state
+          return { ...rest, note: "m3" }
+        },
+      ],
+      [
+        "setting `updatedAt` to undefined",
+        ({ state }: any) => ({ ...state, updatedAt: undefined, note: "m4" }),
+      ],
+    ].flatMap(([label, mutate]: any) =>
+      bothSettings(`an aggregate root with ${name}: ${label} clears nothing`, (h, on) => {
+        const w = aggregateWorld(on, (make) => ({
+          Dated: make(
+            "Dated",
+            Schema.Struct({
+              id: Schema.String,
+              note: Schema.optional(Schema.String),
+              createdAt: field,
+              updatedAt: field,
+            } as never),
+          ),
+        }))
+        return h.on(w, (table) =>
+          Effect.gen(function* () {
+            const db = yield* w.client
+            yield* db.aggregates.Dated.create({ id: "a" })
+            const before = (yield* table.rows()).find((row) => row.id?.S === "a")!
+            yield* tick
+            yield* db.aggregates.Dated.update({ id: "a" }, mutate)
+            const after = (yield* table.rows()).find((row) => row.id?.S === "a")!
+            expect(after.createdAt.S).toBe(before.createdAt.S)
+            expect(after.updatedAt.S).not.toBe(before.updatedAt.S)
+            expect(after.note).toBeDefined()
+          }),
+        )
+      }),
+    ),
+  ),
+]
+
+// ---------------------------------------------------------------------------
+// An upsert holding a value with no stored form: an absent attribute, and a key can't outlive it
+// ---------------------------------------------------------------------------
+
+const AbsentReads = Schema.Struct({
+  id: Schema.String,
+  owner: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+  und: Schema.UndefinedOr(Schema.String),
+  tags: Schema.ReadonlySet(Schema.String),
+  optTags: Schema.optional(Schema.ReadonlySet(Schema.String)),
+  plain: Schema.optional(Schema.Number),
+  score: Schema.optional(Schema.Number),
+})
+
+const absentWorld = (on: boolean, composite: ReadonlyArray<string>, extra = {}) =>
+  looseWorld(on, {
+    N: { model: AbsentReads, indexes: byOwnerOver(composite), ...extra },
+  })
+
+const whole = { owner: "o1", note: "n1", und: "u1", tags: new Set(["t"]) }
+
+export const upsertNoStoredFormScenarios: ReadonlyArray<RepairScenario> = [
+  ...bothSettings("clearing a composite takes its half with it, as an update does", (h, on) => {
+    const w = absentWorld(on, ["und"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", ...whole, und: undefined }).asEffect()
+        // What's left of a half is the update's to say, and that takes the stored row.
+        expect(commands(table)).toEqual(["getItem", "updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.und).toBeUndefined()
+        expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: undefined })
+        expect(yield* db.entities.N.byOwner({ owner: "o1" }).collect()).toHaveLength(0)
+        expect((yield* db.entities.N.get({ id: "a" })).und).toBeUndefined()
+      }),
+    )
+  }),
+  ...bothSettings("the other half still moves", (h, on) => {
+    const w = absentWorld(on, ["und"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+        yield* db.entities.N.upsert({ id: "a", ...whole, owner: "o2", und: undefined }).asEffect()
+        expect(keysOf(typeOf(yield* table.rows(), "N"))).toEqual({ pk: "owner_o2", sk: undefined })
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a hierarchical half truncates, as `.set(parents).remove(leaf)` does",
+    (h, on) => {
+      const w = absentWorld(on, ["note", "und"])
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+          yield* db.entities.N.upsert({ id: "a", ...whole, und: undefined }).asEffect()
+          const upserted = keysOf(typeOf(yield* table.rows(), "N"))
+          expect(upserted).toEqual({ pk: "owner_o1", sk: "note_n1" })
+          yield* db.entities.N.upsert({ id: "b", ...whole }).asEffect()
+          yield* db.entities.N.update({ id: "b" })
+            .set({ owner: "o1", note: "n1" })
+            .remove(["und"])
+            .asEffect()
+          expect(keysOf(typeOf(yield* table.rows(), "N", "b"))).toEqual(upserted)
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a new row cleared from the start has neither", (h, on) => {
+    const w = absentWorld(on, ["und"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole, und: undefined }).asEffect()
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.und).toBeUndefined()
+        expect(row.gsi1sk).toBeUndefined()
+        expect((yield* db.entities.N.get({ id: "a" })).und).toBeUndefined()
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a composite left `undefined` on an optional field stays, with its key",
+    (h, on) => {
+      const w = absentWorld(on, ["note"])
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+          table.clear()
+          yield* db.entities.N.upsert({ id: "a", ...whole, note: undefined }).asEffect()
+          expect(commands(table)).toEqual(["updateItem"])
+          const row = typeOf(yield* table.rows(), "N")
+          expect(row.note.S).toBe("n1")
+          expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: "note_n1" })
+        }),
+      )
+    },
+  ),
+  ...bothSettings("an immutable composite left `undefined` stays, with its key", (h, on) => {
+    const w = looseWorld(on, {
+      N: {
+        model: DynamoModel.configure(AbsentReads, { und: { immutable: true } }),
+        indexes: byOwnerOver(["und"]),
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({ id: "a", ...whole, und: undefined }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.und.S).toBe("u1")
+        expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: "und_u1" })
+      }),
+    )
+  }),
+  ...bothSettings("clearing what no key holds is one write, no read", (h, on) => {
+    const w = absentWorld(on, ["note"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole, optTags: new Set(["t"]) }).asEffect()
+        table.clear()
+        yield* db.entities.N.upsert({
+          id: "a",
+          ...whole,
+          und: undefined,
+          tags: new Set(),
+          optTags: new Set(),
+        }).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.und).toBeUndefined()
+        expect(row.tags).toBeUndefined()
+        expect(row.optTags).toBeUndefined()
+        expect(keysOf(row)).toEqual({ pk: "owner_o1", sk: "note_n1" })
+        const read = yield* db.entities.N.get({ id: "a" })
+        expect(read.tags).toEqual(new Set())
+        expect(read.und).toBeUndefined()
+      }),
+    )
+  }),
+  ...bothSettings("a stamped date left `undefined` is stamped, not cleared: one write", (h, on) => {
+    const Maybe = Schema.UndefinedOr(Schema.DateTimeUtc)
+    const w = looseWorld(on, {
+      N: {
+        model: DynamoModel.configure(
+          Schema.Struct({
+            id: Schema.String,
+            owner: Schema.optional(Schema.String),
+            createdAt: Maybe,
+            updatedAt: Maybe,
+          }),
+          {
+            createdAt: { storedAs: DynamoModel.DateEpochMs },
+            updatedAt: { storedAs: DynamoModel.DateEpochMs },
+          },
+        ),
+        timestamps: true,
+        indexes: {
+          ...byOwnerOver(["updatedAt"]),
+          byBirth: {
+            name: "gsi2",
+            pk: half(2, ["owner"]),
+            sk: sortHalf(2, ["createdAt"]),
+          },
+        },
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        const input = { id: "a", owner: "o1", createdAt: undefined, updatedAt: undefined }
+        yield* db.entities.N.upsert(input).asEffect()
+        const before = typeOf(yield* table.rows(), "N")
+        table.clear()
+        yield* tick
+        yield* db.entities.N.upsert(input).asEffect()
+        expect(commands(table)).toEqual(["updateItem"])
+        const after = typeOf(yield* table.rows(), "N")
+        expect(after.createdAt.N).toBe(before.createdAt.N)
+        expect(after.updatedAt.N).not.toBe(before.updatedAt.N)
+        expect(after.gsi2sk.S).toBe(before.gsi2sk.S)
+        expect(after.gsi1sk.S).toContain(after.updatedAt.N)
+      }),
+    )
+  }),
+  ...bothSettings("an `UndefinedOr` date is the caller's: not stamped, and it clears", (h, on) => {
+    const Maybe = Schema.UndefinedOr(Schema.DateTimeUtc)
+    const w = looseWorld(on, {
+      N: {
+        model: Schema.Struct({
+          id: Schema.String,
+          owner: Schema.optional(Schema.String),
+          createdAt: Maybe,
+          updatedAt: Maybe,
+        }),
+        timestamps: true,
+        indexes: byOwnerOver(["updatedAt"]),
+      },
+    })
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.put({
+          id: "a",
+          owner: "o1",
+          createdAt: undefined,
+          updatedAt: undefined,
+        }).asEffect()
+        const row = typeOf(yield* table.rows(), "N")
+        expect(row.createdAt).toBeUndefined()
+        expect(row.updatedAt).toBeUndefined()
+        expect(row.gsi1sk).toBeUndefined()
+        const when = DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")
+        yield* db.entities.N.update({ id: "a" }).set({ updatedAt: when }).asEffect()
+        expect(typeOf(yield* table.rows(), "N").gsi1sk.S).toContain("2026-01-02")
+        yield* db.entities.N.update({ id: "a" }).remove(["updatedAt"]).asEffect()
+        const cleared = typeOf(yield* table.rows(), "N")
+        expect(cleared.updatedAt).toBeUndefined()
+        expect(cleared.gsi1sk).toBeUndefined()
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a primary composite left `undefined` names no row, and sends nothing",
+    (h, on) => {
+      const w = looseWorld(on, {
+        N: {
+          model: Schema.Struct({ id: Schema.UndefinedOr(Schema.String), owner: Schema.String }),
+          indexes: {
+            byOwner: { name: "gsi1", pk: half(1, ["owner"]), sk: sortHalf(1, ["id"]) },
+          },
+        },
+      })
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          table.clear()
+          const exit = yield* Effect.exit(
+            db.entities.N.upsert({ id: undefined, owner: "o1" }).asEffect() as Effect.Effect<
+              unknown,
+              any
+            >,
+          )
+          expect(commands(table)).toEqual([])
+          expect(String(exit)).toContain("Failure")
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a value DynamoDB can't store sends nothing, and says which", (h, on) => {
+    const w = absentWorld(on, ["note"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.N.upsert({ id: "a", ...whole }).asEffect()
+        const before = yield* table.rows()
+        table.clear()
+        const error: any = yield* Effect.flip(
+          db.entities.N.upsert({
+            id: "a",
+            ...whole,
+            plain: Number.NaN,
+          }).asEffect() as Effect.Effect<unknown, any>,
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toMatch(/"plain":.*\[EDD-9124\]/)
+        expect(commands(table)).toEqual([])
+        expect(yield* table.rows()).toEqual(before)
+      }),
+    )
+  }),
+  ...bothSettings("a `NaN` feeding a half it writes is a key's refusal, `EDD-9096`", (h, on) => {
+    const w = absentWorld(on, ["score"])
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* w.client
+        table.clear()
+        const error: any = yield* Effect.flip(
+          db.entities.N.upsert({
+            id: "a",
+            ...whole,
+            score: Number.NaN,
+          }).asEffect() as Effect.Effect<unknown, any>,
+        )
+        expect(error._tag).toBe("ValidationError")
+        expect(error.cause.message).toContain("[EDD-9096]")
+        expect(commands(table)).toEqual([])
+      }),
+    )
+  }),
+]
+
+// ---------------------------------------------------------------------------
+// rekey reading rows through what an absent attribute means
+// ---------------------------------------------------------------------------
+
+const absentRepairWorld = (on: boolean, policy: string) =>
+  looseWorld(on, {
+    N: {
+      model: Schema.Struct({
+        id: Schema.String,
+        und: Schema.UndefinedOr(Schema.String),
+        tags: Schema.ReadonlySet(Schema.String),
+      }),
+      indexes: {
+        bySort: {
+          name: "gsi1",
+          pk: half(1, []),
+          sk: sortHalf(1, ["und"]),
+          indexPolicy: { pk: policy, sk: policy },
+        },
+        byPartition: {
+          name: "gsi2",
+          pk: half(2, ["und"]),
+          sk: sortHalf(2, ["id"]),
+          indexPolicy: { pk: policy, sk: policy },
+        },
+      },
+    },
+  })
+
+/** Rows a current write leaves, and one an earlier release left: no attribute, the key saying the value. */
+const seedAbsentRows = (w: any, table: RepairTable) =>
+  Effect.gen(function* () {
+    const db = yield* w.client
+    yield* db.entities.N.put({ id: "has", und: "u1", tags: new Set(["t"]) }).asEffect()
+    yield* db.entities.N.put({ id: "none", und: undefined, tags: new Set() }).asEffect()
+    yield* db.entities.N.put({ id: "stale", und: "u1", tags: new Set(["t"]) }).asEffect()
+    yield* table.seed(withoutKeys(typeOf(yield* table.rows(), "N", "stale"), "und"))
+    return db
+  })
+
+export const repairNoStoredFormScenarios: ReadonlyArray<RepairScenario> = [
+  ...POLICIES.flatMap((policy) =>
+    bothSettings(`every row reads, and a current write's are fine: ${policy}`, (h, on) => {
+      const w = absentRepairWorld(on, policy)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* seedAbsentRows(w, table)
+          const report = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+          expect(report.indexKeys.missing).toBe(0)
+          expect(report.indexKeys.truncated).toBe(0)
+          expect(report.skipped.unrecognizedKey ?? 0).toBe(0)
+          const rows = yield* table.rows()
+          expect(typeOf(rows, "N", "has").gsi1sk.S).toContain("und_u1")
+          expect(typeOf(rows, "N", "none").gsi1sk).toBeUndefined()
+          expect(typeOf(rows, "N", "none").gsi2pk).toBeUndefined()
+          expect(typeOf(rows, "N", "none").und).toBeUndefined()
+          expect(typeOf(rows, "N", "none").tags).toBeUndefined()
+          const none = yield* db.entities.N.get({ id: "none" })
+          expect(none.und).toBeUndefined()
+          expect(none.tags).toEqual(new Set())
+          expect((yield* db.entities.N.get({ id: "stale" })).und).toBeUndefined()
+        }),
+      )
+    }),
+  ),
+  ...bothSettings("under `sparse`, a key its value left is repaired away, once", (h, on) => {
+    const w = absentRepairWorld(on, "sparse")
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* seedAbsentRows(w, table)
+        const dry = yield* db.tables.MainTable.rekey({ repairIndexKeys: true, dryRun: true })
+        expect(dry.indexKeys.lagging).toBe(2)
+        expect(typeOf(yield* table.rows(), "N", "stale").gsi1sk.S).toContain("und_u1")
+        const report = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(report.indexKeys.repaired).toBe(2)
+        const stale = typeOf(yield* table.rows(), "N", "stale")
+        expect(stale.gsi1sk).toBeUndefined()
+        expect(stale.gsi2pk).toBeUndefined()
+        expect(stale.gsi2sk.S).toContain("id_stale")
+        expect(stale.tags.SS).toEqual(["t"])
+        const again = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(again.indexKeys.lagging).toBe(0)
+        expect(again.indexKeys.repaired).toBe(0)
+      }),
+    )
+  }),
+  ...bothSettings("under `preserve`, it's what the policy keeps: an update clears it", (h, on) => {
+    const w = absentRepairWorld(on, "preserve")
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        const db = yield* seedAbsentRows(w, table)
+        const before = yield* table.rows()
+        const report = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(report.indexKeys.lagging).toBe(0)
+        expect(report.indexKeys.repaired).toBe(0)
+        expect(yield* table.rows()).toEqual(before)
+        yield* db.entities.N.update({ id: "stale" }).remove(["und"]).asEffect()
+        const stale = typeOf(yield* table.rows(), "N", "stale")
+        expect(stale.gsi1sk).toBeUndefined()
+        expect(stale.gsi2pk).toBeUndefined()
+      }),
+    )
+  }),
+]
+
 export const ALL_SCENARIOS: ReadonlyArray<readonly [string, ReadonlyArray<RepairScenario>]> = [
   ["shapes 16 to 18", writeScenarios],
   ["an append", appendScenarios],
@@ -3721,4 +4470,7 @@ export const ALL_SCENARIOS: ReadonlyArray<readonly [string, ReadonlyArray<Repair
   ["aggregates", aggregateScenarios],
   ["an upsert leaving out a composite", upsertOmittedScenarios],
   ["a custom decompose, and a one edge with no entity", decomposeScenarios],
+  ["clearing a field, against what the library stamps", clearScenarios],
+  ["an upsert holding a value with no stored form", upsertNoStoredFormScenarios],
+  ["rekey and what an absent attribute means", repairNoStoredFormScenarios],
 ]
