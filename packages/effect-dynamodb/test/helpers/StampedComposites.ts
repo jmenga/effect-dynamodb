@@ -518,6 +518,16 @@ export const writeScenarios: ReadonlyArray<RepairScenario> = [
             .map(([, attribute]) => attribute)
           expect(guarded).toContain("price")
           expect(guarded).not.toContain("updatedAt")
+          // Naming the stamp itself doesn't touch what it can't compose either.
+          yield* db.entities.Tickets.update({ id: "a" })
+            .set({ updatedAt: supplied })
+            .add({ price: 1 })
+            .asEffect()
+          const later = rowOf(yield* table.rows(), "a")
+          expect(later.updatedAt.S).toBe(SUPPLIED)
+          expect(later.gsi2sk.S).toContain(`updatedat_${SUPPLIED.toLowerCase()}`)
+          expect(later.gsi3sk).toEqual(stored.gsi3sk)
+          expect(later.gsi4sk).toEqual(stored.gsi4sk)
         }),
       )
     },
@@ -954,7 +964,11 @@ export const adjacentScenarios: ReadonlyArray<RepairScenario> = [
         timestamps: true,
         indexes: {
           ...byOwnerOver(["updatedAt"]),
-          byStatus: { name: "gsi2", pk: half(2, ["owner"]), sk: sortHalf(2, ["status", "updatedAt"]) },
+          byStatus: {
+            name: "gsi2",
+            pk: half(2, ["owner"]),
+            sk: sortHalf(2, ["status", "updatedAt"]),
+          },
         },
       },
     })

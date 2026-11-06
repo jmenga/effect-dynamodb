@@ -467,20 +467,22 @@ describe("projection outbox", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("a row keeps its `createdAt` through an outbox write, in the attribute and the key", () =>
-    Effect.gen(function* () {
-      const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
-      const stored = () => items("read", "StampedSummary")[0]!
-      yield* NotifyingStamped.apply(events[0]!)
-      const first = stored()
-      expect(first.gsi1sk).toContain(String(first.createdAt).toLowerCase())
-      yield* TestClock.adjust("1 minute")
-      yield* NotifyingStamped.apply(events[1]!)
-      const second = stored()
-      expect(second.total).toBe(3)
-      expect(second.createdAt).toBe(first.createdAt)
-      expect(second.gsi1sk).toBe(first.gsi1sk)
-    }).pipe(Effect.provide(TestLayer)),
+  it.effect(
+    "a row keeps its `createdAt` through an outbox write, in the attribute and the key",
+    () =>
+      Effect.gen(function* () {
+        const events = yield* seed("o1", [new Placed({ amount: 1 }), new Added({ amount: 2 })])
+        const stored = () => items("read", "StampedSummary")[0]!
+        yield* NotifyingStamped.apply(events[0]!)
+        const first = stored()
+        expect(first.gsi1sk).toContain(String(first.createdAt).toLowerCase())
+        yield* TestClock.adjust("1 minute")
+        yield* NotifyingStamped.apply(events[1]!)
+        const second = stored()
+        expect(second.total).toBe(3)
+        expect(second.createdAt).toBe(first.createdAt)
+        expect(second.gsi1sk).toBe(first.gsi1sk)
+      }).pipe(Effect.provide(TestLayer)),
   )
 
   it.effect("a write without effects stays a single put", () =>
