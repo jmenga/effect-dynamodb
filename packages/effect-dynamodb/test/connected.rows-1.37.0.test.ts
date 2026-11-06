@@ -1,5 +1,5 @@
 /**
- * Rows 1.37.0 wrote (#183), on DynamoDB Local. The scenarios are in `helpers/Rows137.ts`.
+ * Rows 1.37.0 and 1.38.0 wrote (#183), on DynamoDB Local. The scenarios are in `helpers/Rows137.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local

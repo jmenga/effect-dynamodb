@@ -8,10 +8,10 @@
  *
  * - **Numbers.** Up to 1.36, and with `escapeKeys` off, `String(n)` zero-padded to 16 characters
  *   (a bigint to 38), which keeps non-negative integers below 1e16 in order and nothing else.
- *   1.37.0, and `escapeKeys: true`, encode every number in numeric order (`NumericKey.ts`). The
+ *   1.37.0, 1.38.0 and `escapeKeys: true` encode every number in numeric order (`NumericKey.ts`). The
  *   text of a non-negative integer below 1e16 (1e38 for a bigint) is the same.
  * - **Strings.** With `escapeKeys: true` a key value holding a code point U+0000–U+0025 is escaped
- *   (`KeyComposer.escapeKeyText`) in every key. 1.37.0 escaped sort keys only. Off, and up to 1.36,
+ *   (`KeyComposer.escapeKeyText`) in every key. 1.37.0 and 1.38.0 escaped sort keys only. Off, and up to 1.36,
  *   none. The structural parts of a key are never escaped.
  * - **Time-series event keys.** Up to 1.36, and off, they hold the orderBy attribute's ENCODED
  *   value (a `NumberFromString` `"10"` as the string `10`), and with numeric text its key form
@@ -38,7 +38,7 @@ export const schema136 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.Dynam
   })
 
 /**
- * The schema whose partition key text is what 1.37.0 stored: its numbers in numeric order, its
+ * The schema whose partition key text is what 1.37.0 and 1.38.0 stored: its numbers in numeric order, its
  * strings unescaped.
  */
 export const schema137 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
@@ -63,7 +63,7 @@ export interface KeyForm {
 
 /**
  * Every place a row can be stored, whatever the setting is now, the current one among them:
- * up to 1.36 and off; 1.37.0; on.
+ * up to 1.36 and off; 1.37.0 and 1.38.0; on.
  */
 export const forms = (schema: DynamoSchema.DynamoSchema): ReadonlyArray<KeyForm> => {
   const off = schema136(schema)
@@ -76,7 +76,7 @@ export const forms = (schema: DynamoSchema.DynamoSchema): ReadonlyArray<KeyForm>
 }
 
 /**
- * 1.37.0's row on an entity with an index half in a table key attribute (inverted): each half
+ * The row 1.37.0 and 1.38.0 stored on an entity with an index half in a table key attribute (inverted): each half
  * was overwritten with the index's, so its partition key attribute holds the sort half's text
  * (escaped), and its sort key attribute the partition half's (not).
  */
@@ -88,7 +88,7 @@ export const invertedForm137 = (schema: DynamoSchema.DynamoSchema): KeyForm => (
 /**
  * A row holding no values (a projection's row tombstone or outbox item) says which text its key is
  * by its `__edd_kt__` attribute: none, off's (1.36's), whose text every setting reads the same when
- * nothing in it changes; 1, 1.37.0's; 2, the text of `escapeKeys: true`.
+ * nothing in it changes; 1, that of 1.37.0 and 1.38.0; 2, the text of `escapeKeys: true`.
  */
 export const formOfMark = (
   schema: DynamoSchema.DynamoSchema,

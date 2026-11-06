@@ -136,10 +136,6 @@ type TransactGetResult<T extends ReadonlyArray<AnyGet>> = {
  * ])
  * // user: User | undefined, post: Post | undefined
  * ```
- *
- * An item still under its 1.36 key (#171) — 1.37 composes some key text
- * differently — is read there by a second `TransactGetItems` for the misses
- * whose key text changed. The two reads are separate snapshots, not one.
  */
 export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   items: T,

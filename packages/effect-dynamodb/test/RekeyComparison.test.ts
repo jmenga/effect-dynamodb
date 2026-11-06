@@ -190,7 +190,9 @@ describe.each(settings)("a vector index's partition, %s", (_direction, escapeKey
 
 // The guard, on a key `rekey` really rewrites. Only a recording table can step in between
 // its read and its write.
-describe.each(settings)("a write between `rekey`'s read and its write wins, %s", (_direction, escapeKeys) => {
+describe.each(
+  settings,
+)("a write between `rekey`'s read and its write wins, %s", (_direction, escapeKeys) => {
   const on = DynamoSchema.make({ name: "guarded", version: 1, escapeKeys })
   const then = DynamoSchema.make({ name: "guarded", version: 1, escapeKeys: !escapeKeys })
   const worldWith = (shards: number | undefined) => {

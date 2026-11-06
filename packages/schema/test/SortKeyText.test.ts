@@ -270,7 +270,7 @@ describe("sort key text (#171)", () => {
   })
 })
 
-describe("the names before every key escaped (deprecated since 1.38.0)", () => {
+describe("the names before every key escaped (deprecated since 1.39.0)", () => {
   const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
 
   it("sortKeyText is escapeKeyText", () => {

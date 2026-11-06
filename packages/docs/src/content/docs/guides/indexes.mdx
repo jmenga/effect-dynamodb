@@ -238,8 +238,8 @@ Under `escapeKeys: true` the text holds no letters and no `#`, so casing never c
 
 `NaN` has no order. With `escapeKeys: true` it can't be a key composite: an entity operation given one — `put`, `create`, `upsert`, `update`, `get`, `delete`, `restore`, `purge`, `append`, or a batch or transaction — fails with a `ValidationError` (`EDD-9096`) before anything is sent, and a query accessor, `.where()` or `.within()` given one throws it. A bigint of more than 1,000 digits is refused the same way. Aggregates and event stores don't convert it: there it is a defect. With it off, `NaN` composes the text it did up to 1.36, so a `get` by a `NaN` key fails with `ItemNotFound` and a `delete` does nothing. A `NaN` in a [shard source](/effect-dynamodb/guides/sharding/) is refused under either setting, and a `Schema.Number` attribute holding `NaN` can't be marshalled.
 
-:::caution[Stored keys changed in 1.37.0, and back in 1.38.0]
-1.37.0 gave negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970 numeric text. The 1.38.0 default composes the 1.36 text again: `escapeKeys: true` gets you the numeric text. A row under the text the setting doesn't compose isn't found until `rekey` moves it: see [Upgrading](/effect-dynamodb/guides/upgrading/).
+:::caution[Stored keys changed in 1.37.0, and back in 1.39.0]
+1.37.0 and 1.38.0 gave negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970 numeric text. The 1.39.0 default composes the 1.36 text again: `escapeKeys: true` gets you the numeric text. A row under the text the setting doesn't compose isn't found until `rekey` moves it: see [Upgrading](/effect-dynamodb/guides/upgrading/).
 :::
 
 ### Key text
@@ -268,7 +268,7 @@ These are the default behaviour in 1.x, and the same as up to 1.36. The library 
 - **A `#` in a value can imitate a segment.** `a#b` + `c` and `a` + `b#c` compose one key, and a pin on `new` also returns `new#2`.
 - **A pin on a sort key composite that isn't the last** — on an accessor, `.where(eq)` or an `eq` in `.within()` — is `begins_with(…#city_new#)`. A row an update [truncated at that composite](/effect-dynamodb/guides/index-policy/) isn't returned.
 - **Skip-scan over free-form strings can hide rows.** A `.within()` that skips a composite probes for each distinct value, and a value holding a character below `#` can sort out of the probe's way: `on#zone` hides behind `on`. A probe that lands on a key it can't parse stops, and the rest of the range is read once with every bound checked per row.
-- **A cursor or row from `escapeKeys: true` isn't found,** nor is one 1.37.0 wrote with text that differs: see [Upgrading](/effect-dynamodb/guides/upgrading/#from-1370).
+- **A cursor or row from `escapeKeys: true` isn't found,** nor is one 1.37.0 or 1.38.0 wrote with text that differs: see [Upgrading](/effect-dynamodb/guides/upgrading/#from-1370-or-1380).
 
 ### Casing Resolution
 

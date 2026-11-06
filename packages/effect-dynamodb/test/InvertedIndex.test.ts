@@ -212,9 +212,7 @@ describe("what an inverted query sends", () => {
           .collect(),
       )
       expect(sent).toHaveLength(1)
-      expect(key(sent[0]!)).toEqual(
-        expect.arrayContaining(["$sent#v1#member#tenant_x%20y"]),
-      )
+      expect(key(sent[0]!)).toEqual(expect.arrayContaining(["$sent#v1#member#tenant_x%20y"]))
     }),
   )
 

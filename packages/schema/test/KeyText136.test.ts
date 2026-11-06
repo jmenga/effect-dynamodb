@@ -157,9 +157,10 @@ describe("the default composes the golden vectors from the published 1.36.0", ()
       for (const name of v.index.sk.composite.slice(v.leading)) delete partial[name]
       const at = JSON.stringify(v)
       expect(KeyComposer.composePk(schema, v.entityType, v.index, record), at).toBe(v.pk)
-      expect(KeyComposer.composeSk(schema, v.entityType, v.entityVersion, v.index, record), at).toBe(
-        v.sk,
-      )
+      expect(
+        KeyComposer.composeSk(schema, v.entityType, v.entityVersion, v.index, record),
+        at,
+      ).toBe(v.sk)
       expect(
         KeyComposer.composeSortKeyPrefix(schema, v.entityType, v.entityVersion, v.index, partial),
         at,
@@ -273,7 +274,12 @@ describe("the default composes the golden vectors from the published 1.36.0", ()
   it("vector index partitions", () => {
     for (const v of vectors.vectorPartition) {
       expect(
-        KeyComposer.tryComposeVectorPartition(defaulted(v.schema), "Doc", v.index, revived(v.record)),
+        KeyComposer.tryComposeVectorPartition(
+          defaulted(v.schema),
+          "Doc",
+          v.index,
+          revived(v.record),
+        ),
       ).toBe(v.partition)
     }
   })
@@ -296,7 +302,10 @@ describe("the default composes the golden vectors from the published 1.36.0", ()
         DynamoSchema.composeKey(
           schema,
           "Innings",
-          v.values.flatMap((value, j) => [`d${j}`, KeyComposer.compositeText(schema, revive(value))]),
+          v.values.flatMap((value, j) => [
+            `d${j}`,
+            KeyComposer.compositeText(schema, revive(value)),
+          ]),
           options,
         ),
       ).toBe(v.key)
@@ -356,9 +365,9 @@ describe("KeyText136 — the forms `rekey` recognises", () => {
     expect(KeyText136.markOf(schema, "Item", 1, primary, spelled)).toBeUndefined()
     expect(KeyText136.markOf(on, "Item", 1, primary, plain)).toBeUndefined()
     expect(KeyText136.markOf(on, "Item", 1, primary, spelled)).toBe(2)
-    expect(KeyText136.composeAt(KeyText136.formOfMark(on, "2"), "Item", 1, primary, spelled)).toEqual(
-      KeyText136.composeAt({ pk: on, sk: on }, "Item", 1, primary, spelled),
-    )
+    expect(
+      KeyText136.composeAt(KeyText136.formOfMark(on, "2"), "Item", 1, primary, spelled),
+    ).toEqual(KeyText136.composeAt({ pk: on, sk: on }, "Item", 1, primary, spelled))
     expect(
       KeyText136.composeAt(KeyText136.formOfMark(on, undefined), "Item", 1, primary, spelled),
     ).toEqual(KeyText136.composeAt({ pk: schema, sk: schema }, "Item", 1, primary, spelled))

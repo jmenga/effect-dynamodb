@@ -1544,7 +1544,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   /**
    * Where a row may be under the partition's old text: at the sort key the other setting composes,
-   * or the current one, where 1.37.0 wrote it (its partition key unescaped, its sort key escaped).
+   * or the current one, where 1.37.0 and 1.38.0 wrote it (its partition key unescaped, its sort key escaped).
    * Under a partition whose text didn't change, the current sort key is where the row belongs.
    */
   const oldPosition = (
@@ -4496,7 +4496,7 @@ function writeTransactionGroups(
 }
 
 // ---------------------------------------------------------------------------
-// Internal: Rows under their 1.36 keys (#171)
+// Internal: Rows under other key text (#171, #183)
 // ---------------------------------------------------------------------------
 
 /** DynamoDB's limit on the items of one `TransactWriteItems`. */
@@ -4536,7 +4536,7 @@ const placeRows = (
     currents.add(slot.current)
   }
   for (const [head, slot] of slots.entries()) {
-    // A chain starts at a row whose 1.36 key is no other row's current key.
+    // A chain starts at a row whose old key is no other row's current key.
     if (slot.current === slot.old || currents.has(slot.old)) continue
     const chain: Array<number> = []
     for (

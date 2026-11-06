@@ -2311,22 +2311,25 @@ export interface TableOperations {
     },
   ) => Effect.Effect<void, DynamoClientError>
 
-  // --- 1.36 keys (#171) ---
+  // --- Key text (#171, #183) ---
 
   /**
-   * Move every row 1.36 wrote whose key text changed to its current key:
+   * Move every row under key text the schema's `escapeKeys` setting doesn't compose
+   * (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does:
    * items with their unique sentinels, version snapshots, tombstones,
    * time-series events, aggregates, and the event streams passed in
    * `options.streams` (copied, flipped, then deleted, while writers append).
    * A sharded index's partition key is rewritten in place when it differs from what
    * the row's values compose. Any other index key or vector partition is rewritten
-   * only when it is exactly its own 1.36 text: anything else is left, with no conflict,
-   * and a key the row doesn't have isn't written. Scans the table (`segments` in
-   * parallel); a row is moved only when it is stored under the key 1.36 composed
-   * for its values, so a rerun moves nothing. Conflicts are reported, never
-   * overwritten. `dryRun` counts what would move, judging each row on its own: a row
-   * whose destination is held by a row that can't move may be predicted as moved.
-   * See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
+   * only when it is exactly its values' text under another form: anything else is left,
+   * with no conflict, and a key the row doesn't have isn't written. Scans the table
+   * (`segments` in parallel); a row is moved only when it is stored under a key its
+   * values composed under another form, so a rerun moves nothing. Conflicts are reported,
+   * never overwritten. `dryRun` counts what would move, judging each row on its own: a
+   * row whose destination is held by a row that can't move may be predicted as moved.
+   * This is the only thing that moves a row between key texts: no read or write looks
+   * under any text but the one the setting composes. See DESIGN.md §7 "Rows under other
+   * key text" and the upgrade guide.
    *
    * Fails with `ValidationError` (`EDD-9098`) for a bad option or resume
    * token, and with the `DynamoClientError` of a request that failed — resume

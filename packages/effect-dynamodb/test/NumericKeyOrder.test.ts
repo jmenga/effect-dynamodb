@@ -228,7 +228,11 @@ describe("numeric key order (#171 E8)", () => {
       // tuple: its text (`-`, `.`, `:` included) is parsed from the probed
       // key, and the next probe starts just past it.
       const statuses = ["active", "pending", "sold"]
-      const fixture = makeListings({ statuses, escapeKeys: true, sk: ["price", "status", "listingId"] })
+      const fixture = makeListings({
+        statuses,
+        escapeKeys: true,
+        sk: ["price", "status", "listingId"],
+      })
       const items = listingsOf(statuses, 9)
       for (const status of statuses) {
         for (const reverse of [false, true]) {

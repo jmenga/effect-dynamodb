@@ -1,16 +1,20 @@
 /**
- * #183 rows the published 1.36.0 wrote — connected tests against DynamoDB Local.
+ * #183 rows the published 1.36.0, 1.37.0 and 1.38.0 wrote — connected tests against DynamoDB Local.
  *
  * `fixtures/legacy-rows-1.36.0.json` holds the items `effect-dynamodb@1.36.0`
  * (with `@effect-dynamodb/schema@1.36.0` and `effect@4.0.0`) wrote for the
  * models below, captured ONCE by a scratch script run against the published
  * packages installed outside the repo (never a dependency of this repo). The
  * fixture's `generated` field says the same. Do not regenerate it from this
- * repo: its whole point is that the bytes came from 1.36.0.
+ * repo: its whole point is that the bytes came from 1.36.0. The `tables` of
+ * `fixtures/rows-1.37.0.json` and `rows-1.38.0.json` are the same writes by those
+ * releases, whose keys escape a sort key and whose valueless rows are marked.
  *
- * With `escapeKeys` off, which is the default for all of 1.x, these rows are where every read looks,
- * and `rekey` has nothing to do. With `escapeKeys: true`, `rekey` moves them first: `a%20b`'s rows
- * are at the key `a b`'s belong at, so each has to move out of the other's way. Either way:
+ * With `escapeKeys` off, which is the default for all of 1.x, 1.36.0's rows are where every read
+ * looks, and `rekey` has nothing to do. With `escapeKeys: true`, `rekey` moves them first: `a%20b`'s
+ * rows are at the key `a b`'s belong at, so each has to move out of the other's way. Rows 1.37.0 and
+ * 1.38.0 wrote are the other way about: with the flag off `rekey` moves them back, and with it on only
+ * their marks change. Either way:
  *
  * - **Pending effects.** `a%20b`'s row has effects pending at revisions 2 and 3, on the read table
  *   (with an outbox index) and on an outbox table of its own (without one); `a b`'s row is at
@@ -66,12 +70,20 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 
 type Row = Record<string, AttributeValue>
 
-const fixture = JSON.parse(
-  readFileSync(
-    fileURLToPath(new URL("./fixtures/legacy-rows-1.36.0.json", import.meta.url)),
-    "utf8",
-  ),
-) as { readonly tables: Record<"events" | "read" | "outbox", ReadonlyArray<Row>> }
+type Tables = Record<"events" | "read" | "outbox", ReadonlyArray<Row>>
+
+const tablesIn = (file: string) =>
+  (
+    JSON.parse(
+      readFileSync(fileURLToPath(new URL(`./fixtures/${file}`, import.meta.url)), "utf8"),
+    ) as {
+      readonly tables: Tables
+    }
+  ).tables
+
+const fixture = { tables: tablesIn("legacy-rows-1.36.0.json") }
+const tables137 = tablesIn("rows-1.37.0.json")
+const tables138 = tablesIn("rows-1.38.0.json")
 
 const tableNames = {
   events: "legacy-fix-events",
@@ -299,9 +311,13 @@ const AttributeDefinitions = [
 ]
 
 /**
- * Run `body` over fresh tables holding the items as 1.36.0 wrote them, with both settings' members.
+ * Run `body` over fresh tables holding the items as a release wrote them (1.36.0 unless told
+ * otherwise), with both settings' members.
  */
-const onFixture = <A, E>(body: (names: Names) => Effect.Effect<A, E, any>) => {
+const onFixture = <A, E>(
+  body: (names: Names) => Effect.Effect<A, E, any>,
+  tables: Tables = fixture.tables,
+) => {
   const n = tablesMade++
   const names: Names = {
     events: `${tableNames.events}-${Date.now()}-${n}`,
@@ -339,7 +355,7 @@ const onFixture = <A, E>(body: (names: Names) => Effect.Effect<A, E, any>) => {
       ],
     })
     for (const [role, TableName] of Object.entries(names)) {
-      for (const Item of fixture.tables[role as keyof Names]) {
+      for (const Item of tables[role as keyof Names]) {
         yield* client.putItem({ TableName, Item })
       }
     }
@@ -366,153 +382,169 @@ const onFixture = <A, E>(body: (names: Names) => Effect.Effect<A, E, any>) => {
   ) as Effect.Effect<A, unknown>
 }
 
-/** What has to happen before `w` reads these rows. */
-const SETTINGS: ReadonlyArray<readonly [string, World, Effect.Effect<unknown, unknown, any>]> = [
-  ["the flag off: nothing to do", Off, Effect.void],
-  ["the flag on, after rekey", On, rekeyAll(On)],
+/** Which rows, and what has to happen before `w` reads them. */
+const SETTINGS: ReadonlyArray<
+  readonly [string, World, Effect.Effect<unknown, unknown, any>, Tables]
+> = [
+  ["1.36.0's, the flag off: nothing to do", Off, Effect.void, fixture.tables],
+  ["1.36.0's, the flag on, after rekey", On, rekeyAll(On), fixture.tables],
+  ["1.37.0's, the flag off, after rekey", Off, rekeyAll(Off), tables137],
+  ["1.37.0's, the flag on, after rekey", On, rekeyAll(On), tables137],
+  ["1.38.0's, the flag off, after rekey", Off, rekeyAll(Off), tables138],
+  ["1.38.0's, the flag on, after rekey", On, rekeyAll(On), tables138],
 ]
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describeConnected.each(SETTINGS)("#183 rows 1.36.0 wrote, %s", (_setting, w, prepare) => {
+describeConnected.each(SETTINGS)("#183 rows, %s", (_setting, w, prepare, tables) => {
   it.live("each value's effects are its own, and each drain delivers its own in order", () =>
-    onFixture((names) =>
-      Effect.gen(function* () {
-        yield* prepare
-        const escaped = keysOf(w, "Tallies", "esc")
-        const spaced = keysOf(w, "Tallies", "sp")
-        for (const event of yield* append(
-          w,
-          "sp",
-          [new Added({ amount: 5 }), new Added({ amount: 7 })],
-          2,
-        )) {
-          yield* w.Notifying.apply(event)
-          yield* w.Remote.apply(event)
-        }
-        for (const event of yield* append(w, "esc", [new Added({ amount: 1 })], 3)) {
-          yield* w.Notifying.apply(event)
-          yield* w.Remote.apply(event)
-        }
+    onFixture(
+      (names) =>
+        Effect.gen(function* () {
+          yield* prepare
+          const escaped = keysOf(w, "Tallies", "esc")
+          const spaced = keysOf(w, "Tallies", "sp")
+          for (const event of yield* append(
+            w,
+            "sp",
+            [new Added({ amount: 5 }), new Added({ amount: 7 })],
+            2,
+          )) {
+            yield* w.Notifying.apply(event)
+            yield* w.Remote.apply(event)
+          }
+          for (const event of yield* append(w, "esc", [new Added({ amount: 1 })], 3)) {
+            yield* w.Notifying.apply(event)
+            yield* w.Remote.apply(event)
+          }
 
-        const db = yield* w.db
-        const rowOf = (entity: "Tallies" | "Ledgers", account: string) =>
-          Effect.map(db.entities[entity].get(ROWS[account]!).asEffect(), (found) => ({
-            total: found.total,
-            rev: found.rev,
-          }))
-        expect(yield* rowOf("Tallies", "sp")).toEqual({ total: 22, rev: 3 })
-        expect(yield* rowOf("Tallies", "esc")).toEqual({ total: 6, rev: 4 })
-        expect(yield* rowOf("Ledgers", "sp")).toEqual({ total: 22, rev: 3 })
-        expect(yield* rowOf("Ledgers", "esc")).toEqual({ total: 6, rev: 4 })
-        expect(yield* placed(names.read, "Tally#outbox")).toEqual(
-          [
-            at(spaced, "#outbox#000000000002#0000"),
-            at(spaced, "#outbox#000000000003#0000"),
-            at(escaped, "#outbox#000000000002#0000"),
-            at(escaped, "#outbox#000000000003#0000"),
-            at(escaped, "#outbox#000000000004#0000"),
-            at(keysOf(w, "Tallies", "gone"), "#outbox#000000000001#0000"),
-          ].sort(),
-        )
-        const ledgerEscaped = keysOf(w, "Ledgers", "esc")
-        const ledgerSpaced = keysOf(w, "Ledgers", "sp")
-        expect(yield* placed(names.outbox, "Ledger#outbox")).toEqual(
-          [
-            at(ledgerSpaced, "#outbox#000000000002#0000"),
-            at(ledgerSpaced, "#outbox#000000000003#0000"),
-            at(ledgerEscaped, "#outbox#000000000002#0000"),
-            at(ledgerEscaped, "#outbox#000000000003#0000"),
-            at(ledgerEscaped, "#outbox#000000000004#0000"),
-          ].sort(),
-        )
+          const db = yield* w.db
+          const rowOf = (entity: "Tallies" | "Ledgers", account: string) =>
+            Effect.map(db.entities[entity].get(ROWS[account]!).asEffect(), (found) => ({
+              total: found.total,
+              rev: found.rev,
+            }))
+          expect(yield* rowOf("Tallies", "sp")).toEqual({ total: 22, rev: 3 })
+          expect(yield* rowOf("Tallies", "esc")).toEqual({ total: 6, rev: 4 })
+          expect(yield* rowOf("Ledgers", "sp")).toEqual({ total: 22, rev: 3 })
+          expect(yield* rowOf("Ledgers", "esc")).toEqual({ total: 6, rev: 4 })
+          expect(yield* placed(names.read, "Tally#outbox")).toEqual(
+            [
+              at(spaced, "#outbox#000000000002#0000"),
+              at(spaced, "#outbox#000000000003#0000"),
+              at(escaped, "#outbox#000000000002#0000"),
+              at(escaped, "#outbox#000000000003#0000"),
+              at(escaped, "#outbox#000000000004#0000"),
+              at(keysOf(w, "Tallies", "gone"), "#outbox#000000000001#0000"),
+            ].sort(),
+          )
+          const ledgerEscaped = keysOf(w, "Ledgers", "esc")
+          const ledgerSpaced = keysOf(w, "Ledgers", "sp")
+          expect(yield* placed(names.outbox, "Ledger#outbox")).toEqual(
+            [
+              at(ledgerSpaced, "#outbox#000000000002#0000"),
+              at(ledgerSpaced, "#outbox#000000000003#0000"),
+              at(ledgerEscaped, "#outbox#000000000002#0000"),
+              at(ledgerEscaped, "#outbox#000000000003#0000"),
+              at(ledgerEscaped, "#outbox#000000000004#0000"),
+            ].sort(),
+          )
 
-        for (const projection of [w.Notifying, w.Remote]) {
-          const spDrain = collect()
-          yield* projection.drain(ROWS.sp!, spDrain.deliver)
-          expect(spDrain.delivered).toEqual(["sp:15", "sp:22"])
-          const escDrain = collect()
-          yield* projection.drain(ROWS.esc!, escDrain.deliver)
-          expect(escDrain.delivered).toEqual(["esc:2", "esc:5", "esc:6"])
-        }
-        expect(yield* placed(names.outbox, "Ledger#outbox")).toEqual([])
-      }),
+          for (const projection of [w.Notifying, w.Remote]) {
+            const spDrain = collect()
+            yield* projection.drain(ROWS.sp!, spDrain.deliver)
+            expect(spDrain.delivered).toEqual(["sp:15", "sp:22"])
+            const escDrain = collect()
+            yield* projection.drain(ROWS.esc!, escDrain.deliver)
+            expect(escDrain.delivered).toEqual(["esc:2", "esc:5", "esc:6"])
+          }
+          expect(yield* placed(names.outbox, "Ledger#outbox")).toEqual([])
+        }),
+      tables,
     ),
   )
 
   it.live(
     "an event with no effect writes `r s`'s row again over its tombstone; `r%20s` starts afresh",
     () =>
-      onFixture((names) =>
-        Effect.gen(function* () {
-          yield* prepare
-          const gone = keysOf(w, "Tallies", "gone")
-          expect(yield* placed(names.read, "Tally#tombstone")).toEqual([at(gone)])
-          const [reopened] = yield* append(w, "gone", [new Opened()], 3)
-          const result = yield* w.Notifying.apply(reopened!)
-          expect(result.applied.map((event) => event.version)).toEqual([4])
-          expect(Option.getOrThrow(result.state)).toMatchObject({ total: 0, version: 4, rev: 2 })
-          const removing = yield* w.Removing.apply(reopened!)
-          expect(Option.getOrThrow(removing.state)).toMatchObject({ total: 0, version: 4, rev: 2 })
-          expect(yield* placed(names.read, "Tally#tombstone")).toEqual([])
-          expect(yield* placed(names.read, "Rem#tombstone")).toEqual([])
-          // The effect 1.36 left pending is still delivered, once.
-          const { delivered, deliver } = collect()
-          yield* w.Notifying.drain(ROWS.gone!, deliver)
-          expect(delivered).toEqual(["gone:3"])
+      onFixture(
+        (names) =>
+          Effect.gen(function* () {
+            yield* prepare
+            const gone = keysOf(w, "Tallies", "gone")
+            expect(yield* placed(names.read, "Tally#tombstone")).toEqual([at(gone)])
+            const [reopened] = yield* append(w, "gone", [new Opened()], 3)
+            const result = yield* w.Notifying.apply(reopened!)
+            expect(result.applied.map((event) => event.version)).toEqual([4])
+            expect(Option.getOrThrow(result.state)).toMatchObject({ total: 0, version: 4, rev: 2 })
+            const removing = yield* w.Removing.apply(reopened!)
+            expect(Option.getOrThrow(removing.state)).toMatchObject({
+              total: 0,
+              version: 4,
+              rev: 2,
+            })
+            expect(yield* placed(names.read, "Tally#tombstone")).toEqual([])
+            expect(yield* placed(names.read, "Rem#tombstone")).toEqual([])
+            // The effect 1.36 left pending is still delivered, once.
+            const { delivered, deliver } = collect()
+            yield* w.Notifying.drain(ROWS.gone!, deliver)
+            expect(delivered).toEqual(["gone:3"])
 
-          const fresh = yield* append(w, "gone2", [new Opened(), new Added({ amount: 5 })], 0)
-          expect((yield* w.Notifying.applyBatch(fresh)).outcomes.map((o) => o._tag)).toEqual([
-            "Applied",
-          ])
-          expect((yield* w.Removing.applyBatch(fresh)).outcomes.map((o) => o._tag)).toEqual([
-            "Applied",
-          ])
-          for (const [entity, type] of [
-            ["Tallies", "Tally"],
-            ["Rems", "Rem"],
-          ] as const) {
-            const both = [keysOf(w, entity, "gone"), keysOf(w, entity, "gone2")]
-            expect(
-              (yield* placed(names.read, type)).filter((row) => row.includes("#name_r")),
-            ).toEqual(both.map((keys) => at(keys)).sort())
-          }
-          const again = collect()
-          yield* w.Notifying.drain(ROWS.gone2!, again.deliver)
-          expect(again.delivered).toEqual(["gone2:5"])
-        }),
+            const fresh = yield* append(w, "gone2", [new Opened(), new Added({ amount: 5 })], 0)
+            expect((yield* w.Notifying.applyBatch(fresh)).outcomes.map((o) => o._tag)).toEqual([
+              "Applied",
+            ])
+            expect((yield* w.Removing.applyBatch(fresh)).outcomes.map((o) => o._tag)).toEqual([
+              "Applied",
+            ])
+            for (const [entity, type] of [
+              ["Tallies", "Tally"],
+              ["Rems", "Rem"],
+            ] as const) {
+              const both = [keysOf(w, entity, "gone"), keysOf(w, entity, "gone2")]
+              expect(
+                (yield* placed(names.read, type)).filter((row) => row.includes("#name_r")),
+              ).toEqual(both.map((keys) => at(keys)).sort())
+            }
+            const again = collect()
+            yield* w.Notifying.drain(ROWS.gone2!, again.deliver)
+            expect(again.delivered).toEqual(["gone2:5"])
+          }),
+        tables,
       ),
   )
 
   it.live("`a b` and `a%20b` each list and keep their own retained versions", () =>
-    onFixture(() =>
-      Effect.gen(function* () {
-        yield* prepare
-        const db = yield* w.db
-        const escaped = ["esc v1@1", "esc v2@2", "esc v3@3", "esc v4@4"]
-        expect(yield* versionsOf(w, "a b")).toEqual(["sp v1@1"])
-        expect(yield* versionsOf(w, "a%20b")).toEqual(escaped)
+    onFixture(
+      () =>
+        Effect.gen(function* () {
+          yield* prepare
+          const db = yield* w.db
+          const escaped = ["esc v1@1", "esc v2@2", "esc v3@3", "esc v4@4"]
+          expect(yield* versionsOf(w, "a b")).toEqual(["sp v1@1"])
+          expect(yield* versionsOf(w, "a%20b")).toEqual(escaped)
 
-        const page = { owner: "o", title: "a b" }
-        /** The version a write returned the page at. */
-        const versionOf = (written: object) => (written as { readonly version?: number }).version
-        const put = yield* db.entities.Pages.put({ ...page, body: "sp v3" }).asEffect()
-        expect(versionOf(put)).toBe(3)
-        const updated = yield* db.entities.Pages.update(page).set({ body: "sp v4" }).asEffect()
-        expect(versionOf(updated)).toBe(4)
-        yield* db.entities.Pages.delete(page).asEffect()
-        const restored = yield* db.entities.Pages.restore(page)
-        expect(restored.body).toBe("sp v4")
+          const page = { owner: "o", title: "a b" }
+          /** The version a write returned the page at. */
+          const versionOf = (written: object) => (written as { readonly version?: number }).version
+          const put = yield* db.entities.Pages.put({ ...page, body: "sp v3" }).asEffect()
+          expect(versionOf(put)).toBe(3)
+          const updated = yield* db.entities.Pages.update(page).set({ body: "sp v4" }).asEffect()
+          expect(versionOf(updated)).toBe(4)
+          yield* db.entities.Pages.delete(page).asEffect()
+          const restored = yield* db.entities.Pages.restore(page)
+          expect(restored.body).toBe("sp v4")
 
-        const own = yield* versionsOf(w, "a b")
-        expect(own.slice(0, 4)).toEqual(["sp v1@1", "sp v2@2", "sp v3@3", "sp v4@4"])
-        expect(own.every((entry) => entry.startsWith("sp "))).toBe(true)
-        expect(yield* versionsOf(w, "a%20b")).toEqual(escaped)
-        const current = yield* db.entities.Pages.get({ owner: "o", title: "a%20b" }).asEffect()
-        expect(current).toMatchObject({ body: "esc v5", version: 5 })
-      }),
+          const own = yield* versionsOf(w, "a b")
+          expect(own.slice(0, 4)).toEqual(["sp v1@1", "sp v2@2", "sp v3@3", "sp v4@4"])
+          expect(own.every((entry) => entry.startsWith("sp "))).toBe(true)
+          expect(yield* versionsOf(w, "a%20b")).toEqual(escaped)
+          const current = yield* db.entities.Pages.get({ owner: "o", title: "a%20b" }).asEffect()
+          expect(current).toMatchObject({ body: "esc v5", version: 5 })
+        }),
+      tables,
     ),
   )
 })
@@ -586,4 +618,66 @@ describeConnected("#183 rekey over the rows 1.36.0 wrote", () => {
       }),
     ),
   )
+
+  describe.each([
+    ["1.37.0", tables137],
+    ["1.38.0", tables138],
+  ] as const)("over the rows %s wrote", (release, tables) => {
+    it.live("with the flag off, every row moves to the key 1.36.0 wrote it at", () =>
+      onFixture(
+        (names) =>
+          Effect.gen(function* () {
+            const dry = yield* rekeyAll(Off, { dryRun: true })
+            const { read, outbox } = yield* rekeyAll(Off)
+            expect(read.conflicts).toEqual([])
+            expect(outbox.conflicts).toEqual([])
+            expect(read.skipped.unrecognizedKey).toBe(0)
+            expect(read.moved).toEqual(dry.read.moved)
+            expect(outbox.moved).toEqual(dry.outbox.moved)
+            expect(read.moved).toEqual({ ...ZERO, item: 6, snapshot: 5, tombstone: 2, outbox: 3 })
+            expect(outbox.moved).toEqual({ ...ZERO, outbox: 2 })
+            const after = yield* rowsOf(names)
+            for (const role of Object.keys(names) as ReadonlyArray<keyof Names>) {
+              expect(keysIn(after[role]!)).toEqual(keysIn(fixture.tables[role]))
+            }
+            for (const row of [...after.read!, ...after.outbox!]) {
+              expect(row.__edd_kt__).toBeUndefined()
+            }
+            const again = yield* rekeyAll(Off)
+            expect(again.read.moved).toEqual(ZERO)
+            expect(again.read.conflicts).toEqual([])
+            expect(again.outbox.moved).toEqual(ZERO)
+          }),
+        tables,
+      ),
+    )
+
+    it.live(`with the flag on, ${release}'s sort keys are what it composes: nothing moves`, () =>
+      onFixture(
+        (names) =>
+          Effect.gen(function* () {
+            const before = yield* rowsOf(names)
+            const dry = yield* rekeyAll(On, { dryRun: true })
+            const { read, outbox } = yield* rekeyAll(On)
+            expect(dry.read.moved).toEqual(ZERO)
+            for (const report of [read, outbox]) {
+              expect(report.moved).toEqual(ZERO)
+              expect(report.conflicts).toEqual([])
+              expect(report.skipped.unrecognizedKey).toBe(0)
+            }
+            const after = yield* rowsOf(names)
+            for (const role of Object.keys(names) as ReadonlyArray<keyof Names>) {
+              expect(keysIn(after[role]!)).toEqual(keysIn(before[role]!))
+            }
+            // And back: a row's mark still says which text it's at.
+            yield* rekeyAll(Off)
+            const back = yield* rowsOf(names)
+            for (const role of Object.keys(names) as ReadonlyArray<keyof Names>) {
+              expect(keysIn(back[role]!)).toEqual(keysIn(fixture.tables[role]))
+            }
+          }),
+        tables,
+      ),
+    )
+  })
 })

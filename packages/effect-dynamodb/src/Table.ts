@@ -880,7 +880,7 @@ export interface CreateTableOptions {
 }
 
 // ---------------------------------------------------------------------------
-// rekey — move rows still under their 1.36 keys (#171)
+// rekey — move rows under other key text to what the setting composes (#171, #183)
 // ---------------------------------------------------------------------------
 
 /**

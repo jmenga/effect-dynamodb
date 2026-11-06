@@ -30,7 +30,7 @@ export interface DynamoSchema {
   readonly escapeKeys?: boolean | undefined
   /**
    * @internal Numbers in numeric order and strings as they are: the partition keys 1.37.0
-   * composed. Nothing sets it but `rekey`, which composes that text to find rows there.
+   * and 1.38.0 composed. Nothing sets it but `rekey`, which composes that text to find rows there.
    */
   readonly numericKeyText?: true | undefined
 }

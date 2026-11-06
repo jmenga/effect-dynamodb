@@ -6,9 +6,9 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as PureAggregate from "@effect-dynamodb/schema/Aggregate.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as PureAggregate from "@effect-dynamodb/schema/Aggregate.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import { Effect, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"

@@ -12,7 +12,7 @@
  * a write of it would have put it.
  *
  * A row is moved only when it is stored under the key its values compose under some other text
- * (`KeyText136.forms`: up to 1.36 and `escapeKeys` off, 1.37.0, `escapeKeys: true`); a row under
+ * (`KeyText136.forms`: up to 1.36 and `escapeKeys` off, 1.37.0 and 1.38.0, `escapeKeys: true`); a row under
  * its current key is left alone, and one under neither is reported
  * (`unrecognizedKey`). That makes a run idempotent: a rerun finds every moved
  * row current. Conflicts — a row under both keys, a current key another row

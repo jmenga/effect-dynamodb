@@ -94,8 +94,10 @@ const nothingToEscape = (value: unknown): boolean =>
     return KeyComposer.escapeKeyText(text, casing) === DynamoSchema.applyCasing(text, casing)
   })
 
-const withFlag = (escapeKeys: boolean) => (schema: Schema): Schema =>
-  DynamoSchema.make({ ...schema, escapeKeys })
+const withFlag =
+  (escapeKeys: boolean) =>
+  (schema: Schema): Schema =>
+    DynamoSchema.make({ ...schema, escapeKeys })
 
 /** Each setting, with the records whose text it must keep as 1.36 wrote it. */
 const SETTINGS = [
@@ -238,7 +240,9 @@ describe("what the flag changes", () => {
 
   it("off, a number the numeric text refuses composes as 1.36 did; on it's refused", () => {
     const record = { tenant: Number.NaN, label: "x" }
-    expect(KeyComposer.composePk(flagOff, "E", index, record)).toBe("$app#v1#e#tenant_0000000000000nan")
+    expect(KeyComposer.composePk(flagOff, "E", index, record)).toBe(
+      "$app#v1#e#tenant_0000000000000nan",
+    )
     expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
   })
 

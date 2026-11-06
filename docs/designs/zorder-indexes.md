@@ -15,6 +15,7 @@ on 2026-11-01 as proposed, with the strongly consistent read after an applied `a
 2026-11-05 the owner had three fixes #184 found in this PR's fallback and `rekey` brought in
 (G38–G41).
 Implemented in the same PR (single-PR workflow: this doc is commit 1).
+**Superseded in part by #183 (1.39.0):** the 1.36 fallback, `legacyKeys`, `ItemNotMoved`, the row checks that served them and the two-key cursor are gone, and numeric key text and escaped sort keys now belong to `escapeKeys: true`, off by default for all of 1.x. Passages about them here are this design as it shipped in 1.37.0. See `gsi-write-sharding.md` §17.17.
 **Builds on:** #122 (`filterBy`, the accept loop and over-read cursors), #133 (history rows and
 geometric growth), #114 / #115 (typed `.where()` operands, delimiter clamping), #111 (composite
 key form), #144 (key-condition diagnosis), v1.7.x policy-aware GSI composition (#41 / #43 / #46),

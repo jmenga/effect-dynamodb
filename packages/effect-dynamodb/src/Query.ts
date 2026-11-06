@@ -625,11 +625,7 @@ const encodeCursor = (key: Record<string, AttributeValue>): string => Cursor.enc
 // Combinators (all dual for data-first and data-last)
 // ---------------------------------------------------------------------------
 
-/**
- * @internal Install `condition` as the query's one sort key condition. A new
- * condition is not the pins the 1.36 key was composed for (#171): the caller that
- * composed it installs the 1.36 key again.
- */
+/** @internal Install `condition` as the query's one sort key condition. */
 const withSortKeyCondition = <A>(state: QueryState, condition: SortKeyCondition): Query<A> =>
   new QueryImpl<A>({
     ...state,
@@ -3354,8 +3350,7 @@ export const asParams = <A>(
       }
     }
     // A `BatchGet`-hydrated query shows its index query; the `BatchGetItem`
-    // that follows each page is not part of these parameters. Nor is the
-    // read of a 1.36 key (#171): these are the query's own key's.
+    // that follows each page is not part of these parameters.
     return buildDynamoCommand(indexQueryState(state), tableName)
   })
 

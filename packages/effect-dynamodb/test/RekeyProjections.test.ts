@@ -41,7 +41,6 @@ const Sum = Schema.Struct({
 type Sum = typeof Sum.Type
 
 const Notice = Schema.Struct({ account: Schema.String, total: Schema.Number })
-type Notice = typeof Notice.Type
 
 /**
  * The read-model row each account feeds: text every setting composes the same, text that changes

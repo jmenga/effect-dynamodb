@@ -619,14 +619,14 @@ export const unescapeKeyText = (text: string): string =>
   )
 
 /**
- * @deprecated since 1.38.0: escaping is `escapeKeys: true`'s, in every key. Use {@link keyText},
+ * @deprecated since 1.39.0: escaping is `escapeKeys: true`'s, in every key. Use {@link keyText},
  * which follows the setting, or {@link escapeKeyText}, the same function under its new name.
  */
 export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string =>
   escapeKeyText(text, casing)
 
 /**
- * @deprecated since 1.38.0: escaping is `escapeKeys: true`'s, in every key. Use
+ * @deprecated since 1.39.0: escaping is `escapeKeys: true`'s, in every key. Use
  * {@link keyValueText}, which follows the setting.
  */
 export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
@@ -1683,7 +1683,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
   // partition key, an inverted index, a sort key shared with the table) composes the
   // table's text from what an update can't change, so there is nothing to write; dropping
   // the entry takes only the other half. A half reads as dropped here only for a row an
-  // earlier release's `.remove()` left without a composite, which a move from its 1.36 key
+  // earlier release's `.remove()` left without a composite, which a move from other key text
   // recomposes from: it keeps its key.
   const primary = indexes.primary
   if (primary === undefined) return { sets, removes }
@@ -1963,8 +1963,8 @@ export const composeEventSk: {
     casing?: DynamoSchema.Casing,
   ): string
   /**
-   * @deprecated since 1.38.0: pass the schema first, so `escapeKeys` is followed. Without it, the
-   * value is escaped and `casing` defaults to `"lowercase"`, as in 1.37.
+   * @deprecated since 1.39.0: pass the schema first, so `escapeKeys` is followed. Without it, the
+   * value is escaped and `casing` defaults to `"lowercase"`, as in 1.37.0 and 1.38.0.
    */
   (currentSk: string, orderByValue: unknown, casing?: DynamoSchema.Casing): string
 } = (first: DynamoSchema.DynamoSchema | string, ...rest: ReadonlyArray<unknown>): string => {

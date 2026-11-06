@@ -1,7 +1,7 @@
 /**
  * After `rekey`, `foo bar` and `foo%20bar` are two values (#183). Rows from every key text a table
- * can hold — 1.36's, 1.37.0's, either setting's — are seeded for real, by the setting that wrote
- * them, with 1.37.0's partition key text put back on them. `rekey` then moves them to what the
+ * can hold — 1.36's, that of 1.37.0 and 1.38.0, either setting's — are seeded for real, by the setting
+ * that wrote them, with those releases' partition key text put back on them. `rekey` then moves them to what the
  * setting composes, in both directions, and every operation on each value finds its own rows and
  * touches nothing of the other's. On a fresh table there is no alias at all. These scenarios run on
  * a recording table and on DynamoDB Local, through a {@link Harness}.

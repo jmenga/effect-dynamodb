@@ -20,6 +20,7 @@ import {
   flipScenarios,
   type Harness,
   historyScenarios,
+  releaseRowScenarios,
   sentinelScenarios,
   shapeScenarios,
 } from "./helpers/EscapeKeyScenarios.js"
@@ -137,6 +138,11 @@ describeConnected("escapeKeys", () => {
   })
   describe("every key path finds what it wrote", () => {
     for (const scenario of findsEveryKeyScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  })
+  describe("rows the published 1.37.0 and 1.38.0 stored", () => {
+    for (const scenario of releaseRowScenarios) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })

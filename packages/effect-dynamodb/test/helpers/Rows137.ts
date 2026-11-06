@@ -1,10 +1,12 @@
 /**
- * Rows 1.37.0 wrote (#183): it escaped sort keys and no partition key, so a partition key holding
- * a character to escape is at neither its 1.36 text nor its text with `escapeKeys: true`, and with
- * the flag off a sort key holding one is at no text at all. The stored keys here are the ones the
- * published 1.37.0 package wrote for these values. Only `rekey` looks for them: it moves them to
- * what the setting composes, either way, and until then a read doesn't find them. These scenarios
- * run under both settings, on a recording table and on DynamoDB Local, through a {@link Harness}.
+ * Rows 1.37.0 and 1.38.0 wrote (#183): they escaped sort keys and no partition key, so a partition
+ * key holding a character to escape is at neither its 1.36 text nor its text with
+ * `escapeKeys: true`, and with the flag off a sort key holding one is at no text at all. The stored
+ * keys here are the ones the published 1.37.0 package wrote for these values, which 1.38.0 writes
+ * too (`releaseRowScenarios` in `EscapeKeyScenarios.ts` runs what each package stored). Only `rekey`
+ * looks for them: it moves them to what the setting composes, either way, and until then a read
+ * doesn't find them. These scenarios run under both settings, on a recording table and on DynamoDB
+ * Local, through a {@link Harness}.
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -542,9 +544,7 @@ export const streamScenarios: ReadonlyArray<Scenario> = bothSettings(
     const id = { tenant: "a b", n: -3 } as never
     return h.on(world, (db, table) =>
       Effect.gen(function* () {
-        yield* table.as(writer, () =>
-          writer.Accounts.append(id, [new Deposited({ amount: 1 })], 0),
-        )
+        yield* table.as(writer, () => writer.Accounts.append(id, [new Deposited({ amount: 1 })], 0))
         const now = (yield* table.rows()).map((row) => row.pk.S)
         expect(now).toEqual(["$mixed#v1#accounts#a%20b#-9999999999999996:"])
         yield* demote(table, now[0]!, "$mixed#v1#accounts#a b#-9999999999999996:")

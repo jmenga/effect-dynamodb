@@ -107,10 +107,11 @@ export const isProjectionTombstone = (
 ): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
 
 /**
- * Marks a projection's row tombstone or outbox item written under the key
- * text 1.37 composes (#171). They hold no values to tell whose key they are
- * at, and `foo bar`'s current key is `foo%20bar`'s 1.36 key: one without the
- * mark is 1.36's, the row its key reads back as.
+ * Marks a projection's row tombstone or outbox item with the key text it's
+ * under (#171, #183). They hold no values to tell whose key they are at, and
+ * `foo bar`'s escaped key is `foo%20bar`'s unescaped one, so `rekey` reads the
+ * key back by the mark (`KeyText136.formOfMark`): none is the text 1.36
+ * composed, which `escapeKeys` off composes too.
  */
 export const KEY_TEXT = "__edd_kt__"
 

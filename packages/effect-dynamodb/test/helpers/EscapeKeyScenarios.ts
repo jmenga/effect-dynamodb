@@ -1,8 +1,9 @@
 /**
  * Escaping every key, or none (#183), through the entity, the aggregate and the stream: what each
  * setting stores against what the published 1.36.0 stored (`fixtures/rows-1.36.0.json`), that each
- * finds what it wrote, and the canonical GSI shapes with values a key escapes. These scenarios run
- * on a recording table and on DynamoDB Local, through a {@link Harness}.
+ * finds what it wrote, that `rekey` brings over what the published 1.37.0 and 1.38.0 stored
+ * (`fixtures/rows-1.37.0.json`, `rows-1.38.0.json`), and the canonical GSI shapes with values a key
+ * escapes. These scenarios run on a recording table and on DynamoDB Local, through a {@link Harness}.
  */
 
 import { readFileSync } from "node:fs"
@@ -18,9 +19,12 @@ import * as Table from "../../src/Table.js"
 import {
   CASINGS,
   type Casing,
+  CHANGED,
   keysOf,
   type Library,
   makeWorld,
+  type Numbers,
+  PADDED,
   PLAIN,
   SPELLED,
   type Values,
@@ -112,11 +116,17 @@ const escapedForm = (
   )
 }
 
-const writes = (h: Harness, casing: Casing, escapeKeys: boolean, values: Values) => {
+const writes = (
+  h: Harness,
+  casing: Casing,
+  escapeKeys: boolean,
+  values: Values,
+  numbers: Numbers = PADDED,
+) => {
   const world = makeWorld(library, { casing, escapeKeys })
   return h.on(world.MainTable, (rows) =>
     Effect.gen(function* () {
-      yield* writeEveryKey(library, world, values) as Effect.Effect<void, unknown, any>
+      yield* writeEveryKey(library, world, values, numbers) as Effect.Effect<void, unknown, any>
       return keysOf(yield* rows())
     }),
   )
@@ -150,10 +160,10 @@ export const everyKeyScenarios: ReadonlyArray<Scenario> = CASINGS.flatMap((casin
 ])
 
 /** Every key path's read, finding what `writeEveryKey` wrote. */
-const readsEveryKey = (world: ReturnType<typeof makeWorld>, v: Values) =>
+const readsEveryKey = (world: ReturnType<typeof makeWorld>, v: Values, numbers: Numbers = PADDED) =>
   Effect.gen(function* () {
     const db: any = yield* world.client()
-    const item = { tenant: v.a, n: 5, label: v.b, s: 7 }
+    const item = { tenant: v.a, n: numbers.n, label: v.b, s: numbers.s }
     expect(yield* db.entities.Items.get(item).asEffect()).toMatchObject({ zone: v.d })
     const byRegion = yield* db.entities.Items.byRegion({ region: v.c, zone: v.d }).collect()
     expect(byRegion.map((row: any) => row.tenant)).toEqual([v.a])
@@ -172,10 +182,10 @@ const readsEveryKey = (world: ReturnType<typeof makeWorld>, v: Values) =>
     expect(yield* db.entities.Users.getVersion({ id: v.a }, 1)).toMatchObject({ email: v.b })
     expect(yield* db.entities.Users.deleted.get({ id: v.a })).toMatchObject({ email: v.b })
     const history = yield* db.entities.Readings.history({ device: v.a, channel: v.b }).collect()
-    expect(history.map((row: any) => row.at)).toEqual([9])
+    expect(history.map((row: any) => row.at)).toEqual([numbers.at])
     const byGroup = yield* db.entities.Edges.byGroup({ groupId: v.b }).collect()
     expect(byGroup.map((row: any) => row.userId)).toEqual([v.a])
-    expect((yield* world.Accounts.read({ tenant: v.a, n: 5 })).length).toBe(1)
+    expect((yield* world.Accounts.read({ tenant: v.a, n: numbers.n })).length).toBe(1)
     expect((yield* world.Ledgers.read({ tenant: v.d })).length).toBe(1)
     const route = yield* db.aggregates.Routes.get({ id: v.a })
     expect(route.stops.map((stop: any) => stop.label)).toEqual([v.c])
@@ -183,10 +193,13 @@ const readsEveryKey = (world: ReturnType<typeof makeWorld>, v: Values) =>
     expect(listed.data.map((row: any) => row.id)).toEqual([v.a])
   })
 
-const rekeyOf = (world: ReturnType<typeof makeWorld>) =>
+const rekeyOf = (world: ReturnType<typeof makeWorld>, options?: { readonly dryRun?: boolean }) =>
   Effect.gen(function* () {
     const db: any = yield* world.client()
-    return yield* db.tables.MainTable.rekey({ streams: [world.Accounts, world.Ledgers] })
+    return yield* db.tables.MainTable.rekey({
+      streams: [world.Accounts, world.Ledgers],
+      ...options,
+    })
   }) as Effect.Effect<Table.RekeyReport, unknown, any>
 
 const expectNothingMoved = (report: Table.RekeyReport) => {
@@ -233,6 +246,111 @@ const findsNothing = (world: ReturnType<typeof makeWorld>) =>
     const route = yield* db.aggregates.Routes.get({ id: v.a }).pipe(Effect.flip)
     expect((route as any)._tag).toBe("AggregateAssemblyError")
   })
+
+type ReleaseFixture = {
+  readonly generated: string
+  readonly rows: Record<string, ReadonlyArray<Record<string, any>>>
+}
+
+const RELEASES = ["1.37.0", "1.38.0"] as const
+const releaseFixture = Object.fromEntries(
+  RELEASES.map((release) => [
+    release,
+    JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL(`../fixtures/rows-${release}.json`, import.meta.url)),
+        "utf8",
+      ),
+    ) as ReleaseFixture,
+  ]),
+) as Record<(typeof RELEASES)[number], ReleaseFixture>
+
+const RELEASE_SETS: ReadonlyArray<{
+  readonly label: string
+  readonly values: Values
+  readonly numbers: Numbers
+}> = [
+  { label: "spelled", values: SPELLED, numbers: PADDED },
+  { label: "plain", values: PLAIN, numbers: PADDED },
+  { label: "spelled-changed", values: SPELLED, numbers: CHANGED },
+  { label: "plain-changed", values: PLAIN, numbers: CHANGED },
+]
+
+/** A key attribute's text, from the attribute map a fixture holds. */
+const attributeKeysOf = (rows: ReadonlyArray<Record<string, any>>) =>
+  keysOf(
+    rows.map((row) =>
+      Object.fromEntries(Object.entries(row).map(([name, value]) => [name, value.S])),
+    ),
+  )
+
+/**
+ * The rows the published 1.37.0 and 1.38.0 stored: 1.37.0's key text, which 1.38.0 didn't change.
+ * `rekey` brings them to what a fresh write under either setting stores, with the inverted row, a
+ * chain of escapes and the numbers 1.37.0 changed among them.
+ */
+export const releaseRowScenarios: ReadonlyArray<Scenario> = [
+  {
+    name: "1.38.0 stored every key 1.37.0 did",
+    run: () =>
+      Effect.sync(() => {
+        for (const [set, rows] of Object.entries(releaseFixture["1.37.0"].rows)) {
+          expect(attributeKeysOf(releaseFixture["1.38.0"].rows[set]!)).toEqual(
+            attributeKeysOf(rows),
+          )
+        }
+      }),
+  },
+  ...RELEASES.flatMap((release) =>
+    CASINGS.flatMap((casing) =>
+      RELEASE_SETS.flatMap(({ label, values, numbers }) =>
+        (
+          [
+            ["on", true],
+            ["off", false],
+          ] as const
+        ).map(([setting, escapeKeys]) => ({
+          name: `${release}, ${casing}, ${label}, ${setting}: rekey brings every row to what the setting stores`,
+          run: (h: Harness) => {
+            const world = makeWorld(library, { casing, escapeKeys })
+            return Effect.gen(function* () {
+              const fresh = yield* writes(h, casing, escapeKeys, values, numbers)
+              yield* h.on(world.MainTable, (rows) =>
+                Effect.gen(function* () {
+                  const client: any = yield* DynamoClient
+                  const { name: TableName } = yield* world.MainTable.Tag
+                  for (const Item of releaseFixture[release].rows[`${casing}/${label}`]!) {
+                    yield* client.putItem({ TableName, Item })
+                  }
+                  const before = keysOf(yield* rows())
+                  const dry = yield* rekeyOf(world, { dryRun: true })
+                  expect(keysOf(yield* rows())).toEqual(before)
+                  const report = yield* rekeyOf(world)
+                  expect(report.conflicts).toEqual([])
+                  expect(report.skipped.unrecognizedKey).toBe(0)
+                  expect(dry.moved).toEqual(report.moved)
+                  expect(dry.sentinelsMoved).toBe(report.sentinelsMoved)
+                  expect(dry.indexKeysRewritten).toBe(report.indexKeysRewritten)
+                  expect(dry.conflicts).toEqual([])
+                  expect(keysOf(yield* rows())).toEqual(fresh)
+                  // Nothing here to move: a plain value has one text in every release.
+                  if (label === "plain") expectNothingMoved(report)
+                  if (!escapeKeys && (label === "spelled" || label === "plain")) {
+                    expect(keysOf(yield* rows())).toEqual(stored(casing, label))
+                  }
+                  yield* readsEveryKey(world, values, numbers)
+                  expectNothingMoved(yield* rekeyOf(world))
+                  expect(keysOf(yield* rows())).toEqual(fresh)
+                  yield* readsEveryKey(world, values, numbers)
+                }),
+              )
+            })
+          },
+        })),
+      ),
+    ),
+  ),
+]
 
 /**
  * Turning escaping on or off over stored rows: until `rekey` moves them no read finds a row whose
@@ -348,11 +466,11 @@ export const sentinelScenarios: ReadonlyArray<Scenario> = (() => {
           setup(h, from, (now) =>
             Effect.gen(function* () {
               const db: any = yield* now.client()
-              const dry = yield* (db.tables.MainTable.rekey({ dryRun: true }) as Effect.Effect<
+              const dry = yield* db.tables.MainTable.rekey({ dryRun: true }) as Effect.Effect<
                 Table.RekeyReport,
                 unknown,
                 any
-              >)
+              >
               expect(dry.sentinelsMoved).toBe(1)
               const report = yield* rekeyOf(now)
               expect(report.moved.item).toBe(0)

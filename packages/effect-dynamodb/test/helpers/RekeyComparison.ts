@@ -465,11 +465,11 @@ const off = DynamoSchema.make({ name: "compared", version: 1, escapeKeys: false 
 interface Direction {
   readonly label: string
   readonly now: DynamoSchema.DynamoSchema
-  readonly then: DynamoSchema.DynamoSchema
+  readonly was: DynamoSchema.DynamoSchema
 }
 const DIRECTIONS: ReadonlyArray<Direction> = [
-  { label: "to on", now: on, then: off },
-  { label: "to off", now: off, then: on },
+  { label: "to on", now: on, was: off },
+  { label: "to off", now: off, was: on },
 ]
 
 interface Scenario {
@@ -498,7 +498,7 @@ export const zOrderScenarios: ReadonlyArray<Scenario> = [
     shards: 8,
   },
 ].flatMap(({ name, shards }) =>
-  bothWays(name, (h, { now, then }) => {
+  bothWays(name, (h, { now, was }) => {
     const world = worldOf(
       Flat,
       primaryKey,
@@ -516,7 +516,7 @@ export const zOrderScenarios: ReadonlyArray<Scenario> = [
     const values = { ...key, status: "open", count: -3 }
     const index = world.Rows.indexes.byCount
     const unsharded = KeyComposer.unshardedView(index)
-    const stored = KeyComposer.composePk(then, "Row", unsharded, values)
+    const stored = KeyComposer.composePk(was, "Row", unsharded, values)
     expect(stored).not.toBe(KeyComposer.composePk(now, "Row", unsharded, values))
     const address = { B: new Uint8Array([1, 2, 3]) }
     return h.on(world, (db, table) =>
@@ -635,13 +635,13 @@ export const separatePairScenarios: ReadonlyArray<{
     },
     ...bothWays(
       "a sort key that is its own other text is rewritten, the other half left",
-      (h, { now, then }) => {
+      (h, { now, was }) => {
         const world = pairedWorld(now)
         const values = { tenant: "a b", id: "1", region: "west", group: "team" }
         const index = world.Rows.indexes.byRegion
-        const gsk = KeyComposer.composeSk(then, "Row", 1, index, values)
+        const gsk = KeyComposer.composeSk(was, "Row", 1, index, values)
         expect(gsk).not.toBe(KeyComposer.composeSk(now, "Row", 1, index, values))
-        const gpk = KeyComposer.composePk(then, "Row", index, values)
+        const gpk = KeyComposer.composePk(was, "Row", index, values)
         return h.on(world, (db, table) =>
           Effect.gen(function* () {
             yield* table.seed(rowOf(world, values, { gpk, gsk }, now))
@@ -661,13 +661,13 @@ export const separatePairScenarios: ReadonlyArray<{
     ),
     ...bothWays(
       "one accessor's own other text is rewritten, and the other's unrelated keys left",
-      (h, { now, then }) => {
+      (h, { now, was }) => {
         const world = pairedWorld(now)
         const values = { tenant: "t", id: "1", region: "west", group: "team", extra: "x y" }
         const index = world.Rows.indexes.byGroup
-        const gsk = KeyComposer.composeSk(then, "Row", 1, index, values)
+        const gsk = KeyComposer.composeSk(was, "Row", 1, index, values)
         expect(gsk).not.toBe(KeyComposer.composeSk(now, "Row", 1, index, values))
-        const gpk = KeyComposer.composePk(then, "Row", index, values)
+        const gpk = KeyComposer.composePk(was, "Row", index, values)
         return h.on(world, (db, table) =>
           Effect.gen(function* () {
             yield* table.seed(
@@ -691,7 +691,7 @@ export const separatePairScenarios: ReadonlyArray<{
         )
       },
     ),
-    ...bothWays("a partition key that is its own other text is rewritten", (h, { now, then }) => {
+    ...bothWays("a partition key that is its own other text is rewritten", (h, { now, was }) => {
       const world = worldOf(
         Paired,
         primaryKey,
@@ -712,9 +712,9 @@ export const separatePairScenarios: ReadonlyArray<{
       )
       const values = { ...key, region: "west", score: -3, group: "team" }
       const index = world.Rows.indexes.byScore
-      const gpk = KeyComposer.composePk(then, "Row", index, values)
+      const gpk = KeyComposer.composePk(was, "Row", index, values)
       expect(gpk).not.toBe(KeyComposer.composePk(now, "Row", index, values))
-      const gsk = KeyComposer.composeSk(then, "Row", 1, index, values)
+      const gsk = KeyComposer.composeSk(was, "Row", 1, index, values)
       return h.on(world, (db, table) =>
         Effect.gen(function* () {
           yield* table.seed(rowOf(world, values, { gpk, gsk }, now))
@@ -736,7 +736,7 @@ export const separatePairScenarios: ReadonlyArray<{
  */
 export const sharedShardMoveScenarios: ReadonlyArray<Scenario> = bothWays(
   "two accessors over one sharded partition key",
-  (h, { now, then }) => {
+  (h, { now, was }) => {
     const halves = (i: number) => ({
       name: `gsi${i}`,
       pk: { field: "gpk", composite: ["region"] },
@@ -759,9 +759,9 @@ export const sharedShardMoveScenarios: ReadonlyArray<Scenario> = bothWays(
         yield* table.seed(
           toAttributeMap({
             ...values,
-            pk: KeyComposer.composePk(then, "Row", primary, values),
-            sk: KeyComposer.composeSk(then, "Row", 1, primary, values),
-            gpk: KeyComposer.composePk(then, "Row", unsharded, values),
+            pk: KeyComposer.composePk(was, "Row", primary, values),
+            sk: KeyComposer.composeSk(was, "Row", 1, primary, values),
+            gpk: KeyComposer.composePk(was, "Row", unsharded, values),
             __edd_e__: "Row",
           }) as StoredRow,
         )
@@ -820,11 +820,11 @@ export const sharedTableKeyMoveScenarios: ReadonlyArray<Scenario> = [
     }),
   },
 ].flatMap(({ name, indexes, keys }) =>
-  bothWays(name, (h, { now, then }) => {
+  bothWays(name, (h, { now, was }) => {
     const world = worldOf(Paired, primaryKey, indexes, {}, now)
     const values = { ...key, id: "a b", region: "west", group: "team" }
     const primary = world.Rows.indexes.primary
-    const old = KeyComposer.composeSk(then, "Row", 1, primary, values)
+    const old = KeyComposer.composeSk(was, "Row", 1, primary, values)
     const current = KeyComposer.composeIndexKeys(now, "Row", 1, primary, values)
     expect(old).not.toBe(current.sk)
     return h.on(world, (db, table) =>
@@ -832,7 +832,7 @@ export const sharedTableKeyMoveScenarios: ReadonlyArray<Scenario> = [
         yield* table.seed(
           toAttributeMap({
             ...values,
-            pk: KeyComposer.composePk(then, "Row", primary, values),
+            pk: KeyComposer.composePk(was, "Row", primary, values),
             sk: old,
             ...keys(world, values),
             __edd_e__: "Row",
@@ -886,7 +886,7 @@ export const sameBytesMoveScenarios: ReadonlyArray<Scenario> = [
     },
   },
 ].flatMap(({ name, indexes }) =>
-  bothWays(`${name}, moved by \`rekey\``, (h, { now, then }) => {
+  bothWays(`${name}, moved by \`rekey\``, (h, { now, was }) => {
     const world = worldOf(Paired, primaryKey, indexes, {}, now)
     const values = { ...key, id: "a b", region: "x y", score: -3 }
     const primary = world.Rows.indexes.primary
@@ -897,10 +897,10 @@ export const sameBytesMoveScenarios: ReadonlyArray<Scenario> = [
         yield* table.seed(
           toAttributeMap({
             ...values,
-            pk: KeyComposer.composePk(then, "Row", primary, values),
-            sk: KeyComposer.composeSk(then, "Row", 1, primary, values),
-            gpk: KeyComposer.composePk(then, "Row", index, values),
-            gsk: KeyComposer.composeSk(then, "Row", 1, index, values),
+            pk: KeyComposer.composePk(was, "Row", primary, values),
+            sk: KeyComposer.composeSk(was, "Row", 1, primary, values),
+            gpk: KeyComposer.composePk(was, "Row", index, values),
+            gsk: KeyComposer.composeSk(was, "Row", 1, index, values),
             __edd_e__: "Row",
           }) as StoredRow,
         )
@@ -1031,11 +1031,7 @@ export const labelScenarios: ReadonlyArray<{
       name: `${half}: a number cleared before a string whose label begins with its own`,
       run: (h: Harness) =>
         h.on(
-          worldOf(
-            Labelled,
-            primaryKey,
-            { byIt: composite(["score", "score_label"]) },
-          ),
+          worldOf(Labelled, primaryKey, { byIt: composite(["score", "score_label"]) }),
           (db, table) =>
             Effect.gen(function* () {
               yield* db.entities.Rows.put({ ...key, code: "c", score: 3, score_label: "abc" })
@@ -1054,7 +1050,7 @@ export const labelScenarios: ReadonlyArray<{
     },
     ...bothWays(
       `${half}: a number at its other text, cleared after a string whose label begins the same`,
-      (h, { now, then }) => {
+      (h, { now, was }) => {
         const world = worldOf(
           Labelled,
           primaryKey,
@@ -1067,7 +1063,7 @@ export const labelScenarios: ReadonlyArray<{
         const values = { ...key, code: "abc", score_label: "l", code_value: -3 }
         const { code_value: _gone, ...held } = values
         const stored = KeyComposer.composeIndexKeys(
-          then,
+          was,
           "Row",
           1,
           world.Rows.indexes.byIt,
@@ -1099,7 +1095,7 @@ export const labelScenarios: ReadonlyArray<{
 export const dryRunChainScenarios: ReadonlyArray<Scenario> = [false, true].flatMap((blocked) =>
   bothWays(
     blocked ? "blocked: a dry run predicts the move a real run refuses" : "not blocked: agrees",
-    (h, { now, then }) => {
+    (h, { now, was }) => {
       const model = Schema.Struct({ id: Schema.String, status: Schema.String })
       const world = worldOf(
         model,
@@ -1121,8 +1117,8 @@ export const dryRunChainScenarios: ReadonlyArray<Scenario> = [false, true].flatM
       const rowAtThen = (values: { readonly id: string; readonly status: string }) =>
         toAttributeMap({
           ...values,
-          pk: KeyComposer.composePk(then, "Row", primary, values),
-          sk: KeyComposer.composeSk(then, "Row", 1, primary, values),
+          pk: KeyComposer.composePk(was, "Row", primary, values),
+          sk: KeyComposer.composeSk(was, "Row", 1, primary, values),
           __edd_e__: "Row",
         }) as StoredRow
       // The row the other's target holds: `a%20b`'s old row on the way on, `a b`'s on the way off.

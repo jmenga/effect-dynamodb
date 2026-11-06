@@ -1,5 +1,5 @@
 /**
- * Rows 1.37.0 wrote (#183), on a table that stores what it is sent. The scenarios are in
+ * Rows 1.37.0 and 1.38.0 wrote (#183), on a table that stores what it is sent. The scenarios are in
  * `helpers/Rows137.ts`; `connected.rows-1.37.0.test.ts` runs them on DynamoDB Local.
  */
 

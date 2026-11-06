@@ -97,9 +97,9 @@ const putsIn = (requests: ReadonlyArray<Request>): ReadonlyArray<Record<string, 
   requests.flatMap((request) => {
     if (request.command === "PutItem") return [request.input.Item]
     if (request.command === "BatchWriteItem") {
-      return Object.values<ReadonlyArray<Record<string, any>>>(
-        request.input.RequestItems,
-      ).flatMap((writes) => writes.flatMap((write) => write.PutRequest?.Item ?? []))
+      return Object.values<ReadonlyArray<Record<string, any>>>(request.input.RequestItems).flatMap(
+        (writes) => writes.flatMap((write) => write.PutRequest?.Item ?? []),
+      )
     }
     if (request.command !== "TransactWriteItems") return []
     return (request.input.TransactItems as ReadonlyArray<Record<string, any>>).flatMap(
@@ -272,7 +272,12 @@ const worldOf = (
   options: Record<string, unknown>,
   schemaOptions: { readonly escapeKeys?: boolean } = {},
 ) => {
-  const schema = DynamoSchema.make({ name: "nokey", version: 1, escapeKeys: true, ...schemaOptions })
+  const schema = DynamoSchema.make({
+    name: "nokey",
+    version: 1,
+    escapeKeys: true,
+    ...schemaOptions,
+  })
   const Rows = Entity.make({
     model: Row,
     entityType: "Row",
@@ -589,8 +594,11 @@ describe("no write sets a table key attribute", () => {
         const puts = putsIn(requests)
         for (const item of puts) {
           expect(item.pk.S).toBe("$nokey#v1#routes#a%20b")
-          expect(["$nokey#v1#routeitem", "$nokey#v1#routestop#x%20y", "$nokey#v1#routestop#z%20w"])
-            .toContain(item.sk.S)
+          expect([
+            "$nokey#v1#routeitem",
+            "$nokey#v1#routestop#x%20y",
+            "$nokey#v1#routestop#z%20w",
+          ]).toContain(item.sk.S)
         }
         return puts.length
       }

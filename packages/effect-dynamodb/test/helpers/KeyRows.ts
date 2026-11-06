@@ -1,9 +1,9 @@
 /**
  * One program that writes a row through every key path (#183), taking the library as a
- * parameter so the published 1.36.0 package can run it too. `fixtures/rows-1.36.0.json` holds
- * what that package stored: generated once, from outside the repo, and never regenerated from
- * this tree, since its whole point is that the bytes came from 1.36.0. With `escapeKeys: false`
- * this tree must store the same bytes.
+ * parameter so a published package can run it too. `fixtures/rows-1.36.0.json`,
+ * `rows-1.37.0.json` and `rows-1.38.0.json` hold what those packages stored: each generated once,
+ * from outside the repo, and never regenerated from this tree, since their whole point is that
+ * the bytes came from that release. With `escapeKeys: false` this tree must store 1.36.0's bytes.
  */
 
 export type Casing = "lowercase" | "uppercase" | "preserve"
@@ -32,6 +32,18 @@ export interface Values {
 export const SPELLED: Values = { a: "u 1", b: "a b", c: "50%", d: "Foo#Bar\nBaz" }
 /** Nothing here is: a key holds these as they are, under any setting. */
 export const PLAIN: Values = { a: "u1", b: "ab", c: "50", d: "FooBarBaz" }
+
+/** The numeric composites and the time-series `orderBy`. */
+export interface Numbers {
+  readonly n: number
+  readonly s: number
+  readonly at: number
+}
+
+/** Numbers every release holds as the same zero-padded text. */
+export const PADDED: Numbers = { n: 5, s: 7, at: 9 }
+/** Numbers whose text changed in 1.37.0: a negative, a fraction, and a negative `orderBy`. */
+export const CHANGED: Numbers = { n: -3, s: 2.5, at: -9 }
 
 export const CASINGS: ReadonlyArray<Casing> = ["lowercase", "uppercase", "preserve"]
 
@@ -188,14 +200,14 @@ export const makeWorld = (
 export type World = ReturnType<typeof makeWorld>
 
 /** A row through every key path. */
-export const writeEveryKey = (lib: Library, world: World, v: Values) =>
+export const writeEveryKey = (lib: Library, world: World, v: Values, numbers: Numbers = PADDED) =>
   lib.Effect.gen(function* () {
     const db: any = yield* world.client()
     yield* db.entities.Items.put({
       tenant: v.a,
-      n: 5,
+      n: numbers.n,
       label: v.b,
-      s: 7,
+      s: numbers.s,
       region: v.c,
       zone: v.d,
     }).asEffect()
@@ -206,11 +218,11 @@ export const writeEveryKey = (lib: Library, world: World, v: Values) =>
     yield* db.entities.Users.delete({ id: v.a }).asEffect()
     yield* db.entities.Users.put({ id: v.c, email: v.d }).asEffect()
     // A current row and an event.
-    yield* db.entities.Readings.append({ device: v.a, channel: v.b, at: 9 }).asEffect()
+    yield* db.entities.Readings.append({ device: v.a, channel: v.b, at: numbers.at }).asEffect()
     yield* db.entities.Edges.put({ userId: v.a, groupId: v.b }).asEffect()
     // A stream's events and a command's sentinel, under the schema's casing and the stream's own.
     const deposit = [new (world.Deposited as any)({ amount: 1 })]
-    yield* world.Accounts.append({ tenant: v.a, n: 5 }, deposit, 0, {
+    yield* world.Accounts.append({ tenant: v.a, n: numbers.n }, deposit, 0, {
       idempotency: { commandId: v.b },
     })
     yield* world.Ledgers.append({ tenant: v.d }, deposit, 0)

@@ -3881,7 +3881,7 @@ const makeImpl = <
    */
   const snapshotPut = (tableName: string, snapshotItem: globalThis.Record<string, unknown>) =>
     storedSnapshotPut(tableName, toAttributeMap(snapshotItem))
-  /** {@link snapshotPut} of a snapshot as stored: one moving from its 1.36 key (#171). */
+  /** {@link snapshotPut} of a snapshot as stored: one moving from other key text (#171). */
   const storedSnapshotPut = (
     tableName: string,
     item: globalThis.Record<string, AttributeValue>,
