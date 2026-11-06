@@ -83,7 +83,7 @@ consults it. "What `put` would write" still has two gaps for a stored row, both 
 whole index where an update decides per half, and a ref's id isn't stored under its own name.
 
 **3. What does a repair run cost on an undamaged table?** The scan. Judging is composing strings from a row already
-read, with no read or write unless a key differs. Measured in §Cost, added once built.
+read, with no read or write unless a key differs. Measured in §Cost.
 
 ## The rule
 
@@ -129,6 +129,21 @@ with stamped composites and no key, whether or not the option is set. That's a b
 measuring this. It keeps those halves absent now; anything else it already catches up, as §9.2 of the sharding design
 says.
 
+## Cost
+
+Measured once built, on DynamoDB Local, on an entity with ten secondary indexes. `report.capacity`, in one scan page:
+
+| Table | Run | Requests | Read units | Write units |
+|---|---|---|---|---|
+| 1,000 healthy rows | `rekey()` | 1 | 119.5 | 0 |
+| 1,000 healthy rows | `rekey({ repairIndexKeys: true })` | 1 | 119.5 | 0 |
+| 1,000 healthy rows | The same, `dryRun` | 1 | 119.5 | 0 |
+| The same and one damaged row | `rekey()` | 1 | 119.5 | 0 |
+| The same and one damaged row | `rekey({ repairIndexKeys: true })` | 2 | 119.5 | 9 |
+
+The extra request is the row's one `UpdateItem`, for its three keys. A test on both tables asserts the scan alone on rows
+that are healthy or only look damaged. Nothing here runs outside `rekey`, so ordinary reads and writes don't change.
+
 ## Fix 1: a bounded run's rootless edges
 
 An edge at its current key whose root is on a later page at the old key looks rootless, since the root hasn't told the
@@ -137,3 +152,10 @@ run where it's going. Only a run over the whole table can say otherwise, so a ru
 `skipped.unrecognizedKey`. A whole-table run does exactly what it did, reads included. A real orphan found by a bounded
 chain stays in `rootNotSeen` until a whole-table run; carrying rows across a token would make it grow without limit,
 and `rooted` is the size of the table.
+
+## Fix 2: blocked chains on DynamoDB
+
+The blocked-chain dry runs for sentinels, streams and aggregates now run on DynamoDB Local (`connected.rekey-chains.test.ts`)
+as well as on the recording table, from one set of scenarios (`helpers/RekeyChains.ts`). Each runs under both settings, in
+one and in three segments, over six stems, and a final test confirms the scan met them in both orders. They found nothing
+to fix: the dry run agrees with the real run there too. Making a dry run stop following the chain fails 104 of them.

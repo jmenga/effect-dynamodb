@@ -8,6 +8,7 @@
  *   - `rekey()`: move every row, in parallel segments, checkpointing a resume token
  *   - A bounded run (`maxPages`) resumed until the table is done
  *   - A rerun moves nothing
+ *   - `rekey({ repairIndexKeys: true })`: write an index key its row's values compose and it lacks
  *   - `rekey` under the default moves them back, the same way
  *
  * Prerequisites:
@@ -226,6 +227,47 @@ const program = Effect.gen(function* () {
     "found by its current index key",
   )
   yield* Console.log(`Nothing left to move; ${again.unchanged} rows already current.`)
+
+  // --- Repairing index keys ---
+  yield* Console.log("\n=== Repairing index keys ===\n")
+
+  // What an update under an earlier release could leave: the row holds its label, and no key for it.
+  yield* db.entities.Sensors.put({ siteId: "south", sensorId: 7, label: "pump", offset: 0 })
+  const raw = yield* DynamoClient
+  const { Items: rows = [] } = yield* raw.scan({ TableName: tableName, ConsistentRead: true })
+  const pump = rows.find((row) => row.label?.S === "pump" && row.gsi1sk !== undefined)!
+  yield* raw.updateItem({
+    TableName: tableName,
+    Key: { pk: pump.pk!, sk: pump.sk! },
+    UpdateExpression: "REMOVE gsi1sk",
+  })
+  const byPump = db.entities.Sensors.byLabel({ siteId: "south", label: "pump" })
+  assertEq((yield* byPump.collect()).length, 0, "a query misses the damaged row")
+
+  // #region repair
+  // `rekey` counts index keys that aren't what their row's values compose.
+  // `repairIndexKeys` writes them: dry run first, to see what it would write.
+  const repairs = yield* db.tables.MainTable.rekey({
+    dryRun: true,
+    repairIndexKeys: true,
+    streams: [Calibrations],
+  })
+  // repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
+
+  const repaired = yield* db.tables.MainTable.rekey({
+    repairIndexKeys: true,
+    streams: [Calibrations],
+  })
+  // repaired.indexKeys → the same, and the row is back in its index
+  // #endregion
+  assertEq(
+    repairs.indexKeys,
+    { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 },
+    "what the dry run says",
+  )
+  assertEq(repaired.indexKeys, repairs.indexKeys, "the run agrees")
+  assertEq((yield* byPump.collect()).length, 1, "a query finds it")
+  yield* Console.log(`Repaired: ${JSON.stringify(repaired.indexKeys)}`)
 
   // --- Back to the default ---
   yield* Console.log("\n=== Back to the default ===\n")
