@@ -134,6 +134,27 @@ describe("the input of an aggregate with `timestamps`", () => {
       expect(accepts(Optional, { ...edges, ...stamps }, input)).toBe(true)
     })
 
+    it("a many edge over a HashMap stays a HashMap, not a record of its key and value", () => {
+      const Model = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.HashMap(Schema.String, Child),
+      })
+      const edges = {
+        edges: {
+          lines: Aggregate.many({
+            entityType: "Line",
+            sk: { composite: ["name"] },
+            decompose: () => [],
+            assemble: (items) => items,
+          }),
+        },
+      }
+      const row = { name: "n", createdAt: at, updatedAt: at }
+      expect(accepts(Model, { ...edges, ...stamps }, { lines: [["a", row]] })).toBe(true)
+      expect(accepts(Model, { ...edges, ...stamps }, { lines: { a: row } })).toBe(false)
+      expect(accepts(Model, { ...edges, ...stamps }, { lines: { a: { name: "n" } } })).toBe(false)
+    })
+
     it("a keyed many edge of plain values is as the model has it", () => {
       const edges = {
         edges: {
