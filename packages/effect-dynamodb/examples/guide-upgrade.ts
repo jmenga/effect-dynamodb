@@ -145,7 +145,7 @@ const program = Effect.gen(function* () {
   const plan = yield* db.tables.MainTable.rekey({ dryRun: true, streams: [Calibrations] })
   // plan.moved      → { item: 1, snapshot: 3, tombstone: 1, outbox: 0, event: 0, aggregate: 0, stream: 0 }
   // plan.conflicts  → []  (rows under both keys, or whose current key is taken)
-  // plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0 }
+  // plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0, rootNotSeen: 0 }
   // #endregion
   assertEq(
     plan.moved,

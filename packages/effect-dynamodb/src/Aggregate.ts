@@ -2198,6 +2198,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * or be on its way to it (a run cut short moves the root last), in any order the scan met them,
    * and a dry run decides the same. Its values don't say whose it is unless the aggregate's context
    * holds them, so with no root at all there's no aggregate to move it with, and it's reported.
+   *
+   * A run that hasn't read the whole table can't say there's no root: a root at its old key, on a
+   * page this run didn't read, names this partition only when the scan reaches it. So it reports
+   * the row as unjudged, and a run over the whole table judges it.
    */
   const rekeyFinish = (
     ctx: Rekey.RekeyRowContext,
@@ -2215,7 +2219,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         })
         if (Item !== undefined) left++
       }
-      return left > 0 ? { skipped: { unrecognizedKey: left } } : {}
+      if (left === 0) return {}
+      return { skipped: ctx.sawWholeTable() ? { unrecognizedKey: left } : { rootNotSeen: left } }
     })
 
   const rekeyRow = (

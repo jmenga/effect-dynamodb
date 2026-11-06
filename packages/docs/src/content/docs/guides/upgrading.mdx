@@ -89,7 +89,7 @@ const missing = yield* db.entities.Sensors.get({ siteId: "north", sensorId: -3 }
 const plan = yield* db.tables.MainTable.rekey({ dryRun: true, streams: [Calibrations] })
 // plan.moved      → { item: 1, snapshot: 3, tombstone: 1, outbox: 0, event: 0, aggregate: 0, stream: 0 }
 // plan.conflicts  → []  (rows under both keys, or whose current key is taken)
-// plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0 }
+// plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0, rootNotSeen: 0 }
 ```
 
 Each row of the table goes to the member that owns it, by its `__edd_e__`: the entities and aggregates the client was made with (the table's own, and those listed in `DynamoClient.make`), and the event streams passed in `streams`. `DynamoClient.make` doesn't register event streams, so list every stream on the table there. A stream on another table is ignored.
@@ -104,7 +104,7 @@ The report counts:
 | `indexKeysRewritten` | Items at their current table key whose index keys or vector partitions held other text, rewritten in place |
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
-| `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)) |
+| `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
 | `byMember` | The same counts per entity type, aggregate and stream name |
 | `capacity` | What the run consumed: capacity units (read and write), requests |
 | `resume` | `Some(token)` to go on from, when the run stopped before the end of the table; `None` when it covered the whole table |
@@ -246,7 +246,7 @@ Every row is moved or counted. These are counted on every run, and left as they 
 |-----|------------|
 | A key that isn't any text its row's values composed | `skipped.unrecognizedKey`, when it's the row's table key |
 | A unique-constraint sentinel with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel | `skipped.unrecognizedKey` |
-| An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey` |
+| An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey`; a run bounded by `maxPages` or started from `resume` says `skipped.rootNotSeen` instead, since the root could be on a page it didn't read |
 | An aggregate root under no text its values composed | `skipped.unrecognizedKey` |
 | A projection tombstone or outbox item whose key reads as more than one set of values | `skipped.unrecognizedKey` |
 | A row holding `NaN` in a key, under `escapeKeys: true` (it has no key text there) | `skipped.unrecognizedKey` |

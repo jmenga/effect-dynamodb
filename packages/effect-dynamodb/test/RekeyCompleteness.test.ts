@@ -680,6 +680,129 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
     },
   )
 
+  // A run cut short left the edges at the current key with the root still at the old one, and the
+  // scan meets the edges first. The value decides the order: a table scans in key order here.
+  const edgesFirst = escapeKeys ? "%z" : "r 1"
+  const bounded = {
+    ...route,
+    id: edgesFirst,
+  }
+  /** The bounded run's rows: edges where the move put them, root where it was. */
+  const halfMoved = (table: ReturnType<typeof tableOf>) => {
+    const pkFor = (schema: DynamoSchema.DynamoSchema) =>
+      DynamoSchema.composeCollectionKey(schema, "routes", [
+        KeyComposer.keyText(schema, edgesFirst, "lowercase"),
+      ])
+    const entry = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+    table.items.delete(entry[0])
+    store(table, { ...entry[1], pk: { S: pkFor(old) } })
+    const rows = [...table.items.values()].map((row) => row.pk?.S).sort()
+    expect(rows[0]).toBe(pkFor(w.schema))
+    expect(rows.at(-1)).toBe(pkFor(old))
+  }
+
+  it.effect("a run that stopped before the root says nothing of the edges it met", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+      expect(report.scanned).toBe(1)
+      expect(report.resume._tag).toBe("Some")
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run over the whole table judges them, with no read for a rooted edge", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+      })
+      expect(dry.skipped.unrecognizedKey).toBe(0)
+      expect(dry.skipped.rootNotSeen).toBe(0)
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1 })
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(0)
+      expect(report.moved.aggregate).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed part way can't judge them either, whichever page held the root", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      // A dry run moves nothing, so what it learned of the root on an earlier page is gone.
+      const pages: Array<Table.RekeyReport> = []
+      let resume: string | undefined
+      do {
+        const page: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          dryRun: true,
+          pageSize: 1,
+          maxPages: 1,
+          ...(resume === undefined ? {} : { resume }),
+        })
+        pages.push(page)
+        resume = page.resume._tag === "Some" ? page.resume.value : undefined
+      } while (resume !== undefined)
+      expect(pages.length).toBeGreaterThan(1)
+      expect(pages.map((page) => page.skipped.unrecognizedKey)).toEqual(pages.map(() => 0))
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a real orphan stays unjudged in a bounded run and is counted over the table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      const part: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1, maxPages: 1 })
+      expect(part.skipped.unrecognizedKey).toBe(0)
+      expect(part.skipped.rootNotSeen).toBe(1)
+      const whole: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(whole.skipped.unrecognizedKey).toBe(2)
+      expect(whole.skipped.rootNotSeen).toBe(0)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("the fix adds no read to a run over the whole table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      table.take()
+      yield* db.tables.MainTable.rekey()
+      // Two edges: the root's read for each as the scan meets it, and each edge read again after.
+      expect(table.take().map((request) => request.command)).toEqual([
+        "Scan",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+      ])
+    }).pipe(on(w, table))
+  })
+
   it.effect("segments meeting one aggregate move it once, and edges wait for the move", () => {
     const table = tableOf()
     return Effect.gen(function* () {

@@ -198,7 +198,7 @@ Both `make` and `definition` check the members against each other. Every member 
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
 | `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
-| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
+| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey, rootNotSeen }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
 | `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable", key, target, message }` — a row `rekey` left as it is |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |

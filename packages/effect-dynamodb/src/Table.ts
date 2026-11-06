@@ -921,8 +921,12 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   projection not defined where `rekey` runs
  * - `unrecognizedKey` — its member's, but stored neither under the key its
  *   values compose now nor under the one 1.36 composed for them
+ * - `rootNotSeen` — a row of an aggregate with no root in its partition, met by
+ *   a run that didn't read the whole table (`maxPages` or `resume`). A root at
+ *   its old key on a page the run didn't read could still claim it, so nothing
+ *   is said of it. A run over the whole table judges it: a dry run will do
  */
-export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
+export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" | "rootNotSeen"
 
 /**
  * A row `rekey` did not move, and why. A row is moved only where nothing is
@@ -1002,9 +1006,8 @@ export interface RekeyReport {
 /** Options for `db.tables.<Table>.rekey()`. */
 export interface RekeyOptions {
   /**
-   * Count what would move, reading but writing nothing. Default `false`. Each row is
-   * judged on its own, so a row whose destination is held by a row that can't move
-   * may be predicted as moved.
+   * Count what would move, reading but writing nothing. Default `false`. What holds a
+   * row's destination is judged too, so what would stop the row stops it here as well.
    */
   readonly dryRun?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */

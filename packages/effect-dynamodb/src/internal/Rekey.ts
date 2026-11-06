@@ -50,6 +50,12 @@ export interface RekeyRowContext {
   readonly tableName: string
   readonly dryRun: boolean
   /**
+   * Whether this run has read every page of the table: it started at the beginning and is past the
+   * end. A run bounded by `maxPages`, or started from `resume`, hasn't, so what it didn't find says
+   * nothing. Only meaningful in {@link RekeyMember.finish}.
+   */
+  readonly sawWholeTable: () => boolean
+  /**
    * Claim a unit of rows that move together — an aggregate, an event stream —
    * for this run: `true` for the first row that claims it, `false` after.
    */
@@ -147,6 +153,7 @@ const SKIP_REASONS: ReadonlyArray<RekeySkipReason> = [
   "notLibrary",
   "unregistered",
   "unrecognizedKey",
+  "rootNotSeen",
 ]
 
 type MutableCounts = { -readonly [K in RekeyRowKind]: number }
@@ -182,6 +189,7 @@ class Totals {
     notLibrary: 0,
     unregistered: 0,
     unrecognizedKey: 0,
+    rootNotSeen: 0,
   }
   byMember = new Map<string, MutableMember>()
 
@@ -347,6 +355,7 @@ export const run = (args: {
       } else {
         positions = Array.from({ length: options.segments ?? 1 }, (): Position => 0)
       }
+      const startedAtTheBeginning = positions.every((position) => position === 0)
 
       // Members by the `__edd_e__` values they claim, in registration order.
       const byType = new Map<string, Array<RekeyMember>>()
@@ -366,6 +375,7 @@ export const run = (args: {
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
+        sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
           if (claimed.has(unit)) return false
           claimed.add(unit)

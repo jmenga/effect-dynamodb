@@ -75,7 +75,12 @@ const nothingToDo = (db: any, table: StoredRows) =>
     const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
     expect(report.conflicts).toEqual([])
     expect(report.indexKeysRewritten).toBe(0)
-    expect(report.skipped).toEqual({ notLibrary: 0, unregistered: 0, unrecognizedKey: 0 })
+    expect(report.skipped).toEqual({
+      notLibrary: 0,
+      unregistered: 0,
+      unrecognizedKey: 0,
+      rootNotSeen: 0,
+    })
     expect(before.length).toBeGreaterThan(0)
     expect(report.unchanged).toBe(before.length)
     expect(byKey(yield* table.rows())).toEqual(before)
