@@ -94,7 +94,8 @@ type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
 /**
  * The names `.remove()` takes: model fields a row can lack, less what no update
  * may clear: primary-key composites, refs, library-managed fields, and the
- * fields configured immutable or stored as a sparse map (`TUnremovable`).
+ * fields configured immutable or stored as a sparse map (`TUnremovable`). A
+ * timestamp is the library's when it's a date; one of another type is the caller's.
  */
 export type RemovableFields<
   TModel extends Schema.Top,
@@ -111,8 +112,10 @@ export type RemovableFields<
         | (string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>)
         | (keyof TRefs & string)
         | TUnremovable
-        | CreatedAtFieldName<TTimestamps>
-        | UpdatedAtFieldName<TTimestamps>
+        | ManagedDateField<
+            ModelType<TModel>,
+            CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>
+          >
         | VersionFieldName<TVersioned>
       >
 
@@ -198,11 +201,19 @@ export type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | fal
       : "version"
 
 /**
- * The fields of `K` the library manages: the dates. Any other model field of that name is the
- * caller's, required or not as the model says (`resolveSystemFields`, rule b).
+ * The fields of `K` the library manages: the dates, required or under `Schema.optional` /
+ * `Schema.optionalKey`. Any other model field of that name is the caller's, required or not as the
+ * model says (`resolveSystemFields`, rule b), and that includes `Schema.UndefinedOr` of a date: a
+ * required key whose value may be empty isn't a date to the run time, so nothing stamps it.
  */
 export type ManagedDateField<T, K> = {
-  [P in K & keyof T]: [Exclude<T[P], undefined>] extends [DateTime.DateTime | Date] ? P : never
+  [P in K & keyof T]: [Exclude<T[P], undefined>] extends [DateTime.DateTime | Date]
+    ? undefined extends T[P]
+      ? T extends Record<P, unknown>
+        ? never
+        : P
+      : P
+    : never
 }[K & keyof T]
 
 /**
